@@ -207,13 +207,15 @@ class DeterministicAgentConnector:
 
 @dataclass(slots=True)
 class OpenAIResponsesAgentConfig:
+    DEFAULT_BASE_URL = "https://api.openai.com/v1/responses"
+
     api_key: str | None = None
     model: str = "gpt-5.4"
     fallback_model: str | None = None
     reasoning_effort: str = "medium"
     max_output_tokens: int = 4000
     timeout_seconds: int = 120
-    base_url: str = "https://api.openai.com/v1/responses"
+    base_url: str = DEFAULT_BASE_URL
     organization: str | None = None
     project: str | None = None
 
@@ -257,7 +259,7 @@ class OpenAIResponsesAgentConfig:
                 if timeout_seconds is not None
                 else int(env.get("AI_FACTORY_OPENAI_TIMEOUT_SECONDS", "120"))
             ),
-            base_url=base_url or env.get("AI_FACTORY_OPENAI_BASE_URL") or cls.base_url,
+            base_url=base_url or env.get("AI_FACTORY_OPENAI_BASE_URL") or cls.DEFAULT_BASE_URL,
             organization=organization or env.get("OPENAI_ORGANIZATION"),
             project=project or env.get("OPENAI_PROJECT"),
         )

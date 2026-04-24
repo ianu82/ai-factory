@@ -59,6 +59,7 @@ def test_openai_config_reads_defaults_from_environment(monkeypatch) -> None:
     assert config.model == "gpt-5.4"
     assert config.reasoning_effort == "medium"
     assert config.max_output_tokens == 4000
+    assert config.base_url == "https://api.openai.com/v1/responses"
 
 
 def test_openai_connector_parses_structured_output() -> None:
