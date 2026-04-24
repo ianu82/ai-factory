@@ -564,40 +564,41 @@ class GitHubCLIRepoConnector:
     ) -> PullRequestEvidence:
         self._assert_available()
         self._assert_clean_worktree()
-        branch_name = self._branch_name(work_item_id, spec_packet)
+        original_branch = self._current_branch()
+        branch_name = self._available_branch_name(work_item_id, spec_packet)
         title = pr_packet["pull_request"]["title"]
         body = self._pr_body(work_item_id, spec_packet, ticket_bundle, pr_packet)
 
-        self._git(["switch", self.base_branch])
-        self._git(["pull", "--ff-only", "origin", self.base_branch])
-        if self._git_stdout(["branch", "--list", branch_name]).strip():
-            raise FactoryConnectorError(
-                f"Branch '{branch_name}' already exists locally; refusing to reuse it."
+        try:
+            self._git(["switch", self.base_branch])
+            self._git(["pull", "--ff-only", "origin", self.base_branch])
+            self._git(["switch", "-c", branch_name])
+            evidence_file = self._write_vertical_slice_doc(
+                work_item_id,
+                spec_packet,
+                ticket_bundle,
+                pr_packet,
             )
-        self._git(["switch", "-c", branch_name])
-        evidence_file = self._write_vertical_slice_doc(
-            work_item_id,
-            spec_packet,
-            ticket_bundle,
-            pr_packet,
-        )
-        self._git(["add", str(evidence_file.relative_to(self.repo_root))])
-        self._git(["commit", "-m", f"Add vertical slice evidence for {work_item_id}"])
-        commit_sha = self._git_stdout(["rev-parse", "HEAD"]).strip()
-        self._git(["push", "-u", "origin", branch_name])
-        pr_url = self._create_github_pr(branch_name, title, body)
-        number_match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr_url)
-        if number_match is None:
-            raise FactoryConnectorError(f"Could not parse PR number from GitHub URL: {pr_url}")
-        return PullRequestEvidence(
-            repository=self.repository,
-            branch_name=branch_name,
-            base_branch=self.base_branch,
-            commit_sha=commit_sha,
-            number=int(number_match.group(1)),
-            url=pr_url,
-            title=title,
-        )
+            self._git(["add", str(evidence_file.relative_to(self.repo_root))])
+            self._git(["commit", "-m", f"Add vertical slice evidence for {work_item_id}"])
+            commit_sha = self._git_stdout(["rev-parse", "HEAD"]).strip()
+            self._git(["push", "-u", "origin", branch_name])
+            pr_url = self._create_github_pr(branch_name, title, body)
+            number_match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr_url)
+            if number_match is None:
+                raise FactoryConnectorError(f"Could not parse PR number from GitHub URL: {pr_url}")
+            return PullRequestEvidence(
+                repository=self.repository,
+                branch_name=branch_name,
+                base_branch=self.base_branch,
+                commit_sha=commit_sha,
+                number=int(number_match.group(1)),
+                url=pr_url,
+                title=title,
+            )
+        finally:
+            if original_branch and original_branch != self._current_branch():
+                self._git(["switch", original_branch])
 
     def read_pull_request_status(
         self,
@@ -750,6 +751,24 @@ class GitHubCLIRepoConnector:
         slug = slugify(title)[:34].strip("-") or "anthropic-change"
         suffix = re.sub(r"[^a-zA-Z0-9]", "", work_item_id)[-10:] or "slice"
         return f"factory/vertical-slice-{slug}-{suffix}".lower()
+
+    def _available_branch_name(self, work_item_id: str, spec_packet: dict[str, Any]) -> str:
+        base_name = self._branch_name(work_item_id, spec_packet)
+        candidate = base_name
+        counter = 2
+        while self._branch_exists_locally(candidate) or self._branch_exists_on_origin(candidate):
+            candidate = f"{base_name}-{counter}"
+            counter += 1
+        return candidate
+
+    def _current_branch(self) -> str:
+        return self._git_stdout(["branch", "--show-current"]).strip()
+
+    def _branch_exists_locally(self, branch_name: str) -> bool:
+        return bool(self._git_stdout(["branch", "--list", branch_name]).strip())
+
+    def _branch_exists_on_origin(self, branch_name: str) -> bool:
+        return bool(self._git_stdout(["ls-remote", "--heads", "origin", branch_name]).strip())
 
     def _git(self, args: list[str]) -> None:
         self._run([self.git_bin, *args], cwd=self.repo_root)

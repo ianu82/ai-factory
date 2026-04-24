@@ -8,6 +8,7 @@ from auto_mindsdb_factory.connectors import (
     AgentTask,
     FactoryConnectorError,
     FileBackedOpsConnector,
+    GitHubCLIRepoConnector,
     OpenAIResponsesAgentConfig,
     OpenAIResponsesAgentConnector,
 )
@@ -159,3 +160,28 @@ def test_openai_connector_requires_api_key() -> None:
         OpenAIResponsesAgentConnector(
             OpenAIResponsesAgentConfig(api_key=None),
         )
+
+
+def test_github_connector_picks_next_available_branch_name(tmp_path) -> None:
+    connector = GitHubCLIRepoConnector(tmp_path, repository="ianu82/ai-factory")
+    spec_packet = {
+        "source": {
+            "title": "Support response format tool mode for tool results",
+        }
+    }
+    existing_local = {
+        "factory/vertical-slice-support-response-format-tool-mode-2625307862",
+    }
+    existing_remote = {
+        "factory/vertical-slice-support-response-format-tool-mode-2625307862-2",
+    }
+
+    connector._branch_exists_locally = lambda name: name in existing_local  # type: ignore[method-assign]
+    connector._branch_exists_on_origin = lambda name: name in existing_remote  # type: ignore[method-assign]
+
+    branch_name = connector._available_branch_name(
+        "wi-anthropic-2026-04-20-support-response-format-tool-mode-2625307862",
+        spec_packet,
+    )
+
+    assert branch_name == "factory/vertical-slice-support-response-format-tool-mode-2625307862-3"
