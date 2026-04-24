@@ -1,0 +1,15 @@
+{
+  "work_item_id": "wi-anthropic-2026-04-20-april-20-2026-25307862",
+  "source_provider": "anthropic",
+  "source_external_id": "anthropic-2026-04-20-april-20-2026-25307862",
+  "title": "Support response format tool mode for tool results",
+  "state": "PRODUCTION_MONITORING",
+  "risk_score": 35,
+  "execution_lane": "guarded",
+  "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+  "current_artifact_id": "monitoring-report-attempt-1-prv-5-spec-anthropic-2026-04-20-april-20-202",
+  "attempt_count": 1,
+  "dead_letter_reason": null,
+  "created_at": "2026-04-22T12:00:00Z",
+  "updated_at": "2026-04-22T21:00:08Z"
+}

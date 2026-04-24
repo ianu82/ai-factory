@@ -1,0 +1,79 @@
+{
+  "artifact": {
+    "id": "spec-watch-001",
+    "version": 1,
+    "source_stage": "spec_drafting",
+    "next_stage": "policy_assignment",
+    "status": "ready",
+    "risk_tier": "medium",
+    "owner_agent": "Clarifier",
+    "rollback_class": "none",
+    "created_at": "2026-04-22T12:10:00Z",
+    "updated_at": "2026-04-22T12:40:00Z"
+  },
+  "source": {
+    "provider": "anthropic",
+    "kind": "changelog",
+    "external_id": "feature-2026-04-watchlist",
+    "title": "Speculative multi-repo assistant orchestration",
+    "url": "https://example.com/anthropic/changelog/feature-2026-04-watchlist",
+    "detected_at": "2026-04-22T12:00:00Z"
+  },
+  "summary": {
+    "problem": "The changelog item mentions a broad capability, but the implementation path is unclear and spans multiple systems.",
+    "proposed_capability": "Investigate whether the feature could reduce orchestration complexity later in the roadmap.",
+    "why_now": "We want early awareness without forcing work into the active queue.",
+    "affected_surfaces": [
+      "control_plane",
+      "multi_repo_orchestration"
+    ],
+    "assumptions": [
+      "No immediate product milestone depends on this feature."
+    ],
+    "non_goals": [
+      "Do not start implementation yet."
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "id": "ac-watch-001",
+      "description": "Document the capability and track it for later review.",
+      "verification_method": "manual",
+      "required": true
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "q-watch-001",
+      "question": "Would this require cross-repo orchestration support?",
+      "blocking": false,
+      "resolution_status": "non_blocking",
+      "resolution_notes": "Likely yes, which keeps it out of the MVP lane for now."
+    }
+  ],
+  "risk_profile": {
+    "risk_score": 35,
+    "data_classification": "internal",
+    "blast_radius": "multi_service",
+    "rollback_class": "none",
+    "factors": [
+      {
+        "name": "external_api_contract_change",
+        "score": 15,
+        "notes": "The feature would likely touch multiple contracts if adopted."
+      },
+      {
+        "name": "model_behavior_change",
+        "score": 20,
+        "notes": "It would alter orchestration behavior if we decide to pursue it."
+      }
+    ]
+  },
+  "relevance": {
+    "decision": "watchlist",
+    "rationale": "The feature is interesting but too broad for the current MVP execution lane.",
+    "confidence": 0.73,
+    "expected_roi": "medium",
+    "enqueue": false
+  }
+}

@@ -1,0 +1,393 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/pr-packet.schema.json",
+  "title": "PR Packet",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "ticket_ids",
+    "eval_manifest_id",
+    "branch_name",
+    "pull_request",
+    "summary",
+    "changed_paths",
+    "reviewer_report",
+    "merge_readiness"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ticket_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "eval_manifest_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pull_request": {
+      "type": "object",
+      "required": [
+        "repository",
+        "title"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "number": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "what_changed",
+        "key_risks",
+        "rollback_notes"
+      ],
+      "properties": {
+        "what_changed": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "key_risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "migrations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rollback_notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "changed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "passed",
+              "failed"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "reviewer_report": {
+      "type": "object",
+      "required": [
+        "approved",
+        "blocking_findings",
+        "non_blocking_findings"
+      ],
+      "properties": {
+        "approved": {
+          "type": "boolean"
+        },
+        "blocking_findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "non_blocking_findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "merge_execution": {
+      "type": "object",
+      "required": [
+        "target_branch",
+        "method",
+        "status",
+        "merge_commit_sha",
+        "merged_at",
+        "merged_by"
+      ],
+      "properties": {
+        "target_branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "method": {
+          "$ref": "common.schema.json#/$defs/mergeMethod"
+        },
+        "status": {
+          "$ref": "common.schema.json#/$defs/mergeExecutionStatus"
+        },
+        "merge_commit_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "merged_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "merged_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "merge_readiness": {
+      "type": "object",
+      "required": [
+        "reviewable",
+        "mergeable",
+        "blockers"
+      ],
+      "properties": {
+        "reviewable": {
+          "type": "boolean"
+        },
+        "mergeable": {
+          "type": "boolean"
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "merge_readiness": {
+            "properties": {
+              "mergeable": {
+                "const": true
+              }
+            },
+            "required": [
+              "mergeable"
+            ]
+          }
+        },
+        "required": [
+          "merge_readiness"
+        ]
+      },
+      "then": {
+        "properties": {
+          "merge_readiness": {
+            "properties": {
+              "reviewable": {
+                "const": true
+              }
+            },
+            "required": [
+              "reviewable"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reviewer_report": {
+            "properties": {
+              "approved": {
+                "const": false
+              }
+            },
+            "required": [
+              "approved"
+            ]
+          }
+        },
+        "required": [
+          "reviewer_report"
+        ]
+      },
+      "then": {
+        "properties": {
+          "merge_readiness": {
+            "properties": {
+              "mergeable": {
+                "const": false
+              }
+            },
+            "required": [
+              "mergeable"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reviewer_report": {
+            "properties": {
+              "blocking_findings": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "blocking_findings"
+            ]
+          }
+        },
+        "required": [
+          "reviewer_report"
+        ]
+      },
+      "then": {
+        "properties": {
+          "merge_readiness": {
+            "properties": {
+              "reviewable": {
+                "const": false
+              },
+              "mergeable": {
+                "const": false
+              }
+            },
+            "required": [
+              "reviewable",
+              "mergeable"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "merge_execution": {
+            "properties": {
+              "status": {
+                "const": "merged"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "merge_execution"
+        ]
+      },
+      "then": {
+        "properties": {
+          "merge_execution": {
+            "properties": {
+              "merge_commit_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{7,40}$"
+              },
+              "merged_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "merged_by": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "merge_commit_sha",
+              "merged_at",
+              "merged_by"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

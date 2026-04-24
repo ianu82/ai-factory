@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "auto-mindsdb-factory"
+version = "0.1.0"
+description = "Agent-first software factory runtime and contract validation."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "jsonschema>=4.23.0",
+  "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[project.scripts]
+auto-mindsdb-factory = "auto_mindsdb_factory.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/auto_mindsdb_factory"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
+

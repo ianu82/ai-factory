@@ -1,0 +1,210 @@
+{
+  "artifact": {
+    "id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+    "version": 1,
+    "source_stage": "security_review",
+    "next_stage": "release_staging",
+    "status": "approved",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Security Sentinel",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "security_sentinel.v1",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "blocking_issues": [],
+    "created_at": "2026-04-22T15:54:53Z",
+    "updated_at": "2026-04-22T15:54:53Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "ticket_bundle_id": "ticket-bundle-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "prompt_contract_id": "prompt-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "tool_schema_id": "tool-schema-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "golden_dataset_id": "golden-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "evaluated_pr_artifact_version": 2,
+  "resulting_pr_artifact_version": 3,
+  "threat_model": {
+    "domains": [
+      {
+        "name": "auth_and_authorization",
+        "severity": "low",
+        "status": "mitigated",
+        "findings": [
+          "No auth or permission boundary changes were detected."
+        ],
+        "mitigations": [
+          "No additional auth mitigation is required for this change."
+        ]
+      },
+      {
+        "name": "secrets_handling",
+        "severity": "low",
+        "status": "mitigated",
+        "findings": [
+          "No elevated secret or write scopes were introduced."
+        ],
+        "mitigations": [
+          "Keep tool permissions read-only and fail closed on implicit access."
+        ]
+      },
+      {
+        "name": "stored_user_data",
+        "severity": "low",
+        "status": "mitigated",
+        "findings": [
+          "No sensitive storage or regulated data handling changes were detected."
+        ],
+        "mitigations": [
+          "No additional stored-data mitigation is required."
+        ]
+      },
+      {
+        "name": "prompt_injection",
+        "severity": "medium",
+        "status": "mitigated",
+        "findings": [
+          "Prompt-injection controls are present in guardrails, validation, and failure cases."
+        ],
+        "mitigations": [
+          "Reject or strip hostile content before it reaches control instructions."
+        ]
+      },
+      {
+        "name": "context_exfiltration",
+        "severity": "high",
+        "status": "watch",
+        "findings": [
+          "Context assembly keeps validation and permission guardrails in place."
+        ],
+        "mitigations": [
+          "Keep prompt-injection and schema validation checks enabled on all model outputs."
+        ]
+      },
+      {
+        "name": "jailbreak_resistance",
+        "severity": "medium",
+        "status": "mitigated",
+        "findings": [
+          "Golden failure cases cover jailbreak-style and hostile instruction attempts."
+        ],
+        "mitigations": [
+          "Preserve adversarial probes alongside the golden dataset."
+        ]
+      },
+      {
+        "name": "unsafe_tool_invocation",
+        "severity": "medium",
+        "status": "mitigated",
+        "findings": [
+          "Tool invocation is constrained to explicit least-privilege permissions."
+        ],
+        "mitigations": [
+          "Constrain the model to explicit tool IDs with least-privilege permissions."
+        ]
+      }
+    ],
+    "blast_radius": "multi_service",
+    "rollback_class": "reversible_deploy",
+    "rollback_notes": "Disable rollout traffic, revert the deploy, and preserve compatibility fallbacks."
+  },
+  "abuse_cases": [
+    {
+      "id": "failure-spec-anthropic-2026-04-20-april-20-2026-25307862-bad-too",
+      "title": "Tool emits a payload that violates the declared output schema.",
+      "severity": "medium",
+      "expected_control": "Integration layer rejects the payload and returns a safe contract error or retry."
+    },
+    {
+      "id": "failure-spec-anthropic-2026-04-20-april-20-2026-25307862-contrac",
+      "title": "Caller sends a response format or envelope that is no longer supported.",
+      "severity": "medium",
+      "expected_control": "The request fails deterministically instead of silently coercing to a new shape."
+    },
+    {
+      "id": "failure-spec-anthropic-2026-04-20-april-20-2026-25307862-prompt",
+      "title": "Tool or user content attempts prompt injection.",
+      "severity": "high",
+      "expected_control": "Injected content is blocked from control instructions and the response fails closed."
+    },
+    {
+      "id": "failure-spec-anthropic-2026-04-20-april-20-2026-25307862-degrade",
+      "title": "Primary model returns degraded or empty output.",
+      "severity": "medium",
+      "expected_control": "Retry policy or fallback path triggers before any customer-visible malformed output is returned."
+    }
+  ],
+  "security_checks": [
+    {
+      "id": "sec-least-privilege",
+      "name": "Least privilege tool validation",
+      "status": "passed",
+      "severity": "high",
+      "summary": "Tool invocation is constrained to explicit least-privilege permissions."
+    },
+    {
+      "id": "sec-prompt-injection",
+      "name": "Prompt injection coverage",
+      "status": "passed",
+      "severity": "high",
+      "summary": "Prompt-injection controls are present in guardrails, validation, and abuse cases."
+    },
+    {
+      "id": "sec-context-exfiltration",
+      "name": "Context exfiltration controls",
+      "status": "passed",
+      "severity": "medium",
+      "summary": "Context assembly and rollback documentation remain bounded."
+    },
+    {
+      "id": "sec-rollback-blast-radius",
+      "name": "Rollback and blast-radius documentation",
+      "status": "passed",
+      "severity": "medium",
+      "summary": "Blast radius and rollback notes are documented."
+    },
+    {
+      "id": "sec-signoff-gate",
+      "name": "Security sign-off gate",
+      "status": "passed",
+      "severity": "high",
+      "summary": "No additional human security sign-off is required."
+    }
+  ],
+  "least_privilege_validation": {
+    "status": "passed",
+    "allowed_tool_ids": [
+      "response-format-adapter",
+      "tool-result-normalizer"
+    ],
+    "findings": [
+      "Tool invocation is constrained to explicit least-privilege permissions."
+    ]
+  },
+  "signoff": {
+    "status": "approved",
+    "mode": "auto",
+    "approvals_granted": [],
+    "pending_approvals": [],
+    "downstream_approvals": [],
+    "rationale": "Security controls passed without requiring explicit human intervention."
+  },
+  "summary": {
+    "blocking_findings": [],
+    "watch_findings": [
+      "Context assembly keeps validation and permission guardrails in place."
+    ],
+    "passed_check_ids": [
+      "sec-least-privilege",
+      "sec-prompt-injection",
+      "sec-context-exfiltration",
+      "sec-rollback-blast-radius",
+      "sec-signoff-gate"
+    ],
+    "failed_check_ids": [],
+    "needs_human_review_check_ids": []
+  }
+}

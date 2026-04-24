@@ -1,0 +1,130 @@
+{
+  "artifact": {
+    "id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+    "version": 2,
+    "source_stage": "build",
+    "next_stage": "security_review",
+    "status": "approved",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Eval Gatekeeper",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "eval_runner.v1",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "created_at": "2026-04-22T15:54:53Z",
+    "updated_at": "2026-04-22T15:54:53Z",
+    "blocking_issues": []
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "ticket_ids": [
+    "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-cont",
+    "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-inte"
+  ],
+  "eval_manifest_id": "eval-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "branch_name": "factory/support-response-format-tool-mode-for-tool-resul",
+  "pull_request": {
+    "repository": "mindsdb/platform",
+    "number": null,
+    "url": null,
+    "title": "Implement Support response format tool mode for tool results"
+  },
+  "summary": {
+    "what_changed": [
+      "Implement Support response format tool mode for tool results: contract compatibility with scope anchored on Update request and response contracts with compatibility-safe fallbacks",
+      "Implement Support response format tool mode for tool results: runtime integration wiring with scope anchored on Wire tool/runtime integration, schema handling, and retry-safe execution behavior"
+    ],
+    "key_risks": [
+      "Legacy callers should receive a deterministic contract error for unsupported request shapes.",
+      "Tool/schema mismatches must fail closed instead of running with partial permissions."
+    ],
+    "migrations": [],
+    "rollback_notes": "Disable rollout traffic, revert the deploy, and preserve compatibility fallbacks."
+  },
+  "changed_paths": [
+    "integrations/anthropic/contracts.py",
+    "tests/contracts/test_anthropic_contracts.py",
+    "integrations/anthropic/tool_runtime.py",
+    "tests/integration/test_anthropic_tool_runtime.py"
+  ],
+  "checks": [
+    {
+      "name": "Lint",
+      "status": "passed"
+    },
+    {
+      "name": "Typecheck",
+      "status": "passed"
+    },
+    {
+      "name": "Unit tests",
+      "status": "passed"
+    },
+    {
+      "name": "Contract validation",
+      "status": "passed"
+    },
+    {
+      "name": "Integration tests",
+      "status": "passed"
+    },
+    {
+      "name": "Migration safety checks",
+      "status": "passed"
+    },
+    {
+      "name": "Targeted regression suite",
+      "status": "passed"
+    },
+    {
+      "name": "Latency benchmark",
+      "status": "passed"
+    },
+    {
+      "name": "Cost benchmark",
+      "status": "passed"
+    },
+    {
+      "name": "Adversarial prompt suite",
+      "status": "pending"
+    },
+    {
+      "name": "Long-running integration suite",
+      "status": "pending"
+    },
+    {
+      "name": "Full golden-dataset quality suite",
+      "status": "pending"
+    },
+    {
+      "name": "Canary error-rate check",
+      "status": "pending"
+    },
+    {
+      "name": "Canary latency check",
+      "status": "pending"
+    },
+    {
+      "name": "Canary cost check",
+      "status": "pending"
+    },
+    {
+      "name": "Rollback probe",
+      "status": "pending"
+    }
+  ],
+  "reviewer_report": {
+    "approved": true,
+    "blocking_findings": [],
+    "non_blocking_findings": [
+      "Carry open question: Do any existing Anthropic wrappers need compatibility shims before this change can ship?",
+      "Deferred eval tiers after merge: nightly, post_deploy."
+    ]
+  },
+  "merge_readiness": {
+    "reviewable": true,
+    "mergeable": true,
+    "blockers": []
+  }
+}

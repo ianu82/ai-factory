@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/spec-packet.schema.json",
+  "title": "Spec Packet",
+  "type": "object",
+  "required": [
+    "artifact",
+    "source",
+    "summary",
+    "acceptance_criteria",
+    "open_questions",
+    "risk_profile",
+    "relevance"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataRiskAware"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "provider",
+        "kind",
+        "external_id",
+        "title",
+        "url",
+        "detected_at"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "changelog",
+            "blog_post",
+            "release_note",
+            "manual_intake"
+          ]
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "detected_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "problem",
+        "proposed_capability",
+        "why_now",
+        "affected_surfaces",
+        "assumptions",
+        "non_goals"
+      ],
+      "properties": {
+        "problem": {
+          "type": "string",
+          "minLength": 1
+        },
+        "proposed_capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why_now": {
+          "type": "string",
+          "minLength": 1
+        },
+        "affected_surfaces": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "non_goals": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/acceptanceCriterion"
+      },
+      "minItems": 1
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/openQuestion"
+      }
+    },
+    "risk_profile": {
+      "type": "object",
+      "required": [
+        "risk_score",
+        "data_classification",
+        "blast_radius",
+        "rollback_class",
+        "factors"
+      ],
+      "properties": {
+        "risk_score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "data_classification": {
+          "type": "string",
+          "enum": [
+            "public",
+            "internal",
+            "customer_confidential",
+            "regulated"
+          ]
+        },
+        "blast_radius": {
+          "type": "string",
+          "enum": [
+            "single_service",
+            "multi_service",
+            "customer_facing",
+            "company_wide"
+          ]
+        },
+        "rollback_class": {
+          "$ref": "common.schema.json#/$defs/rollbackClass"
+        },
+        "factors": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/riskFactor"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "relevance": {
+      "type": "object",
+      "required": [
+        "decision",
+        "rationale",
+        "confidence",
+        "expected_roi",
+        "enqueue"
+      ],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": [
+            "ignore",
+            "watchlist",
+            "backlog_candidate",
+            "active_build_candidate"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "expected_roi": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "enqueue": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "relevance": {
+            "properties": {
+              "enqueue": {
+                "const": true
+              }
+            },
+            "required": [
+              "enqueue"
+            ]
+          }
+        },
+        "required": [
+          "relevance"
+        ]
+      },
+      "then": {
+        "properties": {
+          "relevance": {
+            "properties": {
+              "decision": {
+                "const": "active_build_candidate"
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "relevance": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "ignore",
+                  "watchlist",
+                  "backlog_candidate"
+                ]
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          }
+        },
+        "required": [
+          "relevance"
+        ]
+      },
+      "then": {
+        "properties": {
+          "relevance": {
+            "properties": {
+              "enqueue": {
+                "const": false
+              }
+            },
+            "required": [
+              "enqueue"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/latency-baseline.schema.json",
+  "title": "Latency Baseline Artifact",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "prompt_contract_id",
+    "pr_packet_id",
+    "reference_check_ids",
+    "baseline",
+    "thresholds",
+    "sampling_plan"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt_contract_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pr_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reference_check_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "baseline": {
+      "type": "object",
+      "required": [
+        "expected_p50_latency_ms",
+        "expected_p95_latency_ms",
+        "expected_input_tokens",
+        "expected_output_tokens",
+        "expected_cost_per_call_usd",
+        "expected_quality_score"
+      ],
+      "properties": {
+        "expected_p50_latency_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expected_p95_latency_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expected_input_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expected_output_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expected_cost_per_call_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "expected_quality_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "thresholds": {
+      "type": "object",
+      "required": [
+        "max_latency_regression_pct",
+        "max_cost_regression_pct",
+        "max_quality_score_delta"
+      ],
+      "properties": {
+        "max_latency_regression_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_cost_regression_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_quality_score_delta": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "sampling_plan": {
+      "type": "object",
+      "required": [
+        "sample_size",
+        "environment",
+        "notes"
+      ],
+      "properties": {
+        "sample_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "environment": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

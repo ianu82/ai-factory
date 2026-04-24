@@ -1,0 +1,239 @@
+{
+  "artifact": {
+    "id": "eval-spec-anthropic-2026-04-20-april-20-2026-25307862",
+    "version": 1,
+    "source_stage": "eval_generation",
+    "next_stage": "build",
+    "status": "ready",
+    "risk_tier": "medium",
+    "execution_lane": "restricted",
+    "owner_agent": "Eval Engineer",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "budget_class": "large",
+    "rollback_class": "manual_recovery_required",
+    "approval_requirements": [
+      "security",
+      "merge",
+      "release"
+    ],
+    "created_at": "2026-04-22T15:55:28Z",
+    "updated_at": "2026-04-22T15:55:28Z"
+  },
+  "target_type": "ticket_bundle",
+  "target_id": "ticket-bundle-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "tiers": [
+    {
+      "name": "pr_smoke",
+      "checks": [
+        {
+          "id": "check-pr-smoke-lint-ticket-bundle-spec-anthropic-2026-04-20-apri",
+          "name": "Lint",
+          "kind": "lint",
+          "required": true,
+          "timeout_minutes": 5,
+          "pass_condition": "lint exits 0"
+        },
+        {
+          "id": "check-pr-smoke-typecheck-ticket-bundle-spec-anthropic-2026-04-20",
+          "name": "Typecheck",
+          "kind": "typecheck",
+          "required": true,
+          "timeout_minutes": 10,
+          "pass_condition": "type checks exit 0"
+        },
+        {
+          "id": "check-pr-smoke-unit-ticket-bundle-spec-anthropic-2026-04-20-apri",
+          "name": "Unit tests",
+          "kind": "unit",
+          "required": true,
+          "timeout_minutes": 15,
+          "pass_condition": "ticket-scoped unit tests pass"
+        },
+        {
+          "id": "check-pr-smoke-contract-ticket-bundle-spec-anthropic-2026-04-20",
+          "name": "Contract validation",
+          "kind": "contract",
+          "required": true,
+          "timeout_minutes": 10,
+          "pass_condition": "contract validation exits 0"
+        },
+        {
+          "id": "check-pr-smoke-focused-llm-golden-set-ticket-bundle-spec-anthrop",
+          "name": "Focused golden-set quality check",
+          "kind": "llm_quality",
+          "required": false,
+          "timeout_minutes": 15,
+          "pass_condition": "quality score delta remains at or below 0.25 when the optional suite is run",
+          "waivable": true,
+          "baseline_ref": "baseline-pr-smoke-focused-llm-golden-set-ticket-bundle-spec-anthropic-20"
+        }
+      ]
+    },
+    {
+      "name": "pre_merge",
+      "checks": [
+        {
+          "id": "check-pre-merge-integration-ticket-bundle-spec-anthropic-2026-04",
+          "name": "Integration tests",
+          "kind": "integration",
+          "required": true,
+          "timeout_minutes": 30,
+          "pass_condition": "ticket-scoped integration checks pass"
+        },
+        {
+          "id": "check-pre-merge-migration-safety-ticket-bundle-spec-anthropic-20",
+          "name": "Migration safety checks",
+          "kind": "migration_safety",
+          "required": true,
+          "timeout_minutes": 20,
+          "pass_condition": "rollback and migration safety checks pass"
+        },
+        {
+          "id": "check-pre-merge-targeted-regression-ticket-bundle-spec-anthropic",
+          "name": "Targeted regression suite",
+          "kind": "llm_quality",
+          "required": true,
+          "timeout_minutes": 20,
+          "pass_condition": "quality score delta remains at or below 0.15",
+          "baseline_ref": "baseline-pre-merge-targeted-regression-ticket-bundle-spec-anthropic-2026"
+        },
+        {
+          "id": "check-pre-merge-latency-benchmark-ticket-bundle-spec-anthropic-2",
+          "name": "Latency benchmark",
+          "kind": "latency",
+          "required": true,
+          "timeout_minutes": 15,
+          "pass_condition": "latency regression remains under 15 percent",
+          "baseline_ref": "baseline-pre-merge-latency-benchmark-ticket-bundle-spec-anthropic-2026-0"
+        },
+        {
+          "id": "check-pre-merge-cost-benchmark-ticket-bundle-spec-anthropic-2026",
+          "name": "Cost benchmark",
+          "kind": "cost",
+          "required": true,
+          "timeout_minutes": 15,
+          "pass_condition": "cost regression remains under 10 percent",
+          "baseline_ref": "baseline-pre-merge-cost-benchmark-ticket-bundle-spec-anthropic-2026-04-2"
+        },
+        {
+          "id": "check-pre-merge-broader-llm-regression-ticket-bundle-spec-anthro",
+          "name": "Broader LLM regression suite",
+          "kind": "llm_quality",
+          "required": false,
+          "timeout_minutes": 30,
+          "pass_condition": "quality score delta remains at or below 0.15 when the optional suite is run",
+          "waivable": true,
+          "baseline_ref": "baseline-pre-merge-broader-llm-regression-ticket-bundle-spec-anthropic-2"
+        }
+      ]
+    },
+    {
+      "name": "nightly",
+      "checks": [
+        {
+          "id": "check-nightly-adversarial-prompt-suite-ticket-bundle-spec-anthro",
+          "name": "Adversarial prompt suite",
+          "kind": "adversarial",
+          "required": true,
+          "timeout_minutes": 40,
+          "pass_condition": "adversarial failure count remains at 0"
+        },
+        {
+          "id": "check-nightly-long-running-integration-ticket-bundle-spec-anthro",
+          "name": "Long-running integration suite",
+          "kind": "integration",
+          "required": true,
+          "timeout_minutes": 60,
+          "pass_condition": "ticket-scoped integration checks pass"
+        },
+        {
+          "id": "check-nightly-full-golden-dataset-ticket-bundle-spec-anthropic-2",
+          "name": "Full golden-dataset quality suite",
+          "kind": "llm_quality",
+          "required": true,
+          "timeout_minutes": 45,
+          "pass_condition": "quality score delta remains at or below 0.1",
+          "baseline_ref": "baseline-nightly-full-golden-dataset-ticket-bundle-spec-anthropic-2026-0"
+        },
+        {
+          "id": "check-nightly-cross-model-comparison-ticket-bundle-spec-anthropi",
+          "name": "Cross-model comparison suite",
+          "kind": "llm_quality",
+          "required": false,
+          "timeout_minutes": 45,
+          "pass_condition": "quality score delta remains at or below 0.1 when the optional suite is run",
+          "waivable": true,
+          "baseline_ref": "baseline-nightly-cross-model-comparison-ticket-bundle-spec-anthropic-202"
+        },
+        {
+          "id": "check-nightly-synthetic-shadow-replay-ticket-bundle-spec-anthrop",
+          "name": "Synthetic shadow replay",
+          "kind": "integration",
+          "required": false,
+          "timeout_minutes": 60,
+          "pass_condition": "ticket-scoped integration checks pass",
+          "waivable": true
+        }
+      ]
+    },
+    {
+      "name": "post_deploy",
+      "checks": [
+        {
+          "id": "check-post-deploy-canary-error-rate-ticket-bundle-spec-anthropic",
+          "name": "Canary error-rate check",
+          "kind": "integration",
+          "required": true,
+          "timeout_minutes": 20,
+          "pass_condition": "canary traffic shows 0 critical failures and stays within the configured error budget"
+        },
+        {
+          "id": "check-post-deploy-canary-latency-ticket-bundle-spec-anthropic-20",
+          "name": "Canary latency check",
+          "kind": "latency",
+          "required": true,
+          "timeout_minutes": 20,
+          "pass_condition": "latency regression remains under 10 percent",
+          "baseline_ref": "baseline-post-deploy-canary-latency-ticket-bundle-spec-anthropic-2026-04"
+        },
+        {
+          "id": "check-post-deploy-canary-cost-ticket-bundle-spec-anthropic-2026",
+          "name": "Canary cost check",
+          "kind": "cost",
+          "required": true,
+          "timeout_minutes": 20,
+          "pass_condition": "cost regression remains under 10 percent",
+          "baseline_ref": "baseline-post-deploy-canary-cost-ticket-bundle-spec-anthropic-2026-04-20"
+        },
+        {
+          "id": "check-post-deploy-rollback-probe-ticket-bundle-spec-anthropic-20",
+          "name": "Rollback probe",
+          "kind": "migration_safety",
+          "required": true,
+          "timeout_minutes": 15,
+          "pass_condition": "rollback and migration safety checks pass"
+        },
+        {
+          "id": "check-post-deploy-business-kpi-proxy-ticket-bundle-spec-anthropi",
+          "name": "Business KPI proxy check",
+          "kind": "llm_quality",
+          "required": false,
+          "timeout_minutes": 30,
+          "pass_condition": "quality score delta remains at or below 0.1 when the optional suite is run",
+          "waivable": true,
+          "baseline_ref": "baseline-post-deploy-business-kpi-proxy-ticket-bundle-spec-anthropic-202"
+        },
+        {
+          "id": "check-post-deploy-live-quality-sampling-ticket-bundle-spec-anthr",
+          "name": "Live quality sampling",
+          "kind": "llm_quality",
+          "required": false,
+          "timeout_minutes": 30,
+          "pass_condition": "quality score delta remains at or below 0.1 when the optional suite is run",
+          "waivable": true,
+          "baseline_ref": "baseline-post-deploy-live-quality-sampling-ticket-bundle-spec-anthropic"
+        }
+      ]
+    }
+  ]
+}

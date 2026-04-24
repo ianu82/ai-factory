@@ -1,0 +1,810 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from auto_mindsdb_factory.automation import (
+    AutomationState,
+    FactoryAutomationCoordinator,
+    Stage1AutomationCycleResult,
+)
+from auto_mindsdb_factory.__main__ import _load_work_item, main
+from auto_mindsdb_factory.controller import FactoryController
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _history_document(work_item) -> list[dict[str, str | None]]:
+    return [
+        {
+            "event": record.event,
+            "from_state": record.from_state,
+            "to_state": record.to_state,
+            "artifact_id": record.artifact_id,
+            "occurred_at": record.occurred_at,
+        }
+        for record in work_item.history
+    ]
+
+
+def load_stage8_result_document(root: Path, scenario_name: str) -> dict:
+    scenario = root / "fixtures" / "scenarios" / scenario_name
+    replayed = FactoryController().replay_scenario(scenario)
+    return {
+        "spec_packet": _load_json(scenario / "spec-packet.json"),
+        "policy_decision": _load_json(scenario / "policy-decision.json"),
+        "ticket_bundle": _load_json(scenario / "ticket-bundle.json"),
+        "eval_manifest": _load_json(scenario / "eval-manifest.json"),
+        "pr_packet": _load_json(scenario / "pr-packet.json"),
+        "prompt_contract": _load_json(scenario / "prompt-contract.json"),
+        "tool_schema": _load_json(scenario / "tool-schema.json"),
+        "golden_dataset": _load_json(scenario / "golden-dataset.json"),
+        "latency_baseline": _load_json(scenario / "latency-baseline.json"),
+        "eval_report": _load_json(scenario / "eval-report.json"),
+        "security_review": _load_json(scenario / "security-review.json"),
+        "promotion_decision": _load_json(scenario / "promotion-decision.json"),
+        "monitoring_report": _load_json(scenario / "monitoring-report.json"),
+        "work_item": replayed.to_document(),
+        "history": _history_document(replayed),
+    }
+
+
+def test_stage2_cli_reports_invalid_json(capsys, tmp_path) -> None:
+    invalid_stage1 = tmp_path / "stage1-invalid.json"
+    invalid_stage1.write_text('{"spec_packet": ', encoding="utf-8")
+
+    exit_code = main(
+        [
+            "stage2-ticketing",
+            "--stage1-result-file",
+            str(invalid_stage1),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 2 ticketing failed:" in captured.err
+    assert "not valid JSON" in captured.err
+
+
+def test_stage3_cli_reports_missing_stage2_fields(capsys, tmp_path) -> None:
+    incomplete_stage2 = tmp_path / "stage2-incomplete.json"
+    incomplete_stage2.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage3-build-review",
+            "--stage2-result-file",
+            str(incomplete_stage2),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 3 build/review failed:" in captured.err
+    assert "missing the required object field 'eval_manifest'" in captured.err
+
+
+def test_stage4_cli_reports_missing_stage3_fields(capsys, tmp_path) -> None:
+    incomplete_stage3 = tmp_path / "stage3-incomplete.json"
+    incomplete_stage3.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage4-integration",
+            "--stage3-result-file",
+            str(incomplete_stage3),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 4 integration failed:" in captured.err
+    assert "missing the required object field 'pr_packet'" in captured.err
+
+
+def test_stage5_cli_reports_missing_stage4_fields(capsys, tmp_path) -> None:
+    incomplete_stage4 = tmp_path / "stage4-incomplete.json"
+    incomplete_stage4.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "pr_packet": {},
+                "tool_schema": {},
+                "golden_dataset": {},
+                "latency_baseline": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage5-eval",
+            "--stage4-result-file",
+            str(incomplete_stage4),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 5 eval failed:" in captured.err
+    assert "missing the required object field 'prompt_contract'" in captured.err
+
+
+def test_stage6_cli_reports_missing_stage5_fields(capsys, tmp_path) -> None:
+    incomplete_stage5 = tmp_path / "stage5-incomplete.json"
+    incomplete_stage5.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "pr_packet": {},
+                "prompt_contract": {},
+                "tool_schema": {},
+                "golden_dataset": {},
+                "latency_baseline": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage6-security-review",
+            "--stage5-result-file",
+            str(incomplete_stage5),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 6 security review failed:" in captured.err
+    assert "missing the required object field 'eval_report'" in captured.err
+
+
+def test_stage_merge_cli_reports_missing_stage6_fields(capsys, tmp_path) -> None:
+    incomplete_stage6 = tmp_path / "stage6-incomplete.json"
+    incomplete_stage6.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "pr_packet": {},
+                "prompt_contract": {},
+                "tool_schema": {},
+                "golden_dataset": {},
+                "latency_baseline": {},
+                "eval_report": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage-merge",
+            "--stage6-result-file",
+            str(incomplete_stage6),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Merge stage failed:" in captured.err
+    assert "missing the required object field 'security_review'" in captured.err
+
+
+def test_stage7_cli_reports_missing_stage6_fields(capsys, tmp_path) -> None:
+    incomplete_stage6 = tmp_path / "stage6-incomplete.json"
+    incomplete_stage6.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "pr_packet": {},
+                "prompt_contract": {},
+                "tool_schema": {},
+                "golden_dataset": {},
+                "latency_baseline": {},
+                "eval_report": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage7-release-staging",
+            "--stage6-result-file",
+            str(incomplete_stage6),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 7 release staging failed:" in captured.err
+    assert "missing the required object field 'security_review'" in captured.err
+
+
+def test_stage_merge_cli_merges_guarded_fixture(capsys) -> None:
+    root = Path(__file__).resolve().parents[1]
+    base = root / "fixtures" / "scenarios" / "stage6_security_approved_feature"
+
+    exit_code = main(
+        [
+            "stage-merge",
+            "--spec-packet-file",
+            str(base / "spec-packet.json"),
+            "--policy-decision-file",
+            str(base / "policy-decision.json"),
+            "--ticket-bundle-file",
+            str(base / "ticket-bundle.json"),
+            "--eval-manifest-file",
+            str(base / "eval-manifest.json"),
+            "--pr-packet-file",
+            str(base / "pr-packet.json"),
+            "--prompt-contract-file",
+            str(base / "prompt-contract.json"),
+            "--tool-schema-file",
+            str(base / "tool-schema.json"),
+            "--golden-dataset-file",
+            str(base / "golden-dataset.json"),
+            "--latency-baseline-file",
+            str(base / "latency-baseline.json"),
+            "--eval-report-file",
+            str(base / "eval-report.json"),
+            "--security-review-file",
+            str(base / "security-review.json"),
+            "--work-item-file",
+            str(base / "work-item.json"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["merge_decision"]["merge_decision"]["status"] == "merged"
+    assert payload["pr_packet"]["merge_execution"]["status"] == "merged"
+    assert payload["work_item"]["state"] == "MERGED"
+
+
+def test_stage7_cli_rejects_restricted_security_approved_bundle_without_merge(capsys, tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    base = root / "fixtures" / "scenarios" / "stage6_security_pending_feature"
+
+    stage6_exit = main(
+        [
+            "stage6-security-review",
+            "--spec-packet-file",
+            str(base / "spec-packet.json"),
+            "--policy-decision-file",
+            str(base / "policy-decision.json"),
+            "--ticket-bundle-file",
+            str(base / "ticket-bundle.json"),
+            "--eval-manifest-file",
+            str(base / "eval-manifest.json"),
+            "--pr-packet-file",
+            str(base / "pr-packet.json"),
+            "--prompt-contract-file",
+            str(base / "prompt-contract.json"),
+            "--tool-schema-file",
+            str(base / "tool-schema.json"),
+            "--golden-dataset-file",
+            str(base / "golden-dataset.json"),
+            "--latency-baseline-file",
+            str(base / "latency-baseline.json"),
+            "--eval-report-file",
+            str(base / "eval-report.json"),
+            "--work-item-file",
+            str(base / "work-item.json"),
+            "--approved-security-reviewer",
+            "security-oncall",
+        ]
+    )
+    stage6_output = capsys.readouterr()
+
+    assert stage6_exit == 0
+    approved_stage6 = tmp_path / "stage6-approved.json"
+    approved_stage6.write_text(stage6_output.out, encoding="utf-8")
+
+    exit_code = main(
+        [
+            "stage7-release-staging",
+            "--stage6-result-file",
+            str(approved_stage6),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 7 release staging failed:" in captured.err
+    assert "requires merge approval; run merge orchestration first" in captured.err
+
+
+def test_stage8_cli_reports_missing_stage7_fields(capsys, tmp_path) -> None:
+    incomplete_stage7 = tmp_path / "stage7-incomplete.json"
+    incomplete_stage7.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "pr_packet": {},
+                "prompt_contract": {},
+                "tool_schema": {},
+                "golden_dataset": {},
+                "latency_baseline": {},
+                "eval_report": {},
+                "security_review": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage8-production-monitoring",
+            "--stage7-result-file",
+            str(incomplete_stage7),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 8 production monitoring failed:" in captured.err
+    assert "missing the required object field 'promotion_decision'" in captured.err
+
+
+def test_stage9_cli_reports_missing_stage8_fields(capsys, tmp_path) -> None:
+    incomplete_stage8 = tmp_path / "stage8-incomplete.json"
+    incomplete_stage8.write_text(
+        json.dumps(
+            {
+                "spec_packet": {},
+                "policy_decision": {},
+                "ticket_bundle": {},
+                "eval_manifest": {},
+                "pr_packet": {},
+                "prompt_contract": {},
+                "tool_schema": {},
+                "golden_dataset": {},
+                "latency_baseline": {},
+                "eval_report": {},
+                "security_review": {},
+                "promotion_decision": {},
+                "work_item": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage9-feedback-synthesis",
+            "--stage8-result-file",
+            str(incomplete_stage8),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 9 feedback synthesis failed:" in captured.err
+    assert "missing the required object field 'monitoring_report'" in captured.err
+
+
+def test_load_work_item_accepts_stage_result_documents_with_history() -> None:
+    work_item = _load_work_item(
+        {
+            "work_item": {
+                "work_item_id": "wi-test-001",
+                "source_provider": "anthropic",
+                "source_external_id": "anthropic-test-001",
+                "title": "Test work item",
+                "state": "PRODUCTION_MONITORING",
+                "risk_score": 35,
+                "execution_lane": "guarded",
+                "policy_decision_id": "policy-test-001",
+                "current_artifact_id": "feedback-report-test-001",
+                "attempt_count": 1,
+                "dead_letter_reason": None,
+                "created_at": "2026-04-22T12:00:00Z",
+                "updated_at": "2026-04-22T12:30:00Z",
+            },
+            "history": [
+                {
+                    "event": "feedback_synthesized",
+                    "from_state": "PRODUCTION_MONITORING",
+                    "to_state": "PRODUCTION_MONITORING",
+                    "artifact_id": "feedback-report-test-001",
+                    "occurred_at": "2026-04-22T12:30:00Z",
+                }
+            ],
+        },
+        "Stage 9 result",
+    )
+
+    assert work_item.current_artifact_id == "feedback-report-test-001"
+    assert len(work_item.history) == 1
+    assert work_item.history[0].event == "feedback_synthesized"
+
+
+def test_automation_stage1_cli_runs_cycle(capsys, tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+
+    exit_code = main(
+        [
+            "automation-stage1-cycle",
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--html-file",
+            str(html_file),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "stage1"
+    assert payload["created_results"]
+
+
+def test_automation_stage1_cli_can_advance_immediately(capsys, tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+
+    exit_code = main(
+        [
+            "automation-stage1-cycle",
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--html-file",
+            str(html_file),
+            "--repo-root",
+            str(root),
+            "--max-new-items",
+            "1",
+            "--advance-immediately",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["advance_immediately"] is True
+    assert payload["handoff_results"][0]["status"] == "progressed"
+    assert payload["handoff_results"][0]["final_stage"] == "stage8"
+
+
+def test_automation_stage1_cli_returns_error_on_failed_immediate_handoff(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+
+    def _fake_run_stage1_cycle(self, **kwargs):
+        return Stage1AutomationCycleResult(
+            detected_count=1,
+            created_results=[
+                {
+                    "work_item_id": "wi-test-001",
+                    "source_external_id": "anthropic-test-001",
+                    "state": "POLICY_ASSIGNED",
+                    "stored_path": str(tmp_path / "stage1-result.json"),
+                }
+            ],
+            skipped_known_external_ids=[],
+            deferred_external_ids=[],
+            state=AutomationState(),
+            advance_immediately=True,
+            handoff_results=[
+                {
+                    "work_item_id": "wi-test-001",
+                    "source_stage": "stage1",
+                    "source_state": "POLICY_ASSIGNED",
+                    "status": "failed",
+                    "final_stage": None,
+                    "final_state": None,
+                    "stages_completed": [],
+                    "stored_paths": {},
+                    "reason": "synthetic handoff failure",
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        FactoryAutomationCoordinator,
+        "run_stage1_cycle",
+        _fake_run_stage1_cycle,
+    )
+
+    exit_code = main(
+        [
+            "automation-stage1-cycle",
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--html-file",
+            str(html_file),
+            "--repo-root",
+            str(root),
+            "--advance-immediately",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["handoff_results"][0]["status"] == "failed"
+    assert "Automation immediate handoff failed:" in captured.err
+    assert "synthetic handoff failure" in captured.err
+
+
+def test_automation_register_bundle_cli_rejects_malformed_stage8_result(capsys, tmp_path) -> None:
+    invalid_stage8 = tmp_path / "stage8-invalid.json"
+    invalid_stage8.write_text(
+        json.dumps(
+            {
+                "work_item": {
+                    "work_item_id": "wi-test-001",
+                    "updated_at": "2026-04-22T12:30:00Z",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "automation-register-bundle",
+            "--stage",
+            "stage8",
+            "--result-file",
+            str(invalid_stage8),
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--repo-root",
+            str(Path(__file__).resolve().parents[1]),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Automation bundle registration failed:" in captured.err
+    assert "missing required object fields" in captured.err
+
+
+def test_automation_register_bundle_cli_can_advance_immediately(capsys, tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
+        encoding="utf-8"
+    )
+    source_coordinator = FactoryAutomationCoordinator(
+        tmp_path / "source-store",
+        repo_root_override=root,
+    )
+    stage1_result = source_coordinator.run_stage1_cycle(html=html, max_new_items=1)
+    stage1_document = json.loads(
+        Path(stage1_result.created_results[0]["stored_path"]).read_text(encoding="utf-8")
+    )
+    stage1_file = tmp_path / "stage1-result.json"
+    stage1_file.write_text(json.dumps(stage1_document), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "automation-register-bundle",
+            "--stage",
+            "stage1",
+            "--result-file",
+            str(stage1_file),
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--repo-root",
+            str(root),
+            "--advance-immediately",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["advance_immediately"] is True
+    assert payload["handoff"]["status"] == "progressed"
+    assert payload["handoff"]["final_stage"] == "stage8"
+
+
+def test_automation_register_bundle_cli_advances_stage8_incident_into_stage9(
+    capsys,
+    tmp_path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage8_document = load_stage8_result_document(root, "stage8_auto_mitigated_feature")
+    stage8_file = tmp_path / "stage8-result.json"
+    stage8_file.write_text(json.dumps(stage8_document), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "automation-register-bundle",
+            "--stage",
+            "stage8",
+            "--result-file",
+            str(stage8_file),
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--repo-root",
+            str(root),
+            "--advance-immediately",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["handoff"]["status"] == "progressed"
+    assert payload["handoff"]["final_stage"] == "stage9"
+
+
+def test_automation_register_bundle_cli_returns_error_on_failed_immediate_handoff(
+    capsys,
+    tmp_path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    scenario = root / "fixtures" / "scenarios" / "stage4_reviewable_feature"
+    stage4_document = {
+        "spec_packet": json.loads((scenario / "spec-packet.json").read_text(encoding="utf-8")),
+        "policy_decision": json.loads(
+            (scenario / "policy-decision.json").read_text(encoding="utf-8")
+        ),
+        "ticket_bundle": json.loads((scenario / "ticket-bundle.json").read_text(encoding="utf-8")),
+        "eval_manifest": json.loads((scenario / "eval-manifest.json").read_text(encoding="utf-8")),
+        "pr_packet": json.loads((scenario / "pr-packet.json").read_text(encoding="utf-8")),
+        "prompt_contract": json.loads(
+            (scenario / "prompt-contract.json").read_text(encoding="utf-8")
+        ),
+        "tool_schema": json.loads((scenario / "tool-schema.json").read_text(encoding="utf-8")),
+        "golden_dataset": json.loads(
+            (scenario / "golden-dataset.json").read_text(encoding="utf-8")
+        ),
+        "latency_baseline": json.loads(
+            (scenario / "latency-baseline.json").read_text(encoding="utf-8")
+        ),
+        "work_item": json.loads((scenario / "work-item.json").read_text(encoding="utf-8")),
+    }
+    stage4_document["work_item"]["state"] = "PR_MERGEABLE"
+    stage4_file = tmp_path / "stage4-result.json"
+    stage4_file.write_text(json.dumps(stage4_document), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "automation-register-bundle",
+            "--stage",
+            "stage4",
+            "--result-file",
+            str(stage4_file),
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--repo-root",
+            str(root),
+            "--advance-immediately",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["handoff"]["status"] == "failed"
+    assert "missing required object fields: eval_report" in payload["handoff"]["reason"]
+    assert "Automation immediate handoff failed:" in captured.err
+
+
+def test_automation_advance_runs_cli_progresses_active_build_items(capsys, tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+    store_dir = tmp_path / "automation-store"
+
+    stage1_exit_code = main(
+        [
+            "automation-stage1-cycle",
+            "--store-dir",
+            str(store_dir),
+            "--html-file",
+            str(html_file),
+            "--repo-root",
+            str(root),
+            "--max-new-items",
+            "1",
+        ]
+    )
+    stage1_captured = capsys.readouterr()
+
+    assert stage1_exit_code == 0
+    assert json.loads(stage1_captured.out)["created_results"]
+
+    advance_exit_code = main(
+        [
+            "automation-advance-runs",
+            "--store-dir",
+            str(store_dir),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    advance_captured = capsys.readouterr()
+
+    assert advance_exit_code == 0
+    payload = json.loads(advance_captured.out)
+    assert payload["cycle"] == "stage2-through-stage8-progression"
+    assert payload["processed_runs"][0]["final_stage"] == "stage8"
+
+
+def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+
+    exit_code = main(
+        [
+            "automation-supervisor-cycle",
+            "--store-dir",
+            str(tmp_path / "automation-store"),
+            "--html-file",
+            str(html_file),
+            "--repo-root",
+            str(root),
+            "--max-new-items",
+            "1",
+            "--run-weekly-feedback",
+            "--window-label",
+            "2026-W17",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "automation-supervisor-cycle"
+    assert payload["stage1_result"]["created_results"]
+    assert payload["progression_result"]["processed_runs"][0]["final_stage"] == "stage8"
+    assert payload["weekly_feedback_result"]["processed_results"]
+    assert payload["post_progression_handoff_results"] == []

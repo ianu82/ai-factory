@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/eval-manifest.schema.json",
+  "title": "Eval Manifest",
+  "type": "object",
+  "required": [
+    "artifact",
+    "target_type",
+    "target_id",
+    "tiers"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "target_type": {
+      "type": "string",
+      "enum": [
+        "ticket_bundle",
+        "prompt_contract",
+        "pull_request"
+      ]
+    },
+    "target_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tiers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "checks"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "common.schema.json#/$defs/evalTier"
+          },
+          "checks": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "kind",
+                "required",
+                "timeout_minutes",
+                "pass_condition"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "lint",
+                    "typecheck",
+                    "unit",
+                    "contract",
+                    "integration",
+                    "latency",
+                    "cost",
+                    "llm_quality",
+                    "migration_safety",
+                    "adversarial"
+                  ]
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "timeout_minutes": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "baseline_ref": {
+                  "type": "string"
+                },
+                "pass_condition": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "waivable": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

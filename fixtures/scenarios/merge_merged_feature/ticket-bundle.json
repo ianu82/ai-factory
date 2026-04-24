@@ -1,0 +1,128 @@
+{
+  "artifact": {
+    "id": "ticket-bundle-spec-anthropic-2026-04-20-april-20-2026-25307862",
+    "version": 1,
+    "source_stage": "ticketing",
+    "next_stage": "build",
+    "status": "ready",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Ticket Architect",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "created_at": "2026-04-22T15:54:53Z",
+    "updated_at": "2026-04-22T15:54:53Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "eval_manifest_id": "eval-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "tickets": [
+    {
+      "id": "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-cont",
+      "title": "Implement Support response format tool mode for tool results: contract compatibility",
+      "kind": "backend",
+      "summary": "Add or update the affected Anthropic integration surface to support 'Support response format tool mode for tool results'. Focus this ticket on contract compatibility.",
+      "scope": [
+        "Update request and response contracts with compatibility-safe fallbacks.",
+        "Refresh adapter or SDK-facing boundaries touched by the new contract shape.",
+        "Document unsupported request shapes and deterministic contract failures.",
+        "Implement the acceptance criteria without expanding beyond the current Stage 1 scope.",
+        "Prepare the lane-required eval coverage for pr_smoke, pre_merge, nightly, post_deploy."
+      ],
+      "definition_of_done": [
+        "Contract callers can adopt the new behavior without breaking existing request shapes.",
+        "The impacted surfaces are explicit enough to split into 1-2 day implementation tickets.",
+        "The rollout and regression expectations are concrete enough to define eval coverage before coding.",
+        "Required eval tiers pass for this ticket: pr_smoke, pre_merge, nightly, post_deploy.",
+        "Rollback instructions are documented and tested at the ticket scope."
+      ],
+      "known_edge_cases": [
+        "Legacy callers should receive a deterministic contract error for unsupported request shapes."
+      ],
+      "non_goals": [
+        "Do not expand beyond the directly affected Anthropic integration surfaces in this first pass."
+      ],
+      "dependencies": [],
+      "eta_days": 1.3,
+      "risk_tier": "medium",
+      "execution_lane": "guarded",
+      "required_eval_tiers": [
+        "pr_smoke",
+        "pre_merge",
+        "nightly",
+        "post_deploy"
+      ],
+      "allowed_tools": [
+        "git",
+        "python",
+        "pytest"
+      ],
+      "secret_scope": "none",
+      "rollback_strategy": "Disable rollout traffic, revert the deploy, and preserve compatibility fallbacks.",
+      "acceptance_criteria_refs": [
+        "ac-anthropic-2026-04-20-apr-001",
+        "ac-anthropic-2026-04-20-apr-002"
+      ]
+    },
+    {
+      "id": "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-inte",
+      "title": "Implement Support response format tool mode for tool results: runtime integration wiring",
+      "kind": "llm_integration",
+      "summary": "Add or update the affected Anthropic integration surface to support 'Support response format tool mode for tool results'. Focus this ticket on runtime integration wiring.",
+      "scope": [
+        "Wire tool/runtime integration, schema handling, and retry-safe execution behavior.",
+        "Adjust model selection or Anthropic routing behavior needed for the new capability.",
+        "Keep the feature behind a flag or equivalent rollout control.",
+        "Implement the acceptance criteria without expanding beyond the current Stage 1 scope.",
+        "Prepare the lane-required eval coverage for pr_smoke, pre_merge, nightly, post_deploy."
+      ],
+      "definition_of_done": [
+        "Runtime integration paths are deterministic, retry-safe, and guarded for rollout.",
+        "The impacted surfaces are explicit enough to split into 1-2 day implementation tickets.",
+        "The rollout and regression expectations are concrete enough to define eval coverage before coding.",
+        "Required eval tiers pass for this ticket: pr_smoke, pre_merge, nightly, post_deploy.",
+        "Rollback instructions are documented and tested at the ticket scope."
+      ],
+      "known_edge_cases": [
+        "Tool/schema mismatches must fail closed instead of running with partial permissions."
+      ],
+      "non_goals": [
+        "Do not expand beyond the directly affected Anthropic integration surfaces in this first pass."
+      ],
+      "dependencies": [
+        "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-cont"
+      ],
+      "eta_days": 1.55,
+      "risk_tier": "medium",
+      "execution_lane": "guarded",
+      "required_eval_tiers": [
+        "pr_smoke",
+        "pre_merge",
+        "nightly",
+        "post_deploy"
+      ],
+      "allowed_tools": [
+        "git",
+        "python",
+        "pytest"
+      ],
+      "secret_scope": "none",
+      "rollback_strategy": "Disable rollout traffic, revert the deploy, and preserve compatibility fallbacks.",
+      "acceptance_criteria_refs": [
+        "ac-anthropic-2026-04-20-apr-001",
+        "ac-anthropic-2026-04-20-apr-002"
+      ]
+    }
+  ],
+  "dependency_graph": [
+    {
+      "from": "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-cont",
+      "to": "ticket-spec-anthropic-2026-04-20-april-20-2026-25307862-inte",
+      "type": "blocks"
+    }
+  ],
+  "budget_summary": {
+    "total_token_budget_usd": 60.0
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/work-item.schema.json",
+  "title": "Factory Work Item",
+  "type": "object",
+  "required": [
+    "work_item_id",
+    "source_provider",
+    "source_external_id",
+    "title",
+    "state",
+    "attempt_count",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "work_item_id": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "source_provider": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "source_external_id": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "title": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "state": {
+      "$ref": "common.schema.json#/$defs/controllerState"
+    },
+    "risk_score": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 100
+    },
+    "execution_lane": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "fast",
+        "guarded",
+        "restricted",
+        null
+      ]
+    },
+    "policy_decision_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "current_artifact_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "attempt_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dead_letter_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    },
+    "updated_at": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    }
+  },
+  "additionalProperties": false
+}

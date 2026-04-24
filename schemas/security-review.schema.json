@@ -1,0 +1,454 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/security-review.schema.json",
+  "title": "Security Review",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "ticket_bundle_id",
+    "pr_packet_id",
+    "eval_report_id",
+    "prompt_contract_id",
+    "tool_schema_id",
+    "golden_dataset_id",
+    "build_attempt",
+    "evaluated_pr_artifact_version",
+    "resulting_pr_artifact_version",
+    "threat_model",
+    "abuse_cases",
+    "security_checks",
+    "least_privilege_validation",
+    "signoff",
+    "summary"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ticket_bundle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pr_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "eval_report_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt_contract_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tool_schema_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "golden_dataset_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "build_attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "evaluated_pr_artifact_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "resulting_pr_artifact_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "threat_model": {
+      "type": "object",
+      "required": [
+        "domains",
+        "blast_radius",
+        "rollback_class",
+        "rollback_notes"
+      ],
+      "properties": {
+        "domains": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "severity",
+              "status",
+              "findings",
+              "mitigations"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "enum": [
+                  "auth_and_authorization",
+                  "secrets_handling",
+                  "stored_user_data",
+                  "prompt_injection",
+                  "context_exfiltration",
+                  "jailbreak_resistance",
+                  "unsafe_tool_invocation"
+                ]
+              },
+              "severity": {
+                "$ref": "common.schema.json#/$defs/securitySeverity"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "mitigated",
+                  "watch",
+                  "blocked"
+                ]
+              },
+              "findings": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "mitigations": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "blast_radius": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rollback_class": {
+          "$ref": "common.schema.json#/$defs/rollbackClass"
+        },
+        "rollback_notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "abuse_cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "severity",
+          "expected_control"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "severity": {
+            "$ref": "common.schema.json#/$defs/securitySeverity"
+          },
+          "expected_control": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "security_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "status",
+          "severity",
+          "summary"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "$ref": "common.schema.json#/$defs/securityCheckStatus"
+          },
+          "severity": {
+            "$ref": "common.schema.json#/$defs/securitySeverity"
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "least_privilege_validation": {
+      "type": "object",
+      "required": [
+        "status",
+        "allowed_tool_ids",
+        "findings"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "common.schema.json#/$defs/securityCheckStatus"
+        },
+        "allowed_tool_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "signoff": {
+      "type": "object",
+      "required": [
+        "status",
+        "mode",
+        "approvals_granted",
+        "pending_approvals",
+        "downstream_approvals",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "common.schema.json#/$defs/securitySignoffStatus"
+        },
+        "mode": {
+          "$ref": "common.schema.json#/$defs/securitySignoffMode"
+        },
+        "approvals_granted": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "pending_approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "downstream_approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "blocking_findings",
+        "watch_findings",
+        "passed_check_ids",
+        "failed_check_ids",
+        "needs_human_review_check_ids"
+      ],
+      "properties": {
+        "blocking_findings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "watch_findings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "passed_check_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "failed_check_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "needs_human_review_check_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "signoff": {
+            "properties": {
+              "status": {
+                "const": "approved"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "signoff"
+        ]
+      },
+      "then": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "blocking_findings": {
+                "maxItems": 0
+              },
+              "failed_check_ids": {
+                "maxItems": 0
+              }
+            },
+            "required": [
+              "blocking_findings",
+              "failed_check_ids"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "signoff": {
+            "properties": {
+              "status": {
+                "const": "pending_human"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "signoff"
+        ]
+      },
+      "then": {
+        "properties": {
+          "signoff": {
+            "properties": {
+              "mode": {
+                "const": "human_required"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "summary": {
+            "properties": {
+              "failed_check_ids": {
+                "maxItems": 0
+              }
+            },
+            "required": [
+              "failed_check_ids"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "signoff": {
+            "properties": {
+              "status": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "signoff"
+        ]
+      },
+      "then": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "blocking_findings": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "blocking_findings"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,107 @@
+{
+  "artifact": {
+    "id": "promotion-decision-attempt-1-prv-5-spec-anthropic-2026-04-20-april-20-20",
+    "version": 1,
+    "source_stage": "release_staging",
+    "next_stage": "human_release_signoff",
+    "status": "ready",
+    "risk_tier": "medium",
+    "execution_lane": "restricted",
+    "owner_agent": "Release Manager",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "release_manager.v1",
+    "budget_class": "large",
+    "rollback_class": "manual_recovery_required",
+    "approval_requirements": [
+      "security",
+      "merge",
+      "release"
+    ],
+    "blocking_issues": [],
+    "created_at": "2026-04-23T11:13:24Z",
+    "updated_at": "2026-04-23T11:13:24Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "security_review_id": "security-review-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-2026",
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "evaluated_pr_artifact_version": 5,
+  "resulting_pr_artifact_version": 6,
+  "release_runbook": {
+    "feature_flag": "anthropic_2026_04_20_april_20_2026_25307862",
+    "strategy": "staged_rollout_with_signoff",
+    "traffic_mode": "staged_rollout",
+    "staged_steps": [
+      "Deploy behind a feature flag in staging.",
+      "Exercise staged rollout checkpoints with explicit approvals.",
+      "Promote only after all checkpoints pass."
+    ],
+    "auto_promote_allowed": false
+  },
+  "rollback_plan": {
+    "tested": true,
+    "blast_radius": "multi_service",
+    "rollback_class": "reversible_deploy",
+    "trigger_conditions": [
+      "Error rate exceeds the configured budget.",
+      "Latency regresses past the allowed baseline delta.",
+      "Cost per call regresses past the allowed baseline delta.",
+      "Quality score or fallback frequency regresses unexpectedly."
+    ],
+    "steps": [
+      "Disable the rollout feature flag immediately.",
+      "Disable rollout traffic, revert the deploy, and preserve compatibility fallbacks.",
+      "Verify the old path serves traffic before resuming promotion."
+    ]
+  },
+  "staging_report": {
+    "environment": "staging",
+    "traffic_mode": "staged_rollout",
+    "soak_minutes_observed": 1440,
+    "minimum_soak_minutes": 1440,
+    "request_samples_observed": 3000,
+    "minimum_request_samples": 3000,
+    "feature_flag_enabled": true,
+    "rollback_tested": true,
+    "metrics": {
+      "error_rate_pct": 0.35,
+      "p95_latency_ms": 2130,
+      "cost_per_call_usd": 0.0269,
+      "quality_score": 0.91,
+      "fallback_rate_pct": 1.0,
+      "business_kpi_proxy": 0.95
+    },
+    "threshold_breaches": []
+  },
+  "promotion_decision": {
+    "status": "pending_human",
+    "mode": "human_required",
+    "approvals_granted": [],
+    "pending_approvals": [
+      "release"
+    ],
+    "rationale": "Staging soak passed, but lane policy still requires explicit release approval."
+  },
+  "summary": {
+    "threshold_breaches": [],
+    "watch_items": [
+      "Traffic mode in effect: staged_rollout.",
+      "Production dashboards should stay pinned during the initial rollout window.",
+      "Release approval is still pending after a successful staging soak.",
+      "Lane policy disables autonomous production promotion."
+    ],
+    "passed_checks": [
+      "Minimum soak duration met.",
+      "Minimum request sample threshold met.",
+      "Error rate stayed within the rollout budget.",
+      "Latency stayed within the allowed regression threshold.",
+      "Cost stayed within the allowed regression threshold.",
+      "Quality score stayed above the minimum rollout floor.",
+      "Fallback rate stayed within the rollout budget.",
+      "Business KPI proxy stayed above the minimum rollout floor.",
+      "Rollback path was tested before promotion."
+    ]
+  }
+}

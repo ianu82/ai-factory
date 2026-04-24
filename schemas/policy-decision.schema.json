@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/policy-decision.schema.json",
+  "title": "Policy Decision",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "decision",
+    "risk_score",
+    "required_approvals",
+    "reasoning"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadata"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "ignore",
+        "watchlist",
+        "backlog_candidate",
+        "active_build_candidate"
+      ]
+    },
+    "risk_score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "lane_assignment": {
+      "type": "object",
+      "required": [
+        "lane",
+        "locked"
+      ],
+      "properties": {
+        "lane": {
+          "$ref": "common.schema.json#/$defs/executionLane"
+        },
+        "locked": {
+          "type": "boolean"
+        },
+        "hard_override_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "required_eval_tiers": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/evalTier"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "autonomy_policy": {
+      "type": "object",
+      "required": [
+        "merge",
+        "deploy",
+        "rollback"
+      ],
+      "properties": {
+        "merge": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_on_exception",
+            "human_required"
+          ]
+        },
+        "deploy": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_on_exception",
+            "human_required"
+          ]
+        },
+        "rollback": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_on_exception",
+            "human_required"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "budget_policy": {
+      "type": "object",
+      "required": [
+        "max_token_budget_usd",
+        "max_pr_review_cycles",
+        "max_concurrent_work_items"
+      ],
+      "properties": {
+        "max_token_budget_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_pr_review_cycles": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_concurrent_work_items": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "deployment_policy": {
+      "type": "object",
+      "required": [
+        "feature_flag_required",
+        "strategy",
+        "minimum_soak_minutes",
+        "minimum_request_samples",
+        "auto_promote_allowed"
+      ],
+      "properties": {
+        "feature_flag_required": {
+          "type": "boolean"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "short_soak_or_shadow",
+            "canary_then_soak",
+            "staged_rollout_with_signoff"
+          ]
+        },
+        "minimum_soak_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minimum_request_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "auto_promote_allowed": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "required_approvals": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/approvalRequirement"
+      },
+      "uniqueItems": true
+    },
+    "reasoning": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "decision": {
+            "enum": [
+              "backlog_candidate",
+              "active_build_candidate"
+            ]
+          }
+        },
+        "required": [
+          "decision"
+        ]
+      },
+      "then": {
+        "required": [
+          "lane_assignment",
+          "required_eval_tiers",
+          "autonomy_policy",
+          "budget_policy",
+          "deployment_policy"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "decision": {
+            "enum": [
+              "ignore",
+              "watchlist"
+            ]
+          }
+        },
+        "required": [
+          "decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "required_approvals": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

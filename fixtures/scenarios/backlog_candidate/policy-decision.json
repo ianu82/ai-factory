@@ -1,0 +1,54 @@
+{
+  "artifact": {
+    "id": "policy-backlog-001",
+    "version": 1,
+    "source_stage": "policy_engine",
+    "next_stage": "ticketing",
+    "status": "ready",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Policy Engine",
+    "policy_decision_id": "policy-backlog-001",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "created_at": "2026-04-22T12:55:00Z",
+    "updated_at": "2026-04-22T12:55:00Z"
+  },
+  "spec_packet_id": "spec-backlog-001",
+  "decision": "backlog_candidate",
+  "risk_score": 35,
+  "lane_assignment": {
+    "lane": "guarded",
+    "locked": false,
+    "hard_override_reason": null
+  },
+  "required_eval_tiers": [
+    "pr_smoke",
+    "pre_merge",
+    "nightly",
+    "post_deploy"
+  ],
+  "autonomy_policy": {
+    "merge": "autonomous",
+    "deploy": "human_on_exception",
+    "rollback": "autonomous"
+  },
+  "budget_policy": {
+    "max_pr_review_cycles": 4,
+    "max_token_budget_usd": 75,
+    "max_concurrent_work_items": 5
+  },
+  "deployment_policy": {
+    "feature_flag_required": true,
+    "strategy": "canary_then_soak",
+    "minimum_soak_minutes": 1440,
+    "minimum_request_samples": 1000,
+    "auto_promote_allowed": true
+  },
+  "required_approvals": [],
+  "reasoning": [
+    "The weighted risk score maps to the guarded lane.",
+    "The feature is valuable enough to keep in backlog planning, but not to enqueue right now."
+  ]
+}

@@ -1,0 +1,127 @@
+version: 1
+default_lane: fast
+
+risk_score:
+  minimum: 0
+  maximum: 100
+  bands:
+    fast:
+      min: 0
+      max: 29
+    guarded:
+      min: 30
+      max: 69
+    restricted:
+      min: 70
+      max: 100
+  weighted_factors:
+    user_visible: 15
+    model_behavior_change: 20
+    external_api_contract_change: 15
+    new_tool_permission: 20
+    billing_impact: 25
+    estimated_monthly_cost_delta_gt_1000_usd: 15
+    low_test_coverage_area: 10
+    rollback_complexity_medium: 10
+    rollback_complexity_high: 20
+    auth_or_permissions: 35
+    sensitive_data_access: 35
+    irreversible_migration: 40
+
+hard_overrides:
+  restricted:
+    - auth_or_permissions
+    - sensitive_data_access
+    - irreversible_migration
+    - production_write_path_without_flag
+  guarded:
+    - user_facing_llm_output_change
+    - high_cost_model_route_change
+    - external_api_contract_change
+
+lanes:
+  fast:
+    description: Reversible, low-risk changes with narrow blast radius.
+    autonomy:
+      merge: autonomous
+      deploy: autonomous
+      rollback: autonomous
+    default_required_approvals: []
+    exception_approvals:
+      policy_waiver:
+        - policy_waiver
+    required_eval_tiers:
+      - pr_smoke
+      - pre_merge
+    build_limits:
+      max_pr_review_cycles: 3
+      max_token_budget_usd: 25
+      max_concurrent_work_items: 10
+    release_policy:
+      feature_flag_required: true
+      strategy: short_soak_or_shadow
+      minimum_soak_minutes: 60
+      minimum_request_samples: 200
+      auto_promote_allowed: true
+    rollback_class: immediate_flag_disable
+
+  guarded:
+    description: User-visible or cost-sensitive changes that still have a reversible rollout path.
+    autonomy:
+      merge: autonomous
+      deploy: human_on_exception
+      rollback: autonomous
+    default_required_approvals: []
+    exception_approvals:
+      policy_waiver:
+        - policy_waiver
+      deploy_threshold_breach:
+        - release
+      manual_promotion_override:
+        - release
+    required_eval_tiers:
+      - pr_smoke
+      - pre_merge
+      - nightly
+      - post_deploy
+    build_limits:
+      max_pr_review_cycles: 4
+      max_token_budget_usd: 75
+      max_concurrent_work_items: 5
+    release_policy:
+      feature_flag_required: true
+      strategy: canary_then_soak
+      minimum_soak_minutes: 1440
+      minimum_request_samples: 1000
+      auto_promote_allowed: true
+    rollback_class: reversible_deploy
+
+  restricted:
+    description: Sensitive or hard-to-reverse changes requiring explicit human sign-off.
+    autonomy:
+      merge: human_required
+      deploy: human_required
+      rollback: human_on_exception
+    default_required_approvals:
+      - security
+      - merge
+      - release
+    exception_approvals:
+      policy_waiver:
+        - policy_waiver
+    required_eval_tiers:
+      - pr_smoke
+      - pre_merge
+      - nightly
+      - post_deploy
+    build_limits:
+      max_pr_review_cycles: 5
+      max_token_budget_usd: 150
+      max_concurrent_work_items: 2
+    release_policy:
+      feature_flag_required: true
+      strategy: staged_rollout_with_signoff
+      minimum_soak_minutes: 1440
+      minimum_request_samples: 3000
+      auto_promote_allowed: false
+    rollback_class: manual_recovery_required

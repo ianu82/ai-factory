@@ -1,0 +1,53 @@
+version: 1
+cases:
+  - id: active-build-response-format
+    item:
+      title: Support response format tool mode for tool results
+      body: Support response format tool mode for tool results.
+    expected:
+      decision: active_build_candidate
+      expected_roi: high
+      required_flags:
+        - external_api_contract_change
+        - new_tool_permission
+      required_surfaces:
+        - api_contract
+        - tool_runtime
+
+  - id: watchlist-console-preview
+    item:
+      title: Console analytics dashboard preview for workspace admins
+      body: Console analytics dashboard preview for workspace admins.
+    expected:
+      decision: watchlist
+      expected_roi: low
+      required_flags:
+        - user_visible
+        - low_test_coverage_area
+      required_surfaces:
+        - control_plane
+
+  - id: backlog-api-preview
+    item:
+      title: Experimental API orchestration preview
+      body: Experimental API orchestration preview for multi-repo workflows.
+    expected:
+      decision: backlog_candidate
+      expected_roi: medium
+      required_flags:
+        - external_api_contract_change
+        - low_test_coverage_area
+      required_surfaces:
+        - api_contract
+
+  - id: ignore-support-billing
+    item:
+      title: Support article for billing portal changes
+      body: Support article for billing portal changes and account settings.
+    expected:
+      decision: ignore
+      expected_roi: low
+      required_flags:
+        - billing_impact
+      required_surfaces:
+        - billing

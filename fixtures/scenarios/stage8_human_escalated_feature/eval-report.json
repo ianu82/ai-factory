@@ -1,0 +1,324 @@
+{
+  "artifact": {
+    "id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+    "version": 1,
+    "source_stage": "eval_execution",
+    "next_stage": "security_review",
+    "status": "approved",
+    "risk_tier": "medium",
+    "execution_lane": "restricted",
+    "owner_agent": "Eval Gatekeeper",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "eval_runner.v1",
+    "budget_class": "large",
+    "rollback_class": "manual_recovery_required",
+    "approval_requirements": [
+      "security",
+      "merge",
+      "release"
+    ],
+    "blocking_issues": [],
+    "created_at": "2026-04-22T15:55:29Z",
+    "updated_at": "2026-04-22T15:55:29Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "eval_manifest_id": "eval-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "prompt_contract_id": "prompt-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "tool_schema_id": "tool-schema-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "golden_dataset_id": "golden-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "evaluated_pr_artifact_version": 1,
+  "resulting_pr_artifact_version": 2,
+  "tiers": [
+    {
+      "name": "pr_smoke",
+      "merge_gate": true,
+      "status": "passed",
+      "checks": [
+        {
+          "id": "check-pr-smoke-lint-ticket-bundle-spec-anthropic-2026-04-20-apri",
+          "name": "Lint",
+          "kind": "lint",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 45,
+          "summary": "Lint passed on the reviewable PR candidate."
+        },
+        {
+          "id": "check-pr-smoke-typecheck-ticket-bundle-spec-anthropic-2026-04-20",
+          "name": "Typecheck",
+          "kind": "typecheck",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 90,
+          "summary": "Typecheck passed on the reviewable PR candidate."
+        },
+        {
+          "id": "check-pr-smoke-unit-ticket-bundle-spec-anthropic-2026-04-20-apri",
+          "name": "Unit tests",
+          "kind": "unit",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 120,
+          "summary": "Unit tests passed on the reviewable PR candidate."
+        },
+        {
+          "id": "check-pr-smoke-contract-ticket-bundle-spec-anthropic-2026-04-20",
+          "name": "Contract validation",
+          "kind": "contract",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 75,
+          "summary": "Prompt contract prompt-spec-anthropic-2026-04-20-april-20-2026-25307862 stayed schema-valid."
+        },
+        {
+          "id": "check-pr-smoke-focused-llm-golden-set-ticket-bundle-spec-anthrop",
+          "name": "Focused golden-set quality check",
+          "kind": "llm_quality",
+          "required": false,
+          "status": "passed",
+          "duration_seconds": 210,
+          "summary": "Quality score delta stayed within the threshold at 0.23 against 0.25 using 6 reference checks and prompt contract prompt-spec-anthropic-2026-04-20-april-20-2026-25307862.",
+          "threshold_value": 0.25,
+          "observed_value": 0.23,
+          "baseline_ref": "baseline-pr-smoke-focused-llm-golden-set-ticket-bundle-spec-anthropic-20"
+        }
+      ]
+    },
+    {
+      "name": "pre_merge",
+      "merge_gate": true,
+      "status": "passed",
+      "checks": [
+        {
+          "id": "check-pre-merge-integration-ticket-bundle-spec-anthropic-2026-04",
+          "name": "Integration tests",
+          "kind": "integration",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 240,
+          "summary": "Exercised 2 integration tool paths without regressions."
+        },
+        {
+          "id": "check-pre-merge-migration-safety-ticket-bundle-spec-anthropic-20",
+          "name": "Migration safety checks",
+          "kind": "migration_safety",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 180,
+          "summary": "Migration and rollback safety checks passed for the current rollback class."
+        },
+        {
+          "id": "check-pre-merge-targeted-regression-ticket-bundle-spec-anthropic",
+          "name": "Targeted regression suite",
+          "kind": "llm_quality",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 210,
+          "summary": "Quality score delta stayed within the threshold at 0.13 against 0.15 using 6 reference checks and prompt contract prompt-spec-anthropic-2026-04-20-april-20-2026-25307862.",
+          "threshold_value": 0.15,
+          "observed_value": 0.13,
+          "baseline_ref": "baseline-pre-merge-targeted-regression-ticket-bundle-spec-anthropic-2026"
+        },
+        {
+          "id": "check-pre-merge-latency-benchmark-ticket-bundle-spec-anthropic-2",
+          "name": "Latency benchmark",
+          "kind": "latency",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 180,
+          "summary": "Latency regression stayed within the threshold at 13.60 against 15.00 using 6 reference checks and prompt contract prompt-spec-anthropic-2026-04-20-april-20-2026-25307862.",
+          "threshold_value": 15.0,
+          "observed_value": 13.6,
+          "baseline_ref": "baseline-pre-merge-latency-benchmark-ticket-bundle-spec-anthropic-2026-0"
+        },
+        {
+          "id": "check-pre-merge-cost-benchmark-ticket-bundle-spec-anthropic-2026",
+          "name": "Cost benchmark",
+          "kind": "cost",
+          "required": true,
+          "status": "passed",
+          "duration_seconds": 150,
+          "summary": "Cost regression stayed within the threshold at 8.60 against 10.00 using 6 reference checks and prompt contract prompt-spec-anthropic-2026-04-20-april-20-2026-25307862.",
+          "threshold_value": 10.0,
+          "observed_value": 8.6,
+          "baseline_ref": "baseline-pre-merge-cost-benchmark-ticket-bundle-spec-anthropic-2026-04-2"
+        },
+        {
+          "id": "check-pre-merge-broader-llm-regression-ticket-bundle-spec-anthro",
+          "name": "Broader LLM regression suite",
+          "kind": "llm_quality",
+          "required": false,
+          "status": "passed",
+          "duration_seconds": 210,
+          "summary": "Quality score delta stayed within the threshold at 0.13 against 0.15 using 6 reference checks and prompt contract prompt-spec-anthropic-2026-04-20-april-20-2026-25307862.",
+          "threshold_value": 0.15,
+          "observed_value": 0.13,
+          "baseline_ref": "baseline-pre-merge-broader-llm-regression-ticket-bundle-spec-anthropic-2"
+        }
+      ]
+    },
+    {
+      "name": "nightly",
+      "merge_gate": false,
+      "status": "pending",
+      "checks": [
+        {
+          "id": "check-nightly-adversarial-prompt-suite-ticket-bundle-spec-anthro",
+          "name": "Adversarial prompt suite",
+          "kind": "adversarial",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "nightly is deferred to a later stage."
+        },
+        {
+          "id": "check-nightly-long-running-integration-ticket-bundle-spec-anthro",
+          "name": "Long-running integration suite",
+          "kind": "integration",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "nightly is deferred to a later stage."
+        },
+        {
+          "id": "check-nightly-full-golden-dataset-ticket-bundle-spec-anthropic-2",
+          "name": "Full golden-dataset quality suite",
+          "kind": "llm_quality",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "nightly is deferred to a later stage.",
+          "baseline_ref": "baseline-nightly-full-golden-dataset-ticket-bundle-spec-anthropic-2026-0"
+        },
+        {
+          "id": "check-nightly-cross-model-comparison-ticket-bundle-spec-anthropi",
+          "name": "Cross-model comparison suite",
+          "kind": "llm_quality",
+          "required": false,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "nightly is deferred to a later stage.",
+          "baseline_ref": "baseline-nightly-cross-model-comparison-ticket-bundle-spec-anthropic-202"
+        },
+        {
+          "id": "check-nightly-synthetic-shadow-replay-ticket-bundle-spec-anthrop",
+          "name": "Synthetic shadow replay",
+          "kind": "integration",
+          "required": false,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "nightly is deferred to a later stage."
+        }
+      ]
+    },
+    {
+      "name": "post_deploy",
+      "merge_gate": false,
+      "status": "pending",
+      "checks": [
+        {
+          "id": "check-post-deploy-canary-error-rate-ticket-bundle-spec-anthropic",
+          "name": "Canary error-rate check",
+          "kind": "integration",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "post_deploy is deferred to a later stage."
+        },
+        {
+          "id": "check-post-deploy-canary-latency-ticket-bundle-spec-anthropic-20",
+          "name": "Canary latency check",
+          "kind": "latency",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "post_deploy is deferred to a later stage.",
+          "baseline_ref": "baseline-post-deploy-canary-latency-ticket-bundle-spec-anthropic-2026-04"
+        },
+        {
+          "id": "check-post-deploy-canary-cost-ticket-bundle-spec-anthropic-2026",
+          "name": "Canary cost check",
+          "kind": "cost",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "post_deploy is deferred to a later stage.",
+          "baseline_ref": "baseline-post-deploy-canary-cost-ticket-bundle-spec-anthropic-2026-04-20"
+        },
+        {
+          "id": "check-post-deploy-rollback-probe-ticket-bundle-spec-anthropic-20",
+          "name": "Rollback probe",
+          "kind": "migration_safety",
+          "required": true,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "post_deploy is deferred to a later stage."
+        },
+        {
+          "id": "check-post-deploy-business-kpi-proxy-ticket-bundle-spec-anthropi",
+          "name": "Business KPI proxy check",
+          "kind": "llm_quality",
+          "required": false,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "post_deploy is deferred to a later stage.",
+          "baseline_ref": "baseline-post-deploy-business-kpi-proxy-ticket-bundle-spec-anthropic-202"
+        },
+        {
+          "id": "check-post-deploy-live-quality-sampling-ticket-bundle-spec-anthr",
+          "name": "Live quality sampling",
+          "kind": "llm_quality",
+          "required": false,
+          "status": "pending",
+          "duration_seconds": 0,
+          "summary": "post_deploy is deferred to a later stage.",
+          "baseline_ref": "baseline-post-deploy-live-quality-sampling-ticket-bundle-spec-anthropic"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "merge_gate_tiers": [
+      "pr_smoke",
+      "pre_merge"
+    ],
+    "deferred_tiers": [
+      "nightly",
+      "post_deploy"
+    ],
+    "merge_gate_passed": true,
+    "recommendation": "advance_to_security_review",
+    "failing_merge_gate_tiers": [],
+    "failing_check_ids": [],
+    "passed_check_ids": [
+      "check-pr-smoke-lint-ticket-bundle-spec-anthropic-2026-04-20-apri",
+      "check-pr-smoke-typecheck-ticket-bundle-spec-anthropic-2026-04-20",
+      "check-pr-smoke-unit-ticket-bundle-spec-anthropic-2026-04-20-apri",
+      "check-pr-smoke-contract-ticket-bundle-spec-anthropic-2026-04-20",
+      "check-pr-smoke-focused-llm-golden-set-ticket-bundle-spec-anthrop",
+      "check-pre-merge-integration-ticket-bundle-spec-anthropic-2026-04",
+      "check-pre-merge-migration-safety-ticket-bundle-spec-anthropic-20",
+      "check-pre-merge-targeted-regression-ticket-bundle-spec-anthropic",
+      "check-pre-merge-latency-benchmark-ticket-bundle-spec-anthropic-2",
+      "check-pre-merge-cost-benchmark-ticket-bundle-spec-anthropic-2026",
+      "check-pre-merge-broader-llm-regression-ticket-bundle-spec-anthro"
+    ],
+    "pending_check_ids": [
+      "check-nightly-adversarial-prompt-suite-ticket-bundle-spec-anthro",
+      "check-nightly-long-running-integration-ticket-bundle-spec-anthro",
+      "check-nightly-full-golden-dataset-ticket-bundle-spec-anthropic-2",
+      "check-nightly-cross-model-comparison-ticket-bundle-spec-anthropi",
+      "check-nightly-synthetic-shadow-replay-ticket-bundle-spec-anthrop",
+      "check-post-deploy-canary-error-rate-ticket-bundle-spec-anthropic",
+      "check-post-deploy-canary-latency-ticket-bundle-spec-anthropic-20",
+      "check-post-deploy-canary-cost-ticket-bundle-spec-anthropic-2026",
+      "check-post-deploy-rollback-probe-ticket-bundle-spec-anthropic-20",
+      "check-post-deploy-business-kpi-proxy-ticket-bundle-spec-anthropi",
+      "check-post-deploy-live-quality-sampling-ticket-bundle-spec-anthr"
+    ],
+    "warning_count": 0
+  }
+}

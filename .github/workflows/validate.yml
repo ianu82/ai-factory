@@ -1,0 +1,29 @@
+name: Validate Factory Contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Validate contracts
+        run: uv run python scripts/validate_contracts.py
+
+      - name: Run tests
+        run: uv run pytest
+

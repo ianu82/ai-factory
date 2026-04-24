@@ -1,0 +1,178 @@
+version: 1
+
+technical_keywords:
+  - api
+  - model
+  - tool
+  - tools
+  - mcp
+  - prompt caching
+  - batch
+  - files api
+  - streaming
+  - response format
+  - json schema
+  - context window
+  - messages
+  - sdk
+  - embedding
+
+defer_keywords:
+  - preview
+  - beta
+  - experimental
+  - speculative
+  - roadmap
+  - upcoming
+  - orchestration
+  - multi-repo
+
+watchlist_keywords:
+  - console
+  - dashboard
+  - admin
+  - analytics
+  - studio
+  - workspace
+
+ignore_keywords:
+  - legal
+  - support
+  - billing portal
+  - mobile app
+  - account settings
+
+high_roi_keywords:
+  - api
+  - tool
+  - response format
+  - json schema
+  - messages
+  - batch
+  - context window
+  - prompt caching
+
+affected_surface_keywords:
+  anthropic_integration:
+    - anthropic
+    - claude
+  api_contract:
+    - api
+    - response format
+    - json
+    - schema
+    - endpoint
+    - request
+    - response
+  tool_runtime:
+    - tool
+    - tools
+    - mcp
+    - server
+    - connector
+  model_routing:
+    - model
+    - claude
+    - haiku
+    - sonnet
+    - opus
+    - context window
+  sdk:
+    - sdk
+    - python
+    - typescript
+  control_plane:
+    - console
+    - dashboard
+    - admin
+    - project
+  billing:
+    - billing
+    - cost
+    - price
+  auth:
+    - auth
+    - authorization
+    - role
+    - access control
+    - api key scope
+
+risk_flag_keywords:
+  user_visible:
+    - console
+    - dashboard
+    - app
+    - user-facing
+    - customer
+  model_behavior_change:
+    - model
+    - claude
+    - context window
+    - output
+    - reasoning
+  external_api_contract_change:
+    - api
+    - endpoint
+    - response format
+    - json
+    - schema
+    - request
+    - error
+    - retired
+    - removed
+  new_tool_permission:
+    - tool
+    - tools
+    - mcp
+    - server
+    - connector
+    - permission
+  billing_impact:
+    - billing
+    - price
+    - cost
+  estimated_monthly_cost_delta_gt_1000_usd:
+    - premium model
+    - opus
+    - higher cost
+  low_test_coverage_area:
+    - beta
+    - preview
+    - experimental
+  rollback_complexity_medium:
+    - migration
+    - retire
+    - deprecated
+  rollback_complexity_high:
+    - removed
+    - sunset
+    - no longer supported
+  auth_or_permissions:
+    - auth
+    - authorization
+    - role
+    - access control
+    - api key scope
+    - rbac
+  sensitive_data_access:
+    - pii
+    - sensitive data
+    - customer data
+    - retention
+  irreversible_migration:
+    - retired
+    - removed
+    - sunset
+
+hard_override_keywords:
+  user_facing_llm_output_change:
+    - assistant output
+    - generated output
+    - response content
+  high_cost_model_route_change:
+    - opus
+    - premium model
+    - expensive model
+  production_write_path_without_flag:
+    - production write
+    - direct write

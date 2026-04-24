@@ -1,0 +1,119 @@
+{
+  "artifact": {
+    "approval_requirements": [],
+    "budget_class": "medium",
+    "created_at": "2026-04-22T15:54:53Z",
+    "execution_lane": "guarded",
+    "id": "tool-schema-spec-anthropic-2026-04-20-april-20-2026-25307862",
+    "next_stage": "eval",
+    "owner_agent": "Integration Engineer",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "risk_tier": "medium",
+    "rollback_class": "reversible_deploy",
+    "source_stage": "integration_design",
+    "status": "ready",
+    "updated_at": "2026-04-22T15:54:53Z",
+    "version": 1
+  },
+  "prompt_contract_id": "prompt-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "tools": [
+    {
+      "description": "Normalizes response-format contract variants before the model consumes tool results.",
+      "failure_modes": [
+        {
+          "behavior": "Return a deterministic contract error.",
+          "condition": "Unsupported response_format value",
+          "retryable": false
+        }
+      ],
+      "id": "response-format-adapter",
+      "input_schema": {
+        "properties": {
+          "response_format": {
+            "type": "string"
+          },
+          "tool_result": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "response_format",
+          "tool_result"
+        ],
+        "type": "object"
+      },
+      "name": "Response format adapter",
+      "output_schema": {
+        "properties": {
+          "normalized_mode": {
+            "type": "string"
+          },
+          "tool_payload": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "normalized_mode",
+          "tool_payload"
+        ],
+        "type": "object"
+      },
+      "permissions": [
+        "read_only",
+        "contract_translation"
+      ]
+    },
+    {
+      "description": "Validates and canonicalizes tool results before they enter the prompt context.",
+      "failure_modes": [
+        {
+          "behavior": "Reject the response and trigger retry or safe fallback.",
+          "condition": "Tool result fails schema validation",
+          "retryable": true
+        },
+        {
+          "behavior": "Strip the payload from context and return a safe contract error.",
+          "condition": "Prompt-injection content is detected in tool output",
+          "retryable": false
+        }
+      ],
+      "id": "tool-result-normalizer",
+      "input_schema": {
+        "properties": {
+          "tool_name": {
+            "type": "string"
+          },
+          "tool_result": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "tool_name",
+          "tool_result"
+        ],
+        "type": "object"
+      },
+      "name": "Tool result normalizer",
+      "output_schema": {
+        "properties": {
+          "tool_name": {
+            "type": "string"
+          },
+          "validated_result": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "tool_name",
+          "validated_result"
+        ],
+        "type": "object"
+      },
+      "permissions": [
+        "read_only",
+        "tool_result_access"
+      ]
+    }
+  ]
+}

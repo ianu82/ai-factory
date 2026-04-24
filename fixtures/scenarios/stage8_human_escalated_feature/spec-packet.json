@@ -1,0 +1,87 @@
+{
+  "artifact": {
+    "id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+    "version": 1,
+    "source_stage": "spec_drafting",
+    "next_stage": "policy_assignment",
+    "status": "ready",
+    "risk_tier": "medium",
+    "owner_agent": "Clarifier",
+    "rollback_class": "reversible_deploy",
+    "created_at": "2026-04-22T12:00:00Z",
+    "updated_at": "2026-04-22T12:00:00Z"
+  },
+  "source": {
+    "provider": "anthropic",
+    "kind": "release_note",
+    "external_id": "anthropic-2026-04-20-april-20-2026-25307862",
+    "title": "Support response format tool mode for tool results",
+    "url": "https://platform.claude.com/docs/en/release-notes/overview#april-20-2026",
+    "detected_at": "2026-04-22T12:00:00Z"
+  },
+  "summary": {
+    "problem": "Anthropic release note: Support response format tool mode for tool results.",
+    "proposed_capability": "Add or update the affected Anthropic integration surface to support 'Support response format tool mode for tool results'.",
+    "why_now": "The source item was published on April 20, 2026; Stage 1 captures the engineering impact before downstream ticketing or migration work starts.",
+    "affected_surfaces": [
+      "api_contract",
+      "tool_runtime"
+    ],
+    "assumptions": [
+      "Stage 1 reasoning is based on the public Anthropic release note plus local factory policy.",
+      "Any resulting implementation should stay behind a feature flag or controlled migration path.",
+      "Primary integration signal: tool."
+    ],
+    "non_goals": [
+      "Do not expand beyond the directly affected Anthropic integration surfaces in this first pass."
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "id": "ac-anthropic-2026-04-20-apr-001",
+      "description": "The impacted surfaces are explicit enough to split into 1-2 day implementation tickets.",
+      "verification_method": "manual",
+      "required": true
+    },
+    {
+      "id": "ac-anthropic-2026-04-20-apr-002",
+      "description": "The rollout and regression expectations are concrete enough to define eval coverage before coding.",
+      "verification_method": "integration",
+      "required": true
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "q-anthropic-2026-04-20-apr-001",
+      "question": "Do any existing Anthropic wrappers need compatibility shims before this change can ship?",
+      "blocking": false,
+      "resolution_status": "non_blocking",
+      "resolution_notes": "Carry this forward into Stage 2 ticket shaping."
+    }
+  ],
+  "risk_profile": {
+    "risk_score": 35,
+    "data_classification": "internal",
+    "blast_radius": "multi_service",
+    "rollback_class": "reversible_deploy",
+    "factors": [
+      {
+        "name": "external_api_contract_change",
+        "score": 15,
+        "notes": "Matched release-note terms for external_api_contract_change: response format."
+      },
+      {
+        "name": "new_tool_permission",
+        "score": 20,
+        "notes": "Matched release-note terms for new_tool_permission: tool."
+      }
+    ]
+  },
+  "relevance": {
+    "decision": "active_build_candidate",
+    "rationale": "Direct integration signal detected (tool, response format), so this item is concrete enough for the build queue.",
+    "confidence": 0.9,
+    "expected_roi": "high",
+    "enqueue": true
+  }
+}

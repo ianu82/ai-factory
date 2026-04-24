@@ -1,0 +1,68 @@
+version: 1
+
+tiers:
+  pr_smoke:
+    purpose: Fast signal for reviewability.
+    max_runtime_minutes: 15
+    required_checks:
+      - lint
+      - typecheck
+      - unit
+      - contract
+    optional_checks:
+      - focused_llm_golden_set
+    thresholds:
+      critical_failures_allowed: 0
+      latency_regression_pct: 10
+      cost_regression_pct: 5
+      llm_quality_score_delta_max: 0.25
+
+  pre_merge:
+    purpose: Merge gate for correctness, regressions, and cost.
+    max_runtime_minutes: 60
+    required_checks:
+      - integration
+      - migration_safety
+      - targeted_regression
+      - latency_benchmark
+      - cost_benchmark
+    optional_checks:
+      - broader_llm_regression
+    thresholds:
+      critical_failures_allowed: 0
+      latency_regression_pct: 15
+      cost_regression_pct: 10
+      llm_quality_score_delta_max: 0.15
+
+  nightly:
+    purpose: Deep regression and adversarial coverage.
+    max_runtime_minutes: 240
+    required_checks:
+      - adversarial_prompt_suite
+      - long_running_integration
+      - full_golden_dataset
+    optional_checks:
+      - cross_model_comparison
+      - synthetic_shadow_replay
+    thresholds:
+      critical_failures_allowed: 0
+      latency_regression_pct: 20
+      cost_regression_pct: 15
+      llm_quality_score_delta_max: 0.10
+
+  post_deploy:
+    purpose: Canary and soak validation under live-equivalent traffic.
+    max_runtime_minutes: 1440
+    required_checks:
+      - canary_error_rate
+      - canary_latency
+      - canary_cost
+      - rollback_probe
+    optional_checks:
+      - business_kpi_proxy
+      - live_quality_sampling
+    thresholds:
+      critical_failures_allowed: 0
+      latency_regression_pct: 10
+      cost_regression_pct: 10
+      llm_quality_score_delta_max: 0.10

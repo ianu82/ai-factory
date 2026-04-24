@@ -1,0 +1,59 @@
+{
+  "artifact": {
+    "id": "merge-decision-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-2026-2",
+    "version": 1,
+    "source_stage": "merge",
+    "next_stage": "release_staging",
+    "status": "approved",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Merge Conductor",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "merge_conductor.v1",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "blocking_issues": [],
+    "created_at": "2026-04-23T03:52:39Z",
+    "updated_at": "2026-04-23T03:52:39Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "security_review_id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+  "build_attempt": 1,
+  "evaluated_pr_artifact_version": 3,
+  "resulting_pr_artifact_version": 4,
+  "merge_plan": {
+    "target_branch": "main",
+    "method": "squash",
+    "autonomy_mode": "autonomous",
+    "required_approvals": [],
+    "approvals_granted": [],
+    "pending_approvals": []
+  },
+  "merge_decision": {
+    "status": "merged",
+    "mode": "auto",
+    "approvals_granted": [],
+    "pending_approvals": [],
+    "rationale": "Merge checks passed and lane policy allows autonomous merge.",
+    "merged_by": "Merge Conductor",
+    "merged_at": "2026-04-23T03:52:39Z",
+    "merge_commit_sha": "46e4a3c44f66"
+  },
+  "summary": {
+    "blocking_findings": [],
+    "watch_findings": [],
+    "passed_check_ids": [
+      "security_signoff",
+      "reviewer_approval",
+      "merge_readiness",
+      "merge_approval",
+      "explicit_merge_blocking_findings",
+      "merge_not_already_executed",
+      "merge_policy_mode"
+    ],
+    "failed_check_ids": [],
+    "needs_human_review_check_ids": []
+  }
+}

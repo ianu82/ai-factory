@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/prompt-contract.schema.json",
+  "title": "Prompt Contract",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "pr_packet_id",
+    "tool_schema_id",
+    "golden_dataset_id",
+    "model_profile",
+    "context_assembly",
+    "prompt_messages",
+    "tool_choice_policy",
+    "retry_policy",
+    "fallback_policy",
+    "output_validation"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pr_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tool_schema_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "golden_dataset_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_profile": {
+      "type": "object",
+      "required": [
+        "primary_model",
+        "fallback_model",
+        "routing_strategy",
+        "max_input_tokens",
+        "max_output_tokens"
+      ],
+      "properties": {
+        "primary_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fallback_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "routing_strategy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_input_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "context_assembly": {
+      "type": "object",
+      "required": [
+        "sources",
+        "max_context_tokens",
+        "truncation_strategy",
+        "guardrails"
+      ],
+      "properties": {
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "kind",
+              "required"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "system_instructions",
+                  "ticket_scope",
+                  "user_request",
+                  "tool_result",
+                  "conversation_memory",
+                  "runtime_policy"
+                ]
+              },
+              "required": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "max_context_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "truncation_strategy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "guardrails": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "prompt_messages": {
+      "type": "object",
+      "required": [
+        "system",
+        "developer",
+        "user_template"
+      ],
+      "properties": {
+        "system": {
+          "type": "string",
+          "minLength": 1
+        },
+        "developer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "user_template": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "tool_choice_policy": {
+      "type": "object",
+      "required": [
+        "mode",
+        "allowed_tool_ids"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "required",
+            "none"
+          ]
+        },
+        "allowed_tool_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "retry_policy": {
+      "type": "object",
+      "required": [
+        "max_attempts",
+        "retry_on",
+        "backoff_schedule_seconds"
+      ],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "retry_on": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "backoff_schedule_seconds": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "fallback_policy": {
+      "type": "object",
+      "required": [
+        "trigger_conditions",
+        "action",
+        "customer_impact"
+      ],
+      "properties": {
+        "trigger_conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "fallback_model",
+            "contract_error",
+            "feature_flag_disable",
+            "manual_review"
+          ]
+        },
+        "customer_impact": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "output_validation": {
+      "type": "object",
+      "required": [
+        "checks",
+        "failure_mode"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "failure_mode": {
+          "type": "string",
+          "enum": [
+            "fail_closed",
+            "manual_review",
+            "degraded_response_allowed"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,55 @@
+{
+  "artifact": {
+    "approval_requirements": [],
+    "budget_class": "medium",
+    "created_at": "2026-04-22T12:00:00Z",
+    "execution_lane": "guarded",
+    "id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "next_stage": "ticketing",
+    "owner_agent": "Policy Engine",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "risk_tier": "medium",
+    "rollback_class": "reversible_deploy",
+    "source_stage": "policy_engine",
+    "status": "ready",
+    "updated_at": "2026-04-22T12:00:00Z",
+    "version": 1
+  },
+  "autonomy_policy": {
+    "deploy": "human_on_exception",
+    "merge": "autonomous",
+    "rollback": "autonomous"
+  },
+  "budget_policy": {
+    "max_concurrent_work_items": 5,
+    "max_pr_review_cycles": 4,
+    "max_token_budget_usd": 75
+  },
+  "decision": "active_build_candidate",
+  "deployment_policy": {
+    "auto_promote_allowed": true,
+    "feature_flag_required": true,
+    "minimum_request_samples": 1000,
+    "minimum_soak_minutes": 1440,
+    "strategy": "canary_then_soak"
+  },
+  "lane_assignment": {
+    "hard_override_reason": "external_api_contract_change",
+    "lane": "guarded",
+    "locked": true
+  },
+  "reasoning": [
+    "Direct integration signal detected (tool, response format), so this item is concrete enough for the build queue.",
+    "Affected surfaces identified in Stage 1: api_contract, tool_runtime.",
+    "Open questions captured: 1, all currently marked non-blocking."
+  ],
+  "required_approvals": [],
+  "required_eval_tiers": [
+    "pr_smoke",
+    "pre_merge",
+    "nightly",
+    "post_deploy"
+  ],
+  "risk_score": 35,
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862"
+}

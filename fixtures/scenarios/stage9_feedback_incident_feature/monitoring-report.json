@@ -1,0 +1,110 @@
+{
+  "alerts": [
+    {
+      "auto_mitigation_eligible": true,
+      "id": "alert-error-rate-pct-high-production-error-rate-regression",
+      "metric": "error_rate_pct",
+      "observed_value": 1.1,
+      "severity": "high",
+      "status": "mitigated",
+      "summary": "Error rate exceeded the allowed production threshold.",
+      "threshold_value": 0.75,
+      "title": "Production error rate regression"
+    }
+  ],
+  "artifact": {
+    "approval_requirements": [],
+    "blocking_issues": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "budget_class": "medium",
+    "created_at": "2026-04-22T18:27:28Z",
+    "execution_lane": "guarded",
+    "id": "monitoring-report-attempt-1-prv-4-spec-anthropic-2026-04-20-april-20-202",
+    "model_fingerprint": "sre_sentinel.v1",
+    "next_stage": "feedback_synthesis",
+    "owner_agent": "SRE Sentinel",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "risk_tier": "medium",
+    "rollback_class": "reversible_deploy",
+    "source_stage": "production_monitoring",
+    "status": "blocked",
+    "updated_at": "2026-04-22T18:27:28Z",
+    "version": 1
+  },
+  "build_attempt": 1,
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "incident": {
+    "detection_time_minutes": 45,
+    "page_targets": [
+      "lead_engineer",
+      "core_builder"
+    ],
+    "regressions": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "security_anomaly": false,
+    "severity": "high",
+    "status": "mitigated"
+  },
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "mitigation": {
+    "action": "feature_flag_disable",
+    "autonomous_allowed": true,
+    "executed": true,
+    "notes": [
+      "SRE Sentinel executed the pre-approved mitigation automatically.",
+      "The feature flag was disabled to stop the regression path."
+    ],
+    "result": "successful"
+  },
+  "monitored_pr_artifact_version": 4,
+  "monitoring_decision": {
+    "mode": "auto",
+    "rationale": "Production regression was detected and mitigated automatically within the approved policy.",
+    "status": "auto_mitigated"
+  },
+  "monitoring_window": {
+    "detection_time_minutes": 45,
+    "environment": "production",
+    "observed_window_minutes": 240,
+    "regression_detection_slo_hours": 4,
+    "traffic_mode": "canary"
+  },
+  "observed_metrics": {
+    "business_kpi_proxy": 0.97,
+    "cost_per_call_usd": 0.0274,
+    "error_rate_pct": 1.1,
+    "fallback_rate_pct": 0.7,
+    "p95_latency_ms": 2198,
+    "quality_score": 0.92
+  },
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "promotion_decision_id": "promotion-decision-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-20",
+  "resulting_pr_artifact_version": 5,
+  "security_review_id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "summary": {
+    "follow_up_actions": [
+      "Create an incident learning packet for Stage 9.",
+      "Open remediation work for the core builder before reenabling the feature.",
+      "The feature flag was disabled to stop the regression path."
+    ],
+    "regressions": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "watch_items": [
+      "Production rollout mode remains canary.",
+      "Alert routing keeps the lead engineer first and the core builder second.",
+      "Autonomous mitigation succeeded; keep dashboards pinned until the feature is stable again."
+    ]
+  },
+  "thresholds": {
+    "max_cost_per_call_usd": 0.0308,
+    "max_error_rate_pct": 0.75,
+    "max_fallback_rate_pct": 3.0,
+    "max_p95_latency_ms": 2493,
+    "min_business_kpi_proxy": 0.93,
+    "min_quality_score": 0.81
+  }
+}

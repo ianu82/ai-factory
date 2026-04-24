@@ -1,0 +1,71 @@
+{
+  "artifact": {
+    "id": "feedback-report-attempt-1-prv-5-spec-anthropic-2026-04-20-april-20-2026",
+    "version": 1,
+    "source_stage": "feedback_synthesis",
+    "next_stage": "stage1_intake",
+    "status": "ready",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Feedback Synthesizer",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "feedback_synthesizer.v1",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "blocking_issues": [],
+    "created_at": "2026-04-22T21:00:08Z",
+    "updated_at": "2026-04-22T21:00:08Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "ticket_bundle_id": "ticket-bundle-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "eval_manifest_id": "eval-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "monitoring_report_id": "monitoring-report-attempt-1-prv-4-spec-anthropic-2026-04-20-april-20-202",
+  "promotion_decision_id": "promotion-decision-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-20",
+  "security_review_id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "analyzed_pr_artifact_version": 5,
+  "feedback_window": {
+    "mode": "weekly_rollup",
+    "monitored_environment": "production",
+    "lookback_days": 7,
+    "trigger": "scheduled_rollup",
+    "source_monitoring_status": "healthy"
+  },
+  "signals": {
+    "production_incidents": [],
+    "unexpected_user_behaviors": [],
+    "spec_mismatches": [],
+    "eval_misses": [],
+    "positive_surprises": []
+  },
+  "incident_learning_packets": [],
+  "spec_feedback": {
+    "corrections": [],
+    "acceptance_updates": [],
+    "open_questions": []
+  },
+  "eval_improvements": [],
+  "guardrail_recommendations": [],
+  "backlog_candidates": [],
+  "upstream_feedback": {
+    "should_send": false,
+    "messages": []
+  },
+  "rendered_outputs": {
+    "weekly_factory_report_md": "# Weekly Factory Report: Support response format tool mode for tool results\n\n- Mode: weekly_rollup\n- Production incidents: 0\n- Unexpected user behaviors: 0\n- Eval improvements: 0\n- Backlog candidates: 0",
+    "spec_feedback_md": "# Spec Feedback: Support response format tool mode for tool results\n\n## Corrections\n- No spec corrections were synthesized this window.\n\n## Acceptance Updates\n- No acceptance updates were synthesized this window.",
+    "incident_learning_packets_md": []
+  },
+  "summary": {
+    "themes": [
+      "steady_state"
+    ],
+    "top_actions": [],
+    "learning_count": 0,
+    "incident_count": 0
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "artifact": {
+    "id": "monitoring-report-attempt-1-prv-7-spec-anthropic-2026-04-20-april-20-202",
+    "version": 1,
+    "source_stage": "production_monitoring",
+    "next_stage": "human_incident_response",
+    "status": "blocked",
+    "risk_tier": "medium",
+    "execution_lane": "restricted",
+    "owner_agent": "SRE Sentinel",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "sre_sentinel.v1",
+    "budget_class": "large",
+    "rollback_class": "manual_recovery_required",
+    "approval_requirements": [
+      "security",
+      "merge",
+      "release"
+    ],
+    "blocking_issues": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "created_at": "2026-04-23T11:13:24Z",
+    "updated_at": "2026-04-23T11:13:24Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "promotion_decision_id": "promotion-decision-attempt-1-prv-6-spec-anthropic-2026-04-20-april-20-20",
+  "security_review_id": "security-review-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-2026",
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "monitored_pr_artifact_version": 7,
+  "resulting_pr_artifact_version": 8,
+  "monitoring_window": {
+    "environment": "production",
+    "traffic_mode": "staged_rollout",
+    "observed_window_minutes": 240,
+    "detection_time_minutes": 45,
+    "regression_detection_slo_hours": 4
+  },
+  "thresholds": {
+    "max_error_rate_pct": 0.5,
+    "max_p95_latency_ms": 2493,
+    "max_cost_per_call_usd": 0.0308,
+    "min_quality_score": 0.81,
+    "max_fallback_rate_pct": 2.0,
+    "min_business_kpi_proxy": 0.95
+  },
+  "observed_metrics": {
+    "error_rate_pct": 0.8,
+    "p95_latency_ms": 2198,
+    "cost_per_call_usd": 0.0274,
+    "quality_score": 0.92,
+    "fallback_rate_pct": 0.9,
+    "business_kpi_proxy": 0.96
+  },
+  "alerts": [
+    {
+      "id": "alert-error-rate-pct-high-production-error-rate-regression",
+      "title": "Production error rate regression",
+      "metric": "error_rate_pct",
+      "severity": "high",
+      "status": "escalated",
+      "summary": "Error rate exceeded the allowed production threshold.",
+      "observed_value": 0.8,
+      "threshold_value": 0.5,
+      "auto_mitigation_eligible": false
+    }
+  ],
+  "incident": {
+    "status": "escalated",
+    "severity": "high",
+    "page_targets": [
+      "lead_engineer",
+      "core_builder"
+    ],
+    "detection_time_minutes": 45,
+    "regressions": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "security_anomaly": false
+  },
+  "mitigation": {
+    "action": "feature_flag_disable",
+    "autonomous_allowed": false,
+    "executed": false,
+    "result": "blocked_by_policy",
+    "notes": [
+      "Lane policy blocked autonomous rollback, so human incident response is required.",
+      "Lead engineer and core builder were paged for manual mitigation."
+    ]
+  },
+  "monitoring_decision": {
+    "status": "human_escalated",
+    "mode": "human_required",
+    "rationale": "Production regression was detected, but policy requires human incident response."
+  },
+  "summary": {
+    "regressions": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "watch_items": [
+      "Production rollout mode remains staged_rollout.",
+      "Alert routing keeps the lead engineer first and the core builder second.",
+      "Human incident response is required before reenabling production traffic."
+    ],
+    "follow_up_actions": [
+      "Lead engineer acknowledged the page.",
+      "Core builder joins manual incident response.",
+      "Create an incident learning packet for Stage 9 after mitigation completes."
+    ]
+  }
+}

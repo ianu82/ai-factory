@@ -1,0 +1,99 @@
+{
+  "artifact": {
+    "approval_requirements": [],
+    "blocking_issues": [],
+    "budget_class": "medium",
+    "created_at": "2026-04-22T16:20:36Z",
+    "execution_lane": "guarded",
+    "id": "promotion-decision-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-20",
+    "model_fingerprint": "release_manager.v1",
+    "next_stage": "production_monitoring",
+    "owner_agent": "Release Manager",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "risk_tier": "medium",
+    "rollback_class": "reversible_deploy",
+    "source_stage": "release_staging",
+    "status": "approved",
+    "updated_at": "2026-04-22T16:20:36Z",
+    "version": 1
+  },
+  "build_attempt": 1,
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "evaluated_pr_artifact_version": 3,
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "promotion_decision": {
+    "approvals_granted": [],
+    "mode": "auto",
+    "pending_approvals": [],
+    "rationale": "Staging soak thresholds passed and autonomous promotion is allowed for this lane.",
+    "status": "promoted"
+  },
+  "release_runbook": {
+    "auto_promote_allowed": true,
+    "feature_flag": "anthropic_2026_04_20_april_20_2026_25307862",
+    "staged_steps": [
+      "Deploy behind a feature flag in staging.",
+      "Route a bounded canary slice through the new path.",
+      "Promote after soak thresholds and sample size both hold."
+    ],
+    "strategy": "canary_then_soak",
+    "traffic_mode": "canary"
+  },
+  "resulting_pr_artifact_version": 4,
+  "rollback_plan": {
+    "blast_radius": "multi_service",
+    "rollback_class": "reversible_deploy",
+    "steps": [
+      "Disable the rollout feature flag immediately.",
+      "Disable rollout traffic, revert the deploy, and preserve compatibility fallbacks.",
+      "Verify the old path serves traffic before resuming promotion."
+    ],
+    "tested": true,
+    "trigger_conditions": [
+      "Error rate exceeds the configured budget.",
+      "Latency regresses past the allowed baseline delta.",
+      "Cost per call regresses past the allowed baseline delta.",
+      "Quality score or fallback frequency regresses unexpectedly."
+    ]
+  },
+  "security_review_id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "staging_report": {
+    "environment": "canary",
+    "feature_flag_enabled": true,
+    "metrics": {
+      "business_kpi_proxy": 0.96,
+      "cost_per_call_usd": 0.0269,
+      "error_rate_pct": 0.3,
+      "fallback_rate_pct": 0.8,
+      "p95_latency_ms": 2130,
+      "quality_score": 0.91
+    },
+    "minimum_request_samples": 1000,
+    "minimum_soak_minutes": 1440,
+    "request_samples_observed": 1000,
+    "rollback_tested": true,
+    "soak_minutes_observed": 1440,
+    "threshold_breaches": [],
+    "traffic_mode": "canary"
+  },
+  "summary": {
+    "passed_checks": [
+      "Minimum soak duration met.",
+      "Minimum request sample threshold met.",
+      "Error rate stayed within the rollout budget.",
+      "Latency stayed within the allowed regression threshold.",
+      "Cost stayed within the allowed regression threshold.",
+      "Quality score stayed above the minimum rollout floor.",
+      "Fallback rate stayed within the rollout budget.",
+      "Business KPI proxy stayed above the minimum rollout floor.",
+      "Rollback path was tested before promotion."
+    ],
+    "threshold_breaches": [],
+    "watch_items": [
+      "Traffic mode in effect: canary.",
+      "Production dashboards should stay pinned during the initial rollout window."
+    ]
+  }
+}

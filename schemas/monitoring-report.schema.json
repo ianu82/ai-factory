@@ -1,0 +1,618 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/monitoring-report.schema.json",
+  "title": "Production Monitoring Report",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "pr_packet_id",
+    "promotion_decision_id",
+    "security_review_id",
+    "eval_report_id",
+    "latency_baseline_id",
+    "build_attempt",
+    "monitored_pr_artifact_version",
+    "resulting_pr_artifact_version",
+    "monitoring_window",
+    "thresholds",
+    "observed_metrics",
+    "alerts",
+    "incident",
+    "mitigation",
+    "monitoring_decision",
+    "summary"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pr_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "promotion_decision_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "security_review_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "eval_report_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "latency_baseline_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "build_attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "monitored_pr_artifact_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "resulting_pr_artifact_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "monitoring_window": {
+      "type": "object",
+      "required": [
+        "environment",
+        "traffic_mode",
+        "observed_window_minutes",
+        "detection_time_minutes",
+        "regression_detection_slo_hours"
+      ],
+      "properties": {
+        "environment": {
+          "type": "string",
+          "enum": [
+            "production"
+          ]
+        },
+        "traffic_mode": {
+          "type": "string",
+          "enum": [
+            "shadow",
+            "canary",
+            "staged_rollout"
+          ]
+        },
+        "observed_window_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "detection_time_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "regression_detection_slo_hours": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "thresholds": {
+      "type": "object",
+      "required": [
+        "max_error_rate_pct",
+        "max_p95_latency_ms",
+        "max_cost_per_call_usd",
+        "min_quality_score",
+        "max_fallback_rate_pct",
+        "min_business_kpi_proxy"
+      ],
+      "properties": {
+        "max_error_rate_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_p95_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_cost_per_call_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "min_quality_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_fallback_rate_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "min_business_kpi_proxy": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "observed_metrics": {
+      "type": "object",
+      "required": [
+        "error_rate_pct",
+        "p95_latency_ms",
+        "cost_per_call_usd",
+        "quality_score",
+        "fallback_rate_pct",
+        "business_kpi_proxy"
+      ],
+      "properties": {
+        "error_rate_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p95_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_per_call_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "quality_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "fallback_rate_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "business_kpi_proxy": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "alerts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "metric",
+          "severity",
+          "status",
+          "summary",
+          "observed_value",
+          "threshold_value",
+          "auto_mitigation_eligible"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "error_rate_pct",
+              "p95_latency_ms",
+              "cost_per_call_usd",
+              "quality_score",
+              "fallback_rate_pct",
+              "business_kpi_proxy",
+              "security_anomaly"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "medium",
+              "high",
+              "critical"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "mitigated",
+              "escalated"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "observed_value": {
+            "type": [
+              "number",
+              "integer",
+              "boolean"
+            ]
+          },
+          "threshold_value": {
+            "type": [
+              "number",
+              "integer",
+              "boolean"
+            ]
+          },
+          "auto_mitigation_eligible": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "incident": {
+      "type": "object",
+      "required": [
+        "status",
+        "severity",
+        "page_targets",
+        "detection_time_minutes",
+        "regressions",
+        "security_anomaly"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "none",
+            "mitigated",
+            "escalated"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "none",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "page_targets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "lead_engineer",
+              "core_builder"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "detection_time_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "regressions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "security_anomaly": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "mitigation": {
+      "type": "object",
+      "required": [
+        "action",
+        "autonomous_allowed",
+        "executed",
+        "result",
+        "notes"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "none",
+            "feature_flag_disable",
+            "rollback",
+            "kill_switch"
+          ]
+        },
+        "autonomous_allowed": {
+          "type": "boolean"
+        },
+        "executed": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "not_needed",
+            "successful",
+            "blocked_by_policy"
+          ]
+        },
+        "notes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "monitoring_decision": {
+      "type": "object",
+      "required": [
+        "status",
+        "mode",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "healthy",
+            "auto_mitigated",
+            "human_escalated"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "human_required"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "regressions",
+        "watch_items",
+        "follow_up_actions"
+      ],
+      "properties": {
+        "regressions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "watch_items": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "follow_up_actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "monitoring_decision": {
+            "properties": {
+              "status": {
+                "const": "healthy"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "monitoring_decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "alerts": {
+            "maxItems": 0
+          },
+          "incident": {
+            "properties": {
+              "status": {
+                "const": "none"
+              },
+              "severity": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "status",
+              "severity"
+            ]
+          },
+          "mitigation": {
+            "properties": {
+              "action": {
+                "const": "none"
+              },
+              "executed": {
+                "const": false
+              },
+              "result": {
+                "const": "not_needed"
+              }
+            },
+            "required": [
+              "action",
+              "executed",
+              "result"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "monitoring_decision": {
+            "properties": {
+              "status": {
+                "const": "auto_mitigated"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "monitoring_decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "alerts": {
+            "minItems": 1
+          },
+          "incident": {
+            "properties": {
+              "status": {
+                "const": "mitigated"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "mitigation": {
+            "properties": {
+              "executed": {
+                "const": true
+              },
+              "result": {
+                "const": "successful"
+              }
+            },
+            "required": [
+              "executed",
+              "result"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "monitoring_decision": {
+            "properties": {
+              "status": {
+                "const": "human_escalated"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "monitoring_decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "alerts": {
+            "minItems": 1
+          },
+          "incident": {
+            "properties": {
+              "status": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "mitigation": {
+            "properties": {
+              "executed": {
+                "const": false
+              },
+              "result": {
+                "const": "blocked_by_policy"
+              }
+            },
+            "required": [
+              "executed",
+              "result"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mitigation": {
+            "properties": {
+              "action": {
+                "const": "kill_switch"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          }
+        },
+        "required": [
+          "mitigation"
+        ]
+      },
+      "then": {
+        "properties": {
+          "incident": {
+            "properties": {
+              "security_anomaly": {
+                "const": true
+              }
+            },
+            "required": [
+              "security_anomaly"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

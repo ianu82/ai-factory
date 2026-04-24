@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/common.schema.json",
+  "title": "Common Factory Schema Definitions",
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "stageName": {
+      "type": "string",
+      "pattern": "^[a-z0-9_:-]+$"
+    },
+    "controllerState": {
+      "type": "string",
+      "enum": [
+        "DETECTED",
+        "SCREENING",
+        "WATCHLISTED",
+        "REJECTED",
+        "SPEC_DRAFTING",
+        "SPEC_READY",
+        "POLICY_ASSIGNED",
+        "TICKETING",
+        "TICKETED",
+        "BUILD_READY",
+        "BUILDING",
+        "PR_OPEN",
+        "REVIEWING",
+        "PR_REVISION",
+        "PR_REVIEWABLE",
+        "PR_MERGEABLE",
+        "SECURITY_REVIEWING",
+        "SECURITY_APPROVED",
+        "MERGE_REVIEWING",
+        "MERGED",
+        "STAGING_SOAK",
+        "PRODUCTION_MONITORING",
+        "DEAD_LETTER"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "in_progress",
+        "ready",
+        "blocked",
+        "approved",
+        "rejected",
+        "dead_lettered",
+        "superseded"
+      ]
+    },
+    "riskTier": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "executionLane": {
+      "type": "string",
+      "enum": [
+        "fast",
+        "guarded",
+        "restricted"
+      ]
+    },
+    "budgetClass": {
+      "type": "string",
+      "enum": [
+        "small",
+        "medium",
+        "large",
+        "custom"
+      ]
+    },
+    "approvalRequirement": {
+      "type": "string",
+      "enum": [
+        "none",
+        "security",
+        "merge",
+        "release",
+        "product",
+        "operations",
+        "policy_waiver"
+      ]
+    },
+    "evalTier": {
+      "type": "string",
+      "enum": [
+        "pr_smoke",
+        "pre_merge",
+        "nightly",
+        "post_deploy"
+      ]
+    },
+    "evalCheckKind": {
+      "type": "string",
+      "enum": [
+        "lint",
+        "typecheck",
+        "unit",
+        "contract",
+        "integration",
+        "latency",
+        "cost",
+        "llm_quality",
+        "migration_safety",
+        "adversarial"
+      ]
+    },
+    "evalCheckStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "passed",
+        "failed"
+      ]
+    },
+    "evalTierStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "passed",
+        "failed",
+        "warning"
+      ]
+    },
+    "mergeExecutionStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "pending_human",
+        "merged",
+        "blocked"
+      ]
+    },
+    "mergeMethod": {
+      "type": "string",
+      "enum": [
+        "squash",
+        "merge_commit",
+        "rebase"
+      ]
+    },
+    "rollbackClass": {
+      "type": "string",
+      "enum": [
+        "none",
+        "immediate_flag_disable",
+        "reversible_deploy",
+        "forward_fix_only",
+        "manual_recovery_required"
+      ]
+    },
+    "securitySeverity": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "securityCheckStatus": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "needs_human_review"
+      ]
+    },
+    "securitySignoffStatus": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "pending_human",
+        "blocked"
+      ]
+    },
+    "securitySignoffMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "human_required",
+        "human_approved"
+      ]
+    },
+    "link": {
+      "type": "object",
+      "required": [
+        "title",
+        "href"
+      ],
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "href": {
+          "type": "string",
+          "format": "uri"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifactMetadata": {
+      "type": "object",
+      "required": [
+        "id",
+        "version",
+        "source_stage",
+        "next_stage",
+        "status",
+        "owner_agent",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_stage": {
+          "$ref": "#/$defs/stageName"
+        },
+        "next_stage": {
+          "$ref": "#/$defs/stageName"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "risk_tier": {
+          "$ref": "#/$defs/riskTier"
+        },
+        "execution_lane": {
+          "$ref": "#/$defs/executionLane"
+        },
+        "owner_agent": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "policy_decision_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "model_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "budget_class": {
+          "$ref": "#/$defs/budgetClass"
+        },
+        "blocking_issues": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "default": []
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/link"
+          },
+          "default": []
+        },
+        "rollback_class": {
+          "$ref": "#/$defs/rollbackClass"
+        },
+        "approval_requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/approvalRequirement"
+          }
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifactMetadataRiskAware": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/artifactMetadata"
+        },
+        {
+          "type": "object",
+          "required": [
+            "risk_tier",
+            "rollback_class"
+          ]
+        }
+      ]
+    },
+    "artifactMetadataPolicyBound": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/artifactMetadata"
+        },
+        {
+          "type": "object",
+          "required": [
+            "risk_tier",
+            "execution_lane",
+            "policy_decision_id",
+            "budget_class",
+            "rollback_class",
+            "approval_requirements"
+          ]
+        }
+      ]
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "required": [
+        "id",
+        "description",
+        "verification_method"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "description": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "verification_method": {
+          "type": "string",
+          "enum": [
+            "unit",
+            "integration",
+            "eval",
+            "manual"
+          ]
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "openQuestion": {
+      "type": "object",
+      "required": [
+        "id",
+        "question",
+        "blocking",
+        "resolution_status"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "question": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "resolution_status": {
+          "type": "string",
+          "enum": [
+            "unresolved",
+            "resolved",
+            "non_blocking"
+          ]
+        },
+        "resolution_notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "riskFactor": {
+      "type": "object",
+      "required": [
+        "name",
+        "score"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

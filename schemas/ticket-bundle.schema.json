@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/ticket-bundle.schema.json",
+  "title": "Ticket Bundle",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "eval_manifest_id",
+    "tickets",
+    "dependency_graph"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "eval_manifest_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tickets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "kind",
+          "summary",
+          "scope",
+          "definition_of_done",
+          "known_edge_cases",
+          "non_goals",
+          "eta_days",
+          "risk_tier",
+          "execution_lane",
+          "required_eval_tiers",
+          "allowed_tools",
+          "secret_scope",
+          "rollback_strategy",
+          "acceptance_criteria_refs"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "backend",
+              "frontend",
+              "llm_integration",
+              "security",
+              "infra",
+              "data"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scope": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "definition_of_done": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "known_edge_cases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "non_goals": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "eta_days": {
+            "type": "number",
+            "minimum": 0.25,
+            "maximum": 2
+          },
+          "risk_tier": {
+            "$ref": "common.schema.json#/$defs/riskTier"
+          },
+          "execution_lane": {
+            "$ref": "common.schema.json#/$defs/executionLane"
+          },
+          "required_eval_tiers": {
+            "type": "array",
+            "items": {
+              "$ref": "common.schema.json#/$defs/evalTier"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "secret_scope": {
+            "type": "string",
+            "enum": [
+              "none",
+              "read_only",
+              "scoped_write",
+              "elevated"
+            ]
+          },
+          "rollback_strategy": {
+            "type": "string",
+            "minLength": 1
+          },
+          "acceptance_criteria_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "dependency_graph": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "from",
+          "to",
+          "type"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "minLength": 1
+          },
+          "to": {
+            "type": "string",
+            "minLength": 1
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "blocks",
+              "follows",
+              "parallelizable"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "budget_summary": {
+      "type": "object",
+      "properties": {
+        "total_token_budget_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

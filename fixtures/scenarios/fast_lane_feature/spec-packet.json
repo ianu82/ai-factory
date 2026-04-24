@@ -1,0 +1,78 @@
+{
+  "artifact": {
+    "id": "spec-fast-001",
+    "version": 1,
+    "source_stage": "spec_drafting",
+    "next_stage": "policy_assignment",
+    "status": "ready",
+    "risk_tier": "low",
+    "owner_agent": "Clarifier",
+    "rollback_class": "immediate_flag_disable",
+    "created_at": "2026-04-22T12:15:00Z",
+    "updated_at": "2026-04-22T12:45:00Z"
+  },
+  "source": {
+    "provider": "anthropic",
+    "kind": "changelog",
+    "external_id": "feature-2026-04-fast",
+    "title": "Support response format tool mode",
+    "url": "https://example.com/anthropic/changelog/feature-2026-04-fast",
+    "detected_at": "2026-04-22T12:00:00Z"
+  },
+  "summary": {
+    "problem": "Tool mode should support explicit response format selection for internal integrations.",
+    "proposed_capability": "Expose a low-risk backend configuration path for response format tool mode.",
+    "why_now": "The changelog feature unblocks a cleaner internal API surface with minimal blast radius.",
+    "affected_surfaces": [
+      "internal_api"
+    ],
+    "assumptions": [
+      "The feature remains behind a flag during rollout."
+    ],
+    "non_goals": [
+      "No user-facing UI changes are included in this ticket."
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "id": "ac-fast-001",
+      "description": "Internal callers can opt into the new response format tool mode.",
+      "verification_method": "integration",
+      "required": true
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "q-fast-001",
+      "question": "Should we broaden golden-set coverage before rollout?",
+      "blocking": false,
+      "resolution_status": "non_blocking",
+      "resolution_notes": "Track as a nightly follow-up."
+    }
+  ],
+  "risk_profile": {
+    "risk_score": 25,
+    "data_classification": "internal",
+    "blast_radius": "single_service",
+    "rollback_class": "immediate_flag_disable",
+    "factors": [
+      {
+        "name": "user_visible",
+        "score": 15,
+        "notes": "The change is visible only to internal callers."
+      },
+      {
+        "name": "low_test_coverage_area",
+        "score": 10,
+        "notes": "The route has lighter than ideal existing coverage."
+      }
+    ]
+  },
+  "relevance": {
+    "decision": "active_build_candidate",
+    "rationale": "The feature is relevant to the internal API roadmap and can ship through the fast lane.",
+    "confidence": 0.87,
+    "expected_roi": "medium",
+    "enqueue": true
+  }
+}

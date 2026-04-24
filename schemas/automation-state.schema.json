@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/automation-state.schema.json",
+  "title": "Automation State",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "seen_source_external_ids",
+    "weekly_feedback_windows",
+    "last_stage1_cycle_at",
+    "last_stage9_cycle_at",
+    "updated_at"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "seen_source_external_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "weekly_feedback_windows": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^\\d{4}-W\\d{2}$"
+      }
+    },
+    "last_stage1_cycle_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_stage9_cycle_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

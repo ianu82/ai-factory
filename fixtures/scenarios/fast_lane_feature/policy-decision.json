@@ -1,0 +1,52 @@
+{
+  "artifact": {
+    "id": "policy-fast-001",
+    "version": 1,
+    "source_stage": "policy_engine",
+    "next_stage": "ticketing",
+    "status": "ready",
+    "risk_tier": "low",
+    "execution_lane": "fast",
+    "owner_agent": "Policy Engine",
+    "policy_decision_id": "policy-fast-001",
+    "budget_class": "small",
+    "rollback_class": "immediate_flag_disable",
+    "approval_requirements": [],
+    "created_at": "2026-04-22T12:50:00Z",
+    "updated_at": "2026-04-22T12:50:00Z"
+  },
+  "spec_packet_id": "spec-fast-001",
+  "decision": "active_build_candidate",
+  "risk_score": 25,
+  "lane_assignment": {
+    "lane": "fast",
+    "locked": false,
+    "hard_override_reason": null
+  },
+  "required_eval_tiers": [
+    "pr_smoke",
+    "pre_merge"
+  ],
+  "autonomy_policy": {
+    "merge": "autonomous",
+    "deploy": "autonomous",
+    "rollback": "autonomous"
+  },
+  "budget_policy": {
+    "max_pr_review_cycles": 3,
+    "max_token_budget_usd": 25,
+    "max_concurrent_work_items": 10
+  },
+  "deployment_policy": {
+    "feature_flag_required": true,
+    "strategy": "short_soak_or_shadow",
+    "minimum_soak_minutes": 60,
+    "minimum_request_samples": 200,
+    "auto_promote_allowed": true
+  },
+  "required_approvals": [],
+  "reasoning": [
+    "The weighted risk score remains within the fast-lane band.",
+    "No hard override flags were triggered."
+  ]
+}

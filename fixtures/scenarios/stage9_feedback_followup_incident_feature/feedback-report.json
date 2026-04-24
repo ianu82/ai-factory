@@ -1,0 +1,145 @@
+{
+  "artifact": {
+    "id": "feedback-report-attempt-1-prv-6-spec-anthropic-2026-04-20-april-20-2026",
+    "version": 1,
+    "source_stage": "feedback_synthesis",
+    "next_stage": "stage1_intake",
+    "status": "ready",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "Feedback Synthesizer",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "feedback_synthesizer.v1",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "blocking_issues": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "created_at": "2026-04-22T21:00:08Z",
+    "updated_at": "2026-04-22T21:00:08Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "ticket_bundle_id": "ticket-bundle-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "eval_manifest_id": "eval-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "monitoring_report_id": "monitoring-report-attempt-1-prv-5-spec-anthropic-2026-04-20-april-20-202",
+  "promotion_decision_id": "promotion-decision-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-20",
+  "security_review_id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "analyzed_pr_artifact_version": 6,
+  "feedback_window": {
+    "mode": "incident_follow_up",
+    "monitored_environment": "production",
+    "lookback_days": 7,
+    "trigger": "incident_signal",
+    "source_monitoring_status": "healthy"
+  },
+  "signals": {
+    "production_incidents": [
+      "Error rate exceeded the allowed production threshold."
+    ],
+    "unexpected_user_behaviors": [],
+    "spec_mismatches": [
+      "Update acceptance criteria for 'Support response format tool mode for tool results' so production guardrails and rollback expectations are explicit."
+    ],
+    "eval_misses": [
+      "Merge-gating eval coverage missed this production regression: Error rate exceeded the allowed production threshold."
+    ],
+    "positive_surprises": []
+  },
+  "incident_learning_packets": [
+    {
+      "id": "incident-learning-support-response-format-tool-mode-for-tool-results-med",
+      "title": "Incident learning for Support response format tool mode for tool results",
+      "severity": "medium",
+      "status": "captured",
+      "summary": "A prior production incident remains open even though the latest monitoring window was healthy.",
+      "action_items": [
+        "Continue monitoring against the four-hour regression-detection SLO.",
+        "Backfill acceptance and eval coverage for: Error rate exceeded the allowed production threshold."
+      ]
+    }
+  ],
+  "spec_feedback": {
+    "corrections": [
+      "Update acceptance criteria for 'Support response format tool mode for tool results' so production guardrails and rollback expectations are explicit."
+    ],
+    "acceptance_updates": [
+      "Add an acceptance criterion that prevents: Error rate exceeded the allowed production threshold."
+    ],
+    "open_questions": []
+  },
+  "eval_improvements": [
+    {
+      "id": "eval-improvement-error-rate",
+      "title": "Backfill error-rate regression coverage",
+      "summary": "Merge-gating eval coverage missed this production regression: Error rate exceeded the allowed production threshold.",
+      "target_tier": "pre_merge",
+      "check_kind": "integration"
+    }
+  ],
+  "guardrail_recommendations": [
+    {
+      "id": "guardrail-incident-follow-up-linkage",
+      "title": "Keep incident follow-up linked to production monitoring",
+      "summary": "Do not clear incident backlog until corrective work has shipped and soaked.",
+      "review_required": false
+    }
+  ],
+  "backlog_candidates": [
+    {
+      "id": "backlog-spec-feedback",
+      "title": "Fold production learnings back into the spec",
+      "category": "spec_correction",
+      "priority": "high",
+      "rationale": "Production learnings changed either the accepted behavior or the rollout assumptions."
+    },
+    {
+      "id": "backlog-eval-eval-improvement-error-rate",
+      "title": "Backfill error-rate regression coverage",
+      "category": "eval_gap",
+      "priority": "high",
+      "rationale": "Merge-gating eval coverage missed this production regression: Error rate exceeded the allowed production threshold."
+    },
+    {
+      "id": "backlog-guardrail-guardrail-incident-follow-up-linkage",
+      "title": "Keep incident follow-up linked to production monitoring",
+      "category": "guardrail_change",
+      "priority": "medium",
+      "rationale": "Do not clear incident backlog until corrective work has shipped and soaked."
+    }
+  ],
+  "upstream_feedback": {
+    "should_send": true,
+    "messages": [
+      "Production follow-up for 'Support response format tool mode for tool results': Error rate exceeded the allowed production threshold."
+    ]
+  },
+  "rendered_outputs": {
+    "weekly_factory_report_md": "# Weekly Factory Report: Support response format tool mode for tool results\n\n- Mode: incident_follow_up\n- Production incidents: 1\n- Unexpected user behaviors: 0\n- Eval improvements: 1\n- Backlog candidates: 3\n\n## Incident Signals\n- Error rate exceeded the allowed production threshold.\n\n## Backlog Candidates\n- Fold production learnings back into the spec: Production learnings changed either the accepted behavior or the rollout assumptions.\n- Backfill error-rate regression coverage: Merge-gating eval coverage missed this production regression: Error rate exceeded the allowed production threshold.\n- Keep incident follow-up linked to production monitoring: Do not clear incident backlog until corrective work has shipped and soaked.",
+    "spec_feedback_md": "# Spec Feedback: Support response format tool mode for tool results\n\n## Corrections\n- Update acceptance criteria for 'Support response format tool mode for tool results' so production guardrails and rollback expectations are explicit.\n\n## Acceptance Updates\n- Add an acceptance criterion that prevents: Error rate exceeded the allowed production threshold.",
+    "incident_learning_packets_md": [
+      "# Incident learning for Support response format tool mode for tool results\n\n- Severity: medium\n- Status: captured\n\nA prior production incident remains open even though the latest monitoring window was healthy.\n\n## Action Items\n- Continue monitoring against the four-hour regression-detection SLO.\n- Backfill acceptance and eval coverage for: Error rate exceeded the allowed production threshold."
+    ]
+  },
+  "summary": {
+    "themes": [
+      "production_incident",
+      "spec_correction",
+      "eval_gap",
+      "guardrail_change"
+    ],
+    "top_actions": [
+      "Continue monitoring against the four-hour regression-detection SLO.",
+      "Backfill acceptance and eval coverage for: Error rate exceeded the allowed production threshold.",
+      "Fold production learnings back into the spec",
+      "Backfill error-rate regression coverage",
+      "Keep incident follow-up linked to production monitoring"
+    ],
+    "learning_count": 5,
+    "incident_count": 1
+  }
+}

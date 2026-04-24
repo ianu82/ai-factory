@@ -1,0 +1,74 @@
+{
+  "artifact": {
+    "id": "pr-fast-001",
+    "version": 1,
+    "source_stage": "build",
+    "next_stage": "merge",
+    "status": "approved",
+    "risk_tier": "low",
+    "execution_lane": "fast",
+    "owner_agent": "Reviewer",
+    "policy_decision_id": "policy-fast-001",
+    "budget_class": "small",
+    "rollback_class": "immediate_flag_disable",
+    "approval_requirements": [],
+    "created_at": "2026-04-22T16:30:00Z",
+    "updated_at": "2026-04-22T17:45:00Z"
+  },
+  "spec_packet_id": "spec-fast-001",
+  "ticket_ids": [
+    "ticket-fast-001"
+  ],
+  "eval_manifest_id": "eval-fast-001",
+  "branch_name": "factory/response-format-tool-mode",
+  "pull_request": {
+    "repository": "mindsdb/platform",
+    "number": 42,
+    "url": "https://example.com/mindsdb/platform/pull/42",
+    "title": "Add response format tool mode support"
+  },
+  "summary": {
+    "what_changed": [
+      "Added internal route support for the new tool mode.",
+      "Added tests and feature-flag wiring."
+    ],
+    "key_risks": [
+      "Contract handling for invalid tool mode values must remain stable."
+    ],
+    "migrations": [],
+    "rollback_notes": "Disable the feature flag to return traffic to the previous path."
+  },
+  "changed_paths": [
+    "api/routes/response_format.py",
+    "tests/test_response_format.py"
+  ],
+  "checks": [
+    {
+      "name": "lint",
+      "status": "passed",
+      "url": "https://example.com/checks/lint-fast-001"
+    },
+    {
+      "name": "unit",
+      "status": "passed",
+      "url": "https://example.com/checks/unit-fast-001"
+    },
+    {
+      "name": "integration",
+      "status": "passed",
+      "url": "https://example.com/checks/integration-fast-001"
+    }
+  ],
+  "reviewer_report": {
+    "approved": true,
+    "blocking_findings": [],
+    "non_blocking_findings": [
+      "Add broader nightly coverage once the golden dataset grows."
+    ]
+  },
+  "merge_readiness": {
+    "reviewable": true,
+    "mergeable": true,
+    "blockers": []
+  }
+}

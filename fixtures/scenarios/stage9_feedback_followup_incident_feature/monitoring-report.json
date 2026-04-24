@@ -1,0 +1,86 @@
+{
+  "artifact": {
+    "id": "monitoring-report-attempt-1-prv-5-spec-anthropic-2026-04-20-april-20-202",
+    "version": 1,
+    "source_stage": "production_monitoring",
+    "next_stage": "production_monitoring",
+    "status": "approved",
+    "risk_tier": "medium",
+    "execution_lane": "guarded",
+    "owner_agent": "SRE Sentinel",
+    "policy_decision_id": "policy-anthropic-2026-04-20-april-20-2026-25307862",
+    "model_fingerprint": "sre_sentinel.v1",
+    "budget_class": "medium",
+    "rollback_class": "reversible_deploy",
+    "approval_requirements": [],
+    "blocking_issues": [],
+    "created_at": "2026-04-22T21:00:08Z",
+    "updated_at": "2026-04-22T21:00:08Z"
+  },
+  "spec_packet_id": "spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "pr_packet_id": "pr-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "promotion_decision_id": "promotion-decision-attempt-1-prv-3-spec-anthropic-2026-04-20-april-20-20",
+  "security_review_id": "security-review-attempt-1-prv-2-spec-anthropic-2026-04-20-april-20-2026",
+  "eval_report_id": "eval-report-attempt-1-prv-1-spec-anthropic-2026-04-20-april-20-2",
+  "latency_baseline_id": "latency-spec-anthropic-2026-04-20-april-20-2026-25307862",
+  "build_attempt": 1,
+  "monitored_pr_artifact_version": 5,
+  "resulting_pr_artifact_version": 6,
+  "monitoring_window": {
+    "environment": "production",
+    "traffic_mode": "canary",
+    "observed_window_minutes": 240,
+    "detection_time_minutes": 240,
+    "regression_detection_slo_hours": 4
+  },
+  "thresholds": {
+    "max_error_rate_pct": 0.75,
+    "max_p95_latency_ms": 2493,
+    "max_cost_per_call_usd": 0.0308,
+    "min_quality_score": 0.81,
+    "max_fallback_rate_pct": 3.0,
+    "min_business_kpi_proxy": 0.93
+  },
+  "observed_metrics": {
+    "error_rate_pct": 0.25,
+    "p95_latency_ms": 2198,
+    "cost_per_call_usd": 0.0274,
+    "quality_score": 0.92,
+    "fallback_rate_pct": 0.7,
+    "business_kpi_proxy": 0.97
+  },
+  "alerts": [],
+  "incident": {
+    "status": "none",
+    "severity": "none",
+    "page_targets": [],
+    "detection_time_minutes": 240,
+    "regressions": [],
+    "security_anomaly": false
+  },
+  "mitigation": {
+    "action": "none",
+    "autonomous_allowed": true,
+    "executed": false,
+    "result": "not_needed",
+    "notes": [
+      "No production mitigation was needed."
+    ]
+  },
+  "monitoring_decision": {
+    "status": "healthy",
+    "mode": "auto",
+    "rationale": "Production metrics stayed within the allowed thresholds during the monitoring window."
+  },
+  "summary": {
+    "regressions": [],
+    "watch_items": [
+      "Production rollout mode remains canary.",
+      "Alert routing keeps the lead engineer first and the core builder second.",
+      "No alert thresholds fired during this production monitoring window."
+    ],
+    "follow_up_actions": [
+      "Continue monitoring against the four-hour regression-detection SLO."
+    ]
+  }
+}

@@ -1,0 +1,360 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/merge-decision.schema.json",
+  "title": "Merge Decision",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "pr_packet_id",
+    "security_review_id",
+    "build_attempt",
+    "evaluated_pr_artifact_version",
+    "resulting_pr_artifact_version",
+    "merge_plan",
+    "merge_decision",
+    "summary"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "pr_packet_id": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "security_review_id": {
+      "$ref": "common.schema.json#/$defs/nonEmptyString"
+    },
+    "build_attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "evaluated_pr_artifact_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "resulting_pr_artifact_version": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "merge_plan": {
+      "type": "object",
+      "required": [
+        "target_branch",
+        "method",
+        "autonomy_mode",
+        "required_approvals",
+        "approvals_granted",
+        "pending_approvals"
+      ],
+      "properties": {
+        "target_branch": {
+          "$ref": "common.schema.json#/$defs/nonEmptyString"
+        },
+        "method": {
+          "$ref": "common.schema.json#/$defs/mergeMethod"
+        },
+        "autonomy_mode": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_on_exception",
+            "human_required"
+          ]
+        },
+        "required_approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "approvals_granted": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "pending_approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "merge_decision": {
+      "type": "object",
+      "required": [
+        "status",
+        "mode",
+        "approvals_granted",
+        "pending_approvals",
+        "rationale",
+        "merged_by",
+        "merged_at",
+        "merge_commit_sha"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "merged",
+            "pending_human",
+            "blocked"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "human_approved",
+            "human_required",
+            "blocked"
+          ]
+        },
+        "approvals_granted": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "pending_approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/approvalRequirement"
+          },
+          "uniqueItems": true
+        },
+        "rationale": {
+          "$ref": "common.schema.json#/$defs/nonEmptyString"
+        },
+        "merged_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "merged_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "merge_commit_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{7,40}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "blocking_findings",
+        "watch_findings",
+        "passed_check_ids",
+        "failed_check_ids",
+        "needs_human_review_check_ids"
+      ],
+      "properties": {
+        "blocking_findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "watch_findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "passed_check_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/nonEmptyString"
+          },
+          "uniqueItems": true
+        },
+        "failed_check_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/nonEmptyString"
+          },
+          "uniqueItems": true
+        },
+        "needs_human_review_check_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/nonEmptyString"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "resulting_pr_artifact_version": {
+            "type": "integer"
+          },
+          "evaluated_pr_artifact_version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resulting_pr_artifact_version",
+          "evaluated_pr_artifact_version"
+        ]
+      },
+      "then": {
+        "properties": {
+          "resulting_pr_artifact_version": {
+            "minimum": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "merge_decision": {
+            "properties": {
+              "status": {
+                "const": "merged"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "merge_decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "merge_decision": {
+            "properties": {
+              "pending_approvals": {
+                "maxItems": 0
+              },
+              "merged_by": {
+                "type": "string",
+                "minLength": 1
+              },
+              "merged_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "merge_commit_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{7,40}$"
+              }
+            },
+            "required": [
+              "merged_by",
+              "merged_at",
+              "merge_commit_sha"
+            ]
+          },
+          "summary": {
+            "properties": {
+              "blocking_findings": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "merge_decision": {
+            "properties": {
+              "status": {
+                "const": "pending_human"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "merge_decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "merge_decision": {
+            "properties": {
+              "pending_approvals": {
+                "minItems": 1
+              }
+            }
+          },
+          "summary": {
+            "properties": {
+              "needs_human_review_check_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "merge_decision": {
+            "properties": {
+              "status": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "merge_decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "blocking_findings": {
+                "minItems": 1
+              },
+              "failed_check_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

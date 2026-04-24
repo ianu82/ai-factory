@@ -1,0 +1,64 @@
+{
+  "artifact": {
+    "id": "spec-invalid-001",
+    "version": 1,
+    "source_stage": "spec_drafting",
+    "next_stage": "policy_assignment",
+    "status": "ready",
+    "risk_tier": "medium",
+    "owner_agent": "Clarifier",
+    "rollback_class": "none",
+    "created_at": "2026-04-22T12:00:00Z",
+    "updated_at": "2026-04-22T12:30:00Z"
+  },
+  "source": {
+    "provider": "anthropic",
+    "kind": "changelog",
+    "external_id": "feature-invalid-001",
+    "title": "Invalid enqueue mismatch fixture",
+    "url": "https://example.com/anthropic/changelog/feature-invalid-001",
+    "detected_at": "2026-04-22T12:00:00Z"
+  },
+  "summary": {
+    "problem": "This fixture intentionally mismatches enqueue and decision.",
+    "proposed_capability": "N/A",
+    "why_now": "Exercise the schema conditional.",
+    "affected_surfaces": [
+      "validation"
+    ],
+    "assumptions": [],
+    "non_goals": []
+  },
+  "acceptance_criteria": [
+    {
+      "id": "ac-invalid-001",
+      "description": "This fixture should fail schema validation.",
+      "verification_method": "manual",
+      "required": true
+    }
+  ],
+  "open_questions": [],
+  "risk_profile": {
+    "risk_score": 35,
+    "data_classification": "internal",
+    "blast_radius": "single_service",
+    "rollback_class": "none",
+    "factors": [
+      {
+        "name": "model_behavior_change",
+        "score": 20
+      },
+      {
+        "name": "external_api_contract_change",
+        "score": 15
+      }
+    ]
+  },
+  "relevance": {
+    "decision": "watchlist",
+    "rationale": "This should fail because watchlist entries cannot enqueue.",
+    "confidence": 0.5,
+    "expected_roi": "low",
+    "enqueue": true
+  }
+}

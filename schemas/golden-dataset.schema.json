@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/golden-dataset.schema.json",
+  "title": "Golden Dataset Artifact",
+  "type": "object",
+  "required": [
+    "artifact",
+    "spec_packet_id",
+    "prompt_contract_id",
+    "entries",
+    "failure_injection_cases",
+    "coverage_summary"
+  ],
+  "properties": {
+    "artifact": {
+      "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
+    },
+    "spec_packet_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt_contract_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "scenario",
+          "input",
+          "expected_behavior",
+          "tags",
+          "quality_score_target"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scenario": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input": {
+            "type": "object"
+          },
+          "expected_behavior": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "quality_score_target": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "failure_injection_cases": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "attack_or_failure",
+          "expected_outcome",
+          "tags"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attack_or_failure": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_outcome": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "coverage_summary": {
+      "type": "object",
+      "required": [
+        "happy_path_count",
+        "edge_case_count",
+        "failure_injection_count"
+      ],
+      "properties": {
+        "happy_path_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "edge_case_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failure_injection_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
