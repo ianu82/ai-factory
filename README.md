@@ -68,6 +68,13 @@ The first recurring automation layer is now executable through a persisted run s
 
 The factory can now use a live OpenAI agent for the judgment-heavy drafting work in Stage 2 and Stage 3 while keeping the rest of the stage contracts deterministic and eval-gated.
 
+Edit the repo-local `.env` file or override values in `.env.local`:
+
+- `.env`
+- `.env.local`
+
+The CLI auto-loads `.env` first and `.env.local` second from the current working directory and optional `--repo-root`. Existing shell environment variables still win.
+
 Set the environment:
 
 - `export OPENAI_API_KEY=...`

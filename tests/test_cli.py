@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
+
+import auto_mindsdb_factory.__main__ as cli_main
 from auto_mindsdb_factory.automation import (
     AutomationState,
     FactoryAutomationCoordinator,
@@ -27,6 +31,32 @@ def _history_document(work_item) -> list[dict[str, str | None]]:
         }
         for record in work_item.history
     ]
+
+
+@pytest.fixture(autouse=True)
+def _disable_repo_env_files() -> None:
+    tracked_keys = (
+        "AI_FACTORY_SKIP_ENV_FILES",
+        "OPENAI_API_KEY",
+        "AI_FACTORY_AGENT_PROVIDER",
+        "AI_FACTORY_OPENAI_MODEL",
+        "AI_FACTORY_OPENAI_FALLBACK_MODEL",
+        "AI_FACTORY_OPENAI_REASONING_EFFORT",
+        "AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS",
+        "AI_FACTORY_OPENAI_TIMEOUT_SECONDS",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_PROJECT",
+    )
+    original_values = {key: os.environ.get(key) for key in tracked_keys}
+    os.environ["AI_FACTORY_SKIP_ENV_FILES"] = "1"
+    try:
+        yield
+    finally:
+        for key, value in original_values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def load_stage8_result_document(root: Path, scenario_name: str) -> dict:
@@ -161,6 +191,93 @@ def test_stage2_cli_reports_missing_openai_api_key(capsys, monkeypatch, tmp_path
     assert exit_code == 1
     assert "Stage 2 ticketing failed:" in captured.err
     assert "OPENAI_API_KEY" in captured.err
+
+
+def test_stage2_cli_loads_repo_env_file_before_parser_defaults(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("AI_FACTORY_SKIP_ENV_FILES", raising=False)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".env").write_text(
+        "AI_FACTORY_AGENT_PROVIDER=none\nOPENAI_API_KEY=base-key\n",
+        encoding="utf-8",
+    )
+    (repo_root / ".env.local").write_text(
+        "AI_FACTORY_AGENT_PROVIDER=openai\nOPENAI_API_KEY=local-key\n",
+        encoding="utf-8",
+    )
+    stage1_result = tmp_path / "stage1-result.json"
+    stage1_result.write_text("{}", encoding="utf-8")
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(cli_main, "_load_stage1_result", lambda path: ({}, {}, {}))
+    monkeypatch.setattr(cli_main, "_load_work_item", lambda document, label: object())
+
+    def fake_build_agent_connector(args):
+        captured["agent_provider"] = args.agent_provider
+        captured["openai_api_key"] = os.environ.get("OPENAI_API_KEY", "")
+        return None
+
+    class _Stage2Result:
+        def to_document(self) -> dict[str, bool]:
+            return {"ok": True}
+
+    class _FakeStage2Pipeline:
+        def __init__(self, root, *, agent_connector=None) -> None:
+            self.root = root
+            self.agent_connector = agent_connector
+
+        def process(self, spec_packet, policy_decision, work_item):
+            return _Stage2Result()
+
+    monkeypatch.setattr(cli_main, "_build_agent_connector", fake_build_agent_connector)
+    monkeypatch.setattr(cli_main, "Stage2TicketingPipeline", _FakeStage2Pipeline)
+
+    exit_code = main(
+        [
+            "stage2-ticketing",
+            "--repo-root",
+            str(repo_root),
+            "--stage1-result-file",
+            str(stage1_result),
+        ]
+    )
+    captured_io = capsys.readouterr()
+
+    assert exit_code == 0
+    assert json.loads(captured_io.out) == {"ok": True}
+    assert captured["agent_provider"] == "openai"
+    assert captured["openai_api_key"] == "local-key"
+
+
+def test_validate_contracts_cli_reports_malformed_env_file(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("AI_FACTORY_SKIP_ENV_FILES", raising=False)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".env").write_text("NOT VALID", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "validate-contracts",
+            "--repo-root",
+            str(repo_root),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Environment setup failed:" in captured.err
+    assert "KEY=VALUE" in captured.err
 
 
 def test_stage3_cli_reports_missing_stage2_fields(capsys, tmp_path) -> None:

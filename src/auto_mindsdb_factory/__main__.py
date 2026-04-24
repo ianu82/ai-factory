@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,101 @@ from .vertical_slice import (
     VerticalSliceError,
     build_cockpit_summary,
 )
+
+_ENV_FILE_NAMES = (".env", ".env.local")
+_ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class EnvironmentSetupError(RuntimeError):
+    """Raised when repo-local environment files cannot be parsed safely."""
+
+
+def _argv_repo_root(argv: list[str] | None) -> Path | None:
+    if not argv:
+        return None
+    for index, argument in enumerate(argv):
+        if argument == "--repo-root":
+            if index + 1 >= len(argv):
+                return None
+            return Path(argv[index + 1]).expanduser().resolve()
+        if argument.startswith("--repo-root="):
+            return Path(argument.split("=", 1)[1]).expanduser().resolve()
+    return None
+
+
+def _env_search_roots(argv: list[str] | None) -> list[Path]:
+    roots = [Path.cwd().resolve()]
+    repo_root_override = _argv_repo_root(argv)
+    if repo_root_override is not None and repo_root_override not in roots:
+        roots.append(repo_root_override)
+    return roots
+
+
+def _decode_env_value(raw_value: str, *, path: Path, line_number: int) -> str:
+    if not raw_value:
+        return ""
+    if raw_value[0] not in {"'", '"'}:
+        return raw_value
+    quote = raw_value[0]
+    if len(raw_value) < 2 or raw_value[-1] != quote:
+        raise EnvironmentSetupError(
+            f"{path}:{line_number} has an unterminated quoted value."
+        )
+    inner = raw_value[1:-1]
+    if quote == "'":
+        return inner
+    try:
+        return bytes(inner, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError as exc:
+        raise EnvironmentSetupError(
+            f"{path}:{line_number} contains an invalid escape sequence."
+        ) from exc
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise EnvironmentSetupError(f"Could not read environment file {path}: {exc}") from exc
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        if "=" not in stripped:
+            raise EnvironmentSetupError(
+                f"{path}:{line_number} must use KEY=VALUE format."
+            )
+        name, raw_value = stripped.split("=", 1)
+        name = name.strip()
+        if not _ENV_NAME_PATTERN.fullmatch(name):
+            raise EnvironmentSetupError(
+                f"{path}:{line_number} has an invalid variable name '{name}'."
+            )
+        values[name] = _decode_env_value(raw_value.strip(), path=path, line_number=line_number)
+    return values
+
+
+def _load_local_env_files(argv: list[str] | None = None) -> list[Path]:
+    if os.environ.get("AI_FACTORY_SKIP_ENV_FILES") == "1":
+        return []
+
+    protected = set(os.environ)
+    loaded_paths: list[Path] = []
+    for root in _env_search_roots(argv):
+        for filename in _ENV_FILE_NAMES:
+            path = root / filename
+            if not path.is_file():
+                continue
+            for name, value in _parse_env_file(path).items():
+                if name in protected:
+                    continue
+                os.environ[name] = value
+            loaded_paths.append(path)
+    return loaded_paths
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1702,6 +1798,12 @@ def _parse_metric_overrides(values: list[str]) -> dict[str, float | int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        _load_local_env_files(argv)
+    except EnvironmentSetupError as exc:
+        print(f"Environment setup failed: {exc}", file=sys.stderr)
+        return 1
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
