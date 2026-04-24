@@ -144,7 +144,6 @@ class FactoryVerticalSliceRunner:
             ticket_bundle=stage3_result.ticket_bundle,
             pr_packet=stage3_result.pr_packet,
         )
-        pr_status = self.repo_connector.read_pull_request_status(pr_evidence)
         pr_packet = self._attach_pr_evidence(stage3_result.pr_packet, pr_evidence)
         stage3_document = stage3_result.to_document()
         stage3_document["pr_packet"] = pr_packet
@@ -164,6 +163,7 @@ class FactoryVerticalSliceRunner:
 
         eval_evidence = self._run_eval_connector()
         eval_evidence.assert_passed()
+        pr_status = self.repo_connector.read_pull_request_status(pr_evidence)
         self._write_run_document(
             work_item.work_item_id,
             "vertical-slice-eval-evidence.json",
