@@ -214,6 +214,18 @@ def test_vertical_slice_fails_when_required_evals_fail(tmp_path) -> None:
     with pytest.raises(FactoryConnectorError, match="Required local eval commands failed"):
         _run_with_fakes(tmp_path, eval_connector=FakeEvalConnector(passed=False))
 
+    evidence_path = (
+        tmp_path
+        / "factory-store"
+        / "runs"
+        / "wi-anthropic-2026-04-20-april-20-2026-25307862"
+        / "vertical-slice-eval-evidence.json"
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+    assert evidence["status"] == "failed"
+    assert evidence["commands"][0]["exit_code"] == 1
+
 
 def test_vertical_slice_records_unhealthy_monitoring_feedback(tmp_path) -> None:
     result = _run_with_fakes(tmp_path, ops_connector=UnhealthyOpsConnector())

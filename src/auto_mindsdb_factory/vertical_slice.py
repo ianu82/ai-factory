@@ -164,13 +164,13 @@ class FactoryVerticalSliceRunner:
         work_item = stage4_result.work_item
 
         eval_evidence = self._run_eval_connector()
-        eval_evidence.assert_passed()
-        pr_status = self.repo_connector.read_pull_request_status(pr_evidence)
         self._write_run_document(
             work_item.work_item_id,
             "vertical-slice-eval-evidence.json",
             eval_evidence.to_document(),
         )
+        eval_evidence.assert_passed()
+        pr_status = self.repo_connector.read_pull_request_status(pr_evidence)
         stage5_result = self.stage5.process(
             stage4_result.spec_packet,
             stage4_result.policy_decision,
