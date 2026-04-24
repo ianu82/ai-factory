@@ -17,7 +17,7 @@ from .feedback_synthesis import (
     Stage9FeedbackSynthesisPipeline,
 )
 from .integration import IntegrationError, Stage4IntegrationPipeline
-from .intake import AnthropicScout, IntakeError, Stage1IntakePipeline
+from .intake import AnthropicScout, IntakeError, Stage1IntakePipeline, build_manual_intake_item
 from .merge_orchestration import MergeError, StageMergePipeline
 from .policy import PolicyEngine
 from .production_monitoring import (
@@ -156,6 +156,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the detection timestamp.",
     )
     stage1_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
+    stage1_manual_parser = subparsers.add_parser(
+        "stage1-intake-manual",
+        help="Run the Stage 1 intake flow for a manually supplied issue or change request.",
+    )
+    stage1_manual_parser.add_argument(
+        "--title",
+        required=True,
+        help="Short title for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--body",
+        required=True,
+        help="Detailed body for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--url",
+        required=True,
+        help="Canonical URL for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--provider",
+        default="manual",
+        help="Provider label recorded on the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--external-id",
+        default=None,
+        help="Stable external id for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--published-at",
+        default=None,
+        help="Optional published timestamp or ISO date for the source item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--detected-at",
+        default=None,
+        help="Override the detection timestamp.",
+    )
+    stage1_manual_parser.add_argument(
         "--repo-root",
         type=Path,
         default=None,
@@ -1857,6 +1903,25 @@ def main(argv: list[str] | None = None) -> int:
             result = pipeline.process_item(items[args.entry_index])
         except IntakeError as exc:
             print(f"Stage 1 intake failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result.to_document(), indent=2))
+        return 0
+
+    if args.command == "stage1-intake-manual":
+        item = build_manual_intake_item(
+            title=args.title,
+            body=args.body,
+            url=args.url,
+            provider=args.provider,
+            external_id=args.external_id,
+            detected_at=args.detected_at,
+            published_at=args.published_at,
+        )
+        pipeline = Stage1IntakePipeline(args.repo_root)
+        try:
+            result = pipeline.process_item(item)
+        except IntakeError as exc:
+            print(f"Stage 1 manual intake failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
         return 0

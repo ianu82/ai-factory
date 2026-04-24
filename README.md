@@ -44,6 +44,7 @@ The first recurring automation layer is now executable through a persisted run s
 - `uv run pytest`
 - `uv run auto-mindsdb-factory scout-anthropic --html-file fixtures/intake/anthropic-release-notes-sample.html --limit 3`
 - `uv run auto-mindsdb-factory stage1-intake --html-file fixtures/intake/anthropic-release-notes-sample.html --entry-index 0`
+- `uv run auto-mindsdb-factory stage1-intake-manual --provider github --external-id github-issue-2 --title "Factory cockpit should surface GitHub check conclusions and eval status" --body "Update the factory cockpit JSON schema and dashboard output to include pull request check conclusions, local eval status, and a clear health summary for each run." --url https://github.com/ianu82/ai-factory/issues/2`
 - `uv run auto-mindsdb-factory stage2-ticketing --stage1-result-file stage1-result.json`
 - `uv run auto-mindsdb-factory stage3-build-review --stage2-result-file stage2-result.json`
 - `uv run auto-mindsdb-factory stage4-integration --stage3-result-file stage3-result.json`

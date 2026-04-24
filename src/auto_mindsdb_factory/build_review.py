@@ -112,6 +112,40 @@ class Builder:
             "tests/integration/test_anthropic_client.py",
         ],
     }
+    FACTORY_PATH_HINTS = {
+        "api_contract": [
+            "src/auto_mindsdb_factory/vertical_slice.py",
+            "tests/test_vertical_slice.py",
+        ],
+        "tool_runtime": [
+            "src/auto_mindsdb_factory/connectors.py",
+            "tests/test_connectors.py",
+        ],
+        "model_routing": [
+            "src/auto_mindsdb_factory/vertical_slice.py",
+            "tests/test_vertical_slice.py",
+        ],
+        "sdk": [
+            "src/auto_mindsdb_factory/connectors.py",
+            "tests/test_connectors.py",
+        ],
+        "control_plane": [
+            "src/auto_mindsdb_factory/__main__.py",
+            "tests/test_cli.py",
+        ],
+        "billing": [
+            "src/auto_mindsdb_factory/release_staging.py",
+            "tests/test_release_staging.py",
+        ],
+        "auth": [
+            "src/auto_mindsdb_factory/security_review.py",
+            "tests/test_security_review.py",
+        ],
+        "anthropic_integration": [
+            "src/auto_mindsdb_factory/intake.py",
+            "tests/test_intake.py",
+        ],
+    }
 
     def build_pr_packet(
         self,
@@ -234,11 +268,22 @@ class Builder:
     def _changed_paths(cls, spec_packet: dict[str, Any]) -> list[str]:
         paths: list[str] = []
         for surface in spec_packet["summary"]["affected_surfaces"]:
-            paths.extend(cls.PATH_HINTS.get(surface, []))
+            paths.extend(cls._path_hints_for(spec_packet, surface))
         return cls._dedupe(paths)[:8] or [
             "integrations/anthropic/feature.py",
             "tests/integration/test_anthropic_feature.py",
         ]
+
+    @classmethod
+    def _path_hints_for(cls, spec_packet: dict[str, Any], surface: str) -> list[str]:
+        source = spec_packet.get("source", {})
+        if source.get("kind") == "manual_intake" and source.get("provider") in {
+            "github",
+            "internal",
+            "manual",
+        }:
+            return cls.FACTORY_PATH_HINTS.get(surface, cls.PATH_HINTS.get(surface, []))
+        return cls.PATH_HINTS.get(surface, [])
 
     @staticmethod
     def _checks(eval_manifest: dict[str, Any]) -> list[dict[str, Any]]:

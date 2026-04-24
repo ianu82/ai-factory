@@ -86,6 +86,9 @@ affected_surface_keywords:
     - dashboard
     - admin
     - project
+    - control-plane
+    - cockpit
+    - cli
   billing:
     - billing
     - cost

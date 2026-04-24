@@ -51,6 +51,45 @@ def load_stage8_result_document(root: Path, scenario_name: str) -> dict:
     }
 
 
+def test_stage1_manual_intake_cli_emits_valid_bundle(capsys) -> None:
+    exit_code = main(
+        [
+            "stage1-intake-manual",
+            "--provider",
+            "github",
+            "--external-id",
+            "github-issue-2",
+            "--title",
+            "Factory cockpit should surface GitHub check conclusions and eval status",
+            "--body",
+            (
+                "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+                "status, and a clear health summary for each work item. This is a control-plane API and "
+                "JSON schema change for the cockpit command, not a model-runtime change. Operators should "
+                "not need to cross-check multiple artifacts to decide whether a run is healthy. Acceptance "
+                "criteria: - update the factory cockpit tool output to include the latest GitHub check "
+                "conclusions for each run - include the latest local eval status summary from vertical-slice "
+                "or automation artifacts - add a single health field that resolves to ready, blocked, or "
+                "warning based on PR checks, eval status, and monitoring alerts - cover the new output with "
+                "CLI tests and contract-safe validation"
+            ),
+            "--url",
+            "https://github.com/ianu82/ai-factory/issues/2",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["source_item"]["kind"] == "manual_intake"
+    assert payload["spec_packet"]["summary"]["problem"].startswith("GitHub issue:")
+    assert payload["spec_packet"]["summary"]["affected_surfaces"] == [
+        "api_contract",
+        "control_plane",
+    ]
+    assert payload["work_item"]["state"] == "POLICY_ASSIGNED"
+
+
 def test_stage2_cli_reports_invalid_json(capsys, tmp_path) -> None:
     invalid_stage1 = tmp_path / "stage1-invalid.json"
     invalid_stage1.write_text('{"spec_packet": ', encoding="utf-8")
