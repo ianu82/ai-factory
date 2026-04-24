@@ -23,8 +23,10 @@ from auto_mindsdb_factory.vertical_slice import (
 class FakeRepoConnector:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.fail_create = fail_create
+        self.create_calls = 0
 
     def create_pull_request(self, *, work_item_id, spec_packet, ticket_bundle, pr_packet):
+        self.create_calls += 1
         if self.fail_create:
             raise FactoryConnectorError("missing PR evidence")
         return PullRequestEvidence(
@@ -129,6 +131,93 @@ class FakeAgentConnector:
             model="gpt-5.4",
             response_id="resp_stage3_review",
         )
+
+
+class RevisingAgentConnector:
+    def __init__(self) -> None:
+        self.stage3_draft_inputs: list[dict] = []
+        self.stage3_review_calls = 0
+
+    def run_task(self, task):
+        if task.name == "stage2_ticket_drafting":
+            return FakeAgentConnector().run_task(task)
+        if task.name == "stage3_pr_draft":
+            self.stage3_draft_inputs.append(task.input_document)
+            revision_guidance = task.input_document.get("revision_guidance") or []
+            if revision_guidance:
+                return AgentResult(
+                    name=task.name,
+                    output_document={
+                        "what_changed": [
+                            "Gate Anthropic response_format tool mode by explicit capability checks and surface a deterministic unsupported-capability error for unsupported models.",
+                            "Persist and rehydrate tool-result state before request retries so provider retries never re-run side-effecting tools.",
+                        ],
+                        "key_risks": [
+                            "Capability gating must remain compatibility-safe for legacy Anthropic callers."
+                        ],
+                        "changed_paths": [
+                            "integrations/anthropic/contracts.py",
+                            "integrations/anthropic/tool_runtime.py",
+                            "tests/contracts/test_anthropic_contracts.py",
+                            "tests/integration/test_anthropic_tool_runtime.py",
+                        ],
+                    },
+                    model_fingerprint="openai.responses:gpt-5.4",
+                    provider="openai",
+                    model="gpt-5.4",
+                    response_id="resp_stage3_build_revision",
+                )
+            return AgentResult(
+                name=task.name,
+                output_document={
+                    "what_changed": [
+                        "Add initial Anthropic response_format tool-mode support for tool-result turns."
+                    ],
+                    "key_risks": [
+                        "Capability gating still needs explicit rollout and model coverage."
+                    ],
+                    "changed_paths": [
+                        "integrations/anthropic/contracts.py",
+                        "integrations/anthropic/tool_runtime.py",
+                    ],
+                },
+                model_fingerprint="openai.responses:gpt-5.4",
+                provider="openai",
+                model="gpt-5.4",
+                response_id="resp_stage3_build_initial",
+            )
+        if task.name == "stage3_pr_review":
+            self.stage3_review_calls += 1
+            if self.stage3_review_calls == 1:
+                return AgentResult(
+                    name=task.name,
+                    output_document={
+                        "blocking_findings": [
+                            "The draft still does not pin down the Anthropic capability gate for response_format tool mode on unsupported models."
+                        ],
+                        "non_blocking_findings": [
+                            "Spell out retry behavior for persisted tool-result state."
+                        ],
+                    },
+                    model_fingerprint="openai.responses:gpt-5.4",
+                    provider="openai",
+                    model="gpt-5.4",
+                    response_id="resp_stage3_review_blocked",
+                )
+            return AgentResult(
+                name=task.name,
+                output_document={
+                    "blocking_findings": [],
+                    "non_blocking_findings": [
+                        "Add one more regression fixture for malformed provider payloads."
+                    ],
+                },
+                model_fingerprint="openai.responses:gpt-5.4",
+                provider="openai",
+                model="gpt-5.4",
+                response_id="resp_stage3_review_approved",
+            )
+        raise AssertionError(f"Unexpected task: {task.name}")
 
 
 class UnhealthyOpsConnector:
@@ -250,3 +339,41 @@ def test_vertical_slice_can_run_with_agent_assisted_stage2_and_stage3(tmp_path) 
     assert stage2["ticket_bundle"]["artifact"]["model_fingerprint"] == "openai.responses:gpt-5.4"
     assert "openai.responses:gpt-5.4" in stage3["pr_packet"]["artifact"]["model_fingerprint"]
     assert "github_cli_connector.v1" in stage3["pr_packet"]["artifact"]["model_fingerprint"]
+
+
+def test_vertical_slice_revises_stage3_until_reviewable(tmp_path) -> None:
+    repo_connector = FakeRepoConnector()
+    agent_connector = RevisingAgentConnector()
+
+    result = FactoryVerticalSliceRunner(
+        _config(tmp_path),
+        agent_connector=agent_connector,
+        repo_connector=repo_connector,
+        eval_connector=FakeEvalConnector(),
+    ).run()
+
+    stage3 = json.loads(Path(result.stored_paths["stage3"]).read_text(encoding="utf-8"))
+    attempt1_path = (
+        tmp_path
+        / "factory-store"
+        / "runs"
+        / result.work_item_id
+        / "stage3-attempt-1-result.json"
+    )
+    attempt2_path = (
+        tmp_path
+        / "factory-store"
+        / "runs"
+        / result.work_item_id
+        / "stage3-attempt-2-result.json"
+    )
+
+    assert result.final_state == "PRODUCTION_MONITORING"
+    assert repo_connector.create_calls == 1
+    assert attempt1_path.exists()
+    assert attempt2_path.exists()
+    assert agent_connector.stage3_draft_inputs[1]["revision_guidance"] == [
+        "The draft still does not pin down the Anthropic capability gate for response_format tool mode on unsupported models."
+    ]
+    assert stage3["work_item"]["attempt_count"] == 2
+    assert stage3["pr_packet"]["reviewer_report"]["approved"] is True

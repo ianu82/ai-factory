@@ -164,6 +164,8 @@ class Builder:
         *,
         artifact_id: str,
         repository: str,
+        revision_guidance: list[str] | None = None,
+        previous_pr_packet: dict[str, Any] | None = None,
         timestamp: str | None = None,
     ) -> dict[str, Any]:
         created_at = timestamp or utc_now()
@@ -174,6 +176,8 @@ class Builder:
             ticket_bundle,
             eval_manifest,
             repository,
+            revision_guidance=revision_guidance,
+            previous_pr_packet=previous_pr_packet,
         )
 
         return {
@@ -370,9 +374,26 @@ class Builder:
         ticket_bundle: dict[str, Any],
         eval_manifest: dict[str, Any],
         repository: str,
+        *,
+        revision_guidance: list[str] | None = None,
+        previous_pr_packet: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         if self.agent_connector is None:
             return None, None
+        revision_findings = [normalize_whitespace(item) for item in revision_guidance or [] if item]
+        previous_draft = None
+        if previous_pr_packet is not None:
+            previous_draft = {
+                "what_changed": list(previous_pr_packet["summary"]["what_changed"]),
+                "key_risks": list(previous_pr_packet["summary"]["key_risks"]),
+                "changed_paths": list(previous_pr_packet["changed_paths"]),
+                "blocking_findings": list(
+                    previous_pr_packet["reviewer_report"]["blocking_findings"]
+                ),
+                "non_blocking_findings": list(
+                    previous_pr_packet["reviewer_report"]["non_blocking_findings"]
+                ),
+            }
         task = AgentTask(
             name="stage3_pr_draft",
             instructions=(
@@ -380,6 +401,8 @@ class Builder:
                 "Draft a concise PR summary from the supplied tickets and spec. "
                 "Return concrete 'what changed' bullets, the most important key risks, "
                 "and plausible repo-relative changed paths. "
+                "If revision guidance is present, revise the prior draft to address every blocking finding "
+                "before introducing anything new. "
                 "Do not invent unrelated work or refer to files outside the repository."
             ),
             input_document={
@@ -402,6 +425,8 @@ class Builder:
                 ],
                 "required_eval_tiers": [tier["name"] for tier in eval_manifest["tiers"]],
                 "deterministic_path_hints": self._changed_paths(spec_packet),
+                "revision_guidance": revision_findings,
+                "previous_draft": previous_draft,
             },
             output_schema=self._builder_draft_schema(),
         )
@@ -633,6 +658,8 @@ class Stage3BuildReviewPipeline:
         pr_packet_id: str | None = None,
         repository: str = "mindsdb/platform",
         blocking_findings: list[str] | None = None,
+        revision_guidance: list[str] | None = None,
+        previous_pr_packet: dict[str, Any] | None = None,
     ) -> Stage3BuildReviewResult:
         self._validate_document("spec-packet", spec_packet)
         self._validate_document("policy-decision", policy_decision)
@@ -693,6 +720,8 @@ class Stage3BuildReviewPipeline:
             eval_manifest,
             artifact_id=packet_artifact_id,
             repository=repository,
+            revision_guidance=revision_guidance,
+            previous_pr_packet=previous_pr_packet,
             timestamp=builder_timestamp,
         )
         self.controller.apply_event(
