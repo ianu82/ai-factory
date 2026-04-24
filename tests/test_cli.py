@@ -199,6 +199,8 @@ def test_stage2_cli_loads_repo_env_file_before_parser_defaults(
     tmp_path,
 ) -> None:
     monkeypatch.delenv("AI_FACTORY_SKIP_ENV_FILES", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AI_FACTORY_AGENT_PROVIDER", raising=False)
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

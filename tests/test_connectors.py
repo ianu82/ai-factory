@@ -52,6 +52,12 @@ def test_file_backed_ops_connector_rejects_failed_rollback_probe(tmp_path) -> No
 
 
 def test_openai_config_reads_defaults_from_environment(monkeypatch) -> None:
+    monkeypatch.delenv("AI_FACTORY_OPENAI_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     config = OpenAIResponsesAgentConfig.from_env()
