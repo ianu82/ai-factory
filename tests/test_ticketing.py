@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from auto_mindsdb_factory.connectors import AgentResult
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import ControllerState
 from auto_mindsdb_factory.intake import (
@@ -17,6 +18,21 @@ from auto_mindsdb_factory.ticketing import (
     TicketingConsistencyError,
     TicketingEligibilityError,
 )
+
+
+class ScriptedAgentConnector:
+    def __init__(self, outputs: dict[str, dict]) -> None:
+        self.outputs = outputs
+
+    def run_task(self, task):
+        return AgentResult(
+            name=task.name,
+            output_document=self.outputs[task.name],
+            model_fingerprint="openai.responses:gpt-5.4",
+            provider="openai",
+            model="gpt-5.4",
+            response_id="resp_test",
+        )
 
 
 def fixture_html() -> str:
@@ -149,6 +165,64 @@ def test_stage2_ticketing_shapes_manual_issue_into_contract_and_control_plane_wo
     ]
     assert result.ticket_bundle["tickets"][1]["dependencies"] == [
         result.ticket_bundle["tickets"][0]["id"]
+    ]
+
+
+def test_stage2_ticketing_can_use_agent_drafts_for_ticket_content() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage1_result = stage1_manual_issue_result(root)
+    agent_connector = ScriptedAgentConnector(
+        {
+            "stage2_ticket_drafting": {
+                "tickets": [
+                    {
+                        "slug": "contract",
+                        "summary": "Update the cockpit schema and compatibility layer.",
+                        "scope": [
+                            "Expose the health field in the cockpit JSON contract.",
+                            "Keep older callers compatible until they adopt the new field.",
+                        ],
+                        "definition_of_done": [
+                            "Contract consumers can parse the new health field safely."
+                        ],
+                        "known_edge_cases": [
+                            "Older callers should still parse the payload without crashing."
+                        ],
+                    },
+                    {
+                        "slug": "control-plane",
+                        "summary": "Update operator-facing cockpit rendering for the new health signal.",
+                        "scope": [
+                            "Show GitHub checks, eval state, and one consolidated health status.",
+                        ],
+                        "definition_of_done": [
+                            "Operators can judge run health from one cockpit view."
+                        ],
+                        "known_edge_cases": [
+                            "Missing GitHub check data should degrade to a warning state."
+                        ],
+                    },
+                ]
+            }
+        }
+    )
+
+    result = Stage2TicketingPipeline(root, agent_connector=agent_connector).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    assert result.ticket_bundle["artifact"]["model_fingerprint"] == "openai.responses:gpt-5.4"
+    assert (
+        result.ticket_bundle["tickets"][0]["summary"]
+        == "Update the cockpit schema and compatibility layer."
+    )
+    assert result.ticket_bundle["tickets"][0]["scope"][0] == (
+        "Expose the health field in the cockpit JSON contract."
+    )
+    assert result.ticket_bundle["tickets"][1]["known_edge_cases"] == [
+        "Missing GitHub check data should degrade to a warning state."
     ]
 
 

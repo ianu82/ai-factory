@@ -108,6 +108,61 @@ def test_stage2_cli_reports_invalid_json(capsys, tmp_path) -> None:
     assert "not valid JSON" in captured.err
 
 
+def test_stage2_cli_reports_missing_openai_api_key(capsys, monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    stage1_result = tmp_path / "stage1-result.json"
+    stage1_result.write_text(
+        json.dumps(
+            {
+                "spec_packet": {
+                    "artifact": {"artifact_id": "spec-1"},
+                    "summary": {
+                        "problem": "Test problem",
+                        "proposed_capability": "Test capability",
+                        "acceptance_criteria": ["Criterion 1"],
+                        "non_goals": [],
+                        "affected_surfaces": ["api_contract"],
+                    },
+                    "open_questions": [],
+                    "source_item": {
+                        "title": "Manual test item",
+                        "kind": "manual_intake",
+                    },
+                },
+                "policy_decision": {
+                    "artifact": {"artifact_id": "policy-1"},
+                    "lane": "fast",
+                    "required_eval_tiers": ["unit"],
+                    "risk_factors": [],
+                },
+                "work_item": {
+                    "id": "wi-test",
+                    "title": "Test item",
+                    "state": "POLICY_ASSIGNED",
+                    "history": [],
+                    "artifacts": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage2-ticketing",
+            "--agent-provider",
+            "openai",
+            "--stage1-result-file",
+            str(stage1_result),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 2 ticketing failed:" in captured.err
+    assert "OPENAI_API_KEY" in captured.err
+
+
 def test_stage3_cli_reports_missing_stage2_fields(capsys, tmp_path) -> None:
     incomplete_stage2 = tmp_path / "stage2-incomplete.json"
     incomplete_stage2.write_text(

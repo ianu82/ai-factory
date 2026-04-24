@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from auto_mindsdb_factory.connectors import (
+    AgentResult,
     CommandEvidence,
     EvalEvidence,
     FactoryConnectorError,
@@ -70,6 +71,63 @@ class FakeEvalConnector:
                     stderr="" if self.passed else "failed",
                 )
             ],
+        )
+
+
+class FakeAgentConnector:
+    def run_task(self, task):
+        if task.name == "stage2_ticket_drafting":
+            return AgentResult(
+                name=task.name,
+                output_document={
+                    "tickets": [
+                        {
+                            "slug": "contract",
+                            "summary": "Draft contract compatibility work.",
+                            "scope": ["Update the contract to cover the new response-format behavior."],
+                            "definition_of_done": ["Contract callers remain compatible."],
+                            "known_edge_cases": ["Legacy callers should fail deterministically."],
+                        },
+                        {
+                            "slug": "integration",
+                            "summary": "Draft runtime integration work.",
+                            "scope": ["Wire the runtime path with retry-safe behavior."],
+                            "definition_of_done": ["Runtime wiring is deterministic and reversible."],
+                            "known_edge_cases": ["Tool payload mismatches should fail closed."],
+                        },
+                    ]
+                },
+                model_fingerprint="openai.responses:gpt-5.4",
+                provider="openai",
+                model="gpt-5.4",
+                response_id="resp_stage2",
+            )
+        if task.name == "stage3_pr_draft":
+            return AgentResult(
+                name=task.name,
+                output_document={
+                    "what_changed": ["Draft the reviewable PR around the new response-format path."],
+                    "key_risks": ["Contract compatibility must remain deterministic."],
+                    "changed_paths": [
+                        "src/auto_mindsdb_factory/connectors.py",
+                        "tests/test_connectors.py",
+                    ],
+                },
+                model_fingerprint="openai.responses:gpt-5.4",
+                provider="openai",
+                model="gpt-5.4",
+                response_id="resp_stage3_build",
+            )
+        return AgentResult(
+            name=task.name,
+            output_document={
+                "blocking_findings": [],
+                "non_blocking_findings": ["Review the fallback path once pre-merge evals complete."],
+            },
+            model_fingerprint="openai.responses:gpt-5.4",
+            provider="openai",
+            model="gpt-5.4",
+            response_id="resp_stage3_review",
         )
 
 
@@ -164,3 +222,19 @@ def test_vertical_slice_records_unhealthy_monitoring_feedback(tmp_path) -> None:
     stage9 = json.loads(Path(result.stored_paths["stage9"]).read_text(encoding="utf-8"))
     assert stage8["monitoring_report"]["monitoring_decision"]["status"] != "healthy"
     assert stage9["feedback_report"]["summary"]["incident_count"] >= 1
+
+
+def test_vertical_slice_can_run_with_agent_assisted_stage2_and_stage3(tmp_path) -> None:
+    result = FactoryVerticalSliceRunner(
+        _config(tmp_path),
+        agent_connector=FakeAgentConnector(),
+        repo_connector=FakeRepoConnector(),
+        eval_connector=FakeEvalConnector(),
+    ).run()
+
+    stage2 = json.loads(Path(result.stored_paths["stage2"]).read_text(encoding="utf-8"))
+    stage3 = json.loads(Path(result.stored_paths["stage3"]).read_text(encoding="utf-8"))
+
+    assert stage2["ticket_bundle"]["artifact"]["model_fingerprint"] == "openai.responses:gpt-5.4"
+    assert "openai.responses:gpt-5.4" in stage3["pr_packet"]["artifact"]["model_fingerprint"]
+    assert "github_cli_connector.v1" in stage3["pr_packet"]["artifact"]["model_fingerprint"]

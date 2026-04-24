@@ -9,6 +9,7 @@ from typing import Any
 from .automation import FactoryRunStore
 from .build_review import Stage3BuildReviewPipeline
 from .connectors import (
+    AgentConnector,
     EvalConnector,
     EvalEvidence,
     FileBackedOpsConnector,
@@ -86,6 +87,7 @@ class FactoryVerticalSliceRunner:
         self,
         config: VerticalSliceConfig,
         *,
+        agent_connector: AgentConnector | None = None,
         repo_connector: RepoConnector | None = None,
         eval_connector: EvalConnector | None = None,
         ops_connector: OpsSignalConnector | None = None,
@@ -104,8 +106,8 @@ class FactoryVerticalSliceRunner:
             seed_missing_signals=config.seed_missing_ops_signals,
         )
         self.stage1 = Stage1IntakePipeline(self.root)
-        self.stage2 = Stage2TicketingPipeline(self.root)
-        self.stage3 = Stage3BuildReviewPipeline(self.root)
+        self.stage2 = Stage2TicketingPipeline(self.root, agent_connector=agent_connector)
+        self.stage3 = Stage3BuildReviewPipeline(self.root, agent_connector=agent_connector)
         self.stage4 = Stage4IntegrationPipeline(self.root)
         self.stage5 = Stage5EvalPipeline(self.root)
         self.stage6 = Stage6SecurityReviewPipeline(self.root)
@@ -361,9 +363,14 @@ class FactoryVerticalSliceRunner:
         evidence: PullRequestEvidence,
     ) -> dict[str, Any]:
         updated = deepcopy(pr_packet)
+        prior_fingerprint = updated["artifact"].get("model_fingerprint")
         updated["artifact"]["version"] = int(updated["artifact"]["version"]) + 1
         updated["artifact"]["owner_agent"] = "GitHub Connector"
-        updated["artifact"]["model_fingerprint"] = "github_cli_connector.v1"
+        updated["artifact"]["model_fingerprint"] = (
+            f"{prior_fingerprint} -> github_cli_connector.v1"
+            if prior_fingerprint
+            else "github_cli_connector.v1"
+        )
         updated["artifact"]["updated_at"] = evidence.created_at
         updated["branch_name"] = evidence.branch_name
         updated["pull_request"] = {

@@ -9,10 +9,26 @@ from auto_mindsdb_factory.build_review import (
     BuildReviewConsistencyError,
     Stage3BuildReviewPipeline,
 )
+from auto_mindsdb_factory.connectors import AgentResult
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import ControllerState
 from auto_mindsdb_factory.intake import AnthropicScout, Stage1IntakePipeline, build_manual_intake_item
 from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
+
+
+class ScriptedAgentConnector:
+    def __init__(self, outputs: dict[str, dict]) -> None:
+        self.outputs = outputs
+
+    def run_task(self, task):
+        return AgentResult(
+            name=task.name,
+            output_document=self.outputs[task.name],
+            model_fingerprint="openai.responses:gpt-5.4",
+            provider="openai",
+            model="gpt-5.4",
+            response_id="resp_test",
+        )
 
 
 def fixture_html() -> str:
@@ -139,6 +155,56 @@ def test_stage3_build_review_uses_factory_paths_for_manual_github_issues() -> No
     assert not any(
         path.startswith("integrations/anthropic/")
         for path in result.pr_packet["changed_paths"]
+    )
+
+
+def test_stage3_build_review_can_use_agent_drafts() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage2_result = stage2_manual_issue_result(root)
+    agent_connector = ScriptedAgentConnector(
+        {
+            "stage3_pr_draft": {
+                "what_changed": [
+                    "Add cockpit health synthesis to the JSON output.",
+                    "Surface GitHub check conclusions and local eval state together.",
+                ],
+                "key_risks": [
+                    "Health synthesis must stay compatibility-safe for older callers."
+                ],
+                "changed_paths": [
+                    "src/auto_mindsdb_factory/__main__.py",
+                    "tests/test_cli.py",
+                ],
+            },
+            "stage3_pr_review": {
+                "blocking_findings": [],
+                "non_blocking_findings": [
+                    "Confirm that absent GitHub check data downgrades health instead of crashing the cockpit."
+                ],
+            },
+        }
+    )
+
+    result = Stage3BuildReviewPipeline(root, agent_connector=agent_connector).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+        repository="ianu82/ai-factory",
+    )
+
+    assert result.pr_packet["artifact"]["model_fingerprint"] == "openai.responses:gpt-5.4"
+    assert result.pr_packet["summary"]["what_changed"][0] == (
+        "Add cockpit health synthesis to the JSON output."
+    )
+    assert result.pr_packet["summary"]["key_risks"] == [
+        "Health synthesis must stay compatibility-safe for older callers."
+    ]
+    assert "src/auto_mindsdb_factory/__main__.py" in result.pr_packet["changed_paths"]
+    assert (
+        "Confirm that absent GitHub check data downgrades health instead of crashing the cockpit."
+        in result.pr_packet["reviewer_report"]["non_blocking_findings"]
     )
 
 

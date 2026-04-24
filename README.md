@@ -64,6 +64,31 @@ The first recurring automation layer is now executable through a persisted run s
 - `uv run auto-mindsdb-factory factory-cockpit --store-dir .factory-automation`
 - `uv run auto-mindsdb-factory demo-controller fixtures/scenarios/fast_lane_feature`
 
+## Live OpenAI Agent Mode
+
+The factory can now use a live OpenAI agent for the judgment-heavy drafting work in Stage 2 and Stage 3 while keeping the rest of the stage contracts deterministic and eval-gated.
+
+Set the environment:
+
+- `export OPENAI_API_KEY=...`
+- `export AI_FACTORY_AGENT_PROVIDER=openai`
+- `export AI_FACTORY_OPENAI_MODEL=gpt-5.4`
+- Optional: `export AI_FACTORY_OPENAI_FALLBACK_MODEL=gpt-5.4-mini`
+- Optional: `export AI_FACTORY_OPENAI_REASONING_EFFORT=medium`
+- Optional: `export AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS=4000`
+- Optional: `export AI_FACTORY_OPENAI_TIMEOUT_SECONDS=120`
+
+Run agent-assisted stages directly:
+
+- `uv run auto-mindsdb-factory stage2-ticketing --agent-provider openai --stage1-result-file stage1-result.json`
+- `uv run auto-mindsdb-factory stage3-build-review --agent-provider openai --stage2-result-file stage2-result.json`
+
+Run the full vertical slice with a live OpenAI agent:
+
+- `uv run auto-mindsdb-factory factory-vertical-slice --agent-provider openai --store-dir .factory-automation --repository ianu82/ai-factory`
+
+If `OPENAI_API_KEY` is missing, the CLI fails fast with a friendly initialization error before the run starts.
+
 ## Repository Layout
 
 ```text

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from .automation import AutomationError, FactoryAutomationCoordinator, FactoryRunStore
 from .build_review import BuildReviewError, Stage3BuildReviewPipeline
-from .connectors import FactoryConnectorError
+from .connectors import (
+    FactoryConnectorError,
+    OpenAIResponsesAgentConfig,
+    OpenAIResponsesAgentConnector,
+)
 from .contracts import main as validate_contracts_main
 from .controller import FactoryController, WorkItem
 from .eval_execution import EvalExecutionError, Stage5EvalPipeline
@@ -242,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    _add_agent_args(stage2_parser)
 
     stage3_parser = subparsers.add_parser(
         "stage3-build-review",
@@ -300,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    _add_agent_args(stage3_parser)
 
     stage4_parser = subparsers.add_parser(
         "stage4-integration",
@@ -1280,6 +1287,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    _add_agent_args(vertical_slice_parser)
 
     cockpit_parser = subparsers.add_parser(
         "factory-cockpit",
@@ -1303,6 +1311,68 @@ def build_parser() -> argparse.ArgumentParser:
 
 class CommandInputError(RuntimeError):
     """Raised when a CLI artifact or input file cannot be loaded safely."""
+
+
+def _add_agent_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--agent-provider",
+        choices=["none", "openai"],
+        default=os.environ.get("AI_FACTORY_AGENT_PROVIDER", "none"),
+        help="Optional live agent provider for judgment-heavy drafting steps.",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="Override the OpenAI model id. Defaults to AI_FACTORY_OPENAI_MODEL or gpt-5.4.",
+    )
+    parser.add_argument(
+        "--agent-fallback-model",
+        default=None,
+        help="Optional fallback OpenAI model id if the primary model request fails.",
+    )
+    parser.add_argument(
+        "--agent-reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+        default=None,
+        help="Override OpenAI reasoning effort. Defaults to AI_FACTORY_OPENAI_REASONING_EFFORT or medium.",
+    )
+    parser.add_argument(
+        "--agent-max-output-tokens",
+        type=int,
+        default=None,
+        help="Override OpenAI max_output_tokens for agent tasks.",
+    )
+    parser.add_argument(
+        "--agent-timeout-seconds",
+        type=int,
+        default=None,
+        help="Override the OpenAI request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--agent-base-url",
+        default=None,
+        help="Override the OpenAI Responses API base URL.",
+    )
+
+
+def _build_agent_connector(args: argparse.Namespace):
+    provider = getattr(args, "agent_provider", "none")
+    if provider == "none":
+        return None
+    if provider != "openai":
+        raise CommandInputError(f"Unsupported agent provider: {provider}")
+    try:
+        config = OpenAIResponsesAgentConfig.from_env(
+            model=args.agent_model,
+            fallback_model=args.agent_fallback_model,
+            reasoning_effort=args.agent_reasoning_effort,
+            max_output_tokens=args.agent_max_output_tokens,
+            timeout_seconds=args.agent_timeout_seconds,
+            base_url=args.agent_base_url,
+        )
+        return OpenAIResponsesAgentConnector(config)
+    except FactoryConnectorError as exc:
+        raise CommandInputError(f"Could not initialize the OpenAI agent connector: {exc}") from exc
 
 
 def _read_text_file(path: Path, label: str) -> str:
@@ -1852,9 +1922,14 @@ def main(argv: list[str] | None = None) -> int:
             feedback_window_days=args.feedback_window_days,
         )
         try:
-            result = FactoryVerticalSliceRunner(config).run()
+            agent_connector = _build_agent_connector(args)
+            result = FactoryVerticalSliceRunner(
+                config,
+                agent_connector=agent_connector,
+            ).run()
         except (
             BuildReviewError,
+            CommandInputError,
             EvalExecutionError,
             FactoryConnectorError,
             FeedbackSynthesisError,
@@ -1951,7 +2026,11 @@ def main(argv: list[str] | None = None) -> int:
                 policy_decision = _read_json_object(args.policy_decision_file, "policy-decision")
                 work_item_document = _read_json_object(args.work_item_file, "work-item")
 
-            pipeline = Stage2TicketingPipeline(args.repo_root)
+            agent_connector = _build_agent_connector(args)
+            pipeline = Stage2TicketingPipeline(
+                args.repo_root,
+                agent_connector=agent_connector,
+            )
             result = pipeline.process(
                 spec_packet,
                 policy_decision,
@@ -1997,7 +2076,11 @@ def main(argv: list[str] | None = None) -> int:
                 eval_manifest = _read_json_object(args.eval_manifest_file, "eval-manifest")
                 work_item_document = _read_json_object(args.work_item_file, "work-item")
 
-            pipeline = Stage3BuildReviewPipeline(args.repo_root)
+            agent_connector = _build_agent_connector(args)
+            pipeline = Stage3BuildReviewPipeline(
+                args.repo_root,
+                agent_connector=agent_connector,
+            )
             result = pipeline.process(
                 spec_packet,
                 policy_decision,

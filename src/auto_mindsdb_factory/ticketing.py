@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from .connectors import AgentConnector, AgentTask, FactoryConnectorError
 from .contracts import load_validators, validation_errors_for
 from .controller import ControllerEvent, ControllerState, FactoryController, WorkItem
 from .intake import build_identifier, normalize_whitespace, repo_root, utc_now
@@ -65,8 +66,14 @@ class TicketSlice:
 class TicketArchitect:
     """Translate a Stage 1 packet into buildable 1-2 day tickets."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        agent_connector: AgentConnector | None = None,
+    ) -> None:
         self.root = repo_root(root)
+        self.agent_connector = agent_connector
 
     def build_ticket_bundle(
         self,
@@ -79,25 +86,29 @@ class TicketArchitect:
     ) -> dict[str, Any]:
         created_at = timestamp or utc_now()
         policy_artifact = policy_decision["artifact"]
-        tickets = self._tickets_for(spec_packet, policy_decision)
+        tickets, model_fingerprint = self._tickets_for(spec_packet, policy_decision)
+
+        artifact = {
+            "id": artifact_id,
+            "version": 1,
+            "source_stage": "ticketing",
+            "next_stage": "build",
+            "status": "ready",
+            "risk_tier": policy_artifact["risk_tier"],
+            "execution_lane": policy_artifact["execution_lane"],
+            "owner_agent": "Ticket Architect",
+            "policy_decision_id": policy_artifact["id"],
+            "budget_class": policy_artifact["budget_class"],
+            "rollback_class": policy_artifact["rollback_class"],
+            "approval_requirements": list(policy_artifact["approval_requirements"]),
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        if model_fingerprint is not None:
+            artifact["model_fingerprint"] = model_fingerprint
 
         return {
-            "artifact": {
-                "id": artifact_id,
-                "version": 1,
-                "source_stage": "ticketing",
-                "next_stage": "build",
-                "status": "ready",
-                "risk_tier": policy_artifact["risk_tier"],
-                "execution_lane": policy_artifact["execution_lane"],
-                "owner_agent": "Ticket Architect",
-                "policy_decision_id": policy_artifact["id"],
-                "budget_class": policy_artifact["budget_class"],
-                "rollback_class": policy_artifact["rollback_class"],
-                "approval_requirements": list(policy_artifact["approval_requirements"]),
-                "created_at": created_at,
-                "updated_at": created_at,
-            },
+            "artifact": artifact,
             "spec_packet_id": spec_packet["artifact"]["id"],
             "eval_manifest_id": eval_manifest_id,
             "tickets": tickets,
@@ -111,9 +122,14 @@ class TicketArchitect:
         self,
         spec_packet: dict[str, Any],
         policy_decision: dict[str, Any],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str | None]:
         factors = {factor["name"] for factor in spec_packet["risk_profile"]["factors"]}
         ticket_slices = self._ticket_slices(spec_packet)
+        ticket_drafts, model_fingerprint = self._agent_ticket_drafts(
+            spec_packet,
+            policy_decision,
+            ticket_slices,
+        )
         ticket_ids = [
             build_identifier(
                 "ticket",
@@ -124,21 +140,37 @@ class TicketArchitect:
         ]
         tickets: list[dict[str, Any]] = []
         for index, ticket_slice in enumerate(ticket_slices):
+            draft = ticket_drafts.get(ticket_slice.slug)
             dependencies = [ticket_ids[index - 1]] if index > 0 else []
-            scope = self._scope_items(ticket_slice, policy_decision)
+            scope = self._scope_items(
+                draft["scope"] if draft is not None else ticket_slice.scope_items,
+                policy_decision,
+            )
             tickets.append(
                 {
                     "id": ticket_ids[index],
                     "title": self._ticket_title(spec_packet, ticket_slice),
                     "kind": ticket_slice.kind,
-                    "summary": self._summary(spec_packet, ticket_slice),
+                    "summary": (
+                        draft["summary"]
+                        if draft is not None
+                        else self._summary(spec_packet, ticket_slice)
+                    ),
                     "scope": scope,
                     "definition_of_done": self._definition_of_done(
+                        draft["definition_of_done"]
+                        if draft is not None
+                        else ticket_slice.definition_of_done,
                         spec_packet,
                         policy_decision,
-                        ticket_slice,
                     ),
-                    "known_edge_cases": self._known_edge_cases(spec_packet, ticket_slice),
+                    "known_edge_cases": self._known_edge_cases(
+                        spec_packet,
+                        ticket_slice,
+                        drafted_edge_cases=(
+                            draft["known_edge_cases"] if draft is not None else None
+                        ),
+                    ),
                     "non_goals": list(spec_packet["summary"]["non_goals"]),
                     "dependencies": dependencies,
                     "eta_days": self._eta_days(scope, ticket_slice.kind),
@@ -155,7 +187,7 @@ class TicketArchitect:
                     ],
                 }
             )
-        return tickets
+        return tickets, model_fingerprint
 
     @staticmethod
     def _ticket_title(spec_packet: dict[str, Any], ticket_slice: TicketSlice) -> str:
@@ -169,11 +201,11 @@ class TicketArchitect:
 
     @staticmethod
     def _definition_of_done(
+        drafted_done_items: tuple[str, ...] | list[str],
         spec_packet: dict[str, Any],
         policy_decision: dict[str, Any],
-        ticket_slice: TicketSlice,
     ) -> list[str]:
-        done_items = list(ticket_slice.definition_of_done)
+        done_items = list(drafted_done_items)
         done_items.extend(
             criterion["description"] for criterion in spec_packet["acceptance_criteria"]
         )
@@ -184,7 +216,14 @@ class TicketArchitect:
         return TicketArchitect._dedupe(done_items)
 
     @staticmethod
-    def _known_edge_cases(spec_packet: dict[str, Any], ticket_slice: TicketSlice) -> list[str]:
+    def _known_edge_cases(
+        spec_packet: dict[str, Any],
+        ticket_slice: TicketSlice,
+        *,
+        drafted_edge_cases: list[str] | None = None,
+    ) -> list[str]:
+        if drafted_edge_cases:
+            return TicketArchitect._dedupe(drafted_edge_cases)[:4]
         factors = {factor["name"] for factor in spec_packet["risk_profile"]["factors"]}
         edge_cases: list[str] = []
         if ticket_slice.slug == "contract" and "external_api_contract_change" in factors:
@@ -405,8 +444,11 @@ class TicketArchitect:
         return "backend"
 
     @staticmethod
-    def _scope_items(ticket_slice: TicketSlice, policy_decision: dict[str, Any]) -> list[str]:
-        items = list(ticket_slice.scope_items)
+    def _scope_items(
+        drafted_scope_items: tuple[str, ...] | list[str],
+        policy_decision: dict[str, Any],
+    ) -> list[str]:
+        items = list(drafted_scope_items)
         items.extend(
             [
                 "Implement the acceptance criteria without expanding beyond the current Stage 1 scope.",
@@ -414,6 +456,140 @@ class TicketArchitect:
             ]
         )
         return TicketArchitect._dedupe(items)[:5]
+
+    def _agent_ticket_drafts(
+        self,
+        spec_packet: dict[str, Any],
+        policy_decision: dict[str, Any],
+        ticket_slices: list[TicketSlice],
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
+        if self.agent_connector is None or not ticket_slices:
+            return {}, None
+        seed_tickets = [
+            {
+                "slug": ticket_slice.slug,
+                "kind": ticket_slice.kind,
+                "title_suffix": ticket_slice.title_suffix,
+                "seed_summary": self._summary(spec_packet, ticket_slice),
+                "seed_scope": list(ticket_slice.scope_items),
+                "seed_definition_of_done": list(ticket_slice.definition_of_done),
+                "seed_known_edge_cases": self._known_edge_cases(spec_packet, ticket_slice),
+            }
+            for ticket_slice in ticket_slices
+        ]
+        task = AgentTask(
+            name="stage2_ticket_drafting",
+            instructions=(
+                "You are the Stage 2 senior engineer agent. "
+                "Draft ticket-specific summaries, scope bullets, definition-of-done bullets, "
+                "and edge cases for the exact ticket slices provided. "
+                "Keep each ticket buildable in 1-2 days, preserve the slug for each slice, "
+                "stay inside the supplied acceptance criteria and non-goals, and avoid generic boilerplate."
+            ),
+            input_document={
+                "source_title": spec_packet["source"]["title"],
+                "problem": spec_packet["summary"]["problem"],
+                "proposed_capability": spec_packet["summary"]["proposed_capability"],
+                "acceptance_criteria": [
+                    criterion["description"] for criterion in spec_packet["acceptance_criteria"]
+                ],
+                "non_goals": spec_packet["summary"]["non_goals"],
+                "risk_factors": [
+                    factor["name"] for factor in spec_packet["risk_profile"]["factors"]
+                ],
+                "required_eval_tiers": policy_decision["required_eval_tiers"],
+                "ticket_slices": seed_tickets,
+            },
+            output_schema=self._ticket_draft_schema(ticket_slices),
+        )
+        try:
+            result = self.agent_connector.run_task(task)
+        except FactoryConnectorError as exc:
+            raise TicketingError(f"Agent-assisted ticket drafting failed: {exc}") from exc
+
+        drafts = result.output_document.get("tickets")
+        if not isinstance(drafts, list):
+            raise TicketingError("Agent-assisted ticket drafting did not return a tickets list.")
+        draft_by_slug: dict[str, dict[str, Any]] = {}
+        expected_slugs = {ticket_slice.slug for ticket_slice in ticket_slices}
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                raise TicketingError("Agent-assisted ticket draft entries must be objects.")
+            slug = str(draft.get("slug") or "")
+            if slug not in expected_slugs:
+                raise TicketingError(
+                    f"Agent-assisted ticket draft returned an unexpected slug: {slug or '<empty>'}."
+                )
+            if slug in draft_by_slug:
+                raise TicketingError(
+                    f"Agent-assisted ticket draft returned duplicate slug: {slug}."
+                )
+            draft_by_slug[slug] = {
+                "summary": normalize_whitespace(str(draft["summary"])),
+                "scope": self._dedupe([normalize_whitespace(item) for item in draft["scope"]])[:3],
+                "definition_of_done": self._dedupe(
+                    [normalize_whitespace(item) for item in draft["definition_of_done"]]
+                )[:3],
+                "known_edge_cases": self._dedupe(
+                    [normalize_whitespace(item) for item in draft["known_edge_cases"]]
+                )[:3],
+            }
+        missing = expected_slugs - set(draft_by_slug)
+        if missing:
+            raise TicketingError(
+                "Agent-assisted ticket draft did not cover every required ticket slice: "
+                + ", ".join(sorted(missing))
+            )
+        return draft_by_slug, result.model_fingerprint
+
+    @staticmethod
+    def _ticket_draft_schema(ticket_slices: list[TicketSlice]) -> dict[str, Any]:
+        slugs = [ticket_slice.slug for ticket_slice in ticket_slices]
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["tickets"],
+            "properties": {
+                "tickets": {
+                    "type": "array",
+                    "minItems": len(ticket_slices),
+                    "maxItems": len(ticket_slices),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "slug",
+                            "summary",
+                            "scope",
+                            "definition_of_done",
+                            "known_edge_cases",
+                        ],
+                        "properties": {
+                            "slug": {"type": "string", "enum": slugs},
+                            "summary": {"type": "string", "minLength": 1},
+                            "scope": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "definition_of_done": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "known_edge_cases": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                        },
+                    },
+                }
+            },
+        }
 
     @staticmethod
     def _eta_days(scope: list[str], kind: str) -> float:
@@ -692,10 +868,14 @@ class Stage2TicketingPipeline:
         controller: FactoryController | None = None,
         ticket_architect: TicketArchitect | None = None,
         eval_engineer: EvalEngineer | None = None,
+        agent_connector: AgentConnector | None = None,
     ) -> None:
         self.root = repo_root(root)
         self.controller = controller or FactoryController()
-        self.ticket_architect = ticket_architect or TicketArchitect(self.root)
+        self.ticket_architect = ticket_architect or TicketArchitect(
+            self.root,
+            agent_connector=agent_connector,
+        )
         self.eval_engineer = eval_engineer or EvalEngineer(self.root)
         self.validators = load_validators(self.root)
 

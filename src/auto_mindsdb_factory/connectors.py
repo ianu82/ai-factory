@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -8,6 +9,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from jsonschema import ValidationError as JSONSchemaValidationError
+from jsonschema import validate as validate_jsonschema
 
 from .intake import normalize_whitespace, slugify, utc_now
 
@@ -150,8 +156,9 @@ class OpsSignalConnector(Protocol):
 @dataclass(slots=True)
 class AgentTask:
     name: str
+    instructions: str
     input_document: dict[str, Any]
-    output_schema: str
+    output_schema: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -159,7 +166,23 @@ class AgentResult:
     name: str
     output_document: dict[str, Any]
     model_fingerprint: str
+    provider: str = "deterministic"
+    model: str | None = None
+    response_id: str | None = None
+    usage: dict[str, Any] | None = None
     completed_at: str = field(default_factory=utc_now)
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "output_document": dict(self.output_document),
+            "model_fingerprint": self.model_fingerprint,
+            "provider": self.provider,
+            "model": self.model,
+            "response_id": self.response_id,
+            "usage": None if self.usage is None else dict(self.usage),
+            "completed_at": self.completed_at,
+        }
 
 
 class AgentConnector(Protocol):
@@ -177,7 +200,286 @@ class DeterministicAgentConnector:
             name=task.name,
             output_document=dict(task.input_document),
             model_fingerprint=self.MODEL_FINGERPRINT,
+            provider="deterministic",
+            model=self.MODEL_FINGERPRINT,
         )
+
+
+@dataclass(slots=True)
+class OpenAIResponsesAgentConfig:
+    api_key: str | None = None
+    model: str = "gpt-5.4"
+    fallback_model: str | None = None
+    reasoning_effort: str = "medium"
+    max_output_tokens: int = 4000
+    timeout_seconds: int = 120
+    base_url: str = "https://api.openai.com/v1/responses"
+    organization: str | None = None
+    project: str | None = None
+
+    REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        api_key: str | None = None,
+        model: str | None = None,
+        fallback_model: str | None = None,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
+        timeout_seconds: int | None = None,
+        base_url: str | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+    ) -> OpenAIResponsesAgentConfig:
+        env = os.environ
+        return cls(
+            api_key=api_key or env.get("OPENAI_API_KEY"),
+            model=model or env.get("AI_FACTORY_OPENAI_MODEL") or "gpt-5.4",
+            fallback_model=(
+                fallback_model
+                if fallback_model is not None
+                else _env_or_none(env.get("AI_FACTORY_OPENAI_FALLBACK_MODEL"))
+            ),
+            reasoning_effort=(
+                reasoning_effort
+                or env.get("AI_FACTORY_OPENAI_REASONING_EFFORT")
+                or "medium"
+            ),
+            max_output_tokens=(
+                max_output_tokens
+                if max_output_tokens is not None
+                else int(env.get("AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS", "4000"))
+            ),
+            timeout_seconds=(
+                timeout_seconds
+                if timeout_seconds is not None
+                else int(env.get("AI_FACTORY_OPENAI_TIMEOUT_SECONDS", "120"))
+            ),
+            base_url=base_url or env.get("AI_FACTORY_OPENAI_BASE_URL") or cls.base_url,
+            organization=organization or env.get("OPENAI_ORGANIZATION"),
+            project=project or env.get("OPENAI_PROJECT"),
+        )
+
+    def validated(self) -> OpenAIResponsesAgentConfig:
+        if not self.api_key:
+            raise FactoryConnectorError(
+                "OpenAI agent execution requires OPENAI_API_KEY to be set."
+            )
+        if self.reasoning_effort not in self.REASONING_EFFORTS:
+            raise FactoryConnectorError(
+                "OpenAI reasoning_effort must be one of "
+                + ", ".join(sorted(self.REASONING_EFFORTS))
+                + "."
+            )
+        if self.max_output_tokens < 1:
+            raise FactoryConnectorError(
+                "OpenAI max_output_tokens must be >= 1."
+            )
+        if self.timeout_seconds < 1:
+            raise FactoryConnectorError(
+                "OpenAI timeout_seconds must be >= 1."
+            )
+        if not self.model:
+            raise FactoryConnectorError("OpenAI model must be a non-empty string.")
+        return self
+
+
+def _env_or_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+class OpenAIResponsesAgentConnector:
+    """Run factory agent tasks through the OpenAI Responses API with strict JSON outputs."""
+
+    SYSTEM_PROMPT = (
+        "You are an AI Factory stage worker. "
+        "Return only JSON that matches the requested schema. "
+        "Be concrete, terse, and faithful to the supplied source artifacts."
+    )
+
+    def __init__(
+        self,
+        config: OpenAIResponsesAgentConfig,
+        *,
+        urlopen_impl=urlopen,
+    ) -> None:
+        self.config = config.validated()
+        self.urlopen_impl = urlopen_impl
+
+    def run_task(self, task: AgentTask) -> AgentResult:
+        if not isinstance(task.output_schema, dict) or not task.output_schema:
+            raise FactoryConnectorError(
+                f"Agent task '{task.name}' must define a JSON schema output contract."
+            )
+        primary_error: FactoryConnectorError | None = None
+        models = [self.config.model]
+        if self.config.fallback_model and self.config.fallback_model != self.config.model:
+            models.append(self.config.fallback_model)
+
+        for index, model in enumerate(models):
+            try:
+                payload = self._request(model, task)
+                output_document = self._extract_output_document(task, payload)
+                return AgentResult(
+                    name=task.name,
+                    output_document=output_document,
+                    model_fingerprint=f"openai.responses:{payload.get('model') or model}",
+                    provider="openai",
+                    model=str(payload.get("model") or model),
+                    response_id=_env_or_none(str(payload.get("id") or "")),
+                    usage=payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
+                )
+            except FactoryConnectorError as exc:
+                primary_error = exc
+                if index == len(models) - 1:
+                    break
+        assert primary_error is not None
+        raise primary_error
+
+    def _request(self, model: str, task: AgentTask) -> dict[str, Any]:
+        body = {
+            "model": model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": self.SYSTEM_PROMPT,
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": self._task_prompt(task),
+                        }
+                    ],
+                },
+            ],
+            "reasoning": {"effort": self.config.reasoning_effort},
+            "max_output_tokens": self.config.max_output_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": self._schema_name(task.name),
+                    "strict": True,
+                    "schema": task.output_schema,
+                }
+            },
+        }
+
+        request = Request(
+            self.config.base_url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with self.urlopen_impl(request, timeout=self.config.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            raise FactoryConnectorError(
+                f"OpenAI request failed for model '{model}': {exc.code} {detail or exc.reason}"
+            ) from exc
+        except URLError as exc:
+            raise FactoryConnectorError(
+                f"OpenAI request failed for model '{model}': {exc.reason}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise FactoryConnectorError(
+                f"OpenAI returned invalid JSON for model '{model}': {exc}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise FactoryConnectorError(
+                f"OpenAI returned a non-object response for model '{model}'."
+            )
+        return payload
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.config.organization:
+            headers["OpenAI-Organization"] = self.config.organization
+        if self.config.project:
+            headers["OpenAI-Project"] = self.config.project
+        return headers
+
+    @staticmethod
+    def _schema_name(task_name: str) -> str:
+        return slugify(task_name)[:64] or "agent-output"
+
+    @staticmethod
+    def _task_prompt(task: AgentTask) -> str:
+        input_document = json.dumps(task.input_document, indent=2, sort_keys=True)
+        return "\n\n".join(
+            [
+                f"Task: {task.name}",
+                task.instructions.strip(),
+                "Source JSON:",
+                input_document,
+            ]
+        )
+
+    @staticmethod
+    def _extract_output_document(task: AgentTask, payload: dict[str, Any]) -> dict[str, Any]:
+        response_text = OpenAIResponsesAgentConnector._extract_output_text(payload)
+        if response_text is None:
+            raise FactoryConnectorError(
+                f"OpenAI response for task '{task.name}' did not contain output text."
+            )
+        try:
+            output_document = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise FactoryConnectorError(
+                f"OpenAI output for task '{task.name}' was not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(output_document, dict):
+            raise FactoryConnectorError(
+                f"OpenAI output for task '{task.name}' must be a JSON object."
+            )
+        try:
+            validate_jsonschema(output_document, task.output_schema)
+        except JSONSchemaValidationError as exc:
+            raise FactoryConnectorError(
+                f"OpenAI output for task '{task.name}' failed schema validation: {exc.message}"
+            ) from exc
+        return output_document
+
+    @staticmethod
+    def _extract_output_text(payload: dict[str, Any]) -> str | None:
+        direct_text = payload.get("output_text")
+        if isinstance(direct_text, str) and direct_text.strip():
+            return direct_text
+
+        texts: list[str] = []
+        for item in payload.get("output", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"output_text", "text"} and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") in {"output_text", "text"}:
+                    text = content.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+                    elif isinstance(content.get("value"), str):
+                        texts.append(content["value"])
+        joined = "\n".join(part.strip() for part in texts if part and part.strip()).strip()
+        return joined or None
 
 
 class LocalEvalConnector:
