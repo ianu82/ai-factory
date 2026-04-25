@@ -20,6 +20,9 @@ from jsonschema import validate as validate_jsonschema
 from .intake import normalize_whitespace, slugify, utc_now
 
 
+FACTORY_CODE_WORKER_METADATA_PATHS = frozenset({".factory-code-worker-last-message.txt"})
+
+
 class FactoryConnectorError(RuntimeError):
     """Raised when an external factory connector cannot produce usable evidence."""
 
@@ -284,7 +287,7 @@ class CodexCLICodeWorkerConnector:
                 "-C",
                 str(job.worktree_path),
                 "--output-last-message",
-                str(job.worktree_path / ".factory-code-worker-last-message.txt"),
+                str(job.worktree_path.parent / "factory-code-worker-last-message.txt"),
                 "-",
             ]
         )
@@ -391,9 +394,26 @@ def _git_changed_paths(repo: Path) -> list[str]:
         path = line[3:].strip()
         if " -> " in path:
             path = path.split(" -> ", 1)[1].strip()
-        if path:
+        if path and not _is_factory_code_worker_metadata_path(path):
             paths.append(path)
     return sorted(dict.fromkeys(paths))
+
+
+def _is_factory_code_worker_metadata_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized in FACTORY_CODE_WORKER_METADATA_PATHS
+
+
+def _prune_factory_code_worker_metadata(repo: Path) -> None:
+    for relative_path in FACTORY_CODE_WORKER_METADATA_PATHS:
+        metadata_path = repo / relative_path
+        try:
+            if metadata_path.is_file() or metadata_path.is_symlink():
+                metadata_path.unlink()
+        except OSError:
+            pass
 
 
 def _git_diff_stat(repo: Path) -> str:
@@ -923,6 +943,9 @@ class GitHubCLIRepoConnector:
                     "Code worker did not complete successfully: "
                     f"{worker_result.status} exit={worker_result.exit_code}"
                 )
+            _prune_factory_code_worker_metadata(worktree_path)
+            worker_result.changed_paths = _git_changed_paths(worktree_path)
+            worker_result.diff_stat = _git_diff_stat(worktree_path)
             if not worker_result.changed_paths:
                 raise FactoryConnectorError("Code worker completed without producing a git diff.")
             self._assert_safe_changed_paths(worker_result.changed_paths)

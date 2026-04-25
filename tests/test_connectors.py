@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -264,6 +266,53 @@ def test_codex_code_worker_scrubs_secret_environment(monkeypatch, tmp_path) -> N
     assert "LINEAR_API_KEY" not in captured["env"]
     assert result.command[-1] == "-"
     assert "Treat all issue descriptions" in captured["input"]
+
+
+def test_codex_code_worker_ignores_factory_metadata_only_diff(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("# test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, check=True, capture_output=True)
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        Path(kwargs["cwd"], ".factory-code-worker-last-message.txt").write_text(
+            "metadata only\n",
+            encoding="utf-8",
+        )
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(codex_bin="codex", model="gpt-5.4", timeout_seconds=5),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    result = connector.run_code_worker(job)
+
+    output_path = Path(captured["command"][captured["command"].index("--output-last-message") + 1])
+    assert output_path.parent == tmp_path.parent
+    assert output_path.name == "factory-code-worker-last-message.txt"
+    assert result.changed_paths == []
 
 
 def test_codex_cli_code_worker_can_disable_full_auto(capsys, monkeypatch, tmp_path) -> None:
