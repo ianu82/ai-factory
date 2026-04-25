@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import re
+import os
+import shlex
+import subprocess
+import sys
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +27,138 @@ class EvalExecutionEligibilityError(EvalExecutionError):
 
 class EvalExecutionConsistencyError(EvalExecutionError):
     """Raised when Stage 4 artifacts disagree about the work item being evaluated."""
+
+
+@dataclass(slots=True)
+class GateResult:
+    check_kind: str
+    status: str
+    command: list[str] | None
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    duration_seconds: int
+    summary: str
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "check_kind": self.check_kind,
+            "status": self.status,
+            "command": None if self.command is None else list(self.command),
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "duration_seconds": self.duration_seconds,
+            "summary": self.summary,
+        }
+
+
+class CommandGateRunner:
+    """Run the subset of eval checks that are backed by real local commands."""
+
+    DEFAULT_COMMANDS = {
+        "unit": [sys.executable, "-m", "pytest", "-q"],
+        "contract": [sys.executable, "scripts/validate_contracts.py"],
+    }
+    ENV_COMMANDS = {
+        "lint": "AI_FACTORY_GATE_LINT_COMMAND",
+        "typecheck": "AI_FACTORY_GATE_TYPECHECK_COMMAND",
+        "unit": "AI_FACTORY_GATE_UNIT_COMMAND",
+        "contract": "AI_FACTORY_GATE_CONTRACT_COMMAND",
+        "integration": "AI_FACTORY_GATE_INTEGRATION_COMMAND",
+        "migration_safety": "AI_FACTORY_GATE_MIGRATION_SAFETY_COMMAND",
+    }
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        commands_by_kind: dict[str, list[str]] | None = None,
+        required_kinds: set[str] | None = None,
+        timeout_seconds: int = 900,
+    ) -> None:
+        self.repo_root = repo_root.resolve()
+        self.commands_by_kind = commands_by_kind or dict(self.DEFAULT_COMMANDS)
+        self.required_kinds = required_kinds or {"unit", "contract"}
+        self.timeout_seconds = timeout_seconds
+
+    @classmethod
+    def from_env(cls, repo_root: Path) -> "CommandGateRunner":
+        commands = dict(cls.DEFAULT_COMMANDS)
+        for kind, env_name in cls.ENV_COMMANDS.items():
+            raw = os.environ.get(env_name, "").strip()
+            if raw:
+                commands[kind] = shlex.split(raw)
+        required_raw = os.environ.get("AI_FACTORY_REQUIRED_GATE_KINDS", "unit,contract")
+        required = {item.strip() for item in required_raw.split(",") if item.strip()}
+        timeout = int(os.environ.get("AI_FACTORY_GATE_TIMEOUT_SECONDS", "900"))
+        return cls(repo_root, commands_by_kind=commands, required_kinds=required, timeout_seconds=timeout)
+
+    def is_blocking_kind(self, kind: str) -> bool:
+        return kind in self.required_kinds
+
+    def run_check(self, check: dict[str, Any]) -> GateResult:
+        kind = str(check["kind"])
+        command = self.commands_by_kind.get(kind)
+        if not command:
+            return GateResult(
+                check_kind=kind,
+                status="not_configured",
+                command=None,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                duration_seconds=0,
+                summary=f"No command-backed gate is configured for {kind}.",
+            )
+        try:
+            started = time.monotonic()
+            completed = subprocess.run(
+                command,
+                cwd=self.repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=min(self.timeout_seconds, int(check["timeout_minutes"]) * 60),
+            )
+            duration = max(0, int(round(time.monotonic() - started)))
+            status = "passed" if completed.returncode == 0 else "failed"
+            return GateResult(
+                check_kind=kind,
+                status=status,
+                command=list(command),
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                duration_seconds=duration,
+                summary=(
+                    f"Command-backed gate passed: {' '.join(command)}."
+                    if status == "passed"
+                    else f"Command-backed gate failed: {' '.join(command)}."
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return GateResult(
+                check_kind=kind,
+                status="failed",
+                command=list(command),
+                exit_code=124,
+                stdout=exc.stdout if isinstance(exc.stdout, str) else "",
+                stderr=exc.stderr if isinstance(exc.stderr, str) else str(exc),
+                duration_seconds=min(self.timeout_seconds, int(check["timeout_minutes"]) * 60),
+                summary=f"Command-backed gate timed out: {' '.join(command)}.",
+            )
+        except OSError as exc:
+            return GateResult(
+                check_kind=kind,
+                status="failed",
+                command=list(command),
+                exit_code=127,
+                stdout="",
+                stderr=str(exc),
+                duration_seconds=0,
+                summary=f"Command-backed gate could not start: {' '.join(command)}.",
+            )
 
 
 @dataclass(slots=True)
@@ -65,7 +202,7 @@ class Stage5EvalResult:
 
 
 class EvalRunner:
-    """Execute synthetic eval checks against the reviewable PR packet."""
+    """Execute eval checks against the reviewable PR packet."""
 
     PROMPT_CONTRACT_ID = "eval_runner.v1"
     _DEFAULT_DURATIONS = {
@@ -80,6 +217,9 @@ class EvalRunner:
         "migration_safety": 180,
         "adversarial": 240,
     }
+
+    def __init__(self, *, gate_runner: CommandGateRunner | None = None) -> None:
+        self.gate_runner = gate_runner
 
     def build_eval_report(
         self,
@@ -108,6 +248,8 @@ class EvalRunner:
         failing_check_ids_out: list[str] = []
         passed_check_ids: list[str] = []
         pending_check_ids: list[str] = []
+        deferred_check_ids: list[str] = []
+        not_configured_check_ids: list[str] = []
         warning_count = 0
 
         for tier in eval_manifest["tiers"]:
@@ -129,23 +271,32 @@ class EvalRunner:
                 check_results.append(result)
                 if result["status"] == "failed":
                     failing_check_ids_out.append(result["id"])
-                    if check["required"] and merge_gate:
+                    if check["required"] and merge_gate and self._blocks_merge(check):
                         required_failure = True
                     elif not check["required"]:
                         optional_failure = True
                         warning_count += 1
                 elif result["status"] == "passed":
                     passed_check_ids.append(result["id"])
+                elif result["status"] == "deferred":
+                    deferred_check_ids.append(result["id"])
+                    pending_check_ids.append(result["id"])
+                elif result["status"] == "not_configured":
+                    not_configured_check_ids.append(result["id"])
+                    if check["required"] and merge_gate and self._blocks_merge(check):
+                        required_failure = True
                 else:
                     pending_check_ids.append(result["id"])
 
             if not merge_gate:
-                tier_status = "pending"
+                tier_status = "deferred"
             elif required_failure:
                 tier_status = "failed"
                 failing_merge_tiers.append(tier["name"])
             elif optional_failure:
                 tier_status = "warning"
+            elif all(check["status"] == "not_configured" for check in check_results):
+                tier_status = "not_configured"
             else:
                 tier_status = "passed"
 
@@ -204,6 +355,8 @@ class EvalRunner:
                 "failing_check_ids": failing_check_ids_out,
                 "passed_check_ids": passed_check_ids,
                 "pending_check_ids": pending_check_ids,
+                "deferred_check_ids": deferred_check_ids,
+                "not_configured_check_ids": not_configured_check_ids,
                 "warning_count": warning_count,
             },
         }
@@ -302,11 +455,28 @@ class EvalRunner:
                 "name": check["name"],
                 "kind": check["kind"],
                 "required": check["required"],
-                "status": "pending",
+                "status": "deferred",
                 "duration_seconds": 0,
                 "summary": f"{tier_name} is deferred to a later stage.",
                 **({"baseline_ref": check["baseline_ref"]} if "baseline_ref" in check else {}),
             }
+
+        if self.gate_runner is not None:
+            gate = self.gate_runner.run_check(check)
+            result = {
+                "id": check["id"],
+                "name": check["name"],
+                "kind": check["kind"],
+                "required": check["required"],
+                "status": gate.status,
+                "duration_seconds": gate.duration_seconds,
+                "summary": gate.summary,
+                **({"baseline_ref": check["baseline_ref"]} if "baseline_ref" in check else {}),
+            }
+            if gate.command is not None:
+                result["command"] = " ".join(gate.command)
+                result["exit_code"] = gate.exit_code
+            return result
 
         should_fail = check["id"] in failing_check_ids
         duration_seconds = min(
@@ -393,13 +563,18 @@ class EvalRunner:
             failed_checks = [
                 check["name"]
                 for check in tier["checks"]
-                if check["required"] and check["status"] == "failed"
+                if check["required"] and check["status"] in {"failed", "not_configured"}
             ]
             if failed_checks:
                 blockers.append(
                     f"Eval gate failed in {tier['name']}: {', '.join(failed_checks)}."
                 )
         return blockers
+
+    def _blocks_merge(self, check: dict[str, Any]) -> bool:
+        if self.gate_runner is None:
+            return True
+        return self.gate_runner.is_blocking_kind(str(check["kind"]))
 
     @staticmethod
     def _warning_findings(tiers: list[dict[str, Any]]) -> list[str]:
@@ -484,10 +659,11 @@ class Stage5EvalPipeline:
         *,
         controller: FactoryController | None = None,
         eval_runner: EvalRunner | None = None,
+        gate_runner: CommandGateRunner | None = None,
     ) -> None:
         self.root = repo_root(root)
         self.controller = controller or FactoryController()
-        self.eval_runner = eval_runner or EvalRunner()
+        self.eval_runner = eval_runner or EvalRunner(gate_runner=gate_runner)
         self.validators = load_validators(self.root)
 
     def process(

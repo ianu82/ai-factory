@@ -197,7 +197,7 @@ def test_automation_register_bundle_syncs_linear_stage_result(tmp_path) -> None:
     ]
 
 
-def test_automation_progression_skip_syncs_linear_stall_reason(tmp_path) -> None:
+def test_automation_progression_advances_non_model_runs_without_stage4_handoff(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     item = build_manual_intake_item(
         provider="github",
@@ -236,18 +236,15 @@ def test_automation_progression_skip_syncs_linear_stall_reason(tmp_path) -> None
 
     result = coordinator.run_progression_cycle()
 
-    assert result.processed_runs == []
-    assert result.skipped_runs == [
-        {
-            "work_item_id": stage3_result.work_item.work_item_id,
-            "stage_name": "stage3",
-            "reason": "non_model_touching_progression_not_supported",
-        }
-    ]
+    assert result.skipped_runs == []
+    assert len(result.processed_runs) == 1
+    processed = result.processed_runs[0]
+    assert processed.stages_completed == ["stage5", "stage6", "merge", "stage7", "stage8"]
+    assert fake_sync.calls[1]["stage_name"] == "stage5"
     assert fake_sync.calls[-1] == {
-        "stage_name": "stage3",
+        "stage_name": "stage8",
         "work_item_id": stage3_result.work_item.work_item_id,
-        "stall_reason": "non_model_touching_progression_not_supported",
+        "stall_reason": None,
     }
 
 
@@ -280,6 +277,32 @@ def test_automation_progression_cycle_advances_active_build_run_to_stage8(tmp_pa
     stage8_document = _load_json(Path(processed.stored_paths["stage8"]))
     assert stage8_document["work_item"]["state"] == "PRODUCTION_MONITORING"
     assert stage8_document["monitoring_report"]["monitoring_decision"]["status"] == "healthy"
+
+
+def test_pr_ready_autonomy_stops_after_security_review_and_comments_linear(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
+        encoding="utf-8"
+    )
+    store_dir = tmp_path / "automation-store"
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+        autonomy_mode="pr_ready",
+    )
+
+    coordinator.run_stage1_cycle(html=html, max_new_items=1)
+    result = coordinator.run_progression_cycle()
+
+    assert len(result.processed_runs) == 1
+    processed = result.processed_runs[0]
+    assert processed.final_stage == "stage6"
+    assert processed.final_state == "SECURITY_APPROVED"
+    assert processed.stages_completed == ["stage2", "stage3", "stage4", "stage5", "stage6"]
+    assert fake_sync.calls[-1]["stage_name"] == "stage6"
+    assert fake_sync.calls[-1]["stall_reason"] == "pr_ready_for_human_merge_deploy"
 
 
 def test_automation_supervisor_cycle_runs_stage1_progression_and_weekly_feedback(tmp_path) -> None:

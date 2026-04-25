@@ -153,6 +153,11 @@ class LinearWorkflowConfig:
     def maybe_from_env(cls) -> "LinearWorkflowConfig | None":
         if _bool_from_env("LINEAR_FACTORY_SYNC_DISABLED", default=False):
             return None
+        if os.environ.get("PYTEST_CURRENT_TEST") and not _bool_from_env(
+            "AI_FACTORY_ALLOW_LIVE_LINEAR_IN_TESTS",
+            default=False,
+        ):
+            return None
         api_key = os.environ.get("LINEAR_API_KEY", "").strip()
         team_id = os.environ.get("LINEAR_TARGET_TEAM_ID", "").strip()
         if not api_key or not team_id:
@@ -511,6 +516,10 @@ class LinearWorkflowSync:
                 created_by_factory=False,
             )
 
+        existing_factory_issue = self._existing_factory_issue_binding(work_item)
+        if existing_factory_issue is not None:
+            return existing_factory_issue
+
         if not self._should_create_issue(stage_name, document):
             return None
 
@@ -530,6 +539,26 @@ class LinearWorkflowSync:
             issue_url=_optional_str(issue.get("url")),
             created_by_factory=True,
             last_synced_state_id=state_id,
+        )
+
+    def _existing_factory_issue_binding(
+        self,
+        work_item: dict[str, Any],
+    ) -> LinearWorkflowBinding | None:
+        work_item_id = work_item.get("work_item_id")
+        if not isinstance(work_item_id, str) or not work_item_id:
+            return None
+        existing_issue = self.linear_client.find_factory_issue_by_work_item(
+            team_id=self.config.team_id,
+            work_item_id=work_item_id,
+        )
+        if existing_issue is None:
+            return None
+        return LinearWorkflowBinding(
+            issue_id=str(existing_issue["id"]),
+            issue_identifier=_optional_str(existing_issue.get("identifier")),
+            issue_url=_optional_str(existing_issue.get("url")),
+            created_by_factory=True,
         )
 
     def _maybe_post_stall_comment(
@@ -912,6 +941,7 @@ class LinearWorkflowSync:
             "awaiting_release_signoff": "The factory is waiting on release approval after staging.",
             "already_in_production_monitoring": "The run is already in production monitoring and no further automatic move is pending.",
             "non_model_touching_progression_not_supported": "This non-model change still needs the next non-model automation path implemented.",
+            "pr_ready_for_human_merge_deploy": "The PR is ready for human merge and deploy; production-mode automation stops before merge, staging, and monitoring.",
             "awaiting_builder_follow_up": "The builder needs to make another revision before the run can continue.",
             "run_locked": "Another worker currently owns this run lease.",
             "no_persisted_run_found": "No persisted run bundle could be found for this work item.",

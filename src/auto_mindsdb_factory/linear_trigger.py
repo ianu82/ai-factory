@@ -764,6 +764,83 @@ class LinearGraphQLClient:
             ],
         )
 
+    def find_factory_issue_by_work_item(
+        self,
+        *,
+        team_id: str,
+        work_item_id: str,
+    ) -> dict[str, Any] | None:
+        marker = f"Work item: `{work_item_id}`"
+        matches: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            document = self._execute(
+                """
+                query FactoryLinearIssuesForWorkItem($teamId: String!, $after: String) {
+                  team(id: $teamId) {
+                    id
+                    issues(first: 100, after: $after, includeArchived: false) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        id
+                        identifier
+                        title
+                        description
+                        url
+                        createdAt
+                        state {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+                """,
+                {"teamId": team_id, "after": after},
+            )
+            team = document.get("team")
+            if not isinstance(team, dict):
+                raise LinearGraphQLClientError(
+                    f"Linear team '{team_id}' could not be loaded."
+                )
+            issues = team.get("issues")
+            if not isinstance(issues, dict):
+                raise LinearGraphQLClientError(
+                    f"Linear team '{team_id}' did not return an issue connection."
+                )
+            for node in _connection_nodes(issues):
+                description = str(node.get("description") or "")
+                if (
+                    marker in description
+                    and "synchronized automatically by the AI Factory" in description
+                    and isinstance(node.get("id"), str)
+                ):
+                    matches.append(node)
+
+            page_info = issues.get("pageInfo")
+            if not isinstance(page_info, dict) or not page_info.get("hasNextPage"):
+                break
+            next_cursor = page_info.get("endCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            after = next_cursor
+
+        if not matches:
+            return None
+        matches.sort(key=lambda issue: str(issue.get("createdAt") or ""))
+        issue = matches[0]
+        return {
+            "id": str(issue["id"]),
+            "identifier": _optional_str(issue, "identifier"),
+            "title": _optional_str(issue, "title"),
+            "url": _optional_str(issue, "url"),
+            "state": _optional_entity(issue.get("state")),
+        }
+
     def create_comment(self, issue_id: str, body: str) -> str | None:
         document = self._execute(
             """

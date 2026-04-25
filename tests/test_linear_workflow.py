@@ -127,6 +127,7 @@ class FakeLinearWorkflowClient:
         self.issue_snapshots: dict[str, LinearIssueSnapshot] = {
             "issue-123": _snapshot("issue-123"),
         }
+        self.existing_factory_issues: list[dict[str, object]] = []
         self.created_states: list[dict[str, object]] = []
         self.created_issues: list[dict[str, object]] = []
         self.updated_issues: list[dict[str, object]] = []
@@ -167,6 +168,23 @@ class FakeLinearWorkflowClient:
 
     def fetch_issue_snapshot(self, issue_id: str) -> LinearIssueSnapshot:
         return self.issue_snapshots[issue_id]
+
+    def find_factory_issue_by_work_item(
+        self,
+        *,
+        team_id: str,
+        work_item_id: str,
+    ) -> dict[str, object] | None:
+        assert team_id == "team-123"
+        marker = f"Work item: `{work_item_id}`"
+        matches = [
+            issue
+            for issue in self.existing_factory_issues
+            if marker in str(issue.get("description") or "")
+        ]
+        if not matches:
+            return None
+        return dict(matches[0])
 
     def create_issue(
         self,
@@ -250,6 +268,60 @@ def test_linear_workflow_sync_stage1_active_non_linear_creates_issue_without_com
         .read_text(encoding="utf-8")
     )
     assert binding_document["created_by_factory"] is True
+
+
+def test_linear_workflow_reuses_existing_factory_issue_for_same_work_item(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(api_key="test-key", team_id="team-123"),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_github_stage1(root)
+    fake_client.existing_factory_issues.append(
+        {
+            "id": "issue-existing",
+            "identifier": "SOF-900",
+            "title": "AI Factory: Factory cockpit should surface GitHub check conclusions and eval status",
+            "description": (
+                "This issue is synchronized automatically by the AI Factory.\n\n"
+                f"- Work item: `{stage1_result.work_item.work_item_id}`"
+            ),
+            "url": "https://linear.app/example/issue/SOF-900/factory-run",
+            "state": {"id": "state-new-feature", "name": "New Feature"},
+        }
+    )
+
+    result = sync.sync_stage_result("stage1", stage1_result.to_document())
+
+    assert result["status"] == "synced"
+    assert result["issue_id"] == "issue-existing"
+    assert result["state_update"] == "moved"
+    assert fake_client.created_issues == []
+    binding_document = json.loads(
+        LinearWorkflowStore(tmp_path / "automation-store", repo_root_override=root)
+        .binding_path(stage1_result.work_item.work_item_id)
+        .read_text(encoding="utf-8")
+    )
+    assert binding_document["created_by_factory"] is True
+    assert binding_document["issue_id"] == "issue-existing"
+
+
+def test_linear_workflow_maybe_create_skips_live_linear_during_pytest(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.delenv("LINEAR_FACTORY_SYNC_DISABLED", raising=False)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_linear_workflow.py::live_guard")
+    monkeypatch.setenv("LINEAR_API_KEY", "real-looking-key")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "team-123")
+
+    sync = LinearWorkflowSync.maybe_create(tmp_path / "automation-store", repo_root_override=root)
+
+    assert sync is None
 
 
 def test_linear_workflow_sync_stage1_linear_issue_reuses_issue_and_comments_watchlist(tmp_path) -> None:

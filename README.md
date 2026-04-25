@@ -7,6 +7,7 @@ This repository is the starting point for an agent-first software factory.
 - Strategy and operating model: `docs/software-factory-plan.md`
 - Control plane and MVP execution spec: `docs/factory-control-plane-spec.md`
 - Current architecture diagram: `docs/ai-factory-architecture.md`
+- Lightsail production runbook: `docs/lightsail-production-runbook.md`
 - Lane and eval policies: `factory/policies/`
 - Machine handoff schemas: `schemas/`
 
@@ -36,7 +37,7 @@ The first implementation target now includes executable Stage 1 through Stage 9 
 20. Run a unified supervisor cycle that can execute Stage 1 intake, progression, and optional weekly feedback in one safe control-plane pass.
 21. Run a first real vertical slice that keeps the deterministic stage contracts but creates real GitHub branch/PR evidence, gates Stage 5 on local eval commands, and drives Stage 7 through Stage 9 from file-backed ops signals.
 
-The first recurring automation layer is now executable through a persisted run store. The first external seam is GitHub PR creation; staging, monitoring, and rollback remain intentionally file-backed until real deployment and observability credentials are connected.
+The first recurring automation layer is now executable through a persisted run store. The production v1 target is a PR-ready factory: Linear triggers, real code-worker branch/PR creation, command-backed local gates, Linear stage sync, and a deliberate stop before human merge/deploy. Staging, monitoring, rollback, and feedback remain simulation-only until real deployment and observability credentials are connected.
 
 ## Useful Commands
 
@@ -60,6 +61,8 @@ The first recurring automation layer is now executable through a persisted run s
 - `uv run auto-mindsdb-factory linear-webhook-server --store-dir .factory-automation --host 0.0.0.0 --port 8080`
 - `uv run auto-mindsdb-factory automation-linear-trigger-cycle --store-dir .factory-automation --repository ianu82/ai-factory`
 - `uv run auto-mindsdb-factory automation-advance-runs --store-dir .factory-automation`
+- `uv run auto-mindsdb-factory factory-doctor --store-dir .factory-automation --repository ianu82/ai-factory`
+- `uv run auto-mindsdb-factory factory-worker --store-dir .factory-automation --repository ianu82/ai-factory --once`
 - `uv run auto-mindsdb-factory automation-weekly-feedback --store-dir .factory-automation --window-label 2026-W17`
 - `uv run auto-mindsdb-factory automation-supervisor-cycle --store-dir .factory-automation --html-file fixtures/intake/anthropic-release-notes-sample.html --run-weekly-feedback --window-label 2026-W17`
 - `uv run auto-mindsdb-factory factory-vertical-slice --store-dir .factory-automation --repository ianu82/ai-factory`
@@ -86,6 +89,11 @@ Set the environment:
 - Optional: `export AI_FACTORY_OPENAI_REASONING_EFFORT=medium`
 - Optional: `export AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS=4000`
 - Optional: `export AI_FACTORY_OPENAI_TIMEOUT_SECONDS=120`
+- Optional: `export AI_FACTORY_CODE_WORKER_PROVIDER=codex_cli`
+- Optional: `export AI_FACTORY_CODE_WORKER_MODEL=gpt-5.4`
+- Optional: `export AI_FACTORY_CODE_WORKER_TIMEOUT_SECONDS=1800`
+- Optional: `export AI_FACTORY_AUTONOMY_MODE=pr_ready`
+- Optional: `export AI_FACTORY_INTAKE_PAUSED=false`
 
 Run agent-assisted stages directly:
 
@@ -122,6 +130,7 @@ Run the webhook receiver and the drain worker as separate processes:
 Set up the Linear stage workflow and backfill existing factory runs:
 
 - `uv run auto-mindsdb-factory linear-ensure-stage-states --store-dir .factory-automation`
+- `uv run auto-mindsdb-factory linear-stage-setup --store-dir .factory-automation --verify-only`
 - `uv run auto-mindsdb-factory automation-linear-sync-cycle --store-dir .factory-automation`
 
 Practical setup notes:
@@ -133,8 +142,28 @@ Practical setup notes:
 - Keep `LINEAR_TARGET_STATE_ID` pointed at your trigger queue state, for example `New Feature`. The factory creates and manages separate `Stage 1 ... Stage 9` workflow states for in-flight factory work.
 - If a run starts from a Linear issue, the factory reuses that issue and moves it forward. If a run starts elsewhere, the factory creates a new Linear issue once the work becomes an active build candidate.
 - When the factory cannot advance automatically, it keeps the issue in the current stage and writes a short explanatory comment for a human reviewer.
+- In production `pr_ready` mode, Stage 6 is the stop line: the factory comments that the PR is ready for human merge/deploy and does not advance through simulated Stage 7-9 evidence.
 
 Incoming webhook envelopes are persisted under `.factory-automation/linear-trigger-inbox/`, and dedupe state lives in `.factory-automation/linear-trigger-state.json`.
+
+## Production PR-Ready Mode
+
+Production v1 uses `factory-worker` rather than cron-style one-shot commands. The worker drains Linear triggers, advances runs, calls `codex exec` in an isolated git worktree, lets the orchestrator inspect the diff, commits/pushes/opens the PR, runs command-backed gates, syncs Linear, and stops before merge/deploy.
+
+Run the preflight:
+
+- `uv run auto-mindsdb-factory factory-doctor --store-dir .factory-automation --repository ianu82/ai-factory`
+
+Run one production-style cycle:
+
+- `uv run auto-mindsdb-factory factory-worker --store-dir .factory-automation --repository ianu82/ai-factory --once`
+
+Default real gates are:
+
+- `python -m pytest -q`
+- `python scripts/validate_contracts.py`
+
+Configure additional gates with `AI_FACTORY_GATE_LINT_COMMAND`, `AI_FACTORY_GATE_TYPECHECK_COMMAND`, `AI_FACTORY_GATE_INTEGRATION_COMMAND`, and `AI_FACTORY_GATE_MIGRATION_SAFETY_COMMAND`. Checks without real commands are recorded as `not_configured`; later-stage checks are recorded as `deferred` rather than fake-passed.
 
 ## Repository Layout
 

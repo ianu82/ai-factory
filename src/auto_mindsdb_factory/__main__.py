@@ -30,6 +30,7 @@ from .linear_trigger import (
     serve_linear_webhooks,
 )
 from .linear_workflow import (
+    LinearWorkflowConfig,
     LinearWorkflowError,
     LinearWorkflowSync,
 )
@@ -38,6 +39,12 @@ from .policy import PolicyEngine
 from .production_monitoring import (
     ProductionMonitoringError,
     Stage8ProductionMonitoringPipeline,
+)
+from .production_runtime import (
+    FactoryDoctor,
+    FactoryWorker,
+    ProductionRuntimeConfig,
+    intake_paused,
 )
 from .release_staging import ReleaseStagingError, Stage7ReleaseStagingPipeline
 from .security_review import SecurityReviewError, Stage6SecurityReviewPipeline
@@ -1232,6 +1239,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     linear_stage_setup_parser = subparsers.add_parser(
         "linear-ensure-stage-states",
+        aliases=["linear-stage-setup"],
         help="Create or reuse the Linear workflow states that mirror Factory stages 1-9.",
     )
     linear_stage_setup_parser.add_argument(
@@ -1245,6 +1253,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Override the repository root.",
+    )
+    linear_stage_setup_parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Verify that stage states exist instead of creating missing Linear workflow states.",
     )
 
     linear_sync_parser = subparsers.add_parser(
@@ -1339,6 +1352,101 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Override the repository root.",
+    )
+    automation_progress_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "simulation_full"),
+        help="How far autonomous progression is allowed to go.",
+    )
+
+    factory_worker_parser = subparsers.add_parser(
+        "factory-worker",
+        help="Run the production worker loop: drain Linear triggers, advance runs, and sync stages.",
+    )
+    factory_worker_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        required=True,
+        help="Directory where automation state and run bundles are persisted.",
+    )
+    factory_worker_parser.add_argument(
+        "--repository",
+        default="ianu82/ai-factory",
+        help="GitHub repository that receives factory implementation PRs.",
+    )
+    factory_worker_parser.add_argument(
+        "--base-branch",
+        default="main",
+        help="Base branch for factory implementation PRs.",
+    )
+    factory_worker_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+    factory_worker_parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=30.0,
+        help="Delay between worker cycles when not using --once.",
+    )
+    factory_worker_parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Limit how many queued Linear trigger events are processed in one cycle.",
+    )
+    factory_worker_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run exactly one worker cycle and exit.",
+    )
+    factory_worker_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Run at most this many cycles and exit.",
+    )
+    factory_worker_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "pr_ready"),
+        help="Production defaults to pr_ready, which stops before merge/deploy.",
+    )
+
+    factory_doctor_parser = subparsers.add_parser(
+        "factory-doctor",
+        help="Validate production runtime configuration and local dependencies.",
+    )
+    factory_doctor_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where automation state and run bundles are persisted.",
+    )
+    factory_doctor_parser.add_argument(
+        "--repository",
+        default="ianu82/ai-factory",
+        help="GitHub repository used by the production factory.",
+    )
+    factory_doctor_parser.add_argument(
+        "--base-branch",
+        default="main",
+        help="Base branch for factory implementation PRs.",
+    )
+    factory_doctor_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+    factory_doctor_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "pr_ready"),
+        help="Runtime autonomy mode to validate.",
     )
 
     automation_stage9_parser = subparsers.add_parser(
@@ -2008,6 +2116,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "automation-linear-trigger-cycle":
+        if intake_paused():
+            print(
+                json.dumps(
+                    {
+                        "cycle": "linear-trigger",
+                        "status": "skipped",
+                        "reason": "intake_paused",
+                        "processed_events": [],
+                        "skipped_events": [],
+                        "failed_events": [],
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         try:
             worker = LinearTriggerWorker(
                 args.store_dir,
@@ -2038,12 +2161,27 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    if args.command == "linear-ensure-stage-states":
+    if args.command in {"linear-ensure-stage-states", "linear-stage-setup"}:
         try:
-            sync = LinearWorkflowSync(
-                args.store_dir,
-                repo_root_override=args.repo_root,
-            )
+            config = None
+            if args.verify_only:
+                config = LinearWorkflowConfig.maybe_from_env()
+                if config is None:
+                    raise LinearWorkflowError(
+                        "LINEAR_API_KEY and LINEAR_TARGET_TEAM_ID are required for workflow sync."
+                    )
+                config.create_missing_states = False
+            if config is None:
+                sync = LinearWorkflowSync(
+                    args.store_dir,
+                    repo_root_override=args.repo_root,
+                )
+            else:
+                sync = LinearWorkflowSync(
+                    args.store_dir,
+                    repo_root_override=args.repo_root,
+                    config=config,
+                )
             stage_states = sync.ensure_stage_states()
         except LinearWorkflowError as exc:
             print(f"Linear stage setup failed: {exc}", file=sys.stderr)
@@ -2115,6 +2253,7 @@ def main(argv: list[str] | None = None) -> int:
             coordinator = FactoryAutomationCoordinator(
                 args.store_dir,
                 repo_root_override=args.repo_root,
+                autonomy_mode=args.autonomy_mode,
             )
             result = coordinator.run_progression_cycle(
                 repository=args.repository,
@@ -2134,6 +2273,56 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps(result.to_document(), indent=2))
         return 0
+
+    if args.command == "factory-worker":
+        if args.interval_seconds <= 0:
+            parser.error("--interval-seconds must be > 0")
+        if args.max_cycles is not None and args.max_cycles < 1:
+            parser.error("--max-cycles must be >= 1")
+        if args.max_events is not None and args.max_events < 1:
+            parser.error("--max-events must be >= 1")
+        try:
+            config = ProductionRuntimeConfig.from_env(
+                store_dir=args.store_dir,
+                repo_root=args.repo_root or Path.cwd(),
+                repository=args.repository,
+                base_branch=args.base_branch,
+                interval_seconds=args.interval_seconds,
+                max_events_per_cycle=args.max_events,
+                autonomy_mode=args.autonomy_mode,
+            )
+            result = FactoryWorker(config).run(once=args.once, max_cycles=args.max_cycles)
+        except (
+            AutomationError,
+            BuildReviewError,
+            EvalExecutionError,
+            FactoryConnectorError,
+            IntakeError,
+            LinearTriggerError,
+            LinearWorkflowError,
+            TicketingError,
+            OSError,
+        ) as exc:
+            print(f"Factory worker failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "factory-doctor":
+        try:
+            config = ProductionRuntimeConfig.from_env(
+                store_dir=args.store_dir,
+                repo_root=args.repo_root or Path.cwd(),
+                repository=args.repository,
+                base_branch=args.base_branch,
+                autonomy_mode=args.autonomy_mode,
+            )
+            result = FactoryDoctor(config).run()
+        except (AutomationError, OSError) as exc:
+            print(f"Factory doctor failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if result["status"] == "passed" else 1
 
     if args.command == "automation-supervisor-cycle":
         if args.feedback_window_days < 1:

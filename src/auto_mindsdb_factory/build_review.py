@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .connectors import AgentConnector, AgentTask, FactoryConnectorError
+from .connectors import (
+    AgentConnector,
+    AgentTask,
+    CodeWorkerConnector,
+    FactoryConnectorError,
+    GitHubCLIRepoConnector,
+)
 from .contracts import load_validators, validation_errors_for
 from .controller import ControllerEvent, ControllerState, FactoryController, WorkItem
 from .eval_common import pending_merge_gate_tiers
@@ -640,12 +646,16 @@ class Stage3BuildReviewPipeline:
         builder: Builder | None = None,
         reviewer: Reviewer | None = None,
         agent_connector: AgentConnector | None = None,
+        code_worker_connector: CodeWorkerConnector | None = None,
+        repo_connector: GitHubCLIRepoConnector | None = None,
     ) -> None:
         self.root = repo_root(root)
         self.controller = controller or FactoryController()
         self.budget_guardian = budget_guardian or BudgetGuardian()
         self.builder = builder or Builder(agent_connector=agent_connector)
         self.reviewer = reviewer or Reviewer(agent_connector=agent_connector)
+        self.code_worker_connector = code_worker_connector
+        self.repo_connector = repo_connector
         self.validators = load_validators(self.root)
 
     def process(
@@ -725,6 +735,27 @@ class Stage3BuildReviewPipeline:
             previous_pr_packet=previous_pr_packet,
             timestamp=builder_timestamp,
         )
+        if self.code_worker_connector is not None:
+            if self.repo_connector is None:
+                raise BuildReviewError(
+                    "Stage 3 code-worker mode requires a repository connector."
+                )
+            try:
+                pr_evidence, worker_result = self.repo_connector.create_code_worker_pull_request(
+                    work_item_id=working_item.work_item_id,
+                    spec_packet=spec_packet,
+                    ticket_bundle=ticket_bundle,
+                    eval_manifest=eval_manifest,
+                    pr_packet=pr_packet,
+                    code_worker=self.code_worker_connector,
+                )
+            except FactoryConnectorError as exc:
+                raise BuildReviewError(f"Stage 3 code-worker delivery failed: {exc}") from exc
+            pr_packet = self._attach_delivery_evidence(
+                pr_packet,
+                pr_evidence=pr_evidence.to_document(),
+                worker_result=worker_result.to_document(),
+            )
         self.controller.apply_event(
             working_item,
             event=ControllerEvent.PR_CREATED,
@@ -771,6 +802,36 @@ class Stage3BuildReviewPipeline:
             pr_packet=pr_packet,
             work_item=working_item,
         )
+
+    @staticmethod
+    def _attach_delivery_evidence(
+        pr_packet: dict[str, Any],
+        *,
+        pr_evidence: dict[str, Any],
+        worker_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        updated = deepcopy(pr_packet)
+        updated["branch_name"] = str(pr_evidence["branch_name"])
+        updated["pull_request"]["number"] = int(pr_evidence["number"])
+        updated["pull_request"]["url"] = str(pr_evidence["url"])
+        worker_paths = [
+            path for path in worker_result.get("changed_paths", [])
+            if isinstance(path, str) and path
+        ]
+        if worker_paths:
+            updated["changed_paths"] = Builder._dedupe(worker_paths + updated["changed_paths"])
+        updated["delivery_evidence"] = {
+            "mode": "code_worker_pr",
+            "repository": pr_evidence["repository"],
+            "branch_name": pr_evidence["branch_name"],
+            "base_branch": pr_evidence["base_branch"],
+            "commit_sha": pr_evidence["commit_sha"],
+            "pull_request_number": pr_evidence["number"],
+            "pull_request_url": pr_evidence["url"],
+            "code_worker": worker_result,
+            "created_at": pr_evidence["created_at"],
+        }
+        return updated
 
     def _validate_document(self, schema_name: str, document: dict[str, Any]) -> None:
         errors = validation_errors_for(self.validators[schema_name], document)

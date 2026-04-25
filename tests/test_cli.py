@@ -1161,6 +1161,76 @@ def test_automation_advance_runs_cli_progresses_active_build_items(capsys, tmp_p
     assert payload["processed_runs"][0]["final_stage"] == "stage8"
 
 
+def test_factory_doctor_cli_emits_runtime_checks(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+            assert config.autonomy_mode.value == "pr_ready"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+
+    exit_code = main(
+        [
+            "factory-doctor",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "factory-doctor"
+    assert payload["status"] == "passed"
+
+
+def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeWorker:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+            assert config.autonomy_mode.value == "pr_ready"
+            assert config.max_events_per_cycle == 3
+
+        def run(self, *, once: bool = False, max_cycles: int | None = None) -> dict[str, object]:
+            assert once is True
+            assert max_cycles is None
+            return {
+                "cycle": "factory-worker",
+                "status": "completed",
+                "cycles": [{"cycle": "factory-worker-cycle"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryWorker", _FakeWorker)
+
+    exit_code = main(
+        [
+            "factory-worker",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+            "--max-events",
+            "3",
+            "--once",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "factory-worker"
+    assert payload["cycles"] == [{"cycle": "factory-worker-cycle"}]
+
+
 def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
