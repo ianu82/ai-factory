@@ -503,12 +503,18 @@ def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state
     root = Path(__file__).resolve().parents[1]
     store_dir = tmp_path / "automation-store"
     trigger_store = LinearTriggerStore(store_dir, repo_root_override=root)
+    issue_id = "30b259c4-cc73-48f7-8071-0543a360b0c6"
+    state_id = "17fa210f-6809-46cf-8e51-6bfa69a25cfe"
     trigger_store.save_envelope(
         LinearWebhookEnvelope.from_payload(
             delivery_id="delivery-1",
             event_type="Issue",
             received_at="2026-04-24T12:00:01Z",
-            payload=_issue_payload(created_at="2026-04-24T12:00:00Z"),
+            payload=_issue_payload(
+                issue_id=issue_id,
+                state_id=state_id,
+                created_at="2026-04-24T12:00:00Z",
+            ),
         )
     )
     trigger_store.save_envelope(
@@ -516,10 +522,14 @@ def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state
             delivery_id="delivery-2",
             event_type="Issue",
             received_at="2026-04-25T12:00:01Z",
-            payload=_issue_payload(created_at="2026-04-25T12:00:00Z"),
+            payload=_issue_payload(
+                issue_id=issue_id,
+                state_id=state_id,
+                created_at="2026-04-25T12:00:00Z",
+            ),
         )
     )
-    fake_client = FakeLinearClient(_snapshot())
+    fake_client = FakeLinearClient(_snapshot(issue_id=issue_id))
     fake_coordinator = FakeCoordinator(store_dir, root)
     worker = LinearTriggerWorker(
         store_dir,
@@ -539,6 +549,7 @@ def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state
     assert result.skipped_events == []
     assert result.failed_events == []
     assert result.processed_events[0]["work_item_id"] != result.processed_events[1]["work_item_id"]
+    assert result.processed_events[0]["work_item_id"].startswith("wi-linear-eng-123-")
 
 
 def test_linear_trigger_worker_records_handoff_failures_without_aborting_cycle(tmp_path) -> None:

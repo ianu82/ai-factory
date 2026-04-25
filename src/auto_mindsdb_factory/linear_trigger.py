@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from .automation import AutomationError, FactoryAutomationCoordinator
 from .contracts import load_validators, validation_errors_for
-from .intake import build_manual_intake_item, normalize_whitespace, repo_root, utc_now
+from .intake import build_manual_intake_item, normalize_whitespace, repo_root, slugify, utc_now
 
 DEFAULT_LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 DEFAULT_WEBHOOK_MAX_AGE_SECONDS = 60
@@ -1363,7 +1363,10 @@ class LinearTriggerWorker:
             published_at=str(envelope.payload["createdAt"]),
         )
         try:
-            return self.coordinator.stage1_pipeline.process_item(item)
+            return self.coordinator.stage1_pipeline.process_item(
+                item,
+                work_item_id=_linear_work_item_id(snapshot, envelope),
+            )
         except Exception as exc:
             raise LinearTriggerError(
                 f"Linear Stage 1 intake failed for issue '{snapshot.identifier}': {exc}"
@@ -1505,6 +1508,12 @@ def render_linear_manual_intake_body(
         f"trigger_created_at={envelope.payload['createdAt']}; "
         f"logical_trigger_key={envelope.logical_trigger_key}; linear_url={snapshot.url}."
     )
+
+
+def _linear_work_item_id(snapshot: LinearIssueSnapshot, envelope: LinearWebhookEnvelope) -> str:
+    issue_token = slugify(snapshot.identifier) or slugify(envelope.issue_id)[:24] or "issue"
+    trigger_digest = hashlib.sha1(envelope.logical_trigger_key.encode("utf-8")).hexdigest()[:10]
+    return f"wi-linear-{issue_token[:24]}-{trigger_digest}"
 
 
 def render_linear_comment_body(
