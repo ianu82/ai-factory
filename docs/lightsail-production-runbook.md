@@ -10,6 +10,39 @@ Production v1 runs on one persistent Lightsail instance with one active worker a
 - `factory-worker` drains persisted Linear triggers, advances factory runs, invokes the code worker, runs gates, syncs Linear, and stops at human merge/deploy.
 - `AI_FACTORY_AUTONOMY_MODE=pr_ready` is the production default. It disables automatic merge, staging, production monitoring, and feedback movement unless those stages are backed by real external evidence later.
 
+## Current Deployment
+
+The first billable production test box is live on Lightsail and should be treated as the current AI Factory v1 host.
+
+- Instance: `ai-factory-prod-1`
+- Region/AZ: `us-west-2a`
+- Image: Ubuntu 24.04 LTS
+- Static IPv4: `184.33.39.108`
+- Public base URL: `https://184-33-39-108.sslip.io`
+- Linear webhook URL: `https://184-33-39-108.sslip.io/hooks/linear`
+- Linear webhook: `AI Factory Lightsail`, scoped to `software-factory`, `Issue` events only
+- Repository checkout: `/srv/ai-factory`
+- Run store: `/var/lib/ai-factory`
+- Environment file: `/etc/ai-factory/factory.env`
+- Service user: `ai-factory`
+- SSH access: `ssh -i ~/.ssh/anton_lightsail ubuntu@184.33.39.108`
+
+The worker is initially deployed with `AI_FACTORY_INTAKE_PAUSED=true`. This lets the webhook receive and persist valid events without starting new factory work until an operator explicitly unpauses intake.
+
+```sh
+sudo sed -i 's/^AI_FACTORY_INTAKE_PAUSED=.*/AI_FACTORY_INTAKE_PAUSED="false"/' /etc/ai-factory/factory.env
+sudo systemctl restart ai-factory-worker.service
+```
+
+Pause intake again with:
+
+```sh
+sudo sed -i 's/^AI_FACTORY_INTAKE_PAUSED=.*/AI_FACTORY_INTAKE_PAUSED="true"/' /etc/ai-factory/factory.env
+sudo systemctl restart ai-factory-worker.service
+```
+
+The Linear trigger state for this deployment is the team-specific Stage 1 intake state. Issues should move into that state when the team wants the factory to begin scoping and execution. `New Feature` remains a human requirements-quality state before factory intake.
+
 ## Required Host Setup
 
 - Attach a Lightsail static IP.
@@ -97,11 +130,44 @@ uv run auto-mindsdb-factory factory-worker \
   --repository ianu82/ai-factory
 ```
 
+Check the deployed services:
+
+```sh
+sudo systemctl status caddy
+sudo systemctl status ai-factory-webhook.service
+sudo systemctl status ai-factory-worker.service
+```
+
+Run a deployed host doctor check:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-doctor --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory --repository ianu82/ai-factory'
+```
+
 Pause new intake without disturbing active runs:
 
 ```sh
 AI_FACTORY_INTAKE_PAUSED=true
 ```
+
+## Linear Webhook Setup
+
+The current webhook was created in Linear's API settings UI because workspace-admin privileges are required to manage webhooks. The service API key used by the worker can read issues and write comments, but it cannot create or list webhooks.
+
+Use these fields if the webhook must be recreated:
+
+- Label: `AI Factory Lightsail`
+- URL: `https://184-33-39-108.sslip.io/hooks/linear`
+- Data change events: `Issues`
+- Team selection: `software-factory`
+
+After recreating the webhook, copy Linear's generated signing secret into `/etc/ai-factory/factory.env` as `LINEAR_WEBHOOK_SECRET`, then restart `ai-factory-webhook.service`.
+
+```sh
+sudo systemctl restart ai-factory-webhook.service
+```
+
+Do not commit the signing secret, Linear API key, GitHub token, or OpenAI API key to the repository.
 
 ## Systemd Sketch
 
