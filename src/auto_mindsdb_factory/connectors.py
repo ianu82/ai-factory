@@ -229,6 +229,7 @@ class CodexCLICodeWorkerConfig:
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
     full_auto: bool = True
+    bypass_sandbox: bool = False
 
     @classmethod
     def from_env(cls) -> "CodexCLICodeWorkerConfig":
@@ -239,6 +240,10 @@ class CodexCLICodeWorkerConfig:
             sandbox=os.environ.get("AI_FACTORY_CODE_WORKER_SANDBOX", "workspace-write"),
             approval_policy=os.environ.get("AI_FACTORY_CODE_WORKER_APPROVAL_POLICY", "never"),
             full_auto=os.environ.get("AI_FACTORY_CODE_WORKER_FULL_AUTO", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            bypass_sandbox=os.environ.get("AI_FACTORY_CODE_WORKER_BYPASS_SANDBOX", "false")
+            .strip()
+            .lower()
             in {"1", "true", "yes", "on"},
         )
 
@@ -276,7 +281,9 @@ class CodexCLICodeWorkerConnector:
             "-m",
             self.config.model,
         ]
-        if self.config.full_auto:
+        if self.config.bypass_sandbox:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        elif self.config.full_auto:
             command.append("--full-auto")
         else:
             command.extend(["-s", self.config.sandbox])

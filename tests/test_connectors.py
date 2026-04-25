@@ -358,3 +358,47 @@ def test_codex_cli_code_worker_can_disable_full_auto(capsys, monkeypatch, tmp_pa
     assert "-s" in captured["command"]
     assert "-c" in captured["command"]
     assert "-a" not in captured["command"]
+
+
+def test_codex_cli_code_worker_can_bypass_sandbox_for_externally_isolated_hosts(
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            full_auto=True,
+            bypass_sandbox=True,
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    connector.run_code_worker(job)
+
+    assert "--dangerously-bypass-approvals-and-sandbox" in captured["command"]
+    assert "--full-auto" not in captured["command"]
+    assert "-s" not in captured["command"]
