@@ -149,6 +149,7 @@ class LinearWorkflowConfig:
     trigger_state_id: str | None = None
     blocked_label_name: str = "blocked/stuck"
     create_missing_states: bool = True
+    materialize_stage2_tickets: bool = False
 
     @classmethod
     def maybe_from_env(cls) -> "LinearWorkflowConfig | None":
@@ -175,6 +176,10 @@ class LinearWorkflowConfig:
             trigger_state_id=trigger_state_id,
             blocked_label_name=blocked_label_name,
             create_missing_states=_bool_from_env("LINEAR_FACTORY_CREATE_STATES", default=True),
+            materialize_stage2_tickets=_bool_from_env(
+                "LINEAR_MATERIALIZE_STAGE2_TICKETS",
+                default=False,
+            ),
         )
 
 
@@ -189,6 +194,7 @@ class LinearWorkflowBinding:
     last_comment_key: str | None = None
     last_comment_id: str | None = None
     artifact_comment_keys: list[str] = field(default_factory=list)
+    ticket_issue_bindings: dict[str, dict[str, Any]] = field(default_factory=dict)
     updated_at: str = field(default_factory=utc_now)
     version: int = 1
 
@@ -208,6 +214,11 @@ class LinearWorkflowBinding:
                 for item in document.get("artifact_comment_keys", [])
                 if isinstance(item, str)
             ],
+            ticket_issue_bindings={
+                str(ticket_id): dict(binding)
+                for ticket_id, binding in document.get("ticket_issue_bindings", {}).items()
+                if isinstance(ticket_id, str) and isinstance(binding, dict)
+            },
             updated_at=str(document["updated_at"]),
             version=int(document.get("version", 1)),
         )
@@ -224,6 +235,10 @@ class LinearWorkflowBinding:
             "last_comment_key": self.last_comment_key,
             "last_comment_id": self.last_comment_id,
             "artifact_comment_keys": list(self.artifact_comment_keys),
+            "ticket_issue_bindings": {
+                ticket_id: dict(binding)
+                for ticket_id, binding in sorted(self.ticket_issue_bindings.items())
+            },
             "updated_at": self.updated_at,
         }
 
@@ -490,6 +505,13 @@ class LinearWorkflowSync:
                     document=document,
                 ),
             )
+            ticket_issues = self._maybe_sync_ticket_issues(
+                binding,
+                stage_name=stage_name,
+                linear_stage_key=linear_stage_key,
+                state_id=str(target_state["id"]),
+                document=document,
+            )
             comment = self._maybe_post_stall_comment(
                 binding,
                 stall_payload=stall_payload,
@@ -516,6 +538,7 @@ class LinearWorkflowSync:
                 ),
                 "blocked_label": label_result,
                 "artifact_comment": artifact_comment,
+                "ticket_issues": ticket_issues,
                 "comment": comment,
                 "created_by_factory": binding.created_by_factory,
             }
@@ -617,6 +640,143 @@ class LinearWorkflowSync:
         binding.artifact_comment_keys.append(comment_key)
         binding.artifact_comment_keys = sorted(dict.fromkeys(binding.artifact_comment_keys))
         return {"status": "posted", "comment_id": comment_id}
+
+    def _maybe_sync_ticket_issues(
+        self,
+        binding: LinearWorkflowBinding,
+        *,
+        stage_name: str,
+        linear_stage_key: str,
+        state_id: str,
+        document: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.config.materialize_stage2_tickets:
+            return {"status": "skipped", "reason": "disabled"}
+        if stage_name == "stage2":
+            return self._materialize_stage2_ticket_issues(
+                binding,
+                linear_stage_key=linear_stage_key,
+                state_id=state_id,
+                document=document,
+            )
+        if stage_name not in {"stage3", "stage5", "stage6", "merge"}:
+            return {"status": "skipped", "reason": "stage_has_no_ticket_artifact_sync"}
+        if not binding.ticket_issue_bindings:
+            return {"status": "skipped", "reason": "no_materialized_ticket_issues"}
+        posted: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for ticket_id, ticket_binding in sorted(binding.ticket_issue_bindings.items()):
+            issue_id = _optional_str(ticket_binding.get("issue_id"))
+            if issue_id is None:
+                skipped.append({"ticket_id": ticket_id, "reason": "missing_issue_id"})
+                continue
+            payload = self._ticket_issue_artifact_payload(
+                ticket_id=ticket_id,
+                stage_name=stage_name,
+                linear_stage_key=linear_stage_key,
+                document=document,
+            )
+            if payload is None:
+                skipped.append({"ticket_id": ticket_id, "reason": "no_artifact_for_stage"})
+                continue
+            comment_key, body = payload
+            comment_keys = [
+                str(item)
+                for item in ticket_binding.get("artifact_comment_keys", [])
+                if isinstance(item, str)
+            ]
+            if comment_key in comment_keys:
+                skipped.append({"ticket_id": ticket_id, "reason": "duplicate_artifact_comment"})
+                continue
+            comment_id = self.linear_client.create_comment(issue_id, body)
+            comment_keys.append(comment_key)
+            ticket_binding["artifact_comment_keys"] = sorted(dict.fromkeys(comment_keys))
+            posted.append(
+                {
+                    "ticket_id": ticket_id,
+                    "issue_id": issue_id,
+                    "comment_id": comment_id,
+                }
+            )
+        return {"status": "synced", "posted": posted, "skipped": skipped}
+
+    def _materialize_stage2_ticket_issues(
+        self,
+        binding: LinearWorkflowBinding,
+        *,
+        linear_stage_key: str,
+        state_id: str,
+        document: dict[str, Any],
+    ) -> dict[str, Any]:
+        tickets = self._stage2_tickets(document)
+        if not tickets:
+            return {"status": "skipped", "reason": "no_stage2_tickets"}
+        work_item = self._require_work_item(document)
+        created: list[dict[str, Any]] = []
+        reused: list[dict[str, Any]] = []
+        for ticket in tickets:
+            ticket_id = str(ticket.get("id") or "")
+            if not ticket_id:
+                continue
+            existing_binding = binding.ticket_issue_bindings.get(ticket_id)
+            if isinstance(existing_binding, dict) and existing_binding.get("issue_id"):
+                reused.append(
+                    {
+                        "ticket_id": ticket_id,
+                        "issue_id": existing_binding.get("issue_id"),
+                        "reason": "binding_exists",
+                    }
+                )
+                continue
+            existing_issue = self.linear_client.find_factory_ticket_issue(
+                team_id=self.config.team_id,
+                parent_issue_id=binding.issue_id,
+                work_item_id=work_item["work_item_id"],
+                ticket_id=ticket_id,
+            )
+            if existing_issue is not None:
+                ticket_binding = self._ticket_issue_binding_document(existing_issue)
+                binding.ticket_issue_bindings[ticket_id] = ticket_binding
+                reused.append(
+                    {
+                        "ticket_id": ticket_id,
+                        "issue_id": ticket_binding["issue_id"],
+                        "reason": "existing_issue_found",
+                    }
+                )
+                continue
+            issue = self.linear_client.create_issue(
+                team_id=self.config.team_id,
+                title=self._ticket_issue_title(ticket),
+                description=self._ticket_issue_description(
+                    ticket=ticket,
+                    parent_binding=binding,
+                    linear_stage_key=linear_stage_key,
+                    document=document,
+                ),
+                state_id=state_id,
+                parent_id=binding.issue_id,
+            )
+            ticket_binding = self._ticket_issue_binding_document(issue)
+            binding.ticket_issue_bindings[ticket_id] = ticket_binding
+            created.append(
+                {
+                    "ticket_id": ticket_id,
+                    "issue_id": ticket_binding["issue_id"],
+                    "issue_identifier": ticket_binding.get("issue_identifier"),
+                    "issue_url": ticket_binding.get("issue_url"),
+                }
+            )
+        return {"status": "synced", "created": created, "reused": reused}
+
+    @staticmethod
+    def _ticket_issue_binding_document(issue: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "issue_id": str(issue["id"]),
+            "issue_identifier": _optional_str(issue.get("identifier")),
+            "issue_url": _optional_str(issue.get("url")),
+            "artifact_comment_keys": [],
+        }
 
     def _artifact_comment_payload(
         self,
@@ -739,6 +899,41 @@ class LinearWorkflowSync:
             return [f"Merge status: `{status or 'unknown'}`"]
 
         return []
+
+    def _ticket_issue_artifact_payload(
+        self,
+        *,
+        ticket_id: str,
+        stage_name: str,
+        linear_stage_key: str,
+        document: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        artifact_payload = self._artifact_comment_payload(
+            stage_name=stage_name,
+            linear_stage_key=linear_stage_key,
+            document=document,
+        )
+        if artifact_payload is None:
+            return None
+        parent_comment_key, parent_body = artifact_payload
+        comment_key = hashlib.sha1(
+            json.dumps(
+                {
+                    "kind": "ticket-artifact",
+                    "ticket_id": ticket_id,
+                    "parent_comment_key": parent_comment_key,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        body = "\n".join(
+            [
+                f"AI Factory artifact update for scoped ticket `{ticket_id}`.",
+                "",
+                parent_body,
+            ]
+        )
+        return comment_key, body
 
     def _sync_blocked_label(self, issue_id: str, *, blocked: bool) -> dict[str, str]:
         label_id = self._ensure_blocked_label()
@@ -1075,6 +1270,57 @@ class LinearWorkflowSync:
                 lines.extend(["", "Stage 1 rationale:", rationale])
         return "\n".join(lines)
 
+    def _ticket_issue_title(self, ticket: dict[str, Any]) -> str:
+        title = normalize_whitespace(str(ticket.get("title") or "Untitled factory ticket"))
+        if title.lower().startswith("ai factory ticket:"):
+            return title
+        return f"AI Factory ticket: {title}"
+
+    def _ticket_issue_description(
+        self,
+        *,
+        ticket: dict[str, Any],
+        parent_binding: LinearWorkflowBinding,
+        linear_stage_key: str,
+        document: dict[str, Any],
+    ) -> str:
+        work_item = self._require_work_item(document)
+        stage_definition = LINEAR_FACTORY_STAGE_BY_KEY[linear_stage_key]
+        ticket_id = str(ticket.get("id") or "unknown-ticket")
+        lines = [
+            "This child issue is synchronized automatically by the AI Factory.",
+            "",
+            f"- Parent work item: `{work_item['work_item_id']}`",
+            f"- Factory ticket: `{ticket_id}`",
+            f"- Parent Linear issue: `{parent_binding.issue_identifier or parent_binding.issue_id}`",
+            f"- Current factory stage: `{stage_definition.name}`",
+        ]
+        if parent_binding.issue_url:
+            lines.append(f"- Parent issue URL: {parent_binding.issue_url}")
+        if self.config.trigger_base_url:
+            lines.append(
+                f"- Cockpit: {self.config.trigger_base_url.rstrip('/')} (filter for `{work_item['work_item_id']}`)"
+            )
+        summary = normalize_whitespace(str(ticket.get("summary") or ""))
+        if summary:
+            lines.extend(["", "Summary:", summary])
+        sections = [
+            ("Scope", ticket.get("scope")),
+            ("Definition of done", ticket.get("definition_of_done")),
+            ("Known edge cases", ticket.get("known_edge_cases")),
+            ("Non-goals", ticket.get("non_goals")),
+            ("Required eval tiers", ticket.get("required_eval_tiers")),
+        ]
+        for heading, values in sections:
+            formatted = self._format_ticket_list(values)
+            if formatted:
+                lines.extend(["", f"{heading}:"])
+                lines.extend(formatted)
+        rollback = normalize_whitespace(str(ticket.get("rollback_strategy") or ""))
+        if rollback:
+            lines.extend(["", "Rollback strategy:", rollback])
+        return "\n".join(lines)
+
     @staticmethod
     def _problem_summary(document: dict[str, Any]) -> str:
         spec_packet = document.get("spec_packet")
@@ -1122,20 +1368,30 @@ class LinearWorkflowSync:
 
     @staticmethod
     def _stage2_ticket_summaries(document: dict[str, Any]) -> list[tuple[str, str]]:
+        tickets = LinearWorkflowSync._stage2_tickets(document)
+        summaries: list[tuple[str, str]] = []
+        for ticket in tickets:
+            ticket_id = str(ticket.get("id") or "ticket")
+            title = normalize_whitespace(str(ticket.get("title") or "Untitled ticket"))
+            summaries.append((ticket_id, title))
+        return summaries
+
+    @staticmethod
+    def _stage2_tickets(document: dict[str, Any]) -> list[dict[str, Any]]:
         ticket_bundle = document.get("ticket_bundle")
         if not isinstance(ticket_bundle, dict):
             return []
         tickets = ticket_bundle.get("tickets")
         if not isinstance(tickets, list):
             return []
-        summaries: list[tuple[str, str]] = []
-        for ticket in tickets:
-            if not isinstance(ticket, dict):
-                continue
-            ticket_id = str(ticket.get("id") or "ticket")
-            title = normalize_whitespace(str(ticket.get("title") or "Untitled ticket"))
-            summaries.append((ticket_id, title))
-        return summaries
+        return [ticket for ticket in tickets if isinstance(ticket, dict)]
+
+    @staticmethod
+    def _format_ticket_list(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        formatted = [normalize_whitespace(str(value)) for value in values if value]
+        return [f"- {value}" for value in formatted[:10] if value]
 
     @staticmethod
     def _source_url(document: dict[str, Any]) -> str | None:

@@ -841,6 +841,93 @@ class LinearGraphQLClient:
             "state": _optional_entity(issue.get("state")),
         }
 
+    def find_factory_ticket_issue(
+        self,
+        *,
+        team_id: str,
+        parent_issue_id: str,
+        work_item_id: str,
+        ticket_id: str,
+    ) -> dict[str, Any] | None:
+        work_item_marker = f"Parent work item: `{work_item_id}`"
+        ticket_marker = f"Factory ticket: `{ticket_id}`"
+        matches: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            document = self._execute(
+                """
+                query FactoryLinearIssuesForTicket($teamId: String!, $after: String) {
+                  team(id: $teamId) {
+                    id
+                    issues(first: 100, after: $after, includeArchived: false) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        id
+                        identifier
+                        title
+                        description
+                        url
+                        createdAt
+                        parent {
+                          id
+                        }
+                        state {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+                """,
+                {"teamId": team_id, "after": after},
+            )
+            team = document.get("team")
+            if not isinstance(team, dict):
+                raise LinearGraphQLClientError(
+                    f"Linear team '{team_id}' could not be loaded."
+                )
+            issues = team.get("issues")
+            if not isinstance(issues, dict):
+                raise LinearGraphQLClientError(
+                    f"Linear team '{team_id}' did not return an issue connection."
+                )
+            for node in _connection_nodes(issues):
+                description = str(node.get("description") or "")
+                parent = node.get("parent")
+                parent_id = parent.get("id") if isinstance(parent, dict) else None
+                if (
+                    work_item_marker in description
+                    and ticket_marker in description
+                    and "synchronized automatically by the AI Factory" in description
+                    and parent_id == parent_issue_id
+                    and isinstance(node.get("id"), str)
+                ):
+                    matches.append(node)
+
+            page_info = issues.get("pageInfo")
+            if not isinstance(page_info, dict) or not page_info.get("hasNextPage"):
+                break
+            next_cursor = page_info.get("endCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            after = next_cursor
+
+        if not matches:
+            return None
+        matches.sort(key=lambda issue: str(issue.get("createdAt") or ""))
+        issue = matches[0]
+        return {
+            "id": str(issue["id"]),
+            "identifier": _optional_str(issue, "identifier"),
+            "title": _optional_str(issue, "title"),
+            "url": _optional_str(issue, "url"),
+            "state": _optional_entity(issue.get("state")),
+        }
+
     def create_comment(self, issue_id: str, body: str) -> str | None:
         try:
             document = self._execute(
@@ -1147,6 +1234,7 @@ class LinearGraphQLClient:
         title: str,
         description: str,
         state_id: str | None = None,
+        parent_id: str | None = None,
     ) -> dict[str, Any]:
         document = self._execute(
             """
@@ -1154,14 +1242,16 @@ class LinearGraphQLClient:
               $teamId: String!,
               $title: String!,
               $description: String!,
-              $stateId: String
+              $stateId: String,
+              $parentId: String
             ) {
               issueCreate(
                 input: {
                   teamId: $teamId,
                   title: $title,
                   description: $description,
-                  stateId: $stateId
+                  stateId: $stateId,
+                  parentId: $parentId
                 }
               ) {
                 success
@@ -1183,6 +1273,7 @@ class LinearGraphQLClient:
                 "title": title,
                 "description": description,
                 "stateId": state_id,
+                "parentId": parent_id,
             },
         )
         payload = document.get("issueCreate")

@@ -208,6 +208,28 @@ class FakeLinearWorkflowClient:
             return None
         return dict(matches[0])
 
+    def find_factory_ticket_issue(
+        self,
+        *,
+        team_id: str,
+        parent_issue_id: str,
+        work_item_id: str,
+        ticket_id: str,
+    ) -> dict[str, object] | None:
+        assert team_id == "team-123"
+        work_item_marker = f"Parent work item: `{work_item_id}`"
+        ticket_marker = f"Factory ticket: `{ticket_id}`"
+        matches = [
+            issue
+            for issue in self.existing_factory_issues
+            if issue.get("parent_id") == parent_issue_id
+            and work_item_marker in str(issue.get("description") or "")
+            and ticket_marker in str(issue.get("description") or "")
+        ]
+        if not matches:
+            return None
+        return dict(matches[0])
+
     def create_issue(
         self,
         *,
@@ -215,6 +237,7 @@ class FakeLinearWorkflowClient:
         title: str,
         description: str,
         state_id: str | None = None,
+        parent_id: str | None = None,
     ) -> dict[str, object]:
         created = {
             "id": f"issue-{len(self.created_issues) + 900}",
@@ -229,6 +252,7 @@ class FakeLinearWorkflowClient:
                 "title": title,
                 "description": description,
                 "state_id": state_id,
+                "parent_id": parent_id,
             }
         )
         return created
@@ -477,6 +501,97 @@ def test_linear_workflow_sync_stage2_posts_ticket_artifact_comment(tmp_path) -> 
     assert "AI Factory artifact update: `Stage 2 Ticketing`" in comment_text
     assert "Scoped tickets:" in comment_text
     assert stage2_result.ticket_bundle["tickets"][0]["title"] in comment_text
+
+
+def test_linear_workflow_stage2_can_materialize_scoped_tickets_as_child_issues(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage2", stage2_result.to_document())
+
+    tickets = stage2_result.ticket_bundle["tickets"]
+    assert result["ticket_issues"]["status"] == "synced"
+    assert len(result["ticket_issues"]["created"]) == len(tickets)
+    assert [issue["parent_id"] for issue in fake_client.created_issues] == [
+        "issue-123",
+    ] * len(tickets)
+    child_descriptions = "\n\n".join(
+        str(issue["description"]) for issue in fake_client.created_issues
+    )
+    assert "This child issue is synchronized automatically by the AI Factory." in child_descriptions
+    assert f"Parent work item: `{stage1_result.work_item.work_item_id}`" in child_descriptions
+    assert f"Factory ticket: `{tickets[0]['id']}`" in child_descriptions
+    binding_document = json.loads(
+        LinearWorkflowStore(tmp_path / "automation-store", repo_root_override=root)
+        .binding_path(stage1_result.work_item.work_item_id)
+        .read_text(encoding="utf-8")
+    )
+    assert sorted(binding_document["ticket_issue_bindings"]) == sorted(
+        ticket["id"] for ticket in tickets
+    )
+
+
+def test_linear_workflow_ticket_artifacts_are_attached_to_child_issues(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    sync.sync_stage_result("stage2", stage2_result.to_document())
+    fake_client.comment_bodies.clear()
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage3", stage3_result.to_document())
+
+    ticket_count = len(stage2_result.ticket_bundle["tickets"])
+    assert result["ticket_issues"]["status"] == "synced"
+    assert len(result["ticket_issues"]["posted"]) == ticket_count
+    child_comment_bodies = [
+        body
+        for issue_id, body in fake_client.comment_bodies
+        if issue_id.startswith("issue-90")
+    ]
+    assert len(child_comment_bodies) == ticket_count
+    assert all(
+        "AI Factory artifact update for scoped ticket" in body
+        and "AI Factory artifact update: `Stage 3 Build`" in body
+        for body in child_comment_bodies
+    )
 
 
 def test_linear_workflow_artifact_comments_are_idempotent(tmp_path) -> None:
