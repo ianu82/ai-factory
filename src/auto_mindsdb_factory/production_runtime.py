@@ -201,15 +201,6 @@ class FactoryWorker:
             from .automation import AutomationError
 
             raise AutomationError("AI_FACTORY_CODE_WORKER_PROVIDER must be 'codex_cli' for production v1.")
-        trigger_result = None
-        if not intake_paused():
-            trigger_result = LinearTriggerWorker(
-                self.config.store_dir,
-                repo_root_override=self.config.repo_root,
-            ).run_cycle(
-                repository=self.config.repository,
-                max_events=self.config.max_events_per_cycle,
-            ).to_document()
 
         stage3 = Stage3BuildReviewPipeline(
             self.config.repo_root,
@@ -231,6 +222,16 @@ class FactoryWorker:
             stage5_pipeline=stage5,
             autonomy_mode=self.config.autonomy_mode,
         )
+        trigger_result = None
+        if not intake_paused():
+            trigger_result = LinearTriggerWorker(
+                self.config.store_dir,
+                repo_root_override=self.config.repo_root,
+                coordinator=coordinator,
+            ).run_cycle(
+                repository=self.config.repository,
+                max_events=self.config.max_events_per_cycle,
+            ).to_document()
         progression_result = coordinator.run_progression_cycle(repository=self.config.repository)
         return {
             "cycle": "factory-worker-cycle",
