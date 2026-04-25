@@ -133,7 +133,7 @@ class TicketArchitect:
         ticket_ids = [
             build_identifier(
                 "ticket",
-                f"{spec_packet['artifact']['id']}-{ticket_slice.slug}",
+                f"{ticket_slice.slug}-{spec_packet['artifact']['id']}",
                 max_length=60,
             )
             for ticket_slice in ticket_slices

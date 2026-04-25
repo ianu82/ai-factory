@@ -942,7 +942,12 @@ class LinearGraphQLClient:
         self._update_issue_labels(issue_id, added_label_ids=[label_id])
 
     def remove_issue_label(self, issue_id: str, label_id: str) -> None:
-        self._update_issue_labels(issue_id, removed_label_ids=[label_id])
+        try:
+            self._update_issue_labels(issue_id, removed_label_ids=[label_id])
+        except LinearGraphQLClientError as exc:
+            if "Label not on issue" in str(exc):
+                return
+            raise
 
     def _update_issue_labels(
         self,

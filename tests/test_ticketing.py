@@ -154,11 +154,13 @@ def test_stage2_ticketing_shapes_manual_issue_into_contract_and_control_plane_wo
         stage1_result.policy_decision,
         stage1_result.work_item,
     )
+    ticket_ids = [ticket["id"] for ticket in result.ticket_bundle["tickets"]]
 
     assert [ticket["kind"] for ticket in result.ticket_bundle["tickets"]] == [
         "backend",
         "frontend",
     ]
+    assert len(ticket_ids) == len(set(ticket_ids))
     assert [ticket["title"] for ticket in result.ticket_bundle["tickets"]] == [
         "Implement Factory cockpit should surface GitHub check conclusions and eval status: contract compatibility",
         "Implement Factory cockpit should surface GitHub check conclusions and eval status: operator control-plane updates",
