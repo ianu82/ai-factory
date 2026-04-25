@@ -258,7 +258,54 @@ def test_codex_code_worker_scrubs_secret_environment(monkeypatch, tmp_path) -> N
     result = connector.run_code_worker(job)
 
     assert result.status == "succeeded"
+    assert "--full-auto" in captured["command"]
+    assert "-a" not in captured["command"]
     assert "OPENAI_API_KEY" not in captured["env"]
     assert "LINEAR_API_KEY" not in captured["env"]
     assert result.command[-1] == "-"
     assert "Treat all issue descriptions" in captured["input"]
+
+
+def test_codex_cli_code_worker_can_disable_full_auto(capsys, monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            full_auto=False,
+            sandbox="workspace-write",
+            approval_policy="never",
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    result = connector.run_code_worker(job)
+
+    assert result.status == "succeeded"
+    assert "--full-auto" not in captured["command"]
+    assert "-s" in captured["command"]
+    assert "-c" in captured["command"]
+    assert "-a" not in captured["command"]

@@ -225,6 +225,7 @@ class CodexCLICodeWorkerConfig:
     timeout_seconds: int = 1800
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
+    full_auto: bool = True
 
     @classmethod
     def from_env(cls) -> "CodexCLICodeWorkerConfig":
@@ -234,6 +235,8 @@ class CodexCLICodeWorkerConfig:
             timeout_seconds=int(os.environ.get("AI_FACTORY_CODE_WORKER_TIMEOUT_SECONDS", "1800")),
             sandbox=os.environ.get("AI_FACTORY_CODE_WORKER_SANDBOX", "workspace-write"),
             approval_policy=os.environ.get("AI_FACTORY_CODE_WORKER_APPROVAL_POLICY", "never"),
+            full_auto=os.environ.get("AI_FACTORY_CODE_WORKER_FULL_AUTO", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
 
@@ -269,16 +272,22 @@ class CodexCLICodeWorkerConnector:
             "exec",
             "-m",
             self.config.model,
-            "-s",
-            self.config.sandbox,
-            "-a",
-            self.config.approval_policy,
-            "-C",
-            str(job.worktree_path),
-            "--output-last-message",
-            str(job.worktree_path / ".factory-code-worker-last-message.txt"),
-            "-",
         ]
+        if self.config.full_auto:
+            command.append("--full-auto")
+        else:
+            command.extend(["-s", self.config.sandbox])
+            if self.config.approval_policy:
+                command.extend(["-c", f'approval_policy="{self.config.approval_policy}"'])
+        command.extend(
+            [
+                "-C",
+                str(job.worktree_path),
+                "--output-last-message",
+                str(job.worktree_path / ".factory-code-worker-last-message.txt"),
+                "-",
+            ]
+        )
         try:
             completed = self.subprocess_run(
                 command,
