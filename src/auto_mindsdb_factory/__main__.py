@@ -4,9 +4,15 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
+from uuid import UUID
 
 from .automation import AutomationError, FactoryAutomationCoordinator, FactoryRunStore
 from .build_review import BuildReviewError, Stage3BuildReviewPipeline
@@ -17,7 +23,7 @@ from .connectors import (
 )
 from .contracts import main as validate_contracts_main
 from .controller import FactoryController, WorkItem
-from .eval_execution import EvalExecutionError, Stage5EvalPipeline
+from .eval_execution import CommandGateRunner, EvalExecutionError, Stage5EvalPipeline
 from .feedback_synthesis import (
     FeedbackSynthesisError,
     Stage9FeedbackSynthesisPipeline,
@@ -1449,6 +1455,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime autonomy mode to validate.",
     )
 
+    factory_smoke_parser = subparsers.add_parser(
+        "factory-smoke",
+        help="Summarize production readiness for safely unpausing intake.",
+    )
+    factory_smoke_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where automation state and run bundles are persisted.",
+    )
+    factory_smoke_parser.add_argument(
+        "--repository",
+        default="ianu82/ai-factory",
+        help="GitHub repository used by the production factory.",
+    )
+    factory_smoke_parser.add_argument(
+        "--base-branch",
+        default="main",
+        help="Base branch for factory implementation PRs.",
+    )
+    factory_smoke_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+    factory_smoke_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "pr_ready"),
+        help="Runtime autonomy mode to validate.",
+    )
+
     automation_stage9_parser = subparsers.add_parser(
         "automation-weekly-feedback",
         help="Run the recurring weekly Stage 9 synthesis pass over stored production runs.",
@@ -1662,6 +1701,316 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override the OpenAI Responses API base URL.",
     )
+
+
+def _smoke_check(
+    name: str,
+    status: str,
+    summary: str,
+    **details: Any,
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "name": name,
+        "status": status,
+        "summary": summary,
+    }
+    document.update(details)
+    return document
+
+
+def _env_value(name: str) -> str:
+    return os.environ.get(name, "").strip()
+
+
+def _redact_url_credentials(value: str) -> str:
+    parsed = urllib_parse.urlparse(value)
+    if parsed.username is None and parsed.password is None:
+        return value
+    netloc = parsed.hostname or ""
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urllib_parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def _check_uuid_config(env_name: str, *, check_name: str) -> dict[str, Any]:
+    value = _env_value(env_name)
+    if not value:
+        return _smoke_check(check_name, "failed", f"{env_name} is missing.", value=None)
+    try:
+        UUID(value)
+    except ValueError:
+        return _smoke_check(
+            check_name,
+            "failed",
+            f"{env_name} must be a valid UUID.",
+            value=value,
+        )
+    return _smoke_check(check_name, "passed", f"{env_name} is a valid UUID.", value=value)
+
+
+def _check_public_base_url() -> dict[str, Any]:
+    value = _env_value("AI_FACTORY_PUBLIC_BASE_URL")
+    display_value = _redact_url_credentials(value) if value else None
+    if not value:
+        return _smoke_check(
+            "config:public_base_url",
+            "failed",
+            "AI_FACTORY_PUBLIC_BASE_URL is missing.",
+            value=display_value,
+        )
+    parsed = urllib_parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return _smoke_check(
+            "config:public_base_url",
+            "failed",
+            "AI_FACTORY_PUBLIC_BASE_URL must be an absolute http(s) URL.",
+            value=display_value,
+        )
+    return _smoke_check(
+        "config:public_base_url",
+        "passed",
+        "AI_FACTORY_PUBLIC_BASE_URL is configured.",
+        value=display_value,
+    )
+
+
+def _verify_linear_stage_setup(
+    store_dir: Path,
+    *,
+    repo_root_override: Path | None,
+) -> dict[str, Any]:
+    api_key = _env_value("LINEAR_API_KEY")
+    team_id = _env_value("LINEAR_TARGET_TEAM_ID")
+    if not api_key:
+        return _smoke_check(
+            "linear:stage_setup",
+            "failed",
+            "LINEAR_API_KEY is required to verify Linear stage setup.",
+        )
+    if not team_id:
+        return _smoke_check(
+            "linear:stage_setup",
+            "failed",
+            "LINEAR_TARGET_TEAM_ID is required to verify Linear stage setup.",
+        )
+    config = LinearWorkflowConfig(
+        api_key=api_key,
+        team_id=team_id,
+        trigger_base_url=_env_value("FACTORY_TRIGGER_BASE_URL") or None,
+        trigger_state_id=_env_value("LINEAR_TARGET_STATE_ID") or None,
+        create_missing_states=False,
+    )
+    try:
+        sync = LinearWorkflowSync(
+            store_dir,
+            repo_root_override=repo_root_override,
+            config=config,
+        )
+        stage_states = sync.ensure_stage_states()
+    except LinearWorkflowError as exc:
+        return _smoke_check("linear:stage_setup", "failed", str(exc))
+    return _smoke_check(
+        "linear:stage_setup",
+        "passed",
+        f"Verified {len(stage_states)} Linear workflow states.",
+        stage_keys=list(stage_states),
+    )
+
+
+def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
+    gate_runner = CommandGateRunner.from_env(repo_root)
+    command_details: list[dict[str, Any]] = []
+    missing_kinds: list[str] = []
+    unavailable_kinds: list[str] = []
+
+    for kind in sorted(gate_runner.required_kinds):
+        command = gate_runner.commands_by_kind.get(kind)
+        if not command:
+            missing_kinds.append(kind)
+            command_details.append(
+                {
+                    "kind": kind,
+                    "configured": False,
+                    "executable": None,
+                    "available": False,
+                }
+            )
+            continue
+        executable = command[0]
+        executable_path = Path(executable).expanduser()
+        if not executable_path.is_absolute():
+            executable_path = repo_root / executable_path
+        available = executable_path.is_file() or shutil.which(executable) is not None
+        if not available:
+            unavailable_kinds.append(kind)
+        command_details.append(
+            {
+                "kind": kind,
+                "configured": True,
+                "executable": executable,
+                "available": available,
+            }
+        )
+
+    if missing_kinds or unavailable_kinds:
+        summaries: list[str] = []
+        if missing_kinds:
+            summaries.append(
+                f"Missing command configuration for {', '.join(sorted(missing_kinds))}."
+            )
+        if unavailable_kinds:
+            summaries.append(
+                f"Configured executables were not found for {', '.join(sorted(unavailable_kinds))}."
+            )
+        return _smoke_check(
+            "gates:required_commands",
+            "failed",
+            " ".join(summaries),
+            required_kinds=sorted(gate_runner.required_kinds),
+            commands=command_details,
+        )
+
+    return _smoke_check(
+        "gates:required_commands",
+        "passed",
+        "Required gate commands are configured.",
+        required_kinds=sorted(gate_runner.required_kinds),
+        commands=command_details,
+    )
+
+
+def _check_cli_auth(
+    name: str,
+    command: list[str],
+    *,
+    success_summary: str = "authenticated",
+) -> dict[str, Any]:
+    executable = command[0]
+    if shutil.which(executable) is None:
+        return _smoke_check(name, "failed", f"{executable} was not found on PATH.")
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _smoke_check(name, "failed", str(exc))
+    if completed.returncode == 0:
+        return _smoke_check(name, "passed", success_summary)
+    return _smoke_check(
+        name,
+        "failed",
+        f"Authentication check failed with exit code {completed.returncode}.",
+    )
+
+
+def _check_public_webhook_endpoint() -> dict[str, Any]:
+    base_url = _env_value("AI_FACTORY_PUBLIC_BASE_URL")
+    if not base_url:
+        return _smoke_check(
+            "webhook:public_endpoint",
+            "failed",
+            "AI_FACTORY_PUBLIC_BASE_URL is missing.",
+        )
+    parsed = urllib_parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return _smoke_check(
+            "webhook:public_endpoint",
+            "failed",
+            "AI_FACTORY_PUBLIC_BASE_URL must be an absolute http(s) URL.",
+        )
+    url = f"{base_url.rstrip('/')}/hooks/linear"
+    display_url = _redact_url_credentials(url)
+    request = urllib_request.Request(
+        url,
+        data=b"{}",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Linear-Signature": "invalid-signature",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=10):
+            return _smoke_check(
+                "webhook:public_endpoint",
+                "failed",
+                f"Expected {display_url} to reject an invalid signature with HTTP 401.",
+                url=display_url,
+            )
+    except urllib_error.HTTPError as exc:
+        if exc.code == 401:
+            return _smoke_check(
+                "webhook:public_endpoint",
+                "passed",
+                "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+                url=display_url,
+            )
+        return _smoke_check(
+            "webhook:public_endpoint",
+            "failed",
+            f"Expected HTTP 401 from {display_url}, received {exc.code}.",
+            url=display_url,
+            http_status=exc.code,
+        )
+    except urllib_error.URLError as exc:
+        return _smoke_check(
+            "webhook:public_endpoint",
+            "failed",
+            f"Could not reach {display_url}: {exc.reason}.",
+            url=display_url,
+        )
+
+
+def _build_factory_smoke_report(config: ProductionRuntimeConfig) -> dict[str, Any]:
+    doctor = FactoryDoctor(config).run()
+    checks = [
+        _check_uuid_config(
+            "LINEAR_TARGET_TEAM_ID",
+            check_name="config:linear_target_team_id",
+        ),
+        _check_uuid_config(
+            "LINEAR_TARGET_STATE_ID",
+            check_name="config:linear_target_state_id",
+        ),
+        _check_public_base_url(),
+        _verify_linear_stage_setup(
+            config.store_dir,
+            repo_root_override=config.repo_root,
+        ),
+        _check_required_gate_commands(config.repo_root),
+        _check_cli_auth("auth:github", ["gh", "auth", "status"]),
+        _check_cli_auth(
+            "auth:codex",
+            ["codex", "login", "status"],
+        ),
+        _check_public_webhook_endpoint(),
+    ]
+    ready_to_unpause = doctor["status"] == "passed" and all(
+        check["status"] == "passed" for check in checks
+    )
+    return {
+        "cycle": "factory-smoke",
+        "status": "passed" if ready_to_unpause else "failed",
+        "ready_to_unpause": ready_to_unpause,
+        "autonomy_mode": config.autonomy_mode.value,
+        "repository": config.repository,
+        "store_dir": str(config.store_dir),
+        "checked_at": doctor.get("checked_at"),
+        "intake_paused": intake_paused(),
+        "public_base_url": (
+            _redact_url_credentials(_env_value("AI_FACTORY_PUBLIC_BASE_URL"))
+            if _env_value("AI_FACTORY_PUBLIC_BASE_URL")
+            else None
+        ),
+        "linear_target_team_id": _env_value("LINEAR_TARGET_TEAM_ID") or None,
+        "linear_target_state_id": _env_value("LINEAR_TARGET_STATE_ID") or None,
+        "doctor": doctor,
+        "checks": checks,
+    }
 
 
 def _build_agent_connector(args: argparse.Namespace):
@@ -2323,6 +2672,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps(result, indent=2))
         return 0 if result["status"] == "passed" else 1
+
+    if args.command == "factory-smoke":
+        try:
+            config = ProductionRuntimeConfig.from_env(
+                store_dir=args.store_dir,
+                repo_root=args.repo_root or Path.cwd(),
+                repository=args.repository,
+                base_branch=args.base_branch,
+                autonomy_mode=args.autonomy_mode,
+            )
+            result = _build_factory_smoke_report(config)
+        except (AutomationError, OSError) as exc:
+            print(f"Factory smoke failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if result["ready_to_unpause"] else 1
 
     if args.command == "automation-supervisor-cycle":
         if args.feedback_window_days < 1:
