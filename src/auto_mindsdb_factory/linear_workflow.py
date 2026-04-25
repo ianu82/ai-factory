@@ -188,6 +188,7 @@ class LinearWorkflowBinding:
     last_synced_state_id: str | None = None
     last_comment_key: str | None = None
     last_comment_id: str | None = None
+    artifact_comment_keys: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=utc_now)
     version: int = 1
 
@@ -202,6 +203,11 @@ class LinearWorkflowBinding:
             last_synced_state_id=_optional_str(document.get("last_synced_state_id")),
             last_comment_key=_optional_str(document.get("last_comment_key")),
             last_comment_id=_optional_str(document.get("last_comment_id")),
+            artifact_comment_keys=[
+                str(item)
+                for item in document.get("artifact_comment_keys", [])
+                if isinstance(item, str)
+            ],
             updated_at=str(document["updated_at"]),
             version=int(document.get("version", 1)),
         )
@@ -217,6 +223,7 @@ class LinearWorkflowBinding:
             "last_synced_state_id": self.last_synced_state_id,
             "last_comment_key": self.last_comment_key,
             "last_comment_id": self.last_comment_id,
+            "artifact_comment_keys": list(self.artifact_comment_keys),
             "updated_at": self.updated_at,
         }
 
@@ -475,6 +482,14 @@ class LinearWorkflowSync:
                 stall_reason=stall_reason,
             )
             label_result = self._sync_blocked_label(binding.issue_id, blocked=stall_payload is not None)
+            artifact_comment = self._maybe_post_artifact_comment(
+                binding,
+                artifact_payload=self._artifact_comment_payload(
+                    stage_name=stage_name,
+                    linear_stage_key=linear_stage_key,
+                    document=document,
+                ),
+            )
             comment = self._maybe_post_stall_comment(
                 binding,
                 stall_payload=stall_payload,
@@ -500,6 +515,7 @@ class LinearWorkflowSync:
                     else state_update
                 ),
                 "blocked_label": label_result,
+                "artifact_comment": artifact_comment,
                 "comment": comment,
                 "created_by_factory": binding.created_by_factory,
             }
@@ -585,6 +601,144 @@ class LinearWorkflowSync:
         binding.last_comment_key = comment_key
         binding.last_comment_id = comment_id
         return {"status": "posted", "comment_id": comment_id}
+
+    def _maybe_post_artifact_comment(
+        self,
+        binding: LinearWorkflowBinding,
+        *,
+        artifact_payload: tuple[str, str] | None,
+    ) -> dict[str, Any]:
+        if artifact_payload is None:
+            return {"status": "skipped", "reason": "no_artifact_comment_for_stage"}
+        comment_key, body = artifact_payload
+        if comment_key in binding.artifact_comment_keys:
+            return {"status": "skipped", "reason": "duplicate_artifact_comment"}
+        comment_id = self.linear_client.create_comment(binding.issue_id, body)
+        binding.artifact_comment_keys.append(comment_key)
+        binding.artifact_comment_keys = sorted(dict.fromkeys(binding.artifact_comment_keys))
+        return {"status": "posted", "comment_id": comment_id}
+
+    def _artifact_comment_payload(
+        self,
+        *,
+        stage_name: str,
+        linear_stage_key: str,
+        document: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        if stage_name not in {"stage1", "stage2", "stage3", "stage5", "stage6", "merge"}:
+            return None
+        work_item = self._require_work_item(document)
+        stage_definition = LINEAR_FACTORY_STAGE_BY_KEY[linear_stage_key]
+        artifact_id = self._artifact_id_for_stage(stage_name, document)
+        state = ControllerState(work_item["state"])
+        comment_key = hashlib.sha1(
+            json.dumps(
+                {
+                    "kind": "artifact",
+                    "stage": linear_stage_key,
+                    "artifact_id": artifact_id,
+                    "state": state.value,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        lines = [
+            f"AI Factory artifact update: `{stage_definition.name}`",
+            "",
+            f"- Work item: `{work_item['work_item_id']}`",
+            f"- Controller state: `{state.value}`",
+        ]
+        if artifact_id:
+            lines.append(f"- Artifact: `{artifact_id}`")
+        if self.config.trigger_base_url:
+            lines.append(
+                f"- Cockpit: {self.config.trigger_base_url.rstrip('/')} (filter for `{work_item['work_item_id']}`)"
+            )
+
+        details = self._artifact_comment_details(stage_name, document)
+        if details:
+            lines.extend(["", *details])
+        return comment_key, "\n".join(lines)
+
+    def _artifact_comment_details(self, stage_name: str, document: dict[str, Any]) -> list[str]:
+        if stage_name == "stage1":
+            decision = self._stage1_decision(document)
+            rationale = self._stage1_rationale(document)
+            lines = [f"Decision: `{decision}`"]
+            if rationale:
+                lines.append(f"Rationale: {rationale}")
+            return lines
+
+        if stage_name == "stage2":
+            tickets = self._stage2_ticket_summaries(document)
+            lines = [f"Scoped tickets: {len(tickets)}"]
+            lines.extend(f"- `{ticket_id}`: {title}" for ticket_id, title in tickets[:6])
+            eval_manifest = document.get("eval_manifest")
+            required_tiers = []
+            if isinstance(eval_manifest, dict):
+                required_tiers = [
+                    str(tier.get("name"))
+                    for tier in eval_manifest.get("tiers", [])
+                    if isinstance(tier, dict) and tier.get("merge_gate") is True
+                ]
+            if required_tiers:
+                lines.append(f"Merge-gating eval tiers: {', '.join(required_tiers)}")
+            return lines
+
+        if stage_name == "stage3":
+            pr_packet = document.get("pr_packet")
+            if not isinstance(pr_packet, dict):
+                return []
+            pull_request = pr_packet.get("pull_request")
+            changed_paths = pr_packet.get("changed_paths")
+            lines = []
+            if isinstance(pull_request, dict):
+                url = pull_request.get("url")
+                number = pull_request.get("number")
+                if url:
+                    lines.append(f"Pull request: {url}")
+                elif number:
+                    lines.append(f"Pull request number: `{number}`")
+            if isinstance(changed_paths, list) and changed_paths:
+                lines.append("Changed paths:")
+                lines.extend(f"- `{path}`" for path in changed_paths[:8])
+            return lines
+
+        if stage_name == "stage5":
+            summary = self._nested_value(document.get("eval_report"), "summary")
+            if not isinstance(summary, dict):
+                return []
+            status = "passed" if summary.get("merge_gate_passed") is True else "needs revision"
+            lines = [f"Eval status: `{status}`"]
+            failing = summary.get("failing_merge_gate_tiers")
+            if isinstance(failing, list) and failing:
+                lines.append(f"Failing merge-gate tiers: {', '.join(str(item) for item in failing)}")
+            deferred = summary.get("deferred_tiers")
+            if isinstance(deferred, list) and deferred:
+                lines.append(f"Deferred tiers: {', '.join(str(item) for item in deferred)}")
+            return lines
+
+        if stage_name == "stage6":
+            summary = self._nested_value(document.get("security_review"), "summary")
+            if not isinstance(summary, dict):
+                return []
+            lines = [f"Security decision: `{summary.get('decision', 'unknown')}`"]
+            blockers = summary.get("blocking_findings")
+            watch = summary.get("watch_findings")
+            if isinstance(blockers, list) and blockers:
+                lines.append("Blocking findings:")
+                lines.extend(f"- {normalize_whitespace(str(item))}" for item in blockers[:5])
+            if isinstance(watch, list) and watch:
+                lines.append("Watch findings:")
+                lines.extend(f"- {normalize_whitespace(str(item))}" for item in watch[:5])
+            return lines
+
+        if stage_name == "merge":
+            status = self._nested_value(document.get("merge_decision"), "merge_execution", "status")
+            return [f"Merge status: `{status or 'unknown'}`"]
+
+        return []
 
     def _sync_blocked_label(self, issue_id: str, *, blocked: bool) -> dict[str, str]:
         label_id = self._ensure_blocked_label()
@@ -945,6 +1099,43 @@ class LinearWorkflowSync:
         if not isinstance(criteria, list):
             return []
         return [normalize_whitespace(str(item)) for item in criteria if item]
+
+    @staticmethod
+    def _artifact_id_for_stage(stage_name: str, document: dict[str, Any]) -> str | None:
+        if stage_name == "stage1":
+            artifact = document.get("spec_packet", {}).get("artifact")
+        elif stage_name == "stage2":
+            artifact = document.get("ticket_bundle", {}).get("artifact")
+        elif stage_name == "stage3":
+            artifact = document.get("pr_packet", {}).get("artifact")
+        elif stage_name == "stage5":
+            artifact = document.get("eval_report", {}).get("artifact")
+        elif stage_name == "stage6":
+            artifact = document.get("security_review", {}).get("artifact")
+        elif stage_name == "merge":
+            artifact = document.get("merge_decision", {}).get("artifact")
+        else:
+            artifact = None
+        if isinstance(artifact, dict) and isinstance(artifact.get("id"), str):
+            return artifact["id"]
+        return None
+
+    @staticmethod
+    def _stage2_ticket_summaries(document: dict[str, Any]) -> list[tuple[str, str]]:
+        ticket_bundle = document.get("ticket_bundle")
+        if not isinstance(ticket_bundle, dict):
+            return []
+        tickets = ticket_bundle.get("tickets")
+        if not isinstance(tickets, list):
+            return []
+        summaries: list[tuple[str, str]] = []
+        for ticket in tickets:
+            if not isinstance(ticket, dict):
+                continue
+            ticket_id = str(ticket.get("id") or "ticket")
+            title = normalize_whitespace(str(ticket.get("title") or "Untitled ticket"))
+            summaries.append((ticket_id, title))
+        return summaries
 
     @staticmethod
     def _source_url(document: dict[str, Any]) -> str | None:
