@@ -17,8 +17,19 @@ from auto_mindsdb_factory.automation import (
     RunLeaseBusyError,
     StateLeaseBusyError,
 )
+from auto_mindsdb_factory.build_review import Stage3BuildReviewPipeline
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import FactoryController
+from auto_mindsdb_factory.intake import Stage1IntakePipeline, build_manual_intake_item
+from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
+
+
+@pytest.fixture(autouse=True)
+def _disable_linear_workflow_sync(monkeypatch) -> None:
+    monkeypatch.setenv("LINEAR_FACTORY_SYNC_DISABLED", "1")
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("LINEAR_TARGET_TEAM_ID", raising=False)
+    monkeypatch.delenv("LINEAR_TARGET_STATE_ID", raising=False)
 
 
 def _load_json(path: Path) -> dict:
@@ -76,6 +87,27 @@ def load_stage4_result_document(root: Path, scenario_name: str) -> dict:
     }
 
 
+class FakeLinearWorkflowSync:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def sync_stage_result(
+        self,
+        stage_name: str,
+        document: dict,
+        *,
+        stall_reason: str | None = None,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "stage_name": stage_name,
+                "work_item_id": document["work_item"]["work_item_id"],
+                "stall_reason": stall_reason,
+            }
+        )
+        return {"status": "synced"}
+
+
 def test_automation_stage1_cycle_persists_new_items(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
@@ -131,6 +163,91 @@ def test_automation_stage1_cycle_can_advance_immediately(tmp_path) -> None:
     assert Path(handoff["stored_paths"]["stage8"]).exists()
 
 
+def test_automation_register_bundle_syncs_linear_stage_result(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. Acceptance criteria: - keep the "
+            "output compact - add a clear health field - cover it with tests"
+        ),
+    )
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+    )
+
+    coordinator.register_bundle("stage1", stage1_result.to_document())
+
+    assert fake_sync.calls == [
+        {
+            "stage_name": "stage1",
+            "work_item_id": stage1_result.work_item.work_item_id,
+            "stall_reason": None,
+        }
+    ]
+
+
+def test_automation_progression_advances_non_model_runs_without_stage4_handoff(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. This is a control-plane API and "
+            "JSON schema change for the cockpit command, not a model-runtime change. Acceptance criteria: "
+            "- include check conclusions - keep the schema compatibility-safe - cover it with tests"
+        ),
+    )
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+    )
+    coordinator.register_bundle("stage3", stage3_result.to_document())
+
+    result = coordinator.run_progression_cycle()
+
+    assert result.skipped_runs == []
+    assert len(result.processed_runs) == 1
+    processed = result.processed_runs[0]
+    assert processed.stages_completed == ["stage5", "stage6", "merge", "stage7", "stage8"]
+    assert fake_sync.calls[1]["stage_name"] == "stage5"
+    assert fake_sync.calls[-1] == {
+        "stage_name": "stage8",
+        "work_item_id": stage3_result.work_item.work_item_id,
+        "stall_reason": None,
+    }
+
+
 def test_automation_progression_cycle_advances_active_build_run_to_stage8(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
@@ -160,6 +277,32 @@ def test_automation_progression_cycle_advances_active_build_run_to_stage8(tmp_pa
     stage8_document = _load_json(Path(processed.stored_paths["stage8"]))
     assert stage8_document["work_item"]["state"] == "PRODUCTION_MONITORING"
     assert stage8_document["monitoring_report"]["monitoring_decision"]["status"] == "healthy"
+
+
+def test_pr_ready_autonomy_stops_after_security_review_and_comments_linear(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
+        encoding="utf-8"
+    )
+    store_dir = tmp_path / "automation-store"
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+        autonomy_mode="pr_ready",
+    )
+
+    coordinator.run_stage1_cycle(html=html, max_new_items=1)
+    result = coordinator.run_progression_cycle()
+
+    assert len(result.processed_runs) == 1
+    processed = result.processed_runs[0]
+    assert processed.final_stage == "stage6"
+    assert processed.final_state == "SECURITY_APPROVED"
+    assert processed.stages_completed == ["stage2", "stage3", "stage4", "stage5", "stage6"]
+    assert fake_sync.calls[-1]["stage_name"] == "stage6"
+    assert fake_sync.calls[-1]["stall_reason"] == "pr_ready_for_human_merge_deploy"
 
 
 def test_automation_supervisor_cycle_runs_stage1_progression_and_weekly_feedback(tmp_path) -> None:

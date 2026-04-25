@@ -917,6 +917,9 @@ class Stage4IntegrationPipeline:
             tool_ids=[tool["id"] for tool in tool_schema["tools"]],
             timestamp=timestamp,
         )
+        output_checks = prompt_contract["output_validation"]["checks"]
+        if "tool_result_schema_validation" not in output_checks:
+            output_checks.append("tool_result_schema_validation")
         golden_dataset = self.integration_engineer.build_golden_dataset(
             spec_packet,
             policy_decision,
@@ -958,6 +961,96 @@ class Stage4IntegrationPipeline:
             latency_baseline=latency_baseline,
             work_item=deepcopy(work_item),
         )
+
+    def build_eval_support_artifacts(
+        self,
+        spec_packet: dict[str, Any],
+        policy_decision: dict[str, Any],
+        ticket_bundle: dict[str, Any],
+        eval_manifest: dict[str, Any],
+        pr_packet: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Build minimal valid measurement context for non-model command gates.
+
+        These artifacts are not a Stage 4 handoff; they keep downstream Stage 5/6
+        contracts coherent while recording that model-specific evals are not yet
+        backed by real measurement in production mode.
+        """
+        self._validate_document("spec-packet", spec_packet)
+        self._validate_document("policy-decision", policy_decision)
+        self._validate_document("ticket-bundle", ticket_bundle)
+        self._validate_document("eval-manifest", eval_manifest)
+        self._validate_document("pr-packet", pr_packet)
+
+        timestamp = utc_now()
+        prompt_id = build_identifier("prompt", spec_packet["artifact"]["id"], max_length=64)
+        tool_id = build_identifier("tool-schema", spec_packet["artifact"]["id"], max_length=64)
+        golden_id = build_identifier("golden", spec_packet["artifact"]["id"], max_length=64)
+        latency_id = build_identifier("latency", spec_packet["artifact"]["id"], max_length=64)
+        tool_schema = self.integration_engineer.build_tool_schema(
+            spec_packet,
+            policy_decision,
+            artifact_id=tool_id,
+            prompt_contract_id=prompt_id,
+            timestamp=timestamp,
+        )
+        prompt_contract = self.integration_engineer.build_prompt_contract(
+            spec_packet,
+            policy_decision,
+            pr_packet,
+            artifact_id=prompt_id,
+            tool_schema_id=tool_schema["artifact"]["id"],
+            golden_dataset_id=golden_id,
+            tool_ids=[tool["id"] for tool in tool_schema["tools"]],
+            timestamp=timestamp,
+        )
+        output_checks = prompt_contract["output_validation"]["checks"]
+        if "tool_result_schema_validation" not in output_checks:
+            output_checks.append("tool_result_schema_validation")
+        golden_dataset = self.integration_engineer.build_golden_dataset(
+            spec_packet,
+            policy_decision,
+            artifact_id=golden_id,
+            prompt_contract_id=prompt_contract["artifact"]["id"],
+            timestamp=timestamp,
+        )
+        latency_baseline = self.integration_engineer.build_latency_baseline(
+            spec_packet,
+            policy_decision,
+            eval_manifest,
+            pr_packet,
+            artifact_id=latency_id,
+            prompt_contract_id=prompt_contract["artifact"]["id"],
+            timestamp=timestamp,
+        )
+        for artifact in (prompt_contract, tool_schema, golden_dataset, latency_baseline):
+            artifact["artifact"]["source_stage"] = "eval_support"
+            artifact["artifact"]["owner_agent"] = "Eval Support Builder"
+            artifact["artifact"]["model_fingerprint"] = "non_model_eval_support.v1"
+            artifact["artifact"]["links"] = [
+                {
+                    "title": "Production note",
+                    "href": "https://auto-mindsdb-eng.local/docs/eval-support",
+                    "kind": "non_model_eval_support",
+                }
+            ]
+        self._validate_document("tool-schema", tool_schema)
+        self._validate_document("prompt-contract", prompt_contract)
+        self._validate_document("golden-dataset", golden_dataset)
+        self._validate_document("latency-baseline", latency_baseline)
+        self._validate_generated_consistency(
+            prompt_contract,
+            tool_schema,
+            golden_dataset,
+            latency_baseline,
+            pr_packet,
+        )
+        return {
+            "prompt_contract": prompt_contract,
+            "tool_schema": tool_schema,
+            "golden_dataset": golden_dataset,
+            "latency_baseline": latency_baseline,
+        }
 
     def _validate_document(self, schema_name: str, document: dict[str, Any]) -> None:
         errors = validation_errors_for(self.validators[schema_name], document)

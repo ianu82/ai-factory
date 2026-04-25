@@ -4,14 +4,35 @@ from pathlib import Path
 
 import pytest
 
+from auto_mindsdb_factory.connectors import AgentResult
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import ControllerState
-from auto_mindsdb_factory.intake import AnthropicScout, ReleaseNoteItem, Stage1IntakePipeline
+from auto_mindsdb_factory.intake import (
+    AnthropicScout,
+    ReleaseNoteItem,
+    Stage1IntakePipeline,
+    build_manual_intake_item,
+)
 from auto_mindsdb_factory.ticketing import (
     Stage2TicketingPipeline,
     TicketingConsistencyError,
     TicketingEligibilityError,
 )
+
+
+class ScriptedAgentConnector:
+    def __init__(self, outputs: dict[str, dict]) -> None:
+        self.outputs = outputs
+
+    def run_task(self, task):
+        return AgentResult(
+            name=task.name,
+            output_document=self.outputs[task.name],
+            model_fingerprint="openai.responses:gpt-5.4",
+            provider="openai",
+            model="gpt-5.4",
+            response_id="resp_test",
+        )
 
 
 def fixture_html() -> str:
@@ -40,6 +61,29 @@ def stage1_backlog_result(root: Path):
         body="Experimental API orchestration preview for multi-repo workflows.",
         date_label="April 20, 2026",
         anchor="april-20-2026",
+    )
+    return Stage1IntakePipeline(root).process_item(item)
+
+
+def stage1_manual_issue_result(root: Path):
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. This is a control-plane API and "
+            "JSON schema change for the cockpit command, not a model-runtime change. Operators should "
+            "not need to cross-check multiple artifacts to decide whether a run is healthy. Acceptance "
+            "criteria: - update the factory cockpit tool output to include the latest GitHub check "
+            "conclusions for each run - include the latest local eval status summary from vertical-slice "
+            "or automation artifacts - add a single health field that resolves to ready, blocked, or "
+            "warning based on PR checks, eval status, and monitoring alerts - cover the new output with "
+            "CLI tests and contract-safe validation"
+        ),
     )
     return Stage1IntakePipeline(root).process_item(item)
 
@@ -99,6 +143,87 @@ def test_stage2_ticketing_rejects_backlog_candidates() -> None:
             stage1_result.policy_decision,
             stage1_result.work_item,
         )
+
+
+def test_stage2_ticketing_shapes_manual_issue_into_contract_and_control_plane_work() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage1_result = stage1_manual_issue_result(root)
+
+    result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    assert [ticket["kind"] for ticket in result.ticket_bundle["tickets"]] == [
+        "backend",
+        "frontend",
+    ]
+    assert [ticket["title"] for ticket in result.ticket_bundle["tickets"]] == [
+        "Implement Factory cockpit should surface GitHub check conclusions and eval status: contract compatibility",
+        "Implement Factory cockpit should surface GitHub check conclusions and eval status: operator control-plane updates",
+    ]
+    assert result.ticket_bundle["tickets"][1]["dependencies"] == [
+        result.ticket_bundle["tickets"][0]["id"]
+    ]
+
+
+def test_stage2_ticketing_can_use_agent_drafts_for_ticket_content() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage1_result = stage1_manual_issue_result(root)
+    agent_connector = ScriptedAgentConnector(
+        {
+            "stage2_ticket_drafting": {
+                "tickets": [
+                    {
+                        "slug": "contract",
+                        "summary": "Update the cockpit schema and compatibility layer.",
+                        "scope": [
+                            "Expose the health field in the cockpit JSON contract.",
+                            "Keep older callers compatible until they adopt the new field.",
+                        ],
+                        "definition_of_done": [
+                            "Contract consumers can parse the new health field safely."
+                        ],
+                        "known_edge_cases": [
+                            "Older callers should still parse the payload without crashing."
+                        ],
+                    },
+                    {
+                        "slug": "control-plane",
+                        "summary": "Update operator-facing cockpit rendering for the new health signal.",
+                        "scope": [
+                            "Show GitHub checks, eval state, and one consolidated health status.",
+                        ],
+                        "definition_of_done": [
+                            "Operators can judge run health from one cockpit view."
+                        ],
+                        "known_edge_cases": [
+                            "Missing GitHub check data should degrade to a warning state."
+                        ],
+                    },
+                ]
+            }
+        }
+    )
+
+    result = Stage2TicketingPipeline(root, agent_connector=agent_connector).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    assert result.ticket_bundle["artifact"]["model_fingerprint"] == "openai.responses:gpt-5.4"
+    assert (
+        result.ticket_bundle["tickets"][0]["summary"]
+        == "Update the cockpit schema and compatibility layer."
+    )
+    assert result.ticket_bundle["tickets"][0]["scope"][0] == (
+        "Expose the health field in the cockpit JSON contract."
+    )
+    assert result.ticket_bundle["tickets"][1]["known_edge_cases"] == [
+        "Missing GitHub check data should degrade to a warning state."
+    ]
 
 
 def test_stage2_ticketing_rejects_mismatched_work_item() -> None:

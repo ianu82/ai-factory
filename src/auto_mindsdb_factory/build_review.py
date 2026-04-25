@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .connectors import (
+    AgentConnector,
+    AgentTask,
+    CodeWorkerConnector,
+    FactoryConnectorError,
+    GitHubCLIRepoConnector,
+)
 from .contracts import load_validators, validation_errors_for
 from .controller import ControllerEvent, ControllerState, FactoryController, WorkItem
 from .eval_common import pending_merge_gate_tiers
@@ -112,6 +119,47 @@ class Builder:
             "tests/integration/test_anthropic_client.py",
         ],
     }
+    FACTORY_PATH_HINTS = {
+        "api_contract": [
+            "src/auto_mindsdb_factory/vertical_slice.py",
+            "tests/test_vertical_slice.py",
+        ],
+        "tool_runtime": [
+            "src/auto_mindsdb_factory/connectors.py",
+            "tests/test_connectors.py",
+        ],
+        "model_routing": [
+            "src/auto_mindsdb_factory/vertical_slice.py",
+            "tests/test_vertical_slice.py",
+        ],
+        "sdk": [
+            "src/auto_mindsdb_factory/connectors.py",
+            "tests/test_connectors.py",
+        ],
+        "control_plane": [
+            "src/auto_mindsdb_factory/__main__.py",
+            "tests/test_cli.py",
+        ],
+        "billing": [
+            "src/auto_mindsdb_factory/release_staging.py",
+            "tests/test_release_staging.py",
+        ],
+        "auth": [
+            "src/auto_mindsdb_factory/security_review.py",
+            "tests/test_security_review.py",
+        ],
+        "anthropic_integration": [
+            "src/auto_mindsdb_factory/intake.py",
+            "tests/test_intake.py",
+        ],
+    }
+
+    def __init__(
+        self,
+        *,
+        agent_connector: AgentConnector | None = None,
+    ) -> None:
+        self.agent_connector = agent_connector
 
     def build_pr_packet(
         self,
@@ -122,11 +170,21 @@ class Builder:
         *,
         artifact_id: str,
         repository: str,
+        revision_guidance: list[str] | None = None,
+        previous_pr_packet: dict[str, Any] | None = None,
         timestamp: str | None = None,
     ) -> dict[str, Any]:
         created_at = timestamp or utc_now()
         policy_artifact = policy_decision["artifact"]
         pending_tiers = self._pending_eval_tiers(eval_manifest)
+        draft, model_fingerprint = self._agent_pr_draft(
+            spec_packet,
+            ticket_bundle,
+            eval_manifest,
+            repository,
+            revision_guidance=revision_guidance,
+            previous_pr_packet=previous_pr_packet,
+        )
 
         return {
             "artifact": {
@@ -139,7 +197,7 @@ class Builder:
                 "execution_lane": policy_artifact["execution_lane"],
                 "owner_agent": "Builder",
                 "policy_decision_id": policy_artifact["id"],
-                "model_fingerprint": self.PROMPT_CONTRACT_ID,
+                "model_fingerprint": model_fingerprint or self.PROMPT_CONTRACT_ID,
                 "budget_class": policy_artifact["budget_class"],
                 "rollback_class": policy_artifact["rollback_class"],
                 "approval_requirements": list(policy_artifact["approval_requirements"]),
@@ -157,12 +215,19 @@ class Builder:
                 "title": self._pull_request_title(spec_packet),
             },
             "summary": {
-                "what_changed": self._what_changed(ticket_bundle),
-                "key_risks": self._key_risks(ticket_bundle),
+                "what_changed": (
+                    draft["what_changed"] if draft is not None else self._what_changed(ticket_bundle)
+                ),
+                "key_risks": (
+                    draft["key_risks"] if draft is not None else self._key_risks(ticket_bundle)
+                ),
                 "migrations": self._migrations(ticket_bundle),
                 "rollback_notes": self._rollback_notes(ticket_bundle, policy_artifact["rollback_class"]),
             },
-            "changed_paths": self._changed_paths(spec_packet),
+            "changed_paths": self._merge_changed_paths(
+                spec_packet,
+                draft["changed_paths"] if draft is not None else None,
+            ),
             "checks": self._checks(eval_manifest),
             "reviewer_report": {
                 "approved": False,
@@ -234,11 +299,42 @@ class Builder:
     def _changed_paths(cls, spec_packet: dict[str, Any]) -> list[str]:
         paths: list[str] = []
         for surface in spec_packet["summary"]["affected_surfaces"]:
-            paths.extend(cls.PATH_HINTS.get(surface, []))
+            paths.extend(cls._path_hints_for(spec_packet, surface))
         return cls._dedupe(paths)[:8] or [
             "integrations/anthropic/feature.py",
             "tests/integration/test_anthropic_feature.py",
         ]
+
+    @classmethod
+    def _merge_changed_paths(
+        cls,
+        spec_packet: dict[str, Any],
+        agent_paths: list[str] | None,
+    ) -> list[str]:
+        deterministic_paths = cls._changed_paths(spec_packet)
+        if not agent_paths:
+            return deterministic_paths
+        suggested = [
+            normalize_whitespace(path)
+            for path in agent_paths
+            if isinstance(path, str)
+            and path.strip()
+            and not path.startswith("/")
+            and ".." not in path.split("/")
+        ]
+        return cls._dedupe(suggested + deterministic_paths)[:8]
+
+    @classmethod
+    def _path_hints_for(cls, spec_packet: dict[str, Any], surface: str) -> list[str]:
+        source = spec_packet.get("source", {})
+        if source.get("kind") == "manual_intake" and source.get("provider") in {
+            "github",
+            "internal",
+            "linear",
+            "manual",
+        }:
+            return cls.FACTORY_PATH_HINTS.get(surface, cls.PATH_HINTS.get(surface, []))
+        return cls.PATH_HINTS.get(surface, [])
 
     @staticmethod
     def _checks(eval_manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -279,11 +375,125 @@ class Builder:
                 deduped.append(item)
         return deduped
 
+    def _agent_pr_draft(
+        self,
+        spec_packet: dict[str, Any],
+        ticket_bundle: dict[str, Any],
+        eval_manifest: dict[str, Any],
+        repository: str,
+        *,
+        revision_guidance: list[str] | None = None,
+        previous_pr_packet: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if self.agent_connector is None:
+            return None, None
+        revision_findings = [normalize_whitespace(item) for item in revision_guidance or [] if item]
+        previous_draft = None
+        if previous_pr_packet is not None:
+            previous_draft = {
+                "what_changed": list(previous_pr_packet["summary"]["what_changed"]),
+                "key_risks": list(previous_pr_packet["summary"]["key_risks"]),
+                "changed_paths": list(previous_pr_packet["changed_paths"]),
+                "blocking_findings": list(
+                    previous_pr_packet["reviewer_report"]["blocking_findings"]
+                ),
+                "non_blocking_findings": list(
+                    previous_pr_packet["reviewer_report"]["non_blocking_findings"]
+                ),
+            }
+        task = AgentTask(
+            name="stage3_pr_draft",
+            instructions=(
+                "You are the Stage 3 builder agent. "
+                "Draft a concise PR summary from the supplied tickets and spec. "
+                "Return concrete 'what changed' bullets, the most important key risks, "
+                "and plausible repo-relative changed paths. "
+                "If revision guidance is present, revise the prior draft to address every blocking finding "
+                "before introducing anything new. "
+                "Do not invent unrelated work or refer to files outside the repository."
+            ),
+            input_document={
+                "repository": repository,
+                "source_title": spec_packet["source"]["title"],
+                "problem": spec_packet["summary"]["problem"],
+                "proposed_capability": spec_packet["summary"]["proposed_capability"],
+                "affected_surfaces": spec_packet["summary"]["affected_surfaces"],
+                "open_questions": [question["question"] for question in spec_packet["open_questions"]],
+                "tickets": [
+                    {
+                        "id": ticket["id"],
+                        "title": ticket["title"],
+                        "kind": ticket["kind"],
+                        "summary": ticket["summary"],
+                        "scope": ticket["scope"],
+                        "known_edge_cases": ticket["known_edge_cases"],
+                    }
+                    for ticket in ticket_bundle["tickets"]
+                ],
+                "required_eval_tiers": [tier["name"] for tier in eval_manifest["tiers"]],
+                "deterministic_path_hints": self._changed_paths(spec_packet),
+                "revision_guidance": revision_findings,
+                "previous_draft": previous_draft,
+            },
+            output_schema=self._builder_draft_schema(),
+        )
+        try:
+            result = self.agent_connector.run_task(task)
+        except FactoryConnectorError as exc:
+            raise BuildReviewError(f"Agent-assisted PR drafting failed: {exc}") from exc
+        draft = result.output_document
+        return {
+            "what_changed": self._dedupe(
+                [normalize_whitespace(item) for item in draft["what_changed"]]
+            )[:4],
+            "key_risks": self._dedupe(
+                [normalize_whitespace(item) for item in draft["key_risks"]]
+            )[:4],
+            "changed_paths": self._dedupe(
+                [normalize_whitespace(item) for item in draft["changed_paths"]]
+            )[:8],
+        }, result.model_fingerprint
+
+    @staticmethod
+    def _builder_draft_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["what_changed", "key_risks", "changed_paths"],
+            "properties": {
+                "what_changed": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "key_risks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "changed_paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1},
+                },
+            },
+        }
+
 
 class Reviewer:
     """Review the builder draft and decide if the PR is reviewable."""
 
     PROMPT_CONTRACT_ID = "reviewer.v1"
+
+    def __init__(
+        self,
+        *,
+        agent_connector: AgentConnector | None = None,
+    ) -> None:
+        self.agent_connector = agent_connector
 
     def review_pr_packet(
         self,
@@ -297,12 +507,25 @@ class Reviewer:
         reviewed_packet = deepcopy(pr_packet)
         updated_at = timestamp or utc_now()
         pending_tiers = Builder._pending_eval_tiers(eval_manifest)
-        findings = list(blocking_findings or [])
-        non_blocking = self._non_blocking_findings(spec_packet, pending_tiers)
+        agent_review, model_fingerprint = self._agent_review(
+            pr_packet,
+            spec_packet,
+            eval_manifest,
+        )
+        findings = self._dedupe(
+            list(blocking_findings or [])
+            + (agent_review["blocking_findings"] if agent_review is not None else [])
+        )
+        non_blocking = self._dedupe(
+            (agent_review["non_blocking_findings"] if agent_review is not None else [])
+            + self._non_blocking_findings(spec_packet, pending_tiers)
+        )
         approved = not findings
 
         reviewed_packet["artifact"]["owner_agent"] = "Reviewer"
-        reviewed_packet["artifact"]["model_fingerprint"] = self.PROMPT_CONTRACT_ID
+        reviewed_packet["artifact"]["model_fingerprint"] = (
+            model_fingerprint or self.PROMPT_CONTRACT_ID
+        )
         reviewed_packet["artifact"]["updated_at"] = updated_at
         reviewed_packet["artifact"]["status"] = "approved" if approved else "blocked"
         reviewed_packet["artifact"]["next_stage"] = "eval" if approved else "build"
@@ -338,6 +561,78 @@ class Reviewer:
             findings.append(f"Carry open question: {question['question']}")
         return findings[:3]
 
+    def _agent_review(
+        self,
+        pr_packet: dict[str, Any],
+        spec_packet: dict[str, Any],
+        eval_manifest: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if self.agent_connector is None:
+            return None, None
+        task = AgentTask(
+            name="stage3_pr_review",
+            instructions=(
+                "You are the Stage 3 reviewer agent. "
+                "Identify only material blocking findings or worthwhile non-blocking findings "
+                "for this PR draft. Focus on correctness, architecture fit, and edge cases. "
+                "Do not repeat the known pending eval tiers or open questions, because the factory adds those separately."
+            ),
+            input_document={
+                "pull_request_title": pr_packet["pull_request"]["title"],
+                "summary": pr_packet["summary"],
+                "changed_paths": pr_packet["changed_paths"],
+                "checks": pr_packet["checks"],
+                "problem": spec_packet["summary"]["problem"],
+                "acceptance_criteria": [
+                    criterion["description"] for criterion in spec_packet["acceptance_criteria"]
+                ],
+                "open_questions": [question["question"] for question in spec_packet["open_questions"]],
+                "pending_eval_tiers": Builder._pending_eval_tiers(eval_manifest),
+            },
+            output_schema=self._review_schema(),
+        )
+        try:
+            result = self.agent_connector.run_task(task)
+        except FactoryConnectorError as exc:
+            raise BuildReviewError(f"Agent-assisted PR review failed: {exc}") from exc
+        review = result.output_document
+        return {
+            "blocking_findings": self._dedupe(
+                [normalize_whitespace(item) for item in review["blocking_findings"]]
+            )[:3],
+            "non_blocking_findings": self._dedupe(
+                [normalize_whitespace(item) for item in review["non_blocking_findings"]]
+            )[:3],
+        }, result.model_fingerprint
+
+    @staticmethod
+    def _review_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["blocking_findings", "non_blocking_findings"],
+            "properties": {
+                "blocking_findings": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "non_blocking_findings": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {"type": "string", "minLength": 1},
+                },
+            },
+        }
+
+    @staticmethod
+    def _dedupe(items: list[str]) -> list[str]:
+        deduped: list[str] = []
+        for item in items:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped
+
 
 class Stage3BuildReviewPipeline:
     """Run Budget Guardian -> Builder -> Reviewer to produce a reviewable PR packet."""
@@ -350,12 +645,17 @@ class Stage3BuildReviewPipeline:
         budget_guardian: BudgetGuardian | None = None,
         builder: Builder | None = None,
         reviewer: Reviewer | None = None,
+        agent_connector: AgentConnector | None = None,
+        code_worker_connector: CodeWorkerConnector | None = None,
+        repo_connector: GitHubCLIRepoConnector | None = None,
     ) -> None:
         self.root = repo_root(root)
         self.controller = controller or FactoryController()
         self.budget_guardian = budget_guardian or BudgetGuardian()
-        self.builder = builder or Builder()
-        self.reviewer = reviewer or Reviewer()
+        self.builder = builder or Builder(agent_connector=agent_connector)
+        self.reviewer = reviewer or Reviewer(agent_connector=agent_connector)
+        self.code_worker_connector = code_worker_connector
+        self.repo_connector = repo_connector
         self.validators = load_validators(self.root)
 
     def process(
@@ -369,6 +669,8 @@ class Stage3BuildReviewPipeline:
         pr_packet_id: str | None = None,
         repository: str = "mindsdb/platform",
         blocking_findings: list[str] | None = None,
+        revision_guidance: list[str] | None = None,
+        previous_pr_packet: dict[str, Any] | None = None,
     ) -> Stage3BuildReviewResult:
         self._validate_document("spec-packet", spec_packet)
         self._validate_document("policy-decision", policy_decision)
@@ -429,8 +731,31 @@ class Stage3BuildReviewPipeline:
             eval_manifest,
             artifact_id=packet_artifact_id,
             repository=repository,
+            revision_guidance=revision_guidance,
+            previous_pr_packet=previous_pr_packet,
             timestamp=builder_timestamp,
         )
+        if self.code_worker_connector is not None:
+            if self.repo_connector is None:
+                raise BuildReviewError(
+                    "Stage 3 code-worker mode requires a repository connector."
+                )
+            try:
+                pr_evidence, worker_result = self.repo_connector.create_code_worker_pull_request(
+                    work_item_id=working_item.work_item_id,
+                    spec_packet=spec_packet,
+                    ticket_bundle=ticket_bundle,
+                    eval_manifest=eval_manifest,
+                    pr_packet=pr_packet,
+                    code_worker=self.code_worker_connector,
+                )
+            except FactoryConnectorError as exc:
+                raise BuildReviewError(f"Stage 3 code-worker delivery failed: {exc}") from exc
+            pr_packet = self._attach_delivery_evidence(
+                pr_packet,
+                pr_evidence=pr_evidence.to_document(),
+                worker_result=worker_result.to_document(),
+            )
         self.controller.apply_event(
             working_item,
             event=ControllerEvent.PR_CREATED,
@@ -477,6 +802,36 @@ class Stage3BuildReviewPipeline:
             pr_packet=pr_packet,
             work_item=working_item,
         )
+
+    @staticmethod
+    def _attach_delivery_evidence(
+        pr_packet: dict[str, Any],
+        *,
+        pr_evidence: dict[str, Any],
+        worker_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        updated = deepcopy(pr_packet)
+        updated["branch_name"] = str(pr_evidence["branch_name"])
+        updated["pull_request"]["number"] = int(pr_evidence["number"])
+        updated["pull_request"]["url"] = str(pr_evidence["url"])
+        worker_paths = [
+            path for path in worker_result.get("changed_paths", [])
+            if isinstance(path, str) and path
+        ]
+        if worker_paths:
+            updated["changed_paths"] = Builder._dedupe(worker_paths + updated["changed_paths"])
+        updated["delivery_evidence"] = {
+            "mode": "code_worker_pr",
+            "repository": pr_evidence["repository"],
+            "branch_name": pr_evidence["branch_name"],
+            "base_branch": pr_evidence["base_branch"],
+            "commit_sha": pr_evidence["commit_sha"],
+            "pull_request_number": pr_evidence["number"],
+            "pull_request_url": pr_evidence["url"],
+            "code_worker": worker_result,
+            "created_at": pr_evidence["created_at"],
+        }
+        return updated
 
     def _validate_document(self, schema_name: str, document: dict[str, Any]) -> None:
         errors = validation_errors_for(self.validators[schema_name], document)

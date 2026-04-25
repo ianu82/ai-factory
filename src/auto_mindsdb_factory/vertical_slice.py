@@ -9,6 +9,7 @@ from typing import Any
 from .automation import FactoryRunStore
 from .build_review import Stage3BuildReviewPipeline
 from .connectors import (
+    AgentConnector,
     EvalConnector,
     EvalEvidence,
     FileBackedOpsConnector,
@@ -18,7 +19,7 @@ from .connectors import (
     PullRequestStatus,
     RepoConnector,
 )
-from .controller import WorkItem
+from .controller import ControllerState, WorkItem
 from .eval_execution import Stage5EvalPipeline
 from .feedback_synthesis import Stage9FeedbackSynthesisPipeline
 from .integration import Stage4IntegrationPipeline
@@ -86,12 +87,14 @@ class FactoryVerticalSliceRunner:
         self,
         config: VerticalSliceConfig,
         *,
+        agent_connector: AgentConnector | None = None,
         repo_connector: RepoConnector | None = None,
         eval_connector: EvalConnector | None = None,
         ops_connector: OpsSignalConnector | None = None,
     ) -> None:
         self.config = config
         self.root = repo_root(config.repo_root)
+        self.agent_connector = agent_connector
         self.store = FactoryRunStore(config.store_dir, repo_root_override=self.root)
         self.repo_connector = repo_connector or GitHubCLIRepoConnector(
             self.root,
@@ -104,8 +107,8 @@ class FactoryVerticalSliceRunner:
             seed_missing_signals=config.seed_missing_ops_signals,
         )
         self.stage1 = Stage1IntakePipeline(self.root)
-        self.stage2 = Stage2TicketingPipeline(self.root)
-        self.stage3 = Stage3BuildReviewPipeline(self.root)
+        self.stage2 = Stage2TicketingPipeline(self.root, agent_connector=agent_connector)
+        self.stage3 = Stage3BuildReviewPipeline(self.root, agent_connector=agent_connector)
         self.stage4 = Stage4IntegrationPipeline(self.root)
         self.stage5 = Stage5EvalPipeline(self.root)
         self.stage6 = Stage6SecurityReviewPipeline(self.root)
@@ -128,23 +131,13 @@ class FactoryVerticalSliceRunner:
             work_item,
         )
         stored_paths["stage2"] = str(self._save_stage("stage2", stage2_result.to_document()))
-        work_item = stage2_result.work_item
-
-        stage3_result = self.stage3.process(
-            stage2_result.spec_packet,
-            stage2_result.policy_decision,
-            stage2_result.ticket_bundle,
-            stage2_result.eval_manifest,
-            work_item,
-            repository=self.config.repository,
-        )
+        stage3_result = self._run_stage3_until_reviewable(stage2_result, stored_paths)
         pr_evidence = self.repo_connector.create_pull_request(
             work_item_id=stage3_result.work_item.work_item_id,
             spec_packet=stage3_result.spec_packet,
             ticket_bundle=stage3_result.ticket_bundle,
             pr_packet=stage3_result.pr_packet,
         )
-        pr_status = self.repo_connector.read_pull_request_status(pr_evidence)
         pr_packet = self._attach_pr_evidence(stage3_result.pr_packet, pr_evidence)
         stage3_document = stage3_result.to_document()
         stage3_document["pr_packet"] = pr_packet
@@ -163,12 +156,13 @@ class FactoryVerticalSliceRunner:
         work_item = stage4_result.work_item
 
         eval_evidence = self._run_eval_connector()
-        eval_evidence.assert_passed()
         self._write_run_document(
             work_item.work_item_id,
             "vertical-slice-eval-evidence.json",
             eval_evidence.to_document(),
         )
+        eval_evidence.assert_passed()
+        pr_status = self.repo_connector.read_pull_request_status(pr_evidence)
         stage5_result = self.stage5.process(
             stage4_result.spec_packet,
             stage4_result.policy_decision,
@@ -314,6 +308,65 @@ class FactoryVerticalSliceRunner:
         )
         return result
 
+    def _run_stage3_until_reviewable(
+        self,
+        stage2_result,
+        stored_paths: dict[str, str],
+    ) -> Stage3BuildReviewResult:
+        work_item = stage2_result.work_item
+        revision_guidance: list[str] | None = None
+        previous_pr_packet: dict[str, Any] | None = None
+        max_cycles = int(stage2_result.policy_decision["budget_policy"]["max_pr_review_cycles"])
+
+        while True:
+            stage3_result = self.stage3.process(
+                stage2_result.spec_packet,
+                stage2_result.policy_decision,
+                stage2_result.ticket_bundle,
+                stage2_result.eval_manifest,
+                work_item,
+                repository=self.config.repository,
+                revision_guidance=revision_guidance,
+                previous_pr_packet=previous_pr_packet,
+            )
+            attempt_number = stage3_result.work_item.attempt_count
+            stage3_document = stage3_result.to_document()
+            self._write_run_document(
+                stage3_result.work_item.work_item_id,
+                f"stage3-attempt-{attempt_number}-result.json",
+                stage3_document,
+            )
+            stored_paths["stage3"] = str(self._save_stage("stage3", stage3_document))
+
+            if stage3_result.work_item.state is ControllerState.PR_REVIEWABLE:
+                return stage3_result
+            if stage3_result.work_item.state is not ControllerState.PR_REVISION:
+                raise VerticalSliceError(
+                    "Stage 3 revision loop ended in an unexpected state: "
+                    f"{stage3_result.work_item.state.value}."
+                )
+
+            revision_guidance = list(stage3_result.pr_packet["reviewer_report"]["blocking_findings"])
+            if not revision_guidance:
+                raise VerticalSliceError(
+                    "Stage 3 returned PR_REVISION without blocking findings to address."
+                )
+            if self.agent_connector is None:
+                raise VerticalSliceError(
+                    "Stage 3 produced blocking findings but no live agent connector is configured "
+                    "to revise the draft: "
+                    + "; ".join(revision_guidance)
+                )
+            if stage3_result.work_item.attempt_count >= max_cycles:
+                raise VerticalSliceError(
+                    "Stage 3 revision loop exhausted the build retry budget. "
+                    "Last blocking findings: "
+                    + "; ".join(revision_guidance)
+                )
+
+            previous_pr_packet = stage3_result.pr_packet
+            work_item = stage3_result.work_item
+
     def _select_source_item(self):
         html = None
         if self.config.html_file is not None:
@@ -361,9 +414,14 @@ class FactoryVerticalSliceRunner:
         evidence: PullRequestEvidence,
     ) -> dict[str, Any]:
         updated = deepcopy(pr_packet)
+        prior_fingerprint = updated["artifact"].get("model_fingerprint")
         updated["artifact"]["version"] = int(updated["artifact"]["version"]) + 1
         updated["artifact"]["owner_agent"] = "GitHub Connector"
-        updated["artifact"]["model_fingerprint"] = "github_cli_connector.v1"
+        updated["artifact"]["model_fingerprint"] = (
+            f"{prior_fingerprint} -> github_cli_connector.v1"
+            if prior_fingerprint
+            else "github_cli_connector.v1"
+        )
         updated["artifact"]["updated_at"] = evidence.created_at
         updated["branch_name"] = evidence.branch_name
         updated["pull_request"] = {

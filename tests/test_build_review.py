@@ -9,10 +9,26 @@ from auto_mindsdb_factory.build_review import (
     BuildReviewConsistencyError,
     Stage3BuildReviewPipeline,
 )
+from auto_mindsdb_factory.connectors import AgentResult
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import ControllerState
-from auto_mindsdb_factory.intake import AnthropicScout, Stage1IntakePipeline
+from auto_mindsdb_factory.intake import AnthropicScout, Stage1IntakePipeline, build_manual_intake_item
 from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
+
+
+class ScriptedAgentConnector:
+    def __init__(self, outputs: dict[str, dict]) -> None:
+        self.outputs = outputs
+
+    def run_task(self, task):
+        return AgentResult(
+            name=task.name,
+            output_document=self.outputs[task.name],
+            model_fingerprint="openai.responses:gpt-5.4",
+            provider="openai",
+            model="gpt-5.4",
+            response_id="resp_test",
+        )
 
 
 def fixture_html() -> str:
@@ -26,6 +42,59 @@ def stage2_active_result(root: Path):
         html=fixture_html(),
         detected_at="2026-04-22T12:00:00Z",
     )[0]
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    return Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+
+def stage2_manual_issue_result(root: Path):
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. This is a control-plane API and "
+            "JSON schema change for the cockpit command, not a model-runtime change. Operators should "
+            "not need to cross-check multiple artifacts to decide whether a run is healthy. Acceptance "
+            "criteria: - update the factory cockpit tool output to include the latest GitHub check "
+            "conclusions for each run - include the latest local eval status summary from vertical-slice "
+            "or automation artifacts - add a single health field that resolves to ready, blocked, or "
+            "warning based on PR checks, eval status, and monitoring alerts - cover the new output with "
+            "CLI tests and contract-safe validation"
+        ),
+    )
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    return Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+
+def stage2_linear_issue_result(root: Path):
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear-issue-2",
+        title="Factory API should surface Linear intake status in the cockpit",
+        url="https://linear.app/example/issue/ENG-123/factory-intake",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit API should surface Linear-triggered factory runs and their status. "
+            "This is a control-plane API and response format change for the cockpit command, not a "
+            "model-runtime change. Acceptance criteria: - include the latest Linear-triggered run "
+            "status in the cockpit JSON output - show whether Stage 1 accepted or rejected the issue "
+            "in the response format - keep the response schema compatibility-safe for existing callers "
+            "- cover the output with CLI tests"
+        ),
+    )
     stage1_result = Stage1IntakePipeline(root).process_item(item)
     return Stage2TicketingPipeline(root).process(
         stage1_result.spec_packet,
@@ -89,6 +158,102 @@ def test_stage3_build_review_can_return_to_pr_revision() -> None:
     ]
     assert result.pr_packet["merge_readiness"]["reviewable"] is False
     assert result.pr_packet["merge_readiness"]["mergeable"] is False
+
+
+def test_stage3_build_review_uses_factory_paths_for_manual_github_issues() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage2_result = stage2_manual_issue_result(root)
+
+    result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+        repository="ianu82/ai-factory",
+    )
+
+    assert "src/auto_mindsdb_factory/__main__.py" in result.pr_packet["changed_paths"]
+    assert "tests/test_cli.py" in result.pr_packet["changed_paths"]
+    assert "src/auto_mindsdb_factory/vertical_slice.py" in result.pr_packet["changed_paths"]
+    assert "tests/test_vertical_slice.py" in result.pr_packet["changed_paths"]
+    assert not any(
+        path.startswith("integrations/anthropic/")
+        for path in result.pr_packet["changed_paths"]
+    )
+
+
+def test_stage3_build_review_uses_factory_paths_for_manual_linear_issues() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage2_result = stage2_linear_issue_result(root)
+
+    result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+        repository="ianu82/ai-factory",
+    )
+
+    assert "src/auto_mindsdb_factory/__main__.py" in result.pr_packet["changed_paths"]
+    assert "tests/test_cli.py" in result.pr_packet["changed_paths"]
+    assert "src/auto_mindsdb_factory/vertical_slice.py" in result.pr_packet["changed_paths"]
+    assert "tests/test_vertical_slice.py" in result.pr_packet["changed_paths"]
+    assert not any(
+        path.startswith("integrations/anthropic/")
+        for path in result.pr_packet["changed_paths"]
+    )
+
+
+def test_stage3_build_review_can_use_agent_drafts() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage2_result = stage2_manual_issue_result(root)
+    agent_connector = ScriptedAgentConnector(
+        {
+            "stage3_pr_draft": {
+                "what_changed": [
+                    "Add cockpit health synthesis to the JSON output.",
+                    "Surface GitHub check conclusions and local eval state together.",
+                ],
+                "key_risks": [
+                    "Health synthesis must stay compatibility-safe for older callers."
+                ],
+                "changed_paths": [
+                    "src/auto_mindsdb_factory/__main__.py",
+                    "tests/test_cli.py",
+                ],
+            },
+            "stage3_pr_review": {
+                "blocking_findings": [],
+                "non_blocking_findings": [
+                    "Confirm that absent GitHub check data downgrades health instead of crashing the cockpit."
+                ],
+            },
+        }
+    )
+
+    result = Stage3BuildReviewPipeline(root, agent_connector=agent_connector).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+        repository="ianu82/ai-factory",
+    )
+
+    assert result.pr_packet["artifact"]["model_fingerprint"] == "openai.responses:gpt-5.4"
+    assert result.pr_packet["summary"]["what_changed"][0] == (
+        "Add cockpit health synthesis to the JSON output."
+    )
+    assert result.pr_packet["summary"]["key_risks"] == [
+        "Health synthesis must stay compatibility-safe for older callers."
+    ]
+    assert "src/auto_mindsdb_factory/__main__.py" in result.pr_packet["changed_paths"]
+    assert (
+        "Confirm that absent GitHub check data downgrades health instead of crashing the cockpit."
+        in result.pr_packet["reviewer_report"]["non_blocking_findings"]
+    )
 
 
 def test_stage3_build_review_can_resume_from_pr_revision() -> None:

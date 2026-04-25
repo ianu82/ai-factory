@@ -131,6 +131,16 @@
                 },
                 "observed_value": {
                   "type": "number"
+                },
+                "command": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "exit_code": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               },
               "additionalProperties": false
@@ -203,6 +213,22 @@
           "uniqueItems": true
         },
         "pending_check_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "deferred_check_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "not_configured_check_ids": {
           "type": "array",
           "items": {
             "type": "string",

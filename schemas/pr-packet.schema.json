@@ -116,6 +116,123 @@
       "minItems": 1,
       "uniqueItems": true
     },
+    "delivery_evidence": {
+      "type": "object",
+      "required": [
+        "mode",
+        "repository",
+        "branch_name",
+        "base_branch",
+        "commit_sha",
+        "pull_request_number",
+        "pull_request_url",
+        "code_worker",
+        "created_at"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "code_worker_pr"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "base_branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "pull_request_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pull_request_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "code_worker": {
+          "type": "object",
+          "required": [
+            "status",
+            "provider",
+            "model",
+            "command",
+            "changed_paths",
+            "diff_stat",
+            "stdout",
+            "stderr",
+            "started_at",
+            "completed_at",
+            "exit_code"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "succeeded",
+                "failed",
+                "timeout"
+              ]
+            },
+            "provider": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            },
+            "changed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "diff_stat": {
+              "type": "string"
+            },
+            "stdout": {
+              "type": "string"
+            },
+            "stderr": {
+              "type": "string"
+            },
+            "started_at": {
+              "$ref": "common.schema.json#/$defs/timestamp"
+            },
+            "completed_at": {
+              "$ref": "common.schema.json#/$defs/timestamp"
+            },
+            "exit_code": {
+              "type": "integer"
+            }
+          },
+          "additionalProperties": false
+        },
+        "created_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      },
+      "additionalProperties": false
+    },
     "checks": {
       "type": "array",
       "items": {
@@ -134,7 +251,9 @@
             "enum": [
               "pending",
               "passed",
-              "failed"
+              "failed",
+              "deferred",
+              "not_configured"
             ]
           },
           "url": {

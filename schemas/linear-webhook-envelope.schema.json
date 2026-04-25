@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/linear-webhook-envelope.schema.json",
+  "title": "Linear Webhook Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "delivery_id",
+    "event_type",
+    "received_at",
+    "logical_trigger_key",
+    "issue_id",
+    "team_id",
+    "state_id",
+    "payload"
+  ],
+  "properties": {
+    "delivery_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_type": {
+      "type": "string",
+      "const": "Issue"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "logical_trigger_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issue_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "team_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "action",
+        "type",
+        "createdAt",
+        "data",
+        "webhookTimestamp"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "remove"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "Issue"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "webhookTimestamp": {
+          "type": "integer"
+        },
+        "updatedFrom": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "id",
+            "teamId",
+            "stateId"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "teamId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "stateId": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  }
+}

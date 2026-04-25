@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
+
+import auto_mindsdb_factory.__main__ as cli_main
 from auto_mindsdb_factory.automation import (
     AutomationState,
     FactoryAutomationCoordinator,
@@ -29,6 +33,32 @@ def _history_document(work_item) -> list[dict[str, str | None]]:
     ]
 
 
+@pytest.fixture(autouse=True)
+def _disable_repo_env_files() -> None:
+    tracked_keys = (
+        "AI_FACTORY_SKIP_ENV_FILES",
+        "OPENAI_API_KEY",
+        "AI_FACTORY_AGENT_PROVIDER",
+        "AI_FACTORY_OPENAI_MODEL",
+        "AI_FACTORY_OPENAI_FALLBACK_MODEL",
+        "AI_FACTORY_OPENAI_REASONING_EFFORT",
+        "AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS",
+        "AI_FACTORY_OPENAI_TIMEOUT_SECONDS",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_PROJECT",
+    )
+    original_values = {key: os.environ.get(key) for key in tracked_keys}
+    os.environ["AI_FACTORY_SKIP_ENV_FILES"] = "1"
+    try:
+        yield
+    finally:
+        for key, value in original_values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def load_stage8_result_document(root: Path, scenario_name: str) -> dict:
     scenario = root / "fixtures" / "scenarios" / scenario_name
     replayed = FactoryController().replay_scenario(scenario)
@@ -51,6 +81,45 @@ def load_stage8_result_document(root: Path, scenario_name: str) -> dict:
     }
 
 
+def test_stage1_manual_intake_cli_emits_valid_bundle(capsys) -> None:
+    exit_code = main(
+        [
+            "stage1-intake-manual",
+            "--provider",
+            "github",
+            "--external-id",
+            "github-issue-2",
+            "--title",
+            "Factory cockpit should surface GitHub check conclusions and eval status",
+            "--body",
+            (
+                "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+                "status, and a clear health summary for each work item. This is a control-plane API and "
+                "JSON schema change for the cockpit command, not a model-runtime change. Operators should "
+                "not need to cross-check multiple artifacts to decide whether a run is healthy. Acceptance "
+                "criteria: - update the factory cockpit tool output to include the latest GitHub check "
+                "conclusions for each run - include the latest local eval status summary from vertical-slice "
+                "or automation artifacts - add a single health field that resolves to ready, blocked, or "
+                "warning based on PR checks, eval status, and monitoring alerts - cover the new output with "
+                "CLI tests and contract-safe validation"
+            ),
+            "--url",
+            "https://github.com/ianu82/ai-factory/issues/2",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["source_item"]["kind"] == "manual_intake"
+    assert payload["spec_packet"]["summary"]["problem"].startswith("GitHub issue:")
+    assert payload["spec_packet"]["summary"]["affected_surfaces"] == [
+        "api_contract",
+        "control_plane",
+    ]
+    assert payload["work_item"]["state"] == "POLICY_ASSIGNED"
+
+
 def test_stage2_cli_reports_invalid_json(capsys, tmp_path) -> None:
     invalid_stage1 = tmp_path / "stage1-invalid.json"
     invalid_stage1.write_text('{"spec_packet": ', encoding="utf-8")
@@ -67,6 +136,319 @@ def test_stage2_cli_reports_invalid_json(capsys, tmp_path) -> None:
     assert exit_code == 1
     assert "Stage 2 ticketing failed:" in captured.err
     assert "not valid JSON" in captured.err
+
+
+def test_stage2_cli_reports_missing_openai_api_key(capsys, monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    stage1_result = tmp_path / "stage1-result.json"
+    stage1_result.write_text(
+        json.dumps(
+            {
+                "spec_packet": {
+                    "artifact": {"artifact_id": "spec-1"},
+                    "summary": {
+                        "problem": "Test problem",
+                        "proposed_capability": "Test capability",
+                        "acceptance_criteria": ["Criterion 1"],
+                        "non_goals": [],
+                        "affected_surfaces": ["api_contract"],
+                    },
+                    "open_questions": [],
+                    "source_item": {
+                        "title": "Manual test item",
+                        "kind": "manual_intake",
+                    },
+                },
+                "policy_decision": {
+                    "artifact": {"artifact_id": "policy-1"},
+                    "lane": "fast",
+                    "required_eval_tiers": ["unit"],
+                    "risk_factors": [],
+                },
+                "work_item": {
+                    "id": "wi-test",
+                    "title": "Test item",
+                    "state": "POLICY_ASSIGNED",
+                    "history": [],
+                    "artifacts": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "stage2-ticketing",
+            "--agent-provider",
+            "openai",
+            "--stage1-result-file",
+            str(stage1_result),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Stage 2 ticketing failed:" in captured.err
+    assert "OPENAI_API_KEY" in captured.err
+
+
+def test_stage2_cli_loads_repo_env_file_before_parser_defaults(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("AI_FACTORY_SKIP_ENV_FILES", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AI_FACTORY_AGENT_PROVIDER", raising=False)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".env").write_text(
+        "AI_FACTORY_AGENT_PROVIDER=none\nOPENAI_API_KEY=base-key\n",
+        encoding="utf-8",
+    )
+    (repo_root / ".env.local").write_text(
+        "AI_FACTORY_AGENT_PROVIDER=openai\nOPENAI_API_KEY=local-key\n",
+        encoding="utf-8",
+    )
+    stage1_result = tmp_path / "stage1-result.json"
+    stage1_result.write_text("{}", encoding="utf-8")
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(cli_main, "_load_stage1_result", lambda path: ({}, {}, {}))
+    monkeypatch.setattr(cli_main, "_load_work_item", lambda document, label: object())
+
+    def fake_build_agent_connector(args):
+        captured["agent_provider"] = args.agent_provider
+        captured["openai_api_key"] = os.environ.get("OPENAI_API_KEY", "")
+        return None
+
+    class _Stage2Result:
+        def to_document(self) -> dict[str, bool]:
+            return {"ok": True}
+
+    class _FakeStage2Pipeline:
+        def __init__(self, root, *, agent_connector=None) -> None:
+            self.root = root
+            self.agent_connector = agent_connector
+
+        def process(self, spec_packet, policy_decision, work_item):
+            return _Stage2Result()
+
+    monkeypatch.setattr(cli_main, "_build_agent_connector", fake_build_agent_connector)
+    monkeypatch.setattr(cli_main, "Stage2TicketingPipeline", _FakeStage2Pipeline)
+
+    exit_code = main(
+        [
+            "stage2-ticketing",
+            "--repo-root",
+            str(repo_root),
+            "--stage1-result-file",
+            str(stage1_result),
+        ]
+    )
+    captured_io = capsys.readouterr()
+
+    assert exit_code == 0
+    assert json.loads(captured_io.out) == {"ok": True}
+    assert captured["agent_provider"] == "openai"
+    assert captured["openai_api_key"] == "local-key"
+
+
+def test_linear_webhook_server_cli_invokes_runtime(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_serve_linear_webhooks(
+        *,
+        store_dir: Path,
+        host: str,
+        port: int,
+        repo_root_override: Path | None = None,
+        config=None,
+    ) -> None:
+        captured["store_dir"] = store_dir
+        captured["host"] = host
+        captured["port"] = port
+        captured["repo_root_override"] = repo_root_override
+
+    monkeypatch.setattr(cli_main, "serve_linear_webhooks", fake_serve_linear_webhooks)
+
+    exit_code = main(
+        [
+            "linear-webhook-server",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8090",
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "store_dir": tmp_path / "store",
+        "host": "127.0.0.1",
+        "port": 8090,
+        "repo_root_override": tmp_path / "repo",
+    }
+
+
+def test_linear_trigger_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeResult:
+        failed_events: list[dict[str, object]] = []
+
+        def to_document(self) -> dict[str, object]:
+            return {
+                "cycle": "linear-trigger",
+                "processed_events": [{"delivery_id": "delivery-123"}],
+                "skipped_events": [],
+                "failed_events": [],
+                "trigger_state": {
+                    "version": 1,
+                    "processed_delivery_ids": ["delivery-123"],
+                    "processed_logical_trigger_keys": ["linear:issue-123:state-factory:2026-04-24T12:00:00Z"],
+                    "updated_at": "2026-04-24T12:00:02Z",
+                },
+            }
+
+        def failed_handoffs(self) -> list[dict[str, object]]:
+            return []
+
+    class _FakeWorker:
+        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+            self.store_dir = store_dir
+            self.repo_root_override = repo_root_override
+
+        def run_cycle(self, *, repository: str, max_events: int | None = None) -> _FakeResult:
+            assert repository == "ianu82/ai-factory"
+            assert max_events == 2
+            return _FakeResult()
+
+    monkeypatch.setattr(cli_main, "LinearTriggerWorker", _FakeWorker)
+
+    exit_code = main(
+        [
+            "automation-linear-trigger-cycle",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repository",
+            "ianu82/ai-factory",
+            "--max-events",
+            "2",
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "linear-trigger"
+    assert payload["processed_events"] == [{"delivery_id": "delivery-123"}]
+
+
+def test_linear_ensure_stage_states_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeSync:
+        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert repo_root_override == tmp_path / "repo"
+
+        def ensure_stage_states(self) -> dict[str, dict[str, object]]:
+            return {
+                "stage1": {"id": "state-1", "name": "Stage 1 Intake"},
+                "stage9": {"id": "state-9", "name": "Stage 9 Feedback"},
+            }
+
+    monkeypatch.setattr(cli_main, "LinearWorkflowSync", _FakeSync)
+
+    exit_code = main(
+        [
+            "linear-ensure-stage-states",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "linear-stage-setup"
+    assert payload["stage_states"]["stage1"]["name"] == "Stage 1 Intake"
+
+
+def test_linear_sync_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeResult:
+        failed_runs: list[dict[str, object]] = []
+
+        def to_document(self) -> dict[str, object]:
+            return {
+                "cycle": "linear-workflow-sync",
+                "stage_states": {"stage1": {"id": "state-1", "name": "Stage 1 Intake"}},
+                "synced_runs": [{"work_item_id": "wi-123"}],
+                "skipped_runs": [],
+                "failed_runs": [],
+            }
+
+    class _FakeSync:
+        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert repo_root_override == tmp_path / "repo"
+
+        def sync_existing_runs(self, *, max_runs: int | None = None) -> _FakeResult:
+            assert max_runs == 2
+            return _FakeResult()
+
+    monkeypatch.setattr(cli_main, "LinearWorkflowSync", _FakeSync)
+
+    exit_code = main(
+        [
+            "automation-linear-sync-cycle",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--max-runs",
+            "2",
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "linear-workflow-sync"
+    assert payload["synced_runs"] == [{"work_item_id": "wi-123"}]
+
+
+def test_validate_contracts_cli_reports_malformed_env_file(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("AI_FACTORY_SKIP_ENV_FILES", raising=False)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".env").write_text("NOT VALID", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "validate-contracts",
+            "--repo-root",
+            str(repo_root),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Environment setup failed:" in captured.err
+    assert "KEY=VALUE" in captured.err
 
 
 def test_stage3_cli_reports_missing_stage2_fields(capsys, tmp_path) -> None:
@@ -777,6 +1159,76 @@ def test_automation_advance_runs_cli_progresses_active_build_items(capsys, tmp_p
     payload = json.loads(advance_captured.out)
     assert payload["cycle"] == "stage2-through-stage8-progression"
     assert payload["processed_runs"][0]["final_stage"] == "stage8"
+
+
+def test_factory_doctor_cli_emits_runtime_checks(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+            assert config.autonomy_mode.value == "pr_ready"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+
+    exit_code = main(
+        [
+            "factory-doctor",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "factory-doctor"
+    assert payload["status"] == "passed"
+
+
+def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeWorker:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+            assert config.autonomy_mode.value == "pr_ready"
+            assert config.max_events_per_cycle == 3
+
+        def run(self, *, once: bool = False, max_cycles: int | None = None) -> dict[str, object]:
+            assert once is True
+            assert max_cycles is None
+            return {
+                "cycle": "factory-worker",
+                "status": "completed",
+                "cycles": [{"cycle": "factory-worker-cycle"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryWorker", _FakeWorker)
+
+    exit_code = main(
+        [
+            "factory-worker",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+            "--max-events",
+            "3",
+            "--once",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "factory-worker"
+    assert payload["cycles"] == [{"cycle": "factory-worker-cycle"}]
 
 
 def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:

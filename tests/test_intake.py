@@ -4,7 +4,12 @@ from pathlib import Path
 
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import ControllerState
-from auto_mindsdb_factory.intake import AnthropicScout, ReleaseNoteItem, Stage1IntakePipeline
+from auto_mindsdb_factory.intake import (
+    AnthropicScout,
+    ReleaseNoteItem,
+    Stage1IntakePipeline,
+    build_manual_intake_item,
+)
 
 
 def fixture_html() -> str:
@@ -78,6 +83,88 @@ def test_stage1_intake_emits_valid_active_build_bundle() -> None:
     assert result.policy_decision["decision"] == "active_build_candidate"
     assert result.work_item.state is ControllerState.POLICY_ASSIGNED
     assert result.work_item.execution_lane == "guarded"
+
+
+def test_stage1_manual_intake_uses_generic_issue_framing() -> None:
+    root = Path(__file__).resolve().parents[1]
+    validators = load_validators(root)
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. This is a control-plane API and "
+            "JSON schema change for the cockpit command, not a model-runtime change. Operators should "
+            "not need to cross-check multiple artifacts to decide whether a run is healthy. Acceptance "
+            "criteria: - update the factory cockpit tool output to include the latest GitHub check "
+            "conclusions for each run - include the latest local eval status summary from vertical-slice "
+            "or automation artifacts - add a single health field that resolves to ready, blocked, or "
+            "warning based on PR checks, eval status, and monitoring alerts - cover the new output with "
+            "CLI tests and contract-safe validation"
+        ),
+    )
+
+    result = Stage1IntakePipeline(root).process_item(item)
+    factor_names = {factor["name"] for factor in result.spec_packet["risk_profile"]["factors"]}
+
+    assert validation_errors_for(validators["spec-packet"], result.spec_packet) == []
+    assert result.spec_packet["relevance"]["decision"] == "active_build_candidate"
+    assert result.spec_packet["summary"]["problem"].startswith("GitHub issue:")
+    assert "Anthropic release note" not in result.spec_packet["summary"]["problem"]
+    assert (
+        result.spec_packet["summary"]["proposed_capability"]
+        == "Implement the scoped change described in 'Factory cockpit should surface GitHub check conclusions and eval status'."
+    )
+    assert (
+        result.spec_packet["summary"]["assumptions"][0]
+        == "Stage 1 reasoning is based on the manually submitted GitHub issue plus local factory policy."
+    )
+    assert result.spec_packet["summary"]["affected_surfaces"] == [
+        "api_contract",
+        "control_plane",
+    ]
+    assert factor_names == {"external_api_contract_change"}
+    assert (
+        result.spec_packet["open_questions"][0]["question"]
+        == "Do any existing callers need compatibility shims before this change can ship?"
+    )
+    assert result.work_item.state is ControllerState.POLICY_ASSIGNED
+
+
+def test_stage1_manual_intake_uses_linear_issue_framing() -> None:
+    root = Path(__file__).resolve().parents[1]
+    validators = load_validators(root)
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear-issue-2",
+        title="Factory API should surface Linear intake status in the cockpit",
+        url="https://linear.app/example/issue/ENG-123/factory-intake",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit API should surface Linear-triggered factory runs and their status. "
+            "This is a control-plane API and response format change for the cockpit command, not a "
+            "model-runtime change. Acceptance criteria: - include the latest Linear-triggered run "
+            "status in the cockpit JSON output - show whether Stage 1 accepted or rejected the issue "
+            "in the response format - keep the response schema compatibility-safe for existing callers "
+            "- cover the output with CLI tests"
+        ),
+    )
+
+    result = Stage1IntakePipeline(root).process_item(item)
+
+    assert validation_errors_for(validators["spec-packet"], result.spec_packet) == []
+    assert result.spec_packet["relevance"]["decision"] == "active_build_candidate"
+    assert result.spec_packet["summary"]["problem"].startswith("Linear issue:")
+    assert (
+        result.spec_packet["summary"]["assumptions"][0]
+        == "Stage 1 reasoning is based on the manually submitted Linear issue plus local factory policy."
+    )
+    assert result.work_item.state is ControllerState.POLICY_ASSIGNED
 
 
 def test_stage1_intake_watchlist_path_stops_in_watchlisted_state() -> None:

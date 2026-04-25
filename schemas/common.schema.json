@@ -123,7 +123,9 @@
       "enum": [
         "pending",
         "passed",
-        "failed"
+        "failed",
+        "deferred",
+        "not_configured"
       ]
     },
     "evalTierStatus": {
@@ -132,7 +134,9 @@
         "pending",
         "passed",
         "failed",
-        "warning"
+        "warning",
+        "deferred",
+        "not_configured"
       ]
     },
     "mergeExecutionStatus": {

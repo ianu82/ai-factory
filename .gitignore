@@ -2,5 +2,7 @@
 __pycache__/
 .pytest_cache/
 .factory-automation/
+.env
+.env.local
 tmp-*.json
 *.pyc

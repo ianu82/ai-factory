@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mindsdb-eng.local/schemas/linear-trigger-state.schema.json",
+  "title": "Linear Trigger State",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "processed_delivery_ids",
+    "processed_logical_trigger_keys",
+    "updated_at"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "processed_delivery_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "processed_logical_trigger_keys": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

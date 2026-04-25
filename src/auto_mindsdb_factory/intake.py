@@ -73,6 +73,19 @@ def date_label_to_iso(text: str) -> str:
     return datetime.strptime(text, "%B %d, %Y").date().isoformat()
 
 
+def iso_date_label(text: str) -> str:
+    iso_date = timestamp_or_date_to_iso_date(text)
+    moment = datetime.fromisoformat(iso_date)
+    return f"{moment.strftime('%B')} {moment.day}, {moment.year}"
+
+
+def timestamp_or_date_to_iso_date(text: str) -> str:
+    raw_value = text.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_value):
+        return datetime.fromisoformat(raw_value).date().isoformat()
+    return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).date().isoformat()
+
+
 def keyword_matches(text: str, keyword: str) -> bool:
     pattern = rf"\b{re.escape(keyword.lower())}\b"
     return re.search(pattern, text) is not None
@@ -120,6 +133,38 @@ class ReleaseNoteItem:
             "date_label": self.date_label,
             "anchor": self.anchor,
         }
+
+
+def build_manual_intake_item(
+    *,
+    title: str,
+    body: str,
+    url: str,
+    provider: str = "manual",
+    external_id: str | None = None,
+    detected_at: str | None = None,
+    published_at: str | None = None,
+) -> ReleaseNoteItem:
+    observed_at = detected_at or utc_now()
+    published_seed = published_at or observed_at
+    stable_external_id = external_id or build_identifier(
+        "manual",
+        f"{provider}-{title}-{timestamp_or_date_to_iso_date(published_seed)}",
+        max_length=64,
+    )
+    normalized_title = normalize_whitespace(title).rstrip(".")
+    return ReleaseNoteItem(
+        provider=provider,
+        kind="manual_intake",
+        external_id=stable_external_id,
+        title=normalized_title,
+        url=url,
+        detected_at=observed_at,
+        published_at=timestamp_or_date_to_iso_date(published_seed),
+        body=normalize_whitespace(body),
+        date_label=iso_date_label(published_seed),
+        anchor=slugify(stable_external_id),
+    )
 
 
 class ReleaseNotesOverviewParser(HTMLParser):
@@ -319,6 +364,15 @@ class Clarification:
 
 
 class Clarifier:
+    MANUAL_CONTROL_PLANE_CONTEXT = (
+        "control-plane",
+        "cockpit",
+        "dashboard",
+        "cli",
+        "command",
+        "operator",
+    )
+
     def __init__(self, root: Path | None = None, policy_engine: PolicyEngine | None = None) -> None:
         self.root = repo_root(root)
         self.policy_engine = policy_engine or PolicyEngine(self.root)
@@ -335,32 +389,91 @@ class Clarifier:
         with path.open("r", encoding="utf-8") as handle:
             return yaml.safe_load(handle)
 
-    def _keyword_hits(self, text: str, keywords: list[str]) -> list[str]:
+    @staticmethod
+    def _keyword_hits(text: str, keywords: list[str]) -> list[str]:
         hits: list[str] = []
         for keyword in keywords:
             if keyword_matches(text, keyword):
                 hits.append(keyword)
         return hits
 
-    def clarify(self, item: ReleaseNoteItem) -> Clarification:
+    @staticmethod
+    def _classification_text(item: ReleaseNoteItem) -> str:
         text = normalize_whitespace(f"{item.title} {item.body}").lower()
+        if item.kind == "manual_intake":
+            for phrase in (
+                "not a model-runtime change",
+                "not a model runtime change",
+                "tool output",
+            ):
+                text = text.replace(phrase, " ")
+        return normalize_whitespace(text)
+
+    @classmethod
+    def _manual_control_plane_context(cls, raw_text: str) -> bool:
+        return any(keyword_matches(raw_text, keyword) for keyword in cls.MANUAL_CONTROL_PLANE_CONTEXT)
+
+    @classmethod
+    def _flag_hits_for(
+        cls,
+        item: ReleaseNoteItem,
+        *,
+        text: str,
+        raw_text: str,
+        flag_keywords: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        flag_hits: dict[str, list[str]] = {}
+        for flag, keywords in flag_keywords.items():
+            hits = cls._keyword_hits(text, keywords)
+            if item.kind == "manual_intake":
+                hits = cls._filter_manual_flag_hits(flag, hits, raw_text)
+            if hits:
+                flag_hits[flag] = hits
+        return flag_hits
+
+    @classmethod
+    def _filter_manual_flag_hits(
+        cls,
+        flag: str,
+        hits: list[str],
+        raw_text: str,
+    ) -> list[str]:
+        filtered_hits = list(hits)
+        if flag == "model_behavior_change" and cls._manual_control_plane_context(raw_text):
+            filtered_hits = [hit for hit in filtered_hits if hit != "output"]
+        if flag == "new_tool_permission" and "tool output" in raw_text:
+            filtered_hits = [hit for hit in filtered_hits if hit != "tool"]
+        if flag == "external_api_contract_change" and "pull request" in raw_text:
+            filtered_hits = [hit for hit in filtered_hits if hit != "request"]
+        return filtered_hits
+
+    @staticmethod
+    def _signal_label(item: ReleaseNoteItem) -> str:
+        if item.provider == "anthropic" and item.kind == "release_note":
+            return "Direct integration signal"
+        return "Direct implementation signal"
+
+    def clarify(self, item: ReleaseNoteItem) -> Clarification:
+        raw_text = normalize_whitespace(f"{item.title} {item.body}").lower()
+        text = self._classification_text(item)
         technical_hits = self._keyword_hits(text, self.relevance_policy["technical_keywords"])
         defer_hits = self._keyword_hits(text, self.relevance_policy["defer_keywords"])
         watchlist_hits = self._keyword_hits(text, self.relevance_policy["watchlist_keywords"])
         ignore_hits = self._keyword_hits(text, self.relevance_policy["ignore_keywords"])
         high_roi_hits = self._keyword_hits(text, self.relevance_policy["high_roi_keywords"])
+        signal_label = self._signal_label(item)
 
         if technical_hits:
             if defer_hits:
                 decision = "backlog_candidate"
                 rationale = (
-                    f"Direct integration signal detected ({', '.join(technical_hits[:3])}), "
+                    f"{signal_label} detected ({', '.join(technical_hits[:3])}), "
                     f"but defer signals ({', '.join(defer_hits[:3])}) keep it out of the active build queue."
                 )
             else:
                 decision = "active_build_candidate"
                 rationale = (
-                    f"Direct integration signal detected ({', '.join(technical_hits[:3])}), "
+                    f"{signal_label} detected ({', '.join(technical_hits[:3])}), "
                     "so this item is concrete enough for the build queue."
                 )
         elif watchlist_hits:
@@ -405,15 +518,20 @@ class Clarifier:
         if not affected_surfaces:
             affected_surfaces = ["anthropic_integration"]
 
-        flag_hits: dict[str, list[str]] = {}
-        for flag, keywords in self.relevance_policy["risk_flag_keywords"].items():
-            hits = self._keyword_hits(text, keywords)
-            if hits:
-                flag_hits[flag] = hits
-        for flag, keywords in self._hard_override_flags.items():
-            hits = self._keyword_hits(text, keywords)
-            if hits:
-                flag_hits[flag] = hits
+        flag_hits = self._flag_hits_for(
+            item,
+            text=text,
+            raw_text=raw_text,
+            flag_keywords=self.relevance_policy["risk_flag_keywords"],
+        )
+        flag_hits.update(
+            self._flag_hits_for(
+                item,
+                text=text,
+                raw_text=raw_text,
+                flag_keywords=self._hard_override_flags,
+            )
+        )
 
         flags = list(flag_hits)
         risk_score = self.policy_engine.score_flags(flags)
@@ -459,7 +577,7 @@ class Clarifier:
             blast_radius = "single_service"
 
         assumptions = [
-            "Stage 1 reasoning is based on the public Anthropic release note plus local factory policy.",
+            self._stage1_reasoning_basis(item),
         ]
         if decision in {"active_build_candidate", "backlog_candidate"}:
             assumptions.append(
@@ -469,9 +587,14 @@ class Clarifier:
             assumptions.append(f"Primary integration signal: {technical_hits[0]}.")
 
         if decision == "active_build_candidate":
-            non_goals = [
-                "Do not expand beyond the directly affected Anthropic integration surfaces in this first pass."
-            ]
+            if item.kind == "manual_intake":
+                non_goals = [
+                    "Do not expand beyond the directly affected internal control-plane or contract surfaces in this first pass."
+                ]
+            else:
+                non_goals = [
+                    "Do not expand beyond the directly affected Anthropic integration surfaces in this first pass."
+                ]
         elif decision == "backlog_candidate":
             non_goals = ["Do not enqueue implementation until a narrower rollout target is chosen."]
         elif decision == "watchlist":
@@ -513,7 +636,7 @@ class Clarifier:
             acceptance_criteria = [
                 {
                     "id": f"ac-{base_slug}-001",
-                    "description": "The release note is documented with a clear rationale and revisit condition.",
+                    "description": "The source item is documented with a clear rationale and revisit condition.",
                     "verification_method": "manual",
                     "required": True,
                 }
@@ -548,11 +671,11 @@ class Clarifier:
             }
         ]
 
-        problem = f"Anthropic release note: {item.body}"
+        problem = f"{self._source_label(item)}: {item.body}"
         proposed_capability = self._proposed_capability_for(item, clarification.decision)
         why_now = (
-            f"The source item was published on {item.date_label}; Stage 1 captures the engineering impact "
-            "before downstream ticketing or migration work starts."
+            f"The source item was detected on {item.date_label}; Stage 1 captures the engineering impact "
+            "before downstream ticketing or implementation work starts."
         )
 
         factors = [
@@ -612,16 +735,55 @@ class Clarifier:
         }
 
     @staticmethod
-    def _proposed_capability_for(item: ReleaseNoteItem, decision: str) -> str:
+    def _source_label(item: ReleaseNoteItem) -> str:
+        if item.kind == "manual_intake":
+            if item.provider == "github":
+                return "GitHub issue"
+            if item.provider == "linear":
+                return "Linear issue"
+            return "Manual intake"
+        if item.provider == "anthropic" and item.kind == "release_note":
+            return "Anthropic release note"
+        if item.kind == "blog_post":
+            return "Blog post"
+        if item.kind == "changelog":
+            return "Changelog item"
+        if item.kind == "release_note":
+            return "Release note"
+        return item.kind.replace("_", " ").title()
+
+    @classmethod
+    def _stage1_reasoning_basis(cls, item: ReleaseNoteItem) -> str:
+        if item.provider == "anthropic" and item.kind == "release_note":
+            return "Stage 1 reasoning is based on the public Anthropic release note plus local factory policy."
+        if item.provider == "github" and item.kind == "manual_intake":
+            return "Stage 1 reasoning is based on the manually submitted GitHub issue plus local factory policy."
+        if item.provider == "linear" and item.kind == "manual_intake":
+            return "Stage 1 reasoning is based on the manually submitted Linear issue plus local factory policy."
+        if item.kind == "manual_intake":
+            return "Stage 1 reasoning is based on the manually submitted source item plus local factory policy."
+        return (
+            f"Stage 1 reasoning is based on the {cls._source_label(item).lower()} "
+            "plus local factory policy."
+        )
+
+    @classmethod
+    def _proposed_capability_for(cls, item: ReleaseNoteItem, decision: str) -> str:
         if decision == "ignore":
             return "Record the upstream change and keep it out of the active engineering queue."
         if decision == "watchlist":
             return "Track the upstream capability so it can be reconsidered once a clearer internal use case appears."
         if decision == "backlog_candidate":
+            if item.provider == "anthropic" and item.kind == "release_note":
+                return (
+                    f"Translate '{item.title}' into a narrower future integration plan before ticketing begins."
+                )
             return (
-                f"Translate '{item.title}' into a narrower future integration plan before ticketing begins."
+                f"Translate '{item.title}' into a narrower future implementation plan before ticketing begins."
             )
-        return f"Add or update the affected Anthropic integration surface to support '{item.title}'."
+        if item.provider == "anthropic" and item.kind == "release_note":
+            return f"Add or update the affected Anthropic integration surface to support '{item.title}'."
+        return f"Implement the scoped change described in '{item.title}'."
 
     @staticmethod
     def _resolution_notes_for(decision: str) -> str:
@@ -637,6 +799,8 @@ class Clarifier:
     def _question_for(item: ReleaseNoteItem, clarification: Clarification) -> str:
         flags = set(clarification.flags)
         if "external_api_contract_change" in flags:
+            if item.kind == "manual_intake":
+                return "Do any existing callers need compatibility shims before this change can ship?"
             return "Do any existing Anthropic wrappers need compatibility shims before this change can ship?"
         if "new_tool_permission" in flags:
             return "Do we need stricter tool-schema eval coverage before rollout?"
@@ -646,12 +810,14 @@ class Clarifier:
             return "What concrete product signal should move this item from watchlist to backlog?"
         if clarification.decision == "ignore":
             return "What would have to change for this item to become engineering-relevant?"
+        if item.kind == "manual_intake":
+            return f"Which internal surface should land '{item.title}' first?"
         return f"Which internal service should adopt '{item.title}' first?"
 
     @staticmethod
     def _factor_notes(flag: str, hits: list[str]) -> str:
         joined = ", ".join(hits[:3])
-        return f"Matched release-note terms for {flag}: {joined}."
+        return f"Matched source terms for {flag}: {joined}."
 
 
 @dataclass(slots=True)

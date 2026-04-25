@@ -481,7 +481,7 @@ def validate_policy_alignment(
                     check["name"]: check["status"]
                     for tier in eval_report["tiers"]
                     for check in tier["checks"]
-                    if check["status"] != "pending"
+                    if check["status"] not in {"pending", "deferred", "not_configured"}
                 }
                 for check in pr_packet["checks"]:
                     if check["name"] in status_by_name and check["status"] != status_by_name[check["name"]]:

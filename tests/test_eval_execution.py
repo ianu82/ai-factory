@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from auto_mindsdb_factory.contracts import load_validators, validation_errors_fo
 from auto_mindsdb_factory.controller import ControllerState
 from auto_mindsdb_factory.eval_common import deferred_tiers, merge_gate_tiers
 from auto_mindsdb_factory.eval_execution import (
+    CommandGateRunner,
     EvalExecutionConsistencyError,
     Stage5EvalPipeline,
 )
@@ -170,6 +172,82 @@ def test_stage5_eval_execution_surfaces_optional_eval_warnings_without_blocking_
     assert any(
         finding.startswith("Optional eval warnings in pre_merge:")
         for finding in result.pr_packet["reviewer_report"]["non_blocking_findings"]
+    )
+
+
+def test_stage5_command_gates_run_real_commands_and_defer_unconfigured_checks(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage4_result = stage4_active_result(root)
+    runner = CommandGateRunner(
+        root,
+        commands_by_kind={
+            "unit": [sys.executable, "-c", "raise SystemExit(0)"],
+            "contract": [sys.executable, "-c", "raise SystemExit(0)"],
+        },
+        required_kinds={"unit", "contract"},
+    )
+
+    result = Stage5EvalPipeline(root, gate_runner=runner).process(
+        stage4_result.spec_packet,
+        stage4_result.policy_decision,
+        stage4_result.ticket_bundle,
+        stage4_result.eval_manifest,
+        stage4_result.pr_packet,
+        stage4_result.prompt_contract,
+        stage4_result.tool_schema,
+        stage4_result.golden_dataset,
+        stage4_result.latency_baseline,
+        stage4_result.work_item,
+    )
+
+    summary = result.eval_report["summary"]
+    statuses = {
+        check["kind"]: check["status"]
+        for tier in result.eval_report["tiers"]
+        for check in tier["checks"]
+    }
+    assert summary["merge_gate_passed"] is True
+    assert statuses["unit"] == "passed"
+    assert statuses["contract"] == "passed"
+    assert "not_configured" in {
+        check["status"]
+        for tier in result.eval_report["tiers"]
+        for check in tier["checks"]
+        if check["kind"] in {"latency", "cost", "llm_quality", "integration"}
+    }
+    assert summary["not_configured_check_ids"]
+
+
+def test_stage5_command_gate_failure_returns_to_revision() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage4_result = stage4_active_result(root)
+    runner = CommandGateRunner(
+        root,
+        commands_by_kind={
+            "unit": [sys.executable, "-c", "raise SystemExit(7)"],
+            "contract": [sys.executable, "-c", "raise SystemExit(0)"],
+        },
+        required_kinds={"unit", "contract"},
+    )
+
+    result = Stage5EvalPipeline(root, gate_runner=runner).process(
+        stage4_result.spec_packet,
+        stage4_result.policy_decision,
+        stage4_result.ticket_bundle,
+        stage4_result.eval_manifest,
+        stage4_result.pr_packet,
+        stage4_result.prompt_contract,
+        stage4_result.tool_schema,
+        stage4_result.golden_dataset,
+        stage4_result.latency_baseline,
+        stage4_result.work_item,
+    )
+
+    assert result.eval_report["summary"]["merge_gate_passed"] is False
+    assert result.work_item.state is ControllerState.PR_REVISION
+    assert any(
+        finding.startswith("Eval gate failed")
+        for finding in result.pr_packet["reviewer_report"]["blocking_findings"]
     )
 
 

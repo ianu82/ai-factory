@@ -7,6 +7,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -54,6 +55,23 @@ class RunLeaseBusyError(LeaseBusyError):
 
 class StateLeaseBusyError(LeaseBusyError):
     """Raised when another automation worker already owns the automation-state lease."""
+
+
+class AutonomyMode(StrEnum):
+    SIMULATION_FULL = "simulation_full"
+    PR_READY = "pr_ready"
+
+    @classmethod
+    def from_value(cls, value: str | None) -> "AutonomyMode":
+        if value is None or not value.strip():
+            return cls.SIMULATION_FULL
+        try:
+            return cls(value.strip())
+        except ValueError as exc:
+            raise AutomationError(
+                "AI Factory autonomy mode must be one of: "
+                + ", ".join(mode.value for mode in cls)
+            ) from exc
 
 
 class ImmediateHandoffError(AutomationError):
@@ -978,6 +996,8 @@ class FactoryAutomationCoordinator:
         stage7_pipeline: Stage7ReleaseStagingPipeline | None = None,
         stage8_pipeline: Stage8ProductionMonitoringPipeline | None = None,
         stage9_pipeline: Stage9FeedbackSynthesisPipeline | None = None,
+        linear_workflow_sync: Any | None = None,
+        autonomy_mode: str | AutonomyMode | None = None,
     ) -> None:
         self.repo_root = repo_root(repo_root_override)
         self.store = FactoryRunStore(store_dir, repo_root_override=self.repo_root)
@@ -991,6 +1011,53 @@ class FactoryAutomationCoordinator:
         self.stage7_pipeline = stage7_pipeline or Stage7ReleaseStagingPipeline(self.repo_root)
         self.stage8_pipeline = stage8_pipeline or Stage8ProductionMonitoringPipeline(self.repo_root)
         self.stage9_pipeline = stage9_pipeline or Stage9FeedbackSynthesisPipeline(self.repo_root)
+        if isinstance(autonomy_mode, AutonomyMode):
+            self.autonomy_mode = autonomy_mode
+        else:
+            self.autonomy_mode = AutonomyMode.from_value(
+                autonomy_mode or os.environ.get("AI_FACTORY_AUTONOMY_MODE") or AutonomyMode.SIMULATION_FULL.value
+            )
+        if linear_workflow_sync is None:
+            from .linear_workflow import LinearWorkflowSync
+
+            self.linear_workflow_sync = LinearWorkflowSync.maybe_create(
+                store_dir,
+                repo_root_override=self.repo_root,
+            )
+        else:
+            self.linear_workflow_sync = linear_workflow_sync
+
+    def _sync_linear_stage_result(
+        self,
+        stage_name: str,
+        document: dict[str, Any],
+        *,
+        stall_reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        if self.linear_workflow_sync is None:
+            return None
+        return self.linear_workflow_sync.sync_stage_result(
+            stage_name,
+            document,
+            stall_reason=stall_reason,
+        )
+
+    def _sync_linear_candidate_stall(
+        self,
+        candidate: StoredRunCandidate,
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        from .linear_workflow import LinearWorkflowError
+
+        try:
+            return self._sync_linear_stage_result(
+                candidate.stage_name,
+                candidate.document,
+                stall_reason=reason,
+            )
+        except LinearWorkflowError:
+            return None
 
     def register_bundle(
         self,
@@ -1000,6 +1067,7 @@ class FactoryAutomationCoordinator:
         with self.store.state_transaction() as state:
             stored_path = self.store.save_stage_result(stage_name, document)
             self.store.apply_stage_result_to_state(state, stage_name, document)
+        self._sync_linear_stage_result(stage_name, document)
         return stored_path, state
 
     def run_supervisor_cycle(
@@ -1066,10 +1134,21 @@ class FactoryAutomationCoordinator:
     ) -> Stage1AutomationCycleResult:
         if max_new_items is not None and max_new_items < 1:
             raise AutomationError("max_new_items must be >= 1 when provided.")
+        if os.environ.get("AI_FACTORY_INTAKE_PAUSED", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return Stage1AutomationCycleResult(
+                detected_count=0,
+                created_results=[],
+                skipped_known_external_ids=[],
+                deferred_external_ids=[],
+                state=self.store.load_state(),
+                advance_immediately=advance_immediately,
+                handoff_results=[],
+            )
 
         scout = AnthropicScout(source_url=source_url)
         items = scout.list_items(html=html, detected_at=detected_at)
         created_results: list[dict[str, str]] = []
+        created_documents: list[tuple[str, dict[str, Any]]] = []
         handoff_results: list[dict[str, Any]] = []
         with self.store.state_transaction() as state:
             known_external_ids = set(state.seen_source_external_ids)
@@ -1093,9 +1172,13 @@ class FactoryAutomationCoordinator:
                         "stored_path": str(stored_path),
                     }
                 )
+                created_documents.append(("stage1", document))
 
             state.last_stage1_cycle_at = detected_at or utc_now()
             state.updated_at = utc_now()
+
+        for stage_name, document in created_documents:
+            self._sync_linear_stage_result(stage_name, document)
 
         if advance_immediately:
             for created in created_results:
@@ -1186,6 +1269,8 @@ class FactoryAutomationCoordinator:
         *,
         repository: str = "mindsdb/platform",
     ) -> ProgressionCycleResult:
+        from .linear_workflow import LinearWorkflowError
+
         processed_runs: list[ProgressionRunResult] = []
         skipped_runs: list[dict[str, str]] = []
 
@@ -1222,7 +1307,12 @@ class FactoryAutomationCoordinator:
                         MergeError,
                         ReleaseStagingError,
                         ProductionMonitoringError,
+                        LinearWorkflowError,
                     ) as exc:
+                        self._sync_linear_candidate_stall(
+                            candidate,
+                            reason=str(exc),
+                        )
                         skipped_runs.append(
                             {
                                 "work_item_id": candidate.work_item_id,
@@ -1233,11 +1323,16 @@ class FactoryAutomationCoordinator:
                         continue
 
                     if run_result is None:
+                        skip_reason = self._skip_reason(candidate)
+                        self._sync_linear_candidate_stall(
+                            candidate,
+                            reason=skip_reason,
+                        )
                         skipped_runs.append(
                             {
                                 "work_item_id": candidate.work_item_id,
                                 "stage_name": candidate.stage_name,
-                                "reason": self._skip_reason(candidate),
+                                "reason": skip_reason,
                             }
                         )
                         continue
@@ -1264,6 +1359,8 @@ class FactoryAutomationCoordinator:
         repository: str,
         feedback_window_days: int,
     ) -> ImmediateHandoffResult:
+        from .linear_workflow import LinearWorkflowError
+
         source_work_item = self.store.extract_work_item_document(candidate.document)
         try:
             run_result = self._advance_candidate(
@@ -1283,7 +1380,12 @@ class FactoryAutomationCoordinator:
             ReleaseStagingError,
             ProductionMonitoringError,
             FeedbackSynthesisError,
+            LinearWorkflowError,
         ) as exc:
+            self._sync_linear_candidate_stall(
+                candidate,
+                reason=str(exc),
+            )
             return ImmediateHandoffResult(
                 work_item_id=candidate.work_item_id,
                 source_stage=candidate.stage_name,
@@ -1293,12 +1395,17 @@ class FactoryAutomationCoordinator:
             )
 
         if run_result is None:
+            skip_reason = self._immediate_handoff_skip_reason(candidate)
+            self._sync_linear_candidate_stall(
+                candidate,
+                reason=skip_reason,
+            )
             return ImmediateHandoffResult(
                 work_item_id=candidate.work_item_id,
                 source_stage=candidate.stage_name,
                 source_state=source_work_item["state"],
                 status="skipped",
-                reason=self._immediate_handoff_skip_reason(candidate),
+                reason=skip_reason,
             )
 
         return ImmediateHandoffResult(
@@ -1356,6 +1463,11 @@ class FactoryAutomationCoordinator:
 
             next_stage, next_document, continue_allowed = next_step
             stored_path = self.store.save_stage_result(next_stage, next_document)
+            self._sync_linear_stage_result(
+                next_stage,
+                next_document,
+                stall_reason=self._post_stage_stall_reason(next_stage, next_document),
+            )
             stages_completed.append(next_stage)
             stored_paths[next_stage] = str(stored_path)
             current_stage = next_stage
@@ -1375,6 +1487,14 @@ class FactoryAutomationCoordinator:
             stages_completed=stages_completed,
             stored_paths=stored_paths,
         )
+
+    def _post_stage_stall_reason(self, stage_name: str, document: dict[str, Any]) -> str | None:
+        if self.autonomy_mode is not AutonomyMode.PR_READY:
+            return None
+        work_item = self.store.extract_work_item_document(document)
+        if stage_name == "stage6" and work_item["state"] == ControllerState.SECURITY_APPROVED.value:
+            return "pr_ready_for_human_merge_deploy"
+        return None
 
     def _advance_once(
         self,
@@ -1430,17 +1550,21 @@ class FactoryAutomationCoordinator:
             )
 
         if state is ControllerState.PR_REVIEWABLE:
-            if self._has_stage4_artifacts(current_document):
+            if self._has_stage4_artifacts(current_document) or not self.stage4_pipeline.integration_engineer.requires_integration(
+                current_document["spec_packet"],
+                current_document["ticket_bundle"],
+            ):
+                stage5_document = self._document_with_eval_support(current_document)
                 result = self.stage5_pipeline.process(
-                    current_document["spec_packet"],
-                    current_document["policy_decision"],
-                    current_document["ticket_bundle"],
-                    current_document["eval_manifest"],
-                    current_document["pr_packet"],
-                    current_document["prompt_contract"],
-                    current_document["tool_schema"],
-                    current_document["golden_dataset"],
-                    current_document["latency_baseline"],
+                    stage5_document["spec_packet"],
+                    stage5_document["policy_decision"],
+                    stage5_document["ticket_bundle"],
+                    stage5_document["eval_manifest"],
+                    stage5_document["pr_packet"],
+                    stage5_document["prompt_contract"],
+                    stage5_document["tool_schema"],
+                    stage5_document["golden_dataset"],
+                    stage5_document["latency_baseline"],
                     work_item,
                 )
                 return (
@@ -1448,12 +1572,6 @@ class FactoryAutomationCoordinator:
                     result.to_document(),
                     result.work_item.state is ControllerState.PR_MERGEABLE,
                 )
-
-            if not self.stage4_pipeline.integration_engineer.requires_integration(
-                current_document["spec_packet"],
-                current_document["ticket_bundle"],
-            ):
-                return None
 
             result = self.stage4_pipeline.process(
                 current_document["spec_packet"],
@@ -1482,10 +1600,13 @@ class FactoryAutomationCoordinator:
             return (
                 "stage6",
                 result.to_document(),
-                result.work_item.state is ControllerState.SECURITY_APPROVED,
+                result.work_item.state is ControllerState.SECURITY_APPROVED
+                and self.autonomy_mode is not AutonomyMode.PR_READY,
             )
 
         if state is ControllerState.SECURITY_APPROVED:
+            if self.autonomy_mode is AutonomyMode.PR_READY:
+                return None
             result = self.merge_pipeline.process(
                 current_document["spec_packet"],
                 current_document["policy_decision"],
@@ -1565,6 +1686,18 @@ class FactoryAutomationCoordinator:
             return ("stage9", result.to_document(), False)
 
         return None
+
+    def _document_with_eval_support(self, current_document: dict[str, Any]) -> dict[str, Any]:
+        if self._has_stage4_artifacts(current_document):
+            return current_document
+        artifacts = self.stage4_pipeline.build_eval_support_artifacts(
+            current_document["spec_packet"],
+            current_document["policy_decision"],
+            current_document["ticket_bundle"],
+            current_document["eval_manifest"],
+            current_document["pr_packet"],
+        )
+        return {**current_document, **artifacts}
 
     @staticmethod
     def _has_stage4_artifacts(document: dict[str, Any]) -> bool:
@@ -1685,6 +1818,8 @@ class FactoryAutomationCoordinator:
             return "awaiting_merge_signoff"
         if state is ControllerState.STAGING_SOAK:
             return "awaiting_release_signoff"
+        if state is ControllerState.SECURITY_APPROVED and self.autonomy_mode is AutonomyMode.PR_READY:
+            return "pr_ready_for_human_merge_deploy"
         if state is ControllerState.PRODUCTION_MONITORING and self._has_stage8_artifacts(current_document):
             if (
                 continue_into_feedback
@@ -1693,12 +1828,6 @@ class FactoryAutomationCoordinator:
             ):
                 return None
             return "already_in_production_monitoring"
-        if state is ControllerState.PR_REVIEWABLE and not self._has_stage4_artifacts(current_document):
-            if not self.stage4_pipeline.integration_engineer.requires_integration(
-                current_document["spec_packet"],
-                current_document["ticket_bundle"],
-            ):
-                return "non_model_touching_progression_not_supported"
         if state is ControllerState.PR_REVISION and current_stage != "stage3":
             return "awaiting_builder_follow_up"
         return None
@@ -1846,6 +1975,8 @@ class FactoryAutomationCoordinator:
         window_label: str | None = None,
         feedback_window_days: int = 7,
     ) -> WeeklyFeedbackAutomationCycleResult:
+        from .linear_workflow import LinearWorkflowError
+
         if feedback_window_days < 1:
             raise AutomationError("feedback_window_days must be >= 1.")
         window = window_label or weekly_window_label()
@@ -1919,7 +2050,11 @@ class FactoryAutomationCoordinator:
                                 feedback_report_id=feedback_report_id,
                                 feedback_window_days=feedback_window_days,
                             )
-                        except (ArtifactStoreError, FeedbackSynthesisError) as exc:
+                        except (ArtifactStoreError, FeedbackSynthesisError, LinearWorkflowError) as exc:
+                            self._sync_linear_candidate_stall(
+                                candidate,
+                                reason=str(exc),
+                            )
                             skipped_runs.append(
                                 {
                                     "work_item_id": candidate.work_item_id,
@@ -1931,6 +2066,7 @@ class FactoryAutomationCoordinator:
 
                         result_document = result.to_document()
                         stored_path = self.store.save_stage_result("stage9", result_document)
+                        self._sync_linear_stage_result("stage9", result_document)
                         self.store.apply_stage_result_to_state(
                             state,
                             "stage9",

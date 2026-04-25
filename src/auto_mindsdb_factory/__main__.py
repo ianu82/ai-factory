@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 from .automation import AutomationError, FactoryAutomationCoordinator, FactoryRunStore
 from .build_review import BuildReviewError, Stage3BuildReviewPipeline
-from .connectors import FactoryConnectorError
+from .connectors import (
+    FactoryConnectorError,
+    OpenAIResponsesAgentConfig,
+    OpenAIResponsesAgentConnector,
+)
 from .contracts import main as validate_contracts_main
 from .controller import FactoryController, WorkItem
 from .eval_execution import EvalExecutionError, Stage5EvalPipeline
@@ -17,12 +23,28 @@ from .feedback_synthesis import (
     Stage9FeedbackSynthesisPipeline,
 )
 from .integration import IntegrationError, Stage4IntegrationPipeline
-from .intake import AnthropicScout, IntakeError, Stage1IntakePipeline
+from .intake import AnthropicScout, IntakeError, Stage1IntakePipeline, build_manual_intake_item
+from .linear_trigger import (
+    LinearTriggerError,
+    LinearTriggerWorker,
+    serve_linear_webhooks,
+)
+from .linear_workflow import (
+    LinearWorkflowConfig,
+    LinearWorkflowError,
+    LinearWorkflowSync,
+)
 from .merge_orchestration import MergeError, StageMergePipeline
 from .policy import PolicyEngine
 from .production_monitoring import (
     ProductionMonitoringError,
     Stage8ProductionMonitoringPipeline,
+)
+from .production_runtime import (
+    FactoryDoctor,
+    FactoryWorker,
+    ProductionRuntimeConfig,
+    intake_paused,
 )
 from .release_staging import ReleaseStagingError, Stage7ReleaseStagingPipeline
 from .security_review import SecurityReviewError, Stage6SecurityReviewPipeline
@@ -33,6 +55,101 @@ from .vertical_slice import (
     VerticalSliceError,
     build_cockpit_summary,
 )
+
+_ENV_FILE_NAMES = (".env", ".env.local")
+_ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class EnvironmentSetupError(RuntimeError):
+    """Raised when repo-local environment files cannot be parsed safely."""
+
+
+def _argv_repo_root(argv: list[str] | None) -> Path | None:
+    if not argv:
+        return None
+    for index, argument in enumerate(argv):
+        if argument == "--repo-root":
+            if index + 1 >= len(argv):
+                return None
+            return Path(argv[index + 1]).expanduser().resolve()
+        if argument.startswith("--repo-root="):
+            return Path(argument.split("=", 1)[1]).expanduser().resolve()
+    return None
+
+
+def _env_search_roots(argv: list[str] | None) -> list[Path]:
+    roots = [Path.cwd().resolve()]
+    repo_root_override = _argv_repo_root(argv)
+    if repo_root_override is not None and repo_root_override not in roots:
+        roots.append(repo_root_override)
+    return roots
+
+
+def _decode_env_value(raw_value: str, *, path: Path, line_number: int) -> str:
+    if not raw_value:
+        return ""
+    if raw_value[0] not in {"'", '"'}:
+        return raw_value
+    quote = raw_value[0]
+    if len(raw_value) < 2 or raw_value[-1] != quote:
+        raise EnvironmentSetupError(
+            f"{path}:{line_number} has an unterminated quoted value."
+        )
+    inner = raw_value[1:-1]
+    if quote == "'":
+        return inner
+    try:
+        return bytes(inner, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError as exc:
+        raise EnvironmentSetupError(
+            f"{path}:{line_number} contains an invalid escape sequence."
+        ) from exc
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise EnvironmentSetupError(f"Could not read environment file {path}: {exc}") from exc
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        if "=" not in stripped:
+            raise EnvironmentSetupError(
+                f"{path}:{line_number} must use KEY=VALUE format."
+            )
+        name, raw_value = stripped.split("=", 1)
+        name = name.strip()
+        if not _ENV_NAME_PATTERN.fullmatch(name):
+            raise EnvironmentSetupError(
+                f"{path}:{line_number} has an invalid variable name '{name}'."
+            )
+        values[name] = _decode_env_value(raw_value.strip(), path=path, line_number=line_number)
+    return values
+
+
+def _load_local_env_files(argv: list[str] | None = None) -> list[Path]:
+    if os.environ.get("AI_FACTORY_SKIP_ENV_FILES") == "1":
+        return []
+
+    protected = set(os.environ)
+    loaded_paths: list[Path] = []
+    for root in _env_search_roots(argv):
+        for filename in _ENV_FILE_NAMES:
+            path = root / filename
+            if not path.is_file():
+                continue
+            for name, value in _parse_env_file(path).items():
+                if name in protected:
+                    continue
+                os.environ[name] = value
+            loaded_paths.append(path)
+    return loaded_paths
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -162,6 +279,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the repository root.",
     )
 
+    stage1_manual_parser = subparsers.add_parser(
+        "stage1-intake-manual",
+        help="Run the Stage 1 intake flow for a manually supplied issue or change request.",
+    )
+    stage1_manual_parser.add_argument(
+        "--title",
+        required=True,
+        help="Short title for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--body",
+        required=True,
+        help="Detailed body for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--url",
+        required=True,
+        help="Canonical URL for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--provider",
+        default="manual",
+        help="Provider label recorded on the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--external-id",
+        default=None,
+        help="Stable external id for the manual intake item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--published-at",
+        default=None,
+        help="Optional published timestamp or ISO date for the source item.",
+    )
+    stage1_manual_parser.add_argument(
+        "--detected-at",
+        default=None,
+        help="Override the detection timestamp.",
+    )
+    stage1_manual_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
     stage2_parser = subparsers.add_parser(
         "stage2-ticketing",
         help="Run the Stage 2 ticket/eval planning flow for an active-build item.",
@@ -196,6 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    _add_agent_args(stage2_parser)
 
     stage3_parser = subparsers.add_parser(
         "stage3-build-review",
@@ -254,6 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    _add_agent_args(stage3_parser)
 
     stage4_parser = subparsers.add_parser(
         "stage4-integration",
@@ -1016,6 +1181,108 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repository name to embed in generated PR packets when immediate handoff runs.",
     )
 
+    linear_webhook_parser = subparsers.add_parser(
+        "linear-webhook-server",
+        help="Serve the Linear issue webhook intake endpoint.",
+    )
+    linear_webhook_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where Linear trigger inbox and state are persisted.",
+    )
+    linear_webhook_parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host interface to bind the Linear webhook server.",
+    )
+    linear_webhook_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port to bind the Linear webhook server.",
+    )
+    linear_webhook_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
+    linear_cycle_parser = subparsers.add_parser(
+        "automation-linear-trigger-cycle",
+        help="Drain persisted Linear trigger events into Stage 1 manual intake and immediate handoff.",
+    )
+    linear_cycle_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        required=True,
+        help="Directory where Linear trigger state and automation runs are persisted.",
+    )
+    linear_cycle_parser.add_argument(
+        "--repository",
+        default="mindsdb/platform",
+        help="Repository name to embed in generated PR packets when automation advances work.",
+    )
+    linear_cycle_parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Limit how many queued Linear trigger events are processed in one cycle.",
+    )
+    linear_cycle_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
+    linear_stage_setup_parser = subparsers.add_parser(
+        "linear-ensure-stage-states",
+        aliases=["linear-stage-setup"],
+        help="Create or reuse the Linear workflow states that mirror Factory stages 1-9.",
+    )
+    linear_stage_setup_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where automation runs and Linear workflow bindings are persisted.",
+    )
+    linear_stage_setup_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+    linear_stage_setup_parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Verify that stage states exist instead of creating missing Linear workflow states.",
+    )
+
+    linear_sync_parser = subparsers.add_parser(
+        "automation-linear-sync-cycle",
+        help="Backfill or resync persisted factory runs into Linear workflow issues and stage states.",
+    )
+    linear_sync_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        required=True,
+        help="Directory where automation runs and Linear workflow bindings are persisted.",
+    )
+    linear_sync_parser.add_argument(
+        "--max-runs",
+        type=int,
+        default=None,
+        help="Limit how many persisted runs are synced in one pass.",
+    )
+    linear_sync_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
     automation_stage1_parser = subparsers.add_parser(
         "automation-stage1-cycle",
         help="Run the recurring Stage 1 scout/intake cycle and persist new work items.",
@@ -1085,6 +1352,101 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Override the repository root.",
+    )
+    automation_progress_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "simulation_full"),
+        help="How far autonomous progression is allowed to go.",
+    )
+
+    factory_worker_parser = subparsers.add_parser(
+        "factory-worker",
+        help="Run the production worker loop: drain Linear triggers, advance runs, and sync stages.",
+    )
+    factory_worker_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        required=True,
+        help="Directory where automation state and run bundles are persisted.",
+    )
+    factory_worker_parser.add_argument(
+        "--repository",
+        default="ianu82/ai-factory",
+        help="GitHub repository that receives factory implementation PRs.",
+    )
+    factory_worker_parser.add_argument(
+        "--base-branch",
+        default="main",
+        help="Base branch for factory implementation PRs.",
+    )
+    factory_worker_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+    factory_worker_parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=30.0,
+        help="Delay between worker cycles when not using --once.",
+    )
+    factory_worker_parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Limit how many queued Linear trigger events are processed in one cycle.",
+    )
+    factory_worker_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run exactly one worker cycle and exit.",
+    )
+    factory_worker_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Run at most this many cycles and exit.",
+    )
+    factory_worker_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "pr_ready"),
+        help="Production defaults to pr_ready, which stops before merge/deploy.",
+    )
+
+    factory_doctor_parser = subparsers.add_parser(
+        "factory-doctor",
+        help="Validate production runtime configuration and local dependencies.",
+    )
+    factory_doctor_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where automation state and run bundles are persisted.",
+    )
+    factory_doctor_parser.add_argument(
+        "--repository",
+        default="ianu82/ai-factory",
+        help="GitHub repository used by the production factory.",
+    )
+    factory_doctor_parser.add_argument(
+        "--base-branch",
+        default="main",
+        help="Base branch for factory implementation PRs.",
+    )
+    factory_doctor_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+    factory_doctor_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "pr_ready"),
+        help="Runtime autonomy mode to validate.",
     )
 
     automation_stage9_parser = subparsers.add_parser(
@@ -1234,6 +1596,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    _add_agent_args(vertical_slice_parser)
 
     cockpit_parser = subparsers.add_parser(
         "factory-cockpit",
@@ -1257,6 +1620,68 @@ def build_parser() -> argparse.ArgumentParser:
 
 class CommandInputError(RuntimeError):
     """Raised when a CLI artifact or input file cannot be loaded safely."""
+
+
+def _add_agent_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--agent-provider",
+        choices=["none", "openai"],
+        default=os.environ.get("AI_FACTORY_AGENT_PROVIDER", "none"),
+        help="Optional live agent provider for judgment-heavy drafting steps.",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="Override the OpenAI model id. Defaults to AI_FACTORY_OPENAI_MODEL or gpt-5.4.",
+    )
+    parser.add_argument(
+        "--agent-fallback-model",
+        default=None,
+        help="Optional fallback OpenAI model id if the primary model request fails.",
+    )
+    parser.add_argument(
+        "--agent-reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+        default=None,
+        help="Override OpenAI reasoning effort. Defaults to AI_FACTORY_OPENAI_REASONING_EFFORT or medium.",
+    )
+    parser.add_argument(
+        "--agent-max-output-tokens",
+        type=int,
+        default=None,
+        help="Override OpenAI max_output_tokens for agent tasks.",
+    )
+    parser.add_argument(
+        "--agent-timeout-seconds",
+        type=int,
+        default=None,
+        help="Override the OpenAI request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--agent-base-url",
+        default=None,
+        help="Override the OpenAI Responses API base URL.",
+    )
+
+
+def _build_agent_connector(args: argparse.Namespace):
+    provider = getattr(args, "agent_provider", "none")
+    if provider == "none":
+        return None
+    if provider != "openai":
+        raise CommandInputError(f"Unsupported agent provider: {provider}")
+    try:
+        config = OpenAIResponsesAgentConfig.from_env(
+            model=args.agent_model,
+            fallback_model=args.agent_fallback_model,
+            reasoning_effort=args.agent_reasoning_effort,
+            max_output_tokens=args.agent_max_output_tokens,
+            timeout_seconds=args.agent_timeout_seconds,
+            base_url=args.agent_base_url,
+        )
+        return OpenAIResponsesAgentConnector(config)
+    except FactoryConnectorError as exc:
+        raise CommandInputError(f"Could not initialize the OpenAI agent connector: {exc}") from exc
 
 
 def _read_text_file(path: Path, label: str) -> str:
@@ -1586,6 +2011,12 @@ def _parse_metric_overrides(values: list[str]) -> dict[str, float | int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        _load_local_env_files(argv)
+    except EnvironmentSetupError as exc:
+        print(f"Environment setup failed: {exc}", file=sys.stderr)
+        return 1
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1639,7 +2070,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root_override=args.repo_root,
             )
             stored_path, state = coordinator.register_bundle(args.stage, document)
-        except (AutomationError, CommandInputError) as exc:
+        except (AutomationError, LinearWorkflowError, CommandInputError) as exc:
             print(f"Automation bundle registration failed: {exc}", file=sys.stderr)
             return 1
         handoff = None
@@ -1671,6 +2102,121 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "linear-webhook-server":
+        try:
+            serve_linear_webhooks(
+                store_dir=args.store_dir,
+                host=args.host,
+                port=args.port,
+                repo_root_override=args.repo_root,
+            )
+        except (LinearTriggerError, OSError) as exc:
+            print(f"Linear webhook server failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "automation-linear-trigger-cycle":
+        if intake_paused():
+            print(
+                json.dumps(
+                    {
+                        "cycle": "linear-trigger",
+                        "status": "skipped",
+                        "reason": "intake_paused",
+                        "processed_events": [],
+                        "skipped_events": [],
+                        "failed_events": [],
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        try:
+            worker = LinearTriggerWorker(
+                args.store_dir,
+                repo_root_override=args.repo_root,
+            )
+            result = worker.run_cycle(
+                repository=args.repository,
+                max_events=args.max_events,
+            )
+        except (LinearTriggerError, LinearWorkflowError, AutomationError, IntakeError) as exc:
+            print(f"Linear trigger cycle failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result.to_document(), indent=2))
+        if result.failed_events:
+            print(
+                "Linear trigger cycle recorded failures: "
+                f"{result.failed_events[0].get('reason', 'unknown error')}",
+                file=sys.stderr,
+            )
+            return 1
+        failed_handoffs = result.failed_handoffs()
+        if failed_handoffs:
+            print(
+                "Linear trigger handoff failed: "
+                f"{failed_handoffs[0]['handoff'].get('reason', 'unknown handoff error')}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
+    if args.command in {"linear-ensure-stage-states", "linear-stage-setup"}:
+        try:
+            config = None
+            if args.verify_only:
+                config = LinearWorkflowConfig.maybe_from_env()
+                if config is None:
+                    raise LinearWorkflowError(
+                        "LINEAR_API_KEY and LINEAR_TARGET_TEAM_ID are required for workflow sync."
+                    )
+                config.create_missing_states = False
+            if config is None:
+                sync = LinearWorkflowSync(
+                    args.store_dir,
+                    repo_root_override=args.repo_root,
+                )
+            else:
+                sync = LinearWorkflowSync(
+                    args.store_dir,
+                    repo_root_override=args.repo_root,
+                    config=config,
+                )
+            stage_states = sync.ensure_stage_states()
+        except LinearWorkflowError as exc:
+            print(f"Linear stage setup failed: {exc}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "cycle": "linear-stage-setup",
+                    "stage_states": stage_states,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "automation-linear-sync-cycle":
+        try:
+            sync = LinearWorkflowSync(
+                args.store_dir,
+                repo_root_override=args.repo_root,
+            )
+            result = sync.sync_existing_runs(max_runs=args.max_runs)
+        except LinearWorkflowError as exc:
+            print(f"Linear sync cycle failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result.to_document(), indent=2))
+        if result.failed_runs:
+            print(
+                "Linear sync cycle recorded failures: "
+                f"{result.failed_runs[0].get('reason', 'unknown error')}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
     if args.command == "automation-stage1-cycle":
         try:
             html = _read_text_file(args.html_file, "HTML source") if args.html_file is not None else None
@@ -1687,7 +2233,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise_on_failed_handoff=False,
                 repository=args.repository,
             )
-        except (AutomationError, IntakeError, CommandInputError) as exc:
+        except (AutomationError, LinearWorkflowError, IntakeError, CommandInputError) as exc:
             print(f"Automation Stage 1 cycle failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
@@ -1707,6 +2253,7 @@ def main(argv: list[str] | None = None) -> int:
             coordinator = FactoryAutomationCoordinator(
                 args.store_dir,
                 repo_root_override=args.repo_root,
+                autonomy_mode=args.autonomy_mode,
             )
             result = coordinator.run_progression_cycle(
                 repository=args.repository,
@@ -1720,11 +2267,62 @@ def main(argv: list[str] | None = None) -> int:
             SecurityReviewError,
             ReleaseStagingError,
             ProductionMonitoringError,
+            LinearWorkflowError,
         ) as exc:
             print(f"Automation progression failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
         return 0
+
+    if args.command == "factory-worker":
+        if args.interval_seconds <= 0:
+            parser.error("--interval-seconds must be > 0")
+        if args.max_cycles is not None and args.max_cycles < 1:
+            parser.error("--max-cycles must be >= 1")
+        if args.max_events is not None and args.max_events < 1:
+            parser.error("--max-events must be >= 1")
+        try:
+            config = ProductionRuntimeConfig.from_env(
+                store_dir=args.store_dir,
+                repo_root=args.repo_root or Path.cwd(),
+                repository=args.repository,
+                base_branch=args.base_branch,
+                interval_seconds=args.interval_seconds,
+                max_events_per_cycle=args.max_events,
+                autonomy_mode=args.autonomy_mode,
+            )
+            result = FactoryWorker(config).run(once=args.once, max_cycles=args.max_cycles)
+        except (
+            AutomationError,
+            BuildReviewError,
+            EvalExecutionError,
+            FactoryConnectorError,
+            IntakeError,
+            LinearTriggerError,
+            LinearWorkflowError,
+            TicketingError,
+            OSError,
+        ) as exc:
+            print(f"Factory worker failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "factory-doctor":
+        try:
+            config = ProductionRuntimeConfig.from_env(
+                store_dir=args.store_dir,
+                repo_root=args.repo_root or Path.cwd(),
+                repository=args.repository,
+                base_branch=args.base_branch,
+                autonomy_mode=args.autonomy_mode,
+            )
+            result = FactoryDoctor(config).run()
+        except (AutomationError, OSError) as exc:
+            print(f"Factory doctor failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if result["status"] == "passed" else 1
 
     if args.command == "automation-supervisor-cycle":
         if args.feedback_window_days < 1:
@@ -1757,6 +2355,7 @@ def main(argv: list[str] | None = None) -> int:
             SecurityReviewError,
             ReleaseStagingError,
             ProductionMonitoringError,
+            LinearWorkflowError,
             CommandInputError,
         ) as exc:
             print(f"Automation supervisor cycle failed: {exc}", file=sys.stderr)
@@ -1785,7 +2384,7 @@ def main(argv: list[str] | None = None) -> int:
                 window_label=args.window_label,
                 feedback_window_days=args.feedback_window_days,
             )
-        except (AutomationError, FeedbackSynthesisError) as exc:
+        except (AutomationError, FeedbackSynthesisError, LinearWorkflowError) as exc:
             print(f"Automation weekly feedback failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
@@ -1806,9 +2405,14 @@ def main(argv: list[str] | None = None) -> int:
             feedback_window_days=args.feedback_window_days,
         )
         try:
-            result = FactoryVerticalSliceRunner(config).run()
+            agent_connector = _build_agent_connector(args)
+            result = FactoryVerticalSliceRunner(
+                config,
+                agent_connector=agent_connector,
+            ).run()
         except (
             BuildReviewError,
+            CommandInputError,
             EvalExecutionError,
             FactoryConnectorError,
             FeedbackSynthesisError,
@@ -1861,6 +2465,25 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.to_document(), indent=2))
         return 0
 
+    if args.command == "stage1-intake-manual":
+        item = build_manual_intake_item(
+            title=args.title,
+            body=args.body,
+            url=args.url,
+            provider=args.provider,
+            external_id=args.external_id,
+            detected_at=args.detected_at,
+            published_at=args.published_at,
+        )
+        pipeline = Stage1IntakePipeline(args.repo_root)
+        try:
+            result = pipeline.process_item(item)
+        except IntakeError as exc:
+            print(f"Stage 1 manual intake failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result.to_document(), indent=2))
+        return 0
+
     if args.command == "stage2-ticketing":
         try:
             if args.stage1_result_file is not None:
@@ -1886,7 +2509,11 @@ def main(argv: list[str] | None = None) -> int:
                 policy_decision = _read_json_object(args.policy_decision_file, "policy-decision")
                 work_item_document = _read_json_object(args.work_item_file, "work-item")
 
-            pipeline = Stage2TicketingPipeline(args.repo_root)
+            agent_connector = _build_agent_connector(args)
+            pipeline = Stage2TicketingPipeline(
+                args.repo_root,
+                agent_connector=agent_connector,
+            )
             result = pipeline.process(
                 spec_packet,
                 policy_decision,
@@ -1932,7 +2559,11 @@ def main(argv: list[str] | None = None) -> int:
                 eval_manifest = _read_json_object(args.eval_manifest_file, "eval-manifest")
                 work_item_document = _read_json_object(args.work_item_file, "work-item")
 
-            pipeline = Stage3BuildReviewPipeline(args.repo_root)
+            agent_connector = _build_agent_connector(args)
+            pipeline = Stage3BuildReviewPipeline(
+                args.repo_root,
+                agent_connector=agent_connector,
+            )
             result = pipeline.process(
                 spec_packet,
                 policy_decision,
