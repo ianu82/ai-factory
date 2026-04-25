@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from .automation import AutonomyMode, FactoryAutomationCoordinator
 from .build_review import Stage3BuildReviewPipeline
@@ -77,6 +78,7 @@ class FactoryDoctor:
         "LINEAR_WEBHOOK_SECRET",
         "AI_FACTORY_PUBLIC_BASE_URL",
     )
+    UUID_ENV = frozenset({"LINEAR_TARGET_TEAM_ID", "LINEAR_TARGET_STATE_ID"})
 
     def __init__(self, config: ProductionRuntimeConfig) -> None:
         self.config = config
@@ -107,10 +109,22 @@ class FactoryDoctor:
 
     @staticmethod
     def _env_check(name: str) -> dict[str, str]:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            return {"name": f"env:{name}", "status": "failed", "summary": "missing"}
+        if name in FactoryDoctor.UUID_ENV:
+            try:
+                UUID(value)
+            except ValueError:
+                return {
+                    "name": f"env:{name}",
+                    "status": "failed",
+                    "summary": "must be a UUID",
+                }
         return {
             "name": f"env:{name}",
-            "status": "passed" if os.environ.get(name, "").strip() else "failed",
-            "summary": "set" if os.environ.get(name, "").strip() else "missing",
+            "status": "passed",
+            "summary": "set",
         }
 
     def _command_check(self, name: str, command: list[str]) -> dict[str, str]:
