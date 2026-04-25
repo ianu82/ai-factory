@@ -17,8 +17,19 @@ from auto_mindsdb_factory.automation import (
     RunLeaseBusyError,
     StateLeaseBusyError,
 )
+from auto_mindsdb_factory.build_review import Stage3BuildReviewPipeline
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import FactoryController
+from auto_mindsdb_factory.intake import Stage1IntakePipeline, build_manual_intake_item
+from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
+
+
+@pytest.fixture(autouse=True)
+def _disable_linear_workflow_sync(monkeypatch) -> None:
+    monkeypatch.setenv("LINEAR_FACTORY_SYNC_DISABLED", "1")
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("LINEAR_TARGET_TEAM_ID", raising=False)
+    monkeypatch.delenv("LINEAR_TARGET_STATE_ID", raising=False)
 
 
 def _load_json(path: Path) -> dict:
@@ -76,6 +87,27 @@ def load_stage4_result_document(root: Path, scenario_name: str) -> dict:
     }
 
 
+class FakeLinearWorkflowSync:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def sync_stage_result(
+        self,
+        stage_name: str,
+        document: dict,
+        *,
+        stall_reason: str | None = None,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "stage_name": stage_name,
+                "work_item_id": document["work_item"]["work_item_id"],
+                "stall_reason": stall_reason,
+            }
+        )
+        return {"status": "synced"}
+
+
 def test_automation_stage1_cycle_persists_new_items(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
@@ -129,6 +161,94 @@ def test_automation_stage1_cycle_can_advance_immediately(tmp_path) -> None:
     assert handoff["final_stage"] == "stage8"
     assert handoff["final_state"] == "PRODUCTION_MONITORING"
     assert Path(handoff["stored_paths"]["stage8"]).exists()
+
+
+def test_automation_register_bundle_syncs_linear_stage_result(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. Acceptance criteria: - keep the "
+            "output compact - add a clear health field - cover it with tests"
+        ),
+    )
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+    )
+
+    coordinator.register_bundle("stage1", stage1_result.to_document())
+
+    assert fake_sync.calls == [
+        {
+            "stage_name": "stage1",
+            "work_item_id": stage1_result.work_item.work_item_id,
+            "stall_reason": None,
+        }
+    ]
+
+
+def test_automation_progression_skip_syncs_linear_stall_reason(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    item = build_manual_intake_item(
+        provider="github",
+        external_id="github-issue-2",
+        title="Factory cockpit should surface GitHub check conclusions and eval status",
+        url="https://github.com/ianu82/ai-factory/issues/2",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit should surface GitHub pull request check conclusions, local eval "
+            "status, and a clear health summary for each work item. This is a control-plane API and "
+            "JSON schema change for the cockpit command, not a model-runtime change. Acceptance criteria: "
+            "- include check conclusions - keep the schema compatibility-safe - cover it with tests"
+        ),
+    )
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+    )
+    coordinator.register_bundle("stage3", stage3_result.to_document())
+
+    result = coordinator.run_progression_cycle()
+
+    assert result.processed_runs == []
+    assert result.skipped_runs == [
+        {
+            "work_item_id": stage3_result.work_item.work_item_id,
+            "stage_name": "stage3",
+            "reason": "non_model_touching_progression_not_supported",
+        }
+    ]
+    assert fake_sync.calls[-1] == {
+        "stage_name": "stage3",
+        "work_item_id": stage3_result.work_item.work_item_id,
+        "stall_reason": "non_model_touching_progression_not_supported",
+    }
 
 
 def test_automation_progression_cycle_advances_active_build_run_to_stage8(tmp_path) -> None:

@@ -324,6 +324,7 @@ class Builder:
         if source.get("kind") == "manual_intake" and source.get("provider") in {
             "github",
             "internal",
+            "linear",
             "manual",
         }:
             return cls.FACTORY_PATH_HINTS.get(surface, cls.PATH_HINTS.get(surface, []))

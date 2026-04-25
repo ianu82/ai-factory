@@ -78,6 +78,31 @@ def stage2_manual_issue_result(root: Path):
     )
 
 
+def stage2_linear_issue_result(root: Path):
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear-issue-2",
+        title="Factory API should surface Linear intake status in the cockpit",
+        url="https://linear.app/example/issue/ENG-123/factory-intake",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit API should surface Linear-triggered factory runs and their status. "
+            "This is a control-plane API and response format change for the cockpit command, not a "
+            "model-runtime change. Acceptance criteria: - include the latest Linear-triggered run "
+            "status in the cockpit JSON output - show whether Stage 1 accepted or rejected the issue "
+            "in the response format - keep the response schema compatibility-safe for existing callers "
+            "- cover the output with CLI tests"
+        ),
+    )
+    stage1_result = Stage1IntakePipeline(root).process_item(item)
+    return Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+
 def test_stage3_build_review_emits_valid_pr_packet() -> None:
     root = Path(__file__).resolve().parents[1]
     validators = load_validators(root)
@@ -138,6 +163,29 @@ def test_stage3_build_review_can_return_to_pr_revision() -> None:
 def test_stage3_build_review_uses_factory_paths_for_manual_github_issues() -> None:
     root = Path(__file__).resolve().parents[1]
     stage2_result = stage2_manual_issue_result(root)
+
+    result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+        repository="ianu82/ai-factory",
+    )
+
+    assert "src/auto_mindsdb_factory/__main__.py" in result.pr_packet["changed_paths"]
+    assert "tests/test_cli.py" in result.pr_packet["changed_paths"]
+    assert "src/auto_mindsdb_factory/vertical_slice.py" in result.pr_packet["changed_paths"]
+    assert "tests/test_vertical_slice.py" in result.pr_packet["changed_paths"]
+    assert not any(
+        path.startswith("integrations/anthropic/")
+        for path in result.pr_packet["changed_paths"]
+    )
+
+
+def test_stage3_build_review_uses_factory_paths_for_manual_linear_issues() -> None:
+    root = Path(__file__).resolve().parents[1]
+    stage2_result = stage2_linear_issue_result(root)
 
     result = Stage3BuildReviewPipeline(root).process(
         stage2_result.spec_packet,

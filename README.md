@@ -57,6 +57,8 @@ The first recurring automation layer is now executable through a persisted run s
 - `uv run auto-mindsdb-factory automation-register-bundle --stage stage1 --result-file stage1-result.json --store-dir .factory-automation --advance-immediately`
 - `uv run auto-mindsdb-factory automation-register-bundle --stage merge --result-file merge-result.json --store-dir .factory-automation --advance-immediately`
 - `uv run auto-mindsdb-factory automation-stage1-cycle --store-dir .factory-automation --html-file fixtures/intake/anthropic-release-notes-sample.html --advance-immediately`
+- `uv run auto-mindsdb-factory linear-webhook-server --store-dir .factory-automation --host 0.0.0.0 --port 8080`
+- `uv run auto-mindsdb-factory automation-linear-trigger-cycle --store-dir .factory-automation --repository ianu82/ai-factory`
 - `uv run auto-mindsdb-factory automation-advance-runs --store-dir .factory-automation`
 - `uv run auto-mindsdb-factory automation-weekly-feedback --store-dir .factory-automation --window-label 2026-W17`
 - `uv run auto-mindsdb-factory automation-supervisor-cycle --store-dir .factory-automation --html-file fixtures/intake/anthropic-release-notes-sample.html --run-weekly-feedback --window-label 2026-W17`
@@ -95,6 +97,44 @@ Run the full vertical slice with a live OpenAI agent:
 - `uv run auto-mindsdb-factory factory-vertical-slice --agent-provider openai --store-dir .factory-automation --repository ianu82/ai-factory`
 
 If `OPENAI_API_KEY` is missing, the CLI fails fast with a friendly initialization error before the run starts.
+
+## Linear Factory Intake Trigger
+
+The factory can now accept Linear issues through a dedicated `Factory Intake` workflow state and hand them into Stage 1 manual intake.
+
+Set the Linear trigger environment in `.env` or `.env.local`:
+
+- `LINEAR_WEBHOOK_SECRET`
+- `LINEAR_API_KEY`
+- `LINEAR_TARGET_TEAM_ID`
+- `LINEAR_TARGET_STATE_ID`
+- Optional: `LINEAR_COMMENT_ON_ACCEPT=true`
+- Optional: `LINEAR_COMMENT_ON_REJECT=true`
+- Optional: `LINEAR_FACTORY_CREATE_STATES=true`
+- Optional: `LINEAR_FACTORY_SYNC_DISABLED=false`
+- Optional: `FACTORY_TRIGGER_BASE_URL`
+
+Run the webhook receiver and the drain worker as separate processes:
+
+- `uv run auto-mindsdb-factory linear-webhook-server --store-dir .factory-automation --host 0.0.0.0 --port 8080`
+- `uv run auto-mindsdb-factory automation-linear-trigger-cycle --store-dir .factory-automation --repository ianu82/ai-factory`
+
+Set up the Linear stage workflow and backfill existing factory runs:
+
+- `uv run auto-mindsdb-factory linear-ensure-stage-states --store-dir .factory-automation`
+- `uv run auto-mindsdb-factory automation-linear-sync-cycle --store-dir .factory-automation`
+
+Practical setup notes:
+
+- Configure the Linear webhook to send only `Issues` events. Extra event types are harmless because the receiver ignores them, but they create noise.
+- Point Linear at a public `https://.../hooks/linear` URL. The built-in server is the local receiver; in practice you usually place it behind a reverse proxy or HTTPS tunnel.
+- The receiver only verifies, filters, and persists the event. The worker is the process that actually turns the issue into a Stage 1 run and kicks off immediate handoff.
+- `automation-linear-trigger-cycle` is a one-shot drain pass, not a daemon. Run it from cron, systemd, or another heartbeat loop if you want near-real-time processing.
+- Keep `LINEAR_TARGET_STATE_ID` pointed at your trigger queue state, for example `New Feature`. The factory creates and manages separate `Stage 1 ... Stage 9` workflow states for in-flight factory work.
+- If a run starts from a Linear issue, the factory reuses that issue and moves it forward. If a run starts elsewhere, the factory creates a new Linear issue once the work becomes an active build candidate.
+- When the factory cannot advance automatically, it keeps the issue in the current stage and writes a short explanatory comment for a human reviewer.
+
+Incoming webhook envelopes are persisted under `.factory-automation/linear-trigger-inbox/`, and dedupe state lives in `.factory-automation/linear-trigger-state.json`.
 
 ## Repository Layout
 

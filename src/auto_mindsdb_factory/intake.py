@@ -739,6 +739,8 @@ class Clarifier:
         if item.kind == "manual_intake":
             if item.provider == "github":
                 return "GitHub issue"
+            if item.provider == "linear":
+                return "Linear issue"
             return "Manual intake"
         if item.provider == "anthropic" and item.kind == "release_note":
             return "Anthropic release note"
@@ -756,6 +758,8 @@ class Clarifier:
             return "Stage 1 reasoning is based on the public Anthropic release note plus local factory policy."
         if item.provider == "github" and item.kind == "manual_intake":
             return "Stage 1 reasoning is based on the manually submitted GitHub issue plus local factory policy."
+        if item.provider == "linear" and item.kind == "manual_intake":
+            return "Stage 1 reasoning is based on the manually submitted Linear issue plus local factory policy."
         if item.kind == "manual_intake":
             return "Stage 1 reasoning is based on the manually submitted source item plus local factory policy."
         return (

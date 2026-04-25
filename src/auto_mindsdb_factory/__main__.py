@@ -24,6 +24,15 @@ from .feedback_synthesis import (
 )
 from .integration import IntegrationError, Stage4IntegrationPipeline
 from .intake import AnthropicScout, IntakeError, Stage1IntakePipeline, build_manual_intake_item
+from .linear_trigger import (
+    LinearTriggerError,
+    LinearTriggerWorker,
+    serve_linear_webhooks,
+)
+from .linear_workflow import (
+    LinearWorkflowError,
+    LinearWorkflowSync,
+)
 from .merge_orchestration import MergeError, StageMergePipeline
 from .policy import PolicyEngine
 from .production_monitoring import (
@@ -1165,6 +1174,102 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repository name to embed in generated PR packets when immediate handoff runs.",
     )
 
+    linear_webhook_parser = subparsers.add_parser(
+        "linear-webhook-server",
+        help="Serve the Linear issue webhook intake endpoint.",
+    )
+    linear_webhook_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where Linear trigger inbox and state are persisted.",
+    )
+    linear_webhook_parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host interface to bind the Linear webhook server.",
+    )
+    linear_webhook_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port to bind the Linear webhook server.",
+    )
+    linear_webhook_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
+    linear_cycle_parser = subparsers.add_parser(
+        "automation-linear-trigger-cycle",
+        help="Drain persisted Linear trigger events into Stage 1 manual intake and immediate handoff.",
+    )
+    linear_cycle_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        required=True,
+        help="Directory where Linear trigger state and automation runs are persisted.",
+    )
+    linear_cycle_parser.add_argument(
+        "--repository",
+        default="mindsdb/platform",
+        help="Repository name to embed in generated PR packets when automation advances work.",
+    )
+    linear_cycle_parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Limit how many queued Linear trigger events are processed in one cycle.",
+    )
+    linear_cycle_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
+    linear_stage_setup_parser = subparsers.add_parser(
+        "linear-ensure-stage-states",
+        help="Create or reuse the Linear workflow states that mirror Factory stages 1-9.",
+    )
+    linear_stage_setup_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".factory-automation"),
+        help="Directory where automation runs and Linear workflow bindings are persisted.",
+    )
+    linear_stage_setup_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
+    linear_sync_parser = subparsers.add_parser(
+        "automation-linear-sync-cycle",
+        help="Backfill or resync persisted factory runs into Linear workflow issues and stage states.",
+    )
+    linear_sync_parser.add_argument(
+        "--store-dir",
+        type=Path,
+        required=True,
+        help="Directory where automation runs and Linear workflow bindings are persisted.",
+    )
+    linear_sync_parser.add_argument(
+        "--max-runs",
+        type=int,
+        default=None,
+        help="Limit how many persisted runs are synced in one pass.",
+    )
+    linear_sync_parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Override the repository root.",
+    )
+
     automation_stage1_parser = subparsers.add_parser(
         "automation-stage1-cycle",
         help="Run the recurring Stage 1 scout/intake cycle and persist new work items.",
@@ -1857,7 +1962,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root_override=args.repo_root,
             )
             stored_path, state = coordinator.register_bundle(args.stage, document)
-        except (AutomationError, CommandInputError) as exc:
+        except (AutomationError, LinearWorkflowError, CommandInputError) as exc:
             print(f"Automation bundle registration failed: {exc}", file=sys.stderr)
             return 1
         handoff = None
@@ -1889,6 +1994,91 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "linear-webhook-server":
+        try:
+            serve_linear_webhooks(
+                store_dir=args.store_dir,
+                host=args.host,
+                port=args.port,
+                repo_root_override=args.repo_root,
+            )
+        except (LinearTriggerError, OSError) as exc:
+            print(f"Linear webhook server failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "automation-linear-trigger-cycle":
+        try:
+            worker = LinearTriggerWorker(
+                args.store_dir,
+                repo_root_override=args.repo_root,
+            )
+            result = worker.run_cycle(
+                repository=args.repository,
+                max_events=args.max_events,
+            )
+        except (LinearTriggerError, LinearWorkflowError, AutomationError, IntakeError) as exc:
+            print(f"Linear trigger cycle failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result.to_document(), indent=2))
+        if result.failed_events:
+            print(
+                "Linear trigger cycle recorded failures: "
+                f"{result.failed_events[0].get('reason', 'unknown error')}",
+                file=sys.stderr,
+            )
+            return 1
+        failed_handoffs = result.failed_handoffs()
+        if failed_handoffs:
+            print(
+                "Linear trigger handoff failed: "
+                f"{failed_handoffs[0]['handoff'].get('reason', 'unknown handoff error')}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
+    if args.command == "linear-ensure-stage-states":
+        try:
+            sync = LinearWorkflowSync(
+                args.store_dir,
+                repo_root_override=args.repo_root,
+            )
+            stage_states = sync.ensure_stage_states()
+        except LinearWorkflowError as exc:
+            print(f"Linear stage setup failed: {exc}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "cycle": "linear-stage-setup",
+                    "stage_states": stage_states,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "automation-linear-sync-cycle":
+        try:
+            sync = LinearWorkflowSync(
+                args.store_dir,
+                repo_root_override=args.repo_root,
+            )
+            result = sync.sync_existing_runs(max_runs=args.max_runs)
+        except LinearWorkflowError as exc:
+            print(f"Linear sync cycle failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result.to_document(), indent=2))
+        if result.failed_runs:
+            print(
+                "Linear sync cycle recorded failures: "
+                f"{result.failed_runs[0].get('reason', 'unknown error')}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
     if args.command == "automation-stage1-cycle":
         try:
             html = _read_text_file(args.html_file, "HTML source") if args.html_file is not None else None
@@ -1905,7 +2095,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise_on_failed_handoff=False,
                 repository=args.repository,
             )
-        except (AutomationError, IntakeError, CommandInputError) as exc:
+        except (AutomationError, LinearWorkflowError, IntakeError, CommandInputError) as exc:
             print(f"Automation Stage 1 cycle failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
@@ -1938,6 +2128,7 @@ def main(argv: list[str] | None = None) -> int:
             SecurityReviewError,
             ReleaseStagingError,
             ProductionMonitoringError,
+            LinearWorkflowError,
         ) as exc:
             print(f"Automation progression failed: {exc}", file=sys.stderr)
             return 1
@@ -1975,6 +2166,7 @@ def main(argv: list[str] | None = None) -> int:
             SecurityReviewError,
             ReleaseStagingError,
             ProductionMonitoringError,
+            LinearWorkflowError,
             CommandInputError,
         ) as exc:
             print(f"Automation supervisor cycle failed: {exc}", file=sys.stderr)
@@ -2003,7 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
                 window_label=args.window_label,
                 feedback_window_days=args.feedback_window_days,
             )
-        except (AutomationError, FeedbackSynthesisError) as exc:
+        except (AutomationError, FeedbackSynthesisError, LinearWorkflowError) as exc:
             print(f"Automation weekly feedback failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))

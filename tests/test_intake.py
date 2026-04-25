@@ -135,6 +135,38 @@ def test_stage1_manual_intake_uses_generic_issue_framing() -> None:
     assert result.work_item.state is ControllerState.POLICY_ASSIGNED
 
 
+def test_stage1_manual_intake_uses_linear_issue_framing() -> None:
+    root = Path(__file__).resolve().parents[1]
+    validators = load_validators(root)
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear-issue-2",
+        title="Factory API should surface Linear intake status in the cockpit",
+        url="https://linear.app/example/issue/ENG-123/factory-intake",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit API should surface Linear-triggered factory runs and their status. "
+            "This is a control-plane API and response format change for the cockpit command, not a "
+            "model-runtime change. Acceptance criteria: - include the latest Linear-triggered run "
+            "status in the cockpit JSON output - show whether Stage 1 accepted or rejected the issue "
+            "in the response format - keep the response schema compatibility-safe for existing callers "
+            "- cover the output with CLI tests"
+        ),
+    )
+
+    result = Stage1IntakePipeline(root).process_item(item)
+
+    assert validation_errors_for(validators["spec-packet"], result.spec_packet) == []
+    assert result.spec_packet["relevance"]["decision"] == "active_build_candidate"
+    assert result.spec_packet["summary"]["problem"].startswith("Linear issue:")
+    assert (
+        result.spec_packet["summary"]["assumptions"][0]
+        == "Stage 1 reasoning is based on the manually submitted Linear issue plus local factory policy."
+    )
+    assert result.work_item.state is ControllerState.POLICY_ASSIGNED
+
+
 def test_stage1_intake_watchlist_path_stops_in_watchlisted_state() -> None:
     root = Path(__file__).resolve().parents[1]
     validators = load_validators(root)

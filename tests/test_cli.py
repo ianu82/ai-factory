@@ -257,6 +257,175 @@ def test_stage2_cli_loads_repo_env_file_before_parser_defaults(
     assert captured["openai_api_key"] == "local-key"
 
 
+def test_linear_webhook_server_cli_invokes_runtime(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_serve_linear_webhooks(
+        *,
+        store_dir: Path,
+        host: str,
+        port: int,
+        repo_root_override: Path | None = None,
+        config=None,
+    ) -> None:
+        captured["store_dir"] = store_dir
+        captured["host"] = host
+        captured["port"] = port
+        captured["repo_root_override"] = repo_root_override
+
+    monkeypatch.setattr(cli_main, "serve_linear_webhooks", fake_serve_linear_webhooks)
+
+    exit_code = main(
+        [
+            "linear-webhook-server",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8090",
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "store_dir": tmp_path / "store",
+        "host": "127.0.0.1",
+        "port": 8090,
+        "repo_root_override": tmp_path / "repo",
+    }
+
+
+def test_linear_trigger_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeResult:
+        failed_events: list[dict[str, object]] = []
+
+        def to_document(self) -> dict[str, object]:
+            return {
+                "cycle": "linear-trigger",
+                "processed_events": [{"delivery_id": "delivery-123"}],
+                "skipped_events": [],
+                "failed_events": [],
+                "trigger_state": {
+                    "version": 1,
+                    "processed_delivery_ids": ["delivery-123"],
+                    "processed_logical_trigger_keys": ["linear:issue-123:state-factory:2026-04-24T12:00:00Z"],
+                    "updated_at": "2026-04-24T12:00:02Z",
+                },
+            }
+
+        def failed_handoffs(self) -> list[dict[str, object]]:
+            return []
+
+    class _FakeWorker:
+        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+            self.store_dir = store_dir
+            self.repo_root_override = repo_root_override
+
+        def run_cycle(self, *, repository: str, max_events: int | None = None) -> _FakeResult:
+            assert repository == "ianu82/ai-factory"
+            assert max_events == 2
+            return _FakeResult()
+
+    monkeypatch.setattr(cli_main, "LinearTriggerWorker", _FakeWorker)
+
+    exit_code = main(
+        [
+            "automation-linear-trigger-cycle",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repository",
+            "ianu82/ai-factory",
+            "--max-events",
+            "2",
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "linear-trigger"
+    assert payload["processed_events"] == [{"delivery_id": "delivery-123"}]
+
+
+def test_linear_ensure_stage_states_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeSync:
+        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert repo_root_override == tmp_path / "repo"
+
+        def ensure_stage_states(self) -> dict[str, dict[str, object]]:
+            return {
+                "stage1": {"id": "state-1", "name": "Stage 1 Intake"},
+                "stage9": {"id": "state-9", "name": "Stage 9 Feedback"},
+            }
+
+    monkeypatch.setattr(cli_main, "LinearWorkflowSync", _FakeSync)
+
+    exit_code = main(
+        [
+            "linear-ensure-stage-states",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "linear-stage-setup"
+    assert payload["stage_states"]["stage1"]["name"] == "Stage 1 Intake"
+
+
+def test_linear_sync_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeResult:
+        failed_runs: list[dict[str, object]] = []
+
+        def to_document(self) -> dict[str, object]:
+            return {
+                "cycle": "linear-workflow-sync",
+                "stage_states": {"stage1": {"id": "state-1", "name": "Stage 1 Intake"}},
+                "synced_runs": [{"work_item_id": "wi-123"}],
+                "skipped_runs": [],
+                "failed_runs": [],
+            }
+
+    class _FakeSync:
+        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert repo_root_override == tmp_path / "repo"
+
+        def sync_existing_runs(self, *, max_runs: int | None = None) -> _FakeResult:
+            assert max_runs == 2
+            return _FakeResult()
+
+    monkeypatch.setattr(cli_main, "LinearWorkflowSync", _FakeSync)
+
+    exit_code = main(
+        [
+            "automation-linear-sync-cycle",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--max-runs",
+            "2",
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "linear-workflow-sync"
+    assert payload["synced_runs"] == [{"work_item_id": "wi-123"}]
+
+
 def test_validate_contracts_cli_reports_malformed_env_file(
     capsys,
     monkeypatch,
