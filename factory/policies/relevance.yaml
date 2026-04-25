@@ -16,6 +16,13 @@ technical_keywords:
   - messages
   - sdk
   - embedding
+  - cli
+  - command
+  - webhook
+  - worker
+  - gate
+  - control-plane
+  - cockpit
 
 defer_keywords:
   - preview
