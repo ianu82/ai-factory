@@ -1,0 +1,5 @@
+I couldn’t implement the ticket because this worktree is not operable from the session.
+
+Every shell attempt failed before execution with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, including trivial commands like `pwd` and `git status`. File edits also failed: every `apply_patch` attempt returned `Failed to write file ...`, including a throwaway probe file. That means I couldn’t inspect the repo, modify the target files, or run tests, and I left the worktree unchanged.
+
+If you rerun this stage in a healthy workspace, I can make the scoped change directly.
