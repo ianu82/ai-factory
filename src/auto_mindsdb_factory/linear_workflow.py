@@ -147,6 +147,7 @@ class LinearWorkflowConfig:
     graphql_url: str = DEFAULT_LINEAR_GRAPHQL_URL
     trigger_base_url: str | None = None
     trigger_state_id: str | None = None
+    blocked_label_name: str = "blocked/stuck"
     create_missing_states: bool = True
 
     @classmethod
@@ -165,12 +166,14 @@ class LinearWorkflowConfig:
         graphql_url = os.environ.get("LINEAR_GRAPHQL_URL", "").strip() or DEFAULT_LINEAR_GRAPHQL_URL
         trigger_base_url = os.environ.get("FACTORY_TRIGGER_BASE_URL", "").strip() or None
         trigger_state_id = os.environ.get("LINEAR_TARGET_STATE_ID", "").strip() or None
+        blocked_label_name = os.environ.get("LINEAR_BLOCKED_LABEL_NAME", "").strip() or "blocked/stuck"
         return cls(
             api_key=api_key,
             team_id=team_id,
             graphql_url=graphql_url,
             trigger_base_url=trigger_base_url,
             trigger_state_id=trigger_state_id,
+            blocked_label_name=blocked_label_name,
             create_missing_states=_bool_from_env("LINEAR_FACTORY_CREATE_STATES", default=True),
         )
 
@@ -291,6 +294,7 @@ class LinearWorkflowSync:
         self.store = LinearWorkflowStore(store_dir, repo_root_override=self.repo_root)
         self.linear_client = linear_client or LinearGraphQLClient(self.config)
         self._stage_states_cache: dict[str, dict[str, Any]] | None = None
+        self._blocked_label_id: str | None = None
 
     @classmethod
     def maybe_create(
@@ -464,12 +468,16 @@ class LinearWorkflowSync:
                 binding.last_synced_state_id = str(target_state["id"])
                 state_update = "moved"
 
-            comment = self._maybe_post_stall_comment(
-                binding,
+            stall_payload = self._stall_comment_payload(
                 stage_name=stage_name,
                 linear_stage_key=linear_stage_key,
                 document=document,
                 stall_reason=stall_reason,
+            )
+            label_result = self._sync_blocked_label(binding.issue_id, blocked=stall_payload is not None)
+            comment = self._maybe_post_stall_comment(
+                binding,
+                stall_payload=stall_payload,
             )
 
             binding.last_synced_stage_key = linear_stage_key
@@ -491,6 +499,7 @@ class LinearWorkflowSync:
                     "created" if created_new_binding and binding.created_by_factory and state_update == "unchanged"
                     else state_update
                 ),
+                "blocked_label": label_result,
                 "comment": comment,
                 "created_by_factory": binding.created_by_factory,
             }
@@ -565,26 +574,42 @@ class LinearWorkflowSync:
         self,
         binding: LinearWorkflowBinding,
         *,
-        stage_name: str,
-        linear_stage_key: str,
-        document: dict[str, Any],
-        stall_reason: str | None,
+        stall_payload: tuple[str, str] | None,
     ) -> dict[str, Any]:
-        comment_payload = self._stall_comment_payload(
-            stage_name=stage_name,
-            linear_stage_key=linear_stage_key,
-            document=document,
-            stall_reason=stall_reason,
-        )
-        if comment_payload is None:
+        if stall_payload is None:
             return {"status": "skipped", "reason": "no_human_attention_needed"}
-        comment_key, body = comment_payload
+        comment_key, body = stall_payload
         if comment_key == binding.last_comment_key:
             return {"status": "skipped", "reason": "duplicate_comment"}
         comment_id = self.linear_client.create_comment(binding.issue_id, body)
         binding.last_comment_key = comment_key
         binding.last_comment_id = comment_id
         return {"status": "posted", "comment_id": comment_id}
+
+    def _sync_blocked_label(self, issue_id: str, *, blocked: bool) -> dict[str, str]:
+        label_id = self._ensure_blocked_label()
+        if blocked:
+            self.linear_client.add_issue_label(issue_id, label_id)
+            return {"status": "applied", "label": self.config.blocked_label_name}
+        self.linear_client.remove_issue_label(issue_id, label_id)
+        return {"status": "removed", "label": self.config.blocked_label_name}
+
+    def _ensure_blocked_label(self) -> str:
+        if self._blocked_label_id is not None:
+            return self._blocked_label_id
+        normalized_name = self.config.blocked_label_name.strip().lower()
+        for label in self.linear_client.fetch_team_labels(self.config.team_id):
+            if str(label.get("name") or "").strip().lower() == normalized_name:
+                self._blocked_label_id = str(label["id"])
+                return self._blocked_label_id
+        created = self.linear_client.create_issue_label(
+            team_id=self.config.team_id,
+            name=self.config.blocked_label_name,
+            color="#D92D20",
+            description="Applied by AI Factory when a run is blocked or stuck.",
+        )
+        self._blocked_label_id = str(created["id"])
+        return self._blocked_label_id
 
     def _stall_comment_payload(
         self,

@@ -72,6 +72,24 @@ def _watchlist_linear_stage1(root: Path):
     return Stage1IntakePipeline(root).process_item(item)
 
 
+def _active_linear_stage1(root: Path):
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear:issue-123:state-new-feature:2026-04-24T12:00:00Z",
+        title="Factory cockpit should surface Linear stage health",
+        url="https://linear.app/example/issue/SOF-123/factory-intake",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit API should surface Linear stage health for factory runs. "
+            "This is a control-plane API and JSON schema change for the cockpit command. "
+            "Acceptance criteria: include the current Linear stage, blocked label status, "
+            "and gate summary in the cockpit JSON output; cover it with CLI tests."
+        ),
+    )
+    return Stage1IntakePipeline(root).process_item(item)
+
+
 def _stage3_revision_document(root: Path) -> dict:
     item = AnthropicScout().list_items(
         html=_fixture_html(root),
@@ -132,6 +150,10 @@ class FakeLinearWorkflowClient:
         self.created_issues: list[dict[str, object]] = []
         self.updated_issues: list[dict[str, object]] = []
         self.comment_bodies: list[tuple[str, str]] = []
+        self.team_labels: list[dict[str, object]] = [
+            {"id": "label-blocked", "name": "blocked/stuck"},
+        ]
+        self.label_updates: list[dict[str, object]] = []
 
     def fetch_team_states(self, team_id: str) -> list[dict[str, object]]:
         assert team_id == "team-123"
@@ -224,6 +246,37 @@ class FakeLinearWorkflowClient:
     def create_comment(self, issue_id: str, body: str) -> str:
         self.comment_bodies.append((issue_id, body))
         return f"comment-{len(self.comment_bodies)}"
+
+    def fetch_team_labels(self, team_id: str) -> list[dict[str, object]]:
+        assert team_id == "team-123"
+        return [dict(label) for label in self.team_labels]
+
+    def create_issue_label(
+        self,
+        *,
+        team_id: str,
+        name: str,
+        color: str,
+        description: str,
+    ) -> dict[str, object]:
+        created = {
+            "id": f"label-{len(self.team_labels) + 1}",
+            "name": name,
+            "color": color,
+            "description": description,
+        }
+        self.team_labels.append(created)
+        return dict(created)
+
+    def add_issue_label(self, issue_id: str, label_id: str) -> None:
+        self.label_updates.append(
+            {"action": "add", "issue_id": issue_id, "label_id": label_id}
+        )
+
+    def remove_issue_label(self, issue_id: str, label_id: str) -> None:
+        self.label_updates.append(
+            {"action": "remove", "issue_id": issue_id, "label_id": label_id}
+        )
 
 
 def test_linear_workflow_ensure_stage_states_creates_missing_states(tmp_path) -> None:
@@ -340,10 +393,35 @@ def test_linear_workflow_sync_stage1_linear_issue_reuses_issue_and_comments_watc
     assert result["issue_id"] == "issue-123"
     assert result["state_update"] == "moved"
     assert result["comment"]["status"] == "posted"
+    assert result["blocked_label"] == {"status": "applied", "label": "blocked/stuck"}
     assert fake_client.created_issues == []
+    assert fake_client.label_updates == [
+        {"action": "add", "issue_id": "issue-123", "label_id": "label-blocked"}
+    ]
     assert fake_client.comment_bodies
     assert "Stage 1 Intake" in fake_client.comment_bodies[0][1]
     assert "watchlist" in fake_client.comment_bodies[0][1]
+
+
+def test_linear_workflow_sync_removes_blocked_label_when_run_moves_again(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(api_key="test-key", team_id="team-123"),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+
+    result = sync.sync_stage_result("stage1", stage1_result.to_document())
+
+    assert result["status"] == "synced"
+    assert result["comment"]["status"] == "skipped"
+    assert result["blocked_label"] == {"status": "removed", "label": "blocked/stuck"}
+    assert fake_client.label_updates == [
+        {"action": "remove", "issue_id": "issue-123", "label_id": "label-blocked"}
+    ]
 
 
 def test_linear_workflow_sync_stage3_revision_posts_blocking_comment(tmp_path) -> None:

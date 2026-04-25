@@ -863,6 +863,125 @@ class LinearGraphQLClient:
             return str(comment["id"])
         return None
 
+    def fetch_team_labels(self, team_id: str) -> list[dict[str, Any]]:
+        document = self._execute(
+            """
+            query FactoryLinearTeamLabels($id: String!) {
+              team(id: $id) {
+                id
+                labels(first: 250, includeArchived: false) {
+                  nodes {
+                    id
+                    name
+                  }
+                }
+              }
+            }
+            """,
+            {"id": team_id},
+        )
+        team = document.get("team")
+        if not isinstance(team, dict):
+            raise LinearGraphQLClientError(
+                f"Linear team '{team_id}' could not be loaded."
+            )
+        return [
+            {"id": str(node["id"]), "name": str(node["name"])}
+            for node in _connection_nodes(team.get("labels"))
+            if isinstance(node.get("id"), str) and isinstance(node.get("name"), str)
+        ]
+
+    def create_issue_label(
+        self,
+        *,
+        team_id: str,
+        name: str,
+        color: str,
+        description: str,
+    ) -> dict[str, Any]:
+        document = self._execute(
+            """
+            mutation FactoryLinearIssueLabelCreate(
+              $teamId: String!,
+              $name: String!,
+              $color: String!,
+              $description: String!
+            ) {
+              issueLabelCreate(
+                input: {
+                  teamId: $teamId,
+                  name: $name,
+                  color: $color,
+                  description: $description
+                }
+              ) {
+                success
+                issueLabel {
+                  id
+                  name
+                }
+              }
+            }
+            """,
+            {
+                "teamId": team_id,
+                "name": name,
+                "color": color,
+                "description": description,
+            },
+        )
+        payload = document.get("issueLabelCreate")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise LinearGraphQLClientError("Linear issueLabelCreate mutation failed.")
+        label = payload.get("issueLabel")
+        if not isinstance(label, dict):
+            raise LinearGraphQLClientError("Linear issueLabelCreate did not return an issueLabel.")
+        return {"id": str(label["id"]), "name": str(label["name"])}
+
+    def add_issue_label(self, issue_id: str, label_id: str) -> None:
+        self._update_issue_labels(issue_id, added_label_ids=[label_id])
+
+    def remove_issue_label(self, issue_id: str, label_id: str) -> None:
+        self._update_issue_labels(issue_id, removed_label_ids=[label_id])
+
+    def _update_issue_labels(
+        self,
+        issue_id: str,
+        *,
+        added_label_ids: list[str] | None = None,
+        removed_label_ids: list[str] | None = None,
+    ) -> None:
+        document = self._execute(
+            """
+            mutation FactoryLinearIssueLabelsUpdate(
+              $id: String!,
+              $addedLabelIds: [String!],
+              $removedLabelIds: [String!]
+            ) {
+              issueUpdate(
+                id: $id,
+                input: {
+                  addedLabelIds: $addedLabelIds,
+                  removedLabelIds: $removedLabelIds
+                }
+              ) {
+                success
+                issue {
+                  id
+                }
+              }
+            }
+            """,
+            {
+                "id": issue_id,
+                "addedLabelIds": added_label_ids or [],
+                "removedLabelIds": removed_label_ids or [],
+            },
+        )
+        payload = document.get("issueUpdate")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise LinearGraphQLClientError("Linear issue label update failed.")
+
     def fetch_team_states(self, team_id: str) -> list[dict[str, Any]]:
         document = self._execute(
             """
