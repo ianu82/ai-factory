@@ -842,19 +842,24 @@ class LinearGraphQLClient:
         }
 
     def create_comment(self, issue_id: str, body: str) -> str | None:
-        document = self._execute(
-            """
-            mutation FactoryLinearComment($issueId: String!, $body: String!) {
-              commentCreate(input: { issueId: $issueId, body: $body }) {
-                success
-                comment {
-                  id
+        try:
+            document = self._execute(
+                """
+                mutation FactoryLinearComment($issueId: String!, $body: String!) {
+                  commentCreate(input: { issueId: $issueId, body: $body }) {
+                    success
+                    comment {
+                      id
+                    }
+                  }
                 }
-              }
-            }
-            """,
-            {"issueId": issue_id, "body": body},
-        )
+                """,
+                {"issueId": issue_id, "body": body},
+            )
+        except LinearGraphQLClientError as exc:
+            if "Entity not found: Issue" not in str(exc):
+                raise
+            return self._append_issue_description_note(issue_id, body)
         payload = document.get("commentCreate")
         if not isinstance(payload, dict) or not payload.get("success"):
             raise LinearGraphQLClientError("Linear commentCreate mutation failed.")
@@ -862,6 +867,53 @@ class LinearGraphQLClient:
         if isinstance(comment, dict) and isinstance(comment.get("id"), str):
             return str(comment["id"])
         return None
+
+    def _append_issue_description_note(self, issue_id: str, body: str) -> str:
+        issue_document = self._execute(
+            """
+            query FactoryLinearIssueDescription($id: String!) {
+              issue(id: $id) {
+                id
+                description
+              }
+            }
+            """,
+            {"id": issue_id},
+        )
+        issue = issue_document.get("issue")
+        if not isinstance(issue, dict):
+            raise LinearGraphQLClientError(
+                f"Linear issue '{issue_id}' could not be loaded for description fallback."
+            )
+        existing_description = str(issue.get("description") or "").rstrip()
+        note = "\n".join(
+            [
+                "---",
+                "",
+                "### AI Factory update",
+                "",
+                body,
+            ]
+        )
+        updated_description = f"{existing_description}\n\n{note}".strip()
+        update_document = self._execute(
+            """
+            mutation FactoryLinearIssueDescriptionUpdate($id: String!, $description: String!) {
+              issueUpdate(id: $id, input: { description: $description }) {
+                success
+                issue {
+                  id
+                }
+              }
+            }
+            """,
+            {"id": issue_id, "description": updated_description},
+        )
+        payload = update_document.get("issueUpdate")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise LinearGraphQLClientError("Linear issueUpdate description fallback failed.")
+        fingerprint = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
+        return f"description-update-{fingerprint}"
 
     def fetch_team_labels(self, team_id: str) -> list[dict[str, Any]]:
         document = self._execute(

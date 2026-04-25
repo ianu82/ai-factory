@@ -10,6 +10,8 @@ from auto_mindsdb_factory.automation import AutomationError, FactoryRunStore
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.intake import Stage1IntakePipeline
 from auto_mindsdb_factory.linear_trigger import (
+    LinearGraphQLClient,
+    LinearGraphQLClientError,
     LinearIssueSnapshot,
     LinearTriggerConfig,
     LinearTriggerStore,
@@ -140,6 +142,38 @@ class FakeLinearClient:
         assert issue_id == self.snapshot.id
         self.comment_bodies.append(body)
         return f"comment-for-{issue_id}"
+
+
+def test_linear_graphql_client_falls_back_to_description_when_comments_cannot_attach() -> None:
+    class FallbackClient(LinearGraphQLClient):
+        def __init__(self) -> None:
+            super().__init__(
+                LinearTriggerConfig(
+                    api_key="test-api-key",
+                    target_team_id="team-123",
+                    target_state_id="state-factory",
+                )
+            )
+            self.updated_description = ""
+
+        def _execute(self, query: str, variables: dict[str, object]) -> dict[str, object]:
+            if "commentCreate" in query:
+                raise LinearGraphQLClientError("Linear GraphQL errors: Entity not found: Issue")
+            if "FactoryLinearIssueDescription(" in query:
+                return {"issue": {"id": variables["id"], "description": "Existing body"}}
+            if "FactoryLinearIssueDescriptionUpdate" in query:
+                self.updated_description = str(variables["description"])
+                return {"issueUpdate": {"success": True, "issue": {"id": variables["id"]}}}
+            raise AssertionError(query)
+
+    client = FallbackClient()
+
+    comment_id = client.create_comment("issue-123", "Artifact details")
+
+    assert comment_id == "description-update-9b9039d65981"
+    assert "Existing body" in client.updated_description
+    assert "### AI Factory update" in client.updated_description
+    assert "Artifact details" in client.updated_description
 
 
 @dataclass
