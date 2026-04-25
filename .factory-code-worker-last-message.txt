@@ -1,0 +1,10 @@
+I couldn’t implement the scoped change because this session’s workspace is unusable.
+
+`exec_command` fails before any command runs with:
+```text
+bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+```
+
+`apply_patch` also fails to write even a probe file in the repo root and in another declared writable root, so I can’t inspect files, edit code, or run tests. I left the worktree unchanged.
+
+If you re-run this work item in a healthy sandbox or provide the target file contents directly, I can make the smoke-command change and add the scoped tests.
