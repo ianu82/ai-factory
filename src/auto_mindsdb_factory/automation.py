@@ -18,7 +18,14 @@ from .controller import ControllerState, WorkItem
 from .eval_execution import EvalExecutionError, Stage5EvalPipeline
 from .feedback_synthesis import FeedbackSynthesisError, Stage9FeedbackSynthesisPipeline
 from .integration import IntegrationError, Stage4IntegrationPipeline
-from .intake import AnthropicScout, Stage1IntakePipeline, build_identifier, repo_root, utc_now
+from .intake import (
+    AnthropicScout,
+    Stage1IntakePipeline,
+    build_identifier,
+    normalize_whitespace,
+    repo_root,
+    utc_now,
+)
 from .merge_orchestration import MergeError, StageMergePipeline
 from .production_monitoring import (
     ProductionMonitoringError,
@@ -1496,6 +1503,60 @@ class FactoryAutomationCoordinator:
             return "pr_ready_for_human_merge_deploy"
         return None
 
+    def _revision_guidance_for_current_document(
+        self,
+        current_stage: str,
+        current_document: dict[str, Any],
+    ) -> list[str]:
+        guidance: list[str] = []
+        pr_packet = current_document.get("pr_packet")
+        if isinstance(pr_packet, dict):
+            reviewer_report = pr_packet.get("reviewer_report")
+            if isinstance(reviewer_report, dict):
+                guidance.extend(
+                    str(finding)
+                    for finding in reviewer_report.get("blocking_findings", [])
+                    if finding
+                )
+
+        eval_report = current_document.get("eval_report")
+        if isinstance(eval_report, dict):
+            summary = eval_report.get("summary")
+            if isinstance(summary, dict):
+                failing_tiers = summary.get("failing_merge_gate_tiers")
+                if isinstance(failing_tiers, list) and failing_tiers:
+                    guidance.append(
+                        "Stage 5 eval failed merge-gating tiers: "
+                        + ", ".join(str(tier) for tier in failing_tiers)
+                        + "."
+                    )
+            for tier in eval_report.get("tiers", []):
+                if not isinstance(tier, dict):
+                    continue
+                tier_name = str(tier.get("name") or "unknown")
+                for check in tier.get("checks", []):
+                    if not isinstance(check, dict) or check.get("status") != "failed":
+                        continue
+                    check_name = str(check.get("name") or check.get("id") or "unnamed check")
+                    summary_text = str(check.get("summary") or "No failure summary supplied.")
+                    guidance.append(f"{tier_name} failed {check_name}: {summary_text}")
+
+        security_review = current_document.get("security_review")
+        if isinstance(security_review, dict):
+            summary = security_review.get("summary")
+            if isinstance(summary, dict):
+                guidance.extend(
+                    str(finding)
+                    for finding in summary.get("blocking_findings", [])
+                    if finding
+                )
+
+        if not guidance:
+            guidance.append(
+                f"Revise the prior PR after `{current_stage}` returned the work item to PR_REVISION."
+            )
+        return [normalize_whitespace(item) for item in guidance if item]
+
     def _advance_once(
         self,
         *,
@@ -1533,8 +1594,6 @@ class FactoryAutomationCoordinator:
             )
 
         if state is ControllerState.PR_REVISION:
-            if current_stage != "stage3":
-                return None
             result = self.stage3_pipeline.process(
                 current_document["spec_packet"],
                 current_document["policy_decision"],
@@ -1542,6 +1601,15 @@ class FactoryAutomationCoordinator:
                 current_document["eval_manifest"],
                 work_item,
                 repository=repository,
+                revision_guidance=self._revision_guidance_for_current_document(
+                    current_stage,
+                    current_document,
+                ),
+                previous_pr_packet=(
+                    current_document["pr_packet"]
+                    if isinstance(current_document.get("pr_packet"), dict)
+                    else None
+                ),
             )
             return (
                 "stage3",
@@ -1828,8 +1896,6 @@ class FactoryAutomationCoordinator:
             ):
                 return None
             return "already_in_production_monitoring"
-        if state is ControllerState.PR_REVISION and current_stage != "stage3":
-            return "awaiting_builder_follow_up"
         return None
 
     @staticmethod
@@ -1864,13 +1930,10 @@ class FactoryAutomationCoordinator:
             return
 
         if state in {ControllerState.TICKETED, ControllerState.PR_REVISION}:
+            required_fields = ["spec_packet", "policy_decision", "ticket_bundle", "eval_manifest"]
             if state is ControllerState.PR_REVISION and current_stage != "stage3":
-                return
-            self._require_document_objects(
-                document,
-                ("spec_packet", "policy_decision", "ticket_bundle", "eval_manifest"),
-                state=state,
-            )
+                required_fields.append("pr_packet")
+            self._require_document_objects(document, tuple(required_fields), state=state)
             return
 
         if state is ControllerState.PR_REVIEWABLE:
