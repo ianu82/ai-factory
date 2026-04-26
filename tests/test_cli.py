@@ -872,7 +872,8 @@ def test_automation_stage1_cli_runs_cycle(capsys, tmp_path) -> None:
     assert payload["created_results"]
 
 
-def test_automation_stage1_cli_can_advance_immediately(capsys, tmp_path) -> None:
+def test_automation_stage1_cli_can_advance_immediately(capsys, monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
 
@@ -998,7 +999,12 @@ def test_automation_register_bundle_cli_rejects_malformed_stage8_result(capsys, 
     assert "missing required object fields" in captured.err
 
 
-def test_automation_register_bundle_cli_can_advance_immediately(capsys, tmp_path) -> None:
+def test_automation_register_bundle_cli_can_advance_immediately(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
         encoding="utf-8"
@@ -1121,7 +1127,12 @@ def test_automation_register_bundle_cli_returns_error_on_failed_immediate_handof
     assert "Automation immediate handoff failed:" in captured.err
 
 
-def test_automation_advance_runs_cli_progresses_active_build_items(capsys, tmp_path) -> None:
+def test_automation_advance_runs_cli_progresses_active_build_items(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
     store_dir = tmp_path / "automation-store"
@@ -1351,6 +1362,104 @@ def test_factory_smoke_cli_fails_closed_without_leaking_auth_output(
     assert "sensitive-token" not in captured.out
 
 
+def test_factory_smoke_cli_sanitizes_nested_doctor_output(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "failed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [
+                    {
+                        "name": "command:gh",
+                        "status": "failed",
+                        "summary": "token=ghp-secret-token",
+                    },
+                    {
+                        "name": "git:origin",
+                        "status": "passed",
+                        "summary": "https://ops:secret@github.com/ianu82/ai-factory.git",
+                    },
+                ],
+                "debug": {"api_key": "sk-secret"},
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["doctor"]["status"] == "failed"
+    assert "debug" not in payload["doctor"]
+    doctor_checks = {check["name"]: check for check in payload["doctor"]["checks"]}
+    assert doctor_checks["command:gh"]["summary"] == "check failed"
+    assert doctor_checks["git:origin"]["summary"] == "https://github.com/ianu82/ai-factory.git"
+    assert "ghp-secret-token" not in captured.out
+    assert "ops:secret" not in captured.out
+    assert "sk-secret" not in captured.out
+
+
 def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     class _FakeWorker:
         def __init__(self, config) -> None:
@@ -1389,7 +1498,12 @@ def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     assert payload["cycles"] == [{"cycle": "factory-worker-cycle"}]
 
 
-def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:
+def test_automation_supervisor_cycle_cli_runs_full_pass(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
 

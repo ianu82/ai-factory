@@ -1186,6 +1186,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="mindsdb/platform",
         help="Repository name to embed in generated PR packets when immediate handoff runs.",
     )
+    register_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default="simulation_full",
+        help="How far immediate handoff is allowed to progress. Defaults to simulation_full for replay tooling.",
+    )
 
     linear_webhook_parser = subparsers.add_parser(
         "linear-webhook-server",
@@ -1337,6 +1343,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="mindsdb/platform",
         help="Repository name to embed in generated PR packets when immediate handoff runs.",
     )
+    automation_stage1_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default="simulation_full",
+        help="How far immediate handoff is allowed to progress. Defaults to simulation_full for recurring automation.",
+    )
 
     automation_progress_parser = subparsers.add_parser(
         "automation-advance-runs",
@@ -1362,8 +1374,8 @@ def build_parser() -> argparse.ArgumentParser:
     automation_progress_parser.add_argument(
         "--autonomy-mode",
         choices=["simulation_full", "pr_ready"],
-        default=os.environ.get("AI_FACTORY_AUTONOMY_MODE", "simulation_full"),
-        help="How far autonomous progression is allowed to go.",
+        default="simulation_full",
+        help="How far autonomous progression is allowed to go. Defaults to simulation_full for replay tooling.",
     )
 
     factory_worker_parser = subparsers.add_parser(
@@ -1580,6 +1592,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    automation_supervisor_parser.add_argument(
+        "--autonomy-mode",
+        choices=["simulation_full", "pr_ready"],
+        default="simulation_full",
+        help="How far autonomous progression is allowed to go. Defaults to simulation_full for recurring automation.",
+    )
 
     vertical_slice_parser = subparsers.add_parser(
         "factory-vertical-slice",
@@ -1730,6 +1748,53 @@ def _redact_url_credentials(value: str) -> str:
     if parsed.port is not None:
         netloc = f"{netloc}:{parsed.port}"
     return urllib_parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def _doctor_check_for_smoke(report: dict[str, Any]) -> dict[str, Any]:
+    name = str(report.get("name", "unknown"))
+    status = "passed" if report.get("status") == "passed" else "failed"
+    summary = report.get("summary")
+    if name.startswith("env:"):
+        smoke_summary = "set" if status == "passed" else "missing"
+    elif name.startswith("command:"):
+        if summary == "not found on PATH":
+            smoke_summary = "not found on PATH"
+        else:
+            smoke_summary = "available" if status == "passed" else "check failed"
+    elif name == "git:origin" and isinstance(summary, str) and summary:
+        smoke_summary = _redact_url_credentials(summary)
+    elif name == "store:writable":
+        smoke_summary = "run store is writable" if status == "passed" else "not writable"
+    elif isinstance(summary, str) and summary:
+        smoke_summary = summary
+    else:
+        smoke_summary = "passed" if status == "passed" else "failed"
+    return {
+        "name": name,
+        "status": status,
+        "summary": smoke_summary,
+    }
+
+
+def _doctor_report_for_smoke(doctor: dict[str, Any]) -> dict[str, Any]:
+    checks = [
+        _doctor_check_for_smoke(check)
+        for check in doctor.get("checks", [])
+        if isinstance(check, dict)
+    ]
+    report: dict[str, Any] = {
+        "cycle": str(doctor.get("cycle", "factory-doctor")),
+        "status": "passed" if doctor.get("status") == "passed" else "failed",
+        "checks": checks,
+    }
+    checked_at = doctor.get("checked_at")
+    if isinstance(checked_at, str) and checked_at:
+        report["checked_at"] = checked_at
+    for field_name in ("autonomy_mode", "repository", "store_dir"):
+        field_value = doctor.get(field_name)
+        if isinstance(field_value, str) and field_value:
+            report[field_name] = field_value
+    return report
 
 
 def _check_uuid_config(env_name: str, *, check_name: str) -> dict[str, Any]:
@@ -2008,7 +2073,7 @@ def _build_factory_smoke_report(config: ProductionRuntimeConfig) -> dict[str, An
         ),
         "linear_target_team_id": _env_value("LINEAR_TARGET_TEAM_ID") or None,
         "linear_target_state_id": _env_value("LINEAR_TARGET_STATE_ID") or None,
-        "doctor": doctor,
+        "doctor": _doctor_report_for_smoke(doctor),
         "checks": checks,
     }
 
@@ -2417,6 +2482,7 @@ def main(argv: list[str] | None = None) -> int:
             coordinator = FactoryAutomationCoordinator(
                 args.store_dir,
                 repo_root_override=args.repo_root,
+                autonomy_mode=args.autonomy_mode,
             )
             stored_path, state = coordinator.register_bundle(args.stage, document)
         except (AutomationError, LinearWorkflowError, CommandInputError) as exc:
@@ -2572,6 +2638,7 @@ def main(argv: list[str] | None = None) -> int:
             coordinator = FactoryAutomationCoordinator(
                 args.store_dir,
                 repo_root_override=args.repo_root,
+                autonomy_mode=args.autonomy_mode,
             )
             result = coordinator.run_stage1_cycle(
                 html=html,
@@ -2697,6 +2764,7 @@ def main(argv: list[str] | None = None) -> int:
             coordinator = FactoryAutomationCoordinator(
                 args.store_dir,
                 repo_root_override=args.repo_root,
+                autonomy_mode=args.autonomy_mode,
             )
             result = coordinator.run_supervisor_cycle(
                 html=html,
