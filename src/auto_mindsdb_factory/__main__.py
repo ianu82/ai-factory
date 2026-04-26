@@ -2001,13 +2001,25 @@ def _first_local_command_target(command: list[str]) -> str | None:
 
 
 def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
-    gate_runner = CommandGateRunner.from_env(repo_root)
     required_raw = os.environ.get("AI_FACTORY_REQUIRED_GATE_KINDS")
     required_kinds = (
         {item.strip() for item in required_raw.split(",") if item.strip()}
         if required_raw is not None
-        else set(gate_runner.required_kinds)
+        else {"unit", "contract"}
     )
+
+    try:
+        gate_runner = CommandGateRunner.from_env(repo_root)
+    except ValueError as exc:
+        return _smoke_check(
+            "gates:required_commands",
+            "failed",
+            "Gate command configuration is invalid. Review AI_FACTORY_REQUIRED_GATE_KINDS, "
+            "AI_FACTORY_GATE_*_COMMAND, and AI_FACTORY_GATE_TIMEOUT_SECONDS.",
+            required_kinds=sorted(required_kinds),
+            commands=[],
+            error_type=type(exc).__name__,
+        )
 
     if not required_kinds:
         return _smoke_check(

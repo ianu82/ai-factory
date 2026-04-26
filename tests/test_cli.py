@@ -1710,6 +1710,22 @@ def test_factory_smoke_requires_at_least_one_required_gate_kind(
     assert "must declare at least one required gate kind" in check["summary"]
 
 
+def test_factory_smoke_rejects_invalid_gate_command_configuration(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "unit")
+    monkeypatch.setenv("AI_FACTORY_GATE_UNIT_COMMAND", "'unterminated")
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == ["unit"]
+    assert check["commands"] == []
+    assert check["error_type"] == "ValueError"
+    assert "Gate command configuration is invalid" in check["summary"]
+
+
 def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     class _FakeWorker:
         def __init__(self, config) -> None:
