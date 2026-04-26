@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from auto_mindsdb_factory.automation import FactoryRunStore
 from auto_mindsdb_factory.connectors import (
     AgentResult,
     CommandEvidence,
@@ -18,6 +20,8 @@ from auto_mindsdb_factory.vertical_slice import (
     VerticalSliceConfig,
     build_cockpit_summary,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeRepoConnector:
@@ -251,13 +255,104 @@ class UnhealthyOpsConnector:
 
 
 def _config(tmp_path: Path) -> VerticalSliceConfig:
-    root = Path(__file__).resolve().parents[1]
     return VerticalSliceConfig(
-        repo_root=root,
+        repo_root=ROOT,
         store_dir=tmp_path / "factory-store",
         repository="ianu82/ai-factory",
-        html_file=root / "fixtures" / "intake" / "anthropic-release-notes-sample.html",
+        html_file=ROOT / "fixtures" / "intake" / "anthropic-release-notes-sample.html",
         entry_index=0,
+    )
+
+
+def _iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _save_cockpit_stage_result(
+    store_dir: Path,
+    *,
+    stage_name: str,
+    work_item_id: str,
+    state: str,
+    updated_at: str,
+    title: str = "Factory cockpit heartbeat test",
+) -> None:
+    required_fields = {
+        "stage2": ("spec_packet", "policy_decision", "ticket_bundle", "eval_manifest"),
+        "stage4": (
+            "spec_packet",
+            "policy_decision",
+            "ticket_bundle",
+            "eval_manifest",
+            "pr_packet",
+            "prompt_contract",
+            "tool_schema",
+            "golden_dataset",
+            "latency_baseline",
+        ),
+        "stage9": (
+            "spec_packet",
+            "policy_decision",
+            "ticket_bundle",
+            "eval_manifest",
+            "pr_packet",
+            "prompt_contract",
+            "tool_schema",
+            "golden_dataset",
+            "latency_baseline",
+            "eval_report",
+            "security_review",
+            "promotion_decision",
+            "monitoring_report",
+            "feedback_report",
+        ),
+    }
+    document = {field_name: {} for field_name in required_fields[stage_name]}
+    if "pr_packet" in document:
+        document["pr_packet"] = {
+            "pull_request": {
+                "repository": "ianu82/ai-factory",
+                "url": "https://github.com/ianu82/ai-factory/pull/42",
+            }
+        }
+    if "monitoring_report" in document:
+        document["monitoring_report"] = {"monitoring_decision": {"status": "healthy"}}
+    if "feedback_report" in document:
+        document["feedback_report"] = {"artifact": {"id": "feedback-123"}}
+    document["work_item"] = {
+        "work_item_id": work_item_id,
+        "state": state,
+        "title": title,
+        "updated_at": updated_at,
+    }
+    FactoryRunStore(store_dir, repo_root_override=ROOT).save_stage_result(stage_name, document)
+
+
+def _write_run_lock(
+    store_dir: Path,
+    *,
+    work_item_id: str,
+    acquired_at: str,
+    refreshed_at: str,
+    ttl_seconds: int = 1800,
+) -> None:
+    refreshed_dt = datetime.fromisoformat(refreshed_at.replace("Z", "+00:00"))
+    expires_at = _iso_utc(refreshed_dt + timedelta(seconds=ttl_seconds))
+    lock_path = store_dir / "runs" / work_item_id / ".automation.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "scope": "run",
+                "resource_id": work_item_id,
+                "lease_id": "lease-123",
+                "acquired_at": acquired_at,
+                "refreshed_at": refreshed_at,
+                "expires_at": expires_at,
+                "pid": 999,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -292,6 +387,138 @@ def test_vertical_slice_cockpit_summarizes_latest_run(tmp_path) -> None:
     assert summary["runs"][0]["work_item_id"] == result.work_item_id
     assert summary["runs"][0]["latest_stage"] == "stage9"
     assert summary["runs"][0]["pull_request"]["url"] == result.pr_evidence.url
+
+
+def test_factory_cockpit_reports_active_stage3_build(tmp_path, monkeypatch) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    store_dir = tmp_path / "factory-store"
+    work_item_id = "wi-stage3-active"
+    started_at = _iso_utc(now - timedelta(minutes=4))
+    updated_at = _iso_utc(now - timedelta(seconds=20))
+    _save_cockpit_stage_result(
+        store_dir,
+        stage_name="stage2",
+        work_item_id=work_item_id,
+        state="TICKETED",
+        updated_at=started_at,
+    )
+    _write_run_lock(
+        store_dir,
+        work_item_id=work_item_id,
+        acquired_at=started_at,
+        refreshed_at=updated_at,
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.vertical_slice.load_active_code_worker_operations",
+        lambda: {
+            work_item_id: {
+                "work_item_id": work_item_id,
+                "stage": "stage3",
+                "status": "building",
+                "started_at": started_at,
+                "updated_at": updated_at,
+                "message": "Editing connector heartbeat coverage",
+            }
+        },
+    )
+
+    summary = build_cockpit_summary(store_dir, repo_root_override=ROOT)
+
+    active_operation = summary["runs"][0]["active_operation"]
+    assert active_operation["stage"] == "stage3"
+    assert active_operation["status"] == "building"
+    assert active_operation["message"] == "Editing connector heartbeat coverage"
+    assert active_operation["heartbeat_status"] == "healthy"
+
+
+def test_factory_cockpit_reports_active_stage5_eval(tmp_path, monkeypatch) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    store_dir = tmp_path / "factory-store"
+    work_item_id = "wi-stage5-active"
+    started_at = _iso_utc(now - timedelta(minutes=3))
+    updated_at = _iso_utc(now - timedelta(seconds=15))
+    _save_cockpit_stage_result(
+        store_dir,
+        stage_name="stage4",
+        work_item_id=work_item_id,
+        state="PR_REVIEWABLE",
+        updated_at=started_at,
+    )
+    _write_run_lock(
+        store_dir,
+        work_item_id=work_item_id,
+        acquired_at=started_at,
+        refreshed_at=updated_at,
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.vertical_slice.load_active_code_worker_operations",
+        lambda: {},
+    )
+
+    summary = build_cockpit_summary(store_dir, repo_root_override=ROOT)
+
+    active_operation = summary["runs"][0]["active_operation"]
+    assert active_operation["stage"] == "stage5"
+    assert active_operation["status"] == "running_evals"
+    assert active_operation["heartbeat_status"] == "healthy"
+
+
+def test_factory_cockpit_marks_stale_active_operation_as_possibly_stuck(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    store_dir = tmp_path / "factory-store"
+    work_item_id = "wi-stage5-stale"
+    started_at = _iso_utc(now - timedelta(hours=1))
+    updated_at = _iso_utc(now - timedelta(minutes=15))
+    _save_cockpit_stage_result(
+        store_dir,
+        stage_name="stage4",
+        work_item_id=work_item_id,
+        state="PR_REVIEWABLE",
+        updated_at=started_at,
+    )
+    _write_run_lock(
+        store_dir,
+        work_item_id=work_item_id,
+        acquired_at=started_at,
+        refreshed_at=updated_at,
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.vertical_slice.load_active_code_worker_operations",
+        lambda: {},
+    )
+
+    summary = build_cockpit_summary(
+        store_dir,
+        repo_root_override=ROOT,
+        stale_heartbeat_seconds=60,
+    )
+
+    active_operation = summary["runs"][0]["active_operation"]
+    assert active_operation["stage"] == "stage5"
+    assert active_operation["heartbeat_status"] == "possibly_stuck"
+    assert "No heartbeat has been observed" in active_operation["warning"]
+
+
+def test_factory_cockpit_omits_active_operation_for_completed_run(tmp_path, monkeypatch) -> None:
+    store_dir = tmp_path / "factory-store"
+    _save_cockpit_stage_result(
+        store_dir,
+        stage_name="stage9",
+        work_item_id="wi-complete",
+        state="PRODUCTION_MONITORING",
+        updated_at="2026-04-26T20:00:00Z",
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.vertical_slice.load_active_code_worker_operations",
+        lambda: {},
+    )
+
+    summary = build_cockpit_summary(store_dir, repo_root_override=ROOT)
+
+    assert "active_operation" not in summary["runs"][0]
 
 
 def test_vertical_slice_fails_when_pr_evidence_is_missing(tmp_path) -> None:

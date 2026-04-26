@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -20,7 +22,13 @@ from jsonschema import validate as validate_jsonschema
 from .intake import normalize_whitespace, slugify, utc_now
 
 
-FACTORY_CODE_WORKER_METADATA_PATHS = frozenset({".factory-code-worker-last-message.txt"})
+FACTORY_CODE_WORKER_LAST_MESSAGE_FILENAME = "factory-code-worker-last-message.txt"
+FACTORY_CODE_WORKER_METADATA_PATHS = frozenset(
+    {FACTORY_CODE_WORKER_LAST_MESSAGE_FILENAME, f".{FACTORY_CODE_WORKER_LAST_MESSAGE_FILENAME}"}
+)
+FACTORY_CODE_WORKER_ACTIVE_OPERATION_DIRNAME = "ai-factory-active-operations"
+FACTORY_CODE_WORKER_ACTIVE_OPERATION_STAGE = "stage3"
+FACTORY_CODE_WORKER_ACTIVE_OPERATION_STATUS = "building"
 
 
 class FactoryConnectorError(RuntimeError):
@@ -230,6 +238,7 @@ class CodexCLICodeWorkerConfig:
     approval_policy: str = "never"
     full_auto: bool = True
     bypass_sandbox: bool = False
+    heartbeat_interval_seconds: float = 5.0
     run_as_user: str | None = None
     sudo_bin: str = "sudo"
 
@@ -247,9 +256,94 @@ class CodexCLICodeWorkerConfig:
             .strip()
             .lower()
             in {"1", "true", "yes", "on"},
+            heartbeat_interval_seconds=float(
+                os.environ.get("AI_FACTORY_CODE_WORKER_HEARTBEAT_INTERVAL_SECONDS", "5")
+            ),
             run_as_user=os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "").strip() or None,
             sudo_bin=os.environ.get("AI_FACTORY_CODE_WORKER_SUDO_BIN", "sudo"),
         )
+
+
+class _CodeWorkerHeartbeat:
+    def __init__(
+        self,
+        *,
+        work_item_id: str,
+        branch_name: str,
+        provider: str,
+        model: str,
+        started_at: str,
+        last_message_path: Path,
+        operation_path: Path,
+        interval_seconds: float,
+    ) -> None:
+        self.work_item_id = work_item_id
+        self.branch_name = branch_name
+        self.provider = provider
+        self.model = model
+        self.started_at = started_at
+        self.last_message_path = last_message_path
+        self.operation_path = operation_path
+        self.interval_seconds = max(0.1, interval_seconds)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._write_update(self.started_at)
+        self._thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"code-worker-heartbeat-{self.work_item_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
+        try:
+            self.operation_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            self._write_update(utc_now())
+
+    def _write_update(self, updated_at: str) -> None:
+        document: dict[str, Any] = {
+            "work_item_id": self.work_item_id,
+            "stage": FACTORY_CODE_WORKER_ACTIVE_OPERATION_STAGE,
+            "status": FACTORY_CODE_WORKER_ACTIVE_OPERATION_STATUS,
+            "provider": self.provider,
+            "model": self.model,
+            "branch_name": self.branch_name,
+            "started_at": self.started_at,
+            "updated_at": updated_at,
+        }
+        message = self._read_last_message()
+        if message is not None:
+            document["message"] = message
+        try:
+            self.operation_path.parent.mkdir(parents=True, exist_ok=True)
+            self.operation_path.write_text(
+                f"{json.dumps(document, indent=2)}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+
+    def _read_last_message(self) -> str | None:
+        try:
+            raw = self.last_message_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        message = normalize_whitespace(raw)
+        if not message:
+            return None
+        if len(message) > 500:
+            return message[:500] + "...[truncated]"
+        return message
 
 
 class CodexCLICodeWorkerConnector:
@@ -281,6 +375,7 @@ class CodexCLICodeWorkerConnector:
 
     def run_code_worker(self, job: CodeWorkerJob) -> CodeWorkerResult:
         started_at = utc_now()
+        last_message_path = job.worktree_path.parent / FACTORY_CODE_WORKER_LAST_MESSAGE_FILENAME
         command = [
             self.config.codex_bin,
             "exec",
@@ -300,13 +395,26 @@ class CodexCLICodeWorkerConnector:
                 "-C",
                 str(job.worktree_path),
                 "--output-last-message",
-                str(job.worktree_path.parent / "factory-code-worker-last-message.txt"),
+                str(last_message_path),
                 "-",
             ]
         )
         command = self._execution_command(command)
-        prepared_owner = self._prepare_worktree_owner(job)
+        heartbeat = _CodeWorkerHeartbeat(
+            work_item_id=job.work_item_id,
+            branch_name=job.branch_name,
+            provider="codex_cli",
+            model=self.config.model,
+            started_at=started_at,
+            last_message_path=last_message_path,
+            operation_path=active_code_worker_operation_dir()
+            / f"{job.worktree_path.parent.name}.json",
+            interval_seconds=self.config.heartbeat_interval_seconds,
+        )
+        heartbeat.start()
+        prepared_owner = False
         try:
+            prepared_owner = self._prepare_worktree_owner(job)
             completed = self.subprocess_run(
                 command,
                 cwd=job.worktree_path,
@@ -334,6 +442,7 @@ class CodexCLICodeWorkerConnector:
         finally:
             if prepared_owner:
                 self._restore_worktree_owner(job)
+            heartbeat.close()
 
         changed_paths = _git_changed_paths(job.worktree_path)
         diff_stat = _git_diff_stat(job.worktree_path)
@@ -502,6 +611,50 @@ def _git_diff_stat(repo: Path) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def active_code_worker_operation_dir(root: Path | None = None) -> Path:
+    if root is not None:
+        return root.resolve()
+    return Path(tempfile.gettempdir()) / FACTORY_CODE_WORKER_ACTIVE_OPERATION_DIRNAME
+
+
+def load_active_code_worker_operations(
+    *,
+    root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    operation_dir = active_code_worker_operation_dir(root)
+    if not operation_dir.exists():
+        return {}
+
+    operations: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    for path in sorted(operation_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        work_item_id = payload.get("work_item_id")
+        if not isinstance(work_item_id, str) or not work_item_id:
+            continue
+        updated_at = _parse_operation_timestamp(payload.get("updated_at"))
+        current = operations.get(work_item_id)
+        if current is None or updated_at >= current[0]:
+            operations[work_item_id] = (updated_at, payload)
+    return {
+        work_item_id: payload
+        for work_item_id, (_, payload) in operations.items()
+    }
+
+
+def _parse_operation_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 class OpsSignalConnector(Protocol):

@@ -1614,6 +1614,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the repository root.",
     )
+    cockpit_parser.add_argument(
+        "--stale-heartbeat-seconds",
+        type=int,
+        default=300,
+        help="Mark active work as possibly stuck when its heartbeat is older than this many seconds.",
+    )
 
     return parser
 
@@ -2433,7 +2439,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "factory-cockpit":
         try:
-            summary = build_cockpit_summary(args.store_dir, repo_root_override=args.repo_root)
+            summary = build_cockpit_summary(
+                args.store_dir,
+                repo_root_override=args.repo_root,
+                stale_heartbeat_seconds=args.stale_heartbeat_seconds,
+            )
         except AutomationError as exc:
             print(f"Factory cockpit failed: {exc}", file=sys.stderr)
             return 1
