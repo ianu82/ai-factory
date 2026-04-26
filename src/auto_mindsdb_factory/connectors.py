@@ -273,9 +273,11 @@ class CodexCLICodeWorkerConnector:
         config: CodexCLICodeWorkerConfig | None = None,
         *,
         subprocess_run=subprocess.run,
+        ownership_run=subprocess.run,
     ) -> None:
         self.config = config or CodexCLICodeWorkerConfig.from_env()
         self.subprocess_run = subprocess_run
+        self.ownership_run = ownership_run
 
     def run_code_worker(self, job: CodeWorkerJob) -> CodeWorkerResult:
         started_at = utc_now()
@@ -303,6 +305,7 @@ class CodexCLICodeWorkerConnector:
             ]
         )
         command = self._execution_command(command)
+        prepared_owner = self._prepare_worktree_owner(job)
         try:
             completed = self.subprocess_run(
                 command,
@@ -328,6 +331,9 @@ class CodexCLICodeWorkerConnector:
             stdout = ""
             stderr = str(exc)
             status = "failed"
+        finally:
+            if prepared_owner:
+                self._restore_worktree_owner(job)
 
         changed_paths = _git_changed_paths(job.worktree_path)
         diff_stat = _git_diff_stat(job.worktree_path)
@@ -362,6 +368,49 @@ class CodexCLICodeWorkerConnector:
             "--",
             *command,
         ]
+
+    def _prepare_worktree_owner(self, job: CodeWorkerJob) -> bool:
+        if not self.config.run_as_user:
+            return False
+        self._run_ownership_command(
+            [
+                self.config.sudo_bin,
+                "chown",
+                "-R",
+                self.config.run_as_user,
+                str(job.worktree_path.parent),
+            ],
+            action="prepare worktree for code worker user",
+        )
+        return True
+
+    def _restore_worktree_owner(self, job: CodeWorkerJob) -> None:
+        owner = f"{os.getuid()}:{os.getgid()}"
+        self._run_ownership_command(
+            [
+                self.config.sudo_bin,
+                "chown",
+                "-R",
+                owner,
+                str(job.worktree_path.parent),
+            ],
+            action="restore worktree ownership to orchestrator user",
+        )
+
+    def _run_ownership_command(self, command: list[str], *, action: str) -> None:
+        try:
+            completed = self.ownership_run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise FactoryConnectorError(f"Could not {action}: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+            raise FactoryConnectorError(f"Could not {action}: {detail}")
 
 
 _SECRET_VALUE_PATTERN = re.compile(

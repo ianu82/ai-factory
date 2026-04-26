@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -429,6 +430,7 @@ def test_codex_cli_code_worker_can_bypass_sandbox_for_externally_isolated_hosts(
 
 def test_codex_cli_code_worker_can_run_as_separate_os_user(tmp_path) -> None:
     captured: dict[str, object] = {}
+    ownership_commands: list[list[str]] = []
 
     class Completed:
         returncode = 0
@@ -437,6 +439,10 @@ def test_codex_cli_code_worker_can_run_as_separate_os_user(tmp_path) -> None:
 
     def fake_run(command, **kwargs):
         captured["command"] = command
+        return Completed()
+
+    def fake_ownership_run(command, **kwargs):
+        ownership_commands.append(command)
         return Completed()
 
     connector = CodexCLICodeWorkerConnector(
@@ -448,6 +454,7 @@ def test_codex_cli_code_worker_can_run_as_separate_os_user(tmp_path) -> None:
             run_as_user="ai-factory-worker",
         ),
         subprocess_run=fake_run,
+        ownership_run=fake_ownership_run,
     )
     job = CodeWorkerJob(
         work_item_id="wi-123",
@@ -473,3 +480,45 @@ def test_codex_cli_code_worker_can_run_as_separate_os_user(tmp_path) -> None:
         "--",
     ]
     assert captured["command"][5:9] == ["/usr/bin/codex", "exec", "-m", "gpt-5.4"]
+    assert ownership_commands[0] == [
+        "sudo",
+        "chown",
+        "-R",
+        "ai-factory-worker",
+        str(tmp_path.parent),
+    ]
+    assert ownership_commands[1][:4] == ["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}"]
+    assert ownership_commands[1][4] == str(tmp_path.parent)
+
+
+def test_codex_cli_code_worker_reports_worktree_owner_prepare_failure(tmp_path) -> None:
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "not allowed"
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="/usr/bin/codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            run_as_user="ai-factory-worker",
+        ),
+        subprocess_run=lambda command, **kwargs: pytest.fail("code worker should not run"),
+        ownership_run=lambda command, **kwargs: Completed(),
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    with pytest.raises(FactoryConnectorError, match="prepare worktree"):
+        connector.run_code_worker(job)
