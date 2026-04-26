@@ -215,6 +215,16 @@
             "stderr": {
               "type": "string"
             },
+            "worktree_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "isolated_worktree": {
+              "type": "boolean"
+            },
+            "edited_main_checkout": {
+              "type": "boolean"
+            },
             "started_at": {
               "$ref": "common.schema.json#/$defs/timestamp"
             },

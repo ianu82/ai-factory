@@ -195,13 +195,16 @@ class CodeWorkerResult:
     started_at: str
     completed_at: str
     exit_code: int
+    worktree_path: str | None = None
+    isolated_worktree: bool | None = None
+    edited_main_checkout: bool | None = None
 
     @property
     def passed(self) -> bool:
         return self.status == "succeeded" and self.exit_code == 0
 
     def to_document(self) -> dict[str, Any]:
-        return {
+        document = {
             "status": self.status,
             "provider": self.provider,
             "model": self.model,
@@ -214,6 +217,13 @@ class CodeWorkerResult:
             "completed_at": self.completed_at,
             "exit_code": self.exit_code,
         }
+        if self.worktree_path is not None:
+            document["worktree_path"] = self.worktree_path
+        if self.isolated_worktree is not None:
+            document["isolated_worktree"] = self.isolated_worktree
+        if self.edited_main_checkout is not None:
+            document["edited_main_checkout"] = self.edited_main_checkout
+        return document
 
 
 class CodeWorkerConnector(Protocol):
@@ -346,6 +356,9 @@ class CodexCLICodeWorkerConnector:
             diff_stat=diff_stat,
             stdout=stdout,
             stderr=stderr,
+            worktree_path=str(job.worktree_path),
+            isolated_worktree=True,
+            edited_main_checkout=False,
             started_at=started_at,
             completed_at=utc_now(),
             exit_code=exit_code,

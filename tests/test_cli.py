@@ -12,8 +12,11 @@ from auto_mindsdb_factory.automation import (
     FactoryAutomationCoordinator,
     Stage1AutomationCycleResult,
 )
+from auto_mindsdb_factory.build_review import Stage3BuildReviewPipeline
 from auto_mindsdb_factory.__main__ import _load_work_item, main
 from auto_mindsdb_factory.controller import FactoryController
+from auto_mindsdb_factory.intake import Stage1IntakePipeline, build_manual_intake_item
+from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
 
 
 def _load_json(path: Path) -> dict:
@@ -81,6 +84,77 @@ def load_stage8_result_document(root: Path, scenario_name: str) -> dict:
     }
 
 
+def _write_stage_result(
+    store_dir: Path,
+    *,
+    work_item_id: str,
+    stage_name: str,
+    document: dict,
+) -> Path:
+    stage_path = store_dir / "runs" / work_item_id / f"{stage_name}-result.json"
+    stage_path.parent.mkdir(parents=True, exist_ok=True)
+    stage_path.write_text(json.dumps(document), encoding="utf-8")
+    return stage_path
+
+
+def _factory_cockpit_stage3_document(root: Path) -> dict:
+    stage1_result = Stage1IntakePipeline(root).process_item(
+        build_manual_intake_item(
+            provider="linear",
+            external_id="linear-issue-sof-114",
+            title="Factory cockpit should expose run isolation and concurrency health",
+            url="https://linear.app/mindsdb/issue/SOF-114/factory-cockpit-isolation",
+            detected_at="2026-04-26T19:18:23Z",
+            published_at="2026-04-26T19:18:22Z",
+            body=(
+                "The factory cockpit should expose machine-readable branch, pull request, and "
+                "isolated worktree evidence for Stage 3 runs so operators can confirm concurrent "
+                "runs stayed off the main checkout."
+            ),
+        )
+    )
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    stage3_document = (
+        Stage3BuildReviewPipeline(root)
+        .process(
+            stage2_result.spec_packet,
+            stage2_result.policy_decision,
+            stage2_result.ticket_bundle,
+            stage2_result.eval_manifest,
+            stage2_result.work_item,
+            repository="ianu82/ai-factory",
+        )
+        .to_document()
+    )
+    branch_name = (
+        "factory/work-item-factory-cockpit-should-expose-run-isolation-and-1454bb4de285"
+    )
+    pr_url = "https://github.com/ianu82/ai-factory/pull/114"
+    stage3_document["pr_packet"]["branch_name"] = branch_name
+    stage3_document["pr_packet"]["pull_request"]["number"] = 114
+    stage3_document["pr_packet"]["pull_request"]["url"] = pr_url
+    stage3_document["pr_packet"]["delivery_evidence"] = {
+        "mode": "code_worker_pr",
+        "repository": "ianu82/ai-factory",
+        "branch_name": branch_name,
+        "base_branch": "main",
+        "commit_sha": "abc1234",
+        "pull_request_number": 114,
+        "pull_request_url": pr_url,
+        "code_worker": {
+            "worktree_path": "/tmp/ai-factory-worktree-8i3hlh94/repo",
+            "isolated_worktree": True,
+            "edited_main_checkout": False,
+        },
+        "created_at": "2026-04-26T19:25:16Z",
+    }
+    return stage3_document
+
+
 def test_stage1_manual_intake_cli_emits_valid_bundle(capsys) -> None:
     exit_code = main(
         [
@@ -138,7 +212,9 @@ def test_stage2_cli_reports_invalid_json(capsys, tmp_path) -> None:
     assert "not valid JSON" in captured.err
 
 
-def test_stage2_cli_reports_missing_openai_api_key(capsys, monkeypatch, tmp_path) -> None:
+def test_stage2_cli_reports_missing_openai_api_key(
+    capsys, monkeypatch, tmp_path
+) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     stage1_result = tmp_path / "stage1-result.json"
     stage1_result.write_text(
@@ -257,6 +333,174 @@ def test_stage2_cli_loads_repo_env_file_before_parser_defaults(
     assert captured["openai_api_key"] == "local-key"
 
 
+def test_factory_cockpit_cli_exposes_source_and_isolation_fields(
+    capsys, tmp_path
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    stage3_document = _factory_cockpit_stage3_document(root)
+
+    _write_stage_result(
+        store_dir,
+        work_item_id=stage3_document["work_item"]["work_item_id"],
+        stage_name="stage3",
+        document=stage3_document,
+    )
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(store_dir),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    run = payload["runs"][0]
+
+    assert exit_code == 0
+    assert run["source"]["identifier"] == "SOF-114"
+    assert (
+        run["source"]["url"]
+        == "https://linear.app/mindsdb/issue/SOF-114/factory-cockpit-isolation"
+    )
+    assert run["branch_name"] == (
+        "factory/work-item-factory-cockpit-should-expose-run-isolation-and-1454bb4de285"
+    )
+    assert run["pull_request"]["number"] == 114
+    assert run["pull_request"]["url"] == "https://github.com/ianu82/ai-factory/pull/114"
+    assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
+    assert run["isolation"]["status"] == "healthy"
+    assert run["isolation"]["mode"] == "per_run_branch_and_worktree"
+
+
+def test_factory_cockpit_cli_keeps_pre_stage3_runs_pending(
+    capsys, tmp_path
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    stage1_result = Stage1IntakePipeline(root).process_item(
+        build_manual_intake_item(
+            provider="linear",
+            external_id="linear-issue-sof-114",
+            title="Factory cockpit should expose run isolation and concurrency health",
+            url="https://linear.app/mindsdb/issue/SOF-114/factory-cockpit-isolation",
+            detected_at="2026-04-26T19:18:23Z",
+            published_at="2026-04-26T19:18:22Z",
+            body=(
+                "The factory cockpit should expose machine-readable branch, pull request, and "
+                "isolated worktree evidence for Stage 3 runs so operators can confirm concurrent "
+                "runs stayed off the main checkout."
+            ),
+        )
+    )
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    _write_stage_result(
+        store_dir,
+        work_item_id=stage2_result.work_item.work_item_id,
+        stage_name="stage2",
+        document=stage2_result.to_document(),
+    )
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(store_dir),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    run = payload["runs"][0]
+
+    assert exit_code == 0
+    assert run["state"] == "TICKETED"
+    assert run["controller_state"] == "TICKETED"
+    assert run["source"]["identifier"] == "SOF-114"
+    assert run["branch_name"] is None
+    assert run["pull_request"] is None
+    assert run["isolation"]["status"] == "pending"
+    assert run["isolation"]["mode"] == "not_required_yet"
+
+
+def test_factory_cockpit_cli_warns_when_code_worker_evidence_is_incomplete(
+    capsys, tmp_path
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    stage3_document = _factory_cockpit_stage3_document(root)
+    branch_name = (
+        "factory/work-item-factory-cockpit-should-expose-run-isolation-and-1454bb4de285"
+    )
+    pr_url = "https://github.com/ianu82/ai-factory/pull/114"
+    stage3_document["pr_packet"]["branch_name"] = branch_name
+    stage3_document["pr_packet"]["pull_request"]["number"] = 114
+    stage3_document["pr_packet"]["pull_request"]["url"] = pr_url
+    stage3_document["pr_packet"]["delivery_evidence"] = {
+        "mode": "code_worker_pr",
+        "repository": "ianu82/ai-factory",
+        "branch_name": branch_name,
+        "base_branch": "main",
+        "commit_sha": "abc1234",
+        "pull_request_number": 114,
+        "pull_request_url": pr_url,
+        "code_worker": {
+            "status": "succeeded",
+            "provider": "codex_cli",
+            "model": "gpt-5.4",
+            "command": ["codex", "exec", "-m", "gpt-5.4", "-"],
+            "changed_paths": ["src/auto_mindsdb_factory/vertical_slice.py"],
+            "diff_stat": " 1 file changed, 1 insertion(+)",
+            "stdout": "ok",
+            "stderr": "",
+            "started_at": "2026-04-26T19:25:16Z",
+            "completed_at": "2026-04-26T19:25:20Z",
+            "exit_code": 0,
+        },
+        "created_at": "2026-04-26T19:25:16Z",
+    }
+
+    _write_stage_result(
+        store_dir,
+        work_item_id=stage3_document["work_item"]["work_item_id"],
+        stage_name="stage3",
+        document=stage3_document,
+    )
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(store_dir),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    run = payload["runs"][0]
+
+    assert exit_code == 0
+    assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
+    assert run["branch_name"] == branch_name
+    assert run["pull_request"]["number"] == 114
+    assert run["pull_request"]["url"] == pr_url
+    assert run["isolation"]["status"] == "warning"
+    assert run["isolation"]["mode"] == "per_run_branch_and_worktree"
+    assert "not fully persisted" in run["isolation"]["summary"]
+
+
 def test_linear_webhook_server_cli_invokes_runtime(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
 
@@ -311,7 +555,9 @@ def test_linear_trigger_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) ->
                 "trigger_state": {
                     "version": 1,
                     "processed_delivery_ids": ["delivery-123"],
-                    "processed_logical_trigger_keys": ["linear:issue-123:state-factory:2026-04-24T12:00:00Z"],
+                    "processed_logical_trigger_keys": [
+                        "linear:issue-123:state-factory:2026-04-24T12:00:00Z"
+                    ],
                     "updated_at": "2026-04-24T12:00:02Z",
                 },
             }
@@ -320,11 +566,15 @@ def test_linear_trigger_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) ->
             return []
 
     class _FakeWorker:
-        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+        def __init__(
+            self, store_dir: Path, *, repo_root_override: Path | None = None
+        ) -> None:
             self.store_dir = store_dir
             self.repo_root_override = repo_root_override
 
-        def run_cycle(self, *, repository: str, max_events: int | None = None) -> _FakeResult:
+        def run_cycle(
+            self, *, repository: str, max_events: int | None = None
+        ) -> _FakeResult:
             assert repository == "ianu82/ai-factory"
             assert max_events == 2
             return _FakeResult()
@@ -352,9 +602,13 @@ def test_linear_trigger_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) ->
     assert payload["processed_events"] == [{"delivery_id": "delivery-123"}]
 
 
-def test_linear_ensure_stage_states_cli_emits_result(capsys, monkeypatch, tmp_path) -> None:
+def test_linear_ensure_stage_states_cli_emits_result(
+    capsys, monkeypatch, tmp_path
+) -> None:
     class _FakeSync:
-        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+        def __init__(
+            self, store_dir: Path, *, repo_root_override: Path | None = None
+        ) -> None:
             assert store_dir == tmp_path / "store"
             assert repo_root_override == tmp_path / "repo"
 
@@ -397,7 +651,9 @@ def test_linear_sync_cycle_cli_emits_result(capsys, monkeypatch, tmp_path) -> No
             }
 
     class _FakeSync:
-        def __init__(self, store_dir: Path, *, repo_root_override: Path | None = None) -> None:
+        def __init__(
+            self, store_dir: Path, *, repo_root_override: Path | None = None
+        ) -> None:
             assert store_dir == tmp_path / "store"
             assert repo_root_override == tmp_path / "repo"
 
@@ -687,7 +943,9 @@ def test_stage_merge_cli_merges_guarded_fixture(capsys) -> None:
     assert payload["work_item"]["state"] == "MERGED"
 
 
-def test_stage7_cli_rejects_restricted_security_approved_bundle_without_merge(capsys, tmp_path) -> None:
+def test_stage7_cli_rejects_restricted_security_approved_bundle_without_merge(
+    capsys, tmp_path
+) -> None:
     root = Path(__file__).resolve().parents[1]
     base = root / "fixtures" / "scenarios" / "stage6_security_pending_feature"
 
@@ -964,7 +1222,9 @@ def test_automation_stage1_cli_returns_error_on_failed_immediate_handoff(
     assert "synthetic handoff failure" in captured.err
 
 
-def test_automation_register_bundle_cli_rejects_malformed_stage8_result(capsys, tmp_path) -> None:
+def test_automation_register_bundle_cli_rejects_malformed_stage8_result(
+    capsys, tmp_path
+) -> None:
     invalid_stage8 = tmp_path / "stage8-invalid.json"
     invalid_stage8.write_text(
         json.dumps(
@@ -998,18 +1258,22 @@ def test_automation_register_bundle_cli_rejects_malformed_stage8_result(capsys, 
     assert "missing required object fields" in captured.err
 
 
-def test_automation_register_bundle_cli_can_advance_immediately(capsys, tmp_path) -> None:
+def test_automation_register_bundle_cli_can_advance_immediately(
+    capsys, tmp_path
+) -> None:
     root = Path(__file__).resolve().parents[1]
-    html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
-        encoding="utf-8"
-    )
+    html = (
+        root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+    ).read_text(encoding="utf-8")
     source_coordinator = FactoryAutomationCoordinator(
         tmp_path / "source-store",
         repo_root_override=root,
     )
     stage1_result = source_coordinator.run_stage1_cycle(html=html, max_new_items=1)
     stage1_document = json.loads(
-        Path(stage1_result.created_results[0]["stored_path"]).read_text(encoding="utf-8")
+        Path(stage1_result.created_results[0]["stored_path"]).read_text(
+            encoding="utf-8"
+        )
     )
     stage1_file = tmp_path / "stage1-result.json"
     stage1_file.write_text(json.dumps(stage1_document), encoding="utf-8")
@@ -1075,24 +1339,36 @@ def test_automation_register_bundle_cli_returns_error_on_failed_immediate_handof
     root = Path(__file__).resolve().parents[1]
     scenario = root / "fixtures" / "scenarios" / "stage4_reviewable_feature"
     stage4_document = {
-        "spec_packet": json.loads((scenario / "spec-packet.json").read_text(encoding="utf-8")),
+        "spec_packet": json.loads(
+            (scenario / "spec-packet.json").read_text(encoding="utf-8")
+        ),
         "policy_decision": json.loads(
             (scenario / "policy-decision.json").read_text(encoding="utf-8")
         ),
-        "ticket_bundle": json.loads((scenario / "ticket-bundle.json").read_text(encoding="utf-8")),
-        "eval_manifest": json.loads((scenario / "eval-manifest.json").read_text(encoding="utf-8")),
-        "pr_packet": json.loads((scenario / "pr-packet.json").read_text(encoding="utf-8")),
+        "ticket_bundle": json.loads(
+            (scenario / "ticket-bundle.json").read_text(encoding="utf-8")
+        ),
+        "eval_manifest": json.loads(
+            (scenario / "eval-manifest.json").read_text(encoding="utf-8")
+        ),
+        "pr_packet": json.loads(
+            (scenario / "pr-packet.json").read_text(encoding="utf-8")
+        ),
         "prompt_contract": json.loads(
             (scenario / "prompt-contract.json").read_text(encoding="utf-8")
         ),
-        "tool_schema": json.loads((scenario / "tool-schema.json").read_text(encoding="utf-8")),
+        "tool_schema": json.loads(
+            (scenario / "tool-schema.json").read_text(encoding="utf-8")
+        ),
         "golden_dataset": json.loads(
             (scenario / "golden-dataset.json").read_text(encoding="utf-8")
         ),
         "latency_baseline": json.loads(
             (scenario / "latency-baseline.json").read_text(encoding="utf-8")
         ),
-        "work_item": json.loads((scenario / "work-item.json").read_text(encoding="utf-8")),
+        "work_item": json.loads(
+            (scenario / "work-item.json").read_text(encoding="utf-8")
+        ),
     }
     stage4_document["work_item"]["state"] = "PR_MERGEABLE"
     stage4_file = tmp_path / "stage4-result.json"
@@ -1121,7 +1397,9 @@ def test_automation_register_bundle_cli_returns_error_on_failed_immediate_handof
     assert "Automation immediate handoff failed:" in captured.err
 
 
-def test_automation_advance_runs_cli_progresses_active_build_items(capsys, tmp_path) -> None:
+def test_automation_advance_runs_cli_progresses_active_build_items(
+    capsys, tmp_path
+) -> None:
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
     store_dir = tmp_path / "automation-store"
@@ -1200,7 +1478,9 @@ def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
             assert config.autonomy_mode.value == "pr_ready"
             assert config.max_events_per_cycle == 3
 
-        def run(self, *, once: bool = False, max_cycles: int | None = None) -> dict[str, object]:
+        def run(
+            self, *, once: bool = False, max_cycles: int | None = None
+        ) -> dict[str, object]:
             assert once is True
             assert max_cycles is None
             return {
