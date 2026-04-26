@@ -67,9 +67,12 @@ _ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off"})
 _SECRET_VALUE_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*['\"]?[^'\"\s,}]+"
+    r"(?i)(api[_-]?key|token|secret|password|authorization|signature)\s*[:=]\s*['\"]?[^'\"\s,}]+"
 )
 _URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
+_SENSITIVE_SMOKE_KEY_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization|signature)"
+)
 
 
 class EnvironmentSetupError(RuntimeError):
@@ -1779,11 +1782,20 @@ def _sanitize_smoke_text(value: str) -> str:
     return _URL_IN_TEXT_PATTERN.sub(_sanitize_url_match, sanitized)
 
 
-def _sanitize_smoke_value(value: Any) -> Any:
+def _is_sensitive_smoke_key(value: Any) -> bool:
+    return isinstance(value, str) and _SENSITIVE_SMOKE_KEY_PATTERN.search(value) is not None
+
+
+def _sanitize_smoke_value(value: Any, *, parent_key: str | None = None) -> Any:
+    if parent_key is not None and _is_sensitive_smoke_key(parent_key):
+        return None if value is None else "[REDACTED]"
     if isinstance(value, dict):
-        return {key: _sanitize_smoke_value(child) for key, child in value.items()}
+        return {
+            key: _sanitize_smoke_value(child, parent_key=str(key))
+            for key, child in value.items()
+        }
     if isinstance(value, list):
-        return [_sanitize_smoke_value(child) for child in value]
+        return [_sanitize_smoke_value(child, parent_key=parent_key) for child in value]
     if isinstance(value, str):
         return _sanitize_smoke_text(value)
     return value
@@ -1836,13 +1848,19 @@ def _doctor_report_for_smoke(doctor: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _is_valid_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _check_uuid_config(env_name: str, *, check_name: str) -> dict[str, Any]:
     value = _env_value(env_name)
     if not value:
         return _smoke_check(check_name, "failed", f"{env_name} is missing.", value=None)
-    try:
-        UUID(value)
-    except ValueError:
+    if not _is_valid_uuid(value):
         return _smoke_check(
             check_name,
             "failed",
@@ -1944,6 +1962,7 @@ def _verify_linear_stage_setup(
 ) -> dict[str, Any]:
     api_key = _env_value("LINEAR_API_KEY")
     team_id = _env_value("LINEAR_TARGET_TEAM_ID")
+    state_id = _env_value("LINEAR_TARGET_STATE_ID")
     if not api_key:
         return _smoke_check(
             "linear:stage_setup",
@@ -1956,11 +1975,29 @@ def _verify_linear_stage_setup(
             "failed",
             "LINEAR_TARGET_TEAM_ID is required to verify Linear stage setup.",
         )
+    if not _is_valid_uuid(team_id):
+        return _smoke_check(
+            "linear:stage_setup",
+            "failed",
+            "LINEAR_TARGET_TEAM_ID must be a valid UUID before verifying Linear stage setup.",
+        )
+    if not state_id:
+        return _smoke_check(
+            "linear:stage_setup",
+            "failed",
+            "LINEAR_TARGET_STATE_ID is required to verify Linear stage setup.",
+        )
+    if not _is_valid_uuid(state_id):
+        return _smoke_check(
+            "linear:stage_setup",
+            "failed",
+            "LINEAR_TARGET_STATE_ID must be a valid UUID before verifying Linear stage setup.",
+        )
     config = LinearWorkflowConfig(
         api_key=api_key,
         team_id=team_id,
         trigger_base_url=_env_value("FACTORY_TRIGGER_BASE_URL") or None,
-        trigger_state_id=_env_value("LINEAR_TARGET_STATE_ID") or None,
+        trigger_state_id=state_id,
         create_missing_states=False,
     )
     try:

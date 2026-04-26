@@ -1644,6 +1644,121 @@ def test_factory_smoke_cli_sanitizes_nested_doctor_output(
     assert "sk-secret" not in captured.out
 
 
+def test_factory_smoke_cli_redacts_unexpected_sensitive_fields(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "api_key": "sk-secret",
+            "token": "ghp-secret-token",
+            "nested": {
+                "authorization": "Bearer secret-value",
+                "signature": "sha256=abc123",
+            },
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    gates_check = next(check for check in payload["checks"] if check["name"] == "gates:required_commands")
+    assert gates_check["api_key"] == "[REDACTED]"
+    assert gates_check["token"] == "[REDACTED]"
+    assert gates_check["nested"] == {
+        "authorization": "[REDACTED]",
+        "signature": "[REDACTED]",
+    }
+    assert "sk-secret" not in captured.out
+    assert "ghp-secret-token" not in captured.out
+    assert "secret-value" not in captured.out
+    assert "sha256=abc123" not in captured.out
+
+
+def test_factory_smoke_verifies_linear_ids_before_sync(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_key")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "not-a-uuid")
+
+    class _UnexpectedSync:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("LinearWorkflowSync should not be constructed for invalid UUIDs.")
+
+    monkeypatch.setattr(cli_main, "LinearWorkflowSync", _UnexpectedSync)
+
+    check = cli_main._verify_linear_stage_setup(tmp_path / "store", repo_root_override=tmp_path)
+
+    assert check["status"] == "failed"
+    assert (
+        check["summary"]
+        == "LINEAR_TARGET_STATE_ID must be a valid UUID before verifying Linear stage setup."
+    )
+
+
 def test_factory_smoke_requires_executable_repo_relative_gate_commands(
     monkeypatch,
     tmp_path,
