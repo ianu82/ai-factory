@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1229,6 +1230,84 @@ def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     payload = json.loads(captured.out)
     assert payload["cycle"] == "factory-worker"
     assert payload["cycles"] == [{"cycle": "factory-worker-cycle"}]
+
+
+def test_factory_cockpit_cli_marks_stale_heartbeats_with_custom_threshold(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    work_item_id = "wi-stage5-stale-cli"
+    run_dir = tmp_path / "store" / "runs" / work_item_id
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.vertical_slice.load_active_code_worker_operations",
+        lambda: {},
+    )
+
+    stage4_result = {
+        "spec_packet": {},
+        "policy_decision": {},
+        "ticket_bundle": {},
+        "eval_manifest": {},
+        "pr_packet": {
+            "pull_request": {
+                "repository": "ianu82/ai-factory",
+                "url": "https://github.com/ianu82/ai-factory/pull/42",
+            }
+        },
+        "prompt_contract": {},
+        "tool_schema": {},
+        "golden_dataset": {},
+        "latency_baseline": {},
+        "work_item": {
+            "work_item_id": work_item_id,
+            "state": "PR_REVIEWABLE",
+            "title": "CLI stale heartbeat test",
+            "updated_at": "2026-04-26T20:00:00Z",
+        },
+    }
+    (run_dir / "stage4-result.json").write_text(
+        json.dumps(stage4_result),
+        encoding="utf-8",
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    refreshed_at = (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    acquired_at = (now - timedelta(minutes=12)).isoformat().replace("+00:00", "Z")
+    expires_at = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    (run_dir / ".automation.lock").write_text(
+        json.dumps(
+            {
+                "scope": "run",
+                "resource_id": work_item_id,
+                "lease_id": "lease-123",
+                "acquired_at": acquired_at,
+                "refreshed_at": refreshed_at,
+                "expires_at": expires_at,
+                "pid": 999,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(root),
+            "--stale-heartbeat-seconds",
+            "5",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["runs"][0]["active_operation"]["stage"] == "stage5"
+    assert payload["runs"][0]["active_operation"]["heartbeat_status"] == "possibly_stuck"
 
 
 def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:

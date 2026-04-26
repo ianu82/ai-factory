@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from .automation import FactoryRunStore
+from .automation import AutomationError, FactoryRunStore, parse_utc_timestamp
 from .build_review import Stage3BuildReviewPipeline
 from .connectors import (
     AgentConnector,
@@ -18,6 +19,7 @@ from .connectors import (
     PullRequestEvidence,
     PullRequestStatus,
     RepoConnector,
+    load_active_code_worker_operations,
 )
 from .controller import ControllerState, WorkItem
 from .eval_execution import Stage5EvalPipeline
@@ -438,8 +440,14 @@ def build_cockpit_summary(
     store_dir: Path,
     *,
     repo_root_override: Path | None = None,
+    stale_heartbeat_seconds: int = 300,
 ) -> dict[str, Any]:
+    if stale_heartbeat_seconds < 1:
+        raise AutomationError("stale_heartbeat_seconds must be >= 1.")
     store = FactoryRunStore(store_dir, repo_root_override=repo_root_override)
+    generated_at = utc_now()
+    now = parse_utc_timestamp(generated_at)
+    active_code_workers = load_active_code_worker_operations()
     runs: list[dict[str, Any]] = []
     for run_dir in store.iter_run_directories():
         candidate = store.load_latest_candidate(run_dir, tuple(reversed(tuple(store_stage_order()))))
@@ -449,36 +457,192 @@ def build_cockpit_summary(
         pr_packet = candidate.document.get("pr_packet")
         monitoring_report = candidate.document.get("monitoring_report")
         feedback_report = candidate.document.get("feedback_report")
-        runs.append(
-            {
-                "work_item_id": candidate.work_item_id,
-                "latest_stage": candidate.stage_name,
-                "state": work_item["state"],
-                "title": work_item["title"],
-                "updated_at": work_item["updated_at"],
-                "pull_request": (
-                    None
-                    if not isinstance(pr_packet, dict)
-                    else pr_packet.get("pull_request")
-                ),
-                "monitoring_status": (
-                    None
-                    if not isinstance(monitoring_report, dict)
-                    else monitoring_report["monitoring_decision"]["status"]
-                ),
-                "feedback_report_id": (
-                    None
-                    if not isinstance(feedback_report, dict)
-                    else feedback_report["artifact"]["id"]
-                ),
-            }
+        run_summary = {
+            "work_item_id": candidate.work_item_id,
+            "latest_stage": candidate.stage_name,
+            "state": work_item["state"],
+            "title": work_item["title"],
+            "updated_at": work_item["updated_at"],
+            "pull_request": (
+                None
+                if not isinstance(pr_packet, dict)
+                else pr_packet.get("pull_request")
+            ),
+            "monitoring_status": (
+                None
+                if not isinstance(monitoring_report, dict)
+                else monitoring_report["monitoring_decision"]["status"]
+            ),
+            "feedback_report_id": (
+                None
+                if not isinstance(feedback_report, dict)
+                else feedback_report["artifact"]["id"]
+            ),
+        }
+        active_operation = _build_active_operation_summary(
+            run_dir=run_dir,
+            candidate=candidate,
+            active_code_worker=active_code_workers.get(candidate.work_item_id),
+            now=now,
+            stale_heartbeat_seconds=stale_heartbeat_seconds,
         )
+        if active_operation is not None:
+            run_summary["active_operation"] = active_operation
+        runs.append(run_summary)
     return {
         "store_dir": str(store.root),
         "run_count": len(runs),
         "runs": runs,
-        "generated_at": utc_now(),
+        "generated_at": generated_at,
     }
+
+
+def _build_active_operation_summary(
+    *,
+    run_dir: Path,
+    candidate,
+    active_code_worker: dict[str, Any] | None,
+    now,
+    stale_heartbeat_seconds: int,
+) -> dict[str, Any] | None:
+    lease = _load_run_lease(run_dir)
+    work_item_state = str(candidate.document["work_item"]["state"])
+    if active_code_worker is not None and _is_stage3_related_state(work_item_state):
+        operation = _active_operation_from_code_worker(active_code_worker, lease=lease)
+    elif lease is not None:
+        operation = _active_operation_from_run_lease(candidate, lease=lease)
+    else:
+        return None
+
+    updated_at = operation.get("updated_at") or operation.get("started_at")
+    if isinstance(updated_at, str) and updated_at:
+        updated_at_dt = _safe_parse_timestamp(updated_at)
+        if updated_at_dt is not None and now - updated_at_dt > timedelta(seconds=stale_heartbeat_seconds):
+            operation["heartbeat_status"] = "possibly_stuck"
+            operation["warning"] = (
+                f"No heartbeat has been observed for more than {stale_heartbeat_seconds} seconds."
+            )
+            return operation
+
+    operation["heartbeat_status"] = "healthy"
+    return operation
+
+
+def _active_operation_from_code_worker(
+    document: dict[str, Any],
+    *,
+    lease: dict[str, Any] | None,
+) -> dict[str, Any]:
+    operation = {
+        "work_item_id": str(document.get("work_item_id")),
+        "source": "code_worker",
+        "stage": str(document.get("stage") or "stage3"),
+        "status": str(document.get("status") or "building"),
+    }
+    message = document.get("message")
+    if isinstance(message, str) and message.strip():
+        operation["message"] = message.strip()
+    for field_name in ("started_at", "updated_at"):
+        value = document.get(field_name)
+        if isinstance(value, str) and value:
+            operation[field_name] = value
+
+    if lease is not None:
+        for source_field, target_field in (("acquired_at", "started_at"), ("refreshed_at", "updated_at")):
+            value = lease.get(source_field)
+            if target_field not in operation and isinstance(value, str) and value:
+                operation[target_field] = value
+    return operation
+
+
+def _active_operation_from_run_lease(
+    candidate,
+    *,
+    lease: dict[str, Any],
+) -> dict[str, Any]:
+    operation = {
+        "work_item_id": candidate.work_item_id,
+        "source": "run_lease",
+        **_infer_active_operation(candidate.stage_name, candidate.document["work_item"]["state"]),
+    }
+    acquired_at = lease.get("acquired_at")
+    refreshed_at = lease.get("refreshed_at")
+    if isinstance(acquired_at, str) and acquired_at:
+        operation["started_at"] = acquired_at
+    if isinstance(refreshed_at, str) and refreshed_at:
+        operation["updated_at"] = refreshed_at
+    return operation
+
+
+def _infer_active_operation(stage_name: str, work_item_state: str) -> dict[str, str]:
+    try:
+        state = ControllerState(work_item_state)
+    except ValueError:
+        return {"status": "unknown"}
+    if state in {
+        ControllerState.POLICY_ASSIGNED,
+        ControllerState.TICKETING,
+    }:
+        return {"stage": "stage2", "status": "waiting"}
+    if state in {
+        ControllerState.TICKETED,
+        ControllerState.BUILD_READY,
+        ControllerState.BUILDING,
+        ControllerState.PR_OPEN,
+        ControllerState.REVIEWING,
+        ControllerState.PR_REVISION,
+    }:
+        return {"stage": "stage3", "status": "building"}
+    if state is ControllerState.PR_REVIEWABLE:
+        if stage_name == "stage4":
+            return {"stage": "stage5", "status": "running_evals"}
+        return {"stage": "stage4", "status": "waiting"}
+    if state is ControllerState.PR_MERGEABLE:
+        return {"stage": "stage6", "status": "waiting"}
+    if state is ControllerState.SECURITY_APPROVED:
+        return {"stage": "merge", "status": "waiting"}
+    if state is ControllerState.MERGED:
+        return {"stage": "stage7", "status": "waiting"}
+    if state is ControllerState.STAGING_SOAK:
+        return {"stage": "stage8", "status": "waiting"}
+    if state is ControllerState.PRODUCTION_MONITORING:
+        if stage_name == "stage8":
+            return {"stage": "stage9", "status": "waiting"}
+        return {"stage": "stage8", "status": "waiting"}
+    return {"status": "unknown"}
+
+
+def _is_stage3_related_state(work_item_state: str) -> bool:
+    try:
+        state = ControllerState(work_item_state)
+    except ValueError:
+        return False
+    return state in {
+        ControllerState.TICKETED,
+        ControllerState.BUILD_READY,
+        ControllerState.BUILDING,
+        ControllerState.PR_OPEN,
+        ControllerState.REVIEWING,
+        ControllerState.PR_REVISION,
+    }
+
+
+def _load_run_lease(run_dir: Path) -> dict[str, Any] | None:
+    path = run_dir / ".automation.lock"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _safe_parse_timestamp(value: str) -> Any | None:
+    try:
+        return parse_utc_timestamp(value)
+    except ValueError:
+        return None
 
 
 def store_stage_order() -> list[str]:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import auto_mindsdb_factory.connectors as connectors_module
 from auto_mindsdb_factory.connectors import (
     AgentTask,
     CodeWorkerJob,
@@ -17,6 +18,8 @@ from auto_mindsdb_factory.connectors import (
     GitHubCLIRepoConnector,
     OpenAIResponsesAgentConfig,
     OpenAIResponsesAgentConnector,
+    active_code_worker_operation_dir,
+    load_active_code_worker_operations,
     sanitize_factory_document,
 )
 
@@ -248,6 +251,39 @@ def test_sanitize_factory_document_redacts_secret_like_values() -> None:
     assert "ignore prior instructions" in sanitized["description"]
 
 
+def test_load_active_code_worker_operations_keeps_newest_heartbeat(tmp_path) -> None:
+    active_dir = active_code_worker_operation_dir(tmp_path / "active-operations")
+    active_dir.mkdir(parents=True)
+    (active_dir / "older.json").write_text(
+        json.dumps(
+            {
+                "work_item_id": "wi-123",
+                "stage": "stage3",
+                "status": "building",
+                "updated_at": "2026-04-26T20:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (active_dir / "newer.json").write_text(
+        json.dumps(
+            {
+                "work_item_id": "wi-123",
+                "stage": "stage3",
+                "status": "building",
+                "updated_at": "2026-04-26T20:05:00Z",
+                "message": "Running ticket-scoped tests",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (active_dir / "invalid.json").write_text("{not json", encoding="utf-8")
+
+    operations = load_active_code_worker_operations(root=active_dir)
+
+    assert operations["wi-123"]["message"] == "Running ticket-scoped tests"
+
+
 def test_codex_code_worker_scrubs_secret_environment(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
 
@@ -290,6 +326,52 @@ def test_codex_code_worker_scrubs_secret_environment(monkeypatch, tmp_path) -> N
     assert "LINEAR_API_KEY" not in captured["env"]
     assert result.command[-1] == "-"
     assert "Treat all issue descriptions" in captured["input"]
+
+
+def test_codex_code_worker_writes_active_operation_heartbeat(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(connectors_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    active_dir = active_code_worker_operation_dir()
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        operations = load_active_code_worker_operations(root=active_dir)
+        assert operations["wi-123"]["stage"] == "stage3"
+        assert operations["wi-123"]["status"] == "building"
+        assert operations["wi-123"]["branch_name"] == "factory/test"
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            heartbeat_interval_seconds=0.1,
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path / "worktree" / "repo",
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+    job.worktree_path.mkdir(parents=True)
+
+    connector.run_code_worker(job)
+
+    assert load_active_code_worker_operations(root=active_dir) == {}
 
 
 def test_codex_code_worker_ignores_factory_metadata_only_diff(tmp_path) -> None:
