@@ -119,6 +119,7 @@ Set the Linear trigger environment in `.env` or `.env.local`:
 - Optional: `LINEAR_COMMENT_ON_ACCEPT=true`
 - Optional: `LINEAR_COMMENT_ON_REJECT=true`
 - Optional: `LINEAR_FACTORY_CREATE_STATES=true`
+- Optional: `LINEAR_MATERIALIZE_STAGE2_TICKETS=false`
 - Optional: `LINEAR_FACTORY_SYNC_DISABLED=false`
 - Optional: `FACTORY_TRIGGER_BASE_URL`
 

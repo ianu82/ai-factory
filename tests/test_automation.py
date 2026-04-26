@@ -87,6 +87,23 @@ def load_stage4_result_document(root: Path, scenario_name: str) -> dict:
     }
 
 
+def load_stage5_result_document(root: Path, scenario_name: str) -> dict:
+    scenario = root / "fixtures" / "scenarios" / scenario_name
+    return {
+        "spec_packet": _load_json(scenario / "spec-packet.json"),
+        "policy_decision": _load_json(scenario / "policy-decision.json"),
+        "ticket_bundle": _load_json(scenario / "ticket-bundle.json"),
+        "eval_manifest": _load_json(scenario / "eval-manifest.json"),
+        "pr_packet": _load_json(scenario / "pr-packet.json"),
+        "prompt_contract": _load_json(scenario / "prompt-contract.json"),
+        "tool_schema": _load_json(scenario / "tool-schema.json"),
+        "golden_dataset": _load_json(scenario / "golden-dataset.json"),
+        "latency_baseline": _load_json(scenario / "latency-baseline.json"),
+        "eval_report": _load_json(scenario / "eval-report.json"),
+        "work_item": _load_json(scenario / "work-item.json"),
+    }
+
+
 class FakeLinearWorkflowSync:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -303,6 +320,32 @@ def test_pr_ready_autonomy_stops_after_security_review_and_comments_linear(tmp_p
     assert processed.stages_completed == ["stage2", "stage3", "stage4", "stage5", "stage6"]
     assert fake_sync.calls[-1]["stage_name"] == "stage6"
     assert fake_sync.calls[-1]["stall_reason"] == "pr_ready_for_human_merge_deploy"
+
+
+def test_automation_progression_routes_stage5_revision_back_to_stage3(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    store = FactoryRunStore(store_dir, repo_root_override=root)
+    stage5_document = load_stage5_result_document(root, "stage5_revision_feature")
+    store.save_stage_result("stage5", stage5_document)
+    fake_sync = FakeLinearWorkflowSync()
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        linear_workflow_sync=fake_sync,
+        autonomy_mode="pr_ready",
+    )
+
+    result = coordinator.run_progression_cycle()
+
+    assert result.skipped_runs == []
+    assert len(result.processed_runs) == 1
+    processed = result.processed_runs[0]
+    assert processed.starting_stage == "stage5"
+    assert processed.stages_completed[0] == "stage3"
+    stage3_document = _load_json(Path(processed.stored_paths["stage3"]))
+    assert stage3_document["work_item"]["state"] == "PR_REVIEWABLE"
+    assert any(call["stage_name"] == "stage3" for call in fake_sync.calls)
 
 
 def test_automation_supervisor_cycle_runs_stage1_progression_and_weekly_feedback(tmp_path) -> None:

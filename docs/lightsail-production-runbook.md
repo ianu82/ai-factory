@@ -10,13 +10,47 @@ Production v1 runs on one persistent Lightsail instance with one active worker a
 - `factory-worker` drains persisted Linear triggers, advances factory runs, invokes the code worker, runs gates, syncs Linear, and stops at human merge/deploy.
 - `AI_FACTORY_AUTONOMY_MODE=pr_ready` is the production default. It disables automatic merge, staging, production monitoring, and feedback movement unless those stages are backed by real external evidence later.
 
+## Current Deployment
+
+The first billable production test box is live on Lightsail and should be treated as the current AI Factory v1 host.
+
+- Instance: `ai-factory-prod-1`
+- Region/AZ: `us-west-2a`
+- Image: Ubuntu 24.04 LTS
+- Static IPv4: `184.33.39.108`
+- Public base URL: `https://184-33-39-108.sslip.io`
+- Linear webhook URL: `https://184-33-39-108.sslip.io/hooks/linear`
+- Linear webhook: `AI Factory Lightsail`, scoped to `software-factory`, `Issue` events only
+- Repository checkout: `/srv/ai-factory`
+- Run store: `/var/lib/ai-factory`
+- Environment file: `/etc/ai-factory/factory.env`
+- Service user: `ai-factory`
+- SSH access: `ssh -i ~/.ssh/anton_lightsail ubuntu@184.33.39.108`
+
+The worker is initially deployed with `AI_FACTORY_INTAKE_PAUSED=true`. This lets the webhook receive and persist valid events without starting new factory work until an operator explicitly unpauses intake.
+
+```sh
+sudo sed -i 's/^AI_FACTORY_INTAKE_PAUSED=.*/AI_FACTORY_INTAKE_PAUSED="false"/' /etc/ai-factory/factory.env
+sudo systemctl restart ai-factory-worker.service
+```
+
+Pause intake again with:
+
+```sh
+sudo sed -i 's/^AI_FACTORY_INTAKE_PAUSED=.*/AI_FACTORY_INTAKE_PAUSED="true"/' /etc/ai-factory/factory.env
+sudo systemctl restart ai-factory-worker.service
+```
+
+The Linear trigger state for this deployment is the team-specific Stage 1 intake state. Issues should move into that state when the team wants the factory to begin scoping and execution. `New Feature` remains a human requirements-quality state before factory intake.
+
 ## Required Host Setup
 
 - Attach a Lightsail static IP.
 - Point a DNS name at the static IP.
 - Terminate HTTPS with Caddy or nginx and proxy `https://<host>/hooks/linear` to the local webhook server.
-- Run services as a non-root user, for example `ai-factory`.
-- Store secrets outside the repo, for example `/etc/ai-factory/factory.env`, owned by the service user and mode `0600`.
+- Run services as a non-root orchestrator user, for example `ai-factory`.
+- Run the model/code worker through a separate OS user, for example `ai-factory-worker`, with only Codex/model auth in its home directory.
+- Store orchestrator secrets outside the repo, for example `/etc/ai-factory/factory.env`, owned by `root` and readable by systemd only. The `ai-factory-worker` user must not be able to read this file.
 - Enable Lightsail snapshots or another backup for the run store.
 - Keep only ports `22`, `80`, and `443` open publicly; restrict SSH by key.
 - Configure log rotation for service logs.
@@ -31,12 +65,51 @@ LINEAR_API_KEY=...
 LINEAR_WEBHOOK_SECRET=...
 LINEAR_TARGET_TEAM_ID=...
 LINEAR_TARGET_STATE_ID=...
+LINEAR_MATERIALIZE_STAGE2_TICKETS=false
 AI_FACTORY_PUBLIC_BASE_URL=https://<your-host>
 FACTORY_TRIGGER_BASE_URL=https://<your-host>
 AI_FACTORY_AUTONOMY_MODE=pr_ready
 AI_FACTORY_CODE_WORKER_PROVIDER=codex_cli
+AI_FACTORY_CODE_WORKER_CODEX_BIN=/usr/bin/codex
 AI_FACTORY_CODE_WORKER_MODEL=gpt-5.4
+AI_FACTORY_CODE_WORKER_RUN_AS_USER=ai-factory-worker
 AI_FACTORY_INTAKE_PAUSED=false
+```
+
+## Worker User Hardening
+
+Production should use two local users:
+
+- `ai-factory`: owns the orchestrator process, run store, GitHub auth, Linear API access, webhook secret, and PR creation.
+- `ai-factory-worker`: owns Codex/model auth only and runs the untrusted model-authored code edits inside temporary git worktrees.
+
+Create the model worker user:
+
+```sh
+sudo useradd --system --create-home --home-dir /var/lib/ai-factory-worker --shell /usr/sbin/nologin ai-factory-worker
+sudo install -d -o ai-factory-worker -g ai-factory-worker -m 0700 /var/lib/ai-factory-worker
+```
+
+Configure Codex auth for the worker user only. If auth already exists under the old service user, copy only the Codex auth directory, not `/etc/ai-factory/factory.env` or any GitHub/Linear secrets:
+
+```sh
+sudo rsync -a --chown=ai-factory-worker:ai-factory-worker /var/lib/ai-factory/.codex/ /var/lib/ai-factory-worker/.codex/
+sudo chmod -R go-rwx /var/lib/ai-factory-worker/.codex
+```
+
+Allow the orchestrator to invoke only Codex as the model worker:
+
+```sh
+printf 'ai-factory ALL=(ai-factory-worker) NOPASSWD: /usr/bin/codex\n' | sudo tee /etc/sudoers.d/ai-factory-code-worker
+sudo chmod 0440 /etc/sudoers.d/ai-factory-code-worker
+sudo visudo -cf /etc/sudoers.d/ai-factory-code-worker
+```
+
+Smoke-test the boundary:
+
+```sh
+sudo -u ai-factory sudo -H -u ai-factory-worker -- /usr/bin/codex --version
+sudo -u ai-factory-worker test ! -r /etc/ai-factory/factory.env
 ```
 
 Optional command gates:
@@ -97,11 +170,44 @@ uv run auto-mindsdb-factory factory-worker \
   --repository ianu82/ai-factory
 ```
 
+Check the deployed services:
+
+```sh
+sudo systemctl status caddy
+sudo systemctl status ai-factory-webhook.service
+sudo systemctl status ai-factory-worker.service
+```
+
+Run a deployed host doctor check:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-doctor --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory --repository ianu82/ai-factory'
+```
+
 Pause new intake without disturbing active runs:
 
 ```sh
 AI_FACTORY_INTAKE_PAUSED=true
 ```
+
+## Linear Webhook Setup
+
+The current webhook was created in Linear's API settings UI because workspace-admin privileges are required to manage webhooks. The service API key used by the worker can read issues and write comments, but it cannot create or list webhooks.
+
+Use these fields if the webhook must be recreated:
+
+- Label: `AI Factory Lightsail`
+- URL: `https://184-33-39-108.sslip.io/hooks/linear`
+- Data change events: `Issues`
+- Team selection: `software-factory`
+
+After recreating the webhook, copy Linear's generated signing secret into `/etc/ai-factory/factory.env` as `LINEAR_WEBHOOK_SECRET`, then restart `ai-factory-webhook.service`.
+
+```sh
+sudo systemctl restart ai-factory-webhook.service
+```
+
+Do not commit the signing secret, Linear API key, GitHub token, or OpenAI API key to the repository.
 
 ## Systemd Sketch
 
@@ -142,6 +248,7 @@ WantedBy=multi-user.target
 ## Production Boundaries
 
 - The code worker receives sanitized factory artifacts and a writable worktree. It does not receive Linear, GitHub, AWS, or OpenAI API keys through the environment.
+- In production, the code worker runs as `AI_FACTORY_CODE_WORKER_RUN_AS_USER` so same-user `/proc` or home-directory inspection cannot read orchestrator secrets.
 - The orchestrator owns commits, pushes, PR creation, Linear comments, and stage movement.
 - Stage 5 only treats command-backed checks as real evidence. LLM quality, latency, cost, staging, and monitoring checks are `deferred` or `not_configured` until real connectors exist.
 - Stage 7-9 file-backed artifacts are simulation-only and must not satisfy production gates.

@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from .automation import AutonomyMode, FactoryAutomationCoordinator
 from .build_review import Stage3BuildReviewPipeline
@@ -76,7 +77,9 @@ class FactoryDoctor:
         "LINEAR_TARGET_STATE_ID",
         "LINEAR_WEBHOOK_SECRET",
         "AI_FACTORY_PUBLIC_BASE_URL",
+        "AI_FACTORY_CODE_WORKER_RUN_AS_USER",
     )
+    UUID_ENV = frozenset({"LINEAR_TARGET_TEAM_ID", "LINEAR_TARGET_STATE_ID"})
 
     def __init__(self, config: ProductionRuntimeConfig) -> None:
         self.config = config
@@ -89,7 +92,7 @@ class FactoryDoctor:
             [
                 self._command_check("git", ["git", "rev-parse", "--is-inside-work-tree"]),
                 self._command_check("gh", ["gh", "auth", "status"]),
-                self._command_check("codex", ["codex", "--version"]),
+                self._code_worker_command_check(),
                 self._store_check(),
                 self._repo_remote_check(),
             ]
@@ -107,10 +110,22 @@ class FactoryDoctor:
 
     @staticmethod
     def _env_check(name: str) -> dict[str, str]:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            return {"name": f"env:{name}", "status": "failed", "summary": "missing"}
+        if name in FactoryDoctor.UUID_ENV:
+            try:
+                UUID(value)
+            except ValueError:
+                return {
+                    "name": f"env:{name}",
+                    "status": "failed",
+                    "summary": "must be a UUID",
+                }
         return {
             "name": f"env:{name}",
-            "status": "passed" if os.environ.get(name, "").strip() else "failed",
-            "summary": "set" if os.environ.get(name, "").strip() else "missing",
+            "status": "passed",
+            "summary": "set",
         }
 
     def _command_check(self, name: str, command: list[str]) -> dict[str, str]:
@@ -130,6 +145,21 @@ class FactoryDoctor:
         status = "passed" if completed.returncode == 0 else "failed"
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
         return {"name": f"command:{name}", "status": status, "summary": detail[:500]}
+
+    def _code_worker_command_check(self) -> dict[str, str]:
+        run_as_user = os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "").strip()
+        if not run_as_user:
+            return {
+                "name": "command:codex-worker-user",
+                "status": "failed",
+                "summary": "AI_FACTORY_CODE_WORKER_RUN_AS_USER is required in production",
+            }
+        sudo_bin = os.environ.get("AI_FACTORY_CODE_WORKER_SUDO_BIN", "sudo")
+        codex_bin = os.environ.get("AI_FACTORY_CODE_WORKER_CODEX_BIN", "codex")
+        return self._command_check(
+            "codex-worker-user",
+            [sudo_bin, "-H", "-u", run_as_user, "--", codex_bin, "--version"],
+        )
 
     def _store_check(self) -> dict[str, str]:
         try:
@@ -187,15 +217,6 @@ class FactoryWorker:
             from .automation import AutomationError
 
             raise AutomationError("AI_FACTORY_CODE_WORKER_PROVIDER must be 'codex_cli' for production v1.")
-        trigger_result = None
-        if not intake_paused():
-            trigger_result = LinearTriggerWorker(
-                self.config.store_dir,
-                repo_root_override=self.config.repo_root,
-            ).run_cycle(
-                repository=self.config.repository,
-                max_events=self.config.max_events_per_cycle,
-            ).to_document()
 
         stage3 = Stage3BuildReviewPipeline(
             self.config.repo_root,
@@ -217,6 +238,16 @@ class FactoryWorker:
             stage5_pipeline=stage5,
             autonomy_mode=self.config.autonomy_mode,
         )
+        trigger_result = None
+        if not intake_paused():
+            trigger_result = LinearTriggerWorker(
+                self.config.store_dir,
+                repo_root_override=self.config.repo_root,
+                coordinator=coordinator,
+            ).run_cycle(
+                repository=self.config.repository,
+                max_events=self.config.max_events_per_cycle,
+            ).to_document()
         progression_result = coordinator.run_progression_cycle(repository=self.config.repository)
         return {
             "cycle": "factory-worker-cycle",

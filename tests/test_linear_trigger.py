@@ -10,6 +10,8 @@ from auto_mindsdb_factory.automation import AutomationError, FactoryRunStore
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.intake import Stage1IntakePipeline
 from auto_mindsdb_factory.linear_trigger import (
+    LinearGraphQLClient,
+    LinearGraphQLClientError,
     LinearIssueSnapshot,
     LinearTriggerConfig,
     LinearTriggerStore,
@@ -140,6 +142,38 @@ class FakeLinearClient:
         assert issue_id == self.snapshot.id
         self.comment_bodies.append(body)
         return f"comment-for-{issue_id}"
+
+
+def test_linear_graphql_client_falls_back_to_description_when_comments_cannot_attach() -> None:
+    class FallbackClient(LinearGraphQLClient):
+        def __init__(self) -> None:
+            super().__init__(
+                LinearTriggerConfig(
+                    api_key="test-api-key",
+                    target_team_id="team-123",
+                    target_state_id="state-factory",
+                )
+            )
+            self.updated_description = ""
+
+        def _execute(self, query: str, variables: dict[str, object]) -> dict[str, object]:
+            if "commentCreate" in query:
+                raise LinearGraphQLClientError("Linear GraphQL errors: Entity not found: Issue")
+            if "FactoryLinearIssueDescription(" in query:
+                return {"issue": {"id": variables["id"], "description": "Existing body"}}
+            if "FactoryLinearIssueDescriptionUpdate" in query:
+                self.updated_description = str(variables["description"])
+                return {"issueUpdate": {"success": True, "issue": {"id": variables["id"]}}}
+            raise AssertionError(query)
+
+    client = FallbackClient()
+
+    comment_id = client.create_comment("issue-123", "Artifact details")
+
+    assert comment_id == "description-update-9b9039d65981"
+    assert "Existing body" in client.updated_description
+    assert "### AI Factory update" in client.updated_description
+    assert "Artifact details" in client.updated_description
 
 
 @dataclass
@@ -499,16 +533,22 @@ def test_linear_trigger_worker_dedupes_duplicate_logical_trigger_keys(tmp_path) 
     assert fake_coordinator.handoff_calls == [result.processed_events[0]["work_item_id"]]
 
 
-def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state(tmp_path) -> None:
+def test_linear_trigger_worker_skips_reentry_while_issue_has_active_run(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     store_dir = tmp_path / "automation-store"
     trigger_store = LinearTriggerStore(store_dir, repo_root_override=root)
+    issue_id = "30b259c4-cc73-48f7-8071-0543a360b0c6"
+    state_id = "17fa210f-6809-46cf-8e51-6bfa69a25cfe"
     trigger_store.save_envelope(
         LinearWebhookEnvelope.from_payload(
             delivery_id="delivery-1",
             event_type="Issue",
             received_at="2026-04-24T12:00:01Z",
-            payload=_issue_payload(created_at="2026-04-24T12:00:00Z"),
+            payload=_issue_payload(
+                issue_id=issue_id,
+                state_id=state_id,
+                created_at="2026-04-24T12:00:00Z",
+            ),
         )
     )
     trigger_store.save_envelope(
@@ -516,10 +556,14 @@ def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state
             delivery_id="delivery-2",
             event_type="Issue",
             received_at="2026-04-25T12:00:01Z",
-            payload=_issue_payload(created_at="2026-04-25T12:00:00Z"),
+            payload=_issue_payload(
+                issue_id=issue_id,
+                state_id=state_id,
+                created_at="2026-04-25T12:00:00Z",
+            ),
         )
     )
-    fake_client = FakeLinearClient(_snapshot())
+    fake_client = FakeLinearClient(_snapshot(issue_id=issue_id))
     fake_coordinator = FakeCoordinator(store_dir, root)
     worker = LinearTriggerWorker(
         store_dir,
@@ -535,10 +579,18 @@ def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state
 
     result = worker.run_cycle(repository="ianu82/ai-factory")
 
-    assert len(result.processed_events) == 2
-    assert result.skipped_events == []
+    assert len(result.processed_events) == 1
+    assert len(result.skipped_events) == 1
     assert result.failed_events == []
-    assert result.processed_events[0]["work_item_id"] != result.processed_events[1]["work_item_id"]
+    assert result.processed_events[0]["work_item_id"].startswith("wi-linear-eng-123-")
+    assert result.skipped_events == [
+        {
+            "delivery_id": "delivery-2",
+            "reason": "linear_issue_already_has_active_run",
+            "work_item_id": result.processed_events[0]["work_item_id"],
+            "state": "POLICY_ASSIGNED",
+        }
+    ]
 
 
 def test_linear_trigger_worker_records_handoff_failures_without_aborting_cycle(tmp_path) -> None:
@@ -578,10 +630,17 @@ def test_linear_trigger_worker_records_handoff_failures_without_aborting_cycle(t
     result = worker.run_cycle(repository="ianu82/ai-factory")
 
     assert result.processed_events == []
-    assert len(result.failed_events) == 2
+    assert len(result.failed_events) == 1
     assert result.failed_events[0]["delivery_id"] == "delivery-1"
     assert "simulated handoff failure" in result.failed_events[0]["reason"]
-    assert result.failed_events[1]["delivery_id"] == "delivery-2"
+    assert result.skipped_events == [
+        {
+            "delivery_id": "delivery-2",
+            "reason": "linear_issue_already_has_active_run",
+            "work_item_id": "wi-linear-eng-123-8f3c93b1fe",
+            "state": "POLICY_ASSIGNED",
+        }
+    ]
 
 
 def test_linear_trigger_worker_records_workflow_sync_failures_without_aborting_cycle(tmp_path) -> None:

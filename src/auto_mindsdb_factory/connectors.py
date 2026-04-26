@@ -20,6 +20,9 @@ from jsonschema import validate as validate_jsonschema
 from .intake import normalize_whitespace, slugify, utc_now
 
 
+FACTORY_CODE_WORKER_METADATA_PATHS = frozenset({".factory-code-worker-last-message.txt"})
+
+
 class FactoryConnectorError(RuntimeError):
     """Raised when an external factory connector cannot produce usable evidence."""
 
@@ -225,6 +228,10 @@ class CodexCLICodeWorkerConfig:
     timeout_seconds: int = 1800
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
+    full_auto: bool = True
+    bypass_sandbox: bool = False
+    run_as_user: str | None = None
+    sudo_bin: str = "sudo"
 
     @classmethod
     def from_env(cls) -> "CodexCLICodeWorkerConfig":
@@ -234,6 +241,14 @@ class CodexCLICodeWorkerConfig:
             timeout_seconds=int(os.environ.get("AI_FACTORY_CODE_WORKER_TIMEOUT_SECONDS", "1800")),
             sandbox=os.environ.get("AI_FACTORY_CODE_WORKER_SANDBOX", "workspace-write"),
             approval_policy=os.environ.get("AI_FACTORY_CODE_WORKER_APPROVAL_POLICY", "never"),
+            full_auto=os.environ.get("AI_FACTORY_CODE_WORKER_FULL_AUTO", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            bypass_sandbox=os.environ.get("AI_FACTORY_CODE_WORKER_BYPASS_SANDBOX", "false")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"},
+            run_as_user=os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "").strip() or None,
+            sudo_bin=os.environ.get("AI_FACTORY_CODE_WORKER_SUDO_BIN", "sudo"),
         )
 
 
@@ -269,16 +284,25 @@ class CodexCLICodeWorkerConnector:
             "exec",
             "-m",
             self.config.model,
-            "-s",
-            self.config.sandbox,
-            "-a",
-            self.config.approval_policy,
-            "-C",
-            str(job.worktree_path),
-            "--output-last-message",
-            str(job.worktree_path / ".factory-code-worker-last-message.txt"),
-            "-",
         ]
+        if self.config.bypass_sandbox:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        elif self.config.full_auto:
+            command.append("--full-auto")
+        else:
+            command.extend(["-s", self.config.sandbox])
+            if self.config.approval_policy:
+                command.extend(["-c", f'approval_policy="{self.config.approval_policy}"'])
+        command.extend(
+            [
+                "-C",
+                str(job.worktree_path),
+                "--output-last-message",
+                str(job.worktree_path.parent / "factory-code-worker-last-message.txt"),
+                "-",
+            ]
+        )
+        command = self._execution_command(command)
         try:
             completed = self.subprocess_run(
                 command,
@@ -326,6 +350,18 @@ class CodexCLICodeWorkerConnector:
         for name in self.SECRET_ENV_NAMES:
             env.pop(name, None)
         return env
+
+    def _execution_command(self, command: list[str]) -> list[str]:
+        if not self.config.run_as_user:
+            return command
+        return [
+            self.config.sudo_bin,
+            "-H",
+            "-u",
+            self.config.run_as_user,
+            "--",
+            *command,
+        ]
 
 
 _SECRET_VALUE_PATTERN = re.compile(
@@ -382,9 +418,26 @@ def _git_changed_paths(repo: Path) -> list[str]:
         path = line[3:].strip()
         if " -> " in path:
             path = path.split(" -> ", 1)[1].strip()
-        if path:
+        if path and not _is_factory_code_worker_metadata_path(path):
             paths.append(path)
     return sorted(dict.fromkeys(paths))
+
+
+def _is_factory_code_worker_metadata_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized in FACTORY_CODE_WORKER_METADATA_PATHS
+
+
+def _prune_factory_code_worker_metadata(repo: Path) -> None:
+    for relative_path in FACTORY_CODE_WORKER_METADATA_PATHS:
+        metadata_path = repo / relative_path
+        try:
+            if metadata_path.is_file() or metadata_path.is_symlink():
+                metadata_path.unlink()
+        except OSError:
+            pass
 
 
 def _git_diff_stat(repo: Path) -> str:
@@ -914,6 +967,9 @@ class GitHubCLIRepoConnector:
                     "Code worker did not complete successfully: "
                     f"{worker_result.status} exit={worker_result.exit_code}"
                 )
+            _prune_factory_code_worker_metadata(worktree_path)
+            worker_result.changed_paths = _git_changed_paths(worktree_path)
+            worker_result.diff_stat = _git_diff_stat(worktree_path)
             if not worker_result.changed_paths:
                 raise FactoryConnectorError("Code worker completed without producing a git diff.")
             self._assert_safe_changed_paths(worker_result.changed_paths)
@@ -1035,7 +1091,18 @@ class GitHubCLIRepoConnector:
         existing = self._existing_pr_for_branch(branch_name)
         if existing is not None:
             return existing
-        pr_url = self._create_github_pr(branch_name, title, body)
+        try:
+            pr_url = self._create_github_pr(branch_name, title, body)
+        except FactoryConnectorError as exc:
+            if "already exists" not in str(exc):
+                raise
+            existing = self._existing_pr_for_branch(branch_name)
+            if existing is not None:
+                return existing
+            url_match = re.search(r"https://github\.com/[^\s]+/pull/\d+", str(exc))
+            if url_match is None:
+                raise
+            pr_url = url_match.group(0)
         number_match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr_url)
         if number_match is None:
             raise FactoryConnectorError(f"Could not parse PR number from GitHub URL: {pr_url}")

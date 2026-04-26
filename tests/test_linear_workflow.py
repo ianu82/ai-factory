@@ -9,7 +9,7 @@ import pytest
 from auto_mindsdb_factory.automation import FactoryRunStore, RunLeaseBusyError
 from auto_mindsdb_factory.build_review import Stage3BuildReviewPipeline
 from auto_mindsdb_factory.intake import AnthropicScout, Stage1IntakePipeline, build_manual_intake_item
-from auto_mindsdb_factory.linear_trigger import LinearIssueSnapshot
+from auto_mindsdb_factory.linear_trigger import LinearGraphQLClientError, LinearIssueSnapshot
 from auto_mindsdb_factory.linear_workflow import (
     LINEAR_FACTORY_STAGES,
     LinearWorkflowConfig,
@@ -67,6 +67,24 @@ def _watchlist_linear_stage1(root: Path):
         body=(
             "The operator dashboard should show which Linear issues are waiting in Factory Intake. "
             "Acceptance criteria: - show the count in the dashboard - keep the display concise for operators"
+        ),
+    )
+    return Stage1IntakePipeline(root).process_item(item)
+
+
+def _active_linear_stage1(root: Path):
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear:issue-123:state-new-feature:2026-04-24T12:00:00Z",
+        title="Factory cockpit should surface Linear stage health",
+        url="https://linear.app/example/issue/SOF-123/factory-intake",
+        detected_at="2026-04-24T12:00:00Z",
+        published_at="2026-04-24T11:30:00Z",
+        body=(
+            "The operator cockpit API should surface Linear stage health for factory runs. "
+            "This is a control-plane API and JSON schema change for the cockpit command. "
+            "Acceptance criteria: include the current Linear stage, blocked label status, "
+            "and gate summary in the cockpit JSON output; cover it with CLI tests."
         ),
     )
     return Stage1IntakePipeline(root).process_item(item)
@@ -132,6 +150,10 @@ class FakeLinearWorkflowClient:
         self.created_issues: list[dict[str, object]] = []
         self.updated_issues: list[dict[str, object]] = []
         self.comment_bodies: list[tuple[str, str]] = []
+        self.team_labels: list[dict[str, object]] = [
+            {"id": "label-blocked", "name": "blocked/stuck"},
+        ]
+        self.label_updates: list[dict[str, object]] = []
 
     def fetch_team_states(self, team_id: str) -> list[dict[str, object]]:
         assert team_id == "team-123"
@@ -186,6 +208,28 @@ class FakeLinearWorkflowClient:
             return None
         return dict(matches[0])
 
+    def find_factory_ticket_issue(
+        self,
+        *,
+        team_id: str,
+        parent_issue_id: str,
+        work_item_id: str,
+        ticket_id: str,
+    ) -> dict[str, object] | None:
+        assert team_id == "team-123"
+        work_item_marker = f"Parent work item: `{work_item_id}`"
+        ticket_marker = f"Factory ticket: `{ticket_id}`"
+        matches = [
+            issue
+            for issue in self.existing_factory_issues
+            if issue.get("parent_id") == parent_issue_id
+            and work_item_marker in str(issue.get("description") or "")
+            and ticket_marker in str(issue.get("description") or "")
+        ]
+        if not matches:
+            return None
+        return dict(matches[0])
+
     def create_issue(
         self,
         *,
@@ -193,6 +237,7 @@ class FakeLinearWorkflowClient:
         title: str,
         description: str,
         state_id: str | None = None,
+        parent_id: str | None = None,
     ) -> dict[str, object]:
         created = {
             "id": f"issue-{len(self.created_issues) + 900}",
@@ -203,10 +248,14 @@ class FakeLinearWorkflowClient:
         }
         self.created_issues.append(
             {
+                "id": created["id"],
+                "identifier": created["identifier"],
+                "url": created["url"],
                 "team_id": team_id,
                 "title": title,
                 "description": description,
                 "state_id": state_id,
+                "parent_id": parent_id,
             }
         )
         return created
@@ -224,6 +273,37 @@ class FakeLinearWorkflowClient:
     def create_comment(self, issue_id: str, body: str) -> str:
         self.comment_bodies.append((issue_id, body))
         return f"comment-{len(self.comment_bodies)}"
+
+    def fetch_team_labels(self, team_id: str) -> list[dict[str, object]]:
+        assert team_id == "team-123"
+        return [dict(label) for label in self.team_labels]
+
+    def create_issue_label(
+        self,
+        *,
+        team_id: str,
+        name: str,
+        color: str,
+        description: str,
+    ) -> dict[str, object]:
+        created = {
+            "id": f"label-{len(self.team_labels) + 1}",
+            "name": name,
+            "color": color,
+            "description": description,
+        }
+        self.team_labels.append(created)
+        return dict(created)
+
+    def add_issue_label(self, issue_id: str, label_id: str) -> None:
+        self.label_updates.append(
+            {"action": "add", "issue_id": issue_id, "label_id": label_id}
+        )
+
+    def remove_issue_label(self, issue_id: str, label_id: str) -> None:
+        self.label_updates.append(
+            {"action": "remove", "issue_id": issue_id, "label_id": label_id}
+        )
 
 
 def test_linear_workflow_ensure_stage_states_creates_missing_states(tmp_path) -> None:
@@ -244,7 +324,7 @@ def test_linear_workflow_ensure_stage_states_creates_missing_states(tmp_path) ->
     assert stage_states["stage9"]["type"] == "completed"
 
 
-def test_linear_workflow_sync_stage1_active_non_linear_creates_issue_without_comment(tmp_path) -> None:
+def test_linear_workflow_sync_stage1_active_non_linear_creates_issue_without_stall_comment(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     fake_client = FakeLinearWorkflowClient()
     sync = LinearWorkflowSync(
@@ -260,6 +340,7 @@ def test_linear_workflow_sync_stage1_active_non_linear_creates_issue_without_com
     assert result["status"] == "synced"
     assert result["state_update"] == "created"
     assert result["comment"]["status"] == "skipped"
+    assert result["artifact_comment"]["status"] == "posted"
     assert fake_client.created_issues
     assert fake_client.created_issues[0]["title"].startswith("AI Factory:")
     binding_document = json.loads(
@@ -340,10 +421,38 @@ def test_linear_workflow_sync_stage1_linear_issue_reuses_issue_and_comments_watc
     assert result["issue_id"] == "issue-123"
     assert result["state_update"] == "moved"
     assert result["comment"]["status"] == "posted"
+    assert result["artifact_comment"]["status"] == "posted"
+    assert result["blocked_label"] == {"status": "applied", "label": "blocked/stuck"}
     assert fake_client.created_issues == []
+    assert fake_client.label_updates == [
+        {"action": "add", "issue_id": "issue-123", "label_id": "label-blocked"}
+    ]
     assert fake_client.comment_bodies
-    assert "Stage 1 Intake" in fake_client.comment_bodies[0][1]
-    assert "watchlist" in fake_client.comment_bodies[0][1]
+    comment_text = "\n".join(body for _issue_id, body in fake_client.comment_bodies)
+    assert "Stage 1 Intake" in comment_text
+    assert "watchlist" in comment_text
+
+
+def test_linear_workflow_sync_removes_blocked_label_when_run_moves_again(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(api_key="test-key", team_id="team-123"),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+
+    result = sync.sync_stage_result("stage1", stage1_result.to_document())
+
+    assert result["status"] == "synced"
+    assert result["comment"]["status"] == "skipped"
+    assert result["artifact_comment"]["status"] == "posted"
+    assert result["blocked_label"] == {"status": "removed", "label": "blocked/stuck"}
+    assert fake_client.label_updates == [
+        {"action": "remove", "issue_id": "issue-123", "label_id": "label-blocked"}
+    ]
 
 
 def test_linear_workflow_sync_stage3_revision_posts_blocking_comment(tmp_path) -> None:
@@ -362,9 +471,250 @@ def test_linear_workflow_sync_stage3_revision_posts_blocking_comment(tmp_path) -
     assert result["status"] == "synced"
     assert result["linear_stage"] == "Stage 3 Build"
     assert result["comment"]["status"] == "posted"
+    assert result["artifact_comment"]["status"] == "posted"
     assert fake_client.comment_bodies
-    assert "Stage 3 Build" in fake_client.comment_bodies[0][1]
-    assert "Parser still rejects valid tool_result payload variants." in fake_client.comment_bodies[0][1]
+    comment_text = "\n".join(body for _issue_id, body in fake_client.comment_bodies)
+    assert "Stage 3 Build" in comment_text
+    assert "Parser still rejects valid tool_result payload variants." in comment_text
+
+
+def test_linear_workflow_sync_stage2_posts_ticket_artifact_comment(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(api_key="test-key", team_id="team-123"),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage2", stage2_result.to_document())
+
+    assert result["status"] == "synced"
+    assert result["linear_stage"] == "Stage 2 Ticketing"
+    assert result["artifact_comment"]["status"] == "posted"
+    assert result["comment"]["status"] == "skipped"
+    comment_text = "\n".join(body for _issue_id, body in fake_client.comment_bodies)
+    assert "AI Factory artifact update: `Stage 2 Ticketing`" in comment_text
+    assert "Scoped tickets:" in comment_text
+    assert stage2_result.ticket_bundle["tickets"][0]["title"] in comment_text
+
+
+def test_linear_workflow_stage2_can_materialize_scoped_tickets_as_child_issues(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage2", stage2_result.to_document())
+
+    tickets = stage2_result.ticket_bundle["tickets"]
+    assert result["ticket_issues"]["status"] == "synced"
+    assert len(result["ticket_issues"]["created"]) == len(tickets)
+    assert [issue["parent_id"] for issue in fake_client.created_issues] == [
+        "issue-123",
+    ] * len(tickets)
+    child_descriptions = "\n\n".join(
+        str(issue["description"]) for issue in fake_client.created_issues
+    )
+    assert "This child issue is synchronized automatically by the AI Factory." in child_descriptions
+    assert f"Parent work item: `{stage1_result.work_item.work_item_id}`" in child_descriptions
+    assert f"Factory ticket: `{tickets[0]['id']}`" in child_descriptions
+    binding_document = json.loads(
+        LinearWorkflowStore(tmp_path / "automation-store", repo_root_override=root)
+        .binding_path(stage1_result.work_item.work_item_id)
+        .read_text(encoding="utf-8")
+    )
+    assert sorted(binding_document["ticket_issue_bindings"]) == sorted(
+        ticket["id"] for ticket in tickets
+    )
+
+
+def test_linear_workflow_ticket_artifacts_are_attached_to_child_issues(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    sync.sync_stage_result("stage2", stage2_result.to_document())
+    fake_client.comment_bodies.clear()
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage3", stage3_result.to_document())
+
+    ticket_count = len(stage2_result.ticket_bundle["tickets"])
+    assert result["ticket_issues"]["status"] == "synced"
+    assert len(result["ticket_issues"]["posted"]) == ticket_count
+    child_comment_bodies = [
+        body
+        for issue_id, body in fake_client.comment_bodies
+        if issue_id.startswith("issue-90")
+    ]
+    assert len(child_comment_bodies) == ticket_count
+    assert all(
+        "AI Factory artifact update for scoped ticket" in body
+        and "AI Factory artifact update: `Stage 3 Build`" in body
+        for body in child_comment_bodies
+    )
+
+
+def test_linear_workflow_moves_child_tickets_before_parent_advances(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    sync.sync_stage_result("stage2", stage2_result.to_document())
+    fake_client.updated_issues.clear()
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage3", stage3_result.to_document())
+
+    child_issue_ids = {
+        issue["id"]
+        for issue in fake_client.created_issues
+        if issue["parent_id"] == "issue-123"
+    }
+    parent_update_index = next(
+        index
+        for index, update in enumerate(fake_client.updated_issues)
+        if update["issue_id"] == "issue-123"
+    )
+    child_update_indexes = [
+        index
+        for index, update in enumerate(fake_client.updated_issues)
+        if update["issue_id"] in child_issue_ids
+    ]
+    assert child_update_indexes
+    assert max(child_update_indexes) < parent_update_index
+    assert len(result["child_state_sync"]["moved"]) == len(stage2_result.ticket_bundle["tickets"])
+
+
+def test_linear_workflow_does_not_move_parent_when_child_state_sync_fails(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    class FailingChildStateClient(FakeLinearWorkflowClient):
+        def update_issue_state(self, issue_id: str, state_id: str) -> dict[str, object]:
+            if issue_id.startswith("issue-90"):
+                raise LinearGraphQLClientError("child issue state update failed")
+            return super().update_issue_state(issue_id, state_id)
+
+    fake_client = FailingChildStateClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    sync.sync_stage_result("stage2", stage2_result.to_document())
+    fake_client.updated_issues.clear()
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+
+    with pytest.raises(LinearWorkflowError, match="child issue state update failed"):
+        sync.sync_stage_result("stage3", stage3_result.to_document())
+
+    assert {"issue_id": "issue-123", "state_id": "state-3"} not in fake_client.updated_issues
+
+
+def test_linear_workflow_artifact_comments_are_idempotent(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(api_key="test-key", team_id="team-123"),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    first = sync.sync_stage_result("stage2", stage2_result.to_document())
+    second = sync.sync_stage_result("stage2", stage2_result.to_document())
+
+    assert first["artifact_comment"]["status"] == "posted"
+    assert second["artifact_comment"] == {
+        "status": "skipped",
+        "reason": "duplicate_artifact_comment",
+    }
+    assert len(fake_client.comment_bodies) == 1
 
 
 def test_linear_workflow_rejects_existing_stage_with_wrong_type(tmp_path) -> None:

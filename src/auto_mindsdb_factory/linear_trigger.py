@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from .automation import AutomationError, FactoryAutomationCoordinator
 from .contracts import load_validators, validation_errors_for
-from .intake import build_manual_intake_item, normalize_whitespace, repo_root, utc_now
+from .intake import build_manual_intake_item, normalize_whitespace, repo_root, slugify, utc_now
 
 DEFAULT_LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 DEFAULT_WEBHOOK_MAX_AGE_SECONDS = 60
@@ -841,20 +841,112 @@ class LinearGraphQLClient:
             "state": _optional_entity(issue.get("state")),
         }
 
-    def create_comment(self, issue_id: str, body: str) -> str | None:
-        document = self._execute(
-            """
-            mutation FactoryLinearComment($issueId: String!, $body: String!) {
-              commentCreate(input: { issueId: $issueId, body: $body }) {
-                success
-                comment {
-                  id
+    def find_factory_ticket_issue(
+        self,
+        *,
+        team_id: str,
+        parent_issue_id: str,
+        work_item_id: str,
+        ticket_id: str,
+    ) -> dict[str, Any] | None:
+        work_item_marker = f"Parent work item: `{work_item_id}`"
+        ticket_marker = f"Factory ticket: `{ticket_id}`"
+        matches: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            document = self._execute(
+                """
+                query FactoryLinearIssuesForTicket($teamId: String!, $after: String) {
+                  team(id: $teamId) {
+                    id
+                    issues(first: 100, after: $after, includeArchived: false) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        id
+                        identifier
+                        title
+                        description
+                        url
+                        createdAt
+                        parent {
+                          id
+                        }
+                        state {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
                 }
-              }
-            }
-            """,
-            {"issueId": issue_id, "body": body},
-        )
+                """,
+                {"teamId": team_id, "after": after},
+            )
+            team = document.get("team")
+            if not isinstance(team, dict):
+                raise LinearGraphQLClientError(
+                    f"Linear team '{team_id}' could not be loaded."
+                )
+            issues = team.get("issues")
+            if not isinstance(issues, dict):
+                raise LinearGraphQLClientError(
+                    f"Linear team '{team_id}' did not return an issue connection."
+                )
+            for node in _connection_nodes(issues):
+                description = str(node.get("description") or "")
+                parent = node.get("parent")
+                parent_id = parent.get("id") if isinstance(parent, dict) else None
+                if (
+                    work_item_marker in description
+                    and ticket_marker in description
+                    and "synchronized automatically by the AI Factory" in description
+                    and parent_id == parent_issue_id
+                    and isinstance(node.get("id"), str)
+                ):
+                    matches.append(node)
+
+            page_info = issues.get("pageInfo")
+            if not isinstance(page_info, dict) or not page_info.get("hasNextPage"):
+                break
+            next_cursor = page_info.get("endCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            after = next_cursor
+
+        if not matches:
+            return None
+        matches.sort(key=lambda issue: str(issue.get("createdAt") or ""))
+        issue = matches[0]
+        return {
+            "id": str(issue["id"]),
+            "identifier": _optional_str(issue, "identifier"),
+            "title": _optional_str(issue, "title"),
+            "url": _optional_str(issue, "url"),
+            "state": _optional_entity(issue.get("state")),
+        }
+
+    def create_comment(self, issue_id: str, body: str) -> str | None:
+        try:
+            document = self._execute(
+                """
+                mutation FactoryLinearComment($issueId: String!, $body: String!) {
+                  commentCreate(input: { issueId: $issueId, body: $body }) {
+                    success
+                    comment {
+                      id
+                    }
+                  }
+                }
+                """,
+                {"issueId": issue_id, "body": body},
+            )
+        except LinearGraphQLClientError as exc:
+            if "Entity not found: Issue" not in str(exc):
+                raise
+            return self._append_issue_description_note(issue_id, body)
         payload = document.get("commentCreate")
         if not isinstance(payload, dict) or not payload.get("success"):
             raise LinearGraphQLClientError("Linear commentCreate mutation failed.")
@@ -862,6 +954,177 @@ class LinearGraphQLClient:
         if isinstance(comment, dict) and isinstance(comment.get("id"), str):
             return str(comment["id"])
         return None
+
+    def _append_issue_description_note(self, issue_id: str, body: str) -> str:
+        issue_document = self._execute(
+            """
+            query FactoryLinearIssueDescription($id: String!) {
+              issue(id: $id) {
+                id
+                description
+              }
+            }
+            """,
+            {"id": issue_id},
+        )
+        issue = issue_document.get("issue")
+        if not isinstance(issue, dict):
+            raise LinearGraphQLClientError(
+                f"Linear issue '{issue_id}' could not be loaded for description fallback."
+            )
+        existing_description = str(issue.get("description") or "").rstrip()
+        note = "\n".join(
+            [
+                "---",
+                "",
+                "### AI Factory update",
+                "",
+                body,
+            ]
+        )
+        updated_description = f"{existing_description}\n\n{note}".strip()
+        update_document = self._execute(
+            """
+            mutation FactoryLinearIssueDescriptionUpdate($id: String!, $description: String!) {
+              issueUpdate(id: $id, input: { description: $description }) {
+                success
+                issue {
+                  id
+                }
+              }
+            }
+            """,
+            {"id": issue_id, "description": updated_description},
+        )
+        payload = update_document.get("issueUpdate")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise LinearGraphQLClientError("Linear issueUpdate description fallback failed.")
+        fingerprint = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
+        return f"description-update-{fingerprint}"
+
+    def fetch_team_labels(self, team_id: str) -> list[dict[str, Any]]:
+        document = self._execute(
+            """
+            query FactoryLinearTeamLabels($id: String!) {
+              team(id: $id) {
+                id
+                labels(first: 250, includeArchived: false) {
+                  nodes {
+                    id
+                    name
+                  }
+                }
+              }
+            }
+            """,
+            {"id": team_id},
+        )
+        team = document.get("team")
+        if not isinstance(team, dict):
+            raise LinearGraphQLClientError(
+                f"Linear team '{team_id}' could not be loaded."
+            )
+        return [
+            {"id": str(node["id"]), "name": str(node["name"])}
+            for node in _connection_nodes(team.get("labels"))
+            if isinstance(node.get("id"), str) and isinstance(node.get("name"), str)
+        ]
+
+    def create_issue_label(
+        self,
+        *,
+        team_id: str,
+        name: str,
+        color: str,
+        description: str,
+    ) -> dict[str, Any]:
+        document = self._execute(
+            """
+            mutation FactoryLinearIssueLabelCreate(
+              $teamId: String!,
+              $name: String!,
+              $color: String!,
+              $description: String!
+            ) {
+              issueLabelCreate(
+                input: {
+                  teamId: $teamId,
+                  name: $name,
+                  color: $color,
+                  description: $description
+                }
+              ) {
+                success
+                issueLabel {
+                  id
+                  name
+                }
+              }
+            }
+            """,
+            {
+                "teamId": team_id,
+                "name": name,
+                "color": color,
+                "description": description,
+            },
+        )
+        payload = document.get("issueLabelCreate")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise LinearGraphQLClientError("Linear issueLabelCreate mutation failed.")
+        label = payload.get("issueLabel")
+        if not isinstance(label, dict):
+            raise LinearGraphQLClientError("Linear issueLabelCreate did not return an issueLabel.")
+        return {"id": str(label["id"]), "name": str(label["name"])}
+
+    def add_issue_label(self, issue_id: str, label_id: str) -> None:
+        self._update_issue_labels(issue_id, added_label_ids=[label_id])
+
+    def remove_issue_label(self, issue_id: str, label_id: str) -> None:
+        try:
+            self._update_issue_labels(issue_id, removed_label_ids=[label_id])
+        except LinearGraphQLClientError as exc:
+            if "Label not on issue" in str(exc):
+                return
+            raise
+
+    def _update_issue_labels(
+        self,
+        issue_id: str,
+        *,
+        added_label_ids: list[str] | None = None,
+        removed_label_ids: list[str] | None = None,
+    ) -> None:
+        document = self._execute(
+            """
+            mutation FactoryLinearIssueLabelsUpdate(
+              $id: String!,
+              $addedLabelIds: [String!],
+              $removedLabelIds: [String!]
+            ) {
+              issueUpdate(
+                id: $id,
+                input: {
+                  addedLabelIds: $addedLabelIds,
+                  removedLabelIds: $removedLabelIds
+                }
+              ) {
+                success
+                issue {
+                  id
+                }
+              }
+            }
+            """,
+            {
+                "id": issue_id,
+                "addedLabelIds": added_label_ids or [],
+                "removedLabelIds": removed_label_ids or [],
+            },
+        )
+        payload = document.get("issueUpdate")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise LinearGraphQLClientError("Linear issue label update failed.")
 
     def fetch_team_states(self, team_id: str) -> list[dict[str, Any]]:
         document = self._execute(
@@ -971,6 +1234,7 @@ class LinearGraphQLClient:
         title: str,
         description: str,
         state_id: str | None = None,
+        parent_id: str | None = None,
     ) -> dict[str, Any]:
         document = self._execute(
             """
@@ -978,14 +1242,16 @@ class LinearGraphQLClient:
               $teamId: String!,
               $title: String!,
               $description: String!,
-              $stateId: String
+              $stateId: String,
+              $parentId: String
             ) {
               issueCreate(
                 input: {
                   teamId: $teamId,
                   title: $title,
                   description: $description,
-                  stateId: $stateId
+                  stateId: $stateId,
+                  parentId: $parentId
                 }
               ) {
                 success
@@ -1007,6 +1273,7 @@ class LinearGraphQLClient:
                 "title": title,
                 "description": description,
                 "stateId": state_id,
+                "parentId": parent_id,
             },
         )
         payload = document.get("issueCreate")
@@ -1166,6 +1433,19 @@ class LinearTriggerWorker:
                                 }
                             )
                             continue
+                        active_run = self._active_run_for_issue(envelope.issue_id)
+                        if active_run is not None:
+                            self.trigger_store.mark_processed(trigger_state, envelope)
+                            self.trigger_store.remove_envelope(path)
+                            skipped_events.append(
+                                {
+                                    "delivery_id": delivery_id,
+                                    "reason": "linear_issue_already_has_active_run",
+                                    "work_item_id": active_run["work_item_id"],
+                                    "state": active_run["state"],
+                                }
+                            )
+                            continue
 
                     snapshot = self.linear_client.fetch_issue_snapshot(envelope.issue_id)
                     stage1_result = self._create_stage1_result(snapshot, envelope)
@@ -1224,6 +1504,55 @@ class LinearTriggerWorker:
             trigger_state=self.trigger_store.load_state(),
         )
 
+    def _active_run_for_issue(self, issue_id: str) -> dict[str, str] | None:
+        from .automation import FactoryRunStore, PROGRESSION_SCAN_STAGES
+        from .controller import ControllerState
+
+        inactive_states = {
+            ControllerState.WATCHLISTED.value,
+            ControllerState.REJECTED.value,
+            ControllerState.DEAD_LETTER.value,
+            ControllerState.MERGED.value,
+            ControllerState.PRODUCTION_MONITORING.value,
+        }
+        store = FactoryRunStore(self.trigger_store.root, repo_root_override=self.repo_root)
+        matches: list[dict[str, str]] = []
+        for run_dir in store.iter_run_directories():
+            candidate = store.load_latest_candidate(run_dir, PROGRESSION_SCAN_STAGES)
+            if candidate is None:
+                continue
+            work_item = candidate.document.get("work_item")
+            if not isinstance(work_item, dict):
+                continue
+            if self._linear_issue_id_for_work_item(work_item) != issue_id:
+                continue
+            state = str(work_item.get("state") or "")
+            if state in inactive_states:
+                continue
+            matches.append(
+                {
+                    "work_item_id": candidate.work_item_id,
+                    "stage_name": candidate.stage_name,
+                    "state": state,
+                }
+            )
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item["work_item_id"])
+        return matches[0]
+
+    @staticmethod
+    def _linear_issue_id_for_work_item(work_item: dict[str, Any]) -> str | None:
+        if work_item.get("source_provider") != "linear":
+            return None
+        external_id = work_item.get("source_external_id")
+        if not isinstance(external_id, str) or not external_id.startswith("linear:"):
+            return None
+        parts = external_id.split(":")
+        if len(parts) < 2 or not parts[1]:
+            return None
+        return parts[1]
+
     def _create_stage1_result(
         self,
         snapshot: LinearIssueSnapshot,
@@ -1239,7 +1568,10 @@ class LinearTriggerWorker:
             published_at=str(envelope.payload["createdAt"]),
         )
         try:
-            return self.coordinator.stage1_pipeline.process_item(item)
+            return self.coordinator.stage1_pipeline.process_item(
+                item,
+                work_item_id=_linear_work_item_id(snapshot, envelope),
+            )
         except Exception as exc:
             raise LinearTriggerError(
                 f"Linear Stage 1 intake failed for issue '{snapshot.identifier}': {exc}"
@@ -1381,6 +1713,12 @@ def render_linear_manual_intake_body(
         f"trigger_created_at={envelope.payload['createdAt']}; "
         f"logical_trigger_key={envelope.logical_trigger_key}; linear_url={snapshot.url}."
     )
+
+
+def _linear_work_item_id(snapshot: LinearIssueSnapshot, envelope: LinearWebhookEnvelope) -> str:
+    issue_token = slugify(snapshot.identifier) or slugify(envelope.issue_id)[:24] or "issue"
+    trigger_digest = hashlib.sha1(envelope.logical_trigger_key.encode("utf-8")).hexdigest()[:10]
+    return f"wi-linear-{issue_token[:24]}-{trigger_digest}"
 
 
 def render_linear_comment_body(

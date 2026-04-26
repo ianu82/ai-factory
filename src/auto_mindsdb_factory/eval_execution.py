@@ -56,6 +56,7 @@ class GateResult:
 class CommandGateRunner:
     """Run the subset of eval checks that are backed by real local commands."""
 
+    MAX_CAPTURED_OUTPUT_CHARS = 4000
     DEFAULT_COMMANDS = {
         "unit": [sys.executable, "-m", "pytest", "-q"],
         "contract": [sys.executable, "scripts/validate_contracts.py"],
@@ -128,8 +129,8 @@ class CommandGateRunner:
                 status=status,
                 command=list(command),
                 exit_code=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
+                stdout=self._captured_output(completed.stdout),
+                stderr=self._captured_output(completed.stderr),
                 duration_seconds=duration,
                 summary=(
                     f"Command-backed gate passed: {' '.join(command)}."
@@ -143,8 +144,8 @@ class CommandGateRunner:
                 status="failed",
                 command=list(command),
                 exit_code=124,
-                stdout=exc.stdout if isinstance(exc.stdout, str) else "",
-                stderr=exc.stderr if isinstance(exc.stderr, str) else str(exc),
+                stdout=self._captured_output(exc.stdout if isinstance(exc.stdout, str) else ""),
+                stderr=self._captured_output(exc.stderr if isinstance(exc.stderr, str) else str(exc)),
                 duration_seconds=min(self.timeout_seconds, int(check["timeout_minutes"]) * 60),
                 summary=f"Command-backed gate timed out: {' '.join(command)}.",
             )
@@ -159,6 +160,12 @@ class CommandGateRunner:
                 duration_seconds=0,
                 summary=f"Command-backed gate could not start: {' '.join(command)}.",
             )
+
+    @classmethod
+    def _captured_output(cls, output: str) -> str:
+        if len(output) <= cls.MAX_CAPTURED_OUTPUT_CHARS:
+            return output
+        return output[-cls.MAX_CAPTURED_OUTPUT_CHARS :]
 
 
 @dataclass(slots=True)
@@ -476,6 +483,11 @@ class EvalRunner:
             if gate.command is not None:
                 result["command"] = " ".join(gate.command)
                 result["exit_code"] = gate.exit_code
+            if gate.status == "failed":
+                if gate.stdout:
+                    result["stdout"] = gate.stdout
+                if gate.stderr:
+                    result["stderr"] = gate.stderr
             return result
 
         should_fail = check["id"] in failing_check_ids

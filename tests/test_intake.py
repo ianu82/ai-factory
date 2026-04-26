@@ -167,6 +167,34 @@ def test_stage1_manual_intake_uses_linear_issue_framing() -> None:
     assert result.work_item.state is ControllerState.POLICY_ASSIGNED
 
 
+def test_stage1_linear_factory_readiness_issue_is_actionable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    item = build_manual_intake_item(
+        provider="linear",
+        external_id="linear-issue-sof-103",
+        title="Add production readiness smoke command for AI Factory",
+        url="https://linear.app/mindsdb/issue/SOF-103",
+        detected_at="2026-04-25T15:03:04Z",
+        published_at="2026-04-25T15:01:57Z",
+        body=(
+            "Before we run a real production intake, operators need one command that tells them "
+            "whether the Lightsail factory host is ready for an end-to-end PR-factory run. "
+            "Readiness is spread across factory-doctor, service status, HTTPS health, Linear stage "
+            "setup, intake pause state, and webhook signature behavior. Requested outcome: add a "
+            "production smoke/readiness command that summarizes host state in one JSON report and "
+            "exits non-zero when the factory should not be unpaused. Acceptance criteria: report "
+            "AI_FACTORY_INTAKE_PAUSED, configured public base URL, valid Linear target team/state "
+            "UUIDs, Linear stage setup verification, and required gate command configuration. "
+            "Do not print secret values. Cover a healthy report and one failed readiness condition."
+        ),
+    )
+
+    result = Stage1IntakePipeline(root).process_item(item)
+
+    assert result.spec_packet["relevance"]["decision"] == "active_build_candidate"
+    assert result.work_item.state is ControllerState.POLICY_ASSIGNED
+
+
 def test_stage1_intake_watchlist_path_stops_in_watchlisted_state() -> None:
     root = Path(__file__).resolve().parents[1]
     validators = load_validators(root)

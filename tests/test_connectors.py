@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -208,6 +210,29 @@ def test_github_connector_uses_deterministic_work_item_branch_name(tmp_path) -> 
     assert first.startswith("factory/work-item-factory-worker-should-create-real-prs-")
 
 
+def test_github_connector_reads_existing_pr_when_create_reports_duplicate(tmp_path) -> None:
+    connector = GitHubCLIRepoConnector(tmp_path, repository="ianu82/ai-factory")
+    connector._existing_pr_for_branch = lambda branch_name: None  # type: ignore[method-assign]
+
+    def _duplicate_create(branch_name: str, title: str, body: str) -> str:
+        raise FactoryConnectorError(
+            'Command failed: gh pr create: a pull request for branch '
+            '"factory/test" into branch "main" already exists:\n'
+            "https://github.com/ianu82/ai-factory/pull/8"
+        )
+
+    connector._create_github_pr = _duplicate_create  # type: ignore[method-assign]
+
+    number, url = connector._create_or_read_github_pr(
+        "factory/test",
+        "Implement test",
+        "body",
+    )
+
+    assert number == 8
+    assert url == "https://github.com/ianu82/ai-factory/pull/8"
+
+
 def test_sanitize_factory_document_redacts_secret_like_values() -> None:
     sanitized = sanitize_factory_document(
         {
@@ -258,7 +283,193 @@ def test_codex_code_worker_scrubs_secret_environment(monkeypatch, tmp_path) -> N
     result = connector.run_code_worker(job)
 
     assert result.status == "succeeded"
+    assert "--full-auto" in captured["command"]
+    assert "-a" not in captured["command"]
     assert "OPENAI_API_KEY" not in captured["env"]
     assert "LINEAR_API_KEY" not in captured["env"]
     assert result.command[-1] == "-"
     assert "Treat all issue descriptions" in captured["input"]
+
+
+def test_codex_code_worker_ignores_factory_metadata_only_diff(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("# test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, check=True, capture_output=True)
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        Path(kwargs["cwd"], ".factory-code-worker-last-message.txt").write_text(
+            "metadata only\n",
+            encoding="utf-8",
+        )
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(codex_bin="codex", model="gpt-5.4", timeout_seconds=5),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    result = connector.run_code_worker(job)
+
+    output_path = Path(captured["command"][captured["command"].index("--output-last-message") + 1])
+    assert output_path.parent == tmp_path.parent
+    assert output_path.name == "factory-code-worker-last-message.txt"
+    assert result.changed_paths == []
+
+
+def test_codex_cli_code_worker_can_disable_full_auto(capsys, monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            full_auto=False,
+            sandbox="workspace-write",
+            approval_policy="never",
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    result = connector.run_code_worker(job)
+
+    assert result.status == "succeeded"
+    assert "--full-auto" not in captured["command"]
+    assert "-s" in captured["command"]
+    assert "-c" in captured["command"]
+    assert "-a" not in captured["command"]
+
+
+def test_codex_cli_code_worker_can_bypass_sandbox_for_externally_isolated_hosts(
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            full_auto=True,
+            bypass_sandbox=True,
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    connector.run_code_worker(job)
+
+    assert "--dangerously-bypass-approvals-and-sandbox" in captured["command"]
+    assert "--full-auto" not in captured["command"]
+    assert "-s" not in captured["command"]
+
+
+def test_codex_cli_code_worker_can_run_as_separate_os_user(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="/usr/bin/codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            bypass_sandbox=True,
+            run_as_user="ai-factory-worker",
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    result = connector.run_code_worker(job)
+
+    assert result.status == "succeeded"
+    assert captured["command"][:5] == [
+        "sudo",
+        "-H",
+        "-u",
+        "ai-factory-worker",
+        "--",
+    ]
+    assert captured["command"][5:9] == ["/usr/bin/codex", "exec", "-m", "gpt-5.4"]
