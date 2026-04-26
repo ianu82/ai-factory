@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .automation import FactoryRunStore
-from .build_review import Stage3BuildReviewPipeline
+from .build_review import Stage3BuildReviewPipeline, Stage3BuildReviewResult
 from .connectors import (
     AgentConnector,
     EvalConnector,
@@ -19,7 +20,7 @@ from .connectors import (
     PullRequestStatus,
     RepoConnector,
 )
-from .controller import ControllerState, WorkItem
+from .controller import ControllerState
 from .eval_execution import Stage5EvalPipeline
 from .feedback_synthesis import Stage9FeedbackSynthesisPipeline
 from .integration import Stage4IntegrationPipeline
@@ -107,8 +108,12 @@ class FactoryVerticalSliceRunner:
             seed_missing_signals=config.seed_missing_ops_signals,
         )
         self.stage1 = Stage1IntakePipeline(self.root)
-        self.stage2 = Stage2TicketingPipeline(self.root, agent_connector=agent_connector)
-        self.stage3 = Stage3BuildReviewPipeline(self.root, agent_connector=agent_connector)
+        self.stage2 = Stage2TicketingPipeline(
+            self.root, agent_connector=agent_connector
+        )
+        self.stage3 = Stage3BuildReviewPipeline(
+            self.root, agent_connector=agent_connector
+        )
         self.stage4 = Stage4IntegrationPipeline(self.root)
         self.stage5 = Stage5EvalPipeline(self.root)
         self.stage6 = Stage6SecurityReviewPipeline(self.root)
@@ -130,7 +135,9 @@ class FactoryVerticalSliceRunner:
             stage1_result.policy_decision,
             work_item,
         )
-        stored_paths["stage2"] = str(self._save_stage("stage2", stage2_result.to_document()))
+        stored_paths["stage2"] = str(
+            self._save_stage("stage2", stage2_result.to_document())
+        )
         stage3_result = self._run_stage3_until_reviewable(stage2_result, stored_paths)
         pr_evidence = self.repo_connector.create_pull_request(
             work_item_id=stage3_result.work_item.work_item_id,
@@ -152,7 +159,9 @@ class FactoryVerticalSliceRunner:
             pr_packet,
             work_item,
         )
-        stored_paths["stage4"] = str(self._save_stage("stage4", stage4_result.to_document()))
+        stored_paths["stage4"] = str(
+            self._save_stage("stage4", stage4_result.to_document())
+        )
         work_item = stage4_result.work_item
 
         eval_evidence = self._run_eval_connector()
@@ -175,7 +184,9 @@ class FactoryVerticalSliceRunner:
             stage4_result.latency_baseline,
             work_item,
         )
-        stored_paths["stage5"] = str(self._save_stage("stage5", stage5_result.to_document()))
+        stored_paths["stage5"] = str(
+            self._save_stage("stage5", stage5_result.to_document())
+        )
         work_item = stage5_result.work_item
 
         stage6_result = self.stage6.process(
@@ -191,7 +202,9 @@ class FactoryVerticalSliceRunner:
             stage5_result.eval_report,
             work_item,
         )
-        stored_paths["stage6"] = str(self._save_stage("stage6", stage6_result.to_document()))
+        stored_paths["stage6"] = str(
+            self._save_stage("stage6", stage6_result.to_document())
+        )
         work_item = stage6_result.work_item
 
         merge_result = self.merge.process(
@@ -208,7 +221,9 @@ class FactoryVerticalSliceRunner:
             stage6_result.security_review,
             work_item,
         )
-        stored_paths["merge"] = str(self._save_stage("merge", merge_result.to_document()))
+        stored_paths["merge"] = str(
+            self._save_stage("merge", merge_result.to_document())
+        )
         work_item = merge_result.work_item
 
         work_item_id = work_item.work_item_id
@@ -234,7 +249,9 @@ class FactoryVerticalSliceRunner:
             metric_overrides=staging_signal["metrics"],
             rollback_tested=bool(rollback_signal["tested"]),
         )
-        stored_paths["stage7"] = str(self._save_stage("stage7", stage7_result.to_document()))
+        stored_paths["stage7"] = str(
+            self._save_stage("stage7", stage7_result.to_document())
+        )
         work_item = stage7_result.work_item
 
         monitoring_signal = self.ops_connector.read_monitoring_signal(work_item_id)
@@ -257,7 +274,9 @@ class FactoryVerticalSliceRunner:
             metric_overrides=monitoring_signal["metrics"],
             security_anomaly=monitoring_signal["security_anomaly"],
         )
-        stored_paths["stage8"] = str(self._save_stage("stage8", stage8_result.to_document()))
+        stored_paths["stage8"] = str(
+            self._save_stage("stage8", stage8_result.to_document())
+        )
         work_item = stage8_result.work_item
 
         stage9_result = self.stage9.process(
@@ -281,7 +300,9 @@ class FactoryVerticalSliceRunner:
                 "The factory produced real GitHub PR evidence while keeping ops signals file-backed."
             ],
         )
-        stored_paths["stage9"] = str(self._save_stage("stage9", stage9_result.to_document()))
+        stored_paths["stage9"] = str(
+            self._save_stage("stage9", stage9_result.to_document())
+        )
 
         result = VerticalSliceResult(
             work_item_id=stage9_result.work_item.work_item_id,
@@ -316,7 +337,9 @@ class FactoryVerticalSliceRunner:
         work_item = stage2_result.work_item
         revision_guidance: list[str] | None = None
         previous_pr_packet: dict[str, Any] | None = None
-        max_cycles = int(stage2_result.policy_decision["budget_policy"]["max_pr_review_cycles"])
+        max_cycles = int(
+            stage2_result.policy_decision["budget_policy"]["max_pr_review_cycles"]
+        )
 
         while True:
             stage3_result = self.stage3.process(
@@ -346,7 +369,9 @@ class FactoryVerticalSliceRunner:
                     f"{stage3_result.work_item.state.value}."
                 )
 
-            revision_guidance = list(stage3_result.pr_packet["reviewer_report"]["blocking_findings"])
+            revision_guidance = list(
+                stage3_result.pr_packet["reviewer_report"]["blocking_findings"]
+            )
             if not revision_guidance:
                 raise VerticalSliceError(
                     "Stage 3 returned PR_REVISION without blocking findings to address."
@@ -354,14 +379,12 @@ class FactoryVerticalSliceRunner:
             if self.agent_connector is None:
                 raise VerticalSliceError(
                     "Stage 3 produced blocking findings but no live agent connector is configured "
-                    "to revise the draft: "
-                    + "; ".join(revision_guidance)
+                    "to revise the draft: " + "; ".join(revision_guidance)
                 )
             if stage3_result.work_item.attempt_count >= max_cycles:
                 raise VerticalSliceError(
                     "Stage 3 revision loop exhausted the build retry budget. "
-                    "Last blocking findings: "
-                    + "; ".join(revision_guidance)
+                    "Last blocking findings: " + "; ".join(revision_guidance)
                 )
 
             previous_pr_packet = stage3_result.pr_packet
@@ -372,7 +395,12 @@ class FactoryVerticalSliceRunner:
         if self.config.html_file is not None:
             html = self.config.html_file.read_text(encoding="utf-8")
         elif self.config.source_url is None:
-            default_fixture = self.root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
+            default_fixture = (
+                self.root
+                / "fixtures"
+                / "intake"
+                / "anthropic-release-notes-sample.html"
+            )
             html = default_fixture.read_text(encoding="utf-8")
 
         scout = AnthropicScout(source_url=self.config.source_url)
@@ -442,13 +470,17 @@ def build_cockpit_summary(
     store = FactoryRunStore(store_dir, repo_root_override=repo_root_override)
     runs: list[dict[str, Any]] = []
     for run_dir in store.iter_run_directories():
-        candidate = store.load_latest_candidate(run_dir, tuple(reversed(tuple(store_stage_order()))))
+        candidate = store.load_latest_candidate(
+            run_dir, tuple(reversed(tuple(store_stage_order())))
+        )
         if candidate is None:
             continue
         work_item = store.extract_work_item_document(candidate.document)
         pr_packet = candidate.document.get("pr_packet")
         monitoring_report = candidate.document.get("monitoring_report")
         feedback_report = candidate.document.get("feedback_report")
+        source_reference = _cockpit_source_reference(candidate.document)
+        branch_name = _cockpit_branch_name(pr_packet)
         runs.append(
             {
                 "work_item_id": candidate.work_item_id,
@@ -456,20 +488,25 @@ def build_cockpit_summary(
                 "state": work_item["state"],
                 "title": work_item["title"],
                 "updated_at": work_item["updated_at"],
+                "source": source_reference,
+                "branch_name": branch_name,
                 "pull_request": (
                     None
                     if not isinstance(pr_packet, dict)
                     else pr_packet.get("pull_request")
                 ),
+                "isolation": _cockpit_isolation_summary(
+                    candidate.stage_name, pr_packet
+                ),
                 "monitoring_status": (
                     None
                     if not isinstance(monitoring_report, dict)
-                    else monitoring_report["monitoring_decision"]["status"]
+                    else _cockpit_monitoring_status(monitoring_report)
                 ),
                 "feedback_report_id": (
                     None
                     if not isinstance(feedback_report, dict)
-                    else feedback_report["artifact"]["id"]
+                    else _cockpit_feedback_report_id(feedback_report)
                 ),
             }
         )
@@ -479,6 +516,197 @@ def build_cockpit_summary(
         "runs": runs,
         "generated_at": utc_now(),
     }
+
+
+_LINEAR_ISSUE_IDENTIFIER_PATTERN = re.compile(r"/issue/([^/]+)(?:/|$)")
+_GITHUB_ISSUE_IDENTIFIER_PATTERN = re.compile(r"/issues/(\d+)(?:/|$)")
+_GITHUB_PULL_IDENTIFIER_PATTERN = re.compile(r"/pull/(\d+)(?:/|$)")
+_LINEAR_EXTERNAL_ID_IDENTIFIER_PATTERN = re.compile(r"(?i)([a-z]+-\d+)")
+_GITHUB_EXTERNAL_ID_IDENTIFIER_PATTERN = re.compile(r"(?i)(?:issue|pull)[-_]?(\d+)")
+
+
+def _cockpit_source_reference(document: dict[str, Any]) -> dict[str, Any] | None:
+    spec_packet = document.get("spec_packet")
+    if not isinstance(spec_packet, dict):
+        return None
+    source = spec_packet.get("source")
+    if not isinstance(source, dict):
+        return None
+    return {
+        "provider": _optional_str(source.get("provider")),
+        "kind": _optional_str(source.get("kind")),
+        "external_id": _optional_str(source.get("external_id")),
+        "identifier": _source_identifier(source),
+        "url": _optional_str(source.get("url")),
+    }
+
+
+def _source_identifier(source: dict[str, Any]) -> str | None:
+    provider = _optional_str(source.get("provider"))
+    url = _optional_str(source.get("url"))
+    if provider == "linear" and url:
+        match = _LINEAR_ISSUE_IDENTIFIER_PATTERN.search(url)
+        if match is not None:
+            return match.group(1)
+    if provider == "github" and url:
+        match = _GITHUB_ISSUE_IDENTIFIER_PATTERN.search(url)
+        if match is not None:
+            return match.group(1)
+        match = _GITHUB_PULL_IDENTIFIER_PATTERN.search(url)
+        if match is not None:
+            return match.group(1)
+
+    external_id = _optional_str(source.get("external_id"))
+    if provider == "linear" and external_id:
+        match = _LINEAR_EXTERNAL_ID_IDENTIFIER_PATTERN.search(external_id)
+        if match is not None:
+            return match.group(1).upper()
+    if provider == "github" and external_id:
+        match = _GITHUB_EXTERNAL_ID_IDENTIFIER_PATTERN.search(external_id)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _cockpit_branch_name(pr_packet: Any) -> str | None:
+    if not isinstance(pr_packet, dict):
+        return None
+    branch_name = _optional_str(pr_packet.get("branch_name"))
+    if branch_name:
+        return branch_name
+    delivery_evidence = pr_packet.get("delivery_evidence")
+    if not isinstance(delivery_evidence, dict):
+        return None
+    return _optional_str(delivery_evidence.get("branch_name"))
+
+
+def _cockpit_isolation_summary(stage_name: str, pr_packet: Any) -> dict[str, Any]:
+    branch_name = _cockpit_branch_name(pr_packet)
+    delivery_evidence = (
+        pr_packet.get("delivery_evidence")
+        if isinstance(pr_packet, dict)
+        and isinstance(pr_packet.get("delivery_evidence"), dict)
+        else None
+    )
+    delivery_mode = (
+        _optional_str(delivery_evidence.get("mode"))
+        if isinstance(delivery_evidence, dict)
+        else None
+    )
+    code_worker = (
+        delivery_evidence.get("code_worker")
+        if isinstance(delivery_evidence, dict)
+        and isinstance(delivery_evidence.get("code_worker"), dict)
+        else None
+    )
+    base_branch = (
+        _optional_str(delivery_evidence.get("base_branch"))
+        if isinstance(delivery_evidence, dict)
+        else None
+    )
+    worktree_path = (
+        _optional_str(code_worker.get("worktree_path"))
+        if isinstance(code_worker, dict)
+        else None
+    )
+    isolated_worktree = (
+        _optional_bool(code_worker.get("isolated_worktree"))
+        if isinstance(code_worker, dict)
+        else None
+    )
+    edited_main_checkout = (
+        _optional_bool(code_worker.get("edited_main_checkout"))
+        if isinstance(code_worker, dict)
+        else None
+    )
+
+    if stage_name in {"stage1", "stage2"}:
+        return {
+            "status": "pending",
+            "mode": "not_required_yet",
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "worktree_path": worktree_path,
+            "isolated_worktree": isolated_worktree,
+            "edited_main_checkout": edited_main_checkout,
+            "summary": "Branch and worktree isolation evidence is not expected before Stage 3.",
+        }
+
+    if delivery_mode == "code_worker_pr":
+        isolated_worktree = True if isolated_worktree is None else isolated_worktree
+        edited_main_checkout = (
+            False if edited_main_checkout is None else edited_main_checkout
+        )
+        status = "healthy"
+        summary = (
+            "Code worker ran on a per-run branch inside an isolated git worktree and did not edit "
+            "the main checkout."
+        )
+        if not branch_name:
+            status = "blocked"
+            summary = "Code-worker delivery evidence is present, but the run is missing its persisted branch name."
+        elif isolated_worktree is False or edited_main_checkout is True:
+            status = "blocked"
+            summary = "Code-worker delivery evidence conflicts with the expected isolated worktree contract."
+        return {
+            "status": status,
+            "mode": "per_run_branch_and_worktree",
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "worktree_path": worktree_path,
+            "isolated_worktree": isolated_worktree,
+            "edited_main_checkout": edited_main_checkout,
+            "summary": summary,
+        }
+
+    if branch_name:
+        return {
+            "status": "warning",
+            "mode": "per_run_branch_only",
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "worktree_path": worktree_path,
+            "isolated_worktree": isolated_worktree,
+            "edited_main_checkout": edited_main_checkout,
+            "summary": "Per-run branch evidence is present, but isolated worktree evidence was not persisted.",
+        }
+
+    return {
+        "status": "blocked",
+        "mode": "missing_evidence",
+        "branch_name": branch_name,
+        "base_branch": base_branch,
+        "worktree_path": worktree_path,
+        "isolated_worktree": isolated_worktree,
+        "edited_main_checkout": edited_main_checkout,
+        "summary": "The run reached Stage 3 or later without persisted branch or worktree isolation evidence.",
+    }
+
+
+def _cockpit_monitoring_status(monitoring_report: dict[str, Any]) -> str | None:
+    monitoring_decision = monitoring_report.get("monitoring_decision")
+    if not isinstance(monitoring_decision, dict):
+        return None
+    return _optional_str(monitoring_decision.get("status"))
+
+
+def _cockpit_feedback_report_id(feedback_report: dict[str, Any]) -> str | None:
+    artifact = feedback_report.get("artifact")
+    if not isinstance(artifact, dict):
+        return None
+    return _optional_str(artifact.get("id"))
+
+
+def _optional_str(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def store_stage_order() -> list[str]:
