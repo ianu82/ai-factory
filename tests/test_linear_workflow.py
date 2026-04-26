@@ -9,7 +9,7 @@ import pytest
 from auto_mindsdb_factory.automation import FactoryRunStore, RunLeaseBusyError
 from auto_mindsdb_factory.build_review import Stage3BuildReviewPipeline
 from auto_mindsdb_factory.intake import AnthropicScout, Stage1IntakePipeline, build_manual_intake_item
-from auto_mindsdb_factory.linear_trigger import LinearIssueSnapshot
+from auto_mindsdb_factory.linear_trigger import LinearGraphQLClientError, LinearIssueSnapshot
 from auto_mindsdb_factory.linear_workflow import (
     LINEAR_FACTORY_STAGES,
     LinearWorkflowConfig,
@@ -248,6 +248,9 @@ class FakeLinearWorkflowClient:
         }
         self.created_issues.append(
             {
+                "id": created["id"],
+                "identifier": created["identifier"],
+                "url": created["url"],
                 "team_id": team_id,
                 "title": title,
                 "description": description,
@@ -592,6 +595,99 @@ def test_linear_workflow_ticket_artifacts_are_attached_to_child_issues(tmp_path)
         and "AI Factory artifact update: `Stage 3 Build`" in body
         for body in child_comment_bodies
     )
+
+
+def test_linear_workflow_moves_child_tickets_before_parent_advances(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_client = FakeLinearWorkflowClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    sync.sync_stage_result("stage2", stage2_result.to_document())
+    fake_client.updated_issues.clear()
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+
+    result = sync.sync_stage_result("stage3", stage3_result.to_document())
+
+    child_issue_ids = {
+        issue["id"]
+        for issue in fake_client.created_issues
+        if issue["parent_id"] == "issue-123"
+    }
+    parent_update_index = next(
+        index
+        for index, update in enumerate(fake_client.updated_issues)
+        if update["issue_id"] == "issue-123"
+    )
+    child_update_indexes = [
+        index
+        for index, update in enumerate(fake_client.updated_issues)
+        if update["issue_id"] in child_issue_ids
+    ]
+    assert child_update_indexes
+    assert max(child_update_indexes) < parent_update_index
+    assert len(result["child_state_sync"]["moved"]) == len(stage2_result.ticket_bundle["tickets"])
+
+
+def test_linear_workflow_does_not_move_parent_when_child_state_sync_fails(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    class FailingChildStateClient(FakeLinearWorkflowClient):
+        def update_issue_state(self, issue_id: str, state_id: str) -> dict[str, object]:
+            if issue_id.startswith("issue-90"):
+                raise LinearGraphQLClientError("child issue state update failed")
+            return super().update_issue_state(issue_id, state_id)
+
+    fake_client = FailingChildStateClient()
+    sync = LinearWorkflowSync(
+        tmp_path / "automation-store",
+        repo_root_override=root,
+        config=LinearWorkflowConfig(
+            api_key="test-key",
+            team_id="team-123",
+            materialize_stage2_tickets=True,
+        ),
+        linear_client=fake_client,
+    )
+    stage1_result = _active_linear_stage1(root)
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+    sync.sync_stage_result("stage2", stage2_result.to_document())
+    fake_client.updated_issues.clear()
+    stage3_result = Stage3BuildReviewPipeline(root).process(
+        stage2_result.spec_packet,
+        stage2_result.policy_decision,
+        stage2_result.ticket_bundle,
+        stage2_result.eval_manifest,
+        stage2_result.work_item,
+    )
+
+    with pytest.raises(LinearWorkflowError, match="child issue state update failed"):
+        sync.sync_stage_result("stage3", stage3_result.to_document())
+
+    assert {"issue_id": "issue-123", "state_id": "state-3"} not in fake_client.updated_issues
 
 
 def test_linear_workflow_artifact_comments_are_idempotent(tmp_path) -> None:

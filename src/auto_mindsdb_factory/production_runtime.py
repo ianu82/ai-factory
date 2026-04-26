@@ -77,6 +77,7 @@ class FactoryDoctor:
         "LINEAR_TARGET_STATE_ID",
         "LINEAR_WEBHOOK_SECRET",
         "AI_FACTORY_PUBLIC_BASE_URL",
+        "AI_FACTORY_CODE_WORKER_RUN_AS_USER",
     )
     UUID_ENV = frozenset({"LINEAR_TARGET_TEAM_ID", "LINEAR_TARGET_STATE_ID"})
 
@@ -91,7 +92,7 @@ class FactoryDoctor:
             [
                 self._command_check("git", ["git", "rev-parse", "--is-inside-work-tree"]),
                 self._command_check("gh", ["gh", "auth", "status"]),
-                self._command_check("codex", ["codex", "--version"]),
+                self._code_worker_command_check(),
                 self._store_check(),
                 self._repo_remote_check(),
             ]
@@ -144,6 +145,21 @@ class FactoryDoctor:
         status = "passed" if completed.returncode == 0 else "failed"
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
         return {"name": f"command:{name}", "status": status, "summary": detail[:500]}
+
+    def _code_worker_command_check(self) -> dict[str, str]:
+        run_as_user = os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "").strip()
+        if not run_as_user:
+            return {
+                "name": "command:codex-worker-user",
+                "status": "failed",
+                "summary": "AI_FACTORY_CODE_WORKER_RUN_AS_USER is required in production",
+            }
+        sudo_bin = os.environ.get("AI_FACTORY_CODE_WORKER_SUDO_BIN", "sudo")
+        codex_bin = os.environ.get("AI_FACTORY_CODE_WORKER_CODEX_BIN", "codex")
+        return self._command_check(
+            "codex-worker-user",
+            [sudo_bin, "-H", "-u", run_as_user, "--", codex_bin, "--version"],
+        )
 
     def _store_check(self) -> dict[str, str]:
         try:

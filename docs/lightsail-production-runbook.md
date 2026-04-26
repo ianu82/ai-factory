@@ -48,8 +48,9 @@ The Linear trigger state for this deployment is the team-specific Stage 1 intake
 - Attach a Lightsail static IP.
 - Point a DNS name at the static IP.
 - Terminate HTTPS with Caddy or nginx and proxy `https://<host>/hooks/linear` to the local webhook server.
-- Run services as a non-root user, for example `ai-factory`.
-- Store secrets outside the repo, for example `/etc/ai-factory/factory.env`, owned by the service user and mode `0600`.
+- Run services as a non-root orchestrator user, for example `ai-factory`.
+- Run the model/code worker through a separate OS user, for example `ai-factory-worker`, with only Codex/model auth in its home directory.
+- Store orchestrator secrets outside the repo, for example `/etc/ai-factory/factory.env`, owned by `root` and readable by systemd only. The `ai-factory-worker` user must not be able to read this file.
 - Enable Lightsail snapshots or another backup for the run store.
 - Keep only ports `22`, `80`, and `443` open publicly; restrict SSH by key.
 - Configure log rotation for service logs.
@@ -69,8 +70,46 @@ AI_FACTORY_PUBLIC_BASE_URL=https://<your-host>
 FACTORY_TRIGGER_BASE_URL=https://<your-host>
 AI_FACTORY_AUTONOMY_MODE=pr_ready
 AI_FACTORY_CODE_WORKER_PROVIDER=codex_cli
+AI_FACTORY_CODE_WORKER_CODEX_BIN=/usr/bin/codex
 AI_FACTORY_CODE_WORKER_MODEL=gpt-5.4
+AI_FACTORY_CODE_WORKER_RUN_AS_USER=ai-factory-worker
 AI_FACTORY_INTAKE_PAUSED=false
+```
+
+## Worker User Hardening
+
+Production should use two local users:
+
+- `ai-factory`: owns the orchestrator process, run store, GitHub auth, Linear API access, webhook secret, and PR creation.
+- `ai-factory-worker`: owns Codex/model auth only and runs the untrusted model-authored code edits inside temporary git worktrees.
+
+Create the model worker user:
+
+```sh
+sudo useradd --system --create-home --home-dir /var/lib/ai-factory-worker --shell /usr/sbin/nologin ai-factory-worker
+sudo install -d -o ai-factory-worker -g ai-factory-worker -m 0700 /var/lib/ai-factory-worker
+```
+
+Configure Codex auth for the worker user only. If auth already exists under the old service user, copy only the Codex auth directory, not `/etc/ai-factory/factory.env` or any GitHub/Linear secrets:
+
+```sh
+sudo rsync -a --chown=ai-factory-worker:ai-factory-worker /var/lib/ai-factory/.codex/ /var/lib/ai-factory-worker/.codex/
+sudo chmod -R go-rwx /var/lib/ai-factory-worker/.codex
+```
+
+Allow the orchestrator to invoke only Codex as the model worker:
+
+```sh
+printf 'ai-factory ALL=(ai-factory-worker) NOPASSWD: /usr/bin/codex\n' | sudo tee /etc/sudoers.d/ai-factory-code-worker
+sudo chmod 0440 /etc/sudoers.d/ai-factory-code-worker
+sudo visudo -cf /etc/sudoers.d/ai-factory-code-worker
+```
+
+Smoke-test the boundary:
+
+```sh
+sudo -u ai-factory sudo -H -u ai-factory-worker -- /usr/bin/codex --version
+sudo -u ai-factory-worker test ! -r /etc/ai-factory/factory.env
 ```
 
 Optional command gates:
@@ -209,6 +248,7 @@ WantedBy=multi-user.target
 ## Production Boundaries
 
 - The code worker receives sanitized factory artifacts and a writable worktree. It does not receive Linear, GitHub, AWS, or OpenAI API keys through the environment.
+- In production, the code worker runs as `AI_FACTORY_CODE_WORKER_RUN_AS_USER` so same-user `/proc` or home-directory inspection cannot read orchestrator secrets.
 - The orchestrator owns commits, pushes, PR creation, Linear comments, and stage movement.
 - Stage 5 only treats command-backed checks as real evidence. LLM quality, latency, cost, staging, and monitoring checks are `deferred` or `not_configured` until real connectors exist.
 - Stage 7-9 file-backed artifacts are simulation-only and must not satisfy production gates.

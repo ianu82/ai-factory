@@ -230,6 +230,8 @@ class CodexCLICodeWorkerConfig:
     approval_policy: str = "never"
     full_auto: bool = True
     bypass_sandbox: bool = False
+    run_as_user: str | None = None
+    sudo_bin: str = "sudo"
 
     @classmethod
     def from_env(cls) -> "CodexCLICodeWorkerConfig":
@@ -245,6 +247,8 @@ class CodexCLICodeWorkerConfig:
             .strip()
             .lower()
             in {"1", "true", "yes", "on"},
+            run_as_user=os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "").strip() or None,
+            sudo_bin=os.environ.get("AI_FACTORY_CODE_WORKER_SUDO_BIN", "sudo"),
         )
 
 
@@ -298,6 +302,7 @@ class CodexCLICodeWorkerConnector:
                 "-",
             ]
         )
+        command = self._execution_command(command)
         try:
             completed = self.subprocess_run(
                 command,
@@ -345,6 +350,18 @@ class CodexCLICodeWorkerConnector:
         for name in self.SECRET_ENV_NAMES:
             env.pop(name, None)
         return env
+
+    def _execution_command(self, command: list[str]) -> list[str]:
+        if not self.config.run_as_user:
+            return command
+        return [
+            self.config.sudo_bin,
+            "-H",
+            "-u",
+            self.config.run_as_user,
+            "--",
+            *command,
+        ]
 
 
 _SECRET_VALUE_PATTERN = re.compile(

@@ -32,6 +32,59 @@ def test_factory_doctor_env_check_accepts_linear_uuid(monkeypatch) -> None:
     }
 
 
+def test_factory_doctor_requires_code_worker_os_user(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("AI_FACTORY_CODE_WORKER_RUN_AS_USER", raising=False)
+    doctor = FactoryDoctor(
+        ProductionRuntimeConfig(
+            store_dir=tmp_path / "store",
+            repo_root=tmp_path,
+            repository="ianu82/ai-factory",
+        )
+    )
+
+    check = doctor._code_worker_command_check()
+
+    assert check == {
+        "name": "command:codex-worker-user",
+        "status": "failed",
+        "summary": "AI_FACTORY_CODE_WORKER_RUN_AS_USER is required in production",
+    }
+
+
+def test_factory_doctor_checks_code_worker_under_target_user(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "ai-factory-worker")
+    monkeypatch.setenv("AI_FACTORY_CODE_WORKER_CODEX_BIN", "/usr/bin/codex")
+    doctor = FactoryDoctor(
+        ProductionRuntimeConfig(
+            store_dir=tmp_path / "store",
+            repo_root=tmp_path,
+            repository="ianu82/ai-factory",
+        )
+    )
+
+    def fake_command_check(name: str, command: list[str]) -> dict[str, str]:
+        captured["name"] = name
+        captured["command"] = command
+        return {"name": f"command:{name}", "status": "passed", "summary": "ok"}
+
+    monkeypatch.setattr(doctor, "_command_check", fake_command_check)
+
+    check = doctor._code_worker_command_check()
+
+    assert check["status"] == "passed"
+    assert captured["name"] == "codex-worker-user"
+    assert captured["command"] == [
+        "sudo",
+        "-H",
+        "-u",
+        "ai-factory-worker",
+        "--",
+        "/usr/bin/codex",
+        "--version",
+    ]
+
+
 def test_factory_worker_uses_production_coordinator_for_linear_handoff(
     monkeypatch,
     tmp_path,

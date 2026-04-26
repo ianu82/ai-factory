@@ -479,6 +479,14 @@ class LinearWorkflowSync:
                 binding.last_comment_key = None
                 binding.last_comment_id = None
 
+            child_state_result = self._ensure_child_ticket_issues_ready_for_stage(
+                binding,
+                stage_name=stage_name,
+                linear_stage_key=linear_stage_key,
+                state_id=str(target_state["id"]),
+                document=document,
+            )
+
             state_update = "unchanged"
             if binding.last_synced_state_id != str(target_state["id"]):
                 issue = self.linear_client.update_issue_state(
@@ -539,6 +547,7 @@ class LinearWorkflowSync:
                 "blocked_label": label_result,
                 "artifact_comment": artifact_comment,
                 "ticket_issues": ticket_issues,
+                "child_state_sync": child_state_result,
                 "comment": comment,
                 "created_by_factory": binding.created_by_factory,
             }
@@ -700,6 +709,68 @@ class LinearWorkflowSync:
             )
         return {"status": "synced", "posted": posted, "skipped": skipped}
 
+    def _ensure_child_ticket_issues_ready_for_stage(
+        self,
+        binding: LinearWorkflowBinding,
+        *,
+        stage_name: str,
+        linear_stage_key: str,
+        state_id: str,
+        document: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.config.materialize_stage2_tickets:
+            return {"status": "skipped", "reason": "disabled"}
+        if stage_name in {"stage1", "stage2"}:
+            return {"status": "skipped", "reason": "stage_does_not_require_child_sync"}
+        if stage_name not in {"stage3", "stage5", "stage6", "merge"}:
+            return {"status": "skipped", "reason": "stage_has_no_child_state_sync"}
+        if not binding.ticket_issue_bindings:
+            materialized = self._materialize_stage2_ticket_issues(
+                binding,
+                linear_stage_key=linear_stage_key,
+                state_id=state_id,
+                document=document,
+            )
+            if (
+                materialized.get("status") == "synced"
+                and not binding.ticket_issue_bindings
+                and self._stage2_tickets(document)
+            ):
+                raise LinearWorkflowError(
+                    "Linear parent cannot advance because scoped child ticket issues were not materialized."
+                )
+            if not binding.ticket_issue_bindings:
+                return materialized
+
+        moved: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for ticket_id, ticket_binding in sorted(binding.ticket_issue_bindings.items()):
+            issue_id = _optional_str(ticket_binding.get("issue_id"))
+            if issue_id is None:
+                skipped.append({"ticket_id": ticket_id, "reason": "missing_issue_id"})
+                continue
+            if ticket_binding.get("last_synced_state_id") == state_id:
+                skipped.append({"ticket_id": ticket_id, "reason": "already_in_target_state"})
+                continue
+            issue = self.linear_client.update_issue_state(issue_id, state_id)
+            ticket_binding["issue_identifier"] = (
+                _optional_str(issue.get("identifier"))
+                or _optional_str(ticket_binding.get("issue_identifier"))
+            )
+            ticket_binding["issue_url"] = (
+                _optional_str(issue.get("url"))
+                or _optional_str(ticket_binding.get("issue_url"))
+            )
+            ticket_binding["last_synced_state_id"] = state_id
+            moved.append(
+                {
+                    "ticket_id": ticket_id,
+                    "issue_id": issue_id,
+                    "state_id": state_id,
+                }
+            )
+        return {"status": "synced", "moved": moved, "skipped": skipped}
+
     def _materialize_stage2_ticket_issues(
         self,
         binding: LinearWorkflowBinding,
@@ -775,6 +846,9 @@ class LinearWorkflowSync:
             "issue_id": str(issue["id"]),
             "issue_identifier": _optional_str(issue.get("identifier")),
             "issue_url": _optional_str(issue.get("url")),
+            "last_synced_state_id": _optional_str(
+                LinearWorkflowSync._nested_value(issue, "state", "id")
+            ),
             "artifact_comment_keys": [],
         }
 

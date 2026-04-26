@@ -425,3 +425,51 @@ def test_codex_cli_code_worker_can_bypass_sandbox_for_externally_isolated_hosts(
     assert "--dangerously-bypass-approvals-and-sandbox" in captured["command"]
     assert "--full-auto" not in captured["command"]
     assert "-s" not in captured["command"]
+
+
+def test_codex_cli_code_worker_can_run_as_separate_os_user(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    connector = CodexCLICodeWorkerConnector(
+        CodexCLICodeWorkerConfig(
+            codex_bin="/usr/bin/codex",
+            model="gpt-5.4",
+            timeout_seconds=5,
+            bypass_sandbox=True,
+            run_as_user="ai-factory-worker",
+        ),
+        subprocess_run=fake_run,
+    )
+    job = CodeWorkerJob(
+        work_item_id="wi-123",
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        worktree_path=tmp_path,
+        spec_packet={"source": {"title": "Test"}},
+        ticket_bundle={"tickets": []},
+        eval_manifest={"tiers": []},
+        pr_packet={"changed_paths": []},
+        instructions="Implement the scoped work.",
+        target_paths=[],
+    )
+
+    result = connector.run_code_worker(job)
+
+    assert result.status == "succeeded"
+    assert captured["command"][:5] == [
+        "sudo",
+        "-H",
+        "-u",
+        "ai-factory-worker",
+        "--",
+    ]
+    assert captured["command"][5:9] == ["/usr/bin/codex", "exec", "-m", "gpt-5.4"]
