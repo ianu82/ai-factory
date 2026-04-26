@@ -1452,6 +1452,88 @@ def test_factory_smoke_cli_fails_closed_without_leaking_auth_output(
     assert "sensitive-token" not in captured.out
 
 
+def test_factory_smoke_cli_rejects_public_base_url_with_credentials_or_query(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "AI_FACTORY_PUBLIC_BASE_URL",
+        "https://ops:secret@factory.example.com/factory?token=ghp-secret#fragment",
+    )
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "failed"
+    assert payload["public_base_url"] == "https://factory.example.com/factory"
+    config_check = next(check for check in payload["checks"] if check["name"] == "config:public_base_url")
+    webhook_check = next(check for check in payload["checks"] if check["name"] == "webhook:public_endpoint")
+    assert config_check["status"] == "failed"
+    assert webhook_check["status"] == "failed"
+    assert "credentials, query parameters, or fragments" in config_check["summary"]
+    assert "credentials, query parameters, or fragments" in webhook_check["summary"]
+    assert "ops:secret" not in captured.out
+    assert "ghp-secret" not in captured.out
+    assert "#fragment" not in captured.out
+
+
 def test_factory_smoke_cli_sanitizes_nested_doctor_output(
     capsys,
     monkeypatch,
@@ -1548,6 +1630,33 @@ def test_factory_smoke_cli_sanitizes_nested_doctor_output(
     assert "ghp-secret-token" not in captured.out
     assert "ops:secret" not in captured.out
     assert "sk-secret" not in captured.out
+
+
+def test_factory_smoke_requires_executable_repo_relative_gate_commands(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    gate_script = scripts_dir / "unit-gate.sh"
+    gate_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gate_script.chmod(0o644)
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "unit")
+    monkeypatch.setenv("AI_FACTORY_GATE_UNIT_COMMAND", "./scripts/unit-gate.sh --smoke")
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == ["unit"]
+    assert check["commands"] == [
+        {
+            "kind": "unit",
+            "configured": True,
+            "executable": "./scripts/unit-gate.sh",
+            "available": False,
+        }
+    ]
+    assert "Configured executables were not found for unit." in check["summary"]
 
 
 def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:

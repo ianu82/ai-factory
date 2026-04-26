@@ -66,6 +66,10 @@ _ENV_FILE_NAMES = (".env", ".env.local")
 _ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off"})
+_SECRET_VALUE_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*['\"]?[^'\"\s,}]+"
+)
+_URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
 
 
 class EnvironmentSetupError(RuntimeError):
@@ -1735,7 +1739,10 @@ def _smoke_check(
         "summary": summary,
     }
     document.update(details)
-    return document
+    sanitized = _sanitize_smoke_value(document)
+    if not isinstance(sanitized, dict):
+        raise CommandInputError("Smoke checks must remain JSON objects after sanitization.")
+    return sanitized
 
 
 def _env_value(name: str) -> str:
@@ -1744,12 +1751,42 @@ def _env_value(name: str) -> str:
 
 def _redact_url_credentials(value: str) -> str:
     parsed = urllib_parse.urlparse(value)
-    if parsed.username is None and parsed.password is None:
+    if not parsed.scheme or not parsed.netloc:
         return value
-    netloc = parsed.hostname or ""
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    return urllib_parse.urlunparse(parsed._replace(netloc=netloc))
+    netloc = parsed.netloc
+    if parsed.username is not None or parsed.password is not None:
+        netloc = parsed.hostname or ""
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+    return urllib_parse.urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
+
+
+def _sanitize_smoke_text(value: str) -> str:
+    sanitized = "".join(
+        char if char in {"\n", "\t"} or ord(char) >= 32 else " "
+        for char in value
+    )
+    sanitized = _SECRET_VALUE_PATTERN.sub(r"\1=[REDACTED]", sanitized)
+
+    def _sanitize_url_match(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        suffix = ""
+        while candidate and candidate[-1] in ".,;:)]":
+            suffix = candidate[-1] + suffix
+            candidate = candidate[:-1]
+        return _redact_url_credentials(candidate) + suffix
+
+    return _URL_IN_TEXT_PATTERN.sub(_sanitize_url_match, sanitized)
+
+
+def _sanitize_smoke_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _sanitize_smoke_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_smoke_value(child) for child in value]
+    if isinstance(value, str):
+        return _sanitize_smoke_text(value)
+    return value
 
 
 def _doctor_check_for_smoke(report: dict[str, Any]) -> dict[str, Any]:
@@ -1768,7 +1805,7 @@ def _doctor_check_for_smoke(report: dict[str, Any]) -> dict[str, Any]:
     elif name == "store:writable":
         smoke_summary = "run store is writable" if status == "passed" else "not writable"
     elif isinstance(summary, str) and summary:
-        smoke_summary = summary
+        smoke_summary = _sanitize_smoke_text(summary)
     else:
         smoke_summary = "passed" if status == "passed" else "failed"
     return {
@@ -1885,6 +1922,13 @@ def _check_public_base_url() -> dict[str, Any]:
             "AI_FACTORY_PUBLIC_BASE_URL must be an absolute http(s) URL.",
             value=display_value,
         )
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        return _smoke_check(
+            "config:public_base_url",
+            "failed",
+            "AI_FACTORY_PUBLIC_BASE_URL must not include credentials, query parameters, or fragments.",
+            value=display_value,
+        )
     return _smoke_check(
         "config:public_base_url",
         "passed",
@@ -1957,9 +2001,15 @@ def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
             continue
         executable = command[0]
         executable_path = Path(executable).expanduser()
-        if not executable_path.is_absolute():
-            executable_path = repo_root / executable_path
-        available = executable_path.is_file() or shutil.which(executable) is not None
+        path_like_executable = executable_path.is_absolute() or any(
+            separator and separator in executable
+            for separator in (os.sep, os.altsep, "/", "\\")
+        )
+        if path_like_executable:
+            resolved_path = executable_path if executable_path.is_absolute() else repo_root / executable_path
+            available = resolved_path.is_file() and os.access(resolved_path, os.X_OK)
+        else:
+            available = shutil.which(executable) is not None
         if not available:
             unavailable_kinds.append(kind)
         command_details.append(
@@ -2041,7 +2091,15 @@ def _check_public_webhook_endpoint() -> dict[str, Any]:
             "failed",
             "AI_FACTORY_PUBLIC_BASE_URL must be an absolute http(s) URL.",
         )
-    url = f"{base_url.rstrip('/')}/hooks/linear"
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        return _smoke_check(
+            "webhook:public_endpoint",
+            "failed",
+            "AI_FACTORY_PUBLIC_BASE_URL must not include credentials, query parameters, or fragments.",
+            url=_redact_url_credentials(base_url),
+        )
+    normalized_base_url = urllib_parse.urlunparse(parsed).rstrip("/")
+    url = f"{normalized_base_url}/hooks/linear"
     display_url = _redact_url_credentials(url)
     request = urllib_request.Request(
         url,
@@ -2113,7 +2171,7 @@ def _build_factory_smoke_report(config: ProductionRuntimeConfig) -> dict[str, An
     ready_to_unpause = doctor["status"] == "passed" and all(
         check["status"] == "passed" for check in checks
     )
-    return {
+    report = {
         "cycle": "factory-smoke",
         "status": "passed" if ready_to_unpause else "failed",
         "ready_to_unpause": ready_to_unpause,
@@ -2134,6 +2192,10 @@ def _build_factory_smoke_report(config: ProductionRuntimeConfig) -> dict[str, An
         "doctor": _doctor_report_for_smoke(doctor),
         "checks": checks,
     }
+    sanitized = _sanitize_smoke_value(report)
+    if not isinstance(sanitized, dict):
+        raise CommandInputError("Smoke report must remain a JSON object after sanitization.")
+    return sanitized
 
 
 def _build_agent_connector(args: argparse.Namespace):
