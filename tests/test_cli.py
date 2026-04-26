@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -872,7 +873,8 @@ def test_automation_stage1_cli_runs_cycle(capsys, tmp_path) -> None:
     assert payload["created_results"]
 
 
-def test_automation_stage1_cli_can_advance_immediately(capsys, tmp_path) -> None:
+def test_automation_stage1_cli_can_advance_immediately(capsys, monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
 
@@ -998,7 +1000,12 @@ def test_automation_register_bundle_cli_rejects_malformed_stage8_result(capsys, 
     assert "missing required object fields" in captured.err
 
 
-def test_automation_register_bundle_cli_can_advance_immediately(capsys, tmp_path) -> None:
+def test_automation_register_bundle_cli_can_advance_immediately(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
         encoding="utf-8"
@@ -1121,7 +1128,12 @@ def test_automation_register_bundle_cli_returns_error_on_failed_immediate_handof
     assert "Automation immediate handoff failed:" in captured.err
 
 
-def test_automation_advance_runs_cli_progresses_active_build_items(capsys, tmp_path) -> None:
+def test_automation_advance_runs_cli_progresses_active_build_items(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
     store_dir = tmp_path / "automation-store"
@@ -1193,6 +1205,642 @@ def test_factory_doctor_cli_emits_runtime_checks(capsys, monkeypatch, tmp_path) 
     assert payload["status"] == "passed"
 
 
+def test_factory_smoke_cli_emits_readiness_report(capsys, monkeypatch, tmp_path) -> None:
+    team_id = "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844"
+    state_id = "d377109c-25fc-4d26-9b5a-3c9c96b37816"
+    monkeypatch.setenv("AI_FACTORY_INTAKE_PAUSED", "true")
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", team_id)
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", state_id)
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+            assert config.autonomy_mode.value == "pr_ready"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    def fake_run(command, **kwargs):
+        class _Completed:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+                self.stdout = ""
+                self.stderr = ""
+
+        assert command in (["gh", "auth", "status"], ["codex", "login", "status"])
+        return _Completed(0)
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(cli_main.shutil, "which", lambda executable: f"/usr/bin/{executable}")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["cycle"] == "factory-smoke"
+    assert payload["status"] == "passed"
+    assert payload["ready_to_unpause"] is True
+    assert payload["intake_paused"] is True
+    assert payload["intake_paused_configured"] is True
+    assert payload["intake_paused_value"] == "true"
+    assert payload["public_base_url"] == "https://factory.example.com"
+    assert payload["linear_target_team_id"] == team_id
+    assert payload["linear_target_state_id"] == state_id
+    assert payload["doctor"]["status"] == "passed"
+    assert any(check["name"] == "config:intake_paused" for check in payload["checks"])
+    assert any(check["name"] == "auth:github" for check in payload["checks"])
+    assert any(check["name"] == "auth:codex" for check in payload["checks"])
+    assert any(check["name"] == "gates:required_commands" for check in payload["checks"])
+
+
+def test_factory_smoke_cli_rejects_invalid_intake_pause_flag(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_INTAKE_PAUSED", "sometimes")
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "failed"
+    assert payload["ready_to_unpause"] is False
+    assert payload["intake_paused"] is None
+    assert payload["intake_paused_configured"] is True
+    assert payload["intake_paused_value"] == "sometimes"
+    intake_check = next(check for check in payload["checks"] if check["name"] == "config:intake_paused")
+    assert intake_check["status"] == "failed"
+    assert "must be one of" in intake_check["summary"]
+
+
+def test_factory_smoke_cli_fails_closed_without_leaking_auth_output(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://ops:secret@factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    def fake_run(command, **kwargs):
+        class _Completed:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+                self.stdout = "Logged in using an API key - sk-proj-secret"
+                self.stderr = "sensitive-token"
+
+        return _Completed(1 if command[0] == "codex" else 0)
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+    monkeypatch.setattr(cli_main.shutil, "which", lambda executable: f"/usr/bin/{executable}")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "failed"
+    assert payload["ready_to_unpause"] is False
+    codex_check = next(check for check in payload["checks"] if check["name"] == "auth:codex")
+    assert codex_check["status"] == "failed"
+    assert "exit code 1" in codex_check["summary"]
+    assert "sk-proj-secret" not in captured.out
+    assert "ops:secret" not in captured.out
+    assert "sensitive-token" not in captured.out
+
+
+def test_factory_smoke_cli_rejects_public_base_url_with_credentials_or_query(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "AI_FACTORY_PUBLIC_BASE_URL",
+        "https://ops:secret@factory.example.com/factory?token=ghp-secret#fragment",
+    )
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "failed"
+    assert payload["public_base_url"] == "https://factory.example.com/factory"
+    config_check = next(check for check in payload["checks"] if check["name"] == "config:public_base_url")
+    webhook_check = next(check for check in payload["checks"] if check["name"] == "webhook:public_endpoint")
+    assert config_check["status"] == "failed"
+    assert webhook_check["status"] == "failed"
+    assert "credentials, query parameters, or fragments" in config_check["summary"]
+    assert "credentials, query parameters, or fragments" in webhook_check["summary"]
+    assert "ops:secret" not in captured.out
+    assert "ghp-secret" not in captured.out
+    assert "#fragment" not in captured.out
+
+
+def test_factory_smoke_cli_sanitizes_nested_doctor_output(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "failed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [
+                    {
+                        "name": "command:gh",
+                        "status": "failed",
+                        "summary": "token=ghp-secret-token",
+                    },
+                    {
+                        "name": "git:origin",
+                        "status": "passed",
+                        "summary": "https://ops:secret@github.com/ianu82/ai-factory.git",
+                    },
+                ],
+                "debug": {"api_key": "sk-secret"},
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["doctor"]["status"] == "failed"
+    assert "debug" not in payload["doctor"]
+    doctor_checks = {check["name"]: check for check in payload["doctor"]["checks"]}
+    assert doctor_checks["command:gh"]["summary"] == "check failed"
+    assert doctor_checks["git:origin"]["summary"] == "https://github.com/ianu82/ai-factory.git"
+    assert "ghp-secret-token" not in captured.out
+    assert "ops:secret" not in captured.out
+    assert "sk-secret" not in captured.out
+
+
+def test_factory_smoke_cli_redacts_unexpected_sensitive_fields(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "api_key": "sk-secret",
+            "token": "ghp-secret-token",
+            "nested": {
+                "authorization": "Bearer secret-value",
+                "signature": "sha256=abc123",
+            },
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    gates_check = next(check for check in payload["checks"] if check["name"] == "gates:required_commands")
+    assert gates_check["api_key"] == "[REDACTED]"
+    assert gates_check["token"] == "[REDACTED]"
+    assert gates_check["nested"] == {
+        "authorization": "[REDACTED]",
+        "signature": "[REDACTED]",
+    }
+    assert "sk-secret" not in captured.out
+    assert "ghp-secret-token" not in captured.out
+    assert "secret-value" not in captured.out
+    assert "sha256=abc123" not in captured.out
+
+
+def test_factory_smoke_verifies_linear_ids_before_sync(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_key")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "not-a-uuid")
+
+    class _UnexpectedSync:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("LinearWorkflowSync should not be constructed for invalid UUIDs.")
+
+    monkeypatch.setattr(cli_main, "LinearWorkflowSync", _UnexpectedSync)
+
+    check = cli_main._verify_linear_stage_setup(tmp_path / "store", repo_root_override=tmp_path)
+
+    assert check["status"] == "failed"
+    assert (
+        check["summary"]
+        == "LINEAR_TARGET_STATE_ID must be a valid UUID before verifying Linear stage setup."
+    )
+
+
+def test_factory_smoke_requires_executable_repo_relative_gate_commands(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    gate_script = scripts_dir / "unit-gate.sh"
+    gate_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gate_script.chmod(0o644)
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "unit")
+    monkeypatch.setenv("AI_FACTORY_GATE_UNIT_COMMAND", "./scripts/unit-gate.sh --smoke")
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == ["unit"]
+    assert check["commands"] == [
+        {
+            "kind": "unit",
+            "configured": True,
+            "executable": "./scripts/unit-gate.sh",
+            "available": False,
+        }
+    ]
+    assert "Configured executables were not found for unit." in check["summary"]
+
+
+def test_factory_smoke_requires_existing_repo_relative_gate_targets(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "unit")
+    monkeypatch.setenv(
+        "AI_FACTORY_GATE_UNIT_COMMAND",
+        f"{sys.executable} ./scripts/unit-gate.sh --smoke",
+    )
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == ["unit"]
+    assert check["commands"] == [
+        {
+            "kind": "unit",
+            "configured": True,
+            "executable": sys.executable,
+            "available": False,
+        }
+    ]
+    assert "Configured command paths were not found for unit." in check["summary"]
+
+
+def test_factory_smoke_requires_at_least_one_required_gate_kind(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "")
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == []
+    assert check["commands"] == []
+    assert "must declare at least one required gate kind" in check["summary"]
+
+
+def test_factory_smoke_rejects_invalid_gate_command_configuration(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "unit")
+    monkeypatch.setenv("AI_FACTORY_GATE_UNIT_COMMAND", "'unterminated")
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == ["unit"]
+    assert check["commands"] == []
+    assert check["error_type"] == "ValueError"
+    assert "Gate command configuration is invalid" in check["summary"]
+
+
 def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     class _FakeWorker:
         def __init__(self, config) -> None:
@@ -1231,7 +1879,12 @@ def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     assert payload["cycles"] == [{"cycle": "factory-worker-cycle"}]
 
 
-def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:
+def test_automation_supervisor_cycle_cli_runs_full_pass(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_AUTONOMY_MODE", "pr_ready")
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
 
