@@ -210,6 +210,29 @@ def test_github_connector_uses_deterministic_work_item_branch_name(tmp_path) -> 
     assert first.startswith("factory/work-item-factory-worker-should-create-real-prs-")
 
 
+def test_github_connector_reads_existing_pr_when_create_reports_duplicate(tmp_path) -> None:
+    connector = GitHubCLIRepoConnector(tmp_path, repository="ianu82/ai-factory")
+    connector._existing_pr_for_branch = lambda branch_name: None  # type: ignore[method-assign]
+
+    def _duplicate_create(branch_name: str, title: str, body: str) -> str:
+        raise FactoryConnectorError(
+            'Command failed: gh pr create: a pull request for branch '
+            '"factory/test" into branch "main" already exists:\n'
+            "https://github.com/ianu82/ai-factory/pull/8"
+        )
+
+    connector._create_github_pr = _duplicate_create  # type: ignore[method-assign]
+
+    number, url = connector._create_or_read_github_pr(
+        "factory/test",
+        "Implement test",
+        "body",
+    )
+
+    assert number == 8
+    assert url == "https://github.com/ianu82/ai-factory/pull/8"
+
+
 def test_sanitize_factory_document_redacts_secret_like_values() -> None:
     sanitized = sanitize_factory_document(
         {

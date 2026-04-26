@@ -1074,7 +1074,18 @@ class GitHubCLIRepoConnector:
         existing = self._existing_pr_for_branch(branch_name)
         if existing is not None:
             return existing
-        pr_url = self._create_github_pr(branch_name, title, body)
+        try:
+            pr_url = self._create_github_pr(branch_name, title, body)
+        except FactoryConnectorError as exc:
+            if "already exists" not in str(exc):
+                raise
+            existing = self._existing_pr_for_branch(branch_name)
+            if existing is not None:
+                return existing
+            url_match = re.search(r"https://github\.com/[^\s]+/pull/\d+", str(exc))
+            if url_match is None:
+                raise
+            pr_url = url_match.group(0)
         number_match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr_url)
         if number_match is None:
             raise FactoryConnectorError(f"Could not parse PR number from GitHub URL: {pr_url}")
