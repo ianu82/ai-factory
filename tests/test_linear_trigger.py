@@ -533,7 +533,7 @@ def test_linear_trigger_worker_dedupes_duplicate_logical_trigger_keys(tmp_path) 
     assert fake_coordinator.handoff_calls == [result.processed_events[0]["work_item_id"]]
 
 
-def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state(tmp_path) -> None:
+def test_linear_trigger_worker_skips_reentry_while_issue_has_active_run(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     store_dir = tmp_path / "automation-store"
     trigger_store = LinearTriggerStore(store_dir, repo_root_override=root)
@@ -579,11 +579,18 @@ def test_linear_trigger_worker_creates_new_runs_when_issue_reenters_target_state
 
     result = worker.run_cycle(repository="ianu82/ai-factory")
 
-    assert len(result.processed_events) == 2
-    assert result.skipped_events == []
+    assert len(result.processed_events) == 1
+    assert len(result.skipped_events) == 1
     assert result.failed_events == []
-    assert result.processed_events[0]["work_item_id"] != result.processed_events[1]["work_item_id"]
     assert result.processed_events[0]["work_item_id"].startswith("wi-linear-eng-123-")
+    assert result.skipped_events == [
+        {
+            "delivery_id": "delivery-2",
+            "reason": "linear_issue_already_has_active_run",
+            "work_item_id": result.processed_events[0]["work_item_id"],
+            "state": "POLICY_ASSIGNED",
+        }
+    ]
 
 
 def test_linear_trigger_worker_records_handoff_failures_without_aborting_cycle(tmp_path) -> None:
@@ -623,10 +630,17 @@ def test_linear_trigger_worker_records_handoff_failures_without_aborting_cycle(t
     result = worker.run_cycle(repository="ianu82/ai-factory")
 
     assert result.processed_events == []
-    assert len(result.failed_events) == 2
+    assert len(result.failed_events) == 1
     assert result.failed_events[0]["delivery_id"] == "delivery-1"
     assert "simulated handoff failure" in result.failed_events[0]["reason"]
-    assert result.failed_events[1]["delivery_id"] == "delivery-2"
+    assert result.skipped_events == [
+        {
+            "delivery_id": "delivery-2",
+            "reason": "linear_issue_already_has_active_run",
+            "work_item_id": "wi-linear-eng-123-8f3c93b1fe",
+            "state": "POLICY_ASSIGNED",
+        }
+    ]
 
 
 def test_linear_trigger_worker_records_workflow_sync_failures_without_aborting_cycle(tmp_path) -> None:

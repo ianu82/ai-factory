@@ -1433,6 +1433,19 @@ class LinearTriggerWorker:
                                 }
                             )
                             continue
+                        active_run = self._active_run_for_issue(envelope.issue_id)
+                        if active_run is not None:
+                            self.trigger_store.mark_processed(trigger_state, envelope)
+                            self.trigger_store.remove_envelope(path)
+                            skipped_events.append(
+                                {
+                                    "delivery_id": delivery_id,
+                                    "reason": "linear_issue_already_has_active_run",
+                                    "work_item_id": active_run["work_item_id"],
+                                    "state": active_run["state"],
+                                }
+                            )
+                            continue
 
                     snapshot = self.linear_client.fetch_issue_snapshot(envelope.issue_id)
                     stage1_result = self._create_stage1_result(snapshot, envelope)
@@ -1490,6 +1503,55 @@ class LinearTriggerWorker:
             failed_events=failed_events,
             trigger_state=self.trigger_store.load_state(),
         )
+
+    def _active_run_for_issue(self, issue_id: str) -> dict[str, str] | None:
+        from .automation import FactoryRunStore, PROGRESSION_SCAN_STAGES
+        from .controller import ControllerState
+
+        inactive_states = {
+            ControllerState.WATCHLISTED.value,
+            ControllerState.REJECTED.value,
+            ControllerState.DEAD_LETTER.value,
+            ControllerState.MERGED.value,
+            ControllerState.PRODUCTION_MONITORING.value,
+        }
+        store = FactoryRunStore(self.trigger_store.root, repo_root_override=self.repo_root)
+        matches: list[dict[str, str]] = []
+        for run_dir in store.iter_run_directories():
+            candidate = store.load_latest_candidate(run_dir, PROGRESSION_SCAN_STAGES)
+            if candidate is None:
+                continue
+            work_item = candidate.document.get("work_item")
+            if not isinstance(work_item, dict):
+                continue
+            if self._linear_issue_id_for_work_item(work_item) != issue_id:
+                continue
+            state = str(work_item.get("state") or "")
+            if state in inactive_states:
+                continue
+            matches.append(
+                {
+                    "work_item_id": candidate.work_item_id,
+                    "stage_name": candidate.stage_name,
+                    "state": state,
+                }
+            )
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item["work_item_id"])
+        return matches[0]
+
+    @staticmethod
+    def _linear_issue_id_for_work_item(work_item: dict[str, Any]) -> str | None:
+        if work_item.get("source_provider") != "linear":
+            return None
+        external_id = work_item.get("source_external_id")
+        if not isinstance(external_id, str) or not external_id.startswith("linear:"):
+            return None
+        parts = external_id.split(":")
+        if len(parts) < 2 or not parts[1]:
+            return None
+        return parts[1]
 
     def _create_stage1_result(
         self,
