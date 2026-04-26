@@ -372,8 +372,133 @@ def test_factory_cockpit_cli_exposes_source_and_isolation_fields(
     assert run["pull_request"]["number"] == 114
     assert run["pull_request"]["url"] == "https://github.com/ianu82/ai-factory/pull/114"
     assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
     assert run["isolation"]["status"] == "healthy"
     assert run["isolation"]["mode"] == "per_run_branch_and_worktree"
+
+
+def test_factory_cockpit_cli_keeps_pre_stage3_runs_pending(
+    capsys, tmp_path
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    stage1_result = Stage1IntakePipeline(root).process_item(
+        build_manual_intake_item(
+            provider="linear",
+            external_id="linear-issue-sof-114",
+            title="Factory cockpit should expose run isolation and concurrency health",
+            url="https://linear.app/mindsdb/issue/SOF-114/factory-cockpit-isolation",
+            detected_at="2026-04-26T19:18:23Z",
+            published_at="2026-04-26T19:18:22Z",
+            body=(
+                "The factory cockpit should expose machine-readable branch, pull request, and "
+                "isolated worktree evidence for Stage 3 runs so operators can confirm concurrent "
+                "runs stayed off the main checkout."
+            ),
+        )
+    )
+    stage2_result = Stage2TicketingPipeline(root).process(
+        stage1_result.spec_packet,
+        stage1_result.policy_decision,
+        stage1_result.work_item,
+    )
+
+    _write_stage_result(
+        store_dir,
+        work_item_id=stage2_result.work_item.work_item_id,
+        stage_name="stage2",
+        document=stage2_result.to_document(),
+    )
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(store_dir),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    run = payload["runs"][0]
+
+    assert exit_code == 0
+    assert run["state"] == "TICKETED"
+    assert run["controller_state"] == "TICKETED"
+    assert run["source"]["identifier"] == "SOF-114"
+    assert run["branch_name"] is None
+    assert run["pull_request"] is None
+    assert run["isolation"]["status"] == "pending"
+    assert run["isolation"]["mode"] == "not_required_yet"
+
+
+def test_factory_cockpit_cli_warns_when_code_worker_evidence_is_incomplete(
+    capsys, tmp_path
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    stage3_document = _factory_cockpit_stage3_document(root)
+    branch_name = (
+        "factory/work-item-factory-cockpit-should-expose-run-isolation-and-1454bb4de285"
+    )
+    pr_url = "https://github.com/ianu82/ai-factory/pull/114"
+    stage3_document["pr_packet"]["branch_name"] = branch_name
+    stage3_document["pr_packet"]["pull_request"]["number"] = 114
+    stage3_document["pr_packet"]["pull_request"]["url"] = pr_url
+    stage3_document["pr_packet"]["delivery_evidence"] = {
+        "mode": "code_worker_pr",
+        "repository": "ianu82/ai-factory",
+        "branch_name": branch_name,
+        "base_branch": "main",
+        "commit_sha": "abc1234",
+        "pull_request_number": 114,
+        "pull_request_url": pr_url,
+        "code_worker": {
+            "status": "succeeded",
+            "provider": "codex_cli",
+            "model": "gpt-5.4",
+            "command": ["codex", "exec", "-m", "gpt-5.4", "-"],
+            "changed_paths": ["src/auto_mindsdb_factory/vertical_slice.py"],
+            "diff_stat": " 1 file changed, 1 insertion(+)",
+            "stdout": "ok",
+            "stderr": "",
+            "started_at": "2026-04-26T19:25:16Z",
+            "completed_at": "2026-04-26T19:25:20Z",
+            "exit_code": 0,
+        },
+        "created_at": "2026-04-26T19:25:16Z",
+    }
+
+    _write_stage_result(
+        store_dir,
+        work_item_id=stage3_document["work_item"]["work_item_id"],
+        stage_name="stage3",
+        document=stage3_document,
+    )
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(store_dir),
+            "--repo-root",
+            str(root),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    run = payload["runs"][0]
+
+    assert exit_code == 0
+    assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
+    assert run["branch_name"] == branch_name
+    assert run["pull_request"]["number"] == 114
+    assert run["pull_request"]["url"] == pr_url
+    assert run["isolation"]["status"] == "warning"
+    assert run["isolation"]["mode"] == "per_run_branch_and_worktree"
+    assert "not fully persisted" in run["isolation"]["summary"]
 
 
 def test_linear_webhook_server_cli_invokes_runtime(monkeypatch, tmp_path) -> None:

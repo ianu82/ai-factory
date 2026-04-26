@@ -372,6 +372,7 @@ def test_vertical_slice_cockpit_summarizes_latest_run(tmp_path) -> None:
     assert run["branch_name"] == result.pr_evidence.branch_name
     assert run["pull_request"]["url"] == result.pr_evidence.url
     assert run["source"]["provider"] == "anthropic"
+    assert run["controller_state"] == "PRODUCTION_MONITORING"
     assert run["isolation"]["status"] == "warning"
     assert run["isolation"]["mode"] == "per_run_branch_only"
 
@@ -394,6 +395,7 @@ def test_cockpit_summary_keeps_stage2_runs_pending_for_isolation_checks(
     run = summary["runs"][0]
 
     assert run["state"] == "TICKETED"
+    assert run["controller_state"] == "TICKETED"
     assert run["source"]["identifier"] == "SOF-114"
     assert (
         run["source"]["url"]
@@ -442,6 +444,7 @@ def test_cockpit_summary_marks_reviewable_code_worker_runs_healthy(tmp_path) -> 
     run = summary["runs"][0]
 
     assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
     assert run["branch_name"] == branch_name
     assert run["pull_request"]["number"] == 114
     assert run["pull_request"]["url"] == pr_url
@@ -473,10 +476,67 @@ def test_cockpit_summary_warns_when_stage3_run_lacks_worktree_evidence(
     run = summary["runs"][0]
 
     assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
     assert run["branch_name"] == branch_name
     assert run["isolation"]["status"] == "warning"
     assert run["isolation"]["mode"] == "per_run_branch_only"
     assert "worktree evidence" in run["isolation"]["summary"]
+
+
+def test_cockpit_summary_warns_when_code_worker_delivery_lacks_explicit_isolation_fields(
+    tmp_path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "factory-store"
+    stage3_document = _stage3_linear_issue_document(root)
+    branch_name = (
+        "factory/work-item-factory-cockpit-should-expose-run-isolation-and-1454bb4de285"
+    )
+    pr_url = "https://github.com/ianu82/ai-factory/pull/114"
+    stage3_document["pr_packet"]["branch_name"] = branch_name
+    stage3_document["pr_packet"]["pull_request"]["number"] = 114
+    stage3_document["pr_packet"]["pull_request"]["url"] = pr_url
+    stage3_document["pr_packet"]["delivery_evidence"] = {
+        "mode": "code_worker_pr",
+        "repository": "ianu82/ai-factory",
+        "branch_name": branch_name,
+        "base_branch": "main",
+        "commit_sha": "abc1234",
+        "pull_request_number": 114,
+        "pull_request_url": pr_url,
+        "code_worker": {
+            "status": "succeeded",
+            "provider": "codex_cli",
+            "model": "gpt-5.4",
+            "command": ["codex", "exec", "-m", "gpt-5.4", "-"],
+            "changed_paths": ["src/auto_mindsdb_factory/vertical_slice.py"],
+            "diff_stat": " 1 file changed, 1 insertion(+)",
+            "stdout": "ok",
+            "stderr": "",
+            "started_at": "2026-04-26T19:25:16Z",
+            "completed_at": "2026-04-26T19:25:20Z",
+            "exit_code": 0,
+        },
+        "created_at": "2026-04-26T19:25:16Z",
+    }
+
+    _write_stage_result(
+        store_dir,
+        work_item_id=stage3_document["work_item"]["work_item_id"],
+        stage_name="stage3",
+        document=stage3_document,
+    )
+
+    summary = build_cockpit_summary(store_dir, repo_root_override=root)
+    run = summary["runs"][0]
+
+    assert run["state"] == "PR_REVIEWABLE"
+    assert run["controller_state"] == "PR_REVIEWABLE"
+    assert run["branch_name"] == branch_name
+    assert run["pull_request"]["number"] == 114
+    assert run["isolation"]["status"] == "warning"
+    assert run["isolation"]["mode"] == "per_run_branch_and_worktree"
+    assert "not fully persisted" in run["isolation"]["summary"]
 
 
 def test_vertical_slice_fails_when_pr_evidence_is_missing(tmp_path) -> None:

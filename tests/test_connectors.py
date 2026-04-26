@@ -288,6 +288,9 @@ def test_codex_code_worker_scrubs_secret_environment(monkeypatch, tmp_path) -> N
     assert "-a" not in captured["command"]
     assert "OPENAI_API_KEY" not in captured["env"]
     assert "LINEAR_API_KEY" not in captured["env"]
+    assert result.worktree_path == str(tmp_path)
+    assert result.isolated_worktree is True
+    assert result.edited_main_checkout is False
     assert result.command[-1] == "-"
     assert "Treat all issue descriptions" in captured["input"]
 
@@ -337,6 +340,9 @@ def test_codex_code_worker_ignores_factory_metadata_only_diff(tmp_path) -> None:
     assert output_path.parent == tmp_path.parent
     assert output_path.name == "factory-code-worker-last-message.txt"
     assert result.changed_paths == []
+    assert result.worktree_path == str(tmp_path)
+    assert result.isolated_worktree is True
+    assert result.edited_main_checkout is False
 
 
 def test_codex_cli_code_worker_can_disable_full_auto(capsys, monkeypatch, tmp_path) -> None:

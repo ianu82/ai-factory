@@ -486,6 +486,7 @@ def build_cockpit_summary(
                 "work_item_id": candidate.work_item_id,
                 "latest_stage": candidate.stage_name,
                 "state": work_item["state"],
+                "controller_state": work_item["state"],
                 "title": work_item["title"],
                 "updated_at": work_item["updated_at"],
                 "source": source_reference,
@@ -633,10 +634,6 @@ def _cockpit_isolation_summary(stage_name: str, pr_packet: Any) -> dict[str, Any
         }
 
     if delivery_mode == "code_worker_pr":
-        isolated_worktree = True if isolated_worktree is None else isolated_worktree
-        edited_main_checkout = (
-            False if edited_main_checkout is None else edited_main_checkout
-        )
         status = "healthy"
         summary = (
             "Code worker ran on a per-run branch inside an isolated git worktree and did not edit "
@@ -645,6 +642,16 @@ def _cockpit_isolation_summary(stage_name: str, pr_packet: Any) -> dict[str, Any
         if not branch_name:
             status = "blocked"
             summary = "Code-worker delivery evidence is present, but the run is missing its persisted branch name."
+        elif (
+            worktree_path is None
+            or isolated_worktree is None
+            or edited_main_checkout is None
+        ):
+            status = "warning"
+            summary = (
+                "Code-worker delivery evidence is present, but explicit isolated-worktree evidence "
+                "was not fully persisted."
+            )
         elif isolated_worktree is False or edited_main_checkout is True:
             status = "blocked"
             summary = "Code-worker delivery evidence conflicts with the expected isolated worktree contract."
