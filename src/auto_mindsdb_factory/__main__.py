@@ -1980,13 +1980,50 @@ def _verify_linear_stage_setup(
     )
 
 
+def _first_local_command_target(command: list[str]) -> str | None:
+    consume_next = False
+    for argument in command[1:]:
+        if consume_next:
+            consume_next = False
+            continue
+        if argument in {"-c", "-m"}:
+            consume_next = True
+            continue
+        if argument.startswith("-"):
+            continue
+        candidate = Path(argument).expanduser()
+        if candidate.is_absolute() or any(
+            separator and separator in argument
+            for separator in (os.sep, os.altsep, "/", "\\")
+        ):
+            return argument
+    return None
+
+
 def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
     gate_runner = CommandGateRunner.from_env(repo_root)
+    required_raw = os.environ.get("AI_FACTORY_REQUIRED_GATE_KINDS")
+    required_kinds = (
+        {item.strip() for item in required_raw.split(",") if item.strip()}
+        if required_raw is not None
+        else set(gate_runner.required_kinds)
+    )
+
+    if not required_kinds:
+        return _smoke_check(
+            "gates:required_commands",
+            "failed",
+            "AI_FACTORY_REQUIRED_GATE_KINDS must declare at least one required gate kind.",
+            required_kinds=[],
+            commands=[],
+        )
+
     command_details: list[dict[str, Any]] = []
     missing_kinds: list[str] = []
-    unavailable_kinds: list[str] = []
+    unavailable_executable_kinds: list[str] = []
+    unavailable_target_kinds: list[str] = []
 
-    for kind in sorted(gate_runner.required_kinds):
+    for kind in sorted(required_kinds):
         command = gate_runner.commands_by_kind.get(kind)
         if not command:
             missing_kinds.append(kind)
@@ -2007,11 +2044,22 @@ def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
         )
         if path_like_executable:
             resolved_path = executable_path if executable_path.is_absolute() else repo_root / executable_path
-            available = resolved_path.is_file() and os.access(resolved_path, os.X_OK)
+            executable_available = resolved_path.is_file() and os.access(resolved_path, os.X_OK)
         else:
-            available = shutil.which(executable) is not None
-        if not available:
-            unavailable_kinds.append(kind)
+            executable_available = shutil.which(executable) is not None
+
+        target_available = True
+        local_target = _first_local_command_target(command)
+        if executable_available and local_target is not None:
+            target_path = Path(local_target).expanduser()
+            resolved_target = target_path if target_path.is_absolute() else repo_root / target_path
+            target_available = resolved_target.exists()
+
+        available = executable_available and target_available
+        if not executable_available:
+            unavailable_executable_kinds.append(kind)
+        elif not target_available:
+            unavailable_target_kinds.append(kind)
         command_details.append(
             {
                 "kind": kind,
@@ -2021,21 +2069,27 @@ def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
             }
         )
 
-    if missing_kinds or unavailable_kinds:
+    if missing_kinds or unavailable_executable_kinds or unavailable_target_kinds:
         summaries: list[str] = []
         if missing_kinds:
             summaries.append(
                 f"Missing command configuration for {', '.join(sorted(missing_kinds))}."
             )
-        if unavailable_kinds:
+        if unavailable_executable_kinds:
             summaries.append(
-                f"Configured executables were not found for {', '.join(sorted(unavailable_kinds))}."
+                "Configured executables were not found for "
+                f"{', '.join(sorted(unavailable_executable_kinds))}."
+            )
+        if unavailable_target_kinds:
+            summaries.append(
+                "Configured command paths were not found for "
+                f"{', '.join(sorted(unavailable_target_kinds))}."
             )
         return _smoke_check(
             "gates:required_commands",
             "failed",
             " ".join(summaries),
-            required_kinds=sorted(gate_runner.required_kinds),
+            required_kinds=sorted(required_kinds),
             commands=command_details,
         )
 
@@ -2043,7 +2097,7 @@ def _check_required_gate_commands(repo_root: Path) -> dict[str, Any]:
         "gates:required_commands",
         "passed",
         "Required gate commands are configured.",
-        required_kinds=sorted(gate_runner.required_kinds),
+        required_kinds=sorted(required_kinds),
         commands=command_details,
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -1256,6 +1257,17 @@ def test_factory_smoke_cli_emits_readiness_report(capsys, monkeypatch, tmp_path)
             "url": "https://factory.example.com/hooks/linear",
         },
     )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
     monkeypatch.setattr(cli_main.shutil, "which", lambda executable: f"/usr/bin/{executable}")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
 
@@ -1657,6 +1669,45 @@ def test_factory_smoke_requires_executable_repo_relative_gate_commands(
         }
     ]
     assert "Configured executables were not found for unit." in check["summary"]
+
+
+def test_factory_smoke_requires_existing_repo_relative_gate_targets(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "unit")
+    monkeypatch.setenv(
+        "AI_FACTORY_GATE_UNIT_COMMAND",
+        f"{sys.executable} ./scripts/unit-gate.sh --smoke",
+    )
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == ["unit"]
+    assert check["commands"] == [
+        {
+            "kind": "unit",
+            "configured": True,
+            "executable": sys.executable,
+            "available": False,
+        }
+    ]
+    assert "Configured command paths were not found for unit." in check["summary"]
+
+
+def test_factory_smoke_requires_at_least_one_required_gate_kind(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_REQUIRED_GATE_KINDS", "")
+
+    check = cli_main._check_required_gate_commands(tmp_path)
+
+    assert check["status"] == "failed"
+    assert check["required_kinds"] == []
+    assert check["commands"] == []
+    assert "must declare at least one required gate kind" in check["summary"]
 
 
 def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
