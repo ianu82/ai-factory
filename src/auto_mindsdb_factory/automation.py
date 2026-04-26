@@ -1540,6 +1540,15 @@ class FactoryAutomationCoordinator:
                     check_name = str(check.get("name") or check.get("id") or "unnamed check")
                     summary_text = str(check.get("summary") or "No failure summary supplied.")
                     guidance.append(f"{tier_name} failed {check_name}: {summary_text}")
+                    output = "\n".join(
+                        str(check.get(stream) or "").strip()
+                        for stream in ("stdout", "stderr")
+                        if str(check.get(stream) or "").strip()
+                    )
+                    if output:
+                        guidance.append(
+                            f"{tier_name} {check_name} failure output: {output[-2000:]}"
+                        )
 
         security_review = current_document.get("security_review")
         if isinstance(security_review, dict):

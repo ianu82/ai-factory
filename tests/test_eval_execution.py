@@ -224,7 +224,11 @@ def test_stage5_command_gate_failure_returns_to_revision() -> None:
     runner = CommandGateRunner(
         root,
         commands_by_kind={
-            "unit": [sys.executable, "-c", "raise SystemExit(7)"],
+            "unit": [
+                sys.executable,
+                "-c",
+                "import sys; print('unit stdout failure detail'); print('unit stderr detail', file=sys.stderr); raise SystemExit(7)",
+            ],
             "contract": [sys.executable, "-c", "raise SystemExit(0)"],
         },
         required_kinds={"unit", "contract"},
@@ -249,6 +253,15 @@ def test_stage5_command_gate_failure_returns_to_revision() -> None:
         finding.startswith("Eval gate failed")
         for finding in result.pr_packet["reviewer_report"]["blocking_findings"]
     )
+    failed_checks = [
+        check
+        for tier in result.eval_report["tiers"]
+        for check in tier["checks"]
+        if check["status"] == "failed"
+    ]
+    assert failed_checks
+    assert "unit stdout failure detail" in failed_checks[0]["stdout"]
+    assert "unit stderr detail" in failed_checks[0]["stderr"]
 
 
 def test_stage5_eval_execution_rejects_mismatched_latency_baseline() -> None:

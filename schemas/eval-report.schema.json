@@ -141,6 +141,12 @@
                     "integer",
                     "null"
                   ]
+                },
+                "stdout": {
+                  "type": "string"
+                },
+                "stderr": {
+                  "type": "string"
                 }
               },
               "additionalProperties": false
