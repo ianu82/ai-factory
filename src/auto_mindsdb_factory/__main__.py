@@ -64,6 +64,8 @@ from .vertical_slice import (
 
 _ENV_FILE_NAMES = (".env", ".env.local")
 _ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 class EnvironmentSetupError(RuntimeError):
@@ -1813,6 +1815,58 @@ def _check_uuid_config(env_name: str, *, check_name: str) -> dict[str, Any]:
     return _smoke_check(check_name, "passed", f"{env_name} is a valid UUID.", value=value)
 
 
+def _check_intake_pause_state() -> tuple[dict[str, Any], bool | None]:
+    raw_value = os.environ.get("AI_FACTORY_INTAKE_PAUSED")
+    if raw_value is None:
+        return (
+            _smoke_check(
+                "config:intake_paused",
+                "passed",
+                "AI_FACTORY_INTAKE_PAUSED is not set; runtime defaults to unpaused.",
+                configured=False,
+                value=None,
+                intake_paused=False,
+            ),
+            False,
+        )
+
+    value = raw_value.strip()
+    normalized = value.lower()
+    if normalized in _TRUE_ENV_VALUES:
+        paused = True
+    elif normalized in _FALSE_ENV_VALUES:
+        paused = False
+    else:
+        return (
+            _smoke_check(
+                "config:intake_paused",
+                "failed",
+                "AI_FACTORY_INTAKE_PAUSED must be one of true/false, yes/no, on/off, or 1/0.",
+                configured=True,
+                value=value,
+                intake_paused=None,
+            ),
+            None,
+        )
+
+    summary = (
+        "AI_FACTORY_INTAKE_PAUSED is enabled; intake remains paused."
+        if paused
+        else "AI_FACTORY_INTAKE_PAUSED is disabled; intake is unpaused."
+    )
+    return (
+        _smoke_check(
+            "config:intake_paused",
+            "passed",
+            summary,
+            configured=True,
+            value=value,
+            intake_paused=paused,
+        ),
+        paused,
+    )
+
+
 def _check_public_base_url() -> dict[str, Any]:
     value = _env_value("AI_FACTORY_PUBLIC_BASE_URL")
     display_value = _redact_url_credentials(value) if value else None
@@ -2032,7 +2086,9 @@ def _check_public_webhook_endpoint() -> dict[str, Any]:
 
 def _build_factory_smoke_report(config: ProductionRuntimeConfig) -> dict[str, Any]:
     doctor = FactoryDoctor(config).run()
+    intake_pause_check, intake_pause_state = _check_intake_pause_state()
     checks = [
+        intake_pause_check,
         _check_uuid_config(
             "LINEAR_TARGET_TEAM_ID",
             check_name="config:linear_target_team_id",
@@ -2065,7 +2121,9 @@ def _build_factory_smoke_report(config: ProductionRuntimeConfig) -> dict[str, An
         "repository": config.repository,
         "store_dir": str(config.store_dir),
         "checked_at": doctor.get("checked_at"),
-        "intake_paused": intake_paused(),
+        "intake_paused": intake_pause_state,
+        "intake_paused_configured": bool(intake_pause_check["configured"]),
+        "intake_paused_value": intake_pause_check["value"],
         "public_base_url": (
             _redact_url_credentials(_env_value("AI_FACTORY_PUBLIC_BASE_URL"))
             if _env_value("AI_FACTORY_PUBLIC_BASE_URL")

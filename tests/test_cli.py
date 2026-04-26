@@ -1207,6 +1207,7 @@ def test_factory_doctor_cli_emits_runtime_checks(capsys, monkeypatch, tmp_path) 
 def test_factory_smoke_cli_emits_readiness_report(capsys, monkeypatch, tmp_path) -> None:
     team_id = "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844"
     state_id = "d377109c-25fc-4d26-9b5a-3c9c96b37816"
+    monkeypatch.setenv("AI_FACTORY_INTAKE_PAUSED", "true")
     monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
     monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", team_id)
     monkeypatch.setenv("LINEAR_TARGET_STATE_ID", state_id)
@@ -1235,7 +1236,6 @@ def test_factory_smoke_cli_emits_readiness_report(capsys, monkeypatch, tmp_path)
         return _Completed(0)
 
     monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
-    monkeypatch.setattr(cli_main, "intake_paused", lambda: True)
     monkeypatch.setattr(
         cli_main,
         "_verify_linear_stage_setup",
@@ -1276,13 +1276,103 @@ def test_factory_smoke_cli_emits_readiness_report(capsys, monkeypatch, tmp_path)
     assert payload["status"] == "passed"
     assert payload["ready_to_unpause"] is True
     assert payload["intake_paused"] is True
+    assert payload["intake_paused_configured"] is True
+    assert payload["intake_paused_value"] == "true"
     assert payload["public_base_url"] == "https://factory.example.com"
     assert payload["linear_target_team_id"] == team_id
     assert payload["linear_target_state_id"] == state_id
     assert payload["doctor"]["status"] == "passed"
+    assert any(check["name"] == "config:intake_paused" for check in payload["checks"])
     assert any(check["name"] == "auth:github" for check in payload["checks"])
     assert any(check["name"] == "auth:codex" for check in payload["checks"])
     assert any(check["name"] == "gates:required_commands" for check in payload["checks"])
+
+
+def test_factory_smoke_cli_rejects_invalid_intake_pause_flag(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_INTAKE_PAUSED", "sometimes")
+    monkeypatch.setenv("AI_FACTORY_PUBLIC_BASE_URL", "https://factory.example.com")
+    monkeypatch.setenv("LINEAR_TARGET_TEAM_ID", "8c4f7d92-8a9c-4f11-82f7-6d4f4887b844")
+    monkeypatch.setenv("LINEAR_TARGET_STATE_ID", "d377109c-25fc-4d26-9b5a-3c9c96b37816")
+
+    class _FakeDoctor:
+        def __init__(self, config) -> None:
+            assert config.repository == "ianu82/ai-factory"
+
+        def run(self) -> dict[str, object]:
+            return {
+                "cycle": "factory-doctor",
+                "status": "passed",
+                "checked_at": "2026-04-25T16:30:00Z",
+                "checks": [{"name": "env:OPENAI_API_KEY", "status": "passed"}],
+            }
+
+    monkeypatch.setattr(cli_main, "FactoryDoctor", _FakeDoctor)
+    monkeypatch.setattr(
+        cli_main,
+        "_verify_linear_stage_setup",
+        lambda store_dir, *, repo_root_override: {
+            "name": "linear:stage_setup",
+            "status": "passed",
+            "summary": "Verified 9 Linear workflow states.",
+            "stage_keys": [f"stage{index}" for index in range(1, 10)],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_required_gate_commands",
+        lambda repo_root: {
+            "name": "gates:required_commands",
+            "status": "passed",
+            "summary": "Required gate commands are configured.",
+            "required_kinds": ["contract", "unit"],
+            "commands": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_cli_auth",
+        lambda name, command, success_summary="authenticated": {
+            "name": name,
+            "status": "passed",
+            "summary": success_summary,
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_check_public_webhook_endpoint",
+        lambda: {
+            "name": "webhook:public_endpoint",
+            "status": "passed",
+            "summary": "Public webhook endpoint rejected an invalid signature with HTTP 401.",
+            "url": "https://factory.example.com/hooks/linear",
+        },
+    )
+
+    exit_code = main(
+        [
+            "factory-smoke",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "failed"
+    assert payload["ready_to_unpause"] is False
+    assert payload["intake_paused"] is None
+    assert payload["intake_paused_configured"] is True
+    assert payload["intake_paused_value"] == "sometimes"
+    intake_check = next(check for check in payload["checks"] if check["name"] == "config:intake_paused")
+    assert intake_check["status"] == "failed"
+    assert "must be one of" in intake_check["summary"]
 
 
 def test_factory_smoke_cli_fails_closed_without_leaking_auth_output(
