@@ -14,9 +14,12 @@ from auto_mindsdb_factory.connectors import (
     CodexCLICodeWorkerConnector,
     FactoryConnectorError,
     FileBackedOpsConnector,
+    GitHubAPIConfig,
+    GitHubAPIRepoConnector,
     GitHubCLIRepoConnector,
     OpenAIResponsesAgentConfig,
     OpenAIResponsesAgentConnector,
+    PullRequestEvidence,
     sanitize_factory_document,
 )
 
@@ -232,6 +235,118 @@ def test_github_connector_reads_existing_pr_when_create_reports_duplicate(tmp_pa
 
     assert number == 8
     assert url == "https://github.com/ianu82/ai-factory/pull/8"
+
+
+def test_github_api_connector_creates_pr_with_rest_api(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "number": 12,
+                    "html_url": "https://github.com/ianu82/ai-factory/pull/12",
+                }
+            ).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["authorization"] = request.headers["Authorization"]
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    connector = GitHubAPIRepoConnector(
+        tmp_path,
+        repository="ianu82/ai-factory",
+        config=GitHubAPIConfig(token="gh-test", api_base_url="https://api.github.test", timeout_seconds=7),
+        urlopen_impl=fake_urlopen,
+    )
+
+    url = connector._create_github_pr("factory/test", "Implement test", "body")
+
+    assert url == "https://github.com/ianu82/ai-factory/pull/12"
+    assert captured["url"] == "https://api.github.test/repos/ianu82/ai-factory/pulls"
+    assert captured["method"] == "POST"
+    assert captured["authorization"] == "Bearer gh-test"
+    assert captured["timeout"] == 7
+    assert captured["body"] == {
+        "title": "Implement test",
+        "head": "factory/test",
+        "base": "main",
+        "body": "body",
+        "draft": True,
+    }
+
+
+def test_github_api_connector_reads_pr_status_and_checks(tmp_path) -> None:
+    responses = [
+        {
+            "state": "open",
+            "mergeable": True,
+            "html_url": "https://github.com/ianu82/ai-factory/pull/12",
+        },
+        {
+            "check_runs": [
+                {
+                    "name": "pytest",
+                    "conclusion": "success",
+                    "html_url": "https://github.com/checks/1",
+                }
+            ]
+        },
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        return FakeResponse(responses.pop(0))
+
+    connector = GitHubAPIRepoConnector(
+        tmp_path,
+        repository="ianu82/ai-factory",
+        config=GitHubAPIConfig(token="gh-test"),
+        urlopen_impl=fake_urlopen,
+    )
+    evidence = PullRequestEvidence(
+        repository="ianu82/ai-factory",
+        branch_name="factory/test",
+        base_branch="main",
+        commit_sha="abc123",
+        number=12,
+        url="https://github.com/ianu82/ai-factory/pull/12",
+        title="Implement test",
+    )
+
+    status = connector.read_pull_request_status(evidence)
+
+    assert status.state == "open"
+    assert status.mergeable == "True"
+    assert status.checks == [
+        {
+            "name": "pytest",
+            "status": "success",
+            "url": "https://github.com/checks/1",
+        }
+    ]
 
 
 def test_sanitize_factory_document_redacts_secret_like_values() -> None:

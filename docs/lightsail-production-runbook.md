@@ -9,6 +9,7 @@ Production v1 runs on one persistent Lightsail instance with one active worker a
 - `linear-webhook-server` receives signed Linear Issue webhooks at `/hooks/linear`, verifies and persists accepted trigger events, and returns quickly.
 - `factory-worker` drains persisted Linear triggers, advances factory runs, invokes the code worker, runs gates, syncs Linear, and stops at human merge/deploy.
 - `AI_FACTORY_AUTONOMY_MODE=pr_ready` is the production default. It disables automatic merge, staging, production monitoring, and feedback movement unless those stages are backed by real external evidence later.
+- `factory-worker` refuses `AI_FACTORY_AUTONOMY_MODE=simulation_full` unless `AI_FACTORY_ALLOW_SIMULATION_RUNTIME=true` is set deliberately for a non-production drill.
 
 ## Current Deployment
 
@@ -21,6 +22,7 @@ The first billable production test box is live on Lightsail and should be treate
 - Public base URL: `https://184-33-39-108.sslip.io`
 - Linear webhook URL: `https://184-33-39-108.sslip.io/hooks/linear`
 - Linear webhook: `AI Factory Lightsail`, scoped to `software-factory`, `Issue` events only
+- Linear Stage 1 intake state: `Stage 1 Intake` (`d2289e1e-09a1-4f9a-a793-27180a2da5db`)
 - Repository checkout: `/srv/ai-factory`
 - Run store: `/var/lib/ai-factory`
 - Environment file: `/etc/ai-factory/factory.env`
@@ -69,11 +71,17 @@ LINEAR_MATERIALIZE_STAGE2_TICKETS=false
 AI_FACTORY_PUBLIC_BASE_URL=https://<your-host>
 FACTORY_TRIGGER_BASE_URL=https://<your-host>
 AI_FACTORY_AUTONOMY_MODE=pr_ready
+AI_FACTORY_ALLOW_SIMULATION_RUNTIME=false
+AI_FACTORY_REPO_CONNECTOR_PROVIDER=github_cli
 AI_FACTORY_CODE_WORKER_PROVIDER=codex_cli
 AI_FACTORY_CODE_WORKER_CODEX_BIN=/usr/bin/codex
 AI_FACTORY_CODE_WORKER_MODEL=gpt-5.4
 AI_FACTORY_CODE_WORKER_RUN_AS_USER=ai-factory-worker
 AI_FACTORY_INTAKE_PAUSED=false
+AI_FACTORY_WORKER_ID=lightsail-prod-1
+AI_FACTORY_MAX_ACTIVE_RUNS=1
+AI_FACTORY_OPERATION_HEARTBEAT_SECONDS=15
+AI_FACTORY_OPERATION_STALE_SECONDS=120
 ```
 
 ## Worker User Hardening
@@ -121,6 +129,15 @@ AI_FACTORY_GATE_UNIT_COMMAND="uv run python -m pytest -q"
 AI_FACTORY_GATE_CONTRACT_COMMAND="uv run python scripts/validate_contracts.py"
 AI_FACTORY_REQUIRED_GATE_KINDS=unit,contract
 ```
+
+Optional GitHub API PR connector:
+
+```sh
+AI_FACTORY_REPO_CONNECTOR_PROVIDER=github_api
+GITHUB_TOKEN=github_pat_...
+```
+
+The API connector still uses local `git` for branch, worktree, commit, and push operations, but it replaces `gh pr create`, PR lookup, and PR status/check reads with direct GitHub REST calls. Keep `github_cli` until the host has a scoped token with pull-request read/write permissions.
 
 ## Commands
 
@@ -182,6 +199,36 @@ Run a deployed host doctor check:
 
 ```sh
 sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-doctor --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory --repository ianu82/ai-factory'
+```
+
+Inspect queue, active operation, heartbeat age, skip reason, recovery status, and active slot usage:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-cockpit --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory'
+```
+
+Mark stale operations and expired leases as stuck. The worker already runs this before each cycle, but this command is useful during incident response:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-reap-stale-operations --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory'
+```
+
+Recover a stuck run after checking logs and confirming it is safe to retry:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-retry --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory --work-item-id <work_item_id> --reason "operator confirmed worker is safe to retry"'
+```
+
+Clear a blocked/stuck label and recovery state without forcing any special retry semantics:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-unblock --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory --work-item-id <work_item_id> --reason "operator cleared blocker"'
+```
+
+Move a poisoned or intentionally abandoned run out of scheduler rotation:
+
+```sh
+sudo -u ai-factory bash -lc 'cd /srv/ai-factory && set -a; source /etc/ai-factory/factory.env; set +a; uv run auto-mindsdb-factory factory-dead-letter --store-dir /var/lib/ai-factory --repo-root /srv/ai-factory --work-item-id <work_item_id> --reason "operator closed invalid run"'
 ```
 
 Pause new intake without disturbing active runs:

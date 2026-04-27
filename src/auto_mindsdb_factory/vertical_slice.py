@@ -27,6 +27,15 @@ from .intake import AnthropicScout, Stage1IntakePipeline, repo_root, utc_now
 from .merge_orchestration import StageMergePipeline
 from .release_staging import Stage7ReleaseStagingPipeline
 from .production_monitoring import Stage8ProductionMonitoringPipeline
+from .reliability import (
+    ReliabilityError,
+    classify_queue,
+    max_active_runs_from_env,
+    operation_stale_seconds_from_env,
+    operation_summary,
+    recovery_state,
+    scheduler_state,
+)
 from .security_review import Stage6SecurityReviewPipeline
 from .ticketing import Stage2TicketingPipeline
 
@@ -441,14 +450,57 @@ def build_cockpit_summary(
 ) -> dict[str, Any]:
     store = FactoryRunStore(store_dir, repo_root_override=repo_root_override)
     runs: list[dict[str, Any]] = []
+    stale_threshold = operation_stale_seconds_from_env()
+    max_active_runs = max_active_runs_from_env()
     for run_dir in store.iter_run_directories():
         candidate = store.load_latest_candidate(run_dir, tuple(reversed(tuple(store_stage_order()))))
         if candidate is None:
             continue
         work_item = store.extract_work_item_document(candidate.document)
+        artifact_errors: list[str] = []
+        try:
+            recovery = recovery_state(store.root, candidate.work_item_id)
+        except ReliabilityError as exc:
+            artifact_errors.append(str(exc))
+            recovery = _cockpit_artifact_error(str(exc))
+        try:
+            scheduler = scheduler_state(store.root, candidate.work_item_id)
+        except ReliabilityError as exc:
+            artifact_errors.append(str(exc))
+            scheduler = None
+        try:
+            operation = operation_summary(
+                store.root,
+                candidate.work_item_id,
+                stale_seconds=stale_threshold,
+            )
+        except ReliabilityError as exc:
+            artifact_errors.append(str(exc))
+            operation = _cockpit_artifact_error(str(exc))
+        queue_status = (
+            str(scheduler["queue_status"])
+            if isinstance(scheduler, dict) and scheduler.get("queue_status")
+            else classify_queue(
+                state=work_item["state"],
+                stage_name=candidate.stage_name,
+                recovery=recovery,
+            )
+        )
         pr_packet = candidate.document.get("pr_packet")
         monitoring_report = candidate.document.get("monitoring_report")
         feedback_report = candidate.document.get("feedback_report")
+        active_operation = (
+            None
+            if not isinstance(operation, dict) or operation.get("status") != "active"
+            else operation
+        )
+        heartbeat_age = None if operation is None else operation.get("heartbeat_age_seconds")
+        health = _cockpit_health(
+            queue_status=queue_status,
+            operation=operation,
+            recovery=recovery,
+        )
+        recovery_summary = _cockpit_recovery_summary(recovery)
         runs.append(
             {
                 "work_item_id": candidate.work_item_id,
@@ -456,6 +508,31 @@ def build_cockpit_summary(
                 "state": work_item["state"],
                 "title": work_item["title"],
                 "updated_at": work_item["updated_at"],
+                "queue_status": queue_status,
+                "active_operation": active_operation,
+                "heartbeat_age_seconds": heartbeat_age,
+                "last_skip_reason": (
+                    None
+                    if not isinstance(scheduler, dict)
+                    else scheduler.get("last_skip_reason")
+                ),
+                "health": health,
+                "artifact_errors": artifact_errors,
+                "recovery_status": (
+                    None
+                    if recovery_summary is None
+                    else recovery_summary.get("status")
+                ),
+                "recovery": recovery_summary,
+                "worker_id": (
+                    operation.get("worker_id")
+                    if isinstance(operation, dict)
+                    else (
+                        scheduler.get("worker_id")
+                        if isinstance(scheduler, dict)
+                        else None
+                    )
+                ),
                 "pull_request": (
                     None
                     if not isinstance(pr_packet, dict)
@@ -473,12 +550,86 @@ def build_cockpit_summary(
                 ),
             }
         )
+    active_runs = [
+        run
+        for run in runs
+        if isinstance(run.get("active_operation"), dict)
+        and run["active_operation"].get("status") == "active"
+    ]
     return {
         "store_dir": str(store.root),
         "run_count": len(runs),
+        "active_slot_usage": {
+            "active_runs": len(active_runs),
+            "max_active_runs": max_active_runs,
+            "available_slots": max(0, max_active_runs - len(active_runs)),
+            "worker_ids": sorted(
+                {
+                    str(run["worker_id"])
+                    for run in active_runs
+                    if run.get("worker_id")
+                }
+            ),
+        },
         "runs": runs,
         "generated_at": utc_now(),
     }
+
+
+def _cockpit_artifact_error(message: str) -> dict[str, Any]:
+    return {
+        "status": "artifact_error",
+        "reason": message,
+        "message": message,
+        "updated_at": utc_now(),
+    }
+
+
+def _cockpit_recovery_summary(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(recovery, dict):
+        return None
+    actions = [
+        dict(item)
+        for item in recovery.get("actions", [])
+        if isinstance(item, dict)
+    ]
+    last_action = actions[-1] if actions else {}
+    return {
+        "status": recovery.get("status"),
+        "reason": recovery.get("reason"),
+        "recommended_action": recovery.get("recommended_action"),
+        "detected_at": recovery.get("detected_at"),
+        "updated_at": recovery.get("updated_at"),
+        "last_action": recovery.get("last_action") or last_action.get("action"),
+        "last_action_reason": (
+            recovery.get("last_action_reason") or last_action.get("reason")
+        ),
+        "action_count": len(actions),
+    }
+
+
+def _cockpit_health(
+    *,
+    queue_status: str,
+    operation: dict[str, Any] | None,
+    recovery: dict[str, Any] | None,
+) -> str:
+    recovery_status = None if not isinstance(recovery, dict) else recovery.get("status")
+    if recovery_status == "artifact_error":
+        return "artifact_error"
+    if recovery_status == "dead_letter":
+        return "dead_letter"
+    if recovery_status == "stuck":
+        return "stuck"
+    if isinstance(operation, dict) and operation.get("status") == "artifact_error":
+        return "artifact_error"
+    if isinstance(operation, dict) and operation.get("status") == "active":
+        return "stale" if operation.get("stale") is True else "active"
+    if queue_status == "blocked":
+        return "blocked"
+    if queue_status == "complete":
+        return "complete"
+    return "queued"
 
 
 def store_stage_order() -> list[str]:

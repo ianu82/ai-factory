@@ -1400,6 +1400,187 @@ class GitHubCLIRepoConnector:
         )
 
 
+@dataclass(slots=True)
+class GitHubAPIConfig:
+    token: str | None = None
+    api_base_url: str = "https://api.github.com"
+    timeout_seconds: int = 120
+
+    @classmethod
+    def from_env(cls, *, timeout_seconds: int = 120) -> "GitHubAPIConfig":
+        return cls(
+            token=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
+            api_base_url=os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com"),
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class GitHubAPIRepoConnector(GitHubCLIRepoConnector):
+    """Use local git for branch/worktree operations and GitHub REST for PR operations."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        repository: str,
+        base_branch: str = "main",
+        git_bin: str = "git",
+        timeout_seconds: int = 120,
+        config: GitHubAPIConfig | None = None,
+        urlopen_impl=urlopen,
+    ) -> None:
+        super().__init__(
+            repo_root,
+            repository=repository,
+            base_branch=base_branch,
+            git_bin=git_bin,
+            gh_bin="gh",
+            timeout_seconds=timeout_seconds,
+        )
+        self.config = config or GitHubAPIConfig.from_env(timeout_seconds=timeout_seconds)
+        self.urlopen_impl = urlopen_impl
+
+    def _assert_available(self) -> None:
+        if not self.config.token:
+            raise FactoryConnectorError(
+                "GITHUB_TOKEN or GH_TOKEN is required for the GitHub API connector."
+            )
+        self._git(["rev-parse", "--is-inside-work-tree"])
+
+    def _create_github_pr(self, branch_name: str, title: str, body: str) -> str:
+        payload = self._github_json(
+            "POST",
+            f"/repos/{self.repository}/pulls",
+            {
+                "title": title,
+                "head": branch_name,
+                "base": self.base_branch,
+                "body": body,
+                "draft": True,
+            },
+        )
+        url = payload.get("html_url")
+        if not isinstance(url, str) or not url:
+            raise FactoryConnectorError("GitHub API PR create response did not include html_url.")
+        return url
+
+    def _existing_pr_for_branch(self, branch_name: str) -> tuple[int, str] | None:
+        owner, _ = self._repository_parts()
+        payload = self._github_json(
+            "GET",
+            f"/repos/{self.repository}/pulls?head={owner}:{branch_name}&state=open",
+            None,
+        )
+        if not isinstance(payload, list) or not payload:
+            return None
+        first = payload[0]
+        if not isinstance(first, dict):
+            return None
+        number = first.get("number")
+        url = first.get("html_url")
+        if not isinstance(number, int) or not isinstance(url, str) or not url:
+            return None
+        return number, url
+
+    def read_pull_request_status(
+        self,
+        evidence: PullRequestEvidence,
+    ) -> PullRequestStatus:
+        pr_payload = self._github_json("GET", f"/repos/{evidence.repository}/pulls/{evidence.number}", None)
+        checks_payload = self._github_json(
+            "GET",
+            f"/repos/{evidence.repository}/commits/{evidence.commit_sha}/check-runs",
+            None,
+        )
+        checks = checks_payload.get("check_runs") if isinstance(checks_payload, dict) else []
+        if not isinstance(checks, list):
+            checks = []
+        return PullRequestStatus(
+            repository=evidence.repository,
+            number=evidence.number,
+            state=str(pr_payload.get("state") or "UNKNOWN"),
+            mergeable=(
+                None
+                if pr_payload.get("mergeable") is None
+                else str(pr_payload.get("mergeable"))
+            ),
+            url=str(pr_payload.get("html_url") or evidence.url),
+            checks=[self._normalize_api_check(check) for check in checks if isinstance(check, dict)],
+        )
+
+    def _github_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any] | list[Any]:
+        if not self.config.token:
+            raise FactoryConnectorError(
+                "GITHUB_TOKEN or GH_TOKEN is required for the GitHub API connector."
+            )
+        url = self._github_url(path)
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.config.token}",
+                "Content-Type": "application/json",
+                "User-Agent": "auto-mindsdb-factory",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with self.urlopen_impl(request, timeout=self.config.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise FactoryConnectorError(
+                f"GitHub API request failed: {method} {path}: HTTP {exc.code}: {detail[:500]}"
+            ) from exc
+        except URLError as exc:
+            raise FactoryConnectorError(
+                f"GitHub API request failed: {method} {path}: {exc}"
+            ) from exc
+        if not raw.strip():
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise FactoryConnectorError(
+                f"GitHub API returned invalid JSON for {method} {path}: {exc}"
+            ) from exc
+        if not isinstance(payload, (dict, list)):
+            raise FactoryConnectorError(
+                f"GitHub API returned an unsupported payload for {method} {path}."
+            )
+        return payload
+
+    def _github_url(self, path: str) -> str:
+        base = self.config.api_base_url.rstrip("/")
+        if path.startswith("/"):
+            return base + path
+        return f"{base}/{path}"
+
+    def _repository_parts(self) -> tuple[str, str]:
+        parts = self.repository.split("/", 1)
+        if len(parts) != 2 or not all(parts):
+            raise FactoryConnectorError(
+                f"GitHub repository must be in owner/name form, got '{self.repository}'."
+            )
+        return parts[0], parts[1]
+
+    @staticmethod
+    def _normalize_api_check(check: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": str(check.get("name") or "unknown"),
+            "status": str(check.get("conclusion") or check.get("status") or "unknown"),
+            "url": check.get("html_url") or check.get("details_url"),
+        }
+
+
 class FileBackedOpsConnector:
     """Use run-store JSON files as the first safe deployment and observability seam."""
 

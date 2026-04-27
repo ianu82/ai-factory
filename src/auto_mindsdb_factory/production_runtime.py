@@ -9,16 +9,24 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from .automation import AutonomyMode, FactoryAutomationCoordinator
+from .automation import AutomationError, AutonomyMode, FactoryAutomationCoordinator
 from .build_review import Stage3BuildReviewPipeline
 from .connectors import (
     CodexCLICodeWorkerConfig,
     CodexCLICodeWorkerConnector,
+    GitHubAPIRepoConnector,
     GitHubCLIRepoConnector,
 )
 from .eval_execution import CommandGateRunner, Stage5EvalPipeline
 from .intake import utc_now
 from .linear_trigger import LinearTriggerWorker
+from .reliability import (
+    OperationReaper,
+    max_active_runs_from_env,
+    operation_heartbeat_seconds_from_env,
+    operation_stale_seconds_from_env,
+    worker_id_from_env,
+)
 
 
 def env_flag(name: str, *, default: bool = False) -> bool:
@@ -32,6 +40,14 @@ def intake_paused() -> bool:
     return env_flag("AI_FACTORY_INTAKE_PAUSED", default=False)
 
 
+def simulation_runtime_allowed() -> bool:
+    return env_flag("AI_FACTORY_ALLOW_SIMULATION_RUNTIME", default=False)
+
+
+def repo_connector_provider() -> str:
+    return os.environ.get("AI_FACTORY_REPO_CONNECTOR_PROVIDER", "github_cli").strip()
+
+
 @dataclass(slots=True)
 class ProductionRuntimeConfig:
     store_dir: Path
@@ -41,6 +57,10 @@ class ProductionRuntimeConfig:
     autonomy_mode: AutonomyMode = AutonomyMode.PR_READY
     interval_seconds: float = 30.0
     max_events_per_cycle: int | None = None
+    worker_id: str = ""
+    operation_heartbeat_seconds: float = 15.0
+    operation_stale_seconds: float = 120.0
+    max_active_runs: int = 1
 
     @classmethod
     def from_env(
@@ -66,6 +86,10 @@ class ProductionRuntimeConfig:
                 or os.environ.get("AI_FACTORY_AUTONOMY_MODE")
                 or AutonomyMode.PR_READY.value
             ),
+            worker_id=worker_id_from_env(),
+            operation_heartbeat_seconds=operation_heartbeat_seconds_from_env(),
+            operation_stale_seconds=operation_stale_seconds_from_env(),
+            max_active_runs=max_active_runs_from_env(),
         )
 
 
@@ -90,8 +114,9 @@ class FactoryDoctor:
         ]
         checks.extend(
             [
+                self._runtime_boundary_check(),
                 self._command_check("git", ["git", "rev-parse", "--is-inside-work-tree"]),
-                self._command_check("gh", ["gh", "auth", "status"]),
+                self._repo_connector_check(),
                 self._code_worker_command_check(),
                 self._store_check(),
                 self._repo_remote_check(),
@@ -126,6 +151,28 @@ class FactoryDoctor:
             "name": f"env:{name}",
             "status": "passed",
             "summary": "set",
+        }
+
+    def _runtime_boundary_check(self) -> dict[str, str]:
+        if self.config.autonomy_mode is AutonomyMode.PR_READY:
+            return {
+                "name": "runtime:simulation-boundary",
+                "status": "passed",
+                "summary": "production worker stops at PR-ready human merge/deploy boundary",
+            }
+        if simulation_runtime_allowed():
+            return {
+                "name": "runtime:simulation-boundary",
+                "status": "passed",
+                "summary": "simulation_full explicitly allowed by AI_FACTORY_ALLOW_SIMULATION_RUNTIME",
+            }
+        return {
+            "name": "runtime:simulation-boundary",
+            "status": "failed",
+            "summary": (
+                "factory-worker refuses simulation_full unless "
+                "AI_FACTORY_ALLOW_SIMULATION_RUNTIME=true"
+            ),
         }
 
     def _command_check(self, name: str, command: list[str]) -> dict[str, str]:
@@ -190,6 +237,29 @@ class FactoryDoctor:
             "summary": summary,
         }
 
+    def _repo_connector_check(self) -> dict[str, str]:
+        provider = repo_connector_provider()
+        if provider == "github_cli":
+            return self._command_check("gh", ["gh", "auth", "status"])
+        if provider == "github_api":
+            token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+            if not token:
+                return {
+                    "name": "repo-connector:github-api",
+                    "status": "failed",
+                    "summary": "GITHUB_TOKEN or GH_TOKEN is required",
+                }
+            return {
+                "name": "repo-connector:github-api",
+                "status": "passed",
+                "summary": "token configured",
+            }
+        return {
+            "name": "repo-connector",
+            "status": "failed",
+            "summary": "AI_FACTORY_REPO_CONNECTOR_PROVIDER must be github_cli or github_api",
+        }
+
 
 class FactoryWorker:
     def __init__(self, config: ProductionRuntimeConfig) -> None:
@@ -214,18 +284,21 @@ class FactoryWorker:
     def run_cycle(self) -> dict[str, Any]:
         provider = os.environ.get("AI_FACTORY_CODE_WORKER_PROVIDER", "codex_cli").strip()
         if provider != "codex_cli":
-            from .automation import AutomationError
-
             raise AutomationError("AI_FACTORY_CODE_WORKER_PROVIDER must be 'codex_cli' for production v1.")
+        if (
+            self.config.autonomy_mode is AutonomyMode.SIMULATION_FULL
+            and not simulation_runtime_allowed()
+        ):
+            raise AutomationError(
+                "factory-worker is a production-facing runtime and refuses "
+                "AI_FACTORY_AUTONOMY_MODE=simulation_full unless "
+                "AI_FACTORY_ALLOW_SIMULATION_RUNTIME=true is set explicitly."
+            )
 
         stage3 = Stage3BuildReviewPipeline(
             self.config.repo_root,
             code_worker_connector=CodexCLICodeWorkerConnector(CodexCLICodeWorkerConfig.from_env()),
-            repo_connector=GitHubCLIRepoConnector(
-                self.config.repo_root,
-                repository=self.config.repository,
-                base_branch=self.config.base_branch,
-            ),
+            repo_connector=self._repo_connector(),
         )
         stage5 = Stage5EvalPipeline(
             self.config.repo_root,
@@ -237,7 +310,16 @@ class FactoryWorker:
             stage3_pipeline=stage3,
             stage5_pipeline=stage5,
             autonomy_mode=self.config.autonomy_mode,
+            worker_id=self.config.worker_id,
+            operation_heartbeat_seconds=self.config.operation_heartbeat_seconds,
+            operation_stale_seconds=self.config.operation_stale_seconds,
+            max_active_runs=self.config.max_active_runs,
         )
+        reaper_result = OperationReaper(
+            self.config.store_dir,
+            stale_seconds=self.config.operation_stale_seconds,
+            linear_sync=coordinator.linear_workflow_sync,
+        ).run()
         trigger_result = None
         if not intake_paused():
             trigger_result = LinearTriggerWorker(
@@ -253,6 +335,27 @@ class FactoryWorker:
             "cycle": "factory-worker-cycle",
             "started_at": utc_now(),
             "intake_paused": intake_paused(),
+            "worker_id": self.config.worker_id,
+            "max_active_runs": self.config.max_active_runs,
+            "reaper_result": reaper_result.to_document(),
             "trigger_result": trigger_result,
             "progression_result": progression_result.to_document(),
         }
+
+    def _repo_connector(self):
+        provider = repo_connector_provider()
+        if provider == "github_cli":
+            return GitHubCLIRepoConnector(
+                self.config.repo_root,
+                repository=self.config.repository,
+                base_branch=self.config.base_branch,
+            )
+        if provider == "github_api":
+            return GitHubAPIRepoConnector(
+                self.config.repo_root,
+                repository=self.config.repository,
+                base_branch=self.config.base_branch,
+            )
+        raise AutomationError(
+            "AI_FACTORY_REPO_CONNECTOR_PROVIDER must be 'github_cli' or 'github_api'."
+        )

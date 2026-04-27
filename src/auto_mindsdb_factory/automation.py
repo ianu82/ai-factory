@@ -31,7 +31,17 @@ from .production_monitoring import (
     ProductionMonitoringError,
     Stage8ProductionMonitoringPipeline,
 )
+from .reliability import (
+    OperationTracker,
+    classify_queue,
+    operation_heartbeat_seconds_from_env,
+    operation_stale_seconds_from_env,
+    recovery_state,
+    save_scheduler_state,
+    worker_id_from_env,
+)
 from .release_staging import ReleaseStagingError, Stage7ReleaseStagingPipeline
+from .scheduler import FactoryScheduler, SchedulerCandidate
 from .security_review import SecurityReviewError, Stage6SecurityReviewPipeline
 from .ticketing import Stage2TicketingPipeline, TicketingError
 
@@ -1005,6 +1015,10 @@ class FactoryAutomationCoordinator:
         stage9_pipeline: Stage9FeedbackSynthesisPipeline | None = None,
         linear_workflow_sync: Any | None = None,
         autonomy_mode: str | AutonomyMode | None = None,
+        worker_id: str | None = None,
+        operation_heartbeat_seconds: float | None = None,
+        operation_stale_seconds: float | None = None,
+        max_active_runs: int | None = None,
     ) -> None:
         self.repo_root = repo_root(repo_root_override)
         self.store = FactoryRunStore(store_dir, repo_root_override=self.repo_root)
@@ -1033,6 +1047,20 @@ class FactoryAutomationCoordinator:
             )
         else:
             self.linear_workflow_sync = linear_workflow_sync
+        self.worker_id = worker_id or worker_id_from_env()
+        self.operation_heartbeat_seconds = (
+            operation_heartbeat_seconds
+            if operation_heartbeat_seconds is not None
+            else operation_heartbeat_seconds_from_env()
+        )
+        self.operation_stale_seconds = (
+            operation_stale_seconds
+            if operation_stale_seconds is not None
+            else operation_stale_seconds_from_env()
+        )
+        if max_active_runs is not None and max_active_runs < 1:
+            raise AutomationError("max_active_runs must be >= 1 when provided.")
+        self.max_active_runs = max_active_runs
 
     def _sync_linear_stage_result(
         self,
@@ -1280,6 +1308,7 @@ class FactoryAutomationCoordinator:
 
         processed_runs: list[ProgressionRunResult] = []
         skipped_runs: list[dict[str, str]] = []
+        scheduler_candidates: list[SchedulerCandidate] = []
 
         for run_dir in self.store.iter_run_directories():
             try:
@@ -1298,10 +1327,104 @@ class FactoryAutomationCoordinator:
 
                     if candidate is None:
                         continue
+                    queue_status = self._queue_status(candidate)
+                    updated_at = self.store._result_updated_at(candidate.document)
+                    scheduler_candidates.append(
+                        SchedulerCandidate(
+                            work_item_id=candidate.work_item_id,
+                            stage_name=candidate.stage_name,
+                            queue_status=queue_status,
+                            updated_at=updated_at,
+                            payload=candidate,
+                        )
+                    )
+                    save_scheduler_state(
+                        self.store.root,
+                        candidate.work_item_id,
+                        queue_status=queue_status,
+                        last_skip_reason=None,
+                        worker_id=self.worker_id,
+                    )
+            except RunLeaseBusyError:
+                skipped_runs.append(
+                    {
+                        "work_item_id": run_dir.name,
+                        "stage_name": "store_scan",
+                        "reason": "run_locked",
+                    }
+                )
+
+        scheduler = FactoryScheduler(max_active_runs=self.max_active_runs)
+        for decision in scheduler.plan(scheduler_candidates):
+            candidate = decision.payload
+            queue_status = decision.queue_status
+            if not decision.should_run:
+                skip_reason = (
+                    decision.reason
+                    if decision.reason is not None
+                    else self._skip_reason_for_queue(candidate, queue_status)
+                )
+                save_scheduler_state(
+                    self.store.root,
+                    candidate.work_item_id,
+                    queue_status=queue_status,
+                    last_skip_reason=skip_reason,
+                    worker_id=self.worker_id,
+                )
+                if queue_status == "complete":
+                    self._sync_linear_candidate_stall(
+                        candidate,
+                        reason=skip_reason,
+                    )
+                skipped_runs.append(
+                    {
+                        "work_item_id": candidate.work_item_id,
+                        "stage_name": candidate.stage_name,
+                        "reason": skip_reason,
+                    }
+                )
+                continue
+
+            try:
+                with self.store.run_lease(candidate.work_item_id):
+                    refreshed_candidate = self.store.load_latest_candidate(
+                        self.store.runs_dir / candidate.work_item_id,
+                        PROGRESSION_SCAN_STAGES,
+                    )
+                    if refreshed_candidate is None:
+                        skipped_runs.append(
+                            {
+                                "work_item_id": candidate.work_item_id,
+                                "stage_name": "store_scan",
+                                "reason": "no_persisted_run_found",
+                            }
+                        )
+                        continue
+                    refreshed_queue_status = self._queue_status(refreshed_candidate)
+                    if refreshed_queue_status in {"blocked", "dead_letter", "complete"}:
+                        skip_reason = self._skip_reason_for_queue(
+                            refreshed_candidate,
+                            refreshed_queue_status,
+                        )
+                        save_scheduler_state(
+                            self.store.root,
+                            refreshed_candidate.work_item_id,
+                            queue_status=refreshed_queue_status,
+                            last_skip_reason=skip_reason,
+                            worker_id=self.worker_id,
+                        )
+                        skipped_runs.append(
+                            {
+                                "work_item_id": refreshed_candidate.work_item_id,
+                                "stage_name": refreshed_candidate.stage_name,
+                                "reason": skip_reason,
+                            }
+                        )
+                        continue
 
                     try:
                         run_result = self._advance_candidate(
-                            candidate,
+                            refreshed_candidate,
                             repository=repository,
                         )
                     except (
@@ -1317,38 +1440,63 @@ class FactoryAutomationCoordinator:
                         LinearWorkflowError,
                     ) as exc:
                         self._sync_linear_candidate_stall(
-                            candidate,
+                            refreshed_candidate,
                             reason=str(exc),
+                        )
+                        save_scheduler_state(
+                            self.store.root,
+                            refreshed_candidate.work_item_id,
+                            queue_status=refreshed_queue_status,
+                            last_skip_reason=str(exc),
+                            worker_id=self.worker_id,
                         )
                         skipped_runs.append(
                             {
-                                "work_item_id": candidate.work_item_id,
-                                "stage_name": candidate.stage_name,
+                                "work_item_id": refreshed_candidate.work_item_id,
+                                "stage_name": refreshed_candidate.stage_name,
                                 "reason": str(exc),
                             }
                         )
                         continue
 
                     if run_result is None:
-                        skip_reason = self._skip_reason(candidate)
+                        skip_reason = self._skip_reason(refreshed_candidate)
                         self._sync_linear_candidate_stall(
-                            candidate,
+                            refreshed_candidate,
                             reason=skip_reason,
+                        )
+                        save_scheduler_state(
+                            self.store.root,
+                            refreshed_candidate.work_item_id,
+                            queue_status=refreshed_queue_status,
+                            last_skip_reason=skip_reason,
+                            worker_id=self.worker_id,
                         )
                         skipped_runs.append(
                             {
-                                "work_item_id": candidate.work_item_id,
-                                "stage_name": candidate.stage_name,
+                                "work_item_id": refreshed_candidate.work_item_id,
+                                "stage_name": refreshed_candidate.stage_name,
                                 "reason": skip_reason,
                             }
                         )
                         continue
 
                     processed_runs.append(run_result)
+                    save_scheduler_state(
+                        self.store.root,
+                        run_result.work_item_id,
+                        queue_status=self._queue_status_for_state(
+                            run_result.final_state,
+                            run_result.final_stage,
+                            work_item_id=run_result.work_item_id,
+                        ),
+                        last_skip_reason=None,
+                        worker_id=self.worker_id,
+                    )
             except RunLeaseBusyError:
                 skipped_runs.append(
                     {
-                        "work_item_id": run_dir.name,
+                        "work_item_id": candidate.work_item_id,
                         "stage_name": "store_scan",
                         "reason": "run_locked",
                     }
@@ -1358,6 +1506,51 @@ class FactoryAutomationCoordinator:
             processed_runs=processed_runs,
             skipped_runs=skipped_runs,
         )
+
+    def _queue_status(self, candidate: StoredRunCandidate) -> str:
+        work_item = self.store.extract_work_item_document(candidate.document)
+        return self._queue_status_for_state(
+            work_item["state"],
+            candidate.stage_name,
+            work_item_id=candidate.work_item_id,
+        )
+
+    def _queue_status_for_state(
+        self,
+        state: str,
+        stage_name: str,
+        *,
+        work_item_id: str,
+    ) -> str:
+        recovery = recovery_state(self.store.root, work_item_id)
+        if isinstance(recovery, dict) and recovery.get("status") in {"stuck", "dead_letter"}:
+            return classify_queue(
+                state=state,
+                stage_name=stage_name,
+                recovery=recovery,
+            )
+        if state == ControllerState.SECURITY_APPROVED.value and self.autonomy_mode is AutonomyMode.PR_READY:
+            return "complete"
+        return classify_queue(
+            state=state,
+            stage_name=stage_name,
+            recovery=recovery,
+        )
+
+    def _skip_reason_for_queue(
+        self,
+        candidate: StoredRunCandidate,
+        queue_status: str,
+    ) -> str:
+        if queue_status == "blocked":
+            recovery = recovery_state(self.store.root, candidate.work_item_id) or {}
+            if recovery.get("reason"):
+                return str(recovery["reason"])
+            return self._skip_reason(candidate)
+        if queue_status == "dead_letter":
+            recovery = recovery_state(self.store.root, candidate.work_item_id) or {}
+            return str(recovery.get("reason") or "dead_letter_state")
+        return self._skip_reason(candidate)
 
     def _run_immediate_handoff_candidate(
         self,
@@ -1458,27 +1651,43 @@ class FactoryAutomationCoordinator:
         stages_completed: list[str] = []
         stored_paths: dict[str, str] = {}
         while True:
-            next_step = self._advance_once(
-                current_stage=current_stage,
-                current_document=current_document,
-                repository=repository,
-                continue_into_feedback=continue_into_feedback,
-                feedback_window_days=feedback_window_days,
-            )
-            if next_step is None:
-                break
+            operation_name = self._operation_name(current_stage, current_state)
+            with OperationTracker(
+                self.store.root,
+                work_item_id=str(current_work_item["work_item_id"]),
+                stage=current_stage,
+                operation=operation_name,
+                worker_id=self.worker_id,
+                heartbeat_interval_seconds=self.operation_heartbeat_seconds,
+                stale_seconds=self.operation_stale_seconds,
+                message=f"Advancing {current_stage} from {current_state.value}.",
+            ) as operation:
+                next_step = self._advance_once(
+                    current_stage=current_stage,
+                    current_document=current_document,
+                    repository=repository,
+                    continue_into_feedback=continue_into_feedback,
+                    feedback_window_days=feedback_window_days,
+                )
+                operation.heartbeat(message="Stage execution returned; persisting artifacts.")
+                if next_step is None:
+                    break
 
-            next_stage, next_document, continue_allowed = next_step
-            stored_path = self.store.save_stage_result(next_stage, next_document)
-            self._sync_linear_stage_result(
-                next_stage,
-                next_document,
-                stall_reason=self._post_stage_stall_reason(next_stage, next_document),
-            )
-            stages_completed.append(next_stage)
-            stored_paths[next_stage] = str(stored_path)
-            current_stage = next_stage
-            current_document = next_document
+                next_stage, next_document, continue_allowed = next_step
+                operation.heartbeat(message=f"Saving {next_stage} result.")
+                stored_path = self.store.save_stage_result(next_stage, next_document)
+                operation.heartbeat(message=f"Syncing Linear for {next_stage}.")
+                self._sync_linear_stage_result(
+                    next_stage,
+                    next_document,
+                    stall_reason=self._post_stage_stall_reason(next_stage, next_document),
+                )
+                stages_completed.append(next_stage)
+                stored_paths[next_stage] = str(stored_path)
+                current_stage = next_stage
+                current_document = next_document
+                current_work_item = self.store.extract_work_item_document(current_document)
+                current_state = ControllerState(current_work_item["state"])
             if not continue_allowed:
                 break
 
@@ -1494,6 +1703,28 @@ class FactoryAutomationCoordinator:
             stages_completed=stages_completed,
             stored_paths=stored_paths,
         )
+
+    @staticmethod
+    def _operation_name(current_stage: str, state: ControllerState) -> str:
+        if state is ControllerState.POLICY_ASSIGNED:
+            return "stage2_ticketing"
+        if state is ControllerState.TICKETED:
+            return "stage3_code_worker"
+        if state is ControllerState.PR_REVISION:
+            return "stage3_revision"
+        if state is ControllerState.PR_REVIEWABLE:
+            return "stage4_or_stage5_handoff"
+        if state is ControllerState.PR_MERGEABLE:
+            return "stage6_security_review"
+        if state is ControllerState.SECURITY_APPROVED:
+            return "merge_or_pr_ready_gate"
+        if state is ControllerState.MERGED:
+            return "stage7_staging"
+        if state is ControllerState.PRODUCTION_MONITORING and current_stage == "stage8":
+            return "stage9_feedback"
+        if state is ControllerState.PRODUCTION_MONITORING:
+            return "stage8_monitoring"
+        return f"{current_stage}_{state.value.lower()}"
 
     def _post_stage_stall_reason(self, stage_name: str, document: dict[str, Any]) -> str | None:
         if self.autonomy_mode is not AutonomyMode.PR_READY:
