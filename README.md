@@ -106,9 +106,9 @@ Run the full vertical slice with a live OpenAI agent:
 
 If `OPENAI_API_KEY` is missing, the CLI fails fast with a friendly initialization error before the run starts.
 
-## Linear Factory Intake Trigger
+## Linear Stage 1 Intake Trigger
 
-The factory can now accept Linear issues through a dedicated `Factory Intake` workflow state and hand them into Stage 1 manual intake.
+The factory can accept Linear issues through the dedicated `Stage 1 Intake` workflow state and hand them into Stage 1 manual intake.
 
 Set the Linear trigger environment in `.env` or `.env.local`:
 
@@ -140,7 +140,7 @@ Practical setup notes:
 - Point Linear at a public `https://.../hooks/linear` URL. The built-in server is the local receiver; in practice you usually place it behind a reverse proxy or HTTPS tunnel.
 - The receiver only verifies, filters, and persists the event. The worker is the process that actually turns the issue into a Stage 1 run and kicks off immediate handoff.
 - `automation-linear-trigger-cycle` is a one-shot drain pass, not a daemon. Run it from cron, systemd, or another heartbeat loop if you want near-real-time processing.
-- Keep `LINEAR_TARGET_STATE_ID` pointed at your trigger queue state, for example `New Feature`. The factory creates and manages separate `Stage 1 ... Stage 9` workflow states for in-flight factory work.
+- Keep `LINEAR_TARGET_STATE_ID` pointed at the `Stage 1 Intake` workflow state for the target team. `New Feature` can remain a human requirements-quality state before manually moving an issue into factory intake.
 - If a run starts from a Linear issue, the factory reuses that issue and moves it forward. If a run starts elsewhere, the factory creates a new Linear issue once the work becomes an active build candidate.
 - When the factory cannot advance automatically, it keeps the issue in the current stage and writes a short explanatory comment for a human reviewer.
 - In production `pr_ready` mode, Stage 6 is the stop line: the factory comments that the PR is ready for human merge/deploy and does not advance through simulated Stage 7-9 evidence.

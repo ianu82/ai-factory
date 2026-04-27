@@ -21,6 +21,11 @@ from auto_mindsdb_factory.build_review import Stage3BuildReviewPipeline
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import FactoryController
 from auto_mindsdb_factory.intake import Stage1IntakePipeline, build_manual_intake_item
+from auto_mindsdb_factory.reliability import (
+    RecoveryManager,
+    recovery_state_path,
+    write_json_atomic,
+)
 from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
 
 
@@ -100,6 +105,24 @@ def load_stage5_result_document(root: Path, scenario_name: str) -> dict:
         "golden_dataset": _load_json(scenario / "golden-dataset.json"),
         "latency_baseline": _load_json(scenario / "latency-baseline.json"),
         "eval_report": _load_json(scenario / "eval-report.json"),
+        "work_item": _load_json(scenario / "work-item.json"),
+    }
+
+
+def load_stage6_result_document(root: Path, scenario_name: str) -> dict:
+    scenario = root / "fixtures" / "scenarios" / scenario_name
+    return {
+        "spec_packet": _load_json(scenario / "spec-packet.json"),
+        "policy_decision": _load_json(scenario / "policy-decision.json"),
+        "ticket_bundle": _load_json(scenario / "ticket-bundle.json"),
+        "eval_manifest": _load_json(scenario / "eval-manifest.json"),
+        "pr_packet": _load_json(scenario / "pr-packet.json"),
+        "prompt_contract": _load_json(scenario / "prompt-contract.json"),
+        "tool_schema": _load_json(scenario / "tool-schema.json"),
+        "golden_dataset": _load_json(scenario / "golden-dataset.json"),
+        "latency_baseline": _load_json(scenario / "latency-baseline.json"),
+        "eval_report": _load_json(scenario / "eval-report.json"),
+        "security_review": _load_json(scenario / "security-review.json"),
         "work_item": _load_json(scenario / "work-item.json"),
     }
 
@@ -320,6 +343,136 @@ def test_pr_ready_autonomy_stops_after_security_review_and_comments_linear(tmp_p
     assert processed.stages_completed == ["stage2", "stage3", "stage4", "stage5", "stage6"]
     assert fake_sync.calls[-1]["stage_name"] == "stage6"
     assert fake_sync.calls[-1]["stall_reason"] == "pr_ready_for_human_merge_deploy"
+
+
+def test_scheduler_prioritizes_new_builds_over_old_revisions(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    store = FactoryRunStore(store_dir, repo_root_override=root)
+    revision_document = load_stage5_result_document(root, "stage5_revision_feature")
+    revision_document["work_item"]["work_item_id"] = "wi-old-revision"
+    store.save_stage_result("stage5", revision_document)
+    html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
+        encoding="utf-8"
+    )
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        max_active_runs=1,
+    )
+    stage1_result = coordinator.run_stage1_cycle(html=html, max_new_items=1)
+    new_work_item_id = stage1_result.created_results[0]["work_item_id"]
+
+    result = coordinator.run_progression_cycle()
+
+    assert [run.work_item_id for run in result.processed_runs] == [new_work_item_id]
+    assert result.skipped_runs[-1] == {
+        "work_item_id": revision_document["work_item"]["work_item_id"],
+        "stage_name": "stage5",
+        "reason": "max_active_runs_reached",
+    }
+
+
+def test_scheduler_records_terminal_reason_after_slot_limit_reached(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    store = FactoryRunStore(store_dir, repo_root_override=root)
+    complete_document = load_stage6_result_document(root, "stage6_security_approved_feature")
+    complete_document["work_item"]["work_item_id"] = "wi-complete"
+    store.save_stage_result("stage6", complete_document)
+    html = (root / "fixtures" / "intake" / "anthropic-release-notes-sample.html").read_text(
+        encoding="utf-8"
+    )
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        autonomy_mode="pr_ready",
+        max_active_runs=1,
+    )
+    coordinator.run_stage1_cycle(html=html, max_new_items=1)
+
+    result = coordinator.run_progression_cycle()
+
+    complete_skip = [
+        skipped
+        for skipped in result.skipped_runs
+        if skipped["work_item_id"] == "wi-complete"
+    ][0]
+    assert complete_skip == {
+        "work_item_id": "wi-complete",
+        "stage_name": "stage6",
+        "reason": "pr_ready_for_human_merge_deploy",
+    }
+
+
+def test_scheduler_skips_dead_letter_runs(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    store = FactoryRunStore(store_dir, repo_root_override=root)
+    stage5_document = load_stage5_result_document(root, "stage5_revision_feature")
+    stage5_document["work_item"]["work_item_id"] = "wi-dead-letter"
+    store.save_stage_result("stage5", stage5_document)
+    RecoveryManager(store_dir).dead_letter("wi-dead-letter", reason="operator closed")
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        autonomy_mode="pr_ready",
+    )
+
+    result = coordinator.run_progression_cycle()
+
+    assert result.processed_runs == []
+    assert result.skipped_runs == [
+        {
+            "work_item_id": "wi-dead-letter",
+            "stage_name": "stage5",
+            "reason": "operator closed",
+        }
+    ]
+
+
+def test_retry_pending_reenters_scheduler_after_stuck_state(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    store_dir = tmp_path / "automation-store"
+    store = FactoryRunStore(store_dir, repo_root_override=root)
+    stage5_document = load_stage5_result_document(root, "stage5_revision_feature")
+    stage5_document["work_item"]["work_item_id"] = "wi-retry"
+    store.save_stage_result("stage5", stage5_document)
+    write_json_atomic(
+        recovery_state_path(store_dir, "wi-retry"),
+        {
+            "version": 1,
+            "work_item_id": "wi-retry",
+            "status": "stuck",
+            "reason": "stale_operation_heartbeat",
+            "detected_at": "2026-04-26T00:00:00Z",
+            "updated_at": "2026-04-26T00:00:01Z",
+            "recommended_action": "Retry when safe.",
+            "actions": [],
+        },
+    )
+    coordinator = FactoryAutomationCoordinator(
+        store_dir,
+        repo_root_override=root,
+        autonomy_mode="pr_ready",
+    )
+
+    stuck_result = coordinator.run_progression_cycle()
+    assert stuck_result.processed_runs == []
+    assert stuck_result.skipped_runs == [
+        {
+            "work_item_id": "wi-retry",
+            "stage_name": "stage5",
+            "reason": "stale_operation_heartbeat",
+        }
+    ]
+
+    RecoveryManager(store_dir).retry("wi-retry", reason="operator restarted worker")
+    retry_result = coordinator.run_progression_cycle()
+
+    assert [run.work_item_id for run in retry_result.processed_runs] == ["wi-retry"]
+    assert retry_result.processed_runs[0].starting_stage == "stage5"
+    assert retry_result.skipped_runs == []
 
 
 def test_automation_progression_routes_stage5_revision_back_to_stage3(tmp_path) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from auto_mindsdb_factory.automation import AutomationError, AutonomyMode
 from auto_mindsdb_factory.production_runtime import FactoryDoctor
 from auto_mindsdb_factory.production_runtime import FactoryWorker
 from auto_mindsdb_factory.production_runtime import ProductionRuntimeConfig
@@ -51,6 +54,32 @@ def test_factory_doctor_requires_code_worker_os_user(monkeypatch, tmp_path) -> N
     }
 
 
+def test_factory_doctor_rejects_simulation_runtime_without_explicit_override(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("AI_FACTORY_ALLOW_SIMULATION_RUNTIME", raising=False)
+    doctor = FactoryDoctor(
+        ProductionRuntimeConfig(
+            store_dir=tmp_path / "store",
+            repo_root=tmp_path,
+            repository="ianu82/ai-factory",
+            autonomy_mode=AutonomyMode.SIMULATION_FULL,
+        )
+    )
+
+    check = doctor._runtime_boundary_check()
+
+    assert check == {
+        "name": "runtime:simulation-boundary",
+        "status": "failed",
+        "summary": (
+            "factory-worker refuses simulation_full unless "
+            "AI_FACTORY_ALLOW_SIMULATION_RUNTIME=true"
+        ),
+    }
+
+
 def test_factory_doctor_checks_code_worker_under_target_user(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setenv("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "ai-factory-worker")
@@ -83,6 +112,29 @@ def test_factory_doctor_checks_code_worker_under_target_user(monkeypatch, tmp_pa
         "/usr/bin/codex",
         "--version",
     ]
+
+
+def test_factory_doctor_checks_github_api_token(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AI_FACTORY_REPO_CONNECTOR_PROVIDER", "github_api")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    doctor = FactoryDoctor(
+        ProductionRuntimeConfig(
+            store_dir=tmp_path / "store",
+            repo_root=tmp_path,
+            repository="ianu82/ai-factory",
+        )
+    )
+
+    missing = doctor._repo_connector_check()
+    assert missing == {
+        "name": "repo-connector:github-api",
+        "status": "failed",
+        "summary": "GITHUB_TOKEN or GH_TOKEN is required",
+    }
+
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-test")
+    assert doctor._repo_connector_check()["status"] == "passed"
 
 
 def test_factory_worker_uses_production_coordinator_for_linear_handoff(
@@ -131,9 +183,14 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
             stage3_pipeline=None,
             stage5_pipeline=None,
             autonomy_mode=None,
+            worker_id=None,
+            operation_heartbeat_seconds=None,
+            operation_stale_seconds=None,
+            max_active_runs=None,
         ) -> None:
             self.stage3_pipeline = stage3_pipeline
             self.stage5_pipeline = stage5_pipeline
+            self.linear_workflow_sync = None
             created["coordinator"] = self
 
         def run_progression_cycle(self, *, repository: str):
@@ -163,6 +220,7 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.CommandGateRunner", _FakeGateRunner)
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.FactoryAutomationCoordinator", _FakeCoordinator)
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.LinearTriggerWorker", _FakeTriggerWorker)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.OperationReaper", lambda *args, **kwargs: _FakeReaper())
 
     config = ProductionRuntimeConfig(
         store_dir=tmp_path / "store",
@@ -178,3 +236,95 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
     assert coordinator.stage3_pipeline.code_worker_connector is not None
     assert coordinator.stage3_pipeline.repo_connector.repository == "ianu82/ai-factory"
     assert coordinator.stage5_pipeline.gate_runner is not None
+
+
+def test_factory_worker_can_use_github_api_repo_connector(monkeypatch, tmp_path) -> None:
+    created: dict[str, object] = {}
+
+    class _FakeStage3:
+        def __init__(self, root, *, code_worker_connector=None, repo_connector=None) -> None:
+            created["repo_connector"] = repo_connector
+
+    class _FakeStage5:
+        def __init__(self, root, *, gate_runner=None) -> None:
+            pass
+
+    class _FakeCodeWorkerConfig:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+    class _FakeCodeWorker:
+        def __init__(self, config) -> None:
+            pass
+
+    class _FakeAPIRepoConnector:
+        def __init__(self, root, *, repository: str, base_branch: str) -> None:
+            self.repository = repository
+            self.base_branch = base_branch
+
+    class _FakeGateRunner:
+        @classmethod
+        def from_env(cls, root):
+            return cls()
+
+    class _FakeCoordinator:
+        def __init__(self, *args, **kwargs) -> None:
+            self.linear_workflow_sync = None
+
+        def run_progression_cycle(self, *, repository: str):
+            class _Result:
+                def to_document(self):
+                    return {"cycle": "progression"}
+
+            return _Result()
+
+    monkeypatch.setenv("AI_FACTORY_CODE_WORKER_PROVIDER", "codex_cli")
+    monkeypatch.setenv("AI_FACTORY_REPO_CONNECTOR_PROVIDER", "github_api")
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage3BuildReviewPipeline", _FakeStage3)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage5EvalPipeline", _FakeStage5)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.CodexCLICodeWorkerConfig", _FakeCodeWorkerConfig)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.CodexCLICodeWorkerConnector", _FakeCodeWorker)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.GitHubAPIRepoConnector", _FakeAPIRepoConnector)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.CommandGateRunner", _FakeGateRunner)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.FactoryAutomationCoordinator", _FakeCoordinator)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.OperationReaper", lambda *args, **kwargs: _FakeReaper())
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.intake_paused", lambda: True)
+
+    FactoryWorker(
+        ProductionRuntimeConfig(
+            store_dir=tmp_path / "store",
+            repo_root=tmp_path,
+            repository="ianu82/ai-factory",
+        )
+    ).run_cycle()
+
+    repo_connector = created["repo_connector"]
+    assert repo_connector.repository == "ianu82/ai-factory"
+    assert repo_connector.base_branch == "main"
+
+
+class _FakeReaper:
+    def run(self):
+        class _Result:
+            def to_document(self):
+                return {"cycle": "factory-reap-stale-operations"}
+
+        return _Result()
+
+
+def test_factory_worker_refuses_simulation_mode_without_explicit_override(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_CODE_WORKER_PROVIDER", "codex_cli")
+    monkeypatch.delenv("AI_FACTORY_ALLOW_SIMULATION_RUNTIME", raising=False)
+    config = ProductionRuntimeConfig(
+        store_dir=tmp_path / "store",
+        repo_root=tmp_path,
+        repository="ianu82/ai-factory",
+        autonomy_mode=AutonomyMode.SIMULATION_FULL,
+    )
+
+    with pytest.raises(AutomationError, match="refuses AI_FACTORY_AUTONOMY_MODE=simulation_full"):
+        FactoryWorker(config).run_cycle()

@@ -13,6 +13,7 @@ from auto_mindsdb_factory.connectors import (
     PullRequestEvidence,
     PullRequestStatus,
 )
+from auto_mindsdb_factory.reliability import recovery_state_path, write_json_atomic
 from auto_mindsdb_factory.vertical_slice import (
     FactoryVerticalSliceRunner,
     VerticalSliceConfig,
@@ -286,12 +287,75 @@ def test_vertical_slice_reaches_stage9_with_pr_and_eval_evidence(tmp_path) -> No
 def test_vertical_slice_cockpit_summarizes_latest_run(tmp_path) -> None:
     result = _run_with_fakes(tmp_path)
 
-    summary = build_cockpit_summary(tmp_path / "factory-store", repo_root_override=_config(tmp_path).repo_root)
+    summary = build_cockpit_summary(
+        tmp_path / "factory-store",
+        repo_root_override=_config(tmp_path).repo_root,
+    )
 
     assert summary["run_count"] == 1
+    assert summary["active_slot_usage"]["active_runs"] == 0
+    assert summary["active_slot_usage"]["available_slots"] >= 0
     assert summary["runs"][0]["work_item_id"] == result.work_item_id
     assert summary["runs"][0]["latest_stage"] == "stage9"
+    assert summary["runs"][0]["queue_status"] == "complete"
+    assert summary["runs"][0]["health"] == "complete"
+    assert "heartbeat_age_seconds" in summary["runs"][0]
     assert summary["runs"][0]["pull_request"]["url"] == result.pr_evidence.url
+
+
+def test_vertical_slice_cockpit_surfaces_recovery_action_details(tmp_path) -> None:
+    result = _run_with_fakes(tmp_path)
+    store_dir = tmp_path / "factory-store"
+    write_json_atomic(
+        recovery_state_path(store_dir, result.work_item_id),
+        {
+            "version": 1,
+            "work_item_id": result.work_item_id,
+            "status": "stuck",
+            "reason": "stale_operation_heartbeat",
+            "detected_at": "2026-04-26T00:00:00Z",
+            "updated_at": "2026-04-26T00:00:01Z",
+            "recommended_action": "Run factory-retry after checking logs.",
+            "actions": [
+                {
+                    "action": "retry",
+                    "reason": "operator restarted worker",
+                    "at": "2026-04-26T00:00:02Z",
+                    "operator": "ian",
+                }
+            ],
+        },
+    )
+
+    summary = build_cockpit_summary(store_dir, repo_root_override=_config(tmp_path).repo_root)
+    run = summary["runs"][0]
+
+    assert run["health"] == "stuck"
+    assert run["recovery_status"] == "stuck"
+    assert run["recovery"] == {
+        "status": "stuck",
+        "reason": "stale_operation_heartbeat",
+        "recommended_action": "Run factory-retry after checking logs.",
+        "detected_at": "2026-04-26T00:00:00Z",
+        "updated_at": "2026-04-26T00:00:01Z",
+        "last_action": "retry",
+        "last_action_reason": "operator restarted worker",
+        "action_count": 1,
+    }
+
+
+def test_vertical_slice_cockpit_degrades_when_recovery_artifact_is_malformed(tmp_path) -> None:
+    result = _run_with_fakes(tmp_path)
+    store_dir = tmp_path / "factory-store"
+    recovery_state_path(store_dir, result.work_item_id).write_text("not json", encoding="utf-8")
+
+    summary = build_cockpit_summary(store_dir, repo_root_override=_config(tmp_path).repo_root)
+    run = summary["runs"][0]
+
+    assert run["health"] == "artifact_error"
+    assert run["recovery_status"] == "artifact_error"
+    assert run["artifact_errors"]
+    assert "Could not read JSON artifact" in run["recovery"]["reason"]
 
 
 def test_vertical_slice_fails_when_pr_evidence_is_missing(tmp_path) -> None:

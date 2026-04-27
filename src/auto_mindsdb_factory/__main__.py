@@ -46,6 +46,11 @@ from .production_runtime import (
     ProductionRuntimeConfig,
     intake_paused,
 )
+from .reliability import ReliabilityError
+from .reliability_commands import (
+    handle_reliability_command,
+    register_reliability_commands,
+)
 from .release_staging import ReleaseStagingError, Stage7ReleaseStagingPipeline
 from .security_review import SecurityReviewError, Stage6SecurityReviewPipeline
 from .ticketing import Stage2TicketingPipeline, TicketingError
@@ -1449,6 +1454,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime autonomy mode to validate.",
     )
 
+    register_reliability_commands(subparsers)
+
     automation_stage9_parser = subparsers.add_parser(
         "automation-weekly-feedback",
         help="Run the recurring weekly Stage 9 synthesis pass over stored production runs.",
@@ -2070,7 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root_override=args.repo_root,
             )
             stored_path, state = coordinator.register_bundle(args.stage, document)
-        except (AutomationError, LinearWorkflowError, CommandInputError) as exc:
+        except (AutomationError, LinearWorkflowError, ReliabilityError, CommandInputError) as exc:
             print(f"Automation bundle registration failed: {exc}", file=sys.stderr)
             return 1
         handoff = None
@@ -2140,7 +2147,13 @@ def main(argv: list[str] | None = None) -> int:
                 repository=args.repository,
                 max_events=args.max_events,
             )
-        except (LinearTriggerError, LinearWorkflowError, AutomationError, IntakeError) as exc:
+        except (
+            LinearTriggerError,
+            LinearWorkflowError,
+            AutomationError,
+            ReliabilityError,
+            IntakeError,
+        ) as exc:
             print(f"Linear trigger cycle failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
@@ -2233,7 +2246,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise_on_failed_handoff=False,
                 repository=args.repository,
             )
-        except (AutomationError, LinearWorkflowError, IntakeError, CommandInputError) as exc:
+        except (
+            AutomationError,
+            LinearWorkflowError,
+            ReliabilityError,
+            IntakeError,
+            CommandInputError,
+        ) as exc:
             print(f"Automation Stage 1 cycle failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
@@ -2268,6 +2287,7 @@ def main(argv: list[str] | None = None) -> int:
             ReleaseStagingError,
             ProductionMonitoringError,
             LinearWorkflowError,
+            ReliabilityError,
         ) as exc:
             print(f"Automation progression failed: {exc}", file=sys.stderr)
             return 1
@@ -2300,6 +2320,7 @@ def main(argv: list[str] | None = None) -> int:
             IntakeError,
             LinearTriggerError,
             LinearWorkflowError,
+            ReliabilityError,
             TicketingError,
             OSError,
         ) as exc:
@@ -2318,11 +2339,15 @@ def main(argv: list[str] | None = None) -> int:
                 autonomy_mode=args.autonomy_mode,
             )
             result = FactoryDoctor(config).run()
-        except (AutomationError, OSError) as exc:
+        except (AutomationError, ReliabilityError, OSError) as exc:
             print(f"Factory doctor failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result, indent=2))
         return 0 if result["status"] == "passed" else 1
+
+    reliability_exit = handle_reliability_command(args)
+    if reliability_exit is not None:
+        return reliability_exit
 
     if args.command == "automation-supervisor-cycle":
         if args.feedback_window_days < 1:
@@ -2356,6 +2381,7 @@ def main(argv: list[str] | None = None) -> int:
             ReleaseStagingError,
             ProductionMonitoringError,
             LinearWorkflowError,
+            ReliabilityError,
             CommandInputError,
         ) as exc:
             print(f"Automation supervisor cycle failed: {exc}", file=sys.stderr)
@@ -2384,7 +2410,7 @@ def main(argv: list[str] | None = None) -> int:
                 window_label=args.window_label,
                 feedback_window_days=args.feedback_window_days,
             )
-        except (AutomationError, FeedbackSynthesisError, LinearWorkflowError) as exc:
+        except (AutomationError, FeedbackSynthesisError, LinearWorkflowError, ReliabilityError) as exc:
             print(f"Automation weekly feedback failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.to_document(), indent=2))
@@ -2434,7 +2460,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "factory-cockpit":
         try:
             summary = build_cockpit_summary(args.store_dir, repo_root_override=args.repo_root)
-        except AutomationError as exc:
+        except (AutomationError, ReliabilityError) as exc:
             print(f"Factory cockpit failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(summary, indent=2))

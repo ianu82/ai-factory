@@ -1231,6 +1231,233 @@ def test_factory_worker_cli_runs_once(capsys, monkeypatch, tmp_path) -> None:
     assert payload["cycles"] == [{"cycle": "factory-worker-cycle"}]
 
 
+def test_factory_reaper_cli_emits_reaper_result(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeReaper:
+        def __init__(self, store_dir, *, stale_seconds=None, linear_sync=None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert stale_seconds == 42
+            assert linear_sync is None
+
+        def run(self):
+            class _Result:
+                def to_document(self) -> dict[str, object]:
+                    return {
+                        "cycle": "factory-reap-stale-operations",
+                        "checked_runs": 1,
+                        "marked_stuck": [],
+                        "skipped_runs": [],
+                    }
+
+            return _Result()
+
+    monkeypatch.setattr("auto_mindsdb_factory.reliability_commands.OperationReaper", _FakeReaper)
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.LinearWorkflowSync.maybe_create",
+        lambda *args, **kwargs: None,
+    )
+
+    exit_code = main(
+        [
+            "factory-reap-stale-operations",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--stale-seconds",
+            "42",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert json.loads(captured.out)["cycle"] == "factory-reap-stale-operations"
+
+
+def test_factory_reaper_cli_reports_invalid_stale_threshold(capsys, tmp_path) -> None:
+    exit_code = main(
+        [
+            "factory-reap-stale-operations",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--stale-seconds",
+            "0",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "--stale-seconds must be > 0" in captured.err
+
+
+def test_factory_retry_cli_records_recovery_action(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeRecoveryManager:
+        def __init__(self, store_dir, *, linear_sync=None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert linear_sync is None
+
+        def retry(self, work_item_id: str, *, reason: str | None = None) -> dict[str, object]:
+            return {
+                "work_item_id": work_item_id,
+                "status": "retry_pending",
+                "reason": reason,
+            }
+
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.RecoveryManager",
+        _FakeRecoveryManager,
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.LinearWorkflowSync.maybe_create",
+        lambda *args, **kwargs: None,
+    )
+
+    exit_code = main(
+        [
+            "factory-retry",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--work-item-id",
+            "wi-1",
+            "--reason",
+            "operator test",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["status"] == "retry_pending"
+    assert payload["reason"] == "operator test"
+
+
+def test_factory_unblock_cli_records_recovery_action(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeRecoveryManager:
+        def __init__(self, store_dir, *, linear_sync=None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert linear_sync is None
+
+        def unblock(self, work_item_id: str, *, reason: str | None = None) -> dict[str, object]:
+            return {
+                "work_item_id": work_item_id,
+                "status": "cleared",
+                "reason": reason,
+            }
+
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.RecoveryManager",
+        _FakeRecoveryManager,
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.LinearWorkflowSync.maybe_create",
+        lambda *args, **kwargs: None,
+    )
+
+    exit_code = main(
+        [
+            "factory-unblock",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--work-item-id",
+            "wi-1",
+            "--reason",
+            "operator cleared",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["status"] == "cleared"
+    assert payload["reason"] == "operator cleared"
+
+
+def test_factory_dead_letter_cli_records_recovery_action(capsys, monkeypatch, tmp_path) -> None:
+    class _FakeRecoveryManager:
+        def __init__(self, store_dir, *, linear_sync=None) -> None:
+            assert store_dir == tmp_path / "store"
+            assert linear_sync is None
+
+        def dead_letter(self, work_item_id: str, *, reason: str) -> dict[str, object]:
+            return {
+                "work_item_id": work_item_id,
+                "status": "dead_letter",
+                "reason": reason,
+            }
+
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.RecoveryManager",
+        _FakeRecoveryManager,
+    )
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.reliability_commands.LinearWorkflowSync.maybe_create",
+        lambda *args, **kwargs: None,
+    )
+
+    exit_code = main(
+        [
+            "factory-dead-letter",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--work-item-id",
+            "wi-1",
+            "--reason",
+            "operator closed",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["status"] == "dead_letter"
+    assert payload["reason"] == "operator closed"
+
+
+def test_factory_worker_cli_reports_invalid_reliability_env(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_MAX_ACTIVE_RUNS", "not-a-number")
+
+    exit_code = main(
+        [
+            "factory-worker",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+            "--once",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Factory worker failed: AI_FACTORY_MAX_ACTIVE_RUNS must be an integer." in captured.err
+
+
+def test_factory_cockpit_cli_reports_invalid_reliability_env(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("AI_FACTORY_OPERATION_STALE_SECONDS", "soon")
+
+    exit_code = main(
+        [
+            "factory-cockpit",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--repo-root",
+            str(Path(__file__).resolve().parents[1]),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert (
+        "Factory cockpit failed: AI_FACTORY_OPERATION_STALE_SECONDS must be a number."
+        in captured.err
+    )
+
+
 def test_automation_supervisor_cycle_cli_runs_full_pass(capsys, tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     html_file = root / "fixtures" / "intake" / "anthropic-release-notes-sample.html"
