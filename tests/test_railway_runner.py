@@ -1,9 +1,10 @@
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from auto_mindsdb_factory.docker_runner import RunnerError
-from auto_mindsdb_factory.railway_runner import RailwayPool
+from auto_mindsdb_factory.railway_runner import RailwayOperationError, RailwayPool, bridge
 from auto_mindsdb_factory.source_transfer import pack_source
 
 
@@ -174,7 +175,46 @@ def test_current_worker_heartbeat_failure_still_fails_closed(tmp_path):
     try:
         pool.open(tmp_path)
         pool._keep_alive()
-        with pytest.raises(RunnerError, match="^Railway worker heartbeat failed$"):
+        with pytest.raises(RunnerError, match=r"^Railway heartbeat failed \(RuntimeError\)$"):
             pool.call({"action": "run", "command": ["true"]})
     finally:
         pool.close()
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ('{"error":"RailwayAuthError","message":"provider-private-body"}', "RailwayAuthError"),
+    ('{"error":"provider-private-body"}', "UnknownError"),
+    ('provider-private-body', "InvalidJSON"),
+    ('[]', "InvalidResponse"),
+])
+def test_bridge_retains_only_approved_error_classification(monkeypatch, payload, expected):
+    import auto_mindsdb_factory.railway_runner as module
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "private-token")
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "environment")
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=1, stdout=payload, stderr="provider-private-body"))
+    with pytest.raises(RailwayOperationError) as failure:
+        bridge({"action": "request", "request": {"action": "run"}})
+    assert failure.value.public_reason() == f"Railway run failed ({expected})"
+    assert "provider-private-body" not in str(failure.value)
+
+
+def test_original_transport_error_survives_context_and_cleanup_failures(tmp_path, capsys):
+    provider = Provider()
+    original = RailwayOperationError({"action": "request", "request": {"action": "run"}}, "ExecInterruptedError")
+    def transport(request):
+        if request["action"] == "request" and request["request"]["action"] == "run":
+            raise original
+        if request["action"] == "destroy":
+            raise RuntimeError("private cleanup response")
+        return provider(request)
+    pool = RailwayPool(transport)
+    try:
+        with pytest.raises(RailwayOperationError) as failure:
+            with pool(tmp_path, "pinned") as sandbox:
+                sandbox.run(["true"])
+        assert failure.value is original
+        assert pool.failure is not None
+    finally:
+        pool.close()
+    assert "private cleanup response" not in capsys.readouterr().err

@@ -11,7 +11,7 @@ from typing import Callable
 
 from .automation import FactoryRunStore
 from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
-from .docker_runner import DockerSandbox
+from .docker_runner import DockerSandbox, RunnerError
 from .intake import repo_root
 from .product_agent import ProductAgent, AgentSessionError
 from .product_profile import ProductProfile
@@ -196,7 +196,10 @@ class ProductDelivery:
                             journal.append("candidate_verified", attempt=attempt, **verification)
                         except Exception as exc:
                             # No service secrets are sent to candidate commands; avoid storing provider error bodies.
-                            feedback = str(exc) if isinstance(exc, (DeliveryError, WorkspaceError, AgentSessionError)) else type(exc).__name__
+                            if isinstance(exc, RunnerError):
+                                feedback = exc.public_reason()
+                            else:
+                                feedback = str(exc) if isinstance(exc, (DeliveryError, WorkspaceError, AgentSessionError)) else type(exc).__name__
                             journal.append("attempt_finished", attempt=attempt, status="failed", reason=feedback)
                             continue
                         journal.append("attempt_finished", attempt=attempt, status="verified")

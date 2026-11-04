@@ -11,6 +11,34 @@ from auto_mindsdb_factory.product_workspace import git
 from auto_mindsdb_factory.run_journal import RunJournal
 
 
+@pytest.mark.parametrize("classified", [False, True])
+def test_runner_failure_journals_only_safe_classification(tmp_path, monkeypatch, classified):
+    import auto_mindsdb_factory.product_delivery as module
+    from auto_mindsdb_factory.docker_runner import RunnerError
+    from auto_mindsdb_factory.railway_runner import RailwayOperationError
+    target = tmp_path / "target"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    git(target, "remote", "add", "origin", "https://github.com/owner/product.git")
+    profile = ProductProfile.from_document({"version": 1, "name": "p", "repository": "owner/product",
+        "image": "node@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]], "max_attempts": 1})
+    task = ProductTask.from_document({"id": "runner-failed", "title": "Fix", "goal": "fix",
+        "acceptance_criteria": [{"id": "a", "description": "works", "command": ["true"]}]})
+    delivery = ProductDelivery(profile, target, tmp_path / "store")
+    error = RailwayOperationError({"action": "request", "request": {"action": "run"}}, "ExecInterruptedError") if classified else RunnerError("provider-private-body")
+    def unavailable(*args):
+        raise error
+    monkeypatch.setattr(delivery, "_prepare", unavailable)
+    monkeypatch.setattr(module, "git", lambda *args: "a" * 40)
+    with pytest.raises(DeliveryError):
+        delivery.run(task, base_sha="a" * 40)
+    journal = RunJournal(tmp_path / "store", "runner-failed")
+    failure = next(e for e in journal.events() if e["kind"] == "attempt_finished")
+    expected = "Railway run failed (ExecInterruptedError)" if classified else "RunnerError"
+    assert failure["data"]["reason"] == expected
+    assert all("provider-private-body" not in p.read_text() for p in journal.root.glob("*.json"))
+
+
 def test_commit_boundary_rejects_metadata_alias_before_git_operations(tmp_path):
     delivery = object.__new__(ProductDelivery)
     delivery.settings = {"allowed_paths": ["*"], "protected_paths": []}

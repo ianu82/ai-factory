@@ -12,7 +12,9 @@ from uuid import uuid4
 
 
 class RunnerError(RuntimeError):
-    pass
+    def public_reason(self) -> str:
+        # Docker stderr and provider messages may contain private data.
+        return type(self).__name__
 
 
 class DockerSandbox:

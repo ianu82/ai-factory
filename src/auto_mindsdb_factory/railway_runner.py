@@ -19,6 +19,23 @@ from .product_delivery import ProductDelivery
 from .source_transfer import pack_source, write_source
 
 
+class RailwayOperationError(RunnerError):
+    def __init__(self, request, error_type):
+        phase = request.get("request", {}).get("action", request.get("action"))
+        self.phase = phase if phase in {"create", "destroy", "heartbeat", "upload", "download", "enter", "run", "exit"} else "unknown"
+        known = {"RailwayError", "RailwayAuthError", "RailwayGraphQLError", "RailwayConnectionError",
+            "ExecNotStartedError", "ExecControlUnsupportedError", "ExecInterruptedError", "StaleEnvironmentError",
+            "SandboxNotFoundError", "SandboxFailedError", "SandboxTemplateBuildError", "SandboxFilesError",
+            "SandboxFileNotFoundError", "SandboxTimeoutError", "RunnerError", "WorkspaceError", "Error",
+            "ValueError", "KeyError", "TypeError", "RuntimeError", "OSError", "PermissionError", "FileNotFoundError",
+            "TimeoutExpired", "InvalidJSON", "InvalidResponse", "BridgeProcessError"}
+        self.error_type = error_type if isinstance(error_type, str) and error_type in known else "UnknownError"
+        super().__init__(self.public_reason())
+
+    def public_reason(self):
+        return f"Railway {self.phase} failed ({self.error_type})"
+
+
 def bridge(request):
     environment = {name: os.environ[name] for name in
         ("PATH", "RAILWAY_API_TOKEN", "RAILWAY_ENVIRONMENT_ID") if name in os.environ}
@@ -28,12 +45,17 @@ def bridge(request):
     try:
         result = subprocess.run(["node", str(Path(__file__).with_name("railway_bridge") / "bridge.mjs")],
             input=json.dumps(request), capture_output=True, text=True, env=environment, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RailwayOperationError(request, type(error).__name__) from None
+    try:
         response = json.loads(result.stdout)
-        if result.returncode or not isinstance(response, dict) or "error" in response:
-            raise RunnerError("Railway operation failed")
-        return response
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        raise RunnerError("Railway result unavailable") from None
+    except ValueError:
+        raise RailwayOperationError(request, "InvalidJSON") from None
+    if not isinstance(response, dict):
+        raise RailwayOperationError(request, "InvalidResponse")
+    if result.returncode or "error" in response:
+        raise RailwayOperationError(request, response.get("error", "BridgeProcessError"))
+    return response
 
 
 class RailwayPool:
@@ -57,12 +79,13 @@ class RailwayPool:
         if identity:
             try:
                 self.transport({"action": "heartbeat", "id": identity, "timeout": 30})
-            except Exception:
+            except Exception as error:
                 # Retirement can race an in-flight heartbeat. A failure for a
                 # retired worker must never poison its replacement.
                 with self.lock:
                     if self.id == identity:
-                        self.failure = RunnerError("Railway worker heartbeat failed")
+                        self.failure = error if isinstance(error, RailwayOperationError) else RailwayOperationError(
+                            {"action": "heartbeat"}, type(error).__name__)
 
     def _discard(self):
         if self.id:
@@ -90,13 +113,15 @@ class RailwayPool:
                 response = self.transport({"action": "request", "id": self.id,
                                            "request": request, "timeout": timeout})
                 if "error" in response:
-                    raise RunnerError("Railway Docker operation failed")
+                    raise RailwayOperationError({"request": request}, response["error"])
                 return response
             except BaseException:
                 # A lost docker-exec transport cannot prove the candidate stopped.
                 # Retire its whole VM and prevent further use of this source export.
                 try:
                     self._discard()
+                except Exception:
+                    print("Railway worker cleanup failed; five-minute idle expiry remains active", file=sys.stderr)
                 finally:
                     self.failure = RunnerError("Railway execution outcome is uncertain")
                 raise
@@ -137,6 +162,10 @@ class RailwaySandbox:
         return self._call("run", command=command, stdin=stdin)
 
     def __exit__(self, *exc):
+        if exc[0] is not None and self.pool.failure:
+            # The failed pool owns VM cleanup. Preserve the original failure;
+            # another request would only replace it with the uncertainty guard.
+            return False
         # Stop candidate processes before reading a stable source snapshot.
         self._call("exit")
         if exc[0] is None:
