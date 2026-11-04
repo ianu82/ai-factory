@@ -210,6 +210,8 @@ def test_stage3_build_review_uses_factory_paths_for_manual_linear_issues() -> No
 
 def test_stage3_build_review_can_use_agent_drafts() -> None:
     root = Path(__file__).resolve().parents[1]
+    if not (root / ".git").exists():
+        pytest.skip("requires controller Git metadata for tracked-path inventory")
     stage2_result = stage2_manual_issue_result(root)
     agent_connector = ScriptedAgentConnector(
         {

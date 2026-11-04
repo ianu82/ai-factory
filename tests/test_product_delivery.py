@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -67,6 +68,8 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
 
 
 def test_failed_base_fetch_is_preserved_before_attempts(tmp_path, monkeypatch):
+    if not (Path(__file__).resolve().parents[1] / ".git").exists():
+        pytest.skip("requires controller Git metadata for runtime provenance")
     import auto_mindsdb_factory.product_delivery as module
     target = tmp_path / "target"
     target.mkdir()
