@@ -40,12 +40,14 @@ async function dispatch(request) {
         await sandbox.files.write(`${directory}/${name}.py`, code, {mode: 0o644});
       }
       await checkedExec(sandbox,
-        'set -eu; id -u factory >/dev/null 2>&1 || useradd -m factory; ' +
+        'set -eu; if ! test -x /usr/bin/python3; then apt-get update -qq && ' +
+        'apt-get install -y --no-install-recommends python3 >/dev/null; fi; ' +
+        'id -u factory >/dev/null 2>&1 || useradd -m factory; ' +
         'getent group docker >/dev/null || groupadd --system docker; ' +
         'chgrp docker /var/run/docker.sock && chmod 660 /var/run/docker.sock && ' +
         'usermod -aG docker factory && install -d -o factory -g factory /work && ' +
-        'runuser -u factory -- docker info >/dev/null && python3 --version',
-        undefined, 90);
+        'runuser -u factory -- docker info >/dev/null && runuser -u factory -- /usr/bin/python3 --version',
+        undefined, 180);
       return {id: sandbox.id};
     } catch (error) {
       await sandbox.destroy();
@@ -69,7 +71,7 @@ async function dispatch(request) {
   }
   if (request.action !== 'request') throw new Error('Unknown bridge operation');
   const output = await checkedExec(sandbox,
-    'cd /opt/ai-factory && runuser -u factory -- python3 -m auto_mindsdb_factory.railway_remote',
+    'cd /opt/ai-factory && runuser -u factory -- /usr/bin/python3 -m auto_mindsdb_factory.railway_remote',
     JSON.stringify(request.request), request.timeout, MAX_MESSAGE_BYTES);
   return JSON.parse(output);
 }
