@@ -46,4 +46,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: docker pull "$AI_FACTORY_TEST_IMAGE"
-      - run: uv run --locked --extra dev pytest -q tests/test_docker_runner.py
+      - run: uv run --locked --extra dev pytest -q tests/test_docker_runner.py tests/test_product_delivery.py

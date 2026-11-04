@@ -9,6 +9,8 @@ import re
 import stat
 import subprocess
 import tarfile
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 
@@ -24,6 +26,18 @@ def git(root: Path, *args: str) -> str:
     if result.returncode:
         raise WorkspaceError(f"Git operation failed: {args[0]}")
     return result.stdout.strip()
+
+
+@contextmanager
+def controller_worktree(repository: Path, sha: str):
+    """Only trusted controller code may edit Git metadata or create commits."""
+    with tempfile.TemporaryDirectory(prefix="ai-factory-commit-") as temporary:
+        workspace = Path(temporary) / "repo"
+        git(repository, "worktree", "add", "--detach", str(workspace), sha)
+        try:
+            yield workspace
+        finally:
+            git(repository, "worktree", "remove", "--force", str(workspace))
 
 
 def export_source(repository: Path, commit: str, destination: Path) -> None:

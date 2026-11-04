@@ -1,0 +1,174 @@
+"""Short product workflow: implement, independently verify, then promote."""
+
+from __future__ import annotations
+
+import fnmatch
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+from .automation import FactoryRunStore
+from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
+from .docker_runner import DockerSandbox
+from .intake import repo_root
+from .product_agent import ProductAgent
+from .product_profile import ProductProfile
+from .product_task import ProductTask
+from .product_workspace import controller_worktree, export_source, git, source_files, source_digest, WorkspaceError
+from .reliability import OperationTracker
+from .run_journal import RunJournal
+
+
+class DeliveryError(RuntimeError):
+    pass
+
+
+class ProductDelivery:
+    def __init__(self, profile: ProductProfile, target_root: Path, store: Path, *,
+                 agent_factory: Callable | None = None, sandbox_factory: Callable = DockerSandbox) -> None:
+        self.profile = profile
+        self.settings = profile.document
+        self.target = target_root.resolve()
+        self.store = store.resolve()
+        if self.store.is_relative_to(self.target):
+            raise DeliveryError("Delivery evidence must be outside candidate source")
+        profile.validate_repository(self.target)
+        self.agent_factory = agent_factory or self._agent
+        self.sandbox_factory = sandbox_factory
+        self.deadline = 0.0
+
+    def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
+        config = OpenAIResponsesAgentConfig.from_env(model=self.settings[f"{role}_model"])
+        if config.fallback_model:
+            raise DeliveryError("Product delivery requires pinned role models; fallback routing is not enabled")
+        return ProductAgent(OpenAIResponsesAgentConnector(config), journal,
+            max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
+            deadline=self.deadline)
+
+    def _command(self, sandbox, command: list[str]) -> dict:
+        remaining = self.deadline - time.monotonic()
+        if remaining < 1:
+            raise DeliveryError("Run time budget exhausted")
+        sandbox.timeout = min(self.settings["command_timeout_seconds"], int(remaining))
+        return sandbox.run(command)
+
+    def _prepare(self, sha: str, workspace: Path, journal: RunJournal) -> dict[str, bytes]:
+        export_source(self.target, sha, workspace)
+        original = source_files(workspace)
+        if self.settings["setup"]:
+            with self.sandbox_factory(workspace, self.settings["image"], writable=True,
+                                      network=self.settings["setup_network"]) as sandbox:
+                for command in self.settings["setup"]:
+                    result = self._command(sandbox, command)
+                    journal.append("setup_command", commit_sha=sha, **result)
+                    if result["exit_code"]:
+                        raise DeliveryError("Candidate environment setup failed")
+            if source_files(workspace) != original:
+                raise DeliveryError("Environment setup changed source files")
+        return original
+
+    def _commit(self, task: ProductTask, base: str, original: dict, modified: dict, attempt: int) -> tuple[str, list[str]]:
+        paths = sorted(path for path in set(original) | set(modified) if original.get(path) != modified.get(path))
+        if not paths:
+            raise DeliveryError("Builder produced no source changes")
+        for path in paths:
+            if (not any(fnmatch.fnmatchcase(path, pattern) for pattern in self.settings["allowed_paths"])
+                    or any(fnmatch.fnmatchcase(path, pattern) for pattern in self.settings["protected_paths"])):
+                raise DeliveryError(f"Candidate changed a path outside its permitted scope: {path}")
+        with controller_worktree(self.target, base) as checkout:
+            for path in paths:
+                target = checkout / path
+                if path not in modified:
+                    target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(modified[path])
+            git(checkout, "add", "--", *paths)
+            stats = git(checkout, "diff", "--cached", "--numstat", "--no-renames")
+            lines = 0
+            for row in stats.splitlines():
+                added, removed, _ = row.split("\t", 2)
+                if not added.isdigit() or not removed.isdigit():
+                    raise DeliveryError("Binary changes need a separate delivery policy")
+                lines += int(added) + int(removed)
+            if lines > self.settings["max_changed_lines"]:
+                raise DeliveryError("Candidate exceeds the small-PR line budget")
+            git(checkout, "-c", "user.name=AI Factory", "-c", "user.email=ai-factory@users.noreply.github.com",
+                "-c", "commit.gpgsign=false", "commit", "-m", task.document["title"])
+            sha = git(checkout, "rev-parse", "HEAD")
+            git(self.target, "update-ref", f"refs/factory/{task.document['id']}/attempt-{attempt}", sha)
+            return sha, paths
+
+    def verify(self, task: ProductTask, sha: str, base: str, journal: RunJournal) -> dict:
+        with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
+            workspace = Path(temporary) / "source"
+            original = self._prepare(sha, workspace, journal)
+            checks = []
+            with self.sandbox_factory(workspace, self.settings["image"], writable=False) as sandbox:
+                commands = [(name, command) for name, command in self.settings["checks"].items()]
+                commands += [("acceptance:" + item["id"], item["command"]) for item in task.document["acceptance_criteria"]]
+                for name, command in commands:
+                    result = self._command(sandbox, command)
+                    journal.append("verification_check", name=name, commit_sha=sha, **result)
+                    checks.append({"name": name, **result})
+                if any(check["exit_code"] for check in checks):
+                    raise DeliveryError("Independent executable verification failed: " + ", ".join(c["name"] for c in checks if c["exit_code"]))
+                diff = git(self.target, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, sha, "--")
+                if not diff or len(diff) > 60000:
+                    raise DeliveryError("Candidate diff is empty or too large to review")
+                context = {**task.public_context, "base_sha": base, "candidate_sha": sha, "diff": diff,
+                           "required_checks": self.settings["checks"]}
+                report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
+            if source_digest(source_files(workspace)) != source_digest(original):
+                raise DeliveryError("Verifier changed candidate source")
+            if report["status"] != "passed":
+                raise DeliveryError("Independent verifier did not approve the candidate")
+            return {"commit_sha": sha, "source_sha": source_digest(original), "checks": checks, "report": report}
+
+    def run(self, task: ProductTask, *, promote: Callable | None = None, base_sha: str | None = None) -> dict:
+        task_id = task.document["id"]
+        journal = RunJournal(self.store, task_id)
+        self.deadline = time.monotonic() + self.settings["max_run_seconds"]
+        locks = FactoryRunStore(self.store, repo_root_override=repo_root())
+        with locks.run_lease(task_id, ttl_seconds=60, renew_interval_seconds=15) as lease:
+            if base_sha is None:
+                git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
+                base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
+            journal.create({"task": task.document, "base_sha": base_sha, "profile": self.settings,
+                            "profile_sha": self.profile.digest, "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
+            with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
+                feedback = ""
+                try:
+                    for attempt in range(1, self.settings["max_attempts"] + 1):
+                        journal.append("attempt_started", attempt=attempt, base_sha=base_sha)
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="ai-factory-build-") as temporary:
+                                workspace = Path(temporary) / "source"
+                                original = self._prepare(base_sha, workspace, journal)
+                                context = {**task.public_context, "required_checks": self.settings["checks"],
+                                           "allowed_paths": self.settings["allowed_paths"], "revision_feedback": feedback}
+                                with self.sandbox_factory(workspace, self.settings["image"], writable=True) as sandbox:
+                                    report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
+                                if report["status"] != "passed":
+                                    raise DeliveryError("Builder did not complete the task")
+                                sha, paths = self._commit(task, base_sha, original, source_files(workspace), attempt)
+                            journal.append("candidate_created", attempt=attempt, commit_sha=sha, changed_paths=paths)
+                            verification = self.verify(task, sha, base_sha, journal)
+                            journal.append("candidate_verified", attempt=attempt, **verification)
+                        except Exception as exc:
+                            # No service secrets are sent to candidate commands; avoid storing provider error bodies.
+                            feedback = str(exc) if isinstance(exc, (DeliveryError, WorkspaceError)) else type(exc).__name__
+                            journal.append("attempt_finished", attempt=attempt, status="failed", reason=feedback)
+                            continue
+                        journal.append("attempt_finished", attempt=attempt, status="verified")
+                        candidate = {"run_id": task_id, "base_sha": base_sha, "candidate_sha": sha,
+                                     "profile_sha": self.profile.digest, "changed_paths": paths, "verification": verification}
+                        lease.heartbeat()
+                        result = promote(candidate, journal) if promote else {"status": "verified", **candidate}
+                        journal.append("run_finished", status=result["status"])
+                        return {**result, "evidence_dir": str(journal.root), "usage": journal.summary()}
+                    raise DeliveryError("No candidate passed independent verification within the attempt budget")
+                except Exception as exc:
+                    journal.append("run_finished", status="blocked", reason=type(exc).__name__)
+                    raise
