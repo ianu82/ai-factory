@@ -41,7 +41,7 @@ async function dispatch(request) {
       }
       await checkedExec(sandbox,
         'set -eu; if ! test -x /usr/bin/python3; then apt-get update -qq && ' +
-        'apt-get install -y --no-install-recommends python3 >/dev/null; fi; ' +
+        'DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends python3 >/dev/null; fi; ' +
         'id -u factory >/dev/null 2>&1 || useradd -m factory; ' +
         'getent group docker >/dev/null || groupadd --system docker; ' +
         'chgrp docker /var/run/docker.sock && chmod 660 /var/run/docker.sock && ' +
