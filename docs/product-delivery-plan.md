@@ -102,3 +102,11 @@ does not invoke models, change code, schedule itself or adopt proposals. Propose
 fixes must acquire independent regression criteria and pass the normal delivery
 and repeated replay process. Per-role models are explicit profile choices; adaptive
 routing requires evidence and is not enabled by these proposals.
+
+`agent_max_output_tokens` is an explicit profile setting (default 8,000), bounded
+by the remaining run token budget. Builder and verifier use `builder_model` and
+`reviewer_model` respectively. Incomplete responses retain their status/reason and
+never execute a partial tool call. Base-resolution failures are recorded before
+attempts begin; live runs retain the resolved base in an immutable event. Source
+exports read raw committed blobs, including files marked export-ignore, and retain
+executable bits. Archive attributes cannot hide source from verification.

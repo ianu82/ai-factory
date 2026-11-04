@@ -50,6 +50,7 @@ SCHEMA = {
         "reviewer_model": {"type": "string", "minLength": 1},
         "max_attempts": {"type": "integer", "minimum": 1, "maximum": 5},
         "max_agent_turns": {"type": "integer", "minimum": 1, "maximum": 100},
+        "agent_max_output_tokens": {"type": "integer", "minimum": 256, "maximum": 32000},
         "max_total_tokens": {"type": "integer", "minimum": 1000, "maximum": 1000000},
         "command_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800},
         "max_run_seconds": {"type": "integer", "minimum": 30, "maximum": 14400},
@@ -63,7 +64,7 @@ DEFAULTS = {
     "protected_paths": [".git", ".git/**", ".github/**", ".env", ".env.*"],
     "auto_merge": False, "required_status_checks": [],
     "builder_model": "gpt-5.4", "reviewer_model": "gpt-5.4",
-    "max_attempts": 2, "max_agent_turns": 25, "max_total_tokens": 200000,
+    "max_attempts": 2, "max_agent_turns": 25, "max_total_tokens": 200000, "agent_max_output_tokens": 8000,
     "command_timeout_seconds": 300, "max_run_seconds": 1800, "max_changed_lines": 500,
 }
 

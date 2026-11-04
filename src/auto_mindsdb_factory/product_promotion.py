@@ -36,7 +36,7 @@ class GitHubPromotion:
         self.repo = self.settings["repository"]
 
     def _api(self, path: str, body: dict | None = None):
-        command = ["gh", "api", f"repos/{self.repo}/{path}"]
+        command = ["gh", "api", "--hostname", "github.com", f"repos/{self.repo}/{path}"]
         if body is not None:
             command += ["--method", "POST", "--input", "-"]
         remaining = self.deadline - time.monotonic()
@@ -136,6 +136,8 @@ class GitHubPromotion:
         self.api(f"statuses/{sha}", {"state": "success", "context": "ai-factory/verification",
             "description": "Independent executable checks and review passed", "target_url": pr["html_url"]})
         if not self.settings["auto_merge"]:
+            if pr.get("state") != "open":
+                raise PromotionError("Published pull request is no longer open")
             return {"status": "pr_ready", **candidate, "pull_request_url": pr["html_url"]}
         lock_id = "promotion-" + hashlib.sha256(self.repo.lower().encode()).hexdigest()[:24]
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
