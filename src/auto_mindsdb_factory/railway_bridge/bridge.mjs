@@ -40,7 +40,7 @@ async function dispatch(request) {
         await sandbox.files.write(`${directory}/${name}.py`, code, {mode: 0o644});
       }
       await checkedExec(sandbox,
-        'id -u factory >/dev/null 2>&1 || useradd -u 1000 -m factory; ' +
+        'id -u factory >/dev/null 2>&1 || useradd -m factory; ' +
         'usermod -aG docker factory && install -d -o factory -g factory /work && ' +
         'runuser -u factory -- docker info >/dev/null && python3 --version',
         undefined, 90);
