@@ -995,7 +995,14 @@ def test_automation_weekly_feedback_cycle_uses_latest_stage9_bundle_across_weeks
 
 def test_automation_weekly_feedback_cycle_prefers_newer_stage8_result_over_older_stage9_result(
     tmp_path,
+    monkeypatch,
 ) -> None:
+    # The replacement Stage 8 result below must be newer than the generated
+    # Stage 9 artifact, regardless of the date on which this test is run.
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.feedback_synthesis.utc_now",
+        lambda: "2026-04-27T00:00:00Z",
+    )
     root = Path(__file__).resolve().parents[1]
     store_dir = tmp_path / "automation-store"
     store = FactoryRunStore(store_dir, repo_root_override=root)
