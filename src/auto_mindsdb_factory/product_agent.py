@@ -97,6 +97,7 @@ class ProductAgent:
             rate = self.pricing.get(payload.get("model"))
             self.journal.append("model_response", role=role, turn=turn + 1,
                 response_id=payload.get("id"), model=payload.get("model"), usage=payload.get("usage"),
+                status=payload.get("status"), incomplete_details=payload.get("incomplete_details"),
                 duration_seconds=round(time.monotonic() - started, 3),
                 cost_estimate_usd=estimate_cost(payload.get("usage"), rate), pricing=rate)
             if payload.get("status") != "completed":

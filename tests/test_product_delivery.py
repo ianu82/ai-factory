@@ -10,6 +10,44 @@ from auto_mindsdb_factory.product_workspace import git
 from auto_mindsdb_factory.run_journal import RunJournal
 
 
+def test_real_agent_factory_respects_builder_and_reviewer_configuration(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-no-request")
+    monkeypatch.delenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", raising=False)
+    delivery = object.__new__(ProductDelivery)
+    delivery.settings = ProductProfile.from_document({"version": 1, "name": "p", "repository": "owner/product",
+        "image": "node@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]],
+        "builder_model": "builder-snapshot", "reviewer_model": "reviewer-snapshot", "agent_max_output_tokens": 9000}).document
+    delivery.deadline = 999999999
+    journal = RunJournal(tmp_path, "factory-config")
+    assert delivery._agent("builder", journal).connector.config.model == "builder-snapshot"
+    verifier = delivery._agent("verifier", journal)
+    assert verifier.connector.config.model == "reviewer-snapshot"
+    assert verifier.connector.config.max_output_tokens == 9000
+
+
+def test_failed_base_fetch_is_preserved_before_attempts(tmp_path, monkeypatch):
+    import auto_mindsdb_factory.product_delivery as module
+    target = tmp_path / "target"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    git(target, "remote", "add", "origin", "https://github.com/owner/product.git")
+    profile = ProductProfile.from_document({"version": 1, "name": "p", "repository": "owner/product",
+        "image": "node@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]]})
+    task = ProductTask.from_document({"id": "fetch-failed", "title": "Fix", "goal": "fix",
+        "acceptance_criteria": [{"id": "a", "description": "works", "command": ["true"]}]})
+    real_git = module.git
+    def failed_fetch(root, *args):
+        if args[0] == "fetch":
+            raise module.WorkspaceError("Fetch failed")
+        return real_git(root, *args)
+    monkeypatch.setattr(module, "git", failed_fetch)
+    with pytest.raises(module.WorkspaceError):
+        ProductDelivery(profile, target, tmp_path / "store").run(task)
+    journal = RunJournal(tmp_path / "store", "fetch-failed")
+    assert (journal.root / "manifest.json").exists()
+    assert journal.summary()["status"] == "blocked"
+
+
 def test_task_rejects_duplicate_criteria_and_internal_executable_requests(tmp_path):
     criterion = {"id": "a", "description": "works", "command": ["true"]}
     with pytest.raises(ValueError, match="unique"):
@@ -46,6 +84,8 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
             if role == "builder":
                 content = "module.exports=(a,b)=>a+b;" if variant == "correct" else "module.exports=(a,b)=>a*b;"
                 result = command(["node", "-e", f"require('fs').writeFileSync('app.js',{content!r})"])
+                if variant == "correct":
+                    assert command(["chmod", "+x", "app.js"])["exit_code"] == 0
                 if variant == "out-of-scope":
                     command(["node", "-e", "require('fs').writeFileSync('unexpected.txt','bad')"])
             else:
@@ -60,6 +100,7 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
         assert result["status"] == "verified"
         assert result["verification"]["commit_sha"] == result["candidate_sha"] != base
         assert result["changed_paths"] == ["app.js"]
+        assert git(target, "ls-tree", result["candidate_sha"], "app.js").startswith("100755")
         assert [role for role, _ in seen] == ["builder", "verifier"]
     else:
         with pytest.raises(DeliveryError):

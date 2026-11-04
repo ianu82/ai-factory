@@ -12,10 +12,10 @@ from .automation import FactoryRunStore
 from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
 from .docker_runner import DockerSandbox
 from .intake import repo_root
-from .product_agent import ProductAgent
+from .product_agent import ProductAgent, AgentSessionError
 from .product_profile import ProductProfile
 from .product_task import ProductTask
-from .product_workspace import controller_worktree, export_source, git, source_files, source_digest, WorkspaceError
+from .product_workspace import controller_worktree, executable_paths, export_source, git, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
 from .run_journal import RunJournal
 
@@ -43,7 +43,11 @@ class ProductDelivery:
         self.deadline = 0.0
 
     def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
-        config = OpenAIResponsesAgentConfig.from_env(model=self.settings[f"{role}_model"])
+        model_key = {"builder": "builder_model", "verifier": "reviewer_model"}.get(role)
+        if model_key is None:
+            raise DeliveryError("Unknown delivery agent role")
+        config = OpenAIResponsesAgentConfig.from_env(model=self.settings[model_key],
+            max_output_tokens=self.settings["agent_max_output_tokens"])
         if config.fallback_model:
             raise DeliveryError("Product delivery requires pinned role models; fallback routing is not enabled")
         return ProductAgent(OpenAIResponsesAgentConnector(config), journal,
@@ -60,6 +64,7 @@ class ProductDelivery:
     def _prepare(self, sha: str, workspace: Path, journal: RunJournal) -> dict[str, bytes]:
         export_source(self.target, sha, workspace)
         original = source_files(workspace)
+        original_executables = executable_paths(workspace, original)
         if self.settings["setup"]:
             with self.sandbox_factory(workspace, self.settings["image"], writable=True,
                                       network=self.settings["setup_network"], platform=self.settings["platform"]) as sandbox:
@@ -68,12 +73,14 @@ class ProductDelivery:
                     journal.append("setup_command", commit_sha=sha, **result)
                     if result["exit_code"]:
                         raise DeliveryError("Candidate environment setup failed")
-            if source_files(workspace) != original:
+            if source_files(workspace) != original or executable_paths(workspace, original) != original_executables:
                 raise DeliveryError("Environment setup changed source files")
         return original
 
-    def _commit(self, task: ProductTask, base: str, original: dict, modified: dict, attempt: int) -> tuple[str, list[str]]:
-        paths = sorted(path for path in set(original) | set(modified) if original.get(path) != modified.get(path))
+    def _commit(self, task: ProductTask, base: str, original: dict, modified: dict, attempt: int,
+                original_executables: set[str], modified_executables: set[str]) -> tuple[str, list[str]]:
+        paths = sorted(path for path in set(original) | set(modified) if original.get(path) != modified.get(path)
+                       or (path in original_executables) != (path in modified_executables))
         if not paths:
             raise DeliveryError("Builder produced no source changes")
         for path in paths:
@@ -88,6 +95,7 @@ class ProductDelivery:
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(modified[path])
+                    target.chmod(0o755 if path in modified_executables else 0o644)
             git(checkout, "add", "--", *paths)
             stats = git(checkout, "diff", "--cached", "--numstat", "--no-renames")
             lines = 0
@@ -108,6 +116,7 @@ class ProductDelivery:
         with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
+            original_executables = executable_paths(workspace, original)
             checks = []
             with self.sandbox_factory(workspace, self.settings["image"], writable=False, platform=self.settings["platform"]) as sandbox:
                 commands = [(name, command) for name, command in self.settings["checks"].items()]
@@ -126,13 +135,13 @@ class ProductDelivery:
                 context = {**task.public_context, "base_sha": base, "candidate_sha": sha, "diff": diff,
                            "required_checks": self.settings["checks"]}
                 report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
-            if source_digest(source_files(workspace)) != source_digest(original):
+            if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
                 raise DeliveryError("Verifier changed candidate source")
             if report["status"] == "failed":
                 raise VerificationFailed("Independent verifier found blocking defects")
             if report["status"] != "passed":
                 raise DeliveryError("Independent verifier did not approve the candidate")
-            return {"commit_sha": sha, "source_sha": source_digest(original), "checks": checks, "report": report}
+            return {"commit_sha": sha, "source_sha": source_digest(original, original_executables), "checks": checks, "report": report}
 
     def run(self, task: ProductTask, *, promote: Callable | None = None, base_sha: str | None = None,
             replay: dict | None = None) -> dict:
@@ -142,9 +151,6 @@ class ProductDelivery:
         self.deadline = started + self.settings["max_run_seconds"]
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
         with locks.run_lease(task_id, ttl_seconds=60, renew_interval_seconds=15) as lease:
-            if base_sha is None:
-                git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
-                base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
             journal.create({"purpose": "replay" if replay is not None else (
                                 "improvement" if task.document.get("origin") == "improvement" else "delivery"), "replay": replay,
                             "task": task.document, "base_sha": base_sha, "profile": self.settings,
@@ -153,25 +159,32 @@ class ProductDelivery:
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""
                 try:
+                    if base_sha is None:
+                        git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
+                        base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
+                    journal.append("base_resolved", commit_sha=base_sha)
                     for attempt in range(1, self.settings["max_attempts"] + 1):
                         journal.append("attempt_started", attempt=attempt, base_sha=base_sha)
                         try:
                             with tempfile.TemporaryDirectory(prefix="ai-factory-build-") as temporary:
                                 workspace = Path(temporary) / "source"
                                 original = self._prepare(base_sha, workspace, journal)
+                                original_executables = executable_paths(workspace, original)
                                 context = {**task.public_context, "required_checks": self.settings["checks"],
                                            "allowed_paths": self.settings["allowed_paths"], "revision_feedback": feedback}
                                 with self.sandbox_factory(workspace, self.settings["image"], writable=True, platform=self.settings["platform"]) as sandbox:
                                     report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
                                 if report["status"] != "passed":
                                     raise DeliveryError("Builder did not complete the task")
-                                sha, paths = self._commit(task, base_sha, original, source_files(workspace), attempt)
+                                modified = source_files(workspace)
+                                sha, paths = self._commit(task, base_sha, original, modified, attempt,
+                                    original_executables, executable_paths(workspace, modified))
                             journal.append("candidate_created", attempt=attempt, commit_sha=sha, changed_paths=paths)
                             verification = self.verify(task, sha, base_sha, journal)
                             journal.append("candidate_verified", attempt=attempt, **verification)
                         except Exception as exc:
                             # No service secrets are sent to candidate commands; avoid storing provider error bodies.
-                            feedback = str(exc) if isinstance(exc, (DeliveryError, WorkspaceError)) else type(exc).__name__
+                            feedback = str(exc) if isinstance(exc, (DeliveryError, WorkspaceError, AgentSessionError)) else type(exc).__name__
                             journal.append("attempt_finished", attempt=attempt, status="failed", reason=feedback)
                             continue
                         journal.append("attempt_finished", attempt=attempt, status="verified")
