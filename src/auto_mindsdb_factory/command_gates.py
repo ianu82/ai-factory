@@ -5,7 +5,6 @@ import pwd
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -48,8 +47,8 @@ class CommandGateRunner:
 
     MAX_CAPTURED_OUTPUT_CHARS = 4000
     DEFAULT_COMMANDS = {
-        "unit": [sys.executable, "-m", "pytest", "-q"],
-        "contract": [sys.executable, "scripts/validate_contracts.py"],
+        "unit": ["uv", "run", "--locked", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        "contract": ["uv", "run", "--locked", "--extra", "dev", "python", "scripts/validate_contracts.py"],
     }
     ENV_COMMANDS = {
         "lint": "AI_FACTORY_GATE_LINT_COMMAND",
@@ -97,8 +96,13 @@ class CommandGateRunner:
         user = os.environ.get("AI_FACTORY_GATE_RUN_AS_USER") or os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER")
         if require_candidate and not user:
             raise CommandGateError("Production gates require AI_FACTORY_GATE_RUN_AS_USER or AI_FACTORY_CODE_WORKER_RUN_AS_USER.")
-        if require_candidate and user in {"root", "0", str(os.getuid()), pwd.getpwuid(os.getuid()).pw_name}:
-            raise CommandGateError("Production gates must use a non-root account distinct from the orchestrator.")
+        if require_candidate:
+            try:
+                uid = int(user.lstrip("#")) if user.lstrip("#").isdigit() else pwd.getpwnam(user).pw_uid
+            except KeyError as exc:
+                raise CommandGateError(f"Gate execution account does not exist: {user}") from exc
+            if uid in {0, os.getuid()}:
+                raise CommandGateError("Production gates must use a non-root account distinct from the orchestrator.")
         return cls(
             repo_root, commands_by_kind=commands, required_kinds=required,
             timeout_seconds=timeout, require_candidate=require_candidate,
@@ -221,7 +225,10 @@ class CommandGateRunner:
         env = {
             name: value for name, value in os.environ.items()
             if not re.search(r"(?:API_KEY|TOKEN|SECRET|PASSWORD|ACCESS_KEY(?:_ID)?|SESSION_TOKEN)$", name)
-            and name not in {"PYTHONHOME", "OPENAI_ORGANIZATION", "OPENAI_PROJECT"}
+            and name not in {
+                "PYTHONHOME", "OPENAI_ORGANIZATION", "OPENAI_PROJECT", "VIRTUAL_ENV",
+                "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_WORKING_DIRECTORY",
+            }
         }
         env["PYTHONPATH"] = os.pathsep.join(
             str(path) for path in (self.repo_root / "src", self.repo_root) if path.is_dir()

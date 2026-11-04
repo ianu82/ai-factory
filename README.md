@@ -163,8 +163,8 @@ Run one production-style cycle:
 
 Default real gates are:
 
-- `python -m pytest -q`
-- `python scripts/validate_contracts.py`
+- `uv run --locked --extra dev python -m pytest -q`
+- `uv run --locked --extra dev python scripts/validate_contracts.py`
 
 Configure additional gates with `AI_FACTORY_GATE_LINT_COMMAND`, `AI_FACTORY_GATE_TYPECHECK_COMMAND`, `AI_FACTORY_GATE_INTEGRATION_COMMAND`, and `AI_FACTORY_GATE_MIGRATION_SAFETY_COMMAND`. Checks without real commands are recorded as `not_configured`; later-stage checks are recorded as `deferred` rather than fake-passed.
 
@@ -173,6 +173,8 @@ Production gates run in a fresh detached worktree at the full commit SHA recorde
 Every merge-gating check marked `required` must have a real passing command. `AI_FACTORY_REQUIRED_GATE_KINDS` adds mandatory kinds; it does not waive requirements in the manifest. Model and safety gates can use `AI_FACTORY_GATE_LATENCY_COMMAND`, `AI_FACTORY_GATE_COST_COMMAND`, `AI_FACTORY_GATE_LLM_QUALITY_COMMAND`, and `AI_FACTORY_GATE_ADVERSARIAL_COMMAND`. Install or configure each target project's dependencies for these commands before enabling intake.
 
 Production gates run as `AI_FACTORY_GATE_RUN_AS_USER`, falling back to the configured `AI_FACTORY_CODE_WORKER_RUN_AS_USER`; they refuse to start without an execution account. The account must be able to run the configured commands, read the target interpreter and dependencies, and write the temporary workspace. The orchestrator needs permission to change and restore ownership of its generated workspaces. A dedicated gate account without model, GitHub or Linear credentials is preferable. `factory-doctor` checks the gate account before intake is enabled.
+
+Default gates use the candidate's `uv.lock` and a workspace-local environment. A stale lockfile or failed dependency installation blocks the gate. Inherited virtual-environment/project overrides are removed; explicitly configured gate commands remain unchanged and must select the appropriate locked environment for their project.
 
 ## Repository Layout
 
