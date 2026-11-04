@@ -54,6 +54,28 @@ class GitHubPromotion:
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             raise PromotionError("GitHub result unavailable; inspect the remote state before retrying") from exc
 
+    def _check_deadline(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise PromotionError("Run time budget exhausted")
+
+    def _request(self, path: str, journal: RunJournal, body: dict | None = None):
+        read_only = body is None
+        for attempt in range(1, 4 if read_only else 2):
+            self._check_deadline()
+            try:
+                # Preserve the injected adapter's existing calling convention.
+                return self.api(path) if read_only else self.api(path, body)
+            except PromotionError:
+                journal.append("github_request_failed", path=path, read_only=read_only,
+                               attempt=attempt, error_type="PromotionError")
+                if not read_only or attempt == 3:
+                    raise
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.2 * attempt, remaining))
+        raise AssertionError("Unreachable request attempt")
+
     def _branch_sha(self, branch: str) -> str | None:
         rows = git(self.target, "ls-remote", "--heads", "origin", f"refs/heads/{branch}").splitlines()
         return rows[0].split("\t")[0] if rows else None
@@ -102,16 +124,20 @@ class GitHubPromotion:
             state == "success" for name, state in states if name == wanted
         ) for wanted in required) and all(state in {"success", "neutral", "skipped"} for _, state in states)
 
-    def _wait_checks(self, sha: str) -> None:
+    def _wait_checks(self, sha: str, journal: RunJournal) -> None:
         while time.monotonic() < self.deadline:
-            statuses = self.api(f"commits/{sha}/status?per_page=100")
-            checks = self.api(f"commits/{sha}/check-runs?per_page=100&filter=latest")
+            statuses = self._request(f"commits/{sha}/status?per_page=100", journal)
+            # Fail immediately on a reported status failure, even if the next read fails.
+            self.checks_passed(statuses, {}, [])
+            checks = self._request(f"commits/{sha}/check-runs?per_page=100&filter=latest", journal)
             if self.checks_passed(statuses, checks, self.settings["required_status_checks"]):
+                self._check_deadline()
                 return
             time.sleep(min(5, max(0, self.deadline - time.monotonic())))
         raise PromotionError("Candidate checks remain pending, missing or unverified")
 
     def __call__(self, candidate: dict, journal: RunJournal) -> dict:
+        self._check_deadline()
         self.profile.validate_repository(self.target)
         self._validate(candidate)
         sha, base = candidate["candidate_sha"], candidate["base_sha"]
@@ -121,11 +147,12 @@ class GitHubPromotion:
         if remote is not None and remote != sha:
             raise PromotionError("Delivery branch changed; refusing to replace it")
         if remote is None:
+            self._check_deadline()
             git(self.target, "push", f"--force-with-lease=refs/heads/{branch}:", "origin", f"{sha}:refs/heads/{branch}")
-        prs = self.api("pulls?" + urlencode({"state": "all", "head": self.repo.split('/')[0] + ':' + branch}))
+        prs = self._request("pulls?" + urlencode({"state": "all", "head": self.repo.split('/')[0] + ':' + branch}), journal)
         if len(prs) > 1:
             raise PromotionError("Delivery branch has ambiguous pull request history")
-        pr = prs[0] if prs else self.api("pulls", {
+        pr = prs[0] if prs else self._request("pulls", journal, {
             "title": self.task.document["title"], "head": branch, "base": self.settings["base_branch"],
             "body": "\n\n".join([
                 self.task.document["goal"],
@@ -136,19 +163,22 @@ class GitHubPromotion:
             ]),
         })
         journal.append("pull_request_published", number=pr["number"], url=pr["html_url"], commit_sha=sha)
-        self.api(f"statuses/{sha}", {"state": "success", "context": "ai-factory/verification",
+        self._request(f"statuses/{sha}", journal, {"state": "success", "context": "ai-factory/verification",
             "description": "Independent executable checks and review passed", "target_url": pr["html_url"]})
         if not self.settings["auto_merge"]:
+            self._check_deadline()
             if pr.get("state") != "open":
                 raise PromotionError("Published pull request is no longer open")
             return {"status": "pr_ready", **candidate, "pull_request_url": pr["html_url"]}
         lock_id = "promotion-" + hashlib.sha256(self.repo.lower().encode()).hexdigest()[:24]
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
         with locks.run_lease(lock_id, ttl_seconds=60, renew_interval_seconds=15) as lease:
-            self._wait_checks(sha)
+            self._wait_checks(sha, journal)
+            journal.append("github_checks_passed", commit_sha=sha)
+            self._check_deadline()
             if self.before_merge is not None:
                 self.before_merge()
-            current = self.api(f"pulls/{pr['number']}")
+            current = self._request(f"pulls/{pr['number']}", journal)
             if current["head"]["sha"] != sha or current["base"]["ref"] != self.settings["base_branch"]:
                 raise PromotionError("Pull request changed after verification")
             remote_base = self._branch_sha(self.settings["base_branch"])
@@ -156,7 +186,9 @@ class GitHubPromotion:
                 if remote_base != base or current["state"] != "open":
                     raise PromotionError("Base branch advanced or pull request closed; verification is stale")
                 lease.heartbeat()
+                self._check_deadline()
                 journal.append("promotion_requested", candidate_sha=sha, expected_base_sha=base, pr_number=pr["number"])
+                self._check_deadline()
                 try:
                     # Parent validation above makes this a fast-forward. The lease is an
                     # atomic compare-and-swap on the tested base, including remote writers.
@@ -167,7 +199,7 @@ class GitHubPromotion:
                     if self._branch_sha(self.settings["base_branch"]) != sha:
                         raise PromotionError("Promotion was rejected or its result is unknown")
             while time.monotonic() < self.deadline:
-                merged = self.api(f"pulls/{pr['number']}")
+                merged = self._request(f"pulls/{pr['number']}", journal)
                 if merged.get("merged"):
                     break
                 if merged["head"]["sha"] != sha:
@@ -178,5 +210,6 @@ class GitHubPromotion:
             if merged["head"]["sha"] != sha or merged.get("merge_commit_sha") != sha:
                 raise PromotionError("Merged commit differs from verified candidate")
             journal.append("merge_confirmed", commit_sha=sha, pr_number=pr["number"])
+            self._check_deadline()
             self.smoke(sha, journal)
             return {"status": "complete", **candidate, "merge_sha": sha, "pull_request_url": pr["html_url"]}
