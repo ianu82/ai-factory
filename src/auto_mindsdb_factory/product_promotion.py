@@ -23,8 +23,10 @@ class PromotionError(RuntimeError):
 
 
 class GitHubPromotion:
+    """Publish a candidate; before_merge() may raise to cancel automatic promotion."""
+
     def __init__(self, profile: ProductProfile, task: ProductTask, target: Path,
-                 store: Path, *, smoke, deadline: float, api=None) -> None:
+                 store: Path, *, smoke, deadline: float, api=None, before_merge=None) -> None:
         self.profile = profile
         self.settings = profile.document
         self.task = task
@@ -33,6 +35,7 @@ class GitHubPromotion:
         self.smoke = smoke
         self.deadline = deadline
         self.api = api or self._api
+        self.before_merge = before_merge
         self.repo = self.settings["repository"]
 
     def _api(self, path: str, body: dict | None = None):
@@ -143,6 +146,8 @@ class GitHubPromotion:
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
         with locks.run_lease(lock_id, ttl_seconds=60, renew_interval_seconds=15) as lease:
             self._wait_checks(sha)
+            if self.before_merge is not None:
+                self.before_merge()
             current = self.api(f"pulls/{pr['number']}")
             if current["head"]["sha"] != sha or current["base"]["ref"] != self.settings["base_branch"]:
                 raise PromotionError("Pull request changed after verification")

@@ -1148,7 +1148,7 @@ class LinearGraphQLClient:
             {"id": team_id},
         )
         team = document.get("team")
-        if not isinstance(team, dict):
+        if not isinstance(team, dict) or team.get("id") != team_id:
             raise LinearGraphQLClientError(
                 f"Linear team '{team_id}' could not be loaded."
             )
