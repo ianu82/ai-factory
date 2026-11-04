@@ -24,6 +24,10 @@ class DeliveryError(RuntimeError):
     pass
 
 
+class VerificationFailed(DeliveryError):
+    """Evidence establishes a defect, rather than an infrastructure failure."""
+
+
 class ProductDelivery:
     def __init__(self, profile: ProductProfile, target_root: Path, store: Path, *,
                  agent_factory: Callable | None = None, sandbox_factory: Callable = DockerSandbox) -> None:
@@ -112,8 +116,10 @@ class ProductDelivery:
                     result = self._command(sandbox, command)
                     journal.append("verification_check", name=name, commit_sha=sha, **result)
                     checks.append({"name": name, **result})
+                if any(check["exit_code"] in {124, 125, 126, 127, 137} for check in checks):
+                    raise DeliveryError("Verification execution was interrupted or unavailable")
                 if any(check["exit_code"] for check in checks):
-                    raise DeliveryError("Independent executable verification failed: " + ", ".join(c["name"] for c in checks if c["exit_code"]))
+                    raise VerificationFailed("Independent executable verification failed: " + ", ".join(c["name"] for c in checks if c["exit_code"]))
                 diff = git(self.target, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, sha, "--")
                 if not diff or len(diff) > 60000:
                     raise DeliveryError("Candidate diff is empty or too large to review")
@@ -122,11 +128,14 @@ class ProductDelivery:
                 report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
             if source_digest(source_files(workspace)) != source_digest(original):
                 raise DeliveryError("Verifier changed candidate source")
+            if report["status"] == "failed":
+                raise VerificationFailed("Independent verifier found blocking defects")
             if report["status"] != "passed":
                 raise DeliveryError("Independent verifier did not approve the candidate")
             return {"commit_sha": sha, "source_sha": source_digest(original), "checks": checks, "report": report}
 
-    def run(self, task: ProductTask, *, promote: Callable | None = None, base_sha: str | None = None) -> dict:
+    def run(self, task: ProductTask, *, promote: Callable | None = None, base_sha: str | None = None,
+            replay: dict | None = None) -> dict:
         task_id = task.document["id"]
         journal = RunJournal(self.store, task_id)
         self.deadline = time.monotonic() + self.settings["max_run_seconds"]
@@ -135,7 +144,8 @@ class ProductDelivery:
             if base_sha is None:
                 git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
                 base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
-            journal.create({"task": task.document, "base_sha": base_sha, "profile": self.settings,
+            journal.create({"purpose": "replay" if replay is not None else "delivery", "replay": replay,
+                            "task": task.document, "base_sha": base_sha, "profile": self.settings,
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):

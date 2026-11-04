@@ -15,6 +15,7 @@ from .connectors import (
     FactoryConnectorError,
 )
 from .cli_parser import build_parser
+from .product_commands import handle_product_command
 from .contracts import main as validate_contracts_main
 from .controller import FactoryController, WorkItem
 from .eval_execution import EvalExecutionError, Stage5EvalPipeline
@@ -138,6 +139,11 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def _load_local_env_files(argv: list[str] | None = None) -> list[Path]:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0].startswith("product-"):
+        # Product source is untrusted. Credentials come from the process or an
+        # explicit controller file, never automatic discovery in the target cwd.
+        return []
     if os.environ.get("AI_FACTORY_SKIP_ENV_FILES") == "1":
         return []
 
@@ -513,6 +519,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    product_result = handle_product_command(args, parse_env=_parse_env_file)
+    if product_result is not None:
+        return product_result
 
     if args.command == "validate-contracts":
         command_argv: list[str] = []
