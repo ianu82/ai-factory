@@ -67,7 +67,7 @@ class RailwayPool:
                 raise self.failure
             if self.workspace != workspace:
                 self._discard()
-                self.id = self.transport({"action": "create"})["id"]
+                self.id = self.transport({"action": "create", "timeout": 300})["id"]
                 self.workspace = workspace
                 self.call({"action": "upload", "source": pack_source(workspace)}, timeout=120)
 
