@@ -225,7 +225,7 @@ class CodeWorkerConnector(Protocol):
 @dataclass(slots=True)
 class CodexCLICodeWorkerConfig:
     codex_bin: str = "codex"
-    model: str = "gpt-5.4"
+    model: str = "gpt-6.1-terra"
     timeout_seconds: int = 1800
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
@@ -238,7 +238,7 @@ class CodexCLICodeWorkerConfig:
     def from_env(cls) -> "CodexCLICodeWorkerConfig":
         return cls(
             codex_bin=os.environ.get("AI_FACTORY_CODE_WORKER_CODEX_BIN", "codex"),
-            model=os.environ.get("AI_FACTORY_CODE_WORKER_MODEL", "gpt-5.4"),
+            model=os.environ.get("AI_FACTORY_CODE_WORKER_MODEL", "gpt-6.1-terra"),
             timeout_seconds=int(os.environ.get("AI_FACTORY_CODE_WORKER_TIMEOUT_SECONDS", "1800")),
             sandbox=os.environ.get("AI_FACTORY_CODE_WORKER_SANDBOX", "workspace-write"),
             approval_policy=os.environ.get("AI_FACTORY_CODE_WORKER_APPROVAL_POLICY", "never"),
@@ -539,7 +539,7 @@ class OpenAIResponsesAgentConfig:
     DEFAULT_BASE_URL = "https://api.openai.com/v1/responses"
 
     api_key: str | None = None
-    model: str = "gpt-5.4"
+    model: str = "gpt-6.1-terra"
     fallback_model: str | None = None
     reasoning_effort: str = "medium"
     max_output_tokens: int = 4000
@@ -567,7 +567,7 @@ class OpenAIResponsesAgentConfig:
         env = os.environ
         return cls(
             api_key=api_key or env.get("OPENAI_API_KEY"),
-            model=model or env.get("AI_FACTORY_OPENAI_MODEL") or "gpt-5.4",
+            model=model or env.get("AI_FACTORY_OPENAI_MODEL") or "gpt-6.1-terra",
             fallback_model=(
                 fallback_model
                 if fallback_model is not None

@@ -73,10 +73,61 @@ def test_openai_config_reads_defaults_from_environment(monkeypatch) -> None:
     config = OpenAIResponsesAgentConfig.from_env()
 
     assert config.api_key == "test-key"
-    assert config.model == "gpt-5.4"
+    assert config.model == "gpt-6.1-terra"
+    assert config.fallback_model is None
     assert config.reasoning_effort == "medium"
     assert config.max_output_tokens == 4000
     assert config.base_url == "https://api.openai.com/v1/responses"
+
+
+def test_model_config_defaults_and_explicit_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("AI_FACTORY_CODE_WORKER_MODEL", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", raising=False)
+
+    assert CodexCLICodeWorkerConfig().model == "gpt-6.1-terra"
+    assert CodexCLICodeWorkerConfig.from_env().model == "gpt-6.1-terra"
+    assert OpenAIResponsesAgentConfig().model == "gpt-6.1-terra"
+    assert OpenAIResponsesAgentConfig().fallback_model is None
+
+    monkeypatch.setenv("AI_FACTORY_CODE_WORKER_MODEL", "worker-override")
+    monkeypatch.setenv("AI_FACTORY_OPENAI_MODEL", "agent-override")
+    monkeypatch.setenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", "fallback-override")
+    assert CodexCLICodeWorkerConfig.from_env().model == "worker-override"
+    assert CodexCLICodeWorkerConfig(model="worker-direct").model == "worker-direct"
+    config = OpenAIResponsesAgentConfig.from_env()
+    assert (config.model, config.fallback_model) == ("agent-override", "fallback-override")
+    config = OpenAIResponsesAgentConfig.from_env(model="agent-direct", fallback_model="fallback-direct")
+    assert (config.model, config.fallback_model) == ("agent-direct", "fallback-direct")
+    assert OpenAIResponsesAgentConfig.from_env(fallback_model="").fallback_model == ""
+    monkeypatch.setenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", "")
+    assert OpenAIResponsesAgentConfig.from_env().fallback_model is None
+
+
+@pytest.mark.parametrize("fallback", [None, "gpt-5.4-mini"])
+def test_openai_fallback_is_opt_in(monkeypatch, fallback) -> None:
+    monkeypatch.delenv("AI_FACTORY_OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", raising=False)
+    config = OpenAIResponsesAgentConfig.from_env(api_key="test-key", fallback_model=fallback)
+    connector = OpenAIResponsesAgentConnector(config)
+    calls = []
+
+    def fake_request(model, task):
+        calls.append(model)
+        if model == "gpt-6.1-terra":
+            raise FactoryConnectorError("primary failed")
+        return {"model": model, "output_text": "{}"}
+
+    monkeypatch.setattr(connector, "_request", fake_request)
+    task = AgentTask(name="test", instructions="test", input_document={}, output_schema={"type": "object"})
+    if fallback is None:
+        with pytest.raises(FactoryConnectorError, match="primary failed"):
+            connector.run_task(task)
+        assert calls == ["gpt-6.1-terra"]
+    else:
+        result = connector.run_task(task)
+        assert calls == ["gpt-6.1-terra", fallback]
+        assert result.model == fallback
 
 
 def test_openai_connector_parses_structured_output() -> None:

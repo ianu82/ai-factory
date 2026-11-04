@@ -1489,7 +1489,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--agent-model",
         default=None,
-        help="Override the OpenAI model id. Defaults to AI_FACTORY_OPENAI_MODEL or gpt-5.4.",
+        help="Override the OpenAI model id. Defaults to AI_FACTORY_OPENAI_MODEL or gpt-6.1-terra.",
     )
     parser.add_argument(
         "--agent-fallback-model",

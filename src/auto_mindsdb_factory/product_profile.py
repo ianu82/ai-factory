@@ -63,7 +63,7 @@ DEFAULTS = {
     "allowed_paths": ["*"],
     "protected_paths": [".git", ".git/**", ".github/**", ".env", ".env.*"],
     "auto_merge": False, "required_status_checks": [],
-    "builder_model": "gpt-5.4", "reviewer_model": "gpt-5.4",
+    "builder_model": "gpt-6.1-terra", "reviewer_model": "gpt-6.1-terra",
     "max_attempts": 2, "max_agent_turns": 25, "max_total_tokens": 200000, "agent_max_output_tokens": 8000,
     "command_timeout_seconds": 300, "max_run_seconds": 1800, "max_changed_lines": 500,
 }

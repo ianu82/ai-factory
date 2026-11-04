@@ -24,6 +24,18 @@ def test_profile_is_resolved_immutable_and_hashes_configuration(profile_document
     assert profile.digest != ProductProfile.from_document(profile_document).digest
 
 
+def test_profile_model_defaults_and_overrides(profile_document):
+    defaults = ProductProfile.from_document(profile_document).document
+    assert defaults["builder_model"] == "gpt-6.1-terra"
+    assert defaults["reviewer_model"] == "gpt-6.1-terra"
+
+    for role in ("builder_model", "reviewer_model"):
+        resolved = ProductProfile.from_document({**profile_document, role: "custom-model"}).document
+        assert resolved[role] == "custom-model"
+        other_role = "reviewer_model" if role == "builder_model" else "builder_model"
+        assert resolved[other_role] == "gpt-6.1-terra"
+
+
 @pytest.mark.parametrize("change", [{"typo": True}, {"image": "python:latest"}, {"checks": {}},
     {"max_attempts": 0}, {"max_attempts": True}, {"base_branch": "../main"},
     {"allowed_paths": ["../secret"]}, {"smoke": []}, {"setup": [[""]]}])

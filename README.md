@@ -106,13 +106,13 @@ Set the environment:
 
 - `export OPENAI_API_KEY=...`
 - `export AI_FACTORY_AGENT_PROVIDER=openai`
-- `export AI_FACTORY_OPENAI_MODEL=gpt-5.4`
-- Optional: `export AI_FACTORY_OPENAI_FALLBACK_MODEL=gpt-5.4-mini`
+- `export AI_FACTORY_OPENAI_MODEL=gpt-6.1-terra`
+- Optional: set `AI_FACTORY_OPENAI_FALLBACK_MODEL` to a model ID to retry failed primary requests; unset by default.
 - Optional: `export AI_FACTORY_OPENAI_REASONING_EFFORT=medium`
 - Optional: `export AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS=4000`
 - Optional: `export AI_FACTORY_OPENAI_TIMEOUT_SECONDS=120`
 - Optional: `export AI_FACTORY_CODE_WORKER_PROVIDER=codex_cli`
-- Optional: `export AI_FACTORY_CODE_WORKER_MODEL=gpt-5.4`
+- Optional: `export AI_FACTORY_CODE_WORKER_MODEL=gpt-6.1-terra`
 - Optional: `export AI_FACTORY_CODE_WORKER_TIMEOUT_SECONDS=1800`
 - Optional: `export AI_FACTORY_AUTONOMY_MODE=pr_ready`
 - Optional: `export AI_FACTORY_INTAKE_PAUSED=false`
