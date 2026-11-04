@@ -708,6 +708,11 @@ class OpenAIResponsesAgentConnector:
             },
         }
 
+        return self.request_response(body)
+
+    def request_response(self, body: dict[str, Any], *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Shared authenticated transport for structured stages and tool sessions."""
+        model = str(body["model"])
         request = Request(
             self.config.base_url,
             data=json.dumps(body).encode("utf-8"),
@@ -715,7 +720,7 @@ class OpenAIResponsesAgentConnector:
             method="POST",
         )
         try:
-            with self.urlopen_impl(request, timeout=self.config.timeout_seconds) as response:
+            with self.urlopen_impl(request, timeout=timeout_seconds or self.config.timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace").strip()
