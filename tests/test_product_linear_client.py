@@ -30,7 +30,12 @@ def client():
 ID = "abcdef01-2345-6789-abcd-ef0123456789"
 
 
-def connection(nodes=None, has_next=False, cursor=None):
+_DEFAULT_CURSOR = object()
+
+
+def connection(nodes=None, has_next=False, cursor=_DEFAULT_CURSOR):
+    if cursor is _DEFAULT_CURSOR:
+        cursor = "terminal" if nodes else None
     return {"issues": {"nodes": nodes if nodes is not None else [],
                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}}}
 
@@ -41,13 +46,13 @@ def test_scoped_filter_and_single_bounded_page(client, route):
     assert client.queued_issue_ids(route, 100) == [ID]
     query, variables = client._execute.call_args.args
     compact = re.sub(r"\s+", "", query)
-    assert "issues(first:$limit,filter:{id:{nin:$excluded},team:{id:{eq:$team}},state:{id:{eq:$state}},labels:{some:{name:{eq:$label}}}})" in compact
-    assert variables == {"team": "team", "state": "queue", "label": 'factory"label', "limit": 100, "excluded": []}
+    assert "issues(first:$limit,after:$after,filter:{id:{nin:$excluded},team:{id:{eq:$team}},state:{id:{eq:$state}},labels:{some:{name:{eq:$label}}}})" in compact
+    assert variables == {"team": "team", "state": "queue", "label": 'factory"label', "limit": 100, "excluded": [], "after": None}
     assert 'factory"label' not in query
     client._execute.assert_called_once()
     client._execute.return_value = connection()
     assert client.queued_issue_ids(route) == []
-    assert client._execute.call_args.args[1]["limit"] == 10
+    assert client._execute.call_args.args[1]["limit"] == 100
     assert client.queued_issue_ids(route, 1) == []
 
 
@@ -236,7 +241,7 @@ def test_known_claims_are_excluded_before_queue_limit(client, route):
     assert client.queued_issue_ids(route, 1, exclude_ids=[ID.upper()]) == []
     query, variables = client._execute.call_args.args
     assert "nin: $excluded" in query
-    assert variables["excluded"] == [ID.lower()] and variables["limit"] == 1
+    assert variables["excluded"] == [ID.lower()] and variables["limit"] == 100
     client._execute.return_value = connection([{"id": ID, "identifier": "ABC-1"}])
     with pytest.raises(LinearGraphQLClientError):
         client.queued_issue_ids(route, 1, exclude_ids=[ID])
@@ -431,3 +436,88 @@ def test_real_http_launch_keeps_credentials_on_stdin(graphql_server, monkeypatch
     assert options['cwd'] == Path(module.__file__).resolve().parents[1]
     assert options['env']['PYTHONPATH'] == str(options['cwd'])
     assert options['env']['PYTHONNOUSERSITE'] == '1'
+def test_queue_pages_past_history_above_server_exclusion_bound(client, route):
+    from uuid import UUID
+    known = [str(UUID(int=i)) for i in range(10001)]
+    client._execute.side_effect = [
+        connection([{"id": known[-1], "identifier": "OLD-1"}], True, "next"),
+        connection([{"id": ID, "identifier": "NEW-1"}]),
+    ]
+    assert client.queued_issue_ids(route, 1, exclude_ids=known) == [ID]
+    variables = [call.args[1] for call in client._execute.call_args_list]
+    assert all(len(v["excluded"]) == 10000 and v["limit"] == 100 for v in variables)
+    assert [v["after"] for v in variables] == [None, "next"]
+
+
+def test_queue_scan_stops_when_provider_repeats_cursor(client, route):
+    from uuid import UUID
+    known = [str(UUID(int=i)) for i in range(10002)]
+    client._execute.side_effect = [connection([{"id": v, "identifier": "OLD"}], True, "same") for v in known[-2:]]
+    with pytest.raises(LinearGraphQLClientError, match="cursor"):
+        client.queued_issue_ids(route, exclude_ids=known)
+    assert client._execute.call_count == 2
+
+
+def test_queue_scan_has_a_time_budget(client, route, monkeypatch):
+    from uuid import UUID
+    known = [str(UUID(int=i)) for i in range(10001)]
+    clock = [0]
+    monkeypatch.setattr("auto_mindsdb_factory.product_linear_client.monotonic", lambda: clock[0])
+    def first_page(*args, **kwargs):
+        clock[0] = 121
+        return connection([{"id": known[-1], "identifier": "OLD"}], True, "next")
+    client._execute.side_effect = first_page
+    with pytest.raises(LinearGraphQLClientError, match="time budget"):
+        client.queued_issue_ids(route, exclude_ids=known)
+    client._execute.assert_called_once()
+
+
+def test_terminal_cursor_repetition_is_not_exhaustion(client, route):
+    from uuid import UUID
+    known = [str(UUID(int=i)) for i in range(10002)]
+    client._execute.side_effect = [connection([{"id": known[-2], "identifier": "OLD"}], True, "same"),
+                                  connection([{"id": known[-1], "identifier": "OLD"}], False, "same")]
+    with pytest.raises(LinearGraphQLClientError, match="cursor"):
+        client.queued_issue_ids(route, exclude_ids=known)
+
+
+@pytest.mark.parametrize("nodes", [[], [{"id": ID, "identifier": "NEW"}]])
+def test_late_terminal_response_cannot_return_work_or_exhaustion(client, route, monkeypatch, nodes):
+    clock = [0]
+    monkeypatch.setattr("auto_mindsdb_factory.product_linear_client.monotonic", lambda: clock[0])
+    def late(*args, **kwargs):
+        assert 0 < kwargs["timeout_seconds"] <= 30
+        clock[0] = 121
+        return connection(nodes)
+    client._execute.side_effect = late
+    with pytest.raises(LinearGraphQLClientError, match="time budget"):
+        client.queued_issue_ids(route)
+
+
+@pytest.mark.parametrize("page", [connection([], True, "fabricated"), connection([], False, "fabricated")])
+def test_contradictory_empty_page_is_not_exhaustion(client, route, page):
+    client._execute.return_value = page
+    with pytest.raises(LinearGraphQLClientError, match="empty"):
+        client.queued_issue_ids(route)
+
+
+def test_real_request_uses_remaining_scan_deadline(graphql_server, route, monkeypatch):
+    import time
+    ticks = iter([0, 115])
+    monkeypatch.setattr("auto_mindsdb_factory.product_linear_client.monotonic", lambda: next(ticks, 115))
+    with graphql_server({}, trickle=True) as (url, requests):
+        product = LinearProductClient(LinearTriggerConfig(target_team_id="team", target_state_id="queue",
+            api_key="fake", graphql_url=url))
+        started = time.monotonic()
+        with pytest.raises(LinearGraphQLClientError, match="time budget"):
+            product.queued_issue_ids(route)
+        assert time.monotonic() - started < 8 and len(requests) == 1
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_nonempty_terminal_page_requires_cursor(client, route, claimed):
+    from uuid import UUID
+    known = [str(UUID(int=i)) for i in range(10000)] + [ID] if claimed else []
+    client._execute.return_value = connection([{"id": ID, "identifier": "ABC-1"}], cursor=None)
+    with pytest.raises(LinearGraphQLClientError, match="connection"):
+        client.queued_issue_ids(route, exclude_ids=known)

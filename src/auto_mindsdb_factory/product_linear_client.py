@@ -9,6 +9,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+from time import monotonic
 from uuid import UUID
 
 from .linear_trigger import LinearGraphQLClient, LinearGraphQLClientError
@@ -83,52 +85,76 @@ class LinearProductClient(LinearGraphQLClient):
 
     def queued_issue_ids(self, route: LinearProductRoute, limit: int = 10,
                          *, exclude_ids: list[str] | None = None) -> list[str]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        """Return unclaimed work, paging past history within a bounded scan time."""
+        if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Linear queue limit must be an integer from 1 to 100")
         excluded = [] if exclude_ids is None else exclude_ids
-        if not isinstance(excluded, list) or len(excluded) > 10000 or any(
+        if not isinstance(excluded, list) or any(
             not isinstance(value, str) or not re.fullmatch(
                 r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) for value in excluded
         ):
-            raise ValueError("Excluded issue IDs must be a bounded list of UUIDs")
+            raise ValueError("Excluded issue IDs must be a list of UUIDs")
         excluded = [str(UUID(value)) for value in excluded]
         if len(excluded) != len(set(excluded)):
             raise ValueError("Excluded issue IDs must be unique")
+        known, server_excluded = set(excluded), excluded[:10000]
         config = route.document
-        data = self._execute(
-            """
-            query ProductLinearQueue($team: ID!, $state: ID!, $label: String!, $limit: Int!, $excluded: [ID!]!) {
-              issues(first: $limit, filter: {id: {nin: $excluded}, team: {id: {eq: $team}},
-                state: {id: {eq: $state}}, labels: {some: {name: {eq: $label}}}}) {
-                nodes { id identifier }
-                pageInfo { hasNextPage endCursor }
-              }
-            }
-            """,
-            {"team": config["team_id"], "state": config["queued_state_id"],
-             "label": config["required_label"], "limit": limit, "excluded": excluded},
-        )
-        connection = data.get("issues") if isinstance(data, dict) else None
-        if not isinstance(connection, dict):
-            raise LinearGraphQLClientError("Invalid Linear issue connection")
-        nodes, page = connection.get("nodes"), connection.get("pageInfo")
-        if (not isinstance(nodes, list) or len(nodes) > limit or not isinstance(page, dict)
-                or not isinstance(page.get("hasNextPage"), bool) or "endCursor" not in page
-                or (page["endCursor"] is not None and
-                    (not isinstance(page["endCursor"], str) or not page["endCursor"].strip()))
-                or (page["hasNextPage"] and not page["endCursor"])):
-            raise LinearGraphQLClientError("Invalid Linear issue connection")
-        ids: list[str] = []
-        for node in nodes:
-            if (not isinstance(node, dict) or not isinstance(node.get("id"), str)
-                    or not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", node["id"])
-                    or not isinstance(node.get("identifier"), str) or not node["identifier"].strip()):
-                raise LinearGraphQLClientError("Invalid Linear issue node")
-            issue_id = str(UUID(node["id"]))
-            if issue_id in ids or issue_id in excluded:
-                raise LinearGraphQLClientError("Duplicate or excluded Linear issue ID")
-            ids.append(issue_id)
-        return ids
+        cursor, cursors, seen = None, {None}, set()
+        deadline = monotonic() + 120
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise LinearGraphQLClientError("Linear queue scan time budget exhausted")
+            data = self._execute(
+                """
+                query ProductLinearQueue($team: ID!, $state: ID!, $label: String!,
+                                         $limit: Int!, $excluded: [ID!]!, $after: String) {
+                  issues(first: $limit, after: $after, filter: {id: {nin: $excluded},
+                    team: {id: {eq: $team}}, state: {id: {eq: $state}},
+                    labels: {some: {name: {eq: $label}}}}) {
+                    nodes { id identifier }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+                """,
+                {"team": config["team_id"], "state": config["queued_state_id"],
+                 "label": config["required_label"], "limit": 100, "excluded": server_excluded, "after": cursor},
+                timeout_seconds=min(30, remaining),
+            )
+            if monotonic() >= deadline:
+                raise LinearGraphQLClientError("Linear queue scan time budget exhausted")
+            connection = data.get("issues") if isinstance(data, dict) else None
+            if not isinstance(connection, dict):
+                raise LinearGraphQLClientError("Invalid Linear issue connection")
+            nodes, page = connection.get("nodes"), connection.get("pageInfo")
+            if (not isinstance(nodes, list) or len(nodes) > 100 or not isinstance(page, dict)
+                    or not isinstance(page.get("hasNextPage"), bool) or "endCursor" not in page
+                    or (page["endCursor"] is not None and
+                        (not isinstance(page["endCursor"], str) or not page["endCursor"].strip()))
+                    or ((nodes or page["hasNextPage"]) and not page["endCursor"])):
+                raise LinearGraphQLClientError("Invalid Linear issue connection")
+            if not nodes and (page["hasNextPage"] or page["endCursor"] is not None):
+                raise LinearGraphQLClientError("Invalid empty Linear queue page")
+            if page["endCursor"] is not None and page["endCursor"] in cursors:
+                raise LinearGraphQLClientError("Repeated Linear queue cursor")
+            ids = []
+            for node in nodes:
+                if (not isinstance(node, dict) or not isinstance(node.get("id"), str)
+                        or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", node["id"])
+                        or not isinstance(node.get("identifier"), str) or not node["identifier"].strip()):
+                    raise LinearGraphQLClientError("Invalid Linear issue node")
+                issue_id = str(UUID(node["id"]))
+                if issue_id in seen or issue_id in server_excluded:
+                    raise LinearGraphQLClientError("Duplicate or server-excluded Linear issue ID")
+                seen.add(issue_id)
+                if issue_id not in known:
+                    ids.append(issue_id)
+            if monotonic() >= deadline:
+                raise LinearGraphQLClientError("Linear queue scan time budget exhausted")
+            if ids or not page["hasNextPage"]:
+                return ids[:limit]
+            cursor = page["endCursor"]
+            cursors.add(cursor)
 
     def create_comment(self, issue_id: str, body: str) -> str:
         # Requirements are frozen: even an Entity not found error must not fall
