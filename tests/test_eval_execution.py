@@ -175,7 +175,7 @@ def test_stage5_eval_execution_surfaces_optional_eval_warnings_without_blocking_
     )
 
 
-def test_stage5_command_gates_run_real_commands_and_defer_unconfigured_checks(tmp_path) -> None:
+def test_stage5_command_gates_run_real_commands_and_block_missing_required_checks(tmp_path) -> None:
     root = Path(__file__).resolve().parents[1]
     stage4_result = stage4_active_result(root)
     runner = CommandGateRunner(
@@ -206,7 +206,8 @@ def test_stage5_command_gates_run_real_commands_and_defer_unconfigured_checks(tm
         for tier in result.eval_report["tiers"]
         for check in tier["checks"]
     }
-    assert summary["merge_gate_passed"] is True
+    assert summary["merge_gate_passed"] is False
+    assert result.work_item.state is ControllerState.PR_REVISION
     assert statuses["unit"] == "passed"
     assert statuses["contract"] == "passed"
     assert "not_configured" in {

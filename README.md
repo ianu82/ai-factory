@@ -166,6 +166,10 @@ Default real gates are:
 
 Configure additional gates with `AI_FACTORY_GATE_LINT_COMMAND`, `AI_FACTORY_GATE_TYPECHECK_COMMAND`, `AI_FACTORY_GATE_INTEGRATION_COMMAND`, and `AI_FACTORY_GATE_MIGRATION_SAFETY_COMMAND`. Checks without real commands are recorded as `not_configured`; later-stage checks are recorded as `deferred` rather than fake-passed.
 
+Production gates run in a fresh detached worktree at the full commit SHA recorded in the PR delivery evidence. The service checkout is never the fallback for a missing candidate. Eval reports record `execution.mode` and the tested `commit_sha`; simulation reports are explicitly labeled and cannot evaluate a delivered PR. Candidate source paths replace inherited Python import paths, and service credentials are removed from the gate environment. Gates still execute local code and require an appropriately restricted execution account.
+
+Every merge-gating check marked `required` must have a real passing command. `AI_FACTORY_REQUIRED_GATE_KINDS` adds mandatory kinds; it does not waive requirements in the manifest. Model and safety gates can use `AI_FACTORY_GATE_LATENCY_COMMAND`, `AI_FACTORY_GATE_COST_COMMAND`, `AI_FACTORY_GATE_LLM_QUALITY_COMMAND`, and `AI_FACTORY_GATE_ADVERSARIAL_COMMAND`. Install or configure each target project's dependencies for these commands before enabling intake.
+
 ## Repository Layout
 
 ```text

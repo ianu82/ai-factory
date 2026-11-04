@@ -171,7 +171,8 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
 
     class _FakeGateRunner:
         @classmethod
-        def from_env(cls, root):
+        def from_env(cls, root, *, require_candidate=False):
+            assert require_candidate is True
             return cls()
 
     class _FakeCoordinator:
@@ -265,7 +266,8 @@ def test_factory_worker_can_use_github_api_repo_connector(monkeypatch, tmp_path)
 
     class _FakeGateRunner:
         @classmethod
-        def from_env(cls, root):
+        def from_env(cls, root, *, require_candidate=False):
+            assert require_candidate is True
             return cls()
 
     class _FakeCoordinator:

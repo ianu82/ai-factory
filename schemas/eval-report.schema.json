@@ -19,6 +19,21 @@
     "summary"
   ],
   "properties": {
+    "execution": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["simulation", "working_tree", "candidate_commit"]},
+        "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "candidate_commit"}}},
+          "then": {"required": ["commit_sha"]}
+        }
+      ],
+      "additionalProperties": false
+    },
     "artifact": {
       "$ref": "common.schema.json#/$defs/artifactMetadataPolicyBound"
     },
