@@ -1,7 +1,9 @@
 # Railway controller and execution
 
-Use one persistent controller replica (2 vCPU / 2 GB maximum) with a 10 GB volume
-mounted at `/data`. Keep serverless off and restart policy Always. No public HTTP
+Use one persistent controller replica (2 vCPU / 2 GB maximum) with a persistent
+volume mounted at `/data`. Production uses Railway's default 50 GB maximum;
+volume billing follows data stored, not that ceiling. Keep serverless off and
+restart policy Always. No public HTTP
 or Docker endpoint is needed: the controller polls Linear every 60 seconds.
 
 Each source export gets a fresh Railway VM, capped at 4 vCPU / 8 GB. Setup and
@@ -20,9 +22,12 @@ existing non-root, digest-pinned, resource-limited Docker policy; network access
 is available only for trusted setup. Source transfers reject links, Git metadata,
 special files, traversal and oversized data. Generated environments stay on VMs.
 
-The Docker image records the exact release commit. Deploy a dedicated release
-branch, not automatic main updates: a factory merge must not restart its own
-controller before smoke and completion evidence are durable. Upgrade only when
+The Docker image records the exact release commit. Disable automatic main
+deployments: a factory merge must not restart its own controller before smoke
+and completion evidence are durable. Production currently uses manual releases
+from `main` with auto deploy disabled. A dedicated release branch is also suitable
+when Railway's branch selector is available. Keep `codex/railway-production` at
+the deployed commit as the release record. Upgrade only when
 the controller is idle. Railway volume locking also excludes a second controller
 process; do not attach another independently writable state store to this route.
 
@@ -31,7 +36,11 @@ a bare target repository at `/data/target`, and writes `/data/status.json`. Befo
 activation, stop the previous controller, copy and verify its complete immutable
 store into `/data/evidence`, and import its retained Git refs from a bundle. Never
 discard old claims or rewrite failed outcomes. Back up the volume and verify a
-restart preserves claims before accepting new work.
+restart preserves claims before accepting new work. Production has daily backups
+retained for six days and weekly backups retained for 27 days. Confirm a completed
+backup before relying on the schedule. Keep the previous controller unloaded,
+including after a Mac login; its disabled launchd plist is retained outside
+`LaunchAgents` for deliberate recovery only.
 
 Activation requires `/data/activation.json` containing exactly the canonical
 `profile_sha` and `route_sha` reported in status. Missing or mismatched activation
