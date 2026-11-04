@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 from uuid import UUID
 
 from .linear_trigger import LinearGraphQLClient, LinearGraphQLClientError
@@ -10,9 +16,65 @@ from .product_linear_intake import LinearProductRoute
 
 
 class LinearProductClient(LinearGraphQLClient):
+    def _execute(self, query, variables, *, timeout_seconds=30):
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+            raise LinearGraphQLClientError("Invalid Linear request time budget")
+        timeout_seconds = min(30, timeout_seconds)
+        config = {key: getattr(self.config, key) for key in
+                  ("target_team_id", "target_state_id", "api_key", "graphql_url")}
+        packet = {"config": config, "query": query, "variables": variables, "timeout_seconds": timeout_seconds}
+        names = {"PATH", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                 "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+        env = {key: value for key, value in os.environ.items() if key in names}
+        env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+                   PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1")
+        try:
+            # The credential travels through stdin, never process arguments or logs.
+            result = subprocess.run([sys.executable, "-m", "auto_mindsdb_factory.product_linear_http"],
+                input=json.dumps(packet), capture_output=True, text=True, timeout=timeout_seconds, env=env,
+                cwd=Path(__file__).resolve().parents[1])
+        except subprocess.TimeoutExpired:
+            raise LinearGraphQLClientError("Linear request exceeded its time budget") from None
+        except OSError:
+            raise LinearGraphQLClientError("Linear request process unavailable") from None
+        try:
+            payload = json.loads(result.stdout)
+            if result.returncode or not isinstance(payload, dict) or set(payload) != {"data"} or not isinstance(payload["data"], dict):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise LinearGraphQLClientError("Linear GraphQL request failed") from None
+        return payload["data"]
+
+    def _decode_response(self, raw):
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate JSON object key")
+                result[key] = value
+            return result
+        result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+        pending = [result]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+            elif isinstance(value, str):
+                value.encode("utf-8")
+            elif isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("Non-finite JSON number")
+        return result
+
     def _validate_envelope(self, payload):
         if not isinstance(payload, dict):
             raise LinearGraphQLClientError("Linear response must be an object")
+        if (set(payload) - {"data", "errors", "extensions"}
+                or ("extensions" in payload and not isinstance(payload["extensions"], dict))):
+            raise LinearGraphQLClientError("Invalid Linear GraphQL response envelope")
         if "errors" in payload and (not isinstance(payload["errors"], list) or not payload["errors"]):
             raise LinearGraphQLClientError("Invalid Linear GraphQL errors envelope")
 

@@ -1328,11 +1328,15 @@ class LinearGraphQLClient:
             "state": _optional_entity(issue.get("state")),
         }
 
+    def _decode_response(self, raw: bytes) -> Any:
+        return json.loads(raw.decode("utf-8"))
+
     def _validate_envelope(self, payload: Any) -> None:
         """Subclass hook; retain the legacy transport response semantics."""
         pass
 
-    def _execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def _execute(self, query: str, variables: dict[str, Any], *, timeout_seconds: float = 30,
+                 max_response_bytes: int | None = None) -> dict[str, Any]:
         request_payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
         request = urllib_request.Request(
             self.config.graphql_url,
@@ -1344,10 +1348,22 @@ class LinearGraphQLClient:
             },
         )
         try:
-            with urllib_request.urlopen(request, timeout=30) as response:
-                raw = response.read()
+            with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
+                raw = response.read() if max_response_bytes is None else response.read(max_response_bytes + 1)
+                if max_response_bytes is not None and len(raw) > max_response_bytes:
+                    raise LinearGraphQLClientError("Linear response exceeded its size limit")
+                if max_response_bytes is not None:
+                    content_type = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+                    transfer = response.getheader("Transfer-Encoding")
+                    length = response.getheader("Content-Length")
+                    if (response.status != 200 or content_type not in {"application/json", "application/graphql-response+json"}
+                            or (response.getheader("Content-Encoding") or "identity").lower() != "identity"
+                            or (transfer is not None and (transfer.lower().strip() != "chunked" or length is not None))):
+                        raise LinearGraphQLClientError("Invalid product Linear HTTP response")
+                    if length is not None and (not re.fullmatch(r"[0-9]+", length) or int(length) != len(raw)):
+                        raise LinearGraphQLClientError("Incomplete or invalid Linear response length")
         except urllib_error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            body = (exc.read() if max_response_bytes is None else exc.read(max_response_bytes)).decode("utf-8", errors="replace")
             raise LinearGraphQLClientError(
                 f"Linear GraphQL request failed with HTTP {exc.code}: {body}"
             ) from exc
@@ -1356,7 +1372,7 @@ class LinearGraphQLClient:
                 f"Linear GraphQL request failed: {exc}"
             ) from exc
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = self._decode_response(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise LinearGraphQLClientError(
                 "Linear GraphQL response was not valid JSON."
