@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 from jsonschema import ValidationError as JSONSchemaValidationError
 from jsonschema import validate as validate_jsonschema
 
+from .execution_account import ExecutionAccount, ExecutionAccountError
 from .intake import normalize_whitespace, slugify, utc_now
 
 
@@ -278,6 +279,9 @@ class CodexCLICodeWorkerConnector:
         self.config = config or CodexCLICodeWorkerConfig.from_env()
         self.subprocess_run = subprocess_run
         self.ownership_run = ownership_run
+        self.execution_account = ExecutionAccount(
+            self.config.run_as_user, sudo_bin=self.config.sudo_bin, ownership_run=ownership_run,
+        )
 
     def run_code_worker(self, job: CodeWorkerJob) -> CodeWorkerResult:
         started_at = utc_now()
@@ -358,59 +362,19 @@ class CodexCLICodeWorkerConnector:
         return env
 
     def _execution_command(self, command: list[str]) -> list[str]:
-        if not self.config.run_as_user:
-            return command
-        return [
-            self.config.sudo_bin,
-            "-H",
-            "-u",
-            self.config.run_as_user,
-            "--",
-            *command,
-        ]
+        return self.execution_account.command(command)
 
     def _prepare_worktree_owner(self, job: CodeWorkerJob) -> bool:
-        if not self.config.run_as_user:
-            return False
-        self._run_ownership_command(
-            [
-                self.config.sudo_bin,
-                "chown",
-                "-R",
-                self.config.run_as_user,
-                str(job.worktree_path.parent),
-            ],
-            action="prepare worktree for code worker user",
-        )
-        return True
+        try:
+            return self.execution_account.prepare_directory(job.worktree_path.parent)
+        except ExecutionAccountError as exc:
+            raise FactoryConnectorError(f"Could not prepare worktree for code worker: {exc}") from exc
 
     def _restore_worktree_owner(self, job: CodeWorkerJob) -> None:
-        owner = f"{os.getuid()}:{os.getgid()}"
-        self._run_ownership_command(
-            [
-                self.config.sudo_bin,
-                "chown",
-                "-R",
-                owner,
-                str(job.worktree_path.parent),
-            ],
-            action="restore worktree ownership to orchestrator user",
-        )
-
-    def _run_ownership_command(self, command: list[str], *, action: str) -> None:
         try:
-            completed = self.ownership_run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise FactoryConnectorError(f"Could not {action}: {exc}") from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
-            raise FactoryConnectorError(f"Could not {action}: {detail}")
+            self.execution_account.restore_directory(job.worktree_path.parent)
+        except ExecutionAccountError as exc:
+            raise FactoryConnectorError(f"Could not restore worktree ownership: {exc}") from exc
 
 
 _SECRET_VALUE_PATTERN = re.compile(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from auto_mindsdb_factory.command_gates import CommandGateError, CommandGateRunn
 from auto_mindsdb_factory.controller import ControllerState, WorkItem
 from auto_mindsdb_factory.connectors import FactoryConnectorError, GitHubCLIRepoConnector
 from auto_mindsdb_factory.eval_execution import EvalExecutionError, Stage5EvalPipeline
+from auto_mindsdb_factory.execution_account import ExecutionAccount
 
 
 def git(repo: Path, *args: str) -> str:
@@ -136,3 +138,50 @@ def test_code_review_refuses_partial_evidence(candidate_repo, monkeypatch):
     monkeypatch.setattr(connector, "_git_stdout", lambda args: "x" * 60001)
     with pytest.raises(FactoryConnectorError, match="split the work"):
         connector.read_candidate_diff(candidate_repo[2])
+
+
+def test_production_gates_use_restricted_account_and_restore_ownership(candidate_repo, monkeypatch):
+    repo, _, sha = candidate_repo
+    ownership = []
+    executed = []
+    original_run = subprocess.run
+
+    def chown(command, **kwargs):
+        ownership.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def run(command, **kwargs):
+        if command[0] == "sudo":
+            executed.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "service-secret")
+    monkeypatch.setattr("auto_mindsdb_factory.command_gates.subprocess.run", run)
+    account = ExecutionAccount("factory-gates", ownership_run=chown)
+    runner = CommandGateRunner(repo, execution_account=account)
+    with runner.for_pr({"delivery_evidence": {"commit_sha": sha}}) as scoped:
+        result = scoped.run_check({"kind": "unit", "timeout_minutes": 1})
+        workspace = scoped.repo_root
+    assert result.status == "passed"
+    command, kwargs = executed[0]
+    assert command[:6] == ["sudo", "-H", "-u", "factory-gates", "--", "env"]
+    assert command[6].startswith(f"PYTHONPATH={workspace}/src")
+    assert "OPENAI_API_KEY" not in kwargs["env"]
+    assert ownership[0][3] == "factory-gates"
+    assert ownership[-1][3] == f"{os.getuid()}:{os.getgid()}"
+    assert not workspace.exists()
+
+
+def test_production_gate_account_is_required_and_explicit_override_is_respected(candidate_repo, monkeypatch):
+    monkeypatch.delenv("AI_FACTORY_GATE_RUN_AS_USER", raising=False)
+    monkeypatch.delenv("AI_FACTORY_CODE_WORKER_RUN_AS_USER", raising=False)
+    with pytest.raises(CommandGateError, match="Production gates require"):
+        CommandGateRunner.from_env(candidate_repo[0], require_candidate=True)
+    monkeypatch.setenv("AI_FACTORY_CODE_WORKER_RUN_AS_USER", "code-worker")
+    assert CommandGateRunner.from_env(candidate_repo[0], require_candidate=True).execution_account.user == "code-worker"
+    monkeypatch.setenv("AI_FACTORY_GATE_RUN_AS_USER", "dedicated-gates")
+    assert CommandGateRunner.from_env(candidate_repo[0], require_candidate=True).execution_account.user == "dedicated-gates"
+    monkeypatch.setenv("AI_FACTORY_GATE_RUN_AS_USER", str(os.getuid()))
+    with pytest.raises(CommandGateError, match="distinct from the orchestrator"):
+        CommandGateRunner.from_env(candidate_repo[0], require_candidate=True)
