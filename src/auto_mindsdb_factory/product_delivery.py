@@ -29,6 +29,12 @@ class VerificationFailed(DeliveryError):
     """Evidence establishes a defect, rather than an infrastructure failure."""
 
 
+def _report_feedback(report: dict) -> str:
+    details = {"summary": report["summary"], "findings": report["findings"],
+        "criteria": [criterion for criterion in report["criteria"] if criterion["status"] != "passed"]}
+    return json.dumps(details)[:8000]
+
+
 class ProductDelivery:
     def __init__(self, profile: ProductProfile, target_root: Path, store: Path, *,
                  agent_factory: Callable | None = None, sandbox_factory: Callable = DockerSandbox) -> None:
@@ -139,11 +145,9 @@ class ProductDelivery:
             if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
                 raise DeliveryError("Verifier changed candidate source")
             if report["status"] == "failed":
-                details = {"summary": report["summary"], "findings": report["findings"],
-                    "criteria": [criterion for criterion in report["criteria"] if criterion["status"] != "passed"]}
-                raise VerificationFailed("Independent verifier found blocking defects: " + json.dumps(details)[:8000])
+                raise VerificationFailed("Independent verifier found blocking defects: " + _report_feedback(report))
             if report["status"] != "passed":
-                raise DeliveryError("Independent verifier did not approve the candidate")
+                raise DeliveryError("Independent verifier left the candidate unverified: " + _report_feedback(report))
             return {"commit_sha": sha, "source_sha": source_digest(original, original_executables), "checks": checks, "report": report}
 
     def run(self, task: ProductTask, *, promote: Callable | None = None, base_sha: str | None = None,
@@ -178,7 +182,7 @@ class ProductDelivery:
                                 with self.sandbox_factory(workspace, self.settings["image"], writable=True, platform=self.settings["platform"]) as sandbox:
                                     report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
                                 if report["status"] != "passed":
-                                    raise DeliveryError("Builder did not complete the task")
+                                    raise DeliveryError("Builder did not complete the task: " + _report_feedback(report))
                                 modified = source_files(workspace)
                                 sha, paths = self._commit(task, base_sha, original, modified, attempt,
                                     original_executables, executable_paths(workspace, modified))

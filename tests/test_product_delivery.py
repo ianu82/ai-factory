@@ -25,7 +25,8 @@ def test_real_agent_factory_respects_builder_and_reviewer_configuration(tmp_path
     assert verifier.connector.config.max_output_tokens == 9000
 
 
-def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monkeypatch):
+@pytest.mark.parametrize("verdict", ["failed", "unverified"])
+def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monkeypatch, verdict):
     import auto_mindsdb_factory.product_delivery as module
     delivery = object.__new__(ProductDelivery)
     delivery.settings = {"checks": {"unit": ["true"]}, "image": "unused", "platform": "linux/amd64"}
@@ -44,13 +45,13 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
     class Verifier:
         def run(self, *args):
             assert args[1]["prior_attempt_feedback"] == "earlier unresolved finding"
-            return {"status": "failed", "summary": "Rounding needs clarification", "findings": ["Reproduce 99.99 times 0.5"],
-                "criteria": [{"id": "rounding", "status": "failed", "evidence": "Observed 50; task requested exact legacy output"}]}
+            return {"status": verdict, "summary": "Rounding needs clarification", "findings": ["Reproduce 99.99 times 0.5"],
+                "criteria": [{"id": "rounding", "status": verdict, "evidence": "Observed 50; task requested exact legacy output"}]}
     delivery.agent_factory = lambda *args: Verifier()
     monkeypatch.setattr(module, "git", lambda *args: "candidate diff")
     task = ProductTask.from_document({"id": "task", "title": "Fix", "goal": "fix", "acceptance_criteria": [
         {"id": "rounding", "description": "round consistently", "command": ["true"]}]})
-    with pytest.raises(module.VerificationFailed) as error:
+    with pytest.raises(module.DeliveryError) as error:
         delivery.verify(task, "a" * 40, "b" * 40, RunJournal(tmp_path, "revision"), prior_feedback="earlier unresolved finding")
     assert "99.99 times 0.5" in str(error.value)
     assert "rounding" in str(error.value)
