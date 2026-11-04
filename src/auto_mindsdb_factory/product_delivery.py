@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -138,7 +139,9 @@ class ProductDelivery:
             if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
                 raise DeliveryError("Verifier changed candidate source")
             if report["status"] == "failed":
-                raise VerificationFailed("Independent verifier found blocking defects")
+                details = {"summary": report["summary"], "findings": report["findings"],
+                    "criteria": [criterion for criterion in report["criteria"] if criterion["status"] != "passed"]}
+                raise VerificationFailed("Independent verifier found blocking defects: " + json.dumps(details)[:8000])
             if report["status"] != "passed":
                 raise DeliveryError("Independent verifier did not approve the candidate")
             return {"commit_sha": sha, "source_sha": source_digest(original, original_executables), "checks": checks, "report": report}
