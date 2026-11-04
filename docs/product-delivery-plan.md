@@ -92,3 +92,13 @@ and corrective events, and completion latency p50/p90 with sample counts. Infere
 cost per accepted item includes unsuccessful delivery attempts. Replay and
 improvement work are separate. Missing cost coverage yields an unknown total,
 with the known subtotal retained; external human work is never inferred to be zero.
+
+`product-improvements` groups established verification failures or model transport
+failures across distinct delivery work items. Defaults require three work items,
+produce at most three investigation proposals, and impose a 24-hour cooldown.
+Previously covered evidence is deduplicated. Replays and tasks with
+`origin: improvement` are excluded, preventing recursive observation. This command
+does not invoke models, change code, schedule itself or adopt proposals. Proposed
+fixes must acquire independent regression criteria and pass the normal delivery
+and repeated replay process. Per-role models are explicit profile choices; adaptive
+routing requires evidence and is not enabled by these proposals.
