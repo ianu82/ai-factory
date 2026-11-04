@@ -2,7 +2,17 @@ import subprocess
 
 import pytest
 
-from auto_mindsdb_factory.product_workspace import WorkspaceError, export_source, source_files, source_digest
+from auto_mindsdb_factory.product_workspace import WorkspaceError, export_source, is_git_metadata_path, source_files, source_digest
+
+
+@pytest.mark.parametrize("name", [".GiT", ".git.", ".git ", ".g\u200cit", ".g\u0301it", ".git:stream"])
+def test_metadata_aliases_cannot_enter_a_trusted_checkout(tmp_path, name):
+    assert is_git_metadata_path("nested/" + name + "/config")
+    (tmp_path / name).write_text("gitdir: /outside")
+    with pytest.raises(WorkspaceError, match="Git metadata"):
+        source_files(tmp_path)
+    assert not is_git_metadata_path(".gitignore")
+    assert not is_git_metadata_path(".gitattributes")
 
 
 def test_export_uses_commit_without_git_metadata_or_uncommitted_changes(tmp_path):

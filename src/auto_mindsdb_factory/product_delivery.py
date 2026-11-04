@@ -16,7 +16,7 @@ from .intake import repo_root
 from .product_agent import ProductAgent, AgentSessionError
 from .product_profile import ProductProfile
 from .product_task import ProductTask
-from .product_workspace import controller_worktree, executable_paths, export_source, git, source_files, source_digest, WorkspaceError
+from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
 from .run_journal import RunJournal
 
@@ -91,6 +91,8 @@ class ProductDelivery:
         if not paths:
             raise DeliveryError("Builder produced no source changes")
         for path in paths:
+            if is_git_metadata_path(path):
+                raise DeliveryError("Candidate cannot change Git metadata or its portability aliases")
             if (not any(fnmatch.fnmatchcase(path, pattern) for pattern in self.settings["allowed_paths"])
                     or any(fnmatch.fnmatchcase(path, pattern) for pattern in self.settings["protected_paths"])):
                 raise DeliveryError(f"Candidate changed a path outside its permitted scope: {path}")

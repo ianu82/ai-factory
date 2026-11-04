@@ -36,12 +36,14 @@ added before another live run. Accepted-work cost includes this unsuccessful wor
 
 ## Validation boundaries
 
-The factory suite contains 333 tests. The standard suite passes with five
+The factory suite contains 340 tests. The standard suite passes with five
 Docker-dependent cases skipped, and the separate Docker job covers those cases.
 Real-container checks include credential/socket exclusion, blocked networking,
 read-only source, timeout cleanup, incorrect-candidate rejection, scope rejection
 and executable-bit preservation. Transaction tests exercise stale heads, stale
 bases, a real concurrent Git-ref update and post-merge smoke failure.
+Import and commit boundaries also reject case/Unicode portability aliases of Git
+metadata, protecting the controller's worktree on case-insensitive filesystems.
 
 The product had unrelated pre-existing full-application type errors. The accepted
 task explicitly scoped its typecheck to the changed module and imported types.
