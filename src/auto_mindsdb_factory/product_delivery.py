@@ -113,7 +113,7 @@ class ProductDelivery:
             git(self.target, "update-ref", f"refs/factory/{task.document['id']}/attempt-{attempt}", sha)
             return sha, paths
 
-    def verify(self, task: ProductTask, sha: str, base: str, journal: RunJournal) -> dict:
+    def verify(self, task: ProductTask, sha: str, base: str, journal: RunJournal, *, prior_feedback: str = "") -> dict:
         with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
@@ -134,7 +134,7 @@ class ProductDelivery:
                 if not diff or len(diff) > 60000:
                     raise DeliveryError("Candidate diff is empty or too large to review")
                 context = {**task.public_context, "base_sha": base, "candidate_sha": sha, "diff": diff,
-                           "required_checks": self.settings["checks"]}
+                           "required_checks": self.settings["checks"], "prior_attempt_feedback": prior_feedback}
                 report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
             if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
                 raise DeliveryError("Verifier changed candidate source")
@@ -183,7 +183,7 @@ class ProductDelivery:
                                 sha, paths = self._commit(task, base_sha, original, modified, attempt,
                                     original_executables, executable_paths(workspace, modified))
                             journal.append("candidate_created", attempt=attempt, commit_sha=sha, changed_paths=paths)
-                            verification = self.verify(task, sha, base_sha, journal)
+                            verification = self.verify(task, sha, base_sha, journal, prior_feedback=feedback)
                             journal.append("candidate_verified", attempt=attempt, **verification)
                         except Exception as exc:
                             # No service secrets are sent to candidate commands; avoid storing provider error bodies.

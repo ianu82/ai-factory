@@ -43,6 +43,7 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
     delivery._command = lambda sandbox, command: {"command": command, "exit_code": 0}
     class Verifier:
         def run(self, *args):
+            assert args[1]["prior_attempt_feedback"] == "earlier unresolved finding"
             return {"status": "failed", "summary": "Rounding needs clarification", "findings": ["Reproduce 99.99 times 0.5"],
                 "criteria": [{"id": "rounding", "status": "failed", "evidence": "Observed 50; task requested exact legacy output"}]}
     delivery.agent_factory = lambda *args: Verifier()
@@ -50,7 +51,7 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
     task = ProductTask.from_document({"id": "task", "title": "Fix", "goal": "fix", "acceptance_criteria": [
         {"id": "rounding", "description": "round consistently", "command": ["true"]}]})
     with pytest.raises(module.VerificationFailed) as error:
-        delivery.verify(task, "a" * 40, "b" * 40, RunJournal(tmp_path, "revision"))
+        delivery.verify(task, "a" * 40, "b" * 40, RunJournal(tmp_path, "revision"), prior_feedback="earlier unresolved finding")
     assert "99.99 times 0.5" in str(error.value)
     assert "rounding" in str(error.value)
     assert "Observed 50" in str(error.value)

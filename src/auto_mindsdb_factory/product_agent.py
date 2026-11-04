@@ -63,7 +63,12 @@ class ProductAgent:
         if role == "builder":
             instructions += "Implement the smallest complete change and regression tests. You may edit source. Do not create Git metadata. Run the relevant checks."
         elif role == "verifier":
-            instructions += "Independently investigate the candidate against requirements and regressions. Your source checkout is read-only. Run relevant validation yourself. Material unresolved findings block a passed report."
+            instructions += (
+                "Independently investigate the candidate against requirements and regressions. Your source checkout is read-only. "
+                "Run relevant validation yourself. Address prior_attempt_feedback explicitly against the unchanged acceptance criteria "
+                "and current candidate. Report unresolved requirement ambiguity as unverified. "
+                "Material unresolved findings block a passed report."
+            )
         else:
             raise AgentSessionError("Unknown product agent role")
         items: list[dict] = [{"role": "user", "content": json.dumps(context)}]
