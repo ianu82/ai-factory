@@ -129,7 +129,7 @@ def handle_product_command(args, *, parse_env) -> int | None:
                 worker = LinearProductWorker(profile, args.target_root, args.store_dir, route, client, **options)
                 while True:
                     results = worker.run_cycle(max_issues=args.max_issues)
-                    print(json.dumps({"results": results}), flush=True)
+                    print(json.dumps({"runner": args.runner, "results": results}), flush=True)
                     if args.once:
                         blocked = any(item.get("status") in {"blocked", "pending", "conflict"} for item in results)
                         return 1 if blocked else 0

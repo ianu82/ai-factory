@@ -156,10 +156,12 @@ def test_linear_once_routes_trusted_config_and_credentials(linear_cli, tmp_path,
     assert calls[1][2:4] == (target, tmp_path / "store")
     assert calls[1][4].document["required_label"] == "factory"
     assert calls[2:] == [("cycle", 3)]
-    assert json.loads(capsys.readouterr().out)["results"][0]["status"] == "complete"
+    assert json.loads(capsys.readouterr().out) == {
+        "runner": "docker", "results": [{"issue_id": "issue", "status": "complete"}],
+    }
 
 
-def test_linear_railway_runner_requires_explicit_selection(linear_cli, monkeypatch):
+def test_linear_railway_runner_requires_explicit_selection(linear_cli, monkeypatch, capsys):
     from auto_mindsdb_factory.railway_runner import RailwayDelivery
     argv, calls, _, _, _ = linear_cli
     monkeypatch.setenv("LINEAR_API_KEY", "key")
@@ -172,6 +174,57 @@ def test_linear_railway_runner_requires_explicit_selection(linear_cli, monkeypat
     monkeypatch.setattr(product_commands, "LinearProductWorker", Worker)
     assert main(argv + ["--runner", "railway", "--once"]) == 0
     assert selected == [RailwayDelivery]
+    assert json.loads(capsys.readouterr().out) == {"runner": "railway", "results": []}
+
+
+@pytest.mark.parametrize("runner_args,runner", [([], "docker"), (["--runner", "railway"], "railway")])
+def test_linear_continuous_reports_each_cycle(linear_cli, monkeypatch, capsys, runner_args, runner):
+    argv, calls, _, _, _ = linear_cli
+    monkeypatch.setenv("LINEAR_API_KEY", "secret-key")
+    cycle_results = iter([[{"issue_id": "first", "status": "complete"}],
+                          [{"issue_id": "second", "status": "blocked"}]])
+    sleeps = []
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run_cycle(self, max_issues):
+            calls.append(("cycle", max_issues))
+            return next(cycle_results)
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(product_commands, "LinearProductWorker", Worker)
+    monkeypatch.setattr(product_commands.time, "sleep", sleep)
+    assert main(argv + runner_args + ["--poll-seconds", "5", "--max-issues", "3"]) == 0
+    assert calls[1:] == [("cycle", 3), ("cycle", 3)]
+    assert sleeps == [5, 5]
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {"runner": runner, "results": [{"issue_id": "first", "status": "complete"}]},
+        {"runner": runner, "results": [{"issue_id": "second", "status": "blocked"}]},
+    ]
+
+
+@pytest.mark.parametrize("status", ["blocked", "pending", "conflict"])
+def test_linear_once_preserves_blocked_exit_code(linear_cli, monkeypatch, capsys, status):
+    argv, _, _, _, _ = linear_cli
+    monkeypatch.setenv("LINEAR_API_KEY", "secret-key")
+    results = [{"issue_id": "issue", "status": status, "reason": "inspect evidence"}]
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run_cycle(self, max_issues):
+            return results
+
+    monkeypatch.setattr(product_commands, "LinearProductWorker", Worker)
+    assert main(argv + ["--once"]) == 1
+    assert json.loads(capsys.readouterr().out) == {"runner": "docker", "results": results}
 
 
 def test_linear_process_credential_wins_and_target_env_never_loaded(linear_cli, tmp_path, monkeypatch):
@@ -268,7 +321,9 @@ def test_linear_poller_sleeps_and_interrupts_cleanly(linear_cli, monkeypatch, ca
     assert main(argv + ["--poll-seconds", "5"]) == 0
     assert calls[-1] == ("cycle", 1)
     assert delays == [5]
-    assert json.loads(capsys.readouterr().out)["results"][0]["status"] == "complete"
+    assert json.loads(capsys.readouterr().out) == {
+        "runner": "docker", "results": [{"issue_id": "issue", "status": "complete"}],
+    }
 
 
 def test_linear_key_is_not_imported_by_other_product_commands(linear_cli, tmp_path, monkeypatch):
