@@ -1,5 +1,9 @@
 import json
 import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -7,6 +11,76 @@ from auto_mindsdb_factory import product_commands
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.__main__ import _load_local_env_files, main
 from auto_mindsdb_factory.run_journal import RunJournal
+
+
+@pytest.fixture
+def validation_checkout():
+    # Keep Git metadata out of the exported source tree, even with --basetemp.
+    with tempfile.TemporaryDirectory(prefix="product-validate-", dir="/tmp") as directory:
+        root = Path(directory)
+        target = root / "target"
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
+                        "git@github.com:owner/product.git"], check=True)
+        yield root, target
+
+
+def run_product_validate(profile, target):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    return subprocess.run(
+        [sys.executable, "-m", "auto_mindsdb_factory", "product-validate",
+         "--profile", str(profile), "--target-root", str(target)],
+        cwd=target, env=env, capture_output=True, text=True,
+    )
+
+
+@pytest.mark.parametrize("overrides,builder,reviewer", [
+    ({}, "gpt-6.1-terra", "gpt-6.1-terra"),
+    ({"builder_model": "custom-builder"}, "custom-builder", "gpt-6.1-terra"),
+    ({"reviewer_model": "custom-reviewer"}, "gpt-6.1-terra", "custom-reviewer"),
+    ({"builder_model": "custom-builder", "reviewer_model": "custom-reviewer"},
+     "custom-builder", "custom-reviewer"),
+])
+def test_product_validate_reports_effective_models(validation_checkout, overrides, builder, reviewer):
+    root, target = validation_checkout
+    document = {
+        "version": 1, "name": "example", "repository": "Owner/Product",
+        "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["pytest"]},
+        "smoke": [["true"]], **overrides,
+    }
+    profile_path = root / "profile.json"
+    profile_path.write_text(json.dumps(document))
+    expected_profile = ProductProfile.from_document(document)
+
+    result = run_product_validate(profile_path, target)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "status": "valid", "profile_sha": expected_profile.digest,
+        "repository": "Owner/Product", "builder_model": builder, "reviewer_model": reviewer,
+    }
+
+
+def test_product_validate_still_checks_origin_and_external_profile(validation_checkout):
+    root, target = validation_checkout
+    document = {
+        "version": 1, "name": "example", "repository": "owner/other",
+        "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["pytest"]},
+        "smoke": [["true"]],
+    }
+    external_profile = root / "profile.json"
+    external_profile.write_text(json.dumps(document))
+    result = run_product_validate(external_profile, target)
+    assert result.returncode == 1
+    assert "origin does not match" in result.stderr
+
+    document["repository"] = "owner/product"
+    internal_profile = target / "profile.json"
+    internal_profile.write_text(json.dumps(document))
+    result = run_product_validate(internal_profile, target)
+    assert result.returncode == 1
+    assert "outside the candidate repository" in result.stderr
 
 
 def test_product_commands_do_not_load_target_env_files(tmp_path, monkeypatch):

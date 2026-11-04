@@ -130,7 +130,9 @@ def handle_product_command(args, *, parse_env) -> int | None:
                         return 1 if blocked else 0
                     time.sleep(args.poll_seconds)
             if args.command == "product-validate":
-                result = {"status": "valid", "profile_sha": profile.digest, "repository": profile.document["repository"]}
+                document = profile.document
+                result = {"status": "valid", "profile_sha": profile.digest, "repository": document["repository"],
+                          "builder_model": document["builder_model"], "reviewer_model": document["reviewer_model"]}
             elif args.command == "product-replay":
                 result = run_suite(profile, args.target_root, args.store_dir, args.suite, repetitions=args.repetitions)
             else:
