@@ -34,3 +34,16 @@ jobs:
 
       - name: Run tests
         run: timeout 300 uv run --locked pytest -q
+
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      AI_FACTORY_TEST_IMAGE: node@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+      - run: docker pull "$AI_FACTORY_TEST_IMAGE"
+      - run: uv run --locked --extra dev pytest -q tests/test_docker_runner.py
