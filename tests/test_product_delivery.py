@@ -10,6 +10,14 @@ from auto_mindsdb_factory.product_workspace import git
 from auto_mindsdb_factory.run_journal import RunJournal
 
 
+def test_commit_boundary_rejects_metadata_alias_before_git_operations(tmp_path):
+    delivery = object.__new__(ProductDelivery)
+    delivery.settings = {"allowed_paths": ["*"], "protected_paths": []}
+    delivery.target = tmp_path / "not-a-repository"
+    with pytest.raises(DeliveryError, match="Git metadata"):
+        delivery._commit(None, "a" * 40, {}, {".GiT": b"gitdir: /outside"}, 1, set(), set())
+
+
 def test_real_agent_factory_respects_builder_and_reviewer_configuration(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-only-no-request")
     monkeypatch.delenv("AI_FACTORY_OPENAI_FALLBACK_MODEL", raising=False)

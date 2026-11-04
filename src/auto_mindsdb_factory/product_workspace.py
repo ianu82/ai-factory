@@ -8,12 +8,24 @@ import re
 import stat
 import subprocess
 import tempfile
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+def is_git_metadata_path(path: str) -> bool:
+    """Reserve Git metadata names and conservative portability aliases."""
+    for part in PurePosixPath(path).parts:
+        normalized = unicodedata.normalize("NFKD", part).casefold()
+        normalized = "".join(char for char in normalized if unicodedata.category(char) not in {"Cf", "Mn"})
+        normalized = normalized.rstrip(" .")
+        if normalized == ".git" or normalized.startswith(".git:"):
+            return True
+    return False
 
 
 def git(root: Path, *args: str) -> str:
@@ -55,7 +67,7 @@ def export_source(repository: Path, commit: str, destination: Path) -> None:
         mode, kind, oid, size_raw = header.split()
         path = PurePosixPath(name.decode("utf-8"))
         if (mode not in {b"100644", b"100755"} or kind != b"blob" or path.is_absolute()
-                or ".." in path.parts or ".git" in path.parts
+                or ".." in path.parts or is_git_metadata_path(str(path))
                 or any(part in GENERATED_DIRECTORIES for part in path.parts)):
             raise WorkspaceError("Source contains an unsupported path, tracked cache, link or submodule")
         size = int(size_raw)
@@ -100,12 +112,12 @@ def source_files(root: Path) -> dict[str, bytes]:
             if name in GENERATED_DIRECTORIES:
                 dirs.remove(name)
                 continue
-            if path.is_symlink() or name == ".git":
+            if path.is_symlink() or is_git_metadata_path(name):
                 raise WorkspaceError("Candidate contains a link or Git metadata")
         for name in names:
             path = Path(directory) / name
             mode = path.lstat().st_mode
-            if not stat.S_ISREG(mode) or name == ".git":
+            if not stat.S_ISREG(mode) or is_git_metadata_path(name):
                 raise WorkspaceError("Candidate contains a special file or Git metadata")
             size = path.stat().st_size
             total += size
