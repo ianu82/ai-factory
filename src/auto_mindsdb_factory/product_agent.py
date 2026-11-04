@@ -23,7 +23,7 @@ REPORT_SCHEMA = {
     "required": ["status", "summary", "criteria", "findings"],
     "properties": {
         "status": STATUS, "summary": {"type": "string"},
-        "findings": {"type": "array", "items": {"type": "string"}},
+        "findings": {"type": "array", "description": "Unresolved material blocking defects only. Return an empty array when none remain; put observations in summary or criterion evidence.", "items": {"type": "string"}},
         "criteria": {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
             "required": ["id", "status", "evidence"],
@@ -69,12 +69,15 @@ class ProductAgent:
         for turn in range(self.max_turns):
             if time.monotonic() >= self.deadline:
                 raise AgentSessionError("Run time budget exhausted")
-            if self.journal.summary()["total_tokens"] >= self.max_total_tokens:
+            usage = self.journal.summary()
+            if not usage["usage_complete"]:
+                raise AgentSessionError("Prior model usage is unknown; cannot continue within a token budget")
+            if usage["total_tokens"] >= self.max_total_tokens:
                 raise AgentSessionError("Run token budget exhausted")
             body = {
                 "model": self.connector.config.model, "instructions": instructions,
                 "input": items, "tools": TOOLS, "parallel_tool_calls": False, "tool_choice": "required",
-                "max_output_tokens": self.connector.config.max_output_tokens,
+                "max_output_tokens": min(self.connector.config.max_output_tokens, self.max_total_tokens - usage["total_tokens"]),
                 "reasoning": {"effort": self.connector.config.reasoning_effort},
                 "store": False, "include": ["reasoning.encrypted_content"],
             }
@@ -107,6 +110,7 @@ class ProductAgent:
             if len(calls) != 1:
                 raise AgentSessionError("Expected exactly one tool call")
             call = calls[0]
+            self.journal.append("agent_tool_requested", role=role, tool=call.get("name"), arguments=call.get("arguments"))
             try:
                 arguments = json.loads(call["arguments"])
                 validate(arguments, REPORT_SCHEMA if call["name"] == "finish" else COMMAND_SCHEMA)
