@@ -48,11 +48,20 @@ class RailwayPool:
 
     def _heartbeat(self):
         while not self.stopped.wait(60):
-            with self.lock:
-                if self.id:
-                    try:
-                        self.transport({"action": "heartbeat", "id": self.id, "timeout": 30})
-                    except Exception:
+            self._keep_alive()
+
+    def _keep_alive(self):
+        # Commands hold the lifecycle lock while awaiting remote execution.
+        # Keepalives must run independently, including during a silent command.
+        identity = self.id
+        if identity:
+            try:
+                self.transport({"action": "heartbeat", "id": identity, "timeout": 30})
+            except Exception:
+                # Retirement can race an in-flight heartbeat. A failure for a
+                # retired worker must never poison its replacement.
+                with self.lock:
+                    if self.id == identity:
                         self.failure = RunnerError("Railway worker heartbeat failed")
 
     def _discard(self):

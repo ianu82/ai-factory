@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from auto_mindsdb_factory.docker_runner import RunnerError
@@ -93,5 +95,86 @@ def test_disconnected_command_retires_vm_and_prohibits_further_execution(tmp_pat
         assert provider.calls[-1]["action"] == "destroy"
         with pytest.raises(RunnerError, match="uncertain"):
             pool.open(tmp_path)
+    finally:
+        pool.close()
+
+
+def test_heartbeat_continues_while_remote_command_is_blocked(tmp_path):
+    provider = Provider()
+    started, release, alive = threading.Event(), threading.Event(), threading.Event()
+    def transport(request):
+        if request["action"] == "request" and request["request"]["action"] == "run":
+            started.set()
+            assert release.wait(5)
+        if request["action"] == "heartbeat":
+            alive.set()
+        return provider(request)
+    pool = RailwayPool(transport)
+    command = heartbeat = None
+    results = []
+    try:
+        pool.open(tmp_path)
+        command = threading.Thread(target=lambda: results.append(
+            pool.call({"action": "run", "command": ["sleep", "90"]})))
+        command.start()
+        assert started.wait(2)
+        heartbeat = threading.Thread(target=pool._keep_alive)
+        heartbeat.start()
+        assert alive.wait(2), "A running command prevented its worker's keepalive"
+        assert command.is_alive()
+    finally:
+        release.set()
+        for thread in (command, heartbeat):
+            if thread:
+                thread.join(5)
+        pool.close()
+    assert all(not thread.is_alive() for thread in (command, heartbeat))
+    assert results[0]["exit_code"] == 0
+
+
+def test_late_heartbeat_failure_does_not_poison_replacement(tmp_path):
+    provider = Provider()
+    started, release = threading.Event(), threading.Event()
+    def transport(request):
+        if request["action"] == "heartbeat":
+            started.set()
+            assert release.wait(5)
+            raise RuntimeError("retired worker")
+        return provider(request)
+    pool = RailwayPool(transport)
+    heartbeat = None
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    try:
+        pool.open(first)
+        heartbeat = threading.Thread(target=pool._keep_alive)
+        heartbeat.start()
+        assert started.wait(2)
+        pool.open(second)
+        release.set()
+        heartbeat.join(5)
+        assert not heartbeat.is_alive()
+        assert pool.failure is None
+        assert pool.call({"action": "run", "command": ["true"]})["exit_code"] == 0
+    finally:
+        release.set()
+        if heartbeat:
+            heartbeat.join(5)
+        pool.close()
+
+
+def test_current_worker_heartbeat_failure_still_fails_closed(tmp_path):
+    provider = Provider()
+    def transport(request):
+        if request["action"] == "heartbeat":
+            raise RuntimeError("private provider body")
+        return provider(request)
+    pool = RailwayPool(transport)
+    try:
+        pool.open(tmp_path)
+        pool._keep_alive()
+        with pytest.raises(RunnerError, match="^Railway worker heartbeat failed$"):
+            pool.call({"action": "run", "command": ["true"]})
     finally:
         pool.close()
