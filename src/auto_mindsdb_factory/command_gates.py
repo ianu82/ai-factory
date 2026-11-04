@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from .execution_account import ExecutionAccount, ExecutionAccountError
 
 class CommandGateError(RuntimeError):
     """A command gate could not safely prepare its evaluation target."""
@@ -70,13 +72,17 @@ class CommandGateRunner:
         required_kinds: set[str] | None = None,
         timeout_seconds: int = 900,
         require_candidate: bool = False,
+        execution_account: ExecutionAccount | None = None,
     ) -> None:
+        if timeout_seconds < 1:
+            raise CommandGateError("Gate timeout_seconds must be positive.")
         self.repo_root = repo_root.resolve()
         self.commands_by_kind = dict(self.DEFAULT_COMMANDS if commands_by_kind is None else commands_by_kind)
         self.required_kinds = {"unit", "contract"} if required_kinds is None else set(required_kinds)
         self.timeout_seconds = timeout_seconds
         self.require_candidate = require_candidate
         self.commit_sha: str | None = None
+        self.execution_account = execution_account or ExecutionAccount(None)
 
     @classmethod
     def from_env(cls, repo_root: Path, *, require_candidate: bool = False) -> "CommandGateRunner":
@@ -88,9 +94,15 @@ class CommandGateRunner:
         required_raw = os.environ.get("AI_FACTORY_REQUIRED_GATE_KINDS", "unit,contract")
         required = {item.strip() for item in required_raw.split(",") if item.strip()}
         timeout = int(os.environ.get("AI_FACTORY_GATE_TIMEOUT_SECONDS", "900"))
+        user = os.environ.get("AI_FACTORY_GATE_RUN_AS_USER") or os.environ.get("AI_FACTORY_CODE_WORKER_RUN_AS_USER")
+        if require_candidate and not user:
+            raise CommandGateError("Production gates require AI_FACTORY_GATE_RUN_AS_USER or AI_FACTORY_CODE_WORKER_RUN_AS_USER.")
+        if require_candidate and user in {"root", "0", str(os.getuid()), pwd.getpwuid(os.getuid()).pw_name}:
+            raise CommandGateError("Production gates must use a non-root account distinct from the orchestrator.")
         return cls(
             repo_root, commands_by_kind=commands, required_kinds=required,
             timeout_seconds=timeout, require_candidate=require_candidate,
+            execution_account=ExecutionAccount(user, sudo_bin=os.environ.get("AI_FACTORY_GATE_SUDO_BIN", "sudo")),
         )
 
     @contextmanager
@@ -109,9 +121,18 @@ class CommandGateRunner:
                 workspace, commands_by_kind=self.commands_by_kind,
                 required_kinds=self.required_kinds, timeout_seconds=self.timeout_seconds,
                 require_candidate=True,
+                execution_account=self.execution_account,
             )
             runner.commit_sha = commit_sha
-            yield runner
+            try:
+                prepared = self.execution_account.prepare_directory(workspace.parent)
+                try:
+                    yield runner
+                finally:
+                    if prepared:
+                        self.execution_account.restore_directory(workspace.parent)
+            except ExecutionAccountError as exc:
+                raise CommandGateError(str(exc)) from exc
 
     def is_blocking_kind(self, kind: str) -> bool:
         return kind in self.required_kinds
@@ -132,8 +153,16 @@ class CommandGateRunner:
             )
         try:
             started = time.monotonic()
+            env = self._command_env()
+            execution_command = command
+            if self.execution_account.user:
+                # sudo resets the environment; pass only the candidate import path
+                # after the identity change, never the service environment.
+                execution_command = self.execution_account.command([
+                    "env", f"PYTHONPATH={env['PYTHONPATH']}", *command,
+                ])
             completed = subprocess.run(
-                command,
+                execution_command,
                 cwd=self.repo_root,
                 check=False,
                 capture_output=True,

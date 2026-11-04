@@ -210,6 +210,7 @@ class EvalRunner:
                     else "working_tree"
                 ),
                 **({"commit_sha": self.gate_runner.commit_sha} if self.gate_runner and self.gate_runner.commit_sha else {}),
+                **({"run_as_user": self.gate_runner.execution_account.user} if self.gate_runner and self.gate_runner.execution_account.user else {}),
             },
             "artifact": {
                 "id": artifact_id,

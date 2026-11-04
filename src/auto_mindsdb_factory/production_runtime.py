@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from .connectors import (
     GitHubCLIRepoConnector,
     FactoryConnectorError,
 )
+from .command_gates import CommandGateError
 from .eval_execution import CommandGateRunner, Stage5EvalPipeline
 from .intake import utc_now
 from .linear_trigger import LinearTriggerWorker
@@ -119,6 +121,7 @@ class FactoryDoctor:
             [
                 self._runtime_boundary_check(),
                 self._agent_check(),
+                self._gate_check(),
                 self._command_check("git", ["git", "rev-parse", "--is-inside-work-tree"]),
                 self._repo_connector_check(),
                 self._code_worker_command_check(),
@@ -163,6 +166,15 @@ class FactoryDoctor:
         except AutomationError as exc:
             return {"name": "runtime:agent", "status": "failed", "summary": str(exc)}
         return {"name": "runtime:agent", "status": "passed", "summary": "agent configuration valid"}
+
+    def _gate_check(self) -> dict[str, str]:
+        try:
+            gates = CommandGateRunner.from_env(self.config.repo_root, require_candidate=True)
+        except (CommandGateError, ValueError) as exc:
+            return {"name": "runtime:gates", "status": "failed", "summary": str(exc)}
+        return self._command_check(
+            "gate-user", gates.execution_account.command([sys.executable, "--version"]),
+        )
 
     def _runtime_boundary_check(self) -> dict[str, str]:
         if self.config.autonomy_mode is AutonomyMode.PR_READY:
@@ -314,9 +326,13 @@ class FactoryWorker:
             code_worker_connector=CodexCLICodeWorkerConnector(CodexCLICodeWorkerConfig.from_env()),
             repo_connector=self._repo_connector(),
         )
+        try:
+            gates = CommandGateRunner.from_env(self.config.repo_root, require_candidate=True)
+        except (CommandGateError, ValueError) as exc:
+            raise AutomationError(f"Could not initialize production gates: {exc}") from exc
         stage5 = Stage5EvalPipeline(
             self.config.repo_root,
-            gate_runner=CommandGateRunner.from_env(self.config.repo_root, require_candidate=True),
+            gate_runner=gates,
         )
         coordinator = FactoryAutomationCoordinator(
             self.config.store_dir,
