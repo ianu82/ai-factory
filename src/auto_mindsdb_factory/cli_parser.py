@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from .reliability_commands import register_reliability_commands
+from .product_commands import register_product_commands
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Factory validation and controller utilities.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    register_product_commands(subparsers)
 
     validate_parser = subparsers.add_parser(
         "validate-contracts",

@@ -1,6 +1,8 @@
 # AI Factory Architecture
 
-The production runtime turns accepted Linear issues into draft GitHub PRs with live planning, code review and command-backed candidate checks. Human merge/deploy is the production stop line. Stage 7-9 release, monitoring and feedback remain simulation workflows until real deployment and observability integrations are connected.
+The staged Linear runtime turns accepted issues into draft GitHub PRs with live planning, code review and command-backed candidate checks. Its production stop line remains PR-ready. Stage 7-9 release, monitoring and feedback remain simulation workflows until real deployment and observability integrations are connected.
+
+The short product workflow accepts authenticated scoped tasks and trusted product profiles outside candidate source. It implements in disposable containers, independently verifies a pinned commit, and can publish and automatically promote small changes under an explicit profile. GitHub merge confirmation and post-merge smoke evidence are required for completion. See [product delivery](product-delivery-plan.md) for the supported boundary, commands and replay format. Factory-owned schemas/policies remain in the controller repository; product repositories need none of them.
 
 ## Production workflow
 
