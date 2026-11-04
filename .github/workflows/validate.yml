@@ -29,6 +29,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate Railway transport
+        run: |
+          npm ci --prefix src/auto_mindsdb_factory/railway_bridge --ignore-scripts --no-audit --no-fund
+          node --test src/auto_mindsdb_factory/railway_bridge/client.test.mjs
+
       - name: Validate contracts
         run: uv run --locked python scripts/validate_contracts.py
 

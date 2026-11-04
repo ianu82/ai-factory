@@ -1,13 +1,10 @@
 // Controller-only SDK bridge. No controller secrets enter the VM's environment.
 import {readFile} from 'node:fs/promises';
 import {Sandbox, SandboxNotFoundError} from 'railway';
+import {clientOptions} from './client.mjs';
 
 const MAX_MESSAGE_BYTES = 100 * 1024 * 1024;
-const options = {
-  token: process.env.RAILWAY_API_TOKEN,
-  authType: 'project-token',
-  environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
-};
+const options = clientOptions();
 
 async function checkedExec(sandbox, command, input, timeoutSec, maxOutputBytes = 65536) {
   const handle = sandbox.exec(command, {
