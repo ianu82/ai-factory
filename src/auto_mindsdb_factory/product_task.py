@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +52,10 @@ class ProductTask:
     @property
     def document(self) -> dict:
         return json.loads(self.canonical_json)
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical_json.encode()).hexdigest()
 
     @property
     def public_context(self) -> dict:

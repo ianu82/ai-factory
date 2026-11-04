@@ -136,7 +136,8 @@ class ProductDelivery:
                 git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
                 base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
             journal.create({"task": task.document, "base_sha": base_sha, "profile": self.settings,
-                            "profile_sha": self.profile.digest, "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
+                            "profile_sha": self.profile.digest, "task_sha": task.digest,
+                            "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""
                 try:
@@ -163,7 +164,8 @@ class ProductDelivery:
                             continue
                         journal.append("attempt_finished", attempt=attempt, status="verified")
                         candidate = {"run_id": task_id, "base_sha": base_sha, "candidate_sha": sha,
-                                     "profile_sha": self.profile.digest, "changed_paths": paths, "verification": verification}
+                                     "profile_sha": self.profile.digest, "task_sha": task.digest,
+                                     "changed_paths": paths, "verification": verification}
                         lease.heartbeat()
                         result = promote(candidate, journal) if promote else {"status": "verified", **candidate}
                         journal.append("run_finished", status=result["status"])
@@ -172,3 +174,16 @@ class ProductDelivery:
                 except Exception as exc:
                     journal.append("run_finished", status="blocked", reason=type(exc).__name__)
                     raise
+
+    def smoke(self, sha: str, journal: RunJournal) -> None:
+        with tempfile.TemporaryDirectory(prefix="ai-factory-smoke-") as temporary:
+            workspace = Path(temporary) / "source"
+            original = self._prepare(sha, workspace, journal)
+            with self.sandbox_factory(workspace, self.settings["image"], writable=False) as sandbox:
+                for index, command in enumerate(self.settings["smoke"], start=1):
+                    result = self._command(sandbox, command)
+                    journal.append("post_merge_smoke", commit_sha=sha, index=index, **result)
+                    if result["exit_code"]:
+                        raise DeliveryError("Post-merge smoke failed; task remains blocked")
+            if source_files(workspace) != original:
+                raise DeliveryError("Post-merge smoke changed source")

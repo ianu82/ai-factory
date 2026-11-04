@@ -49,7 +49,7 @@ class DockerSandbox:
             self._docker(
                 "run", "--detach", "--name", self.name, "--init", "--read-only",
                 "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=128",
-                "--memory=2g", "--cpus=1", "--ulimit", "fsize=67108864:67108864",
+                "--memory=2g", "--cpus=1", "--ulimit", "fsize=268435456:268435456",
                 "--user", f"{uid}:{os.getgid()}", "--network", "bridge" if self.network else "none",
                 "--mount", mount, "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
                 "--env", "HOME=/tmp", "--env", "npm_config_cache=/tmp/npm-cache",
