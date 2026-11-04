@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import re
 import threading
@@ -484,8 +485,10 @@ class FileLease:
                     scope=self.scope,
                     ttl_seconds=self.ttl_seconds,
                 )
-            except AutomationError as exc:
-                self._renewal_error = exc
+            except (AutomationError, OSError) as exc:
+                self._renewal_error = exc if isinstance(exc, AutomationError) else AutomationError(
+                    f"Could not renew {self.scope} lease: {type(exc).__name__}"
+                )
                 self._stop_event.set()
                 return
 
@@ -772,20 +775,24 @@ class FactoryRunStore:
 
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lease_id = uuid4().hex
-        now = parse_utc_timestamp(utc_now())
-        self._clear_expired_lease(lock_path, now=now)
-        document = self._lease_document(
-            resource_id=resource_id,
-            scope=scope,
-            lease_id=lease_id,
-            acquired_at=now,
-            ttl_seconds=ttl_seconds,
-            refreshed_at=now,
-        )
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError as exc:
-            raise busy_error_cls(busy_message) from exc
+        with self._lease_guard(lock_path):
+            now = datetime.now(timezone.utc)
+            self._clear_expired_lease(lock_path, now=now)
+            document = self._lease_document(
+                resource_id=resource_id, scope=scope, lease_id=lease_id,
+                acquired_at=now, ttl_seconds=ttl_seconds, refreshed_at=now,
+            )
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError as exc:
+                raise busy_error_cls(busy_message) from exc
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(document, handle, indent=2)
+                    handle.write("\n")
+            except BaseException:
+                lock_path.unlink(missing_ok=True)
+                raise
 
         lease = FileLease(
             store=self,
@@ -797,13 +804,22 @@ class FactoryRunStore:
             renew_interval_seconds=interval,
         )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(document, handle, indent=2)
-                handle.write("\n")
             lease.start()
             yield lease
         finally:
             lease.close()
+
+    @staticmethod
+    @contextmanager
+    def _lease_guard(lock_path: Path):
+        # A separate, stable inode serializes create/refresh/reap/release. The
+        # lease JSON itself is atomically replaced and cannot be the mutex inode.
+        with lock_path.with_name(lock_path.name + ".guard").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(guard, fcntl.LOCK_UN)
 
     @staticmethod
     def _lease_document(
@@ -835,32 +851,22 @@ class FactoryRunStore:
         scope: str,
         ttl_seconds: float,
     ) -> None:
-        try:
-            document = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise AutomationError(
-                f"Could not refresh {scope} lease for '{resource_id}': {exc}"
-            ) from exc
-
-        if document.get("lease_id") != lease_id:
-            raise AutomationError(
-                f"{scope.capitalize()} lease for '{resource_id}' is no longer owned by this worker."
+        with self._lease_guard(lock_path):
+            try:
+                document = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AutomationError(f"Could not refresh {scope} lease for '{resource_id}': {exc}") from exc
+            if document.get("lease_id") != lease_id:
+                raise AutomationError(f"{scope.capitalize()} lease for '{resource_id}' is no longer owned by this worker.")
+            acquired_at_raw = document.get("acquired_at")
+            if not isinstance(acquired_at_raw, str):
+                raise AutomationError(f"{scope.capitalize()} lease for '{resource_id}' is missing acquired_at.")
+            updated_document = self._lease_document(
+                resource_id=resource_id, scope=scope, lease_id=lease_id,
+                acquired_at=parse_utc_timestamp(acquired_at_raw), ttl_seconds=ttl_seconds,
+                refreshed_at=datetime.now(timezone.utc),
             )
-        acquired_at_raw = document.get("acquired_at")
-        if not isinstance(acquired_at_raw, str):
-            raise AutomationError(
-                f"{scope.capitalize()} lease for '{resource_id}' is missing acquired_at."
-            )
-        refreshed_at = parse_utc_timestamp(utc_now())
-        updated_document = self._lease_document(
-            resource_id=resource_id,
-            scope=scope,
-            lease_id=lease_id,
-            acquired_at=parse_utc_timestamp(acquired_at_raw),
-            ttl_seconds=ttl_seconds,
-            refreshed_at=refreshed_at,
-        )
-        self._write_json_atomic(lock_path, updated_document)
+            self._write_json_atomic(lock_path, updated_document)
 
     @staticmethod
     def _clear_expired_lease(lock_path: Path, *, now: datetime) -> None:
@@ -879,15 +885,13 @@ class FactoryRunStore:
 
     @staticmethod
     def _release_lease(lock_path: Path, *, lease_id: str) -> None:
-        try:
-            document = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            lock_path.unlink(missing_ok=True)
-            return
-
-        if document.get("lease_id") != lease_id:
-            return
-        lock_path.unlink(missing_ok=True)
+        with FactoryRunStore._lease_guard(lock_path):
+            try:
+                document = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return
+            if document.get("lease_id") == lease_id:
+                lock_path.unlink(missing_ok=True)
 
     def _load_state_document(self) -> dict[str, Any] | None:
         if not self.state_path.exists():
