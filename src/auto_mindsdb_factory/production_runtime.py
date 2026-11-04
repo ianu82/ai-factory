@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -172,9 +173,10 @@ class FactoryDoctor:
             gates = CommandGateRunner.from_env(self.config.repo_root, require_candidate=True)
         except (CommandGateError, ValueError) as exc:
             return {"name": "runtime:gates", "status": "failed", "summary": str(exc)}
-        return self._command_check(
-            "gate-user", gates.execution_account.command([sys.executable, "--version"]),
-        )
+        probe = ["uv", "--version"] if any(
+            command[0] == "uv" for command in gates.commands_by_kind.values()
+        ) else [sys.executable, "--version"]
+        return self._command_check("gate-user", gates.execution_account.command(probe))
 
     def _runtime_boundary_check(self) -> dict[str, str]:
         if self.config.autonomy_mode is AutonomyMode.PR_READY:
@@ -285,11 +287,15 @@ class FactoryDoctor:
 
 
 class FactoryWorker:
+    MAX_RETAINED_CYCLES = 100
+
     def __init__(self, config: ProductionRuntimeConfig) -> None:
         self.config = config
 
     def run(self, *, once: bool = False, max_cycles: int | None = None) -> dict[str, Any]:
-        cycles: list[dict[str, Any]] = []
+        if max_cycles is not None and max_cycles < 1:
+            raise AutomationError("max_cycles must be positive.")
+        cycles: deque[dict[str, Any]] = deque(maxlen=self.MAX_RETAINED_CYCLES)
         cycle_count = 0
         while True:
             cycle_count += 1
@@ -300,11 +306,14 @@ class FactoryWorker:
         return {
             "cycle": "factory-worker",
             "status": "completed" if once or max_cycles is not None else "running",
-            "cycles": cycles,
+            "cycles": list(cycles),
+            "cycle_count": cycle_count,
+            "history_truncated": cycle_count > len(cycles),
             "completed_at": utc_now(),
         }
 
     def run_cycle(self) -> dict[str, Any]:
+        started_at = utc_now()
         provider = os.environ.get("AI_FACTORY_CODE_WORKER_PROVIDER", "codex_cli").strip()
         if provider != "codex_cli":
             raise AutomationError("AI_FACTORY_CODE_WORKER_PROVIDER must be 'codex_cli' for production v1.")
@@ -364,7 +373,7 @@ class FactoryWorker:
         progression_result = coordinator.run_progression_cycle(repository=self.config.repository)
         return {
             "cycle": "factory-worker-cycle",
-            "started_at": utc_now(),
+            "started_at": started_at,
             "intake_paused": intake_paused(),
             "worker_id": self.config.worker_id,
             "max_active_runs": self.config.max_active_runs,

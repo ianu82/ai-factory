@@ -376,3 +376,23 @@ def test_doctor_reports_invalid_agent_configuration_before_work_starts(monkeypat
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     doctor = FactoryDoctor(ProductionRuntimeConfig(tmp_path / "store", tmp_path, "owner/repo"))
     assert doctor._agent_check()["status"] == "failed"
+
+
+def test_long_running_worker_bounds_retained_history_and_reports_total_cycles(monkeypatch, tmp_path):
+    worker = FactoryWorker(ProductionRuntimeConfig(tmp_path / "store", tmp_path, "owner/repo"))
+    calls = []
+
+    def cycle():
+        calls.append(len(calls) + 1)
+        return {"cycle_number": calls[-1]}
+
+    monkeypatch.setattr(worker, "MAX_RETAINED_CYCLES", 2)
+    monkeypatch.setattr(worker, "run_cycle", cycle)
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.time.sleep", lambda seconds: None)
+    result = worker.run(max_cycles=5)
+    assert result["cycle_count"] == 5
+    assert result["cycles"] == [{"cycle_number": 4}, {"cycle_number": 5}]
+    assert result["history_truncated"] is True
+    with pytest.raises(AutomationError, match="max_cycles must be positive"):
+        worker.run(max_cycles=0)
+    assert len(calls) == 5

@@ -1,104 +1,72 @@
 # AI Factory Architecture
 
-This is the current executable shape of the factory: Anthropic release-note intake, policy assignment, staged build/review/eval/security/merge/release/monitoring/feedback, recurring automation around a persisted run store, and a first real vertical slice that creates GitHub PR evidence while keeping deployment and observability file-backed.
+The production runtime turns accepted Linear issues into draft GitHub PRs with live planning, code review and command-backed candidate checks. Human merge/deploy is the production stop line. Stage 7-9 release, monitoring and feedback remain simulation workflows until real deployment and observability integrations are connected.
 
-## Workflow
+## Production workflow
 
 ```mermaid
 flowchart TD
-    A["Anthropic release notes"] --> B["Stage 1: Scout + Clarifier"]
-    B --> C["Spec packet"]
-    C --> D["Policy Engine"]
-    D --> E{"Relevant?"}
-    E -->|"watchlist / ignore"| Z["Stop: watchlisted or rejected"]
-    E -->|"active build"| F["Stage 2: Ticket Architect + Eval Engineer"]
-    F --> G["Ticket bundle + eval manifest"]
-    G --> H["Stage 3: Builder + Reviewer"]
-    H --> I{"PR reviewable?"}
-    I -->|"no"| H
-    I -->|"yes"| J["Stage 4: Integration Engineer"]
-    J --> K["Prompt contract + tool schema + golden dataset + latency baseline"]
-    K --> L["Stage 5: Eval Runner"]
-    L --> M{"Merge-gating evals pass?"}
-    M -->|"no"| H
-    M -->|"yes"| N["Stage 6: Security Sentinel"]
-    N --> O{"Security approved?"}
-    O -->|"blocked"| H
-    O -->|"human signoff needed"| P["Wait: SECURITY_REVIEWING"]
-    O -->|"approved"| Q["Merge Conductor"]
-    Q --> R{"Merged?"}
-    R -->|"blocked"| H
-    R -->|"human signoff needed"| S["Wait: MERGE_REVIEWING"]
-    R -->|"merged"| T["Stage 7: Release Manager"]
-    T --> U{"Promoted?"}
-    U -->|"blocked"| H
-    U -->|"release signoff needed"| V["Wait: STAGING_SOAK"]
-    U -->|"promoted"| W["Stage 8: SRE Sentinel"]
-    W --> X{"Production status"}
-    X -->|"healthy"| Y["Stage 9: Weekly feedback"]
-    X -->|"incident or open follow-up"| AA["Immediate Stage 9 feedback"]
-    Y --> AB["Feedback report + backlog candidates"]
-    AA --> AB
-    AB --> A
+    Linear["Signed Linear webhook"] --> Inbox["Durable trigger inbox"]
+    Inbox --> Worker["Factory worker: leases + operation heartbeats"]
+    Worker --> Intake["Stage 1: normalize spec + assign policy"]
+    Intake --> Tickets["Stage 2: live ticket drafting + eval manifest"]
+    Tickets --> Draft["Stage 3: live PR drafting"]
+    Draft --> Code["Codex CLI: isolated worktree + restricted account"]
+    Code --> PR["Orchestrator: inspect changed files + commit + push + draft PR"]
+    PR --> Review["Live review of the actual candidate diff"]
+    Review -->|"blocking findings"| Revision["Revision or operator recovery"]
+    Review -->|"reviewable"| Integration["Stage 4: integration contracts"]
+    Integration --> Gates["Stage 5: command gates at the pinned candidate commit"]
+    Gates -->|"failed or unconfigured required check"| Revision
+    Gates -->|"passed"| Security["Stage 6: policy/security checks + required human signoff"]
+    Security --> Human["Stop: engineer reviews, merges and deploys"]
 ```
 
-## Runtime
+Stage 1 and Stage 4/6 contain deterministic policy and artifact processing. The Stage 6 report is not a replacement for implementation security review or external security tooling. Stage 3 now reviews code, while Stage 5 runs the project's configured executable checks.
 
-```mermaid
-flowchart LR
-    subgraph Workspace["Local workspace: /Users/ian/auto-mindsdb-eng"]
-        CLI["auto-mindsdb-factory CLI"]
-        Runtime["src/auto_mindsdb_factory runtime"]
-        Schemas["schemas/*.schema.json"]
-        Policies["factory/policies/*.yaml"]
-        Fixtures["fixtures/scenarios + fixtures/intake"]
-        Tests["pytest + validate_contracts.py"]
-    end
+## Evidence and execution boundaries
 
-    subgraph Store["Run store: .factory-automation"]
-        Bundles["stage1..stage9 + merge result bundles"]
-        Signals["file-backed staging, monitoring, rollback signals"]
-        State["automation-state.json"]
-        Leases["state lease + per-run leases"]
-    end
+- Intake is acknowledged after persistence. The worker drains the inbox and advances saved work under renewable per-run leases.
+- The service owns Linear/GitHub access, run persistence and PR creation. Model-authored edits run through the separately configured code-worker account.
+- Stage 2 and Stage 3 use the configured OpenAI provider, model, fallback, reasoning and timeout settings. Invalid settings fail before intake processing. Production refuses a disabled agent; explicitly enabled simulation may use deterministic drafting.
+- Drafting receives a bounded tracked-file inventory and project manifests. Proposed file hints are not delivery evidence. After execution, the PR packet records the worker's actual changed files.
+- The reviewer reads the full diff between the base branch and recorded candidate commit. Empty or oversized diffs stop review. Repository content is treated as untrusted evidence rather than instructions.
+- Command gates create a fresh detached worktree at the delivery SHA. They never fall back to the service checkout. Candidate source paths replace inherited Python import paths.
+- Default Python gates use `uv run --locked --extra dev` to build the candidate's own environment. Lockfile and dependency installation failures block the gate. Custom commands must select their project's reproducible environment explicitly.
+- Production gates run under the restricted code-worker account, or a dedicated `AI_FACTORY_GATE_RUN_AS_USER`. They do not inherit service credentials, and the service restores workspace ownership before removal. Account provisioning and workspace-ownership permissions remain deployment prerequisites. The doctor checks tool startup under the gate account; each gate verifies dependency installation and command execution.
+- Every required merge-gating manifest check needs a real passing command. Configured required kinds add requirements; they do not waive the manifest. Missing commands remain `not_configured` and block readiness.
+- Eval reports identify `simulation`, `working_tree` or `candidate_commit` execution. Candidate reports record the tested SHA and, when configured, the execution account. Existing saved reports remain readable.
+- PR-ready mode stops before merge/deploy. Simulation cannot approve a delivered PR. Command exit status is execution evidence; model-authored prose is not a substitute for it.
 
-    subgraph External["External seams"]
-        GitHub["GitHub repo + PR + checks"]
-    end
+## Runtime modules
 
-    subgraph Schedulers["How it is invoked"]
-        Manual["One-shot stage commands"]
-        Supervisor["automation-supervisor-cycle"]
-        Stage1Loop["automation-stage1-cycle"]
-        ProgressionLoop["automation-advance-runs"]
-        WeeklyLoop["automation-weekly-feedback"]
-    end
+| Module | Responsibility |
+| --- | --- |
+| `cli_parser.py` | Argument declarations; no stage execution |
+| `__main__.py` | Environment loading, input validation and command dispatch |
+| `production_runtime.py` | Preflight, production dependency wiring and worker loop |
+| `agent_runtime.py` | Shared live-agent configuration |
+| `repository_context.py` | Bounded repository evidence for drafting |
+| `automation.py` | Stage progression, persisted bundles and renewable leases |
+| `command_gates.py` | Candidate workspace lifecycle and executable gates |
+| `execution_account.py` | Shared account switching and workspace ownership |
+| `connectors.py` | OpenAI, Codex and GitHub adapters |
+| `reliability.py` | Operation tracking, stale-work detection and recovery |
 
-    Manual --> CLI
-    Supervisor --> CLI
-    Stage1Loop --> CLI
-    ProgressionLoop --> CLI
-    WeeklyLoop --> CLI
-    CLI --> Runtime
-    Runtime --> Schemas
-    Runtime --> Policies
-    Runtime --> Bundles
-    Runtime --> Signals
-    Runtime --> State
-    Runtime --> Leases
-    Runtime --> GitHub
-    Tests --> Runtime
-    Fixtures --> Tests
-```
+The worker retains only its latest 100 in-memory cycle summaries and reports the full cycle count separately. Durable stage evidence remains in the run store. Longer-term maintainability work should continue to reduce orchestration coupling through these module boundaries, rather than add more provider-specific branches to the coordinator.
 
-## Execution Surfaces
+## Run store and recovery
 
-- One-shot stages run through `uv run auto-mindsdb-factory stage1-intake`, `stage2-ticketing`, `stage3-build-review`, `stage4-integration`, `stage5-eval`, `stage6-security-review`, `stage-merge`, `stage7-release-staging`, `stage8-production-monitoring`, and `stage9-feedback-synthesis`.
-- The autonomous lane runs through `uv run auto-mindsdb-factory automation-supervisor-cycle --store-dir .factory-automation ...`.
-- Persisted work lives in `.factory-automation`, with stage result bundles per work item and shared automation state in `automation-state.json`.
-- The first real vertical slice runs through `uv run auto-mindsdb-factory factory-vertical-slice --store-dir .factory-automation --repository ianu82/ai-factory`.
-- GitHub is the first real connector seam: the slice creates a branch, commits a small evidence file, opens a draft PR, and records PR/check status in the run store.
-- Staging, monitoring, and rollback use JSON signal files in `.factory-automation/ops-signals/<work_item_id>/` until real deploy, observability, feature-flag, and rollback providers replace them.
-- Operators can inspect the local control-plane view with `uv run auto-mindsdb-factory factory-cockpit --store-dir .factory-automation`.
-- Governance lives in `factory/policies/*.yaml`; handoff shape and drift checks live in `schemas/*.schema.json` and `scripts/validate_contracts.py`.
-- The current boundary is live rollback execution. Stage 8 can model mitigation and escalation, Stage 9 can synthesize incident feedback, and the vertical slice can require rollback-probe evidence, but no real infrastructure rollback command is executed yet.
+`.factory-automation/` holds stage bundles, shared dedupe state, operation heartbeats, scheduler/recovery state and trigger inbox records. State updates use atomic replacement and compare-and-swap checks. The worker runs stale-operation detection before processing new work.
+
+The cockpit exposes queue and operation status. Operators can explicitly retry, unblock or dead-letter saved runs after examining their evidence. Production is currently designed for one persistent host and one filesystem store; this is not a distributed database or a guarantee of exactly-once external side effects.
+
+## Simulation workflows
+
+The Stage 7 release, Stage 8 monitoring and Stage 9 feedback pipelines can exercise rollout decisions, incidents, mitigation and feedback using file-backed signals. These are rehearsal surfaces. They do not deploy infrastructure, collect real production telemetry or execute an infrastructure rollback.
+
+`AI_FACTORY_AUTONOMY_MODE=simulation_full` requires `AI_FACTORY_ALLOW_SIMULATION_RUNTIME=true` when used through the production-facing worker. Keep simulated evidence separate from production readiness decisions.
+
+## Validation
+
+Run the repository's pytest suite and `scripts/validate_contracts.py`. Candidate-gate regression tests use actual local Git commits to prove that a passing base checkout cannot hide a failing candidate. Provider tests exercise configuration and structured handoffs without credentials; a live API smoke test can validate the configured provider separately without creating external work items.

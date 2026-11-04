@@ -1517,5 +1517,3 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override the OpenAI Responses API base URL.",
     )
-
-

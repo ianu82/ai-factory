@@ -13,7 +13,7 @@ Production v1 runs on one persistent Lightsail instance with one active worker a
 
 ## Current Deployment
 
-The first billable production test box is live on Lightsail and should be treated as the current AI Factory v1 host.
+These are the recorded AI Factory v1 deployment details. Verify current host and service status before operating it.
 
 - Instance: `ai-factory-prod-1`
 - Region/AZ: `us-west-2a`
@@ -52,7 +52,7 @@ The Linear trigger state for this deployment is the team-specific Stage 1 intake
 - Terminate HTTPS with Caddy or nginx and proxy `https://<host>/hooks/linear` to the local webhook server.
 - Run services as a non-root orchestrator user, for example `ai-factory`.
 - Run the model/code worker through a separate OS user, for example `ai-factory-worker`, with only Codex/model auth in its home directory.
-- Run candidate gates under that restricted worker account, or set `AI_FACTORY_GATE_RUN_AS_USER` to a dedicated account without credentials. The service account must be allowed to run configured gate commands as that account and to change/restore ownership of generated temporary workspaces. Gate commands must not execute as the orchestrator account; `factory-doctor` validates the execution account and interpreter access.
+- Run candidate gates under that restricted worker account, or set `AI_FACTORY_GATE_RUN_AS_USER` to a dedicated account without credentials. The service account must be allowed to run configured gate commands as that account and to change/restore ownership of generated temporary workspaces. Gate commands must not execute as the orchestrator account; `factory-doctor` validates account selection and tool startup.
 - Store orchestrator secrets outside the repo, for example `/etc/ai-factory/factory.env`, owned by `root` and readable by systemd only. The `ai-factory-worker` user must not be able to read this file.
 - Enable Lightsail snapshots or another backup for the run store.
 - Keep only ports `22`, `80`, and `443` open publicly; restrict SSH by key.

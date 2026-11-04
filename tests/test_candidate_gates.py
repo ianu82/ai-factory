@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,6 +176,7 @@ def test_production_gates_use_restricted_account_and_restore_ownership(candidate
 
 
 def test_production_gate_account_is_required_and_explicit_override_is_respected(candidate_repo, monkeypatch):
+    monkeypatch.setattr("auto_mindsdb_factory.command_gates.pwd.getpwnam", lambda name: SimpleNamespace(pw_uid=os.getuid() + 1))
     monkeypatch.delenv("AI_FACTORY_GATE_RUN_AS_USER", raising=False)
     monkeypatch.delenv("AI_FACTORY_CODE_WORKER_RUN_AS_USER", raising=False)
     with pytest.raises(CommandGateError, match="Production gates require"):
@@ -185,3 +188,36 @@ def test_production_gate_account_is_required_and_explicit_override_is_respected(
     monkeypatch.setenv("AI_FACTORY_GATE_RUN_AS_USER", str(os.getuid()))
     with pytest.raises(CommandGateError, match="distinct from the orchestrator"):
         CommandGateRunner.from_env(candidate_repo[0], require_candidate=True)
+
+
+@pytest.mark.parametrize("user", ["#0", "0", f"#{os.getuid()}"])
+def test_numeric_gate_account_cannot_select_root_or_service_identity(candidate_repo, monkeypatch, user):
+    monkeypatch.setenv("AI_FACTORY_GATE_RUN_AS_USER", user)
+    with pytest.raises(CommandGateError, match="distinct from the orchestrator"):
+        CommandGateRunner.from_env(candidate_repo[0], require_candidate=True)
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="locked-environment integration requires uv")
+def test_default_gate_rejects_candidate_with_invalid_dependency_lock(candidate_repo):
+    repo, _, _ = candidate_repo
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "gate-fixture"\nversion = "0.0.0"\nrequires-python = ">=3.11"\n'
+        '[project.optional-dependencies]\ndev = []\n'
+    )
+    (repo / "scripts").mkdir()
+    (repo / "scripts/validate_contracts.py").write_text("print('base environment passed')\n")
+    subprocess.run(["uv", "lock", "--offline"], cwd=repo, check=True, capture_output=True)
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "Valid locked environment")
+    passing_base = git(repo, "rev-parse", "HEAD")
+    (repo / "uv.lock").write_text("invalid lockfile [\n")
+    git(repo, "commit", "-am", "Break candidate dependency lock")
+    broken_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", passing_base)
+
+    with CommandGateRunner(repo).for_pr({"delivery_evidence": {"commit_sha": broken_sha}}) as runner:
+        result = runner.run_check({"kind": "contract", "timeout_minutes": 1})
+    assert result.status == "failed"
+    assert "uv.lock" in result.stderr
+    assert "base environment passed" not in result.stdout
+    assert git(repo, "rev-parse", "HEAD") == passing_base
