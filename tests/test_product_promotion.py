@@ -1,5 +1,6 @@
 import subprocess
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,22 @@ from auto_mindsdb_factory.product_task import ProductTask
 from auto_mindsdb_factory.product_promotion import GitHubPromotion, PromotionError
 from auto_mindsdb_factory.product_workspace import git
 from auto_mindsdb_factory.run_journal import RunJournal
+
+
+@pytest.fixture(autouse=True)
+def isolated_promotion_clock(monkeypatch):
+    # Mock retry timing only in the component under test. subprocess uses the
+    # real time module while waiting for Git; altering it can expire a promotion
+    # or report a retry before any HTTP request has even run.
+    monkeypatch.setattr("auto_mindsdb_factory.product_promotion.time",
+                        SimpleNamespace(monotonic=time.monotonic, sleep=time.sleep))
+
+
+def test_retry_clock_does_not_change_subprocess_deadline_waits(monkeypatch):
+    monkeypatch.setattr("auto_mindsdb_factory.product_promotion.time.sleep",
+                        lambda _: pytest.fail("unexpected retry"))
+    subprocess.run(["git", "-c", "alias.wait=!sleep 0.05", "wait"], check=True, timeout=2,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 @pytest.mark.parametrize("state,required,passes", [("success", ["ci"], True), ("pending", ["ci"], False),
