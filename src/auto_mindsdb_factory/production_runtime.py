@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from .agent_runtime import build_agent_connector
 from .automation import AutomationError, AutonomyMode, FactoryAutomationCoordinator
 from .build_review import Stage3BuildReviewPipeline
 from .connectors import (
@@ -16,10 +17,12 @@ from .connectors import (
     CodexCLICodeWorkerConnector,
     GitHubAPIRepoConnector,
     GitHubCLIRepoConnector,
+    FactoryConnectorError,
 )
 from .eval_execution import CommandGateRunner, Stage5EvalPipeline
 from .intake import utc_now
 from .linear_trigger import LinearTriggerWorker
+from .ticketing import Stage2TicketingPipeline
 from .reliability import (
     OperationReaper,
     max_active_runs_from_env,
@@ -115,6 +118,7 @@ class FactoryDoctor:
         checks.extend(
             [
                 self._runtime_boundary_check(),
+                self._agent_check(),
                 self._command_check("git", ["git", "rev-parse", "--is-inside-work-tree"]),
                 self._repo_connector_check(),
                 self._code_worker_command_check(),
@@ -152,6 +156,13 @@ class FactoryDoctor:
             "status": "passed",
             "summary": "set",
         }
+
+    def _agent_check(self) -> dict[str, str]:
+        try:
+            _production_agent(self.config.autonomy_mode)
+        except AutomationError as exc:
+            return {"name": "runtime:agent", "status": "failed", "summary": str(exc)}
+        return {"name": "runtime:agent", "status": "passed", "summary": "agent configuration valid"}
 
     def _runtime_boundary_check(self) -> dict[str, str]:
         if self.config.autonomy_mode is AutonomyMode.PR_READY:
@@ -295,8 +306,11 @@ class FactoryWorker:
                 "AI_FACTORY_ALLOW_SIMULATION_RUNTIME=true is set explicitly."
             )
 
+        agent = _production_agent(self.config.autonomy_mode)
+        stage2 = Stage2TicketingPipeline(self.config.repo_root, agent_connector=agent)
         stage3 = Stage3BuildReviewPipeline(
             self.config.repo_root,
+            agent_connector=agent,
             code_worker_connector=CodexCLICodeWorkerConnector(CodexCLICodeWorkerConfig.from_env()),
             repo_connector=self._repo_connector(),
         )
@@ -307,6 +321,7 @@ class FactoryWorker:
         coordinator = FactoryAutomationCoordinator(
             self.config.store_dir,
             repo_root_override=self.config.repo_root,
+            stage2_pipeline=stage2,
             stage3_pipeline=stage3,
             stage5_pipeline=stage5,
             autonomy_mode=self.config.autonomy_mode,
@@ -359,3 +374,13 @@ class FactoryWorker:
         raise AutomationError(
             "AI_FACTORY_REPO_CONNECTOR_PROVIDER must be 'github_cli' or 'github_api'."
         )
+
+
+def _production_agent(autonomy_mode: AutonomyMode):
+    provider = os.environ.get("AI_FACTORY_AGENT_PROVIDER", "openai").strip()
+    if provider == "none" and autonomy_mode is not AutonomyMode.SIMULATION_FULL:
+        raise AutomationError("Production requires a live agent; AI_FACTORY_AGENT_PROVIDER=none is simulation-only.")
+    try:
+        return build_agent_connector(provider)
+    except FactoryConnectorError as exc:
+        raise AutomationError(f"Could not initialize production agent: {exc}") from exc

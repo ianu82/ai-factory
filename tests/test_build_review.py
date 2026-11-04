@@ -9,7 +9,7 @@ from auto_mindsdb_factory.build_review import (
     BuildReviewConsistencyError,
     Stage3BuildReviewPipeline,
 )
-from auto_mindsdb_factory.connectors import AgentResult
+from auto_mindsdb_factory.connectors import AgentResult, CodeWorkerResult, PullRequestEvidence
 from auto_mindsdb_factory.contracts import load_validators, validation_errors_for
 from auto_mindsdb_factory.controller import ControllerState
 from auto_mindsdb_factory.intake import AnthropicScout, Stage1IntakePipeline, build_manual_intake_item
@@ -19,8 +19,10 @@ from auto_mindsdb_factory.ticketing import Stage2TicketingPipeline
 class ScriptedAgentConnector:
     def __init__(self, outputs: dict[str, dict]) -> None:
         self.outputs = outputs
+        self.tasks = []
 
     def run_task(self, task):
+        self.tasks.append(task)
         return AgentResult(
             name=task.name,
             output_document=self.outputs[task.name],
@@ -254,6 +256,43 @@ def test_stage3_build_review_can_use_agent_drafts() -> None:
         "Confirm that absent GitHub check data downgrades health instead of crashing the cockpit."
         in result.pr_packet["reviewer_report"]["non_blocking_findings"]
     )
+    draft = agent_connector.tasks[0]
+    assert "src/auto_mindsdb_factory/build_review.py" in draft.input_document["repository_context"]["tracked_paths"]
+    assert agent_connector.tasks[1].input_document["review_scope"] == "draft_only"
+
+
+def test_live_code_review_receives_candidate_diff_and_can_block_delivery():
+    root = Path(__file__).resolve().parents[1]
+    source = stage2_manual_issue_result(root)
+    sha = "a" * 40
+    patch = "diff --git a/module.py b/module.py\n+raise RuntimeError('broken candidate')\n"
+
+    class Repo:
+        def create_code_worker_pull_request(self, **kwargs):
+            evidence = PullRequestEvidence("ianu82/ai-factory", "candidate", "main", sha, 1,
+                "https://github.com/ianu82/ai-factory/pull/1", "Candidate")
+            result = CodeWorkerResult("succeeded", "codex_cli", "test", ["codex"], ["module.py"],
+                "1 file", "", "", "2026-04-22T12:00:00Z", "2026-04-22T12:00:00Z", 0)
+            return evidence, result
+
+        def read_candidate_diff(self, commit_sha):
+            assert commit_sha == sha
+            return patch
+
+    agent = ScriptedAgentConnector({
+        "stage3_pr_draft": {"what_changed": ["Update module"], "key_risks": [], "changed_paths": ["module.py"]},
+        "stage3_pr_review": {"blocking_findings": ["Candidate always raises an exception."], "non_blocking_findings": []},
+    })
+    result = Stage3BuildReviewPipeline(
+        root, agent_connector=agent, code_worker_connector=object(), repo_connector=Repo(),
+    ).process(source.spec_packet, source.policy_decision, source.ticket_bundle,
+        source.eval_manifest, source.work_item, repository="ianu82/ai-factory")
+    review = next(task for task in agent.tasks if task.name == "stage3_pr_review")
+    assert review.input_document["review_scope"] == "candidate_diff"
+    assert review.input_document["candidate_diff"] == patch
+    assert result.work_item.state is ControllerState.PR_REVISION
+    assert result.pr_packet["reviewer_report"]["approved"] is False
+    assert result.pr_packet["changed_paths"] == ["module.py"]
 
 
 def test_stage3_build_review_can_resume_from_pr_revision() -> None:
