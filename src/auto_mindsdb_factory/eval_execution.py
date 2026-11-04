@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import re
-import os
-import shlex
-import subprocess
-import sys
-import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+from .command_gates import CommandGateError, CommandGateRunner, GateResult
 from .contracts import load_validators, validation_errors_for
 from .controller import ControllerEvent, ControllerState, FactoryController, WorkItem
 from .eval_common import deferred_tiers, merge_gate_tiers
@@ -27,145 +24,6 @@ class EvalExecutionEligibilityError(EvalExecutionError):
 
 class EvalExecutionConsistencyError(EvalExecutionError):
     """Raised when Stage 4 artifacts disagree about the work item being evaluated."""
-
-
-@dataclass(slots=True)
-class GateResult:
-    check_kind: str
-    status: str
-    command: list[str] | None
-    exit_code: int | None
-    stdout: str
-    stderr: str
-    duration_seconds: int
-    summary: str
-
-    def to_document(self) -> dict[str, Any]:
-        return {
-            "check_kind": self.check_kind,
-            "status": self.status,
-            "command": None if self.command is None else list(self.command),
-            "exit_code": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "duration_seconds": self.duration_seconds,
-            "summary": self.summary,
-        }
-
-
-class CommandGateRunner:
-    """Run the subset of eval checks that are backed by real local commands."""
-
-    MAX_CAPTURED_OUTPUT_CHARS = 4000
-    DEFAULT_COMMANDS = {
-        "unit": [sys.executable, "-m", "pytest", "-q"],
-        "contract": [sys.executable, "scripts/validate_contracts.py"],
-    }
-    ENV_COMMANDS = {
-        "lint": "AI_FACTORY_GATE_LINT_COMMAND",
-        "typecheck": "AI_FACTORY_GATE_TYPECHECK_COMMAND",
-        "unit": "AI_FACTORY_GATE_UNIT_COMMAND",
-        "contract": "AI_FACTORY_GATE_CONTRACT_COMMAND",
-        "integration": "AI_FACTORY_GATE_INTEGRATION_COMMAND",
-        "migration_safety": "AI_FACTORY_GATE_MIGRATION_SAFETY_COMMAND",
-    }
-
-    def __init__(
-        self,
-        repo_root: Path,
-        *,
-        commands_by_kind: dict[str, list[str]] | None = None,
-        required_kinds: set[str] | None = None,
-        timeout_seconds: int = 900,
-    ) -> None:
-        self.repo_root = repo_root.resolve()
-        self.commands_by_kind = commands_by_kind or dict(self.DEFAULT_COMMANDS)
-        self.required_kinds = required_kinds or {"unit", "contract"}
-        self.timeout_seconds = timeout_seconds
-
-    @classmethod
-    def from_env(cls, repo_root: Path) -> "CommandGateRunner":
-        commands = dict(cls.DEFAULT_COMMANDS)
-        for kind, env_name in cls.ENV_COMMANDS.items():
-            raw = os.environ.get(env_name, "").strip()
-            if raw:
-                commands[kind] = shlex.split(raw)
-        required_raw = os.environ.get("AI_FACTORY_REQUIRED_GATE_KINDS", "unit,contract")
-        required = {item.strip() for item in required_raw.split(",") if item.strip()}
-        timeout = int(os.environ.get("AI_FACTORY_GATE_TIMEOUT_SECONDS", "900"))
-        return cls(repo_root, commands_by_kind=commands, required_kinds=required, timeout_seconds=timeout)
-
-    def is_blocking_kind(self, kind: str) -> bool:
-        return kind in self.required_kinds
-
-    def run_check(self, check: dict[str, Any]) -> GateResult:
-        kind = str(check["kind"])
-        command = self.commands_by_kind.get(kind)
-        if not command:
-            return GateResult(
-                check_kind=kind,
-                status="not_configured",
-                command=None,
-                exit_code=None,
-                stdout="",
-                stderr="",
-                duration_seconds=0,
-                summary=f"No command-backed gate is configured for {kind}.",
-            )
-        try:
-            started = time.monotonic()
-            completed = subprocess.run(
-                command,
-                cwd=self.repo_root,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=min(self.timeout_seconds, int(check["timeout_minutes"]) * 60),
-            )
-            duration = max(0, int(round(time.monotonic() - started)))
-            status = "passed" if completed.returncode == 0 else "failed"
-            return GateResult(
-                check_kind=kind,
-                status=status,
-                command=list(command),
-                exit_code=completed.returncode,
-                stdout=self._captured_output(completed.stdout),
-                stderr=self._captured_output(completed.stderr),
-                duration_seconds=duration,
-                summary=(
-                    f"Command-backed gate passed: {' '.join(command)}."
-                    if status == "passed"
-                    else f"Command-backed gate failed: {' '.join(command)}."
-                ),
-            )
-        except subprocess.TimeoutExpired as exc:
-            return GateResult(
-                check_kind=kind,
-                status="failed",
-                command=list(command),
-                exit_code=124,
-                stdout=self._captured_output(exc.stdout if isinstance(exc.stdout, str) else ""),
-                stderr=self._captured_output(exc.stderr if isinstance(exc.stderr, str) else str(exc)),
-                duration_seconds=min(self.timeout_seconds, int(check["timeout_minutes"]) * 60),
-                summary=f"Command-backed gate timed out: {' '.join(command)}.",
-            )
-        except OSError as exc:
-            return GateResult(
-                check_kind=kind,
-                status="failed",
-                command=list(command),
-                exit_code=127,
-                stdout="",
-                stderr=str(exc),
-                duration_seconds=0,
-                summary=f"Command-backed gate could not start: {' '.join(command)}.",
-            )
-
-    @classmethod
-    def _captured_output(cls, output: str) -> str:
-        if len(output) <= cls.MAX_CAPTURED_OUTPUT_CHARS:
-            return output
-        return output[-cls.MAX_CAPTURED_OUTPUT_CHARS :]
 
 
 @dataclass(slots=True)
@@ -228,6 +86,19 @@ class EvalRunner:
     def __init__(self, *, gate_runner: CommandGateRunner | None = None) -> None:
         self.gate_runner = gate_runner
 
+    @contextmanager
+    def for_pr(self, pr_packet: dict[str, Any]) -> Iterator["EvalRunner"]:
+        if self.gate_runner is None:
+            if pr_packet.get("delivery_evidence"):
+                raise EvalExecutionError("A delivered PR requires command-backed candidate evals.")
+            yield self
+            return
+        try:
+            with self.gate_runner.for_pr(pr_packet) as gates:
+                yield EvalRunner(gate_runner=gates)
+        except CommandGateError as exc:
+            raise EvalExecutionError(str(exc)) from exc
+
     def build_eval_report(
         self,
         spec_packet: dict[str, Any],
@@ -250,6 +121,14 @@ class EvalRunner:
         policy_artifact = policy_decision["artifact"]
         merge_tiers = merge_gate_tiers(eval_manifest)
         deferred = deferred_tiers(eval_manifest)
+        if self.gate_runner is not None:
+            present_kinds = {
+                check["kind"] for tier in eval_manifest["tiers"] if tier["name"] in merge_tiers
+                for check in tier["checks"]
+            }
+            missing = self.gate_runner.required_kinds - present_kinds
+            if missing:
+                raise EvalExecutionError(f"Required gate kinds missing from merge manifest: {', '.join(sorted(missing))}.")
         tier_results: list[dict[str, Any]] = []
         failing_merge_tiers: list[str] = []
         failing_check_ids_out: list[str] = []
@@ -278,9 +157,9 @@ class EvalRunner:
                 check_results.append(result)
                 if result["status"] == "failed":
                     failing_check_ids_out.append(result["id"])
-                    if check["required"] and merge_gate and self._blocks_merge(check):
+                    if result["required"] and merge_gate:
                         required_failure = True
-                    elif not check["required"]:
+                    elif not result["required"]:
                         optional_failure = True
                         warning_count += 1
                 elif result["status"] == "passed":
@@ -290,7 +169,7 @@ class EvalRunner:
                     pending_check_ids.append(result["id"])
                 elif result["status"] == "not_configured":
                     not_configured_check_ids.append(result["id"])
-                    if check["required"] and merge_gate and self._blocks_merge(check):
+                    if result["required"] and merge_gate:
                         required_failure = True
                 else:
                     pending_check_ids.append(result["id"])
@@ -324,6 +203,14 @@ class EvalRunner:
         )
         resulting_pr_artifact_version = evaluated_pr_artifact_version + 1
         return {
+            "execution": {
+                "mode": (
+                    "simulation" if self.gate_runner is None
+                    else "candidate_commit" if self.gate_runner.commit_sha
+                    else "working_tree"
+                ),
+                **({"commit_sha": self.gate_runner.commit_sha} if self.gate_runner and self.gate_runner.commit_sha else {}),
+            },
             "artifact": {
                 "id": artifact_id,
                 "version": 1,
@@ -461,7 +348,7 @@ class EvalRunner:
                 "id": check["id"],
                 "name": check["name"],
                 "kind": check["kind"],
-                "required": check["required"],
+                "required": self._required(check),
                 "status": "deferred",
                 "duration_seconds": 0,
                 "summary": f"{tier_name} is deferred to a later stage.",
@@ -474,7 +361,7 @@ class EvalRunner:
                 "id": check["id"],
                 "name": check["name"],
                 "kind": check["kind"],
-                "required": check["required"],
+                "required": self._required(check),
                 "status": gate.status,
                 "duration_seconds": gate.duration_seconds,
                 "summary": gate.summary,
@@ -516,7 +403,7 @@ class EvalRunner:
                 "id": check["id"],
                 "name": check["name"],
                 "kind": check["kind"],
-                "required": check["required"],
+                "required": self._required(check),
                 "status": "failed" if should_fail else "passed",
                 "duration_seconds": duration_seconds,
                 "summary": summary,
@@ -561,7 +448,7 @@ class EvalRunner:
             "id": check["id"],
             "name": check["name"],
             "kind": check["kind"],
-            "required": check["required"],
+            "required": self._required(check),
             "status": "failed" if should_fail else "passed",
             "duration_seconds": duration_seconds,
             "summary": summary,
@@ -583,10 +470,10 @@ class EvalRunner:
                 )
         return blockers
 
-    def _blocks_merge(self, check: dict[str, Any]) -> bool:
-        if self.gate_runner is None:
-            return True
-        return self.gate_runner.is_blocking_kind(str(check["kind"]))
+    def _required(self, check: dict[str, Any]) -> bool:
+        return bool(check["required"]) or (
+            self.gate_runner is not None and self.gate_runner.is_blocking_kind(str(check["kind"]))
+        )
 
     @staticmethod
     def _warning_findings(tiers: list[dict[str, Any]]) -> list[str]:
@@ -738,21 +625,22 @@ class Stage5EvalPipeline:
             work_item.attempt_count,
             evaluated_pr_artifact_version,
         )
-        eval_report = self.eval_runner.build_eval_report(
-            spec_packet,
-            policy_decision,
-            eval_manifest,
-            pr_packet,
-            prompt_contract,
-            tool_schema,
-            golden_dataset,
-            latency_baseline,
-            artifact_id=artifact_id,
-            build_attempt=work_item.attempt_count,
-            evaluated_pr_artifact_version=evaluated_pr_artifact_version,
-            timestamp=timestamp,
-            failing_check_ids=set(failing_check_ids or []),
-        )
+        with self.eval_runner.for_pr(pr_packet) as eval_runner:
+            eval_report = eval_runner.build_eval_report(
+                spec_packet,
+                policy_decision,
+                eval_manifest,
+                pr_packet,
+                prompt_contract,
+                tool_schema,
+                golden_dataset,
+                latency_baseline,
+                artifact_id=artifact_id,
+                build_attempt=work_item.attempt_count,
+                evaluated_pr_artifact_version=evaluated_pr_artifact_version,
+                timestamp=timestamp,
+                failing_check_ids=set(failing_check_ids or []),
+            )
         updated_pr_packet = self.eval_runner.finalize_pr_packet(
             pr_packet,
             eval_report,

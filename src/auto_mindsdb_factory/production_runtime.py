@@ -302,7 +302,7 @@ class FactoryWorker:
         )
         stage5 = Stage5EvalPipeline(
             self.config.repo_root,
-            gate_runner=CommandGateRunner.from_env(self.config.repo_root),
+            gate_runner=CommandGateRunner.from_env(self.config.repo_root, require_candidate=True),
         )
         coordinator = FactoryAutomationCoordinator(
             self.config.store_dir,
