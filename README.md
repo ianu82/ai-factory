@@ -13,6 +13,7 @@ criteria. Automatic promotion requires current evidence, the tested base, GitHub
 merge confirmation and fresh post-merge smoke checks.
 
 - [Product workflow, commands and supported boundaries](docs/product-delivery-plan.md)
+- [Opt-in Linear product delivery](docs/linear-product-delivery.md)
 - [Verified end-to-end milestone](docs/product-delivery-milestone.md)
 - [Architecture and staged-runtime compatibility](docs/ai-factory-architecture.md)
 
