@@ -25,7 +25,7 @@ def git(root: Path, *args: str) -> str:
     )
     if result.returncode:
         raise WorkspaceError(f"Git operation failed: {args[0]}")
-    return result.stdout.strip()
+    return result.stdout.rstrip("\n")
 
 
 @contextmanager
