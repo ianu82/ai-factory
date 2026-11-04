@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "team_id": "7717d7c6-f63c-4056-b1cd-72a9400c181b",
+  "queued_state_id": "67a279df-ee75-4795-9449-ad36835f3fb6",
+  "required_label": "factory-auto",
+  "acceptance_criteria": [
+    {
+      "id": "requirements-and-public-contract",
+      "description": "Implement the issue requirements in a small cohesive change, preserve existing behavior and pass the full configured regressions/contracts. Independently investigate requirement fulfillment; report unresolved ambiguity rather than inventing success. Source exports report documented unavailable Git/Docker capabilities as skips; actual Git/Docker CI remains required before merge. The real public validation CLI must retain resolved model defaults/overrides and canonical status/repository/profile fields. This is implementation readiness; production behavior is separately verified by the controller.",
+      "command": [
+        ".venv/bin/python",
+        "-c",
+        "\"\"\"Exercise the actual public CLI with real Git origins and external profiles.\"\"\"\nimport contextlib\nimport io\nimport json\nimport subprocess\nimport tempfile\nfrom pathlib import Path\n\nfrom auto_mindsdb_factory.__main__ import main\nfrom auto_mindsdb_factory.product_profile import ProductProfile\n\nwith tempfile.TemporaryDirectory() as directory:\n    root = Path(directory)\n    target = root / 'target'\n    target.mkdir()\n    subprocess.run(['git', 'init', '-q', str(target)], check=True)\n    subprocess.run(['git', '-C', str(target), 'remote', 'add', 'origin',\n                    'https://github.com/example/product.git'], check=True)\n    for overrides, expected in [({}, ('gpt-6.1-terra', 'gpt-6.1-terra')),\n            ({'builder_model': 'only-builder'}, ('only-builder', 'gpt-6.1-terra')),\n            ({'reviewer_model': 'only-reviewer'}, ('gpt-6.1-terra', 'only-reviewer')),\n            ({'builder_model': 'explicit-builder', 'reviewer_model': 'explicit-reviewer'},\n             ('explicit-builder', 'explicit-reviewer'))]:\n        document = {'version': 1, 'name': 'acceptance', 'repository': 'example/product',\n                    'image': 'python@sha256:' + 'a' * 64,\n                    'checks': {'test': ['true']}, 'smoke': [['true']], **overrides}\n        profile_path = root / 'profile.json'\n        profile_path.write_text(json.dumps(document))\n        output = io.StringIO()\n        with contextlib.redirect_stdout(output):\n            status = main(['product-validate', '--profile', str(profile_path),\n                           '--target-root', str(target)])\n        result = json.loads(output.getvalue())\n        assert status == 0, result\n        assert result['status'] == 'valid'\n        assert result['repository'] == 'example/product'\n        assert result['profile_sha'] == ProductProfile.from_document(document).digest\n        assert (result['builder_model'], result['reviewer_model']) == expected, result\nprint('Effective models and existing validation fields verified through the actual CLI')\n"
+      ]
+    }
+  ]
+}

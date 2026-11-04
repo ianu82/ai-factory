@@ -159,6 +159,21 @@ def test_linear_once_routes_trusted_config_and_credentials(linear_cli, tmp_path,
     assert json.loads(capsys.readouterr().out)["results"][0]["status"] == "complete"
 
 
+def test_linear_railway_runner_requires_explicit_selection(linear_cli, monkeypatch):
+    from auto_mindsdb_factory.railway_runner import RailwayDelivery
+    argv, calls, _, _, _ = linear_cli
+    monkeypatch.setenv("LINEAR_API_KEY", "key")
+    selected = []
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            selected.append(kwargs["delivery_factory"])
+        def run_cycle(self, max_issues):
+            return []
+    monkeypatch.setattr(product_commands, "LinearProductWorker", Worker)
+    assert main(argv + ["--runner", "railway", "--once"]) == 0
+    assert selected == [RailwayDelivery]
+
+
 def test_linear_process_credential_wins_and_target_env_never_loaded(linear_cli, tmp_path, monkeypatch):
     argv, calls, target, _, _ = linear_cli
     monkeypatch.chdir(target)

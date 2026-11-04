@@ -1,0 +1,10 @@
+.git
+.venv
+**/node_modules
+**/__pycache__
+.pytest_cache
+.factory-automation
+.env
+.env.*
+!.env.example
+tmp-*.json

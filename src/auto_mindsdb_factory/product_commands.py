@@ -59,6 +59,7 @@ def register_product_commands(subparsers) -> None:
     linear.add_argument("--once", action="store_true")
     linear.add_argument("--poll-seconds", type=_bounded_int(5, 3600), default=60)
     linear.add_argument("--max-issues", type=_bounded_int(1, 100), default=1)
+    linear.add_argument("--runner", choices=["docker", "railway"], default="docker")
     inspect = subparsers.add_parser("product-inspect")
     inspect.add_argument("--store-dir", type=Path, required=True)
     inspect.add_argument("--run-id", required=True)
@@ -121,7 +122,11 @@ def handle_product_command(args, *, parse_env) -> int | None:
                     api_key=api_key,
                 )
                 client = LinearProductClient(config)
-                worker = LinearProductWorker(profile, args.target_root, args.store_dir, route, client)
+                options = {}
+                if args.runner == "railway":
+                    from .railway_runner import RailwayDelivery
+                    options["delivery_factory"] = RailwayDelivery
+                worker = LinearProductWorker(profile, args.target_root, args.store_dir, route, client, **options)
                 while True:
                     results = worker.run_cycle(max_issues=args.max_issues)
                     print(json.dumps({"results": results}), flush=True)
