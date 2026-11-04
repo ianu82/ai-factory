@@ -16,6 +16,8 @@ class RunnerError(RuntimeError):
 
 
 class DockerSandbox:
+    MAX_CAPTURED_OUTPUT_BYTES = 12000
+
     def __init__(self, workspace: Path, image: str, *, writable: bool = False,
                  network: bool = False, timeout: int = 300, platform: str | None = None) -> None:
         if not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}", image):
@@ -75,9 +77,11 @@ class DockerSandbox:
         except OSError as exc:
             raise RunnerError("Could not start sandbox command") from exc
         captured = {"stdout": b"", "stderr": b""}
+        sizes = {"stdout": 0, "stderr": 0}
         def drain(name, stream):
             while chunk := stream.read(4096):
-                captured[name] = (captured[name] + chunk)[-12000:]
+                sizes[name] += len(chunk)
+                captured[name] = (captured[name] + chunk)[-self.MAX_CAPTURED_OUTPUT_BYTES:]
             stream.close()
         def feed():
             try:
@@ -102,6 +106,8 @@ class DockerSandbox:
             thread.join(timeout=10)
         return {"command": command, "exit_code": exit_code,
                 **{name: value.decode("utf-8", errors="replace") for name, value in captured.items()},
+                **{name + "_bytes": size for name, size in sizes.items()},
+                **{name + "_truncated": sizes[name] > len(captured[name]) for name in captured},
                 "duration_seconds": round(time.monotonic() - started, 3)}
 
     def _remove(self) -> None:
