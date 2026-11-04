@@ -33,7 +33,8 @@ jobs:
         run: uv run --locked python scripts/validate_contracts.py
 
       - name: Run tests
-        run: timeout 300 uv run --locked pytest -q
+        # The complete suite exceeds five minutes on slower hosted runners.
+        run: timeout 420 uv run --locked pytest -q
 
   sandbox:
     runs-on: ubuntu-latest
