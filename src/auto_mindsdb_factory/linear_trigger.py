@@ -1328,6 +1328,10 @@ class LinearGraphQLClient:
             "state": _optional_entity(issue.get("state")),
         }
 
+    def _validate_envelope(self, payload: Any) -> None:
+        """Subclass hook; retain the legacy transport response semantics."""
+        pass
+
     def _execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         request_payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
         request = urllib_request.Request(
@@ -1357,6 +1361,7 @@ class LinearGraphQLClient:
             raise LinearGraphQLClientError(
                 "Linear GraphQL response was not valid JSON."
             ) from exc
+        self._validate_envelope(payload)
         errors = payload.get("errors")
         if isinstance(errors, list) and errors:
             messages = ", ".join(

@@ -21,8 +21,12 @@ def route_document():
     }
 
 
-@pytest.fixture
-def route(route_document):
+@pytest.fixture(params=[1, 2])
+def route(route_document, request):
+    if request.param == 2:
+        route_document["version"] = 2
+        for key in ("building_state_id", "completed_state_id", "blocked_state_id"):
+            del route_document[key]
     return LinearProductRoute.from_document(route_document)
 
 
@@ -168,3 +172,34 @@ def test_route_load_requires_external_file_including_symlinks(tmp_path, route_do
     bad.write_text("{")
     with pytest.raises(ValueError):
         LinearProductRoute.load(bad, target_root=target)
+
+
+def test_v2_policy_schema_and_external_loading(tmp_path, route_document):
+    route_document["version"] = 2
+    for key in ("building_state_id", "completed_state_id", "blocked_state_id"):
+        del route_document[key]
+    route = LinearProductRoute.from_document(route_document)
+    assert route.digest == LinearProductRoute.from_document(dict(reversed(list(route_document.items())))).digest
+    path = tmp_path / "route.json"
+    path.write_text(json.dumps(route_document))
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert LinearProductRoute.load(path, target_root=target) == route
+    with pytest.raises(ValueError):
+        LinearProductRoute.load(path, target_root=tmp_path)
+    for key in route_document:
+        with pytest.raises(ValueError):
+            LinearProductRoute.from_document({k: v for k, v in route_document.items() if k != key})
+    for key in ("building_state_id", "completed_state_id", "blocked_state_id", "extra"):
+        with pytest.raises(ValueError):
+            LinearProductRoute.from_document({**route_document, key: "unexpected"})
+    for change in ({"version": 3}, {"version": True}, {"team_id": " "},
+                   {"queued_state_id": ""}, {"required_label": ""}, {"acceptance_criteria": []},
+                   {"acceptance_criteria": route_document["acceptance_criteria"] * 2}):
+        with pytest.raises(ValueError):
+            LinearProductRoute.from_document({**route_document, **change})
+    original = route.digest
+    route_document["acceptance_criteria"][0]["command"].append("attack")
+    route.document["acceptance_criteria"].clear()
+    assert route.digest == original
+    assert route.document["acceptance_criteria"][0]["command"] == ["pytest", "-q"]

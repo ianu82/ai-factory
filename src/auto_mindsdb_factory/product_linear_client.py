@@ -10,14 +10,33 @@ from .product_linear_intake import LinearProductRoute
 
 
 class LinearProductClient(LinearGraphQLClient):
-    def queued_issue_ids(self, route: LinearProductRoute, limit: int = 10) -> list[str]:
+    def _validate_envelope(self, payload):
+        if not isinstance(payload, dict):
+            raise LinearGraphQLClientError("Linear response must be an object")
+        if "errors" in payload and (not isinstance(payload["errors"], list) or not payload["errors"]):
+            raise LinearGraphQLClientError("Invalid Linear GraphQL errors envelope")
+
+    def update_issue_state(self, issue_id: str, state_id: str):
+        raise LinearGraphQLClientError("Product delivery preserves human workflow state")
+
+    def queued_issue_ids(self, route: LinearProductRoute, limit: int = 10,
+                         *, exclude_ids: list[str] | None = None) -> list[str]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("Linear queue limit must be an integer from 1 to 100")
+        excluded = [] if exclude_ids is None else exclude_ids
+        if not isinstance(excluded, list) or len(excluded) > 10000 or any(
+            not isinstance(value, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) for value in excluded
+        ):
+            raise ValueError("Excluded issue IDs must be a bounded list of UUIDs")
+        excluded = [str(UUID(value)) for value in excluded]
+        if len(excluded) != len(set(excluded)):
+            raise ValueError("Excluded issue IDs must be unique")
         config = route.document
         data = self._execute(
             """
-            query ProductLinearQueue($team: ID!, $state: ID!, $label: String!, $limit: Int!) {
-              issues(first: $limit, filter: {team: {id: {eq: $team}},
+            query ProductLinearQueue($team: ID!, $state: ID!, $label: String!, $limit: Int!, $excluded: [ID!]!) {
+              issues(first: $limit, filter: {id: {nin: $excluded}, team: {id: {eq: $team}},
                 state: {id: {eq: $state}}, labels: {some: {name: {eq: $label}}}}) {
                 nodes { id identifier }
                 pageInfo { hasNextPage endCursor }
@@ -25,7 +44,7 @@ class LinearProductClient(LinearGraphQLClient):
             }
             """,
             {"team": config["team_id"], "state": config["queued_state_id"],
-             "label": config["required_label"], "limit": limit},
+             "label": config["required_label"], "limit": limit, "excluded": excluded},
         )
         connection = data.get("issues") if isinstance(data, dict) else None
         if not isinstance(connection, dict):
@@ -44,10 +63,58 @@ class LinearProductClient(LinearGraphQLClient):
                     or not isinstance(node.get("identifier"), str) or not node["identifier"].strip()):
                 raise LinearGraphQLClientError("Invalid Linear issue node")
             issue_id = str(UUID(node["id"]))
-            if issue_id in ids:
-                raise LinearGraphQLClientError("Duplicate Linear issue ID")
+            if issue_id in ids or issue_id in excluded:
+                raise LinearGraphQLClientError("Duplicate or excluded Linear issue ID")
             ids.append(issue_id)
         return ids
+
+    def create_comment(self, issue_id: str, body: str) -> str:
+        # Requirements are frozen: even an Entity not found error must not fall
+        # back to the legacy description update.
+        try:
+            data = self._execute(
+                """mutation FactoryLinearComment($issueId: String!, $body: String!) {
+                  commentCreate(input: {issueId: $issueId, body: $body}) {
+                    success comment { id }
+                  }
+                }""",
+                {"issueId": issue_id, "body": body},
+            )
+        except AttributeError as exc:
+            # The inherited transport assumes the JSON envelope is an object.
+            raise LinearGraphQLClientError("Invalid Linear comment response") from exc
+        payload = data.get("commentCreate") if isinstance(data, dict) else None
+        comment = payload.get("comment") if isinstance(payload, dict) else None
+        comment_id = comment.get("id") if isinstance(comment, dict) else None
+        if (not isinstance(payload, dict) or payload.get("success") is not True
+                or not isinstance(comment_id, str) or not comment_id.strip()):
+            raise LinearGraphQLClientError("Invalid Linear commentCreate response")
+        return comment_id
+
+    def fetch_team_states(self, team_id: str) -> list[dict]:
+        # The legacy reader filters malformed nodes. Inspect the raw connection
+        # here so a malformed duplicate cannot hide a contradictory state.
+        data = self._execute(
+            """query FactoryLinearTeamStates($id: String!) {
+              team(id: $id) { id states(first: 250) {
+                nodes { id name type } pageInfo { hasNextPage }
+              } }
+            }""", {"id": team_id},
+        )
+        team = data.get("team") if isinstance(data, dict) else None
+        connection = team.get("states") if isinstance(team, dict) else None
+        if (not isinstance(team, dict) or team.get("id") != team_id
+                or not isinstance(connection, dict)
+                or not isinstance(connection.get("nodes"), list)
+                or not isinstance(connection.get("pageInfo"), dict)
+                or connection["pageInfo"].get("hasNextPage") is not False):
+            raise LinearGraphQLClientError("Invalid Linear team states")
+        nodes = connection["nodes"]
+        if len(nodes) > 250 or any(not isinstance(node, dict) or any(
+                not isinstance(node.get(key), str) or not node[key].strip()
+                for key in ("id", "name", "type")) for node in nodes):
+            raise LinearGraphQLClientError("Invalid Linear team states")
+        return nodes
 
     def validate_route(self, route: LinearProductRoute) -> None:
         config = route.document
@@ -60,10 +127,11 @@ class LinearProductClient(LinearGraphQLClient):
                     or not state["id"].strip() or state["id"] in by_id):
                 raise LinearGraphQLClientError("Invalid Linear team states")
             by_id[state["id"]] = state.get("type")
-        for field, allowed in (("queued_state_id", {"unstarted", "backlog"}),
-                               ("building_state_id", {"started"}),
-                               ("blocked_state_id", {"started"}),
-                               ("completed_state_id", {"completed"})):
+        fields = [("queued_state_id", {"unstarted", "backlog"})]
+        if config["version"] == 1:
+            fields += [("building_state_id", {"started"}), ("blocked_state_id", {"started"}),
+                       ("completed_state_id", {"completed"})]
+        for field, allowed in fields:
             state_type = by_id.get(config[field])
             if not isinstance(state_type, str) or state_type not in allowed:
                 raise LinearGraphQLClientError(f"Invalid Linear route state: {field}")

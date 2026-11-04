@@ -24,12 +24,15 @@ _STATE_FIELDS = ("queued_state_id", "building_state_id", "completed_state_id", "
 _NONEMPTY = {"type": "string", "minLength": 1, "pattern": r"\S"}
 _ROUTE_SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["version", "team_id", *_STATE_FIELDS, "required_label", "acceptance_criteria"],
+    "required": ["version", "team_id", "queued_state_id", "required_label", "acceptance_criteria"],
     "properties": {
-        "version": {"type": "integer", "const": 1},
+        "version": {"type": "integer", "enum": [1, 2]},
         **{key: _NONEMPTY for key in ("team_id", *_STATE_FIELDS, "required_label")},
         "acceptance_criteria": TASK_SCHEMA["properties"]["acceptance_criteria"],
     },
+    "allOf": [{"if": {"properties": {"version": {"const": 1}}},
+               "then": {"required": list(_STATE_FIELDS)},
+               "else": {"not": {"anyOf": [{"required": [key]} for key in _STATE_FIELDS[1:]]}}}],
 }
 
 
@@ -44,7 +47,7 @@ class LinearProductRoute:
         errors = list(Draft202012Validator(_ROUTE_SCHEMA).iter_errors(document))
         if errors:
             raise ValueError("Invalid Linear product route") from errors[0]
-        states = [document[key] for key in _STATE_FIELDS]
+        states = [document[key] for key in _STATE_FIELDS if key in document]
         if len(set(states)) != len(states):
             raise ValueError("Linear route state IDs must be distinct")
         # Reuse ProductTask's additional uniqueness check as well as its schema.
