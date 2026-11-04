@@ -35,3 +35,26 @@ def test_timeout_destroys_container_and_output_is_bounded(tmp_path):
         result = sandbox.run(["node", "-e", "setTimeout(()=>{},20000)"])
         assert result["exit_code"] == 124
         assert subprocess.run(["docker", "inspect", sandbox.name], capture_output=True).returncode != 0
+
+
+@pytest.mark.skipif(not os.environ.get("AI_FACTORY_TEST_IMAGE"), reason="requires Docker")
+def test_real_railway_driver_confirms_isolation_and_container_removal(tmp_path, monkeypatch):
+    from uuid import uuid4
+    from auto_mindsdb_factory import railway_remote
+    monkeypatch.setattr(railway_remote, "WORKSPACE", tmp_path)
+    (tmp_path / "source.txt").write_text("immutable")
+    options = {"name": "ai-factory-" + uuid4().hex, "image": os.environ["AI_FACTORY_TEST_IMAGE"],
+               "writable": False, "network": False, "timeout": 5, "platform": None}
+    request = {"sandbox": options}
+    try:
+        railway_remote.dispatch({**request, "action": "enter"})
+        result = railway_remote.dispatch({**request, "action": "run", "command": ["sh", "-c",
+            "test $(id -u) != 0 && test ! -S /var/run/docker.sock && ! touch /workspace/source.txt && ! touch /etc/probe"]})
+        assert result["exit_code"] == 0, result
+        assert (tmp_path / "source.txt").read_text() == "immutable"
+        with monkeypatch.context() as failed_removal:
+            failed_removal.setattr(DockerSandbox, "_remove", lambda _: None)
+            with pytest.raises(RunnerError, match="not confirmed"):
+                railway_remote.dispatch({**request, "action": "exit"})
+    finally:
+        railway_remote.dispatch({**request, "action": "exit"})

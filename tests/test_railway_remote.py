@@ -34,20 +34,16 @@ def test_remote_rejects_shell_in_container_identity():
         railway_remote.dispatch({"action": "exit", "sandbox": {"name": "container; touch /tmp/escape"}})
 
 
-def test_remote_uses_existing_docker_policy(tmp_path, monkeypatch):
-    image = os.environ.get("AI_FACTORY_TEST_IMAGE")
-    if not image:
-        pytest.skip("Set AI_FACTORY_TEST_IMAGE for real Docker execution")
-    monkeypatch.setattr(railway_remote, "WORKSPACE", tmp_path)
-    (tmp_path / "source.txt").write_text("immutable")
-    options = {"name": "ai-factory-" + "a" * 32, "image": image,
-               "writable": False, "network": False, "timeout": 5, "platform": None}
-    request = {"sandbox": options}
-    try:
-        railway_remote.dispatch({**request, "action": "enter"})
-        result = railway_remote.dispatch({**request, "action": "run", "command": ["sh", "-c",
-            "test $(id -u) != 0 && test ! -S /var/run/docker.sock && ! touch /workspace/source.txt && ! touch /etc/probe"]})
-        assert result["exit_code"] == 0, result
-        assert (tmp_path / "source.txt").read_text() == "immutable"
-    finally:
-        railway_remote.dispatch({**request, "action": "exit"})
+def test_unconfirmed_container_removal_cannot_authorize_source_import(monkeypatch):
+    class Unstopped:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __exit__(self):
+            pass  # simulates a daemon refusing rm without the old wrapper raising
+        def _docker(self, *args):
+            return subprocess.CompletedProcess(args, 0, "still-running\n", "")
+    monkeypatch.setattr(railway_remote, "DockerSandbox", Unstopped)
+    with pytest.raises(RunnerError, match="not confirmed"):
+        railway_remote.dispatch({"action": "exit", "sandbox": {
+            "name": "ai-factory-" + "a" * 32, "image": "unused", "writable": False,
+            "network": False, "timeout": 5, "platform": None}})

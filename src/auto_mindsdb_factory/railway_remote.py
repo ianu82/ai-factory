@@ -34,6 +34,9 @@ def dispatch(request):
         return sandbox.run(request["command"], stdin=request.get("stdin"))
     if action == "exit":
         sandbox.__exit__()
+        remaining = sandbox._docker("ps", "--all", "--quiet", "--filter", f"name=^/{name}$")
+        if remaining.stdout.strip():
+            raise RunnerError("Container cleanup was not confirmed")
         return {"removed": True}
     raise RunnerError("Unknown remote operation")
 
