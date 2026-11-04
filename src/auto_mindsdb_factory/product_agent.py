@@ -11,6 +11,7 @@ from jsonschema import validate, ValidationError
 
 from .connectors import OpenAIResponsesAgentConnector
 from .run_journal import RunJournal
+from .product_costs import estimate_cost
 
 
 class AgentSessionError(RuntimeError):
@@ -43,12 +44,13 @@ TOOLS = [
 
 class ProductAgent:
     def __init__(self, connector: OpenAIResponsesAgentConnector, journal: RunJournal,
-                 *, max_turns: int, max_total_tokens: int, deadline: float) -> None:
+                 *, max_turns: int, max_total_tokens: int, deadline: float, pricing: dict | None = None) -> None:
         self.connector = connector
         self.journal = journal
         self.max_turns = max_turns
         self.max_total_tokens = max_total_tokens
         self.deadline = deadline
+        self.pricing = pricing or {}
 
     def run(self, role: str, context: dict[str, Any], command: Callable[[list[str]], dict]) -> dict:
         instructions = (
@@ -92,9 +94,11 @@ class ProductAgent:
             except Exception:
                 self.journal.append("model_failed", role=role, turn=turn + 1, model=body["model"])
                 raise
+            rate = self.pricing.get(payload.get("model"))
             self.journal.append("model_response", role=role, turn=turn + 1,
                 response_id=payload.get("id"), model=payload.get("model"), usage=payload.get("usage"),
-                duration_seconds=round(time.monotonic() - started, 3))
+                duration_seconds=round(time.monotonic() - started, 3),
+                cost_estimate_usd=estimate_cost(payload.get("usage"), rate), pricing=rate)
             if payload.get("status") != "completed":
                 raise AgentSessionError("Model response did not complete")
             if not self.journal.summary()["usage_complete"]:

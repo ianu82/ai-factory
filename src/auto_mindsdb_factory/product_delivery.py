@@ -48,7 +48,7 @@ class ProductDelivery:
             raise DeliveryError("Product delivery requires pinned role models; fallback routing is not enabled")
         return ProductAgent(OpenAIResponsesAgentConnector(config), journal,
             max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
-            deadline=self.deadline)
+            deadline=self.deadline, pricing=self.settings["pricing"])
 
     def _command(self, sandbox, command: list[str]) -> dict:
         remaining = self.deadline - time.monotonic()
@@ -62,7 +62,7 @@ class ProductDelivery:
         original = source_files(workspace)
         if self.settings["setup"]:
             with self.sandbox_factory(workspace, self.settings["image"], writable=True,
-                                      network=self.settings["setup_network"]) as sandbox:
+                                      network=self.settings["setup_network"], platform=self.settings["platform"]) as sandbox:
                 for command in self.settings["setup"]:
                     result = self._command(sandbox, command)
                     journal.append("setup_command", commit_sha=sha, **result)
@@ -109,7 +109,7 @@ class ProductDelivery:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
             checks = []
-            with self.sandbox_factory(workspace, self.settings["image"], writable=False) as sandbox:
+            with self.sandbox_factory(workspace, self.settings["image"], writable=False, platform=self.settings["platform"]) as sandbox:
                 commands = [(name, command) for name, command in self.settings["checks"].items()]
                 commands += [("acceptance:" + item["id"], item["command"]) for item in task.document["acceptance_criteria"]]
                 for name, command in commands:
@@ -138,7 +138,8 @@ class ProductDelivery:
             replay: dict | None = None) -> dict:
         task_id = task.document["id"]
         journal = RunJournal(self.store, task_id)
-        self.deadline = time.monotonic() + self.settings["max_run_seconds"]
+        started = time.monotonic()
+        self.deadline = started + self.settings["max_run_seconds"]
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
         with locks.run_lease(task_id, ttl_seconds=60, renew_interval_seconds=15) as lease:
             if base_sha is None:
@@ -159,7 +160,7 @@ class ProductDelivery:
                                 original = self._prepare(base_sha, workspace, journal)
                                 context = {**task.public_context, "required_checks": self.settings["checks"],
                                            "allowed_paths": self.settings["allowed_paths"], "revision_feedback": feedback}
-                                with self.sandbox_factory(workspace, self.settings["image"], writable=True) as sandbox:
+                                with self.sandbox_factory(workspace, self.settings["image"], writable=True, platform=self.settings["platform"]) as sandbox:
                                     report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
                                 if report["status"] != "passed":
                                     raise DeliveryError("Builder did not complete the task")
@@ -178,18 +179,18 @@ class ProductDelivery:
                                      "changed_paths": paths, "verification": verification}
                         lease.heartbeat()
                         result = promote(candidate, journal) if promote else {"status": "verified", **candidate}
-                        journal.append("run_finished", status=result["status"])
+                        journal.append("run_finished", status=result["status"], duration_seconds=round(time.monotonic() - started, 3))
                         return {**result, "evidence_dir": str(journal.root), "usage": journal.summary()}
                     raise DeliveryError("No candidate passed independent verification within the attempt budget")
                 except Exception as exc:
-                    journal.append("run_finished", status="blocked", reason=type(exc).__name__)
+                    journal.append("run_finished", status="blocked", reason=type(exc).__name__, duration_seconds=round(time.monotonic() - started, 3))
                     raise
 
     def smoke(self, sha: str, journal: RunJournal) -> None:
         with tempfile.TemporaryDirectory(prefix="ai-factory-smoke-") as temporary:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
-            with self.sandbox_factory(workspace, self.settings["image"], writable=False) as sandbox:
+            with self.sandbox_factory(workspace, self.settings["image"], writable=False, platform=self.settings["platform"]) as sandbox:
                 for index, command in enumerate(self.settings["smoke"], start=1):
                     result = self._command(sandbox, command)
                     journal.append("post_merge_smoke", commit_sha=sha, index=index, **result)

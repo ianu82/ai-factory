@@ -65,13 +65,21 @@ class RunJournal:
         usage = [event["data"].get("usage") for event in events if event["kind"] == "model_response"]
         total = sum(item.get("total_tokens", 0) for item in usage if isinstance(item, dict))
         terminal = [event for event in events if event["kind"] == "run_finished"]
+        responses = [event["data"] for event in events if event["kind"] == "model_response"]
+        usage_complete = (sum(event["kind"] == "model_requested" for event in events) <= len(responses)
+            and not any(event["kind"] == "model_failed" for event in events)
+            and all(isinstance(item, dict) and "total_tokens" in item for item in usage))
+        known_cost = round(sum(item.get("cost_estimate_usd") or 0 for item in responses), 8)
+        cost_complete = usage_complete and all(item.get("cost_estimate_usd") is not None for item in responses)
         return {
             "status": terminal[-1]["data"]["status"] if terminal else "incomplete",
             "attempts": sum(event["kind"] == "attempt_started" for event in events),
             "total_tokens": total,
-            "usage_complete": not any(event["kind"] == "model_failed" for event in events) and all(
-                isinstance(item, dict) and "total_tokens" in item for item in usage),
-            "cost_usd": None,
-            "cost_basis": "unavailable; token usage is recorded without inventing prices",
+            "usage_complete": usage_complete,
+            "duration_seconds": terminal[-1]["data"].get("duration_seconds") if terminal else None,
+            "cost_usd": known_cost if cost_complete else None,
+            "known_inference_cost_usd": known_cost,
+            "cost_complete": cost_complete,
+            "cost_basis": "inference estimate from recorded usage and explicit rates; excludes execution costs and unobserved requests",
             "events": len(events),
         }
