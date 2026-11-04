@@ -1,4 +1,3 @@
-import copy
 import subprocess
 import time
 
@@ -47,6 +46,7 @@ def promotion_case(tmp_path, monkeypatch):
     sha = git(root, "rev-parse", "HEAD")
     tree = git(root, "rev-parse", base + "^{tree}")
     other = subprocess.check_output(["git", "-C", str(root), "commit-tree", tree, "-p", base], input="concurrent\n", text=True).strip()
+    git(root, "push", "origin", f"{other}:refs/heads/concurrent")
     profile = ProductProfile.from_document({"version": 1, "name": "product", "repository": "owner/product",
         "image": "node@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]], "auto_merge": True})
     task = ProductTask.from_document({"id": "task", "title": "Fix", "goal": "fix", "acceptance_criteria": [
