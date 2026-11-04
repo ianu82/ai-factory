@@ -196,7 +196,7 @@ class LinearDeliveryState:
         if not synced:
             journal.append("synced")
 
-    def pending(self):
+    def _journals(self):
         self._safe(self.base, self.delivery)
         if not self.delivery.exists():
             return []
@@ -206,6 +206,16 @@ class LinearDeliveryState:
             if not path.is_dir():
                 raise LinearStateError("Invalid delivery evidence directory")
             journal = self._journal(path.name)
-            if not self._read(journal)[2]:
-                result.append(journal)
+            self._read(journal)
+            result.append(journal)
         return result
+
+    def is_synced(self, journal):
+        return self._read(journal)[2]
+
+    def pending(self):
+        return [journal for journal in self._journals() if not self._read(journal)[2]]
+
+    def claimed_issue_ids(self):
+        """All validated claims, including completed ones, for server-side exclusion."""
+        return [self._read(journal)[0]["issue_id"] for journal in self._journals()]

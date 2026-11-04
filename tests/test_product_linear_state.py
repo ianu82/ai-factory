@@ -241,3 +241,25 @@ def test_lease_rechecks_paths_at_context_entry(inputs, tmp_path):
         with context:
             pass
     assert not outside.exists()
+
+
+def test_claimed_issue_ids_include_synced_and_validate_all(inputs):
+    state, issue, route, profile, task = inputs
+    assert state.claimed_issue_ids() == []
+    with state.lease(issue.id):
+        journal = state.claim(task, issue, route, profile)
+        assert state.claimed_issue_ids() == [issue.id]
+        state.record_outcome(journal, {'status': 'blocked'})
+        state.mark_synced(journal)
+    assert state.pending() == [] and state.claimed_issue_ids() == [issue.id]
+    (journal.root / 'event-000001.json').write_text('{}')
+    with pytest.raises(JournalError):
+        state.claimed_issue_ids()
+
+
+def test_claimed_issue_ids_reject_unsafe_directory(inputs, tmp_path):
+    state, issue, route, profile, task = inputs
+    state.delivery.mkdir(parents=True)
+    (state.delivery / ('linear-' + issue.id)).symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(LinearStateError):
+        state.claimed_issue_ids()
