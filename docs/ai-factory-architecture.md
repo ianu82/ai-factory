@@ -4,7 +4,31 @@ The staged Linear runtime turns accepted issues into draft GitHub PRs with live 
 
 The short product workflow accepts authenticated scoped tasks and trusted product profiles outside candidate source. It implements in disposable containers, independently verifies a pinned commit, and can publish and automatically promote small changes under an explicit profile. GitHub merge confirmation and post-merge smoke evidence are required for completion. See [product delivery](product-delivery-plan.md) for the supported boundary, commands and replay format. Factory-owned schemas/policies remain in the controller repository; product repositories need none of them.
 
-## Production workflow
+## Short product workflow
+
+```mermaid
+flowchart TD
+    Input["Trusted external task + product profile"] --> Build["Disposable source snapshot + builder"]
+    Build --> Commit["Controller: inspect scope + create commit"]
+    Commit --> Checks["Fresh read-only candidate: executable checks"]
+    Checks -->|passed| Review["Independent verifier + prior findings"]
+    Review -->|passed| Publish["Controller: publish PR + current GitHub checks"]
+    Publish --> Promote["Expected-base fast-forward + merge confirmation"]
+    Promote --> Smoke["Fresh post-merge smoke checks"]
+    Smoke --> Complete["Persist complete outcome"]
+    Checks -->|failed| Retry["Bounded revision with concrete evidence"]
+    Review -->|failed or unverified| Retry
+    Retry --> Build
+    Retry -->|budget exhausted| Blocked["Persist blocked outcome"]
+    Promote -->|stale or rejected| Blocked
+    Smoke -->|failed| Blocked
+```
+
+Attempts, commands, reviews, provider usage and outcome events remain in the run
+journal. Failed or unavailable verification cannot authorize promotion. Replays
+have no publication callback. Improvement proposals do not activate themselves.
+
+## Staged Linear workflow
 
 ```mermaid
 flowchart TD

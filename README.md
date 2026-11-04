@@ -1,6 +1,24 @@
-# Auto MindsDB Engineering Factory
+# AI Factory
 
-This repository is the starting point for an agent-first software factory.
+AI Factory implements scoped software tasks, independently verifies the resulting
+commit, and can publish and merge small changes under a trusted product profile.
+
+## Product delivery
+
+The short product workflow uses a target repository without factory schemas or
+policy files. Controller-owned profiles define pinned execution, required checks,
+per-role models, permitted paths and budgets. Implementation runs in a disposable
+container; verification gets a fresh read-only checkout and executable acceptance
+criteria. Automatic promotion requires current evidence, the tested base, GitHub
+merge confirmation and fresh post-merge smoke checks.
+
+- [Product workflow, commands and supported boundaries](docs/product-delivery-plan.md)
+- [Verified end-to-end milestone](docs/product-delivery-milestone.md)
+- [Architecture and staged-runtime compatibility](docs/ai-factory-architecture.md)
+
+Frozen replays retain every repetition and score. Outcome metrics include failed
+delivery attempts in accepted-work cost. Repeated failures can generate bounded
+investigation proposals; proposals do not adopt or execute themselves.
 
 ## Start Here
 
@@ -11,7 +29,7 @@ This repository is the starting point for an agent-first software factory.
 - Lane and eval policies: `factory/policies/`
 - Machine handoff schemas: `schemas/`
 
-## Current Scope
+## Staged workflow
 
 The first implementation target now includes executable Stage 1 through Stage 9 behavior for the `spec -> tickets -> PR -> integration -> eval -> security -> staging -> monitoring -> feedback` lane:
 
@@ -37,7 +55,11 @@ The first implementation target now includes executable Stage 1 through Stage 9 
 20. Run a unified supervisor cycle that can execute Stage 1 intake, progression, and optional weekly feedback in one safe control-plane pass.
 21. Run a first real vertical slice that keeps the deterministic stage contracts but creates real GitHub branch/PR evidence, gates Stage 5 on local eval commands, and drives Stage 7 through Stage 9 from file-backed ops signals.
 
-The first recurring automation layer is now executable through a persisted run store. The production v1 target is a PR-ready factory: Linear triggers, real code-worker branch/PR creation, command-backed local gates, Linear stage sync, and a deliberate stop before human merge/deploy. Staging, monitoring, rollback, and feedback remain simulation-only until real deployment and observability credentials are connected.
+The recurring staged workflow uses a persisted run store. Its Linear worker stops
+at PR-ready: real code-worker branch/PR creation, command-backed local gates and
+Linear stage sync. The separate product workflow above supports automatic merge
+through an explicit profile. Staging, monitoring, rollback and feedback remain
+simulation-only until real deployment and observability integrations are connected.
 
 ## Useful Commands
 
