@@ -151,6 +151,8 @@ Incoming webhook envelopes are persisted under `.factory-automation/linear-trigg
 
 Production v1 uses `factory-worker` rather than cron-style one-shot commands. The worker drains Linear triggers, advances runs, calls `codex exec` in an isolated git worktree, lets the orchestrator inspect the diff, commits/pushes/opens the PR, runs command-backed gates, syncs Linear, and stops before merge/deploy.
 
+The production worker defaults to the OpenAI agent provider for Stage 2 ticket drafting and Stage 3 drafting/review. It uses the same model, fallback, reasoning and timeout settings as one-shot stage commands, and checks them before processing intake. An explicit `AI_FACTORY_AGENT_PROVIDER=none` is accepted only in deliberately enabled simulation mode. Drafting receives a bounded tracked-file inventory and project manifests. Delivered PR review receives the actual candidate diff; an empty or oversized diff blocks review instead of being silently omitted. The PR packet records the worker's actual changed files rather than proposed path hints.
+
 Run the preflight:
 
 - `uv run auto-mindsdb-factory factory-doctor --store-dir .factory-automation --repository ianu82/ai-factory`

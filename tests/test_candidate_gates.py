@@ -9,6 +9,7 @@ import pytest
 
 from auto_mindsdb_factory.command_gates import CommandGateError, CommandGateRunner
 from auto_mindsdb_factory.controller import ControllerState, WorkItem
+from auto_mindsdb_factory.connectors import FactoryConnectorError, GitHubCLIRepoConnector
 from auto_mindsdb_factory.eval_execution import EvalExecutionError, Stage5EvalPipeline
 
 
@@ -119,3 +120,19 @@ def test_delivered_pr_cannot_use_simulated_evals():
     with pytest.raises(EvalExecutionError, match="command-backed"):
         with EvalRunner().for_pr({"delivery_evidence": {"commit_sha": "a" * 40}}):
             pytest.fail("Simulation cannot approve a delivered PR.")
+
+
+def test_code_review_reads_the_pinned_candidate_diff(candidate_repo):
+    repo, base_sha, candidate_sha = candidate_repo
+    git(repo, "update-ref", "refs/remotes/origin/main", base_sha)
+    connector = GitHubCLIRepoConnector(repo, repository="owner/repo")
+    diff = connector.read_candidate_diff(candidate_sha)
+    assert "+VALUE = 'candidate'" in diff
+    assert "-VALUE = 'base'" in diff
+
+
+def test_code_review_refuses_partial_evidence(candidate_repo, monkeypatch):
+    connector = GitHubCLIRepoConnector(candidate_repo[0], repository="owner/repo")
+    monkeypatch.setattr(connector, "_git_stdout", lambda args: "x" * 60001)
+    with pytest.raises(FactoryConnectorError, match="split the work"):
+        connector.read_candidate_diff(candidate_repo[2])

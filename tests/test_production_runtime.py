@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from auto_mindsdb_factory.automation import AutomationError, AutonomyMode
@@ -144,8 +146,9 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
     created: dict[str, object] = {}
 
     class _FakeStage3:
-        def __init__(self, root, *, code_worker_connector=None, repo_connector=None) -> None:
+        def __init__(self, root, *, agent_connector=None, code_worker_connector=None, repo_connector=None) -> None:
             self.root = root
+            self.agent_connector = agent_connector
             self.code_worker_connector = code_worker_connector
             self.repo_connector = repo_connector
 
@@ -181,6 +184,7 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
             store_dir,
             *,
             repo_root_override=None,
+            stage2_pipeline=None,
             stage3_pipeline=None,
             stage5_pipeline=None,
             autonomy_mode=None,
@@ -190,6 +194,7 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
             max_active_runs=None,
         ) -> None:
             self.stage3_pipeline = stage3_pipeline
+            self.stage2_pipeline = stage2_pipeline
             self.stage5_pipeline = stage5_pipeline
             self.linear_workflow_sync = None
             created["coordinator"] = self
@@ -213,6 +218,12 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
             return _Result()
 
     monkeypatch.setenv("AI_FACTORY_CODE_WORKER_PROVIDER", "codex_cli")
+    agent = object()
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.build_agent_connector", lambda provider: agent)
+    monkeypatch.setattr(
+        "auto_mindsdb_factory.production_runtime.Stage2TicketingPipeline",
+        lambda root, *, agent_connector: SimpleNamespace(ticket_architect=SimpleNamespace(agent_connector=agent_connector)),
+    )
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage3BuildReviewPipeline", _FakeStage3)
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage5EvalPipeline", _FakeStage5)
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.CodexCLICodeWorkerConfig", _FakeCodeWorkerConfig)
@@ -237,13 +248,15 @@ def test_factory_worker_uses_production_coordinator_for_linear_handoff(
     assert coordinator.stage3_pipeline.code_worker_connector is not None
     assert coordinator.stage3_pipeline.repo_connector.repository == "ianu82/ai-factory"
     assert coordinator.stage5_pipeline.gate_runner is not None
+    assert coordinator.stage2_pipeline.ticket_architect.agent_connector is agent
+    assert coordinator.stage3_pipeline.agent_connector is agent
 
 
 def test_factory_worker_can_use_github_api_repo_connector(monkeypatch, tmp_path) -> None:
     created: dict[str, object] = {}
 
     class _FakeStage3:
-        def __init__(self, root, *, code_worker_connector=None, repo_connector=None) -> None:
+        def __init__(self, root, *, agent_connector=None, code_worker_connector=None, repo_connector=None) -> None:
             created["repo_connector"] = repo_connector
 
     class _FakeStage5:
@@ -282,6 +295,8 @@ def test_factory_worker_can_use_github_api_repo_connector(monkeypatch, tmp_path)
             return _Result()
 
     monkeypatch.setenv("AI_FACTORY_CODE_WORKER_PROVIDER", "codex_cli")
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.build_agent_connector", lambda provider: object())
+    monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage2TicketingPipeline", lambda *args, **kwargs: object())
     monkeypatch.setenv("AI_FACTORY_REPO_CONNECTOR_PROVIDER", "github_api")
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage3BuildReviewPipeline", _FakeStage3)
     monkeypatch.setattr("auto_mindsdb_factory.production_runtime.Stage5EvalPipeline", _FakeStage5)
@@ -330,3 +345,34 @@ def test_factory_worker_refuses_simulation_mode_without_explicit_override(
 
     with pytest.raises(AutomationError, match="refuses AI_FACTORY_AUTONOMY_MODE=simulation_full"):
         FactoryWorker(config).run_cycle()
+
+
+def test_production_agent_defaults_to_openai_and_preserves_model_settings(monkeypatch, tmp_path):
+    from auto_mindsdb_factory.production_runtime import _production_agent
+
+    monkeypatch.delenv("AI_FACTORY_AGENT_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FACTORY_OPENAI_MODEL", "configured-model")
+    monkeypatch.setenv("AI_FACTORY_OPENAI_REASONING_EFFORT", "high")
+    agent = _production_agent(AutonomyMode.PR_READY)
+    assert agent.config.model == "configured-model"
+    assert agent.config.reasoning_effort == "high"
+
+
+def test_production_agent_does_not_silently_disable_or_replace_provider(monkeypatch, tmp_path):
+    from auto_mindsdb_factory.production_runtime import _production_agent
+
+    monkeypatch.setenv("AI_FACTORY_AGENT_PROVIDER", "none")
+    with pytest.raises(AutomationError, match="simulation-only"):
+        _production_agent(AutonomyMode.PR_READY)
+    assert _production_agent(AutonomyMode.SIMULATION_FULL) is None
+    monkeypatch.setenv("AI_FACTORY_AGENT_PROVIDER", "unsupported")
+    with pytest.raises(AutomationError, match="Unsupported agent provider"):
+        _production_agent(AutonomyMode.PR_READY)
+
+
+def test_doctor_reports_invalid_agent_configuration_before_work_starts(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_FACTORY_AGENT_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    doctor = FactoryDoctor(ProductionRuntimeConfig(tmp_path / "store", tmp_path, "owner/repo"))
+    assert doctor._agent_check()["status"] == "failed"

@@ -8,12 +8,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .agent_runtime import build_agent_connector
 from .automation import AutomationError, FactoryAutomationCoordinator, FactoryRunStore
 from .build_review import BuildReviewError, Stage3BuildReviewPipeline
 from .connectors import (
     FactoryConnectorError,
-    OpenAIResponsesAgentConfig,
-    OpenAIResponsesAgentConnector,
 )
 from .contracts import main as validate_contracts_main
 from .controller import FactoryController, WorkItem
@@ -1675,10 +1674,9 @@ def _build_agent_connector(args: argparse.Namespace):
     provider = getattr(args, "agent_provider", "none")
     if provider == "none":
         return None
-    if provider != "openai":
-        raise CommandInputError(f"Unsupported agent provider: {provider}")
     try:
-        config = OpenAIResponsesAgentConfig.from_env(
+        return build_agent_connector(
+            provider,
             model=args.agent_model,
             fallback_model=args.agent_fallback_model,
             reasoning_effort=args.agent_reasoning_effort,
@@ -1686,7 +1684,6 @@ def _build_agent_connector(args: argparse.Namespace):
             timeout_seconds=args.agent_timeout_seconds,
             base_url=args.agent_base_url,
         )
-        return OpenAIResponsesAgentConnector(config)
     except FactoryConnectorError as exc:
         raise CommandInputError(f"Could not initialize the OpenAI agent connector: {exc}") from exc
 
