@@ -19,6 +19,7 @@ TASK_SCHEMA = {
         "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$"},
         "title": {"type": "string", "minLength": 1, "maxLength": 200},
         "goal": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "origin": {"enum": ["request", "improvement"]},
         "acceptance_criteria": {"type": "array", "minItems": 1, "maxItems": 20, "items": {
             "type": "object", "additionalProperties": False, "required": ["id", "description", "command"],
             "properties": {"id": {"type": "string", "pattern": "^[a-zA-Z0-9_-]{1,64}$"},

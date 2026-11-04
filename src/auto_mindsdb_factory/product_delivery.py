@@ -145,7 +145,8 @@ class ProductDelivery:
             if base_sha is None:
                 git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
                 base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
-            journal.create({"purpose": "replay" if replay is not None else "delivery", "replay": replay,
+            journal.create({"purpose": "replay" if replay is not None else (
+                                "improvement" if task.document.get("origin") == "improvement" else "delivery"), "replay": replay,
                             "task": task.document, "base_sha": base_sha, "profile": self.settings,
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})

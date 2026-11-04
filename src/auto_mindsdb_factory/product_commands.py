@@ -13,6 +13,7 @@ from .product_promotion import GitHubPromotion
 from .product_replay import run_suite
 from .product_task import ProductTask
 from .product_outcomes import outcome_metrics
+from .product_improvements import propose_improvements
 from .run_journal import RunJournal
 
 
@@ -36,13 +37,21 @@ def register_product_commands(subparsers) -> None:
     inspect.add_argument("--events", action="store_true")
     metrics = subparsers.add_parser("product-metrics")
     metrics.add_argument("--store-dir", type=Path, required=True)
+    improvements = subparsers.add_parser("product-improvements")
+    improvements.add_argument("--store-dir", type=Path, required=True)
+    improvements.add_argument("--min-failures", type=int, default=3)
+    improvements.add_argument("--limit", type=int, default=3)
+    improvements.add_argument("--cooldown-hours", type=float, default=24)
 
 
 def handle_product_command(args, *, parse_env) -> int | None:
     if not args.command.startswith("product-"):
         return None
     try:
-        if args.command == "product-metrics":
+        if args.command == "product-improvements":
+            result = {"proposals": propose_improvements(args.store_dir, min_failures=args.min_failures,
+                limit=args.limit, cooldown_hours=args.cooldown_hours)}
+        elif args.command == "product-metrics":
             result = outcome_metrics(args.store_dir)
         elif args.command == "product-inspect":
             journal = RunJournal(args.store_dir, args.run_id)
