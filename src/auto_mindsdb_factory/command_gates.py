@@ -172,7 +172,7 @@ class CommandGateRunner:
                 capture_output=True,
                 text=True,
                 timeout=min(self.timeout_seconds, int(check["timeout_minutes"]) * 60),
-                env=self._command_env(),
+                env=env,
             )
             duration = max(0, int(round(time.monotonic() - started)))
             status = "passed" if completed.returncode == 0 else "failed"
@@ -266,5 +266,3 @@ def candidate_workspace(repo_root: Path, commit_sha: str) -> Iterator[Path]:
                 raise CommandGateError("Candidate HEAD changed while gates were running.")
         finally:
             _git(repo_root, "worktree", "remove", "--force", str(workspace))
-
-
