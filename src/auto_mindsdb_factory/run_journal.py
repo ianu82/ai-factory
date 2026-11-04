@@ -69,7 +69,8 @@ class RunJournal:
             "status": terminal[-1]["data"]["status"] if terminal else "incomplete",
             "attempts": sum(event["kind"] == "attempt_started" for event in events),
             "total_tokens": total,
-            "usage_complete": all(isinstance(item, dict) and "total_tokens" in item for item in usage),
+            "usage_complete": not any(event["kind"] == "model_failed" for event in events) and all(
+                isinstance(item, dict) and "total_tokens" in item for item in usage),
             "cost_usd": None,
             "cost_basis": "unavailable; token usage is recorded without inventing prices",
             "events": len(events),

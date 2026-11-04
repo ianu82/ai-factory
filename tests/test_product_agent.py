@@ -55,3 +55,20 @@ def test_token_budget_is_shared_across_roles(tmp_path):
     with pytest.raises(AgentSessionError, match="budget"):
         agent.run("builder", CONTEXT, lambda cmd: {})
     assert len(requests) == 1
+
+
+def test_rejected_report_is_preserved_for_diagnosis(tmp_path):
+    agent, _, journal = session(tmp_path, [response("finish", REPORT)])
+    with pytest.raises(AgentSessionError):
+        agent.run("verifier", CONTEXT, lambda cmd: {})
+    event = journal.events()[-1]
+    assert event["kind"] == "agent_tool_requested"
+    assert json.loads(event["data"]["arguments"]) == REPORT
+
+
+def test_unknown_usage_prevents_more_requests(tmp_path):
+    agent, requests, journal = session(tmp_path, [])
+    journal.append("model_failed", role="builder")
+    with pytest.raises(AgentSessionError, match="unknown"):
+        agent.run("verifier", CONTEXT, lambda cmd: {})
+    assert not requests
