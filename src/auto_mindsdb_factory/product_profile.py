@@ -19,6 +19,14 @@ class ProfileError(ValueError):
 
 COMMAND = {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
 COMMANDS = {"type": "array", "items": COMMAND}
+RATE = {
+    "type": "object", "additionalProperties": False,
+    "required": ["input", "cached_input", "output", "max_input_tokens", "source", "as_of"],
+    "properties": {**{name: {"type": "number", "minimum": 0} for name in ["input", "cached_input", "output"]},
+        "max_input_tokens": {"type": "integer", "minimum": 1},
+        "source": {"type": "string", "pattern": "^https://"},
+        "as_of": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}},
+}
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["version", "name", "repository", "image", "checks", "smoke"],
@@ -28,6 +36,8 @@ SCHEMA = {
         "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
         "base_branch": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$"},
         "image": {"type": "string", "pattern": "^[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}$"},
+        "platform": {"enum": ["linux/amd64", "linux/arm64"]},
+        "pricing": {"type": "object", "additionalProperties": RATE},
         "setup": COMMANDS,
         "setup_network": {"type": "boolean"},
         "checks": {"type": "object", "minProperties": 1, "additionalProperties": COMMAND},
@@ -48,6 +58,7 @@ SCHEMA = {
 }
 DEFAULTS = {
     "base_branch": "main", "setup": [], "setup_network": False,
+    "platform": "linux/amd64", "pricing": {},
     "allowed_paths": ["*"],
     "protected_paths": [".git", ".git/**", ".github/**", ".env", ".env.*"],
     "auto_merge": False, "required_status_checks": [],
@@ -74,7 +85,7 @@ class ProductProfile:
         for pattern in resolved["allowed_paths"] + resolved["protected_paths"]:
             if pattern.startswith(("/", "-")) or ".." in pattern.split("/") or "\x00" in pattern:
                 raise ProfileError("Path patterns must be relative and cannot traverse directories")
-        return cls(json.dumps(resolved, sort_keys=True, separators=(",", ":")))
+        return cls(json.dumps(resolved, sort_keys=True, separators=(",", ":"), allow_nan=False))
 
     @classmethod
     def load(cls, path: Path, *, target_root: Path | None = None) -> "ProductProfile":

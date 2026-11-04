@@ -17,7 +17,7 @@ class RunnerError(RuntimeError):
 
 class DockerSandbox:
     def __init__(self, workspace: Path, image: str, *, writable: bool = False,
-                 network: bool = False, timeout: int = 300) -> None:
+                 network: bool = False, timeout: int = 300, platform: str | None = None) -> None:
         if not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}", image):
             raise RunnerError("Runner image must be pinned by digest")
         self.workspace = workspace.resolve()
@@ -25,6 +25,9 @@ class DockerSandbox:
         self.writable = writable
         self.network = network
         self.timeout = timeout
+        if platform not in {None, "linux/amd64", "linux/arm64"}:
+            raise RunnerError("Unsupported runner platform")
+        self.platform = platform
         self.name = "ai-factory-" + uuid4().hex
 
     def _docker(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -51,6 +54,7 @@ class DockerSandbox:
                 "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=128",
                 "--memory=2g", "--cpus=1", "--ulimit", "fsize=268435456:268435456",
                 "--user", f"{uid}:{os.getgid()}", "--network", "bridge" if self.network else "none",
+                *(["--platform", self.platform] if self.platform else []),
                 "--mount", mount, "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
                 "--env", "HOME=/tmp", "--env", "npm_config_cache=/tmp/npm-cache",
                 "--workdir", "/workspace", "--entrypoint", "/bin/sh", self.image,

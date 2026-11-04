@@ -77,5 +77,18 @@ not. Setup cannot change source. Verification source is read-only, so projects
 must direct generated output to temporary locations or provide appropriate checks.
 Run time is checked between operations; API and command calls are individually
 bounded. Token usage is checked after each response, so the input cost of the last
-response may cross the token threshold. Monetary cost is unavailable; token usage
-is not an invoice.
+response may cross the token threshold.
+
+Profiles also pin `platform` (`linux/amd64` by default, or `linux/arm64`). Optional
+`pricing` maps exact returned model versions to explicit per-million `input`,
+`cached_input` and `output` rates, `max_input_tokens`, a `source` URL and `as_of`
+date. Every quoted response retains its rate and usage. Missing rates, unknown
+usage and requests beyond the quoted context regime remain unpriced. Estimates
+exclude execution costs and endpoint-specific billing adjustments; they are not
+invoices. No model alias is silently mapped to another model's rate.
+
+`product-metrics` reports accepted work items, blocked work, recorded intervention
+and corrective events, and completion latency p50/p90 with sample counts. Inference
+cost per accepted item includes unsuccessful delivery attempts. Replay and
+improvement work are separate. Missing cost coverage yields an unknown total,
+with the known subtotal retained; external human work is never inferred to be zero.

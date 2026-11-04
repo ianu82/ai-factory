@@ -33,7 +33,8 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
     base = git(target, "rev-parse", "HEAD")
     (target / "uncommitted.txt").write_text("preserve user work")
     profile = ProductProfile.from_document({"version": 1, "name": "product", "repository": "owner/product",
-        "image": os.environ["AI_FACTORY_TEST_IMAGE"], "checks": {"syntax": ["node", "--check", "app.js"]},
+        "image": os.environ["AI_FACTORY_TEST_IMAGE"], "platform": os.environ.get("AI_FACTORY_TEST_PLATFORM", "linux/amd64"),
+        "checks": {"syntax": ["node", "--check", "app.js"]},
         "smoke": [["node", "--check", "app.js"]], "allowed_paths": ["app.js"], "max_attempts": 1})
     task = ProductTask.from_document({"id": "add", "title": "Add numbers", "goal": "Add two integers",
         "acceptance_criteria": [{"id": "addition", "description": "1 plus 1 is 2", "command": ["node", "-e", "process.exit(require('./app')(1,1)===2?0:1)"]}]})
