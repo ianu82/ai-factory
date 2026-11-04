@@ -101,8 +101,9 @@ def test_task_rejects_duplicate_criteria_and_internal_executable_requests(tmp_pa
 
 
 @pytest.mark.skipif(not os.environ.get("AI_FACTORY_TEST_IMAGE"), reason="requires a pinned Docker image")
-@pytest.mark.parametrize("variant", ["correct", "broken", "out-of-scope"])
-def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
+@pytest.mark.parametrize("builder_status", ["passed", "unverified"])
+@pytest.mark.parametrize("variant", ["correct", "broken", "out-of-scope", "known-finding"])
+def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant, builder_status):
     target = tmp_path / "product"
     target.mkdir()
     subprocess.run(["git", "init", "-q", str(target)], check=True)
@@ -126,7 +127,7 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
             seen.append((role, context))
             assert "command" not in context["acceptance_criteria"][0]
             if role == "builder":
-                content = "module.exports=(a,b)=>a+b;" if variant == "correct" else "module.exports=(a,b)=>a*b;"
+                content = "module.exports=(a,b)=>a+b;" if variant in {"correct", "known-finding"} else "module.exports=(a,b)=>a*b;"
                 result = command(["node", "-e", f"require('fs').writeFileSync('app.js',{content!r})"])
                 if variant == "correct":
                     assert command(["chmod", "+x", "app.js"])["exit_code"] == 0
@@ -134,10 +135,13 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
                     command(["node", "-e", "require('fs').writeFileSync('unexpected.txt','bad')"])
             else:
                 assert "revision_feedback" not in context
+                assert context["controller_checks"] == [
+                    {"name": "syntax", "exit_code": 0}, {"name": "acceptance:addition", "exit_code": 0}]
                 assert command(["sh", "-c", "echo tamper > app.js"])["exit_code"] != 0
                 result = command(["node", "-e", "process.exit(require('./app')(2,3)===5?0:1)"])
             assert result["exit_code"] == 0, result
-            return {"status": "passed", "summary": "checked", "criteria": [], "findings": []}
+            return {"status": builder_status if role == "builder" else "passed", "summary": "checked",
+                    "criteria": [], "findings": ["Known defect"] if role == "builder" and variant == "known-finding" else []}
     delivery = ProductDelivery(profile, target, tmp_path / "store", agent_factory=lambda *args: Agent())
     if variant == "correct":
         result = delivery.run(task, base_sha=base)
@@ -146,6 +150,8 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant):
         assert result["changed_paths"] == ["app.js"]
         assert git(target, "ls-tree", result["candidate_sha"], "app.js").startswith("100755")
         assert [role for role, _ in seen] == ["builder", "verifier"]
+        uncertainty = [e for e in RunJournal(tmp_path / "store", "add").events() if e["kind"] == "builder_unverified"]
+        assert len(uncertainty) == (builder_status == "unverified")
     else:
         with pytest.raises(DeliveryError):
             delivery.run(task, base_sha=base)
