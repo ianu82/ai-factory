@@ -101,6 +101,130 @@ def test_inspect_reports_terminal_state_and_retains_events(tmp_path, capsys):
     assert output["timeline"][-1]["kind"] == "run_finished"
 
 
+def _tree_snapshot(root):
+    # Capture directories as well as exact file bytes and modification times.
+    return {
+        str(path.relative_to(root)): (path.lstat().st_mode, path.lstat().st_mtime_ns,
+                                      os.readlink(path) if path.is_symlink() else
+                                      None if path.is_dir() else path.read_bytes())
+        for path in [root, *sorted(root.rglob("*"))]
+    }
+
+
+def _inspect(store, run_id, with_events):
+    args = ["product-inspect", "--store-dir", str(store), f"--run-id={run_id}"]
+    return main(args + (["--events"] if with_events else []))
+
+
+@pytest.mark.parametrize("with_events", [False, True])
+@pytest.mark.parametrize("layout", ["missing-store", "missing-delivery", "missing-run", "run-is-file"])
+def test_inspect_missing_paths_never_write(tmp_path, capsys, with_events, layout):
+    store = tmp_path / "store"
+    if layout != "missing-store":
+        store.mkdir()
+        (store / "unrelated").write_bytes(b"do not change")
+    if layout in {"missing-run", "run-is-file"}:
+        (store / "delivery" / "other").mkdir(parents=True)
+        (store / "delivery" / "other" / "event-000001.json").write_bytes(b"evidence")
+    if layout == "run-is-file":
+        (store / "delivery" / "task").write_bytes(b"not a directory")
+    before = _tree_snapshot(tmp_path)
+    assert _inspect(store, "task", with_events) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "Run does not exist" in output.err
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("run_id", ["..", "../escape", "a/b", "/absolute", "", "-bad", "x" * 97])
+@pytest.mark.parametrize("store_exists", [False, True])
+def test_inspect_invalid_ids_do_not_touch_files(tmp_path, capsys, run_id, store_exists):
+    store = tmp_path / "store"
+    if store_exists:
+        (store / "delivery" / "existing").mkdir(parents=True)
+        (store / "delivery" / "existing" / "manifest.json").write_bytes(b"{}")
+    before = _tree_snapshot(tmp_path)
+    assert _inspect(store, run_id, True) == 1
+    output = capsys.readouterr()
+    assert output.out == "" and "Invalid run id" in output.err
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("with_events", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_inspect_existing_journal_is_unchanged(tmp_path, capsys, with_events, empty):
+    journal = RunJournal(tmp_path / "store", "task")
+    if not empty:
+        journal.create({"task": "test"})
+        journal.append("attempt_started")
+        journal.append("model_response", usage={"total_tokens": 23}, cost_estimate_usd=0.25)
+        journal.append("run_finished", status="complete", duration_seconds=5)
+        # Inspection does not require or create a lock file.
+        (journal.root / ".journal.lock").unlink()
+    expected = journal.summary()
+    if with_events:
+        expected["timeline"] = journal.events()
+    before = _tree_snapshot(tmp_path)
+    assert _inspect(tmp_path / "store", "task", with_events) == 0
+    output = capsys.readouterr()
+    assert output.err == "" and json.loads(output.out) == expected
+    assert expected["status"] == ("incomplete" if empty else "complete")
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("with_events", [False, True])
+@pytest.mark.parametrize("corruption", ["bad-json", "bad-data", "bad-kind", "bad-status", "gap", "misnamed", "bad-manifest", "dangling-manifest"])
+def test_inspect_corrupt_or_gapped_evidence_never_writes(tmp_path, capsys, with_events, corruption):
+    journal = RunJournal(tmp_path / "store", "task")
+    journal.create({})
+    journal.append("first")
+    journal.append("second")
+    first = journal.root / "event-000001.json"
+    if corruption == "bad-json":
+        first.write_text("{")
+    elif corruption == "bad-data":
+        first.write_text(json.dumps({"sequence": 1, "kind": "first", "data": []}))
+    elif corruption == "bad-kind":
+        event = json.loads(first.read_text())
+        event["kind"] = None
+        first.write_text(json.dumps(event))
+    elif corruption == "bad-status":
+        event = json.loads(first.read_text())
+        event["kind"] = "run_finished"
+        first.write_text(json.dumps(event))
+    elif corruption == "gap":
+        first.unlink()
+    elif corruption == "misnamed":
+        (journal.root / "event-000002.json").unlink()
+        first.rename(journal.root / "event-000002.json")
+    elif corruption == "bad-manifest":
+        (journal.root / "manifest.json").write_text("{")
+    else:
+        manifest = journal.root / "manifest.json"
+        manifest.unlink()
+        manifest.symlink_to(journal.root / "missing")
+    before = _tree_snapshot(tmp_path)
+    assert _inspect(tmp_path / "store", "task", with_events) == 1
+    output = capsys.readouterr()
+    assert output.out == "" and "Run " in output.err
+    assert _tree_snapshot(tmp_path) == before
+
+
+def test_real_inspect_cli_missing_run_has_no_side_effects(tmp_path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    store = tmp_path / "missing-store"
+    before = _tree_snapshot(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "auto_mindsdb_factory", "product-inspect",
+         "--store-dir", str(store), "--run-id", "task", "--events"],
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode != 0 and result.stdout == ""
+    assert "Run does not exist" in result.stderr
+    assert _tree_snapshot(tmp_path) == before
+
+
 @pytest.fixture
 def linear_cli(tmp_path, monkeypatch):
     target = tmp_path / "target"

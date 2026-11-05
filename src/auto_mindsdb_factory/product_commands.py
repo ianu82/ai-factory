@@ -83,7 +83,7 @@ def handle_product_command(args, *, parse_env) -> int | None:
         elif args.command == "product-metrics":
             result = outcome_metrics(args.store_dir)
         elif args.command == "product-inspect":
-            journal = RunJournal(args.store_dir, args.run_id)
+            journal = RunJournal(args.store_dir, args.run_id, read_only=True)
             result = journal.summary()
             if args.events:
                 result["timeline"] = journal.events()

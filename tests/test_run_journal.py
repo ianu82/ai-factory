@@ -52,3 +52,20 @@ def test_missing_usage_is_explicit(tmp_path):
 def test_run_ids_cannot_escape_store(tmp_path, run_id):
     with pytest.raises(JournalError):
         RunJournal(tmp_path, run_id)
+
+
+def test_read_only_open_and_mutators_never_create_evidence(tmp_path):
+    store = tmp_path / "store"
+    with pytest.raises(JournalError, match="does not exist"):
+        RunJournal(store, "task", read_only=True)
+    assert not store.exists()
+    writable = RunJournal(store, "task")
+    readonly = RunJournal(store, "task", read_only=True)
+    assert readonly.summary() == writable.summary()
+    with pytest.raises(JournalError, match="read-only"):
+        readonly.create({})
+    with pytest.raises(JournalError, match="read-only"):
+        readonly.append("event")
+    assert list(writable.root.iterdir()) == []
+    writable.append("event")
+    assert readonly.events() == writable.events()

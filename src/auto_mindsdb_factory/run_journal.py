@@ -18,14 +18,31 @@ class JournalError(RuntimeError):
 
 
 class RunJournal:
-    def __init__(self, store: Path, run_id: str) -> None:
+    def __init__(self, store: Path, run_id: str, *, read_only: bool = False) -> None:
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}", run_id):
             raise JournalError("Invalid run id")
         self.root = store.resolve() / "delivery" / run_id
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._read_only = read_only
+        if read_only:
+            if not self.root.is_dir():
+                raise JournalError("Run does not exist")
+            # A manifest is optional (empty run directories are inspectable), but
+            # if present it must be readable evidence rather than broken JSON.
+            manifest = self.root / "manifest.json"
+            try:
+                if manifest.is_symlink() and not manifest.exists():
+                    raise JournalError("Run manifest could not be read")
+                if manifest.exists() and not isinstance(json.loads(manifest.read_text(encoding="utf-8")), dict):
+                    raise JournalError("Run manifest is invalid")
+            except (OSError, ValueError) as exc:
+                raise JournalError("Run manifest could not be read") from exc
+        else:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
+        if self._read_only:
+            raise JournalError("Journal is read-only")
         with (self.root / ".journal.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
@@ -50,10 +67,17 @@ class RunJournal:
 
     def events(self) -> list[dict[str, Any]]:
         result = []
+        if self._read_only and not self.root.is_dir():
+            raise JournalError("Run does not exist")
         try:
-            for sequence, path in enumerate(sorted(self.root.glob("event-*.json")), start=1):
+            for sequence, path in enumerate(sorted(p for p in self.root.iterdir() if p.match("event-*.json")), start=1):
                 event = json.loads(path.read_text(encoding="utf-8"))
-                if event.get("sequence") != sequence or not isinstance(event.get("data"), dict):
+                if (path.name != f"event-{sequence:06d}.json" or event.get("sequence") != sequence
+                        or not isinstance(event.get("data"), dict)):
+                    raise JournalError("Run evidence has a missing or invalid event")
+                if self._read_only and (type(event["sequence"]) is not int
+                        or not isinstance(event.get("kind"), str)
+                        or (event["kind"] == "run_finished" and not isinstance(event["data"].get("status"), str))):
                     raise JournalError("Run evidence has a missing or invalid event")
                 result.append(event)
         except (OSError, json.JSONDecodeError, AttributeError) as exc:
