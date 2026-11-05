@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from auto_mindsdb_factory.product_profile import ProductProfile, ProfileError
+from auto_mindsdb_factory.product_harness import resolve_harness
 
 
 @pytest.fixture
@@ -34,6 +35,41 @@ def test_profile_model_defaults_and_overrides(profile_document):
         assert resolved[role] == "custom-model"
         other_role = "reviewer_model" if role == "builder_model" else "builder_model"
         assert resolved[other_role] == "gpt-6.1-terra"
+
+
+def test_implicit_native_preserves_legacy_fingerprint(profile_document):
+    original = copy.deepcopy(profile_document)
+    profile = ProductProfile.from_document(profile_document)
+    assert profile.digest == "f64a16bebc844dcd3b58e7912c8a83be243372e6d9e7340446ae6d36781f5353"
+    assert profile_document == original
+    for role in ("builder", "verifier"):
+        assert resolve_harness(profile.document, role) == "native"
+    assert "builder_harness" not in profile.document
+    assert "reviewer_harness" not in profile.document
+    assert ProductProfile.from_document(profile.document).canonical_json == profile.canonical_json
+
+
+@pytest.mark.parametrize("field,role,other", [
+    ("builder_harness", "builder", "reviewer_harness"),
+    ("reviewer_harness", "verifier", "builder_harness"),
+])
+def test_explicit_harness_is_frozen_per_role(profile_document, field, role, other):
+    implicit = ProductProfile.from_document(profile_document)
+    document = {**profile_document, field: "native"}
+    profile = ProductProfile.from_document(document)
+    document[field] = "anton"
+    assert profile.document[field] == "native"
+    assert other not in profile.document
+    assert resolve_harness(profile.document, role) == "native"
+    assert profile.digest != implicit.digest
+    assert ProductProfile.from_document(profile.document).digest == profile.digest
+
+
+@pytest.mark.parametrize("field", ["builder_harness", "reviewer_harness"])
+@pytest.mark.parametrize("harness", ["anton", "codex", "typo", None, [], 1])
+def test_profile_rejects_unknown_or_unavailable_harness(profile_document, field, harness):
+    with pytest.raises(ProfileError):
+        ProductProfile.from_document({**profile_document, field: harness})
 
 
 @pytest.mark.parametrize("change", [{"typo": True}, {"image": "python:latest"}, {"checks": {}},

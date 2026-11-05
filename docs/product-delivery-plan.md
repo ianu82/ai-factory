@@ -24,6 +24,18 @@ Unknown keys fail validation. Automatic merge defaults to off. A profile is reso
 to immutable canonical JSON and a SHA-256 identifier before execution; candidate
 source cannot replace it. Profiles are activated only after complete validation.
 
+The trusted profile can select an agent harness separately through
+`builder_harness` and `reviewer_harness`. Both currently support only `native`,
+the existing Factory agent. `anton` and `codex` are reserved names and fail
+validation until their adapters are available; there is no automatic fallback.
+These fields select the agent runtime independently of the pinned role models.
+Task descriptions and repository files cannot select a different harness.
+
+Omitting both fields keeps existing canonical profiles and fingerprints unchanged.
+Explicit selections are frozen in the profile and change its fingerprint, so
+operators must validate and activate that configuration deliberately.
+`product-validate` reports both effective harnesses even when the fields are omitted.
+
 ## Supported product workflow
 
 `product-validate` checks a profile and the target checkout identity.

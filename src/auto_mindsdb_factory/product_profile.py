@@ -12,6 +12,8 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from .product_harness import HARNESS_NAMES, HarnessSelectionError, resolve_harness
+
 
 class ProfileError(ValueError):
     pass
@@ -48,6 +50,8 @@ SCHEMA = {
         "required_status_checks": {"type": "array", "uniqueItems": True, "items": {"type": "string", "minLength": 1}},
         "builder_model": {"type": "string", "minLength": 1},
         "reviewer_model": {"type": "string", "minLength": 1},
+        "builder_harness": {"enum": list(HARNESS_NAMES)},
+        "reviewer_harness": {"enum": list(HARNESS_NAMES)},
         "max_attempts": {"type": "integer", "minimum": 1, "maximum": 5},
         "max_agent_turns": {"type": "integer", "minimum": 1, "maximum": 100},
         "agent_max_output_tokens": {"type": "integer", "minimum": 256, "maximum": 32000},
@@ -57,6 +61,7 @@ SCHEMA = {
         "max_changed_lines": {"type": "integer", "minimum": 1, "maximum": 2000},
     },
 }
+# Implicit native harness selection must not alter already activated profile hashes.
 DEFAULTS = {
     "base_branch": "main", "setup": [], "setup_network": False,
     "platform": "linux/amd64", "pricing": {},
@@ -79,6 +84,11 @@ class ProductProfile:
         errors = sorted(Draft202012Validator(SCHEMA).iter_errors(document), key=lambda e: str(e.path))
         if errors:
             raise ProfileError(f"Invalid product profile at {list(errors[0].path)}: {errors[0].message}")
+        try:
+            for role in ("builder", "verifier"):
+                resolve_harness(document, role)
+        except HarnessSelectionError as exc:
+            raise ProfileError(str(exc)) from None
         resolved = {**DEFAULTS, **document}
         branch = resolved["base_branch"]
         if subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True).returncode:

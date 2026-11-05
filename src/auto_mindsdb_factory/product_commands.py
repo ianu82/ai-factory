@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .linear_trigger import LinearTriggerConfig
 from .product_delivery import ProductDelivery
+from .product_harness import resolve_harness
 from .product_linear_client import LinearProductClient
 from .product_linear_intake import LinearProductRoute
 from .product_linear_worker import LinearProductWorker
@@ -137,7 +138,9 @@ def handle_product_command(args, *, parse_env) -> int | None:
             if args.command == "product-validate":
                 document = profile.document
                 result = {"status": "valid", "profile_sha": profile.digest, "repository": document["repository"],
-                          "builder_model": document["builder_model"], "reviewer_model": document["reviewer_model"]}
+                          "builder_model": document["builder_model"], "reviewer_model": document["reviewer_model"],
+                          "builder_harness": resolve_harness(document, "builder"),
+                          "reviewer_harness": resolve_harness(document, "verifier")}
             elif args.command == "product-replay":
                 result = run_suite(profile, args.target_root, args.store_dir, args.suite, repetitions=args.repetitions)
             else:
