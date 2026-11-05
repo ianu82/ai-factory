@@ -15,6 +15,7 @@ from .docker_runner import DockerSandbox, RunnerError
 from .intake import repo_root
 from .product_agent import ProductAgent, AgentSessionError
 from .product_profile import ProductProfile
+from .product_harness import AgentHarness, resolve_harness
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
@@ -41,7 +42,8 @@ def _report_feedback(report: dict) -> str:
 
 class ProductDelivery:
     def __init__(self, profile: ProductProfile, target_root: Path, store: Path, *,
-                 agent_factory: Callable | None = None, sandbox_factory: Callable = DockerSandbox) -> None:
+                 agent_factory: Callable[[str, RunJournal], AgentHarness] | None = None,
+                 sandbox_factory: Callable = DockerSandbox) -> None:
         self.profile = profile
         self.settings = profile.document
         self.target = target_root.resolve()
@@ -54,9 +56,8 @@ class ProductDelivery:
         self.deadline = 0.0
 
     def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
-        model_key = {"builder": "builder_model", "verifier": "reviewer_model"}.get(role)
-        if model_key is None:
-            raise DeliveryError("Unknown delivery agent role")
+        resolve_harness(self.settings, role)
+        model_key = {"builder": "builder_model", "verifier": "reviewer_model"}[role]
         config = OpenAIResponsesAgentConfig.from_env(model=self.settings[model_key],
             max_output_tokens=self.settings["agent_max_output_tokens"])
         if config.fallback_model:

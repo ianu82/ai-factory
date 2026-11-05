@@ -41,6 +41,8 @@ def run_product_validate(profile, target):
     ({"reviewer_model": "custom-reviewer"}, "gpt-6.1-terra", "custom-reviewer"),
     ({"builder_model": "custom-builder", "reviewer_model": "custom-reviewer"},
      "custom-builder", "custom-reviewer"),
+    ({"builder_harness": "native", "reviewer_harness": "native"},
+     "gpt-6.1-terra", "gpt-6.1-terra"),
 ])
 def test_product_validate_reports_effective_models(validation_checkout, overrides, builder, reviewer):
     root, target = validation_checkout
@@ -59,7 +61,25 @@ def test_product_validate_reports_effective_models(validation_checkout, override
     assert json.loads(result.stdout) == {
         "status": "valid", "profile_sha": expected_profile.digest,
         "repository": "Owner/Product", "builder_model": builder, "reviewer_model": reviewer,
+        "builder_harness": "native", "reviewer_harness": "native",
     }
+
+
+@pytest.mark.parametrize("role", ["builder_harness", "reviewer_harness"])
+@pytest.mark.parametrize("harness", ["anton", "codex", "typo"])
+def test_product_validate_rejects_unavailable_harnesses(validation_checkout, role, harness):
+    root, target = validation_checkout
+    document = {
+        "version": 1, "name": "example", "repository": "owner/product",
+        "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["pytest"]},
+        "smoke": [["true"]], role: harness,
+    }
+    profile_path = root / "profile.json"
+    profile_path.write_text(json.dumps(document))
+    result = run_product_validate(profile_path, target)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "Product workflow failed:" in result.stderr
 
 
 def test_product_validate_still_checks_origin_and_external_profile(validation_checkout):
