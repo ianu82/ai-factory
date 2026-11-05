@@ -96,3 +96,17 @@ The Stage 7 release, Stage 8 monitoring and Stage 9 feedback pipelines can exerc
 ## Validation
 
 Run the repository's pytest suite and `scripts/validate_contracts.py`. Candidate-gate regression tests use actual local Git commits to prove that a passing base checkout cannot hide a failing candidate. Provider tests exercise configuration and structured handoffs without credentials; a live API smoke test can validate the configured provider separately without creating external work items.
+
+### Trusted product roles
+
+Product role contracts are versioned in the controller package (`product_roles`),
+not in the candidate checkout or task. Their SHA-256 digest covers all contract
+fields except the digest itself, encoded as UTF-8 JSON with sorted keys, compact
+separators and unescaped Unicode. Selections are detached copies. Role text and
+metadata describe intent, not permissions: controller policy, tool dispatch,
+workspace isolation and configured models remain authoritative. Candidate files,
+cwd, task text and tool output cannot override the contracts. The planner contract
+is descriptive only; planner execution is not enabled.
+This boundary assumes the controller itself is started from a trusted Python
+import path; starting Python with a candidate package shadowing the controller
+would execute candidate code before the registry can establish any boundary.

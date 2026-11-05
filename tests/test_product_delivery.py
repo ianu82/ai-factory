@@ -74,7 +74,8 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
         return {"app.txt": b"source"}
     delivery._prepare = prepare
     class Sandbox:
-        def __init__(self, *args, **kwargs): pass
+        def __init__(self, *args, **kwargs):
+            assert kwargs["writable"] is False
         def __enter__(self): return self
         def __exit__(self, *args): pass
     delivery.sandbox_factory = Sandbox
