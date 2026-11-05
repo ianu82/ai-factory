@@ -22,6 +22,9 @@ class Client:
             self.fail_done = False
             raise RuntimeError('secret provider response')
         self.issue = replace(self.issue, comments=self.issue.comments + [{'body': body}])
+    def set_workflow_state(self, issue_id, state_id, route):
+        self.writes.append('state:' + state_id)
+        self.issue = replace(self.issue, state={'id': state_id})
 @pytest.fixture
 def env(tmp_path):
     issue = LinearIssueSnapshot(id='b894af1a-d838-4bc8-bddf-a2800cdd0cde', identifier='ENG-1',
@@ -45,12 +48,16 @@ def env(tmp_path):
             class Delivery:
                 deadline = 123
                 def smoke(self, sha, journal): pass
-                def run(self, task, *, promote):
+                def run(self, task, *, promote, on_stage=None):
+                    if on_stage: on_stage('building')
                     harness.builds += 1
                     journal = RunJournal(store, task.document['id'])
                     journal.create({'purpose': 'delivery', 'task': task.document, 'task_sha': task.digest,
                                     'profile': profile.document, 'profile_sha': profile.digest})
                     if harness.before_publish: harness.before_publish()
+                    if on_stage:
+                        on_stage('verifying')
+                        on_stage('merging')
                     result = promote({}, journal)
                     journal.append('run_finished', status=result['status'])
                     return result
@@ -285,3 +292,95 @@ def test_automatic_delivery_requires_named_ci_policy(env, checks):
     with pytest.raises(ValueError, match="named GitHub CI checks"):
         worker(ProductProfile.from_document({**profile.document, 'required_status_checks': checks}))
     assert client.writes == []
+
+
+@pytest.fixture
+def staged(env):
+    client, h, factory, profile, route = env
+    route = LinearProductRoute.from_document({**route.document, 'version': 3,
+        'building_state_id': 'building', 'verifying_state_id': 'verifying',
+        'merging_state_id': 'merging', 'completed_state_id': 'done', 'blocked_state_id': 'blocked'})
+    return client, h, lambda: factory(r=route)
+
+
+def test_stages_follow_delivery_and_terminal_sync(staged):
+    client, h, factory = staged
+    assert factory().run_cycle()[0]['status'] == 'complete'
+    assert client.writes == ['validated', 'comment', 'state:building', 'state:verifying',
+                             'state:merging', 'comment', 'state:done']
+    assert client.issue.state['id'] == 'done'
+    assert factory().run_cycle() == []
+    assert h.builds == h.merges == 1
+
+
+@pytest.mark.parametrize('applied', [False, True])
+def test_terminal_write_failure_recovers_without_rebuilding(staged, applied):
+    client, h, factory = staged
+    write = client.set_workflow_state
+    def fail(issue_id, state, route):
+        if state != 'done' or applied:
+            write(issue_id, state, route)
+        if state == 'done':
+            raise RuntimeError('ambiguous private response')
+    client.set_workflow_state = fail
+    assert factory().run_cycle()[0]['status'] == 'pending'
+    assert client.issue.state['id'] == ('done' if applied else 'merging')
+    client.set_workflow_state = write
+    assert factory().run_cycle()[0]['status'] == 'complete'
+    assert client.issue.state['id'] == 'done'
+    assert h.builds == h.merges == 1 and len(client.issue.comments) == 2
+
+
+@pytest.mark.parametrize('phase', ['before_publish', 'during_ci'])
+@pytest.mark.parametrize('change', ['cancel', 'edit', 'assignee'])
+def test_staged_delivery_preserves_human_changes(staged, phase, change):
+    client, h, factory = staged
+    def mutate():
+        client.issue = replace(client.issue, **{
+            'cancel': {'state': {'id': 'canceled'}}, 'edit': {'description': 'new requirements'},
+            'assignee': {'assignee': {'id': 'someone'}}}[change])
+    setattr(h, phase, mutate)
+    assert factory().run_cycle()[0]['status'] in {'blocked', 'conflict'}
+    assert h.merges == 0
+    assert client.issue.state['id'] == ('canceled' if change == 'cancel' else (
+        'building' if phase == 'before_publish' else 'merging'))
+
+
+def test_cancel_between_outcome_comment_and_state_update_is_preserved(staged):
+    client, h, factory = staged
+    comment = client.create_comment
+    def cancel(issue_id, body):
+        comment(issue_id, body)
+        if 'outcome]' in body:
+            client.issue = replace(client.issue, state={'id': 'canceled'})
+    client.create_comment = cancel
+    assert factory().run_cycle()[0]['status'] == 'complete'
+    assert client.issue.state['id'] == 'canceled'
+    assert 'state:done' not in client.writes
+    assert h.merges == 1
+
+
+def test_unknown_start_write_blocks_before_build(staged):
+    client, h, factory = staged
+    write = client.set_workflow_state
+    def ambiguous(issue_id, state, route):
+        write(issue_id, state, route)
+        if state == 'building':
+            raise RuntimeError('response lost')
+    client.set_workflow_state = ambiguous
+    assert factory().run_cycle()[0]['status'] == 'blocked'
+    assert client.issue.state['id'] == 'blocked'
+    assert h.builds == h.merges == 0
+    assert factory().run_cycle() == []
+
+
+def test_interrupted_stage_recovers_as_blocked_not_a_new_build(staged, monkeypatch):
+    client, h, factory = staged
+    worker = factory()
+    monkeypatch.setattr(worker.state, 'record_outcome', lambda *a: (_ for _ in ()).throw(OSError()))
+    h.before_publish = lambda: (_ for _ in ()).throw(RuntimeError('interrupted'))
+    assert worker.run_cycle()[0]['status'] == 'pending'
+    assert client.issue.state['id'] == 'building'
+    assert factory().run_cycle()[0]['status'] == 'blocked'
+    assert client.issue.state['id'] == 'blocked'
+    assert h.builds == 1 and h.merges == 0

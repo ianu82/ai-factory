@@ -143,7 +143,24 @@ class LinearProductWorker:
         if not any(isinstance(c, dict) and c.get("body") == comment for c in snapshot.comments):
             self.client.create_comment(binding["issue_id"], comment)
         lease.heartbeat()
+        config = self.route.document
+        if config["version"] == 3:
+            target = config["completed_state_id" if outcome["status"] == "complete" else "blocked_state_id"]
+            active = {config[key] for key in (
+                "queued_state_id", "building_state_id", "verifying_state_id", "merging_state_id")}
+            # Recheck after the comment: a human may have canceled meanwhile.
+            snapshot = self._check(journal, binding)
+            if snapshot.state["id"] in active | {target}:
+                self._workflow_transition(journal, binding, target, active, lease)
         self.state.mark_synced(journal)
+
+    def _workflow_transition(self, journal, binding, target, allowed, lease):
+        lease.heartbeat()
+        snapshot = self._check(journal, binding, allowed | {target})
+        if snapshot.state["id"] != target:
+            self.client.set_workflow_state(binding["issue_id"], target, self.route)
+        lease.heartbeat()
+        self._check(journal, binding, {target})
 
     def _reconcile(self, journal, lease):
         binding = self.state.get_binding(journal)
@@ -175,6 +192,7 @@ class LinearProductWorker:
         binding = self.state.get_binding(journal)
         config = self.route.document
         promoted = []
+        current_state = config["queued_state_id"]
         try:
             lease.heartbeat()
             marker = f"[ai-factory run:{binding['task']['id']} started]"
@@ -186,8 +204,15 @@ class LinearProductWorker:
             delivery = self.delivery_factory(self.profile, self.target, self.store)
             def guard():
                 lease.heartbeat()
-                self._check(journal, binding, {config["queued_state_id"]})
+                self._check(journal, binding, {current_state})
                 lease.heartbeat()
+            def stage(name):
+                nonlocal current_state
+                if name not in {"building", "verifying", "merging"}:
+                    raise SourceConflict("Unknown delivery stage")
+                target = config[name + "_state_id"]
+                self._workflow_transition(journal, binding, target, {current_state}, lease)
+                current_state = target
             def promote(candidate, product_journal):
                 guard()
                 promotion = self.promotion_factory(self.profile, task, self.target, self.store,
@@ -195,7 +220,8 @@ class LinearProductWorker:
                 result = promotion(candidate, product_journal)
                 promoted.append(result)
                 return result
-            result = delivery.run(task, promote=promote)
+            options = {"on_stage": stage} if config["version"] == 3 else {}
+            result = delivery.run(task, promote=promote, **options)
             if (result.get("status") == "complete" and len(promoted) == 1
                     and promoted[0].get("status") == "complete"
                     and result.get("merge_sha") == promoted[0].get("merge_sha")
