@@ -100,8 +100,8 @@ def snapshot_roles() -> dict:
 def stored_role_snapshots(manifest: dict) -> dict:
     """Validate stored snapshots against trusted historical versions, returning a detached copy.
 
-    This does not consult candidate files or change the manifest, and does not
-    imply that execution consumes the snapshots. Legacy inspection need not call it.
+    This does not consult candidate files or change the manifest.
+    Legacy inspection need not call it.
     """
     if not isinstance(manifest, dict) or not isinstance(manifest.get("role_snapshots"), dict):
         raise RoleDefinitionError("Missing or malformed role snapshots")

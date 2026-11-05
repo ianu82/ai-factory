@@ -111,7 +111,8 @@ def test_real_delivery_manifest_freezes_roles_and_keeps_provenance(delivery, mon
     path = instance.store / "delivery" / task.document["id"] / "manifest.json"
     original = path.read_bytes()
     manifest = json.loads(original)
-    assert calls == [("builder",), ("verifier",)]
+    assert [call for call in calls if len(call) == 1] == [("builder",), ("verifier",)]
+    assert ("builder", "1") in calls and ("verifier", "1") in calls
     assert manifest["purpose"] == "delivery" and manifest["replay"] is None
     assert manifest["base_sha"] == "a" * 40 and len(manifest["runtime_sha"]) == 40
     assert manifest["task"] == task.document and manifest["task_sha"] == task.digest

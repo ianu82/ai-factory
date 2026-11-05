@@ -89,8 +89,11 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
     monkeypatch.setattr(module, "git", lambda *args: "candidate diff")
     task = ProductTask.from_document({"id": "task", "title": "Fix", "goal": "fix", "acceptance_criteria": [
         {"id": "rounding", "description": "round consistently", "command": ["true"]}]})
+    from auto_mindsdb_factory.product_roles import snapshot_roles
+    journal = RunJournal(tmp_path, "revision")
+    journal.create({"role_snapshots": snapshot_roles()})
     with pytest.raises(module.DeliveryError) as error:
-        delivery.verify(task, "a" * 40, "b" * 40, RunJournal(tmp_path, "revision"), prior_feedback="earlier unresolved finding")
+        delivery.verify(task, "a" * 40, "b" * 40, journal, prior_feedback="earlier unresolved finding")
     assert "99.99 times 0.5" in str(error.value)
     assert "rounding" in str(error.value)
     assert "Observed 50" in str(error.value)

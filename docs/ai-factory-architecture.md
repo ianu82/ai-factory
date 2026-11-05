@@ -106,7 +106,11 @@ separators and unescaped Unicode. Selections are detached copies. Role text and
 metadata describe intent, not permissions: controller policy, tool dispatch,
 workspace isolation and configured models remain authoritative. Candidate files,
 cwd, task text and tool output cannot override the contracts. The planner contract
-is descriptive only; planner execution is not enabled.
+is descriptive only; planner execution is not enabled. Each delivery or replay
+freezes builder and verifier selections in its manifest. Before source preparation
+or execution, and again at agent invocation, both snapshots must match retained
+trusted historical versions. Missing, changed or unknown versions block execution;
+legacy manifests are not upgraded or resumed. Default changes affect only new runs.
 This boundary assumes the controller itself is started from a trusted Python
 import path; starting Python with a candidate package shadowing the controller
 would execute candidate code before the registry can establish any boundary.

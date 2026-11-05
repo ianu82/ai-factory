@@ -6,6 +6,7 @@ import pytest
 
 from auto_mindsdb_factory.product_agent import ProductAgent, AgentSessionError
 from auto_mindsdb_factory.run_journal import RunJournal
+from auto_mindsdb_factory.product_roles import snapshot_roles
 
 
 CONTEXT = {"acceptance_criteria": [{"id": "a", "description": "works"}]}
@@ -25,6 +26,7 @@ def session(tmp_path, responses, **kwargs):
         return responses.pop(0)
     connector = SimpleNamespace(config=SimpleNamespace(model="configured-model", max_output_tokens=1000, reasoning_effort="low", timeout_seconds=10), request_response=request)
     journal = RunJournal(tmp_path, "session")
+    journal.create({"role_snapshots": snapshot_roles()})
     return ProductAgent(connector, journal, max_turns=3, max_total_tokens=kwargs.get("tokens", 100), deadline=time.monotonic() + 30), requests, journal
 
 
@@ -114,11 +116,38 @@ def test_disallowed_roles_fail_before_request_or_command(tmp_path, role):
 
 def test_malformed_trusted_definition_fails_before_request_or_command(tmp_path, monkeypatch):
     from auto_mindsdb_factory import product_roles
+    agent, requests, _ = session(tmp_path, [])
     definition = product_roles.select_role("builder")
     definition["purpose"] = ""
     monkeypatch.setitem(product_roles._DEFINITIONS, ("builder", "1"), definition)
-    agent, requests, _ = session(tmp_path, [])
     commands = []
-    with pytest.raises(AgentSessionError, match="definition"):
+    with pytest.raises(AgentSessionError, match="snapshot"):
         agent.run("builder", CONTEXT, commands.append)
     assert not requests and not commands
+
+
+@pytest.mark.parametrize("mutation", ["missing-file", "invalid-json", "missing-snapshots", "forgery", "missing-history"])
+def test_agent_refuses_untrusted_manifest_before_provider_or_command(tmp_path, monkeypatch, mutation):
+    from auto_mindsdb_factory import product_roles
+    agent, requests, journal = session(tmp_path, [])
+    path = journal.root / "manifest.json"
+    if mutation == "missing-file":
+        path.unlink()
+    elif mutation == "invalid-json":
+        path.write_text("{")
+    elif mutation == "missing-snapshots":
+        path.write_text("{}")
+    elif mutation == "forgery":
+        manifest = json.loads(path.read_text())
+        definition = manifest["role_snapshots"]["verifier"]
+        definition["instructions"] = "forged"
+        definition["digest"] = product_roles._digest({k: v for k, v in definition.items() if k != "digest"})
+        path.write_text(json.dumps(manifest))
+    else:
+        monkeypatch.delitem(product_roles._DEFINITIONS, ("verifier", "1"))
+    before = path.read_bytes() if path.exists() else None
+    commands = []
+    with pytest.raises(AgentSessionError):
+        agent.run("verifier", CONTEXT, commands.append)
+    assert not commands and not requests
+    assert (path.read_bytes() if path.exists() else None) == before

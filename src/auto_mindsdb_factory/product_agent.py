@@ -12,11 +12,27 @@ from jsonschema import validate, ValidationError
 from .connectors import OpenAIResponsesAgentConnector
 from .run_journal import RunJournal
 from .product_costs import estimate_cost
-from .product_roles import RoleDefinitionError, select_role
+from .product_roles import RoleDefinitionError, stored_role_snapshots
 
 
 class AgentSessionError(RuntimeError):
     pass
+
+
+class RoleSnapshotError(AgentSessionError):
+    """Execution cannot proceed with missing or untrusted historical roles."""
+
+
+def execution_role(journal: RunJournal, role: str) -> dict:
+    if role not in ("builder", "verifier"):
+        raise AgentSessionError("Unknown product agent role")
+    try:
+        manifest = json.loads((journal.root / "manifest.json").read_text(encoding="utf-8"))
+        return stored_role_snapshots(manifest)[role]
+    except RoleDefinitionError as exc:
+        raise RoleSnapshotError(f"Invalid execution role snapshot: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise RoleSnapshotError("Missing or unreadable execution manifest") from exc
 
 
 STATUS = {"type": "string", "enum": ["passed", "failed", "unverified"]}
@@ -54,13 +70,8 @@ class ProductAgent:
         self.pricing = pricing or {}
 
     def run(self, role: str, context: dict[str, Any], command: Callable[[list[str]], dict]) -> dict:
-        # Contracts describe roles; they cannot grant execution or tool permissions.
-        if role not in ("builder", "verifier"):
-            raise AgentSessionError("Unknown product agent role")
-        try:
-            instructions = select_role(role)["instructions"]
-        except RoleDefinitionError as exc:
-            raise AgentSessionError("Invalid product agent role definition") from exc
+        # Only executable roles and trusted historical manifest content can supply instructions.
+        instructions = execution_role(self.journal, role)["instructions"]
         items: list[dict] = [{"role": "user", "content": json.dumps(context)}]
         ran_command = False
         for turn in range(self.max_turns):

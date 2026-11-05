@@ -13,7 +13,7 @@ from .automation import FactoryRunStore
 from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
 from .docker_runner import DockerSandbox, RunnerError
 from .intake import repo_root
-from .product_agent import ProductAgent, AgentSessionError
+from .product_agent import ProductAgent, AgentSessionError, RoleSnapshotError, execution_role
 from .product_profile import ProductProfile
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
@@ -128,6 +128,7 @@ class ProductDelivery:
             return sha, paths
 
     def verify(self, task: ProductTask, sha: str, base: str, journal: RunJournal, *, prior_feedback: str = "") -> dict:
+        execution_role(journal, "verifier")
         with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
@@ -183,6 +184,7 @@ class ProductDelivery:
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""
                 try:
+                    execution_role(journal, "builder")
                     if base_sha is None:
                         git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
                         base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
@@ -190,6 +192,7 @@ class ProductDelivery:
                     for attempt in range(1, self.settings["max_attempts"] + 1):
                         journal.append("attempt_started", attempt=attempt, base_sha=base_sha)
                         try:
+                            execution_role(journal, "builder")
                             stage("building")
                             with tempfile.TemporaryDirectory(prefix="ai-factory-build-") as temporary:
                                 workspace = Path(temporary) / "source"
@@ -210,7 +213,7 @@ class ProductDelivery:
                             stage("verifying")
                             verification = self.verify(task, sha, base_sha, journal, prior_feedback=feedback)
                             journal.append("candidate_verified", attempt=attempt, **verification)
-                        except DeliveryStageError:
+                        except (DeliveryStageError, RoleSnapshotError):
                             raise
                         except Exception as exc:
                             # No service secrets are sent to candidate commands; avoid storing provider error bodies.
@@ -232,7 +235,7 @@ class ProductDelivery:
                         return {**result, "evidence_dir": str(journal.root), "usage": journal.summary()}
                     raise DeliveryError("No candidate passed independent verification within the attempt budget")
                 except Exception as exc:
-                    journal.append("run_finished", status="blocked", reason=type(exc).__name__, duration_seconds=round(time.monotonic() - started, 3))
+                    journal.append("run_finished", status="blocked", reason=str(exc) if isinstance(exc, RoleSnapshotError) else type(exc).__name__, duration_seconds=round(time.monotonic() - started, 3))
                     raise
 
     def smoke(self, sha: str, journal: RunJournal) -> None:

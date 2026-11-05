@@ -13,6 +13,7 @@ from jsonschema import validate, ValidationError
 from .automation import FactoryRunStore
 from .intake import repo_root
 from .product_delivery import ProductDelivery, VerificationFailed
+from .product_agent import RoleSnapshotError
 from .product_profile import ProductProfile
 from .product_roles import snapshot_roles
 from .product_task import ProductTask, TASK_SCHEMA
@@ -87,7 +88,7 @@ def run_suite(profile: ProductProfile, target: Path, store: Path, suite_path: Pa
                                 actual, reason = "rejected", str(exc)
                             journal.append("run_finished", status=actual)
             except Exception as exc:
-                reason = type(exc).__name__
+                reason = str(exc) if isinstance(exc, RoleSnapshotError) else type(exc).__name__
                 journal.append("run_finished", status="unverified", reason=reason)
             score = {**metadata, "run_id": run_id, "expected": case["expected"], "actual": actual,
                      "correct": actual == case["expected"], "reason": reason, "usage": journal.summary()}
