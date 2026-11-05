@@ -89,6 +89,49 @@ def test_sync_failure_aborts_without_code_retry_or_publication(delivery, failed_
     assert "private provider response" not in str(journal.events())
 
 
+@pytest.mark.parametrize("failed_stage", ["building", "verifying", "merging"])
+@pytest.mark.parametrize("write_before_failure", [False, True])
+def test_ack_write_failure_aborts_without_retry_or_publication(delivery, monkeypatch, failed_stage, write_before_failure):
+    instance, task, calls = delivery
+    stages = ["building", "verifying", "merging"]
+    observed = []
+    prepare = instance._prepare
+    def record_prepare(*args):
+        calls.append("prepare")
+        return prepare(*args)
+    monkeypatch.setattr(instance, "_prepare", record_prepare)
+    append = RunJournal.append
+    def failing_append(journal, kind, **data):
+        if kind == "delivery_stage_started" and data["stage"] == failed_stage:
+            assert observed[-1] == failed_stage  # observer returned successfully first
+            if write_before_failure:
+                append(journal, kind, **data)  # outcome of a failed durable write can be uncertain
+            raise OSError("private journal failure")
+        return append(journal, kind, **data)
+    monkeypatch.setattr(RunJournal, "append", failing_append)
+    def observe(stage):
+        observed.append(stage)
+    def promote(*args):
+        calls.append("promotion")
+        return {"status": "complete"}
+    with pytest.raises(DeliveryStageError, match="Controller stage synchronization failed"):
+        instance.run(task, base_sha="a" * 40, promote=promote, on_stage=observe)
+    assert observed == stages[:stages.index(failed_stage) + 1]
+    assert calls.count("prepare") == calls.count("builder") == (failed_stage != "building")
+    assert calls.count("verifier") == (failed_stage == "merging")
+    assert "promotion" not in calls
+    journal = RunJournal(instance.store, task.document["id"])
+    events = journal.events()
+    assert journal.summary()["status"] == "blocked"
+    assert journal.summary()["attempts"] == 1
+    assert events[-1]["kind"] == "run_finished"
+    assert events[-1]["data"]["reason"] == "DeliveryStageError"
+    assert not any(e["kind"] == "attempt_finished" and e["data"]["status"] == "failed" for e in events)
+    assert [e["data"]["stage"] for e in events if e["kind"] == "delivery_stage_started"] == (
+        stages[:stages.index(failed_stage) + int(write_before_failure)])
+    assert "private journal failure" not in str(events)
+
+
 def test_legacy_delivery_has_no_observer_side_effects(delivery):
     instance, task, calls = delivery
     assert instance.run(task, base_sha="a" * 40)["status"] == "verified"

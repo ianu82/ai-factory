@@ -32,7 +32,7 @@ class VerificationFailed(DeliveryError):
 
 
 class DeliveryStageError(DeliveryError):
-    """A controller stage observer failed; never retry this as a code defect."""
+    """A controller stage observer or acknowledgement failed; never retry as a code defect."""
 
 
 def _report_feedback(report: dict) -> str:
@@ -168,9 +168,9 @@ class ProductDelivery:
             if on_stage is not None:
                 try:
                     on_stage(name)
+                    journal.append("delivery_stage_started", stage=name)
                 except Exception:
                     raise DeliveryStageError("Controller stage synchronization failed") from None
-                journal.append("delivery_stage_started", stage=name)
         started = time.monotonic()
         self.deadline = started + self.settings["max_run_seconds"]
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
