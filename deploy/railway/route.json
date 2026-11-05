@@ -1,7 +1,12 @@
 {
-  "version": 2,
+  "version": 3,
   "team_id": "7717d7c6-f63c-4056-b1cd-72a9400c181b",
   "queued_state_id": "67a279df-ee75-4795-9449-ad36835f3fb6",
+  "building_state_id": "641e584b-1ad4-4bca-b3da-5f9f6c4bd55b",
+  "verifying_state_id": "dfda81cf-07d3-4f1a-8a27-37871a7feb43",
+  "merging_state_id": "640bac6f-bd20-421a-a272-e7463163e0fd",
+  "completed_state_id": "800b1a4b-1ee1-4342-9990-8de2471dd548",
+  "blocked_state_id": "bb656c04-ff71-4f44-a746-1c529790e914",
   "required_label": "factory-auto",
   "acceptance_criteria": [
     {

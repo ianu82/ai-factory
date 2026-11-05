@@ -49,6 +49,19 @@ and wait for the current cycle to finish. Restoring it re-enables polling. Treat
 partly completed claim after an unexpected restart as an incident: reconciliation
 fails closed rather than rebuilding or guessing whether publication succeeded.
 
+The current default route opts into Linear status synchronization (version 3).
+See the [workflow and recovery guide](linear-product-delivery.md). Existing volume
+configuration is intentionally never overwritten at boot. To upgrade an older
+comment-only route, pause intake and let its active cycle finish and synchronize
+its outcome first. Back up the trusted route, activation and evidence; add the
+Building, Verifying, CI / Merge, Merged and Blocked state IDs to the volume route
+without changing its team, criteria or required label. Validate the route against
+Linear using the new release, then restart the controller while still paused.
+Verify the exact release and the new route fingerprint in status before writing
+activation for that fingerprint. Do not restore the old activation blindly.
+Retain all old claims: reconcile their board status from recorded outcomes, not
+by returning them to Ready or dispatching them again.
+
 The deployed profile pins GPT-6.1-terra for builder and reviewer, limits PRs to 300
 changed lines, protects deployment/credentials/dependencies, and requires both
 `validate` and `sandbox` CI plus fresh post-merge smoke before reporting completion.
