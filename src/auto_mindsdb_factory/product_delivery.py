@@ -190,6 +190,13 @@ class ProductDelivery:
                         base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
                     journal.append("base_resolved", commit_sha=base_sha)
                     for attempt in range(1, self.settings["max_attempts"] + 1):
+                        # A previous response (including a failed verifier response) can
+                        # exhaust the shared budget. Check before any attempt setup.
+                        usage = journal.summary()
+                        if not usage["usage_complete"]:
+                            raise DeliveryError("Prior model usage is unknown; cannot continue within a token budget")
+                        if usage["total_tokens"] >= self.settings["max_total_tokens"]:
+                            raise DeliveryError("Run token budget exhausted")
                         journal.append("attempt_started", attempt=attempt, base_sha=base_sha)
                         try:
                             execution_role(journal, "builder")
