@@ -63,8 +63,15 @@ _DEFINITIONS = {
 }
 
 
-def select_role(role: str, version: str = "1") -> dict:
+# Keep historical definitions in _DEFINITIONS when changing an active version.
+_DEFAULT_VERSIONS = {"builder": "1", "verifier": "1", "planner": "1"}
+_DEFAULT = object()
+
+
+def select_role(role: str, version: str = _DEFAULT) -> dict:
     """Return a validated detached contract; this does not authorize role execution."""
+    if version is _DEFAULT:
+        version = _DEFAULT_VERSIONS.get(role) if isinstance(role, str) else None
     if not isinstance(role, str) or not isinstance(version, str) or (role, version) not in _DEFINITIONS:
         raise RoleDefinitionError("Unknown product role or version")
     definition = deepcopy(_DEFINITIONS[(role, version)])
@@ -83,3 +90,29 @@ def select_role(role: str, version: str = "1") -> dict:
     if not isinstance(definition["digest"], str) or definition["digest"] != _digest(content):
         raise RoleDefinitionError("Malformed product role definition digest")
     return definition
+
+
+def snapshot_roles() -> dict:
+    """Select the active delivery roles once for inclusion in a new manifest."""
+    return {role: select_role(role) for role in ("builder", "verifier")}
+
+
+def stored_role_snapshots(manifest: dict) -> dict:
+    """Validate stored snapshots against trusted historical versions, returning a detached copy.
+
+    This does not consult candidate files or change the manifest, and does not
+    imply that execution consumes the snapshots. Legacy inspection need not call it.
+    """
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("role_snapshots"), dict):
+        raise RoleDefinitionError("Missing or malformed role snapshots")
+    snapshots = manifest["role_snapshots"]
+    if set(snapshots) != {"builder", "verifier"}:
+        raise RoleDefinitionError("Missing or malformed role snapshots")
+    for role in ("builder", "verifier"):
+        snapshot = snapshots[role]
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("version"), str):
+            raise RoleDefinitionError(f"Malformed {role} snapshot")
+        trusted = select_role(role, snapshot["version"])
+        if snapshot != trusted:
+            raise RoleDefinitionError(f"Untrusted or digest-mismatched {role} snapshot")
+    return deepcopy(snapshots)

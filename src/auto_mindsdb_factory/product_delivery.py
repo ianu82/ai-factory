@@ -15,6 +15,7 @@ from .docker_runner import DockerSandbox, RunnerError
 from .intake import repo_root
 from .product_agent import ProductAgent, AgentSessionError
 from .product_profile import ProductProfile
+from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
@@ -177,6 +178,7 @@ class ProductDelivery:
                                 "improvement" if task.document.get("origin") == "improvement" else "delivery"), "replay": replay,
                             "task": task.document, "base_sha": base_sha, "profile": self.settings,
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
+                            "role_snapshots": snapshot_roles(),
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""

@@ -176,6 +176,9 @@ def test_inspect_existing_journal_is_unchanged(tmp_path, capsys, with_events, em
     journal = RunJournal(tmp_path / "store", "task")
     if not empty:
         journal.create({"task": "test"})
+        from auto_mindsdb_factory.product_roles import RoleDefinitionError, stored_role_snapshots
+        with pytest.raises(RoleDefinitionError, match="Missing"):
+            stored_role_snapshots(json.loads((journal.root / "manifest.json").read_bytes()))
         journal.append("attempt_started")
         journal.append("model_response", usage={"total_tokens": 23}, cost_estimate_usd=0.25)
         journal.append("run_finished", status="complete", duration_seconds=5)

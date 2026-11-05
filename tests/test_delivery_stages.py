@@ -95,3 +95,73 @@ def test_legacy_delivery_has_no_observer_side_effects(delivery):
     assert calls == ["builder", "verifier"]
     assert not any(e["kind"] == "delivery_stage_started"
                    for e in RunJournal(instance.store, task.document["id"]).events())
+
+
+def test_real_delivery_manifest_freezes_roles_and_keeps_provenance(delivery, monkeypatch):
+    import json
+    from auto_mindsdb_factory import product_roles
+    instance, task, _ = delivery
+    calls = []
+    select = product_roles.select_role
+    def counted(*args):
+        calls.append(args)
+        return select(*args)
+    monkeypatch.setattr(product_roles, "select_role", counted)
+    instance.run(task, base_sha="a" * 40)
+    path = instance.store / "delivery" / task.document["id"] / "manifest.json"
+    original = path.read_bytes()
+    manifest = json.loads(original)
+    assert calls == [("builder",), ("verifier",)]
+    assert manifest["purpose"] == "delivery" and manifest["replay"] is None
+    assert manifest["base_sha"] == "a" * 40 and len(manifest["runtime_sha"]) == 40
+    assert manifest["task"] == task.document and manifest["task_sha"] == task.digest
+    assert manifest["profile"] == instance.profile.document and manifest["profile_sha"] == instance.profile.digest
+    assert product_roles.stored_role_snapshots(manifest) == {r: select(r, "1") for r in ("builder", "verifier")}
+    for role in ("builder", "verifier"):
+        updated = select(role, "1")
+        updated["version"] = "2"
+        updated["digest"] = product_roles._digest({k: v for k, v in updated.items() if k != "digest"})
+        monkeypatch.setitem(product_roles._DEFINITIONS, (role, "2"), updated)
+        monkeypatch.setitem(product_roles._DEFAULT_VERSIONS, role, "2")
+    assert product_roles.stored_role_snapshots(manifest)["builder"]["version"] == "1"
+    assert path.read_bytes() == original
+
+
+def test_real_build_and_verification_replay_manifests(delivery, tmp_path, monkeypatch):
+    import json
+    from auto_mindsdb_factory.product_replay import run_suite
+    from auto_mindsdb_factory import product_roles
+    from auto_mindsdb_factory.product_roles import select_role, stored_role_snapshots
+    instance, task, _ = delivery
+    suite = {"version": 1, "cases": [
+        {"name": "build", "mode": "build", "base_sha": "a" * 40, "task": task.document, "expected": "verified"},
+        {"name": "verify", "mode": "verify", "base_sha": "a" * 40, "candidate_sha": "b" * 40,
+         "task": task.document, "expected": "verified"},
+    ]}
+    path = tmp_path / "suite.json"
+    path.write_text(json.dumps(suite))
+    result = run_suite(instance.profile, instance.target, instance.store, path,
+                       delivery_factory=lambda *args: instance)
+    assert result["correct"] == result["total"] == 2
+    paths = [instance.store / "delivery" / score["run_id"] / "manifest.json" for score in result["results"]]
+    originals = [path.read_bytes() for path in paths]
+    for index, (score, original) in enumerate(zip(result["results"], originals)):
+        manifest = json.loads(original)
+        assert manifest["purpose"] == "replay" and manifest["base_sha"] == "a" * 40
+        assert manifest["profile"] == instance.profile.document and manifest["profile_sha"] == instance.profile.digest
+        assert manifest["task"] == {**task.document, "id": score["run_id"]}
+        assert manifest["replay"] == {k: score[k] for k in ("suite_sha", "case", "repetition", "original_task_sha")}
+        if index == 0:
+            assert manifest["task_sha"] and len(manifest["runtime_sha"]) == 40
+        else:
+            assert manifest["candidate_sha"] == "b" * 40
+        assert stored_role_snapshots(manifest) == {r: select_role(r, "1") for r in ("builder", "verifier")}
+    for role in ("builder", "verifier"):
+        updated = select_role(role, "1")
+        updated["version"] = "2"
+        updated["digest"] = product_roles._digest({k: v for k, v in updated.items() if k != "digest"})
+        monkeypatch.setitem(product_roles._DEFINITIONS, (role, "2"), updated)
+        monkeypatch.setitem(product_roles._DEFAULT_VERSIONS, role, "2")
+    for path, original in zip(paths, originals):
+        assert stored_role_snapshots(json.loads(path.read_bytes()))["verifier"]["version"] == "1"
+        assert path.read_bytes() == original

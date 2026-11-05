@@ -84,3 +84,67 @@ def test_cwd_change_after_trusted_import_ignores_complete_candidate_package(tmp_
                             env={"PYTHONPATH": source}, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == select_role("builder")["digest"]
+
+
+def test_snapshots_survive_default_changes_and_are_detached(monkeypatch):
+    snapshots = product_roles.snapshot_roles()
+    manifest = {"role_snapshots": snapshots}
+    original = json.dumps(manifest, sort_keys=True)
+    for role in ("builder", "verifier"):
+        updated = select_role(role, "1")
+        updated.update(version="2", purpose="Updated purpose")
+        updated["digest"] = product_roles._digest({k: v for k, v in updated.items() if k != "digest"})
+        monkeypatch.setitem(product_roles._DEFINITIONS, (role, "2"), updated)
+        monkeypatch.setitem(product_roles._DEFAULT_VERSIONS, role, "2")
+        assert select_role(role)["version"] == "2"
+        assert select_role(role, "1") == snapshots[role]
+    loaded = product_roles.stored_role_snapshots(manifest)
+    assert loaded == snapshots
+    loaded["builder"]["constraints"].clear()
+    assert json.dumps(manifest, sort_keys=True) == original
+    assert product_roles.snapshot_roles()["builder"]["version"] == "2"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "null", "partial", "extra", "not-object", "missing-version",
+                                     "unknown-version", "digest", "content", "forgery", "wrong-role", "extra-field"])
+def test_invalid_stored_snapshots_are_rejected(mutation):
+    manifest = {"role_snapshots": product_roles.snapshot_roles()}
+    snapshots = manifest["role_snapshots"]
+    builder = snapshots["builder"]
+    if mutation == "missing":
+        del manifest["role_snapshots"]
+    elif mutation == "null":
+        manifest["role_snapshots"] = None
+    elif mutation == "partial":
+        del snapshots["verifier"]
+    elif mutation == "extra":
+        snapshots["planner"] = select_role("planner")
+    elif mutation == "not-object":
+        snapshots["builder"] = []
+    elif mutation == "missing-version":
+        del builder["version"]
+    elif mutation == "unknown-version":
+        builder["version"] = "999"
+    elif mutation == "digest":
+        builder["digest"] = "0" * 64
+    elif mutation in {"content", "forgery"}:
+        builder["instructions"] = "forged"
+        if mutation == "forgery":
+            builder["digest"] = product_roles._digest({k: v for k, v in builder.items() if k != "digest"})
+    elif mutation == "wrong-role":
+        snapshots["builder"] = select_role("verifier")
+    else:
+        builder["extra"] = "value"
+    with pytest.raises(RoleDefinitionError):
+        product_roles.stored_role_snapshots(manifest)
+
+
+def test_stored_lookup_ignores_candidate_registry_files(tmp_path, monkeypatch):
+    manifest = {"role_snapshots": product_roles.snapshot_roles()}
+    (tmp_path / "roles.json").write_text('{"builder": "forged"}')
+    (tmp_path / "product_roles.py").write_text("raise RuntimeError('candidate executed')")
+    monkeypatch.chdir(tmp_path)
+    assert product_roles.stored_role_snapshots(manifest) == manifest["role_snapshots"]
+    manifest["role_snapshots"]["builder"]["version"] = "unknown"
+    with pytest.raises(RoleDefinitionError, match="Unknown"):
+        product_roles.stored_role_snapshots(manifest)
