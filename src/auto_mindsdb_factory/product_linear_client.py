@@ -14,7 +14,7 @@ from time import monotonic
 from uuid import UUID
 
 from .linear_trigger import LinearGraphQLClient, LinearGraphQLClientError
-from .product_linear_intake import LinearProductRoute
+from .product_linear_intake import LinearProductRoute, WORKFLOW_STATE_FIELDS
 
 
 class LinearProductClient(LinearGraphQLClient):
@@ -82,6 +82,27 @@ class LinearProductClient(LinearGraphQLClient):
 
     def update_issue_state(self, issue_id: str, state_id: str):
         raise LinearGraphQLClientError("Product delivery preserves human workflow state")
+
+    def set_workflow_state(self, issue_id: str, state_id: str, route: LinearProductRoute):
+        """Write only a controller-owned output state on an explicitly opted-in route."""
+        config = route.document
+        if (config["version"] != 3 or state_id not in {
+                config[key] for key in WORKFLOW_STATE_FIELDS[1:]}):
+            raise LinearGraphQLClientError("Workflow state is not authorized by this route")
+        data = self._execute(
+            """mutation FactoryWorkflowState($id: String!, $state: String!) {
+              issueUpdate(id: $id, input: {stateId: $state}) {
+                success issue { id state { id } team { id } }
+              }
+            }""", {"id": issue_id, "state": state_id},
+        )
+        payload = data.get("issueUpdate") if isinstance(data, dict) else None
+        issue = payload.get("issue") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or payload.get("success") is not True
+                or not isinstance(issue, dict) or issue.get("id") != issue_id
+                or issue.get("state") != {"id": state_id}
+                or issue.get("team") != {"id": config["team_id"]}):
+            raise LinearGraphQLClientError("Invalid Linear workflow state acknowledgement")
 
     def queued_issue_ids(self, route: LinearProductRoute, limit: int = 10,
                          *, exclude_ids: list[str] | None = None) -> list[str]:
@@ -216,9 +237,11 @@ class LinearProductClient(LinearGraphQLClient):
                 raise LinearGraphQLClientError("Invalid Linear team states")
             by_id[state["id"]] = state.get("type")
         fields = [("queued_state_id", {"unstarted", "backlog"})]
-        if config["version"] == 1:
+        if config["version"] in {1, 3}:
             fields += [("building_state_id", {"started"}), ("blocked_state_id", {"started"}),
                        ("completed_state_id", {"completed"})]
+        if config["version"] == 3:
+            fields += [("verifying_state_id", {"started"}), ("merging_state_id", {"started"})]
         for field, allowed in fields:
             state_type = by_id.get(config[field])
             if not isinstance(state_type, str) or state_type not in allowed:
