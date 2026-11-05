@@ -1,5 +1,7 @@
 """Stage callbacks follow real delivery boundaries and fail closed."""
 from contextlib import contextmanager
+from pathlib import Path
+from shutil import copytree
 import subprocess
 
 import pytest
@@ -12,6 +14,15 @@ from auto_mindsdb_factory.run_journal import RunJournal
 
 @pytest.fixture
 def delivery(tmp_path, monkeypatch):
+    # Source exports intentionally omit the controller checkout's Git metadata.
+    controller = tmp_path / "controller"
+    subprocess.run(["git", "init", "-q", str(controller)], check=True)
+    copytree(Path(__file__).resolve().parents[1] / "schemas", controller / "schemas")
+    subprocess.run(["git", "-C", str(controller), "add", "schemas"], check=True)
+    subprocess.run(["git", "-C", str(controller), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "commit", "-qm", "controller fixture"], check=True)
+    monkeypatch.setattr("auto_mindsdb_factory.product_delivery.repo_root", lambda: controller)
     target = tmp_path / "target"
     subprocess.run(["git", "init", "-q", str(target)], check=True)
     subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
