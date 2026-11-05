@@ -29,6 +29,10 @@ class VerificationFailed(DeliveryError):
     """Evidence establishes a defect, rather than an infrastructure failure."""
 
 
+class DeliveryStageError(DeliveryError):
+    """A controller stage observer failed; never retry this as a code defect."""
+
+
 def _report_feedback(report: dict) -> str:
     details = {"summary": report["summary"], "findings": report["findings"],
         "criteria": [criterion for criterion in report["criteria"] if criterion["status"] != "passed"]}
@@ -154,9 +158,16 @@ class ProductDelivery:
             return {"commit_sha": sha, "source_sha": source_digest(original, original_executables), "checks": checks, "report": report}
 
     def run(self, task: ProductTask, *, promote: Callable | None = None, base_sha: str | None = None,
-            replay: dict | None = None) -> dict:
+            replay: dict | None = None, on_stage: Callable[[str], None] | None = None) -> dict:
         task_id = task.document["id"]
         journal = RunJournal(self.store, task_id)
+        def stage(name):
+            if on_stage is not None:
+                try:
+                    on_stage(name)
+                except Exception:
+                    raise DeliveryStageError("Controller stage synchronization failed") from None
+                journal.append("delivery_stage_started", stage=name)
         started = time.monotonic()
         self.deadline = started + self.settings["max_run_seconds"]
         locks = FactoryRunStore(self.store, repo_root_override=repo_root())
@@ -176,6 +187,7 @@ class ProductDelivery:
                     for attempt in range(1, self.settings["max_attempts"] + 1):
                         journal.append("attempt_started", attempt=attempt, base_sha=base_sha)
                         try:
+                            stage("building")
                             with tempfile.TemporaryDirectory(prefix="ai-factory-build-") as temporary:
                                 workspace = Path(temporary) / "source"
                                 original = self._prepare(base_sha, workspace, journal)
@@ -192,8 +204,11 @@ class ProductDelivery:
                                 sha, paths = self._commit(task, base_sha, original, modified, attempt,
                                     original_executables, executable_paths(workspace, modified))
                             journal.append("candidate_created", attempt=attempt, commit_sha=sha, changed_paths=paths)
+                            stage("verifying")
                             verification = self.verify(task, sha, base_sha, journal, prior_feedback=feedback)
                             journal.append("candidate_verified", attempt=attempt, **verification)
+                        except DeliveryStageError:
+                            raise
                         except Exception as exc:
                             # No service secrets are sent to candidate commands; avoid storing provider error bodies.
                             if isinstance(exc, RunnerError):
@@ -207,6 +222,8 @@ class ProductDelivery:
                                      "profile_sha": self.profile.digest, "task_sha": task.digest,
                                      "changed_paths": paths, "verification": verification}
                         lease.heartbeat()
+                        if promote is not None:
+                            stage("merging")
                         result = promote(candidate, journal) if promote else {"status": "verified", **candidate}
                         journal.append("run_finished", status=result["status"], duration_seconds=round(time.monotonic() - started, 3))
                         return {**result, "evidence_dir": str(journal.root), "usage": journal.summary()}
