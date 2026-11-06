@@ -106,9 +106,9 @@ def test_worker_bootstrap_uses_existing_run_budget_before_the_bounded_planning_p
     p.delivery.prepare_runner = bootstrap
     execute(p)
     assert p.delivery.deadline == 300  # Hardware preparation never extends the run.
-    assert p.calls[0][1]["deadline"] == 270  # Setup/investigation/inference share 120 seconds.
+    assert p.calls[0][1]["deadline"] == 250  # Reserve finalization within the same 120 seconds.
     start = next(e["data"] for e in p.journal.events() if e["kind"] == "planning_started")
-    assert start == {"max_seconds": 120, "remaining_run_seconds": 150}
+    assert start == {"max_seconds": 120, "remaining_run_seconds": 150, "finalization_reserve_seconds": 20}
 
 
 def test_bootstrap_cannot_reset_an_exhausted_global_deadline(phase, monkeypatch):
@@ -134,6 +134,46 @@ def test_one_request_stops_before_allocating_hardware(phase):
     phase.delivery.settings = {**phase.delivery.settings, "max_agent_turns": 1}
     phase.delivery.prepare_runner = lambda journal: pytest.fail("Infeasible planner allocated hardware")
     with pytest.raises(PlanningStopped, match="investigation request and a report"):
+        execute(phase)
+    assert not phase.calls and not phase.contexts
+
+
+@pytest.mark.parametrize("cleanup_seconds,admitted", [(4, True), (20, False)])
+def test_report_finalization_is_reserved_but_the_phase_deadline_still_blocks(phase, monkeypatch, cleanup_seconds, admitted):
+    p = phase
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    p.delivery.deadline = 300
+    @contextmanager
+    def sandbox(*args, **kwargs):
+        yield SimpleNamespace(workspace=args[0])
+        clock["now"] += cleanup_seconds
+    p.delivery.sandbox_factory = sandbox
+    def factory(task, base, journal, deadline):
+        assert deadline == 100  # Total phase still ends at 120.
+        def run(role, context, command):
+            command(["cat", "parser.py"])
+            clock["now"] = deadline
+            return p.content
+        return SimpleNamespace(run=run)
+    p.factory = factory
+    if admitted:
+        execute(p)
+        assert (p.journal.root / "plan.json").exists()
+    else:
+        with pytest.raises(PlanningStopped):
+            execute(p)
+        assert not (p.journal.root / "plan.json").exists()
+    validation = next(e["data"] for e in p.journal.events() if e["kind"] == "planning_validation")
+    assert validation == {"investigated": True, "within_deadline": admitted,
+                          "source_unchanged": True, "modes_unchanged": True}
+    assert p.delivery.deadline == 300
+
+
+def test_finalization_reserve_stops_infeasible_work_before_setup(phase, monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 0)
+    phase.delivery.deadline = 20
+    with pytest.raises(PlanningStopped, match="safe finalization"):
         execute(phase)
     assert not phase.calls and not phase.contexts
 

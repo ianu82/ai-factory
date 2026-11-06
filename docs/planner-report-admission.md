@@ -13,5 +13,11 @@ both investigation and reporting and fails before hardware preparation. Deadline
 cancellation, missing usage, unresolved questions and invalid acceptance mappings
 still stop implementation. The controller never manufactures a ready plan.
 
+Twenty seconds of that same phase are reserved for stopping the job, returning
+and checking source, and retaining the plan. Setup, commands and inference use
+the earlier deadline. Finalization still fails closed at the original phase
+deadline; exact investigation/source/mode/deadline checks are journaled where
+they are observed, without deriving a cause from exception text.
+
 Builder and verifier prompts, tools and budgets are unchanged. Existing failed
 runs stay terminal; a new planning policy requires a fresh intake and fresh proof.

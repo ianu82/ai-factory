@@ -19,6 +19,9 @@ class PlanningStopped(HarnessStopped):
     pass
 
 
+FINALIZATION_RESERVE_SECONDS = 20
+
+
 def planning_manifest(profile):
     settings = profile.document
     return {"planner_role_snapshot": select_role("planner", PLANNER_VERSION), "planning_limits": {
@@ -26,7 +29,8 @@ def planning_manifest(profile):
         "runner_preparation_budget": "shared_run_deadline",
         "max_turns": min(8, settings["max_agent_turns"]),
         "max_tokens": min(100000, settings["max_total_tokens"]), "max_seconds": 120,
-        "last_request_report_only": True, "report_reserve_seconds": REPORT_RESERVE_SECONDS}}
+        "last_request_report_only": True, "report_reserve_seconds": REPORT_RESERVE_SECONDS,
+        "finalization_reserve_seconds": FINALIZATION_RESERVE_SECONDS}}
 
 
 def retained_plan(delivery, task, base, journal):
@@ -69,31 +73,42 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         deadline = min(delivery.deadline, time.monotonic() + 120)
         if time.monotonic() >= deadline:
             raise PlanningStopped("Run time budget exhausted during runner preparation")
+        # Stop investigation/inference early enough to close the job and validate
+        # its returned source, without extending either the phase or run deadline.
+        work_deadline = deadline - FINALIZATION_RESERVE_SECONDS
+        if time.monotonic() >= work_deadline:
+            raise PlanningStopped("Insufficient planning time for safe finalization")
         journal.append("planning_started", max_seconds=120,
+                       finalization_reserve_seconds=FINALIZATION_RESERVE_SECONDS,
                        remaining_run_seconds=round(delivery.deadline - time.monotonic(), 3))
         if planner_factory is None:
             planner = ProductPlanner(OpenAIResponsesAgentConnector(config), journal, task=task,
-                base_sha=base, profile=delivery.profile, deadline=deadline, cancelled=delivery.cancelled)
+                base_sha=base, profile=delivery.profile, deadline=work_deadline, cancelled=delivery.cancelled)
         else:
-            planner = planner_factory(task, base, journal, deadline)
+            planner = planner_factory(task, base, journal, work_deadline)
         with tempfile.TemporaryDirectory(prefix="ai-factory-plan-") as temporary:
             workspace = Path(temporary) / "source"
-            original = delivery._prepare(base, workspace, journal, deadline=deadline)
+            original = delivery._prepare(base, workspace, journal, deadline=work_deadline)
             modes = executable_paths(workspace, original)
             investigated = False
             with delivery.sandbox_factory(workspace, delivery.settings["image"], writable=False,
                     platform=delivery.settings["platform"]) as sandbox:
                 def command(argv):
                     nonlocal investigated
-                    result = delivery._command(sandbox, argv, deadline=deadline)
+                    result = delivery._command(sandbox, argv, deadline=work_deadline)
                     investigated = True
                     return result
                 content = planner.run("planner", {**task.public_context, "base_sha": base,
                     "required_checks": delivery.settings["checks"],
                     "allowed_paths": delivery.settings["allowed_paths"]}, command)
-            if (not investigated or time.monotonic() >= deadline
-                    or source_files(workspace) != original or executable_paths(workspace, original) != modes):
+            checks = {"investigated": investigated, "source_unchanged": source_files(workspace) == original,
+                      "modes_unchanged": executable_paths(workspace, original) == modes,
+                      "within_deadline": time.monotonic() < deadline}
+            journal.append("planning_validation", **checks)
+            if not all(checks.values()):
                 raise PlanningStopped("Planning did not complete unchanged read-only investigation")
+        if time.monotonic() >= deadline:
+            raise PlanningStopped("Planning finalization exceeded its phase deadline")
         plan = ProductPlan.create(content, task=task, base_sha=base, profile_sha=delivery.profile.digest,
                                   planner_role=select_role("planner", PLANNER_VERSION))
         freeze_plan(journal, plan, task=task, base_sha=base, profile_sha=delivery.profile.digest)
