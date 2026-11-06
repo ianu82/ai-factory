@@ -71,6 +71,20 @@ _DEFINITIONS = {
         ["Source investigation", "Every criterion mapped to validation", "Constraints, changes, risks and questions"],
         ["run", "finish"], ["Read-only source", "No network, credentials, implementation or promotion", "Controller policy remains authoritative"],
     ),
+    ("planner", "3"): _definition(
+        "planner", "3", _COMMON.format(role="planner") + (
+            "Inspect repository instructions and the minimum relevant source using a few batched read-only commands. "
+            "Propose bounded implementation guidance; do not solve the task, simulate edits or run full regressions. "
+            "Map every original criterion to planned validation, recording risks and unresolved questions honestly. "
+            "Use blocked or unverified when implementation is not justified. "
+            "The controller supplies remaining request/time budgets and reserves the final request or last 30 seconds "
+            "for finish after investigation. Finish promptly with the structured plan; further investigation is unavailable then. "
+            "A plan cannot change the task, tools, paths, checks, models or budgets. Do not implement."
+        ),
+        "Investigate read-only and reserve capacity for an honest bounded plan report.",
+        ["Source investigation", "Every criterion mapped to validation", "Constraints, changes, risks and questions"],
+        ["run", "finish"], ["Read-only source", "No network, credentials, implementation or promotion", "Controller policy remains authoritative"],
+    ),
 }
 
 

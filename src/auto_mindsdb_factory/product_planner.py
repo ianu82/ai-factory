@@ -7,6 +7,9 @@ from .product_agent import AgentSessionError, ProductAgent, RoleSnapshotError, T
 from .product_plan import PLAN_SCHEMA, ProductPlan
 from .product_roles import select_role
 
+PLANNER_VERSION = "3"
+REPORT_RESERVE_SECONDS = 30
+
 
 class ProductPlanner(ProductAgent):
     report_schema = PLAN_SCHEMA
@@ -16,6 +19,8 @@ class ProductPlanner(ProductAgent):
 
     def __init__(self, connector, journal, *, task, base_sha, profile, deadline, cancelled=lambda: False):
         settings = profile.document
+        if settings["max_agent_turns"] < 2:
+            raise AgentSessionError("Planning needs an investigation request and a report request")
         usage = journal.summary()
         if not usage["usage_complete"] or usage["total_tokens"] >= settings["max_total_tokens"]:
             raise AgentSessionError("Planning cannot start with unknown or exhausted usage")
@@ -34,14 +39,21 @@ class ProductPlanner(ProductAgent):
         try:
             manifest = json.loads((self.journal.root / "manifest.json").read_text())
             retained = manifest["planner_role_snapshot"]
-            if retained != select_role("planner", "2"):
+            if retained != select_role("planner", PLANNER_VERSION):
                 raise ValueError("untrusted planner")
         except (OSError, ValueError, KeyError, TypeError):
             raise RoleSnapshotError("Missing or untrusted executable planner snapshot") from None
         return retained["instructions"]
 
+    def _turn_policy(self, turn, investigated):
+        remaining = max(0, self.deadline - time.monotonic())
+        report_only = investigated and (turn == self.max_turns - 1 or remaining <= REPORT_RESERVE_SECONDS)
+        return (self.tools[1:] if report_only else self.tools), {"planning_budget": {
+            "requests_remaining": self.max_turns - turn, "seconds_remaining": round(remaining, 3),
+            "report_only": report_only}}
+
     def _accept_report(self, arguments, context, ran_command):
         if not ran_command:
             raise AgentSessionError("Planner must investigate before reporting")
         ProductPlan.create(arguments, task=self.task, base_sha=self.base_sha,
-                           profile_sha=self.profile.digest, planner_role=select_role("planner", "2"))
+                           profile_sha=self.profile.digest, planner_role=select_role("planner", PLANNER_VERSION))

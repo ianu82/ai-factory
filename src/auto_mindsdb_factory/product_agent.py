@@ -82,6 +82,9 @@ class ProductAgent:
     def _instructions(self, role: str) -> str:
         return execution_role(self.journal, role)["instructions"]
 
+    def _turn_policy(self, turn: int, investigated: bool) -> tuple[list, dict | None]:
+        return self.tools, None
+
     def _accept_report(self, arguments: dict, context: dict, ran_command: bool) -> None:
         expected = {criterion["id"] for criterion in context["acceptance_criteria"]}
         actual = [criterion["id"] for criterion in arguments["criteria"]]
@@ -107,9 +110,11 @@ class ProductAgent:
                 raise AgentSessionError("Prior model usage is unknown; cannot continue within a token budget")
             if usage["total_tokens"] >= self.max_total_tokens:
                 raise AgentSessionError("Run token budget exhausted")
+            tools, guidance = self._turn_policy(turn, ran_command)
             body = {
                 "model": self.connector.config.model, "instructions": instructions,
-                "input": items, "tools": self.tools, "parallel_tool_calls": False, "tool_choice": "required",
+                "input": items if guidance is None else [*items, {"role": "developer", "content": json.dumps(guidance)}],
+                "tools": tools, "parallel_tool_calls": False, "tool_choice": "required",
                 "max_output_tokens": min(self.connector.config.max_output_tokens, self.max_total_tokens - usage["total_tokens"]),
                 "reasoning": {"effort": self.connector.config.reasoning_effort},
                 "store": False, "include": ["reasoning.encrypted_content"],
@@ -149,6 +154,8 @@ class ProductAgent:
                 raise AgentSessionError("Expected exactly one tool call")
             call = calls[0]
             self.journal.append("agent_tool_requested", role=role, tool=call.get("name"), arguments=call.get("arguments"))
+            if call.get("name") not in {tool["name"] for tool in tools}:
+                raise AgentSessionError("Agent requested a tool unavailable for this turn")
             try:
                 arguments = json.loads(call["arguments"])
                 validate(arguments, self.report_schema if call["name"] == "finish" else COMMAND_SCHEMA)

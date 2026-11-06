@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from auto_mindsdb_factory.product_agent import AgentSessionError, RoleSnapshotError
-from auto_mindsdb_factory.product_planner import ProductPlanner
+from auto_mindsdb_factory.product_planner import ProductPlanner, PLANNER_VERSION
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.product_roles import select_role, snapshot_roles
 from auto_mindsdb_factory.product_task import ProductTask
@@ -27,7 +27,7 @@ def setup(tmp_path, responses, **settings):
     task = ProductTask.from_document({"id": "task", "title": "Parser", "goal": "Reject invalid input",
         "acceptance_criteria": [{"id": "reject", "description": "Reject invalid input", "command": ["pytest"]}]})
     journal = RunJournal(tmp_path, "planner")
-    journal.create({"role_snapshots": snapshot_roles(), "planner_role_snapshot": select_role("planner", "2")})
+    journal.create({"role_snapshots": snapshot_roles(), "planner_role_snapshot": select_role("planner", PLANNER_VERSION)})
     return ProductPlanner(connector, journal, task=task, base_sha="b" * 40, profile=profile,
                           deadline=time.monotonic() + 300), requests, journal
 
@@ -44,14 +44,14 @@ def test_planner_uses_frozen_role_and_shared_accounting(tmp_path):
     assert agent.run("planner", agent.task.public_context, lambda cmd: {"command": cmd, "exit_code": 0}) == plan()
     assert journal.summary()["total_tokens"] == 20
     assert journal.events()[-1]["kind"] == "planner_report"
-    assert all(r["instructions"] == select_role("planner", "2")["instructions"] for r in requests)
+    assert all(r["instructions"] == select_role("planner", PLANNER_VERSION)["instructions"] for r in requests)
     assert all([t["name"] for t in r["tools"]] == ["run", "finish"] for r in requests)
     assert all(r["model"] == "pinned" and r["max_output_tokens"] <= 1000 for r in requests)
     assert agent.max_turns == 8 and agent.max_total_tokens == 1000
     assert 0 < agent.deadline - time.monotonic() <= 120
 
 
-@pytest.mark.parametrize("mutation", ["missing", "historical", "forged"])
+@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "forged"])
 def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, mutation):
     agent, requests, journal = setup(tmp_path, [])
     manifest = json.loads((journal.root / "manifest.json").read_text())
@@ -59,6 +59,8 @@ def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, 
         del manifest["planner_role_snapshot"]
     elif mutation == "historical":
         manifest["planner_role_snapshot"] = select_role("planner", "1")
+    elif mutation == "previous-planner":
+        manifest["planner_role_snapshot"] = select_role("planner", "2")
     else:
         manifest["planner_role_snapshot"]["instructions"] = "write code"
     (journal.root / "manifest.json").write_text(json.dumps(manifest))
@@ -84,3 +86,54 @@ def test_planning_cannot_waive_admission_or_report_requirements(tmp_path, mode):
         agent.run("planner", agent.task.public_context, lambda cmd: {"command": cmd, "exit_code": 0})
     if mode in {"unknown-usage", "exhausted", "deadline"}:
         assert not requests
+
+
+@pytest.mark.parametrize("limit", [2, 8])
+def test_last_request_reserves_report_without_extending_limits(tmp_path, limit):
+    response = ("run", {"command": ["cat", "parser.py"]})
+    agent, requests, journal = setup(tmp_path, [response] * (limit - 1) + [("finish", plan())],
+                                     max_agent_turns=limit)
+    manifest = (journal.root / "manifest.json").read_bytes()
+    deadline = agent.deadline
+    commands = []
+    result = agent.run("planner", agent.task.public_context,
+                      lambda argv: commands.append(argv) or {"exit_code": 0})
+    assert result == plan() and len(commands) == limit - 1 and len(requests) == limit
+    assert [t["name"] for t in requests[-1]["tools"]] == ["finish"]
+    guidance = json.loads(requests[-1]["input"][-1]["content"])["planning_budget"]
+    assert guidance["requests_remaining"] == 1 and guidance["report_only"] is True
+    assert agent.deadline == deadline and agent.max_turns == limit
+    assert (journal.root / "manifest.json").read_bytes() == manifest
+    assert journal.summary()["total_tokens"] == limit * 10
+
+
+def test_time_reservation_requires_report_before_the_last_request(tmp_path, monkeypatch):
+    agent, requests, journal = setup(tmp_path, [("run", {"command": ["cat", "parser.py"]}),
+                                               ("finish", plan())])
+    clock = {"now": agent.deadline - 100}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    def investigate(argv):
+        clock["now"] = agent.deadline - 20
+        return {"exit_code": 0}
+    assert agent.run("planner", agent.task.public_context, investigate) == plan()
+    assert [t["name"] for t in requests[-1]["tools"]] == ["finish"]
+    assert json.loads(requests[-1]["input"][-1]["content"])["planning_budget"] == {
+        "requests_remaining": 7, "seconds_remaining": 20, "report_only": True}
+    assert journal.summary()["usage_complete"] is True
+
+
+def test_provider_cannot_execute_an_unoffered_last_turn_command(tmp_path):
+    response = ("run", {"command": ["cat", "parser.py"]})
+    agent, requests, journal = setup(tmp_path, [response, response], max_agent_turns=2)
+    commands = []
+    with pytest.raises(AgentSessionError, match="unavailable for this turn"):
+        agent.run("planner", agent.task.public_context,
+                  lambda argv: commands.append(argv) or {"exit_code": 0})
+    assert len(commands) == 1 and len(requests) == 2
+    assert journal.summary()["total_tokens"] == 20 and journal.summary()["usage_complete"]
+    assert not any(e["kind"] == "planner_report" for e in journal.events())
+
+
+def test_one_request_cannot_authorize_investigation_and_a_report(tmp_path):
+    with pytest.raises(AgentSessionError, match="investigation request and a report"):
+        setup(tmp_path, [], max_agent_turns=1)

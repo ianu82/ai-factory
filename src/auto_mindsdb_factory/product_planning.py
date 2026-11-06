@@ -9,7 +9,7 @@ from .connectors import OpenAIResponsesAgentConnector
 from .docker_runner import RunnerError
 from .product_agent import HarnessStopped
 from .product_plan import ProductPlan, freeze_plan, read_plan
-from .product_planner import ProductPlanner
+from .product_planner import ProductPlanner, PLANNER_VERSION, REPORT_RESERVE_SECONDS
 from .product_roles import select_role
 from .product_workspace import source_files, executable_paths
 from .product_execution import execution_config
@@ -21,11 +21,12 @@ class PlanningStopped(HarnessStopped):
 
 def planning_manifest(profile):
     settings = profile.document
-    return {"planner_role_snapshot": select_role("planner", "2"), "planning_limits": {
+    return {"planner_role_snapshot": select_role("planner", PLANNER_VERSION), "planning_limits": {
         "harness": "native", "model": settings["builder_model"],
         "runner_preparation_budget": "shared_run_deadline",
         "max_turns": min(8, settings["max_agent_turns"]),
-        "max_tokens": min(100000, settings["max_total_tokens"]), "max_seconds": 120}}
+        "max_tokens": min(100000, settings["max_total_tokens"]), "max_seconds": 120,
+        "last_request_report_only": True, "report_reserve_seconds": REPORT_RESERVE_SECONDS}}
 
 
 def retained_plan(delivery, task, base, journal):
@@ -57,6 +58,8 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
             raise PlanningStopped("Planning usage is unknown or its token budget exhausted")
         if time.monotonic() >= delivery.deadline:
             raise PlanningStopped("Run time budget exhausted before planning")
+        if delivery.settings["max_agent_turns"] < 2:
+            raise PlanningStopped("Planning needs an investigation request and a report request")
         if (journal.root / "plan.json").exists() or any(e["kind"] == "plan_frozen" for e in journal.events()):
             raise PlanningStopped("Planning cannot replace an existing run plan")
         config = execution_config(delivery.settings, "planner", journal) if planner_factory is None else None
@@ -92,7 +95,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                     or source_files(workspace) != original or executable_paths(workspace, original) != modes):
                 raise PlanningStopped("Planning did not complete unchanged read-only investigation")
         plan = ProductPlan.create(content, task=task, base_sha=base, profile_sha=delivery.profile.digest,
-                                  planner_role=select_role("planner", "2"))
+                                  planner_role=select_role("planner", PLANNER_VERSION))
         freeze_plan(journal, plan, task=task, base_sha=base, profile_sha=delivery.profile.digest)
         journal.append("plan_frozen", digest=plan.digest, status=content["status"])
         return retained_plan(delivery, task, base, journal)

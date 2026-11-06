@@ -130,6 +130,14 @@ def test_no_preparation_is_admitted_after_usage_exhaustion(phase):
         execute(p)
 
 
+def test_one_request_stops_before_allocating_hardware(phase):
+    phase.delivery.settings = {**phase.delivery.settings, "max_agent_turns": 1}
+    phase.delivery.prepare_runner = lambda journal: pytest.fail("Infeasible planner allocated hardware")
+    with pytest.raises(PlanningStopped, match="investigation request and a report"):
+        execute(phase)
+    assert not phase.calls and not phase.contexts
+
+
 @pytest.mark.parametrize("mode", ["self-consistent-tamper", "missing-ack", "changed-task", "legacy"])
 def test_execution_requires_original_ready_acknowledgement(phase, mode):
     p = phase
