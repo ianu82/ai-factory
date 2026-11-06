@@ -36,6 +36,15 @@ Explicit selections are frozen in the profile and change its fingerprint, so
 operators must validate and activate that configuration deliberately.
 `product-validate` reports both effective harnesses even when the fields are omitted.
 
+`ProductPlan` provides a bounded, versioned planning artifact tied to the exact
+task/criteria, base commit, profile and trusted historical planner role. Every
+criterion needs a validation mapping. Ready guidance requires investigated source,
+constraints, intended changes, risks and no unresolved questions. Blocked and
+unverified guidance retains its reason. Plans cannot change executable policy.
+The journal freezes `plan.json` once; matching reads do not rewrite it and conflicts
+or tampering fail closed. This contract alone does not enable planner execution
+or alter legacy runs. Delivery integration follows separately.
+
 ## Supported product workflow
 
 `product-validate` checks a profile and the target checkout identity.
