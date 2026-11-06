@@ -70,6 +70,28 @@ def test_prepared_worker_is_the_first_source_worker_without_extra_allocation(tmp
     assert [r["id"] for r in provider.calls if r["action"] == "destroy"] == ["1", "2"]
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_verification_fixture_always_closes_its_owned_pool(monkeypatch, failed):
+    from auto_mindsdb_factory.railway_runner import RailwayDelivery
+    from auto_mindsdb_factory.product_delivery import ProductDelivery, VerificationFailed
+    calls = []
+    class Pool:
+        def close(self): calls.append("closed")
+    monkeypatch.setattr("auto_mindsdb_factory.railway_runner.RailwayPool", Pool)
+    def verify(delivery, *args, **kwargs):
+        assert isinstance(delivery._railway_pool, Pool) and delivery.sandbox_factory is delivery._railway_pool
+        if failed: raise VerificationFailed("Observed defect")
+        return {"status": "verified"}
+    monkeypatch.setattr(ProductDelivery, "verify_fixture", verify)
+    delivery = object.__new__(RailwayDelivery)
+    original = delivery.sandbox_factory = object()
+    if failed:
+        with pytest.raises(VerificationFailed): delivery.verify_fixture()
+    else:
+        assert delivery.verify_fixture() == {"status": "verified"}
+    assert calls == ["closed"] and delivery._railway_pool is None and delivery.sandbox_factory is original
+
+
 def test_cancelled_runner_preparation_retires_late_creation_and_cannot_continue(tmp_path):
     import time
     from auto_mindsdb_factory.product_agent import HarnessStopped

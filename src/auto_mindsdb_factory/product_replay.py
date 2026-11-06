@@ -19,6 +19,7 @@ from .product_planning import planning_manifest
 from .product_execution import execution_manifest
 from .product_roles import snapshot_roles
 from .product_task import ProductTask, TASK_SCHEMA
+from .product_workspace import git
 from .reliability import OperationTracker, write_json_atomic
 from .run_journal import RunJournal
 
@@ -64,7 +65,7 @@ def run_suite(profile: ProductProfile, target: Path, store: Path, suite_path: Pa
             # Neither expected outcomes nor case names enter the agent's context.
             run_id = "replay-" + uuid4().hex
             task = ProductTask.from_document({**case["task"], "id": run_id})
-            metadata = {"suite_sha": suite_sha, "case": case["name"], "repetition": repetition,
+            metadata = {"suite_sha": suite_sha, "case": case["name"], "repetition": repetition, "mode": case["mode"],
                         "original_task_sha": ProductTask.from_document(case["task"]).digest}
             delivery = delivery_factory(profile, target, store)
             journal = RunJournal(store, run_id)
@@ -78,15 +79,16 @@ def run_suite(profile: ProductProfile, target: Path, store: Path, suite_path: Pa
                     delivery.deadline = time.monotonic() + profile.document["max_run_seconds"]
                     locks = FactoryRunStore(store, repo_root_override=repo_root())
                     with locks.run_lease(run_id, ttl_seconds=60, renew_interval_seconds=15):
-                        journal.create({"purpose": "replay", "replay": metadata, "profile": profile.document,
+                        journal.create({"purpose": "replay", "replay": metadata, "verification_only": True,
+                            "runtime_sha": git(repo_root(), "rev-parse", "HEAD"), "task_sha": task.digest,
+                            "profile": profile.document,
                             "profile_sha": profile.digest, "task": task.document, "base_sha": case["base_sha"],
                             "candidate_sha": case["candidate_sha"], "role_snapshots": snapshot_roles(),
                             **planning_manifest(profile), **execution_manifest(profile.document)})
                         with OperationTracker(store, run_id, "delivery", "replay-verification"):
                             try:
                                 journal.append("base_resolved", commit_sha=case["base_sha"])
-                                delivery.plan(task, case["base_sha"], journal)
-                                verification = delivery.verify(task, case["candidate_sha"], case["base_sha"], journal)
+                                verification = delivery.verify_fixture(task, case["candidate_sha"], case["base_sha"], journal)
                                 journal.append("candidate_verified", **verification)
                                 actual = "verified"
                             except VerificationFailed as exc:

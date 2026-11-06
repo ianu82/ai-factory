@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -167,6 +168,43 @@ class ProductDelivery:
         execution_role(journal, "verifier")
         self.check_cancelled()
         plan = retained_plan(self, task, base, journal)
+        return self._verify_candidate(task, sha, base, journal, plan=plan, prior_feedback=prior_feedback)
+
+    def verify_fixture(self, task: ProductTask, sha: str, base: str, journal: RunJournal) -> dict:
+        """Verify a frozen replay input, without authorizing implementation or promotion."""
+        try:
+            manifest = json.loads((journal.root / "manifest.json").read_text())
+            events = journal.events()
+            if (manifest.get("purpose") != "replay" or manifest.get("verification_only") is not True
+                    or manifest["replay"].get("mode") != "verify"
+                    or task.document["id"] != journal.root.name
+                    or manifest.get("task_sha") != task.digest
+                    or ProductTask.from_document(manifest["task"]).digest != task.digest
+                    or manifest.get("profile_sha") != self.profile.digest
+                    or ProductProfile.from_document(manifest["profile"]).digest != self.profile.digest
+                    or ProductProfile.from_document(self.settings).digest != self.profile.digest
+                    or manifest.get("base_sha") != base or manifest.get("candidate_sha") != sha
+                    or not all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) for value in (base, sha))
+                    or manifest.get("runtime_sha") != git(repo_root(), "rev-parse", "HEAD")
+                    or len(events) != 1 or events[0]["kind"] != "base_resolved"
+                    or events[0]["data"] != {"commit_sha": base}):
+                raise ValueError("Unbound verification fixture")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise DeliveryError("Frozen verification-only replay inputs are required") from None
+        execution_role(journal, "verifier")
+        execution_config(self.settings, "verifier", journal)
+        self._cancellation = RunCancellation(journal)
+        self.check_cancelled()
+        usage = journal.summary()
+        if (not usage["usage_complete"] or usage["total_tokens"] >= self.settings["max_total_tokens"]
+                or time.monotonic() >= self.deadline):
+            raise HarnessStopped("Verification replay budget is unavailable or exhausted")
+        self.prepare_runner(journal)
+        return self._verify_candidate(task, sha, base, journal)
+
+    def _verify_candidate(self, task, sha, base, journal, *, plan=None, prior_feedback=""):
+        execution_role(journal, "verifier")
+        self.check_cancelled()
         with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
@@ -187,8 +225,10 @@ class ProductDelivery:
                 if not diff or len(diff) > 60000:
                     raise DeliveryError("Candidate diff is empty or too large to review")
                 context = {**task.public_context, "base_sha": base, "candidate_sha": sha, "diff": diff,
-                           "required_checks": self.settings["checks"], "prior_attempt_feedback": prior_feedback, "plan": plan,
+                           "required_checks": self.settings["checks"], "prior_attempt_feedback": prior_feedback,
                            "controller_checks": [{"name": c["name"], "exit_code": c["exit_code"]} for c in checks]}
+                if plan is not None:
+                    context["plan"] = plan
                 report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
             if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
                 raise DeliveryError("Verifier changed candidate source")

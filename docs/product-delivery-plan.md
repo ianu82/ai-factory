@@ -112,6 +112,14 @@ and `expected` (`verified` or `rejected`). Verification cases also require a ful
 runner image and configuration. Neither case names nor expected outcomes enter
 agent prompts. Replay has no publication callback and cannot create or merge PRs.
 
+Verification-only cases inspect an existing pinned candidate, so they do not
+request an implementation plan or invoke a builder. Their dedicated entry binds
+the exact task, profile, base, candidate and controller runtime before allocating
+hardware, rejects prior execution history, and freezes verifier configuration.
+It runs the same executable checks, read-only independent verifier and source
+integrity checks as delivery. Normal build cases and normal delivery verification
+still require the trusted ready plan; fixture verification cannot authorize them.
+
 Every repetition gets fresh evidence and an immutable scoring event, preserving
 previous results. Defect evidence can establish rejection; timeouts, unavailable
 commands, setup failures and missing model usage remain unverified. Report those

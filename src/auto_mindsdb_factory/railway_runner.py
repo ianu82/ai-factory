@@ -308,3 +308,6 @@ class RailwayDelivery(ProductDelivery):
 
     def verify(self, *args, **kwargs):
         return self._in_pool(super().verify, *args, **kwargs)
+
+    def verify_fixture(self, *args, **kwargs):
+        return self._in_pool(super().verify_fixture, *args, **kwargs)

@@ -18,7 +18,8 @@ def suite_document():
     ]}
 
 
-def test_replays_pin_inputs_preserve_scores_and_keep_failures_honest(tmp_path):
+def test_replays_pin_inputs_preserve_scores_and_keep_failures_honest(tmp_path, monkeypatch):
+    monkeypatch.setattr("auto_mindsdb_factory.product_replay.git", lambda *args: "d" * 40)
     path = tmp_path / "suite.json"
     path.write_text(json.dumps(suite_document()))
     profile = ProductProfile.from_document({"version": 1, "name": "product", "repository": "owner/product",
@@ -38,8 +39,12 @@ def test_replays_pin_inputs_preserve_scores_and_keep_failures_honest(tmp_path):
             j.append("run_finished", status="verified")
             return {"status": "verified"}
         def plan(self, task, base, journal):
-            assert base == "a" * 40
-        def verify(self, task, candidate, base, journal):
+            pytest.fail("Verification-only replay must not plan implementation")
+        def verify_fixture(self, task, candidate, base, journal):
+            manifest = json.loads((journal.root / "manifest.json").read_text())
+            assert manifest["verification_only"] is True and manifest["replay"]["mode"] == "verify"
+            assert manifest["task_sha"] == task.digest
+            assert "expected" not in task.public_context and "case" not in task.public_context
             if candidate == "b" * 40:
                 raise VerificationFailed("assertion failed")
             raise DeliveryError("environment unavailable")
