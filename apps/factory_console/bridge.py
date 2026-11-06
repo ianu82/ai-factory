@@ -1,5 +1,6 @@
 """Bounded read-only journal publisher. No inference, execution or claim mutation."""
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -54,6 +55,11 @@ class Publisher:
         manifest = json.loads(manifest_file.read_text())
         journal = self.journal_factory(store,directory.name,read_only=True)
         events, summary = journal.events(), journal.summary()
+        current_files = list(directory.glob('event-*.json'))
+        current = (len(current_files), max((p.stat().st_mtime_ns for p in current_files), default=0),
+                   manifest_file.stat().st_mtime_ns)
+        if current != fingerprint:
+            raise ValueError('Journal changed during observation')
         if not events:
             return None
         created = manifest.get('created_at',events[0]['at'])
@@ -107,11 +113,16 @@ class Publisher:
             if not root.is_dir() or root.is_symlink():continue
             directories.extend((store,p) for p in root.iterdir() if p.is_dir() and not p.is_symlink() and (p/'manifest.json').is_file())
         directories.sort(key=lambda pair:(pair[1]/'manifest.json').stat().st_mtime_ns,reverse=True)
+        identities=Counter(directory.name for _,directory in directories)
         runs, unavailable = [], 0
         for store,directory in directories[:50]:
             try:
+                if identities[directory.name]>1:
+                    raise ValueError('Ambiguous run identity across configured stores')
                 value=self.run(store,directory)
-                if value:runs.append(value)
+                if value:
+                    checked=projection({'version':1,'observed_at':stamp,'controller':{'mode':'unknown'},'runs':[value]})['runs'][0]
+                    runs.append(checked)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 unavailable+=1
         return projection({'version':1,'observed_at':stamp,'controller':{'mode':mode,
