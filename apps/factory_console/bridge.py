@@ -54,6 +54,11 @@ class Publisher:
         manifest = json.loads(manifest_file.read_text())
         journal = self.journal_factory(store,directory.name,read_only=True)
         events, summary = journal.events(), journal.summary()
+        current_files = list(directory.glob('event-*.json'))
+        current = (len(current_files), max((p.stat().st_mtime_ns for p in current_files), default=0),
+                   manifest_file.stat().st_mtime_ns)
+        if current != fingerprint:
+            raise ValueError('Journal changed during observation')
         if not events:
             return None
         created = manifest.get('created_at',events[0]['at'])
@@ -111,7 +116,11 @@ class Publisher:
         for store,directory in directories[:50]:
             try:
                 value=self.run(store,directory)
-                if value:runs.append(value)
+                if value:
+                    checked=projection({'version':1,'observed_at':stamp,'controller':{'mode':'unknown'},'runs':[value]})['runs'][0]
+                    if any(run['id']==checked['id'] for run in runs):
+                        raise ValueError('Ambiguous run identity across configured stores')
+                    runs.append(checked)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 unavailable+=1
         return projection({'version':1,'observed_at':stamp,'controller':{'mode':mode,

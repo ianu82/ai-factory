@@ -85,3 +85,19 @@ def test_check_outcomes_require_exact_integer_evidence(tmp_path,exit_code,expect
     run=publisher.snapshot()['runs'][0]
     assert run['checks'][0]['status']==expected
     assert before=={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in journal.root.iterdir()}
+
+
+def test_minimal_journal_does_not_suppress_valid_runs(tmp_path):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence'
+    valid=RunJournal(store,'valid')
+    valid.create({'task':{'title':'Actual delivery'},'profile':{'repository':'owner/repo'}})
+    valid.append('run_finished',status='blocked')
+    minimal=RunJournal(store,'qualification')
+    minimal.create({'purpose':'qualification'})
+    minimal.append('qualification_finished')
+    before={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in store.rglob('*') if p.is_file()}
+    result=Publisher([store],tmp_path/'no-status').snapshot()
+    assert [run['id'] for run in result['runs']]==['valid']
+    assert result['controller']['unreadable_runs']==1
+    assert before=={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in store.rglob('*') if p.is_file()}
