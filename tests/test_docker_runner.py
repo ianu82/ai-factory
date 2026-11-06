@@ -38,6 +38,29 @@ def test_timeout_destroys_container_and_output_is_bounded(tmp_path):
 
 
 @pytest.mark.skipif(not os.environ.get("AI_FACTORY_TEST_IMAGE"), reason="requires Docker")
+def test_abort_terminates_an_active_command_and_its_container(tmp_path):
+    import subprocess
+    import threading
+    import time
+    results = []
+    with DockerSandbox(tmp_path, os.environ["AI_FACTORY_TEST_IMAGE"], writable=True) as sandbox:
+        thread = threading.Thread(target=lambda: results.append(sandbox.run(
+            ["sh", "-c", "touch /workspace/started; exec sleep 600"])))
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while not (tmp_path / "started").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert (tmp_path / "started").exists(), "candidate command never started"
+            sandbox.abort()
+        finally:
+            sandbox._remove()
+            thread.join(timeout=10)
+        assert not thread.is_alive() and results and results[0]["exit_code"] != 0
+        assert subprocess.run(["docker", "inspect", sandbox.name], capture_output=True).returncode != 0
+
+
+@pytest.mark.skipif(not os.environ.get("AI_FACTORY_TEST_IMAGE"), reason="requires Docker")
 def test_real_railway_driver_confirms_isolation_and_container_removal(tmp_path, monkeypatch):
     from uuid import uuid4
     from auto_mindsdb_factory import railway_remote

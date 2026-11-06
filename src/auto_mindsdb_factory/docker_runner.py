@@ -112,8 +112,13 @@ class DockerSandbox:
                 **{name + "_truncated": sizes[name] > len(captured[name]) for name in captured},
                 "duration_seconds": round(time.monotonic() - started, 3)}
 
-    def _remove(self) -> None:
-        subprocess.run(["docker", "rm", "--force", self.name], capture_output=True, timeout=30)
+    def _remove(self) -> subprocess.CompletedProcess:
+        return subprocess.run(["docker", "rm", "--force", self.name], capture_output=True, timeout=30)
+
+    def abort(self) -> None:
+        """Stop the owned container, including processes behind a blocked exec client."""
+        if self._remove().returncode:
+            raise RunnerError("Sandbox cancellation cleanup could not be confirmed")
 
     def __exit__(self, *exc) -> None:
         self._remove()

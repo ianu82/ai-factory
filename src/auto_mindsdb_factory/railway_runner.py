@@ -105,6 +105,7 @@ class RailwayPool:
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self.failure = None
+        self._aborting = None
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.thread.start()
 
@@ -129,22 +130,31 @@ class RailwayPool:
 
     def _discard(self):
         if self.id:
+            if self.id == self._aborting:
+                return  # An independent cancellation already owns this retirement.
             self.transport({"action": "destroy", "id": self.id, "timeout": 30})
             self.id = self.workspace = None
             self.failure = None
 
     def open(self, workspace):
         with self.lock:
+            if self.stopped.is_set():
+                raise RunnerError("Railway worker pool is closed")
             if self.failure:
                 raise self.failure
             if self.workspace != workspace:
                 self._discard()
                 self.id = self.transport({"action": "create", "timeout": 300})["id"]
+                if self.stopped.is_set():
+                    self._discard()
+                    raise RunnerError("Railway worker creation was cancelled")
                 self.workspace = workspace
                 self.call({"action": "upload", "source": pack_source(workspace)}, timeout=120)
 
     def call(self, request, *, timeout=120):
         with self.lock:
+            if self.stopped.is_set():
+                raise RunnerError("Railway worker pool is closed")
             if self.failure:
                 raise self.failure
             if not self.id:
@@ -182,6 +192,22 @@ class RailwayPool:
                 # heartbeats stopped, the provider's finite idle TTL remains active.
                 print("Railway worker cleanup failed; five-minute idle expiry remains active", file=sys.stderr)
 
+    def abort(self):
+        """Retire our VM without waiting for a command's lifecycle lock."""
+        self.stopped.set()
+        identity = self.id
+        self._aborting = identity
+        try:
+            if identity:
+                response = self.transport({"action": "destroy", "id": identity, "timeout": 30})
+                if "error" in response:
+                    raise RailwayOperationError({"action": "destroy"}, response["error"])
+                if self.id == identity:
+                    self.id = self.workspace = None
+        finally:
+            self._aborting = None
+            self.failure = RunnerError("Railway execution was cancelled")
+
 
 class RailwaySandbox:
     def __init__(self, pool, workspace, image, **options):
@@ -200,6 +226,9 @@ class RailwaySandbox:
 
     def run(self, command, *, stdin=None):
         return self._call("run", command=command, stdin=stdin)
+
+    def abort(self):
+        self.pool.abort()
 
     def __exit__(self, *exc):
         if exc[0] is not None and self.pool.failure:
