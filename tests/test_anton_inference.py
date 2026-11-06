@@ -14,7 +14,7 @@ def boundary(tmp_path, *, tokens=100, **options):
                           deadline=time.monotonic() + 30, **options)
 
 
-def client(usage=None, status="completed", failure=None, delay=0):
+def client(usage=None, status="completed", failure=None, delay=0, output=None):
     calls, settings = [], []
     async def create(**body):
         calls.append(body)
@@ -23,6 +23,7 @@ def client(usage=None, status="completed", failure=None, delay=0):
         if failure:
             raise failure
         return SimpleNamespace(id="response", model="pinned", status=status,
+            output=output or [],
             usage=SimpleNamespace(model_dump=lambda: usage) if usage is not None else None)
     transport = SimpleNamespace(responses=SimpleNamespace(create=create))
     def with_options(**options):
@@ -114,3 +115,17 @@ def test_cancel_stops_active_sdk_work(tmp_path):
         asyncio.run(guard.request(sdk, BODY))
     assert time.monotonic() - started < 1
     assert len(calls) == 1 and not guard.journal.summary()["usage_complete"]
+
+
+@pytest.mark.parametrize("output", [
+    [SimpleNamespace(type="function_call", name="scratchpad", arguments='{"code":"read_host()"}')],
+    [SimpleNamespace(type="function_call", name="run", arguments='{"command":["cat"')],
+    [SimpleNamespace(type="function_call", name="run", arguments='{"command":"shell"}')],
+    [SimpleNamespace(type="function_call", name="run", arguments='{"command":["true"]}')] * 2,
+])
+def test_malformed_or_undeclared_calls_are_rejected_before_sdk_dispatch(tmp_path, output):
+    guard = boundary(tmp_path)
+    sdk, calls, _ = client(USAGE, output=output)
+    with pytest.raises(AntonStopped):
+        asyncio.run(guard.request(sdk, BODY))
+    assert len(calls) == 1 and guard.journal.summary()["total_tokens"] == 10

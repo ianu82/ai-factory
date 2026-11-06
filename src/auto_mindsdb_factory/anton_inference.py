@@ -5,6 +5,9 @@ import hashlib
 import json
 import time
 
+from jsonschema import ValidationError, validate
+
+from .product_agent import COMMAND_SCHEMA, REPORT_SCHEMA
 from .product_costs import estimate_cost
 
 
@@ -82,4 +85,12 @@ class AntonInference:
         self.admit()
         if model != self.config.model or getattr(response, "status", None) != "completed":
             raise AntonStopped("Anton model response did not complete")
+        calls = [item for item in getattr(response, "output", []) if getattr(item, "type", None) == "function_call"]
+        if len(calls) > 1 or any(call.name not in {"run", "finish"} for call in calls):
+            raise AntonStopped("Anton returned unsupported tool calls")
+        for call in calls:
+            try:
+                validate(json.loads(call.arguments), REPORT_SCHEMA if call.name == "finish" else COMMAND_SCHEMA)
+            except (ValueError, TypeError, ValidationError):
+                raise AntonStopped("Anton returned malformed tool arguments") from None
         return response
