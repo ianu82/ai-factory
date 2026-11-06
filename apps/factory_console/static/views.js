@@ -20,13 +20,17 @@ export function inbox(data, workspace) {
       !i.resolved &&
       (!workspace || i.workspace_id === workspace.id),
   ).length;
-  return `<div class="page-heading">
+  return `${
+    workspace
+      ? ""
+      : `<div class="page-heading">
 <div>
-<h1>${workspace ? "Attention" : "Inbox"}<span class="heading-count">${count}</span>
+<h1>Inbox<span class="heading-count">${count}</span>
 </h1>
 </div>
 <button class="button primary" data-new-work>${icon("plus")}New work</button>
-</div>
+</div>`
+  }
 <div class="inbox-toolbar">
 <div class="segments" aria-label="Inbox order">
 <button class="selected" data-order="priority">${icon("layers")}Priority</button>
@@ -87,7 +91,7 @@ function attentionList(
 ${i.mode === "non-coding" ? "<span>· Non-coding</span>" : ""}
 </div>
 <h3>${e(i.title)}</h3>
-${i.description && !i.run_id ? `<p>${e(i.description)}</p>` : ""}
+${i.description && !i.run_id && i.description.trim() !== i.title.trim() ? `<p>${e(i.description)}</p>` : ""}
 <div class="row-bottom">${badge(i.status)}<span title="${e(fullDate(i.attention_at))}">${icon("clock")}${relative(i.attention_at)}</span>
 </div>
 </div>${icon("chevron", "row-chevron")}</button>`;

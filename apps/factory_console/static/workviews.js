@@ -32,10 +32,7 @@ export function board(data, workspace) {
       : s === "complete"
         ? "complete"
         : s;
-  return `<div class="section-heading">
-<button class="button primary" data-new-work>${icon("plus")}New work</button>
-</div>
-<div class="board" aria-label="Work board">${[
+  return `<div class="board" aria-label="Work board">${[
     ["backlog", "Backlog"],
     ["ready", "Ready"],
     ["progress", "In progress"],
@@ -62,7 +59,7 @@ export function board(data, workspace) {
                 ) => `<button class="work-card ${c.status === "blocked" ? "blocked" : ""}" ${c.run_id ? `data-open-run="${e(c.run_id)}"` : `data-edit-item="${e(c.id)}"`}>
 <div class="work-card-meta">
 <span>${c.run_id ? "Run" : "Draft"}</span>${c.priority ? priority(c.priority) : ""}</div>
-<h3>${e(c.title)}</h3>${c.description ? `<p>${e(c.description)}</p>` : ""}${badge(c.status)}<footer>
+<h3>${e(c.title)}</h3>${c.description && c.description.trim() !== c.title.trim() ? `<p>${e(c.description)}</p>` : ""}${column(c.status) === "progress" ? badge(c.status) : ""}<footer>
 <span>${c.run_id ? e(c.repository.split("/")[1]) : c.mode === "non-coding" ? "Non-coding" : "Engineering"}</span>
 <span>${relative(c.updated_at)}</span>
 </footer>
@@ -79,11 +76,15 @@ export function runs(data, workspace) {
   const list = scopedRuns(data, workspace).sort((a, b) =>
     b.created_at.localeCompare(a.created_at),
   );
-  return `<div class="${workspace ? "section-heading" : "page-heading"}">
+  return `${
+    !workspace || data.connection.stale
+      ? `<div class="${workspace ? "section-heading" : "page-heading"}">
 <div>${workspace ? "" : `<h1>Runs<span class="heading-count">${list.length}</span></h1>`}
 </div>
 ${data.connection.stale ? `<span class="quiet-label">Last updated ${relative(data.connection.observed_at)}</span>` : ""}
-</div>${
+</div>`
+      : ""
+  }${
     list.length
       ? `<div class="runs-table">
 <div class="runs-table-heading">
@@ -155,13 +156,10 @@ export function runDetail(data, id) {
     .join("")}</ol>
 <div class="run-detail-grid">
 <div>
-<section class="detail-section">
-<div class="section-title"><h2>${r.status === "blocked" ? "Blocked during " + e(r.stage) : r.status === "complete" ? "Delivered" : "Progress"}</h2>
-</div>
-${r.pull_request_url ? `<a class="button secondary" href="${e(r.pull_request_url)}" target="_blank" rel="noopener noreferrer">${icon("git")}Pull request ${icon("external")}</a>` : ""}</section>
+${r.pull_request_url ? `<section class="detail-section"><a class="button secondary" href="${e(r.pull_request_url)}" target="_blank" rel="noopener noreferrer">${icon("git")}Pull request ${icon("external")}</a></section>` : ""}
 <section class="detail-section">
 <div class="section-title">${icon("checkcircle")}<h2>Verification</h2>
-<span class="quiet-label">${r.checks.length} recorded checks</span>
+${r.checks.length ? `<span class="quiet-label">${r.checks.length} checks</span>` : ""}
 </div>${
     r.checks.length
       ? `<div class="checks">${r.checks

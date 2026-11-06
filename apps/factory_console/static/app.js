@@ -162,13 +162,16 @@ function nav(path, label, name, count = 0) {
   return `<a class="nav-link ${current === path ? "active" : ""}" href="#/${path}">${icon(name)}<span>${label}</span>${count ? `<span class="nav-count">${count}</span>` : ""}</a>`;
 }
 function workspaceHeader(ws, view) {
+  const waiting = data.items.filter(
+    (item) =>
+      item.workspace_id === ws.id && item.attention_at && !item.resolved,
+  ).length;
   return `<section class="workspace-heading">
 <div>
 <h1>${e(ws.name)}</h1>
-<p>${e(ws.description)}</p>
+${ws.description ? `<p>${e(ws.description)}</p>` : ""}
 </div>
-<div class="workspace-repos">${icon("git")}<span>${ws.repositories.length} repositories</span>
-</div>
+${["board", "inbox"].includes(view) ? `<button class="button primary" data-new-work>${icon("plus")}New work</button>` : `<a class="workspace-repos" href="#/workspace/${e(ws.id)}/settings">${icon("git")}<span>${ws.repositories.length} repositories</span></a>`}
 </section>
 <nav class="tabs" aria-label="Workspace views">${[
     ["chat", "Master chat"],
@@ -179,7 +182,7 @@ function workspaceHeader(ws, view) {
   ]
     .map(
       ([v, l]) =>
-        `<a href="#/workspace/${e(ws.id)}/${v}" class="${v === view ? "selected" : ""}">${l}</a>`,
+        `<a href="#/workspace/${e(ws.id)}/${v}" class="${v === view ? "selected" : ""}">${l}${v === "inbox" && waiting ? ` <span class="tab-count">${waiting}</span>` : ""}</a>`,
     )
     .join("")}</nav>
 <div id="workspace-view">
