@@ -26,5 +26,12 @@ at 0.167.0 with npm integrity hashes. Linux CI runs `--version` with an empty,
 temporary home and no authentication variables. Installation and this version
 check do not establish runtime isolation, protocol integration or certification.
 
+`tests/test_codex_transport.py` exercises the actual pinned app-server with a
+loopback-only provider, no inherited credentials and a one-request bound. It
+checks a permitted report's real callback and rejects an attempted built-in
+before streaming any action. The fixture terminates its owned process group and
+joins its reader/server threads. Dedicated Linux CI requires the installed CLI;
+an ordinary test environment without the optional CLI reports a capability skip.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
