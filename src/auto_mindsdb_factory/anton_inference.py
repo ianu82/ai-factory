@@ -7,12 +7,18 @@ import time
 
 from jsonschema import ValidationError, validate
 
-from .product_agent import COMMAND_SCHEMA, REPORT_SCHEMA
+from .product_agent import COMMAND_SCHEMA, REPORT_SCHEMA, TOOLS
 from .product_costs import estimate_cost
 
 
 class AntonStopped(BaseException):
     """Stop SDK recovery too: a Factory policy stop cannot authorize another call."""
+
+
+STOP_REASONS = frozenset({"cancelled_or_deadline", "evidence_unavailable", "usage_unknown_or_exhausted",
+    "unapproved_model", "unapproved_reasoning", "unsupported_request_tools", "unapproved_tool_schema",
+    "request_cancelled", "model_or_status_mismatch", "unsupported_response_items", "unsupported_tool_calls",
+    "malformed_tool_arguments", "request_limit", "scratchpad_blocked", "cleanup_unconfirmed"})
 
 
 class AntonInference:
@@ -22,15 +28,21 @@ class AntonInference:
         self.pricing, self.cancelled = pricing or {}, cancelled
         self.calls = 0
 
+    def stop(self, reason):
+        # Record the established decision here, never by inspecting mutable exception state.
+        safe = reason if type(reason) is str and reason in STOP_REASONS else "unknown"
+        self.record("harness_policy_stopped", role=self.role, harness="anton", reason=safe)
+        raise AntonStopped("Anton execution stopped by Factory policy")
+
     def admit(self):
         if self.cancelled() or time.monotonic() >= self.deadline:
-            raise AntonStopped("Anton execution cancelled or timed out")
+            self.stop("cancelled_or_deadline")
         try:
             usage = self.journal.summary()
         except Exception:
-            raise AntonStopped("Anton execution evidence is unavailable") from None
+            self.stop("evidence_unavailable")
         if not usage["usage_complete"] or usage["total_tokens"] >= self.max_total_tokens:
-            raise AntonStopped("Anton usage is unknown or its shared budget is exhausted")
+            self.stop("usage_unknown_or_exhausted")
         return usage
 
     def record(self, kind, **data):
@@ -42,15 +54,22 @@ class AntonInference:
     async def request(self, client, supplied):
         usage = self.admit()
         if supplied.get("model") != self.config.model:
-            raise AntonStopped("Anton attempted an unapproved model")
+            self.stop("unapproved_model")
         reasoning = supplied.get("reasoning") or {}
-        if reasoning.get("effort", self.config.reasoning_effort) != self.config.reasoning_effort:
-            raise AntonStopped("Anton attempted an unapproved reasoning setting")
-        if supplied.get("stream") or any(tool.get("type") != "function" or tool.get("name") not in {"run", "finish"}
-                                         for tool in supplied.get("tools", [])):
-            raise AntonStopped("Anton attempted an unsupported transport or tool")
+        if type(reasoning) is not dict or reasoning.get("effort", self.config.reasoning_effort) != self.config.reasoning_effort:
+            self.stop("unapproved_reasoning")
+        tools = supplied.get("tools")
+        expected = {tool["name"]: tool["parameters"] for tool in TOOLS}
+        if (supplied.get("stream") or type(tools) is not list or len(tools) != 2
+                or any(type(tool) is not dict or tool.get("type") != "function"
+                       or type(tool.get("name")) is not str or tool["name"] not in expected for tool in tools)
+                or {tool["name"] for tool in tools} != set(expected)):
+            self.stop("unsupported_request_tools")
+        if any(tool.get("parameters") != expected[tool["name"]] for tool in tools):
+            self.stop("unapproved_tool_schema")
         remaining = self.deadline - time.monotonic()
         body = {**supplied, "store": False, "parallel_tool_calls": False,
+                "tools": json.loads(json.dumps(TOOLS)), "tool_choice": "required",
                 "max_output_tokens": min(self.config.max_output_tokens, self.max_total_tokens - usage["total_tokens"]),
                 "reasoning": {**reasoning, "effort": self.config.reasoning_effort},
                 "include": sorted(set(supplied.get("include", [])) | {"reasoning.encrypted_content"})}
@@ -69,7 +88,7 @@ class AntonInference:
                     while not request.done():
                         await asyncio.wait({request}, timeout=0.05)
                         if self.cancelled():
-                            raise AntonStopped("Anton execution cancelled")
+                            self.stop("request_cancelled")
                     response = await request
                 finally:
                     if not request.done():
@@ -93,17 +112,18 @@ class AntonInference:
             cost_estimate_usd=estimate_cost(recorded, rate), pricing=rate)
         self.admit()
         if model != self.config.model or getattr(response, "status", None) != "completed":
-            raise AntonStopped("Anton model response did not complete")
+            self.stop("model_or_status_mismatch")
         output = getattr(response, "output", None)
-        if not isinstance(output, list) or any(getattr(item, "type", None) not in
-                {"message", "reasoning", "function_call"} for item in output):
-            raise AntonStopped("Anton returned unsupported response items")
+        if not isinstance(output, list) or any(type(getattr(item, "type", None)) is not str
+                or item.type not in {"message", "reasoning", "function_call"} for item in output):
+            self.stop("unsupported_response_items")
         calls = [item for item in output if item.type == "function_call"]
-        if len(calls) > 1 or any(getattr(call, "name", None) not in {"run", "finish"} for call in calls):
-            raise AntonStopped("Anton returned unsupported tool calls")
+        if len(calls) != 1 or any(type(getattr(call, "name", None)) is not str
+                                or call.name not in {"run", "finish"} for call in calls):
+            self.stop("unsupported_tool_calls")
         for call in calls:
             try:
                 validate(json.loads(call.arguments), REPORT_SCHEMA if call.name == "finish" else COMMAND_SCHEMA)
-            except (ValueError, TypeError, ValidationError):
-                raise AntonStopped("Anton returned malformed tool arguments") from None
+            except (ValueError, TypeError, RecursionError, ValidationError):
+                self.stop("malformed_tool_arguments")
         return response

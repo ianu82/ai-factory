@@ -9,6 +9,7 @@ import pytest
 from auto_mindsdb_factory.anton_session import AntonAgent
 from auto_mindsdb_factory.connectors import OpenAIResponsesAgentConfig
 from auto_mindsdb_factory.product_agent import HarnessStopped
+from auto_mindsdb_factory.product_agent import TOOLS
 from auto_mindsdb_factory.product_roles import snapshot_roles
 from auto_mindsdb_factory.run_journal import RunJournal
 
@@ -18,7 +19,7 @@ REPORT = {"status": "passed", "summary": "Parser checked", "findings": [],
 CONTEXT = {"acceptance_criteria": [{"id": "a", "description": "Reject invalid input"}]}
 
 
-@pytest.mark.parametrize("mode", ["success", "provider-error", "cancel-active", "host-tool"])
+@pytest.mark.parametrize("mode", ["success", "provider-error", "cancel-active", "host-tool", "multiple-calls"])
 def test_real_sdk_http_protocol_accounting_and_cleanup(tmp_path, monkeypatch, mode):
     pytest.importorskip("anton.core.session")
     import httpx2
@@ -38,10 +39,13 @@ def test_real_sdk_http_protocol_accounting_and_cleanup(tmp_path, monkeypatch, mo
         name, arguments = ("finish", REPORT) if len(requests) == 2 else ("run", {"command": ["cat", "parser.py"]})
         if mode == "host-tool":
             name, arguments = "scratchpad", {"code": "read_host_secret()"}
+        output = [{"id": "fc_" + str(len(requests)), "type": "function_call", "status": "completed",
+                   "call_id": "call_" + str(len(requests)), "name": name, "arguments": json.dumps(arguments)}]
+        if mode == "multiple-calls":
+            output.append({**output[0], "id": "second", "call_id": "second"})
         return httpx2.Response(200, json={"id": "resp_" + str(len(requests)), "object": "response",
             "created_at": 1, "status": "completed", "model": "pinned", "parallel_tool_calls": False,
-            "output": [{"id": "fc_" + str(len(requests)), "type": "function_call", "status": "completed",
-                        "call_id": "call_" + str(len(requests)), "name": name, "arguments": json.dumps(arguments)}],
+            "output": output,
             "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}})
     def create_client(**kwargs):
         http = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
@@ -64,12 +68,13 @@ def test_real_sdk_http_protocol_accounting_and_cleanup(tmp_path, monkeypatch, mo
         assert all(body["model"] == "pinned" and body["store"] is False for body in bodies)
         assert all(body["parallel_tool_calls"] is False and body["max_output_tokens"] <= 1000 for body in bodies)
         assert all({tool["name"] for tool in body["tools"]} == {"run", "finish"} for body in bodies)
+        assert all(body["tools"] == TOOLS and body["tool_choice"] == "required" for body in bodies)
         assert any(item.get("type") == "function_call_output" for item in bodies[1]["input"])
     else:
         with pytest.raises(HarnessStopped):
             agent.run("builder", CONTEXT, command)
         assert len(requests) == 1 and not commands
-        assert journal.summary()["usage_complete"] is (mode == "host-tool")
+        assert journal.summary()["usage_complete"] is (mode in {"host-tool", "multiple-calls"})
         assert cancellations == ([True] if mode == "cancel-active" else [])
     assert clients and all(client.is_closed for client in clients)
     assert all(request.headers["authorization"] == "Bearer controller-only-http-test" for request in requests)

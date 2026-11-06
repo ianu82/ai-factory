@@ -73,7 +73,7 @@ class AntonAgent:
         class Provider(OpenAIProvider):
             async def _create_response(provider, body):
                 if gate.calls >= self.max_turns:
-                    raise AntonStopped("Anton request-count budget exhausted")
+                    gate.stop("request_limit")
                 return await gate.request(provider._client, body)
 
             async def stream(provider, **kwargs):
@@ -94,6 +94,7 @@ class AntonAgent:
             nonlocal investigated
             gate.admit()
             validate(arguments, COMMAND_SCHEMA)
+            gate.record("agent_tool_requested", role=role, tool="run")
             result = command(arguments["command"])
             investigated = True
             gate.record("agent_command", role=role, **result)
@@ -103,13 +104,14 @@ class AntonAgent:
             nonlocal report
             gate.admit()
             validate(arguments, REPORT_SCHEMA)
+            gate.record("agent_tool_requested", role=role, tool="finish")
             # Use the same acceptance rules as the native backend.
             ProductAgent._accept_report(self, arguments, context, investigated)
             report = json.loads(json.dumps(arguments))
             raise _ReportReady()
 
         def no_scratchpad(**kwargs):
-            raise AntonStopped("Native scratchpad execution is disabled; use the isolated job tool")
+            gate.stop("scratchpad_blocked")
 
         provider = Provider(api_key=self.config.api_key,
             base_url=self.config.base_url.removesuffix("/responses"), flavor=OpenAIProvider.FLAVOR_OPENAI,
@@ -154,7 +156,7 @@ class AntonAgent:
                 try:
                     await session.close()
                 except BaseException:
-                    raise AntonStopped("Anton cleanup did not complete") from None
+                    gate.stop("cleanup_unconfirmed")
             if report is None:
                 raise AgentSessionError("Anton ended without a validated criterion report")
             gate.record("agent_report", role=role, report=report)
