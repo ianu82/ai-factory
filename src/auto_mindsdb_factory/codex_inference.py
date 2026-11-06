@@ -34,6 +34,10 @@ class CodexInference:
         self.pricing, self.cancelled = pricing or {}, cancelled
         self.calls, self._busy, self._stopped = 0, False, False
 
+    @property
+    def stopped(self):
+        return self._stopped
+
     def record(self, kind, **data):
         try:
             return self.journal.append(kind, role=self.role, harness="codex", **data)

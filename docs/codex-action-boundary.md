@@ -70,5 +70,10 @@ browser-origin, compressed and upgraded requests without leaking raw errors.
 The local session capability is separate from the controller's provider key.
 This parser alone starts no listener, inference, tool or enabled backend.
 
+`codex_proxy.open_codex_proxy` owns the scoped loopback listener and request tasks.
+It authenticates each request, routes inference through the accounting gate and
+buffers the validated SSE. Stop/deadline, disconnect and context exit cancel and
+drain active provider work; the owning session still closes the provider client.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
