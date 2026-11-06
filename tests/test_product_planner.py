@@ -1,0 +1,86 @@
+import json
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from auto_mindsdb_factory.product_agent import AgentSessionError, RoleSnapshotError
+from auto_mindsdb_factory.product_planner import ProductPlanner
+from auto_mindsdb_factory.product_profile import ProductProfile
+from auto_mindsdb_factory.product_roles import select_role, snapshot_roles
+from auto_mindsdb_factory.product_task import ProductTask
+from auto_mindsdb_factory.run_journal import RunJournal
+
+
+def setup(tmp_path, responses, **settings):
+    requests = []
+    def request(body, **kwargs):
+        requests.append(body)
+        return {"id": str(len(requests)), "status": "completed", "model": "pinned", "usage": {"total_tokens": 10},
+            "output": [{"type": "function_call", "call_id": str(len(requests)),
+                        "name": responses[0][0], "arguments": json.dumps(responses.pop(0)[1])}]}
+    connector = SimpleNamespace(config=SimpleNamespace(model="pinned", max_output_tokens=1000,
+        reasoning_effort="low", timeout_seconds=10, fallback_model=None), request_response=request)
+    profile = ProductProfile.from_document({"version": 1, "name": "planner", "repository": "owner/repo",
+        "image": "python@sha256:" + "a" * 64, "checks": {"test": ["pytest"]}, "smoke": [["pytest"]],
+        "builder_model": "pinned", "max_total_tokens": 1000, **settings})
+    task = ProductTask.from_document({"id": "task", "title": "Parser", "goal": "Reject invalid input",
+        "acceptance_criteria": [{"id": "reject", "description": "Reject invalid input", "command": ["pytest"]}]})
+    journal = RunJournal(tmp_path, "planner")
+    journal.create({"role_snapshots": snapshot_roles(), "planner_role_snapshot": select_role("planner", "2")})
+    return ProductPlanner(connector, journal, task=task, base_sha="b" * 40, profile=profile,
+                          deadline=time.monotonic() + 300), requests, journal
+
+
+def plan():
+    return {"status": "ready", "reason": "Inspected parser", "goal": "Reject invalid input",
+        "constraints": ["Keep API"], "source_paths": ["parser.py"], "changes": ["Validate parser inputs"],
+        "risks": ["Preserve valid input"], "questions": [],
+        "validation": [{"criterion_id": "reject", "evidence": "Run invalid and valid parser cases"}]}
+
+
+def test_planner_uses_frozen_role_and_shared_accounting(tmp_path):
+    agent, requests, journal = setup(tmp_path, [("run", {"command": ["cat", "parser.py"]}), ("finish", plan())])
+    assert agent.run("planner", agent.task.public_context, lambda cmd: {"command": cmd, "exit_code": 0}) == plan()
+    assert journal.summary()["total_tokens"] == 20
+    assert journal.events()[-1]["kind"] == "planner_report"
+    assert all(r["instructions"] == select_role("planner", "2")["instructions"] for r in requests)
+    assert all([t["name"] for t in r["tools"]] == ["run", "finish"] for r in requests)
+    assert all(r["model"] == "pinned" and r["max_output_tokens"] <= 1000 for r in requests)
+    assert agent.max_turns == 8 and agent.max_total_tokens == 1000
+    assert 0 < agent.deadline - time.monotonic() <= 120
+
+
+@pytest.mark.parametrize("mutation", ["missing", "historical", "forged"])
+def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, mutation):
+    agent, requests, journal = setup(tmp_path, [])
+    manifest = json.loads((journal.root / "manifest.json").read_text())
+    if mutation == "missing":
+        del manifest["planner_role_snapshot"]
+    elif mutation == "historical":
+        manifest["planner_role_snapshot"] = select_role("planner", "1")
+    else:
+        manifest["planner_role_snapshot"]["instructions"] = "write code"
+    (journal.root / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(RoleSnapshotError):
+        agent.run("planner", agent.task.public_context, lambda cmd: pytest.fail("command invoked"))
+    assert not requests
+
+
+@pytest.mark.parametrize("mode", ["no-investigation", "bad-mapping", "unknown-usage", "exhausted", "deadline"])
+def test_planning_cannot_waive_admission_or_report_requirements(tmp_path, mode):
+    proposed = plan()
+    if mode == "bad-mapping":
+        proposed["validation"][0]["criterion_id"] = "other"
+    responses = ([] if mode == "no-investigation" else [("run", {"command": ["cat", "parser.py"]})])
+    agent, requests, journal = setup(tmp_path, responses + [("finish", proposed)])
+    if mode == "unknown-usage":
+        journal.append("model_failed", role="builder")
+    elif mode == "exhausted":
+        journal.append("model_response", usage={"total_tokens": 1000})
+    elif mode == "deadline":
+        agent.deadline = time.monotonic() - 1
+    with pytest.raises(ValueError if mode == "bad-mapping" else AgentSessionError):
+        agent.run("planner", agent.task.public_context, lambda cmd: {"command": cmd, "exit_code": 0})
+    if mode in {"unknown-usage", "exhausted", "deadline"}:
+        assert not requests

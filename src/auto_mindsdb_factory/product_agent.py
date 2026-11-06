@@ -60,6 +60,10 @@ TOOLS = [
 
 
 class ProductAgent:
+    report_schema = REPORT_SCHEMA
+    tools = TOOLS
+    report_event = "agent_report"
+
     def __init__(self, connector: OpenAIResponsesAgentConnector, journal: RunJournal,
                  *, max_turns: int, max_total_tokens: int, deadline: float, pricing: dict | None = None) -> None:
         self.connector = connector
@@ -69,9 +73,22 @@ class ProductAgent:
         self.deadline = deadline
         self.pricing = pricing or {}
 
+    def _instructions(self, role: str) -> str:
+        return execution_role(self.journal, role)["instructions"]
+
+    def _accept_report(self, arguments: dict, context: dict, ran_command: bool) -> None:
+        expected = {criterion["id"] for criterion in context["acceptance_criteria"]}
+        actual = [criterion["id"] for criterion in arguments["criteria"]]
+        if set(actual) != expected or len(actual) != len(expected) or not ran_command:
+            raise AgentSessionError("Agent must investigate and report every acceptance criterion exactly once")
+        if arguments["status"] == "passed" and (
+            arguments["findings"] or any(c["status"] != "passed" or not c["evidence"].strip() for c in arguments["criteria"])
+        ):
+            raise AgentSessionError("Passed report contains unresolved findings or missing evidence")
+
     def run(self, role: str, context: dict[str, Any], command: Callable[[list[str]], dict]) -> dict:
         # Only executable roles and trusted historical manifest content can supply instructions.
-        instructions = execution_role(self.journal, role)["instructions"]
+        instructions = self._instructions(role)
         items: list[dict] = [{"role": "user", "content": json.dumps(context)}]
         ran_command = False
         for turn in range(self.max_turns):
@@ -84,7 +101,7 @@ class ProductAgent:
                 raise AgentSessionError("Run token budget exhausted")
             body = {
                 "model": self.connector.config.model, "instructions": instructions,
-                "input": items, "tools": TOOLS, "parallel_tool_calls": False, "tool_choice": "required",
+                "input": items, "tools": self.tools, "parallel_tool_calls": False, "tool_choice": "required",
                 "max_output_tokens": min(self.connector.config.max_output_tokens, self.max_total_tokens - usage["total_tokens"]),
                 "reasoning": {"effort": self.connector.config.reasoning_effort},
                 "store": False, "include": ["reasoning.encrypted_content"],
@@ -124,19 +141,12 @@ class ProductAgent:
             self.journal.append("agent_tool_requested", role=role, tool=call.get("name"), arguments=call.get("arguments"))
             try:
                 arguments = json.loads(call["arguments"])
-                validate(arguments, REPORT_SCHEMA if call["name"] == "finish" else COMMAND_SCHEMA)
+                validate(arguments, self.report_schema if call["name"] == "finish" else COMMAND_SCHEMA)
             except (KeyError, ValueError, ValidationError) as exc:
                 raise AgentSessionError("Invalid tool arguments") from exc
             if call["name"] == "finish":
-                expected = {criterion["id"] for criterion in context["acceptance_criteria"]}
-                actual = [criterion["id"] for criterion in arguments["criteria"]]
-                if set(actual) != expected or len(actual) != len(expected) or not ran_command:
-                    raise AgentSessionError("Agent must investigate and report every acceptance criterion exactly once")
-                if arguments["status"] == "passed" and (
-                    arguments["findings"] or any(c["status"] != "passed" or not c["evidence"].strip() for c in arguments["criteria"])
-                ):
-                    raise AgentSessionError("Passed report contains unresolved findings or missing evidence")
-                self.journal.append("agent_report", role=role, report=arguments)
+                self._accept_report(arguments, context, ran_command)
+                self.journal.append(self.report_event, role=role, report=arguments)
                 return arguments
             if call["name"] != "run":
                 raise AgentSessionError("Unknown agent tool")

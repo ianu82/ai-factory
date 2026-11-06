@@ -60,6 +60,17 @@ _DEFINITIONS = {
         ["run", "finish"],
         ["Read-only investigation only", "No implementation, network, credentials, Git hosting or merge operations", "Execution is not enabled", "Controller policy remains authoritative"],
     ),
+    ("planner", "2"): _definition(
+        "planner", "2", _COMMON.format(role="planner") + (
+            "Investigate the original task and repository instructions read-only before proposing a small plan. "
+            "Use finish with the structured plan. Map every original criterion to validation evidence. "
+            "Record risks and unresolved questions; use blocked or unverified when implementation is not justified. "
+            "Your plan is guidance and cannot change the task, tools, paths, checks, models or budgets. Do not implement."
+        ),
+        "Investigate read-only and propose bounded implementation guidance.",
+        ["Source investigation", "Every criterion mapped to validation", "Constraints, changes, risks and questions"],
+        ["run", "finish"], ["Read-only source", "No network, credentials, implementation or promotion", "Controller policy remains authoritative"],
+    ),
 }
 
 
