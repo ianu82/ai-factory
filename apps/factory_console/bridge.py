@@ -88,7 +88,7 @@ class Publisher:
                 review={'status':report.get('status'),'at':at,'candidate_sha':candidate,
                         'record_sha256':record_hash(event),'accepted':False,'criteria':report.get('criteria',[])}
             if kind=='candidate_verified' and review and candidate and data.get('commit_sha')==candidate and data.get('report')==review_report:
-                review['accepted']=review['status']=='passed' and bool(review['criteria']) and all(
+                review['accepted']=review['status']=='passed' and review_report.get('findings')==[] and bool(review['criteria']) and all(
                     c.get('status')=='passed' for c in review['criteria'])
             if kind=='plan_frozen':status='passed' if data.get('status')=='ready' else 'unverified'
             if kind=='run_finished':status='passed' if data.get('status')=='complete' else 'blocked'

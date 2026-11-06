@@ -20,8 +20,10 @@ def metadata(db):
 
 def save(db, kind, target, document):
     identifier(target)
+    if kind not in {'item', 'run'}:
+        raise ValueError('Evidence target not found')
     row = db.execute('SELECT 1 FROM records WHERE kind=? AND id=?', (kind, target)).fetchone()
-    if kind not in {'item', 'run'} or not row:
+    if not row:
         raise ValueError('Evidence target not found')
     name = document.get('name', '')
     if not isinstance(name, str) or not re.fullmatch(r'[^/\\\x00-\x1f]{1,120}', name):

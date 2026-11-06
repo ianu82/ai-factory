@@ -1,5 +1,6 @@
 """Qualify the real console container without provider credentials or inference."""
 import json
+import base64
 import subprocess
 import time
 from datetime import datetime,timezone
@@ -51,7 +52,15 @@ def main():
         assert request('/bridge/snapshot',snapshot,{'Authorization':'Bearer ci-bridge-only-never-production'})[0]==200
         assert json.loads(request('/api/state',headers={'Cookie':cookie})[1])['connection']['connected'] is True
         assert request('/api/items',{'title':'Rejected'}, {'Cookie':cookie,'Origin':'https://another.example'})[0]==403
-        print('Actual console container passed: private configuration upload, nonroot, read-only root, private state, scoped ingestion, secure cookies and assets')
+        item=json.loads(request('/api/items',{'workspace_id':'factory','title':'Container evidence qualification'}, {'Cookie':cookie})[1])
+        report=b'Console artifact storage qualification; no Factory certification claim.'
+        artifact=json.loads(request('/api/evidence',{'target_kind':'item','target_id':item['id'],
+            'name':'qualification.txt','content_base64':base64.b64encode(report).decode()}, {'Cookie':cookie})[1])
+        assert artifact['source']=='manual'
+        assert request('/api/evidence/'+artifact['id'])[0]==401
+        code,content,headers=request('/api/evidence/'+artifact['id'],headers={'Cookie':cookie})
+        assert code==200 and content==report and headers['Content-Disposition']=='attachment; filename=evidence.txt'
+        print('Actual console container passed: private configuration upload, nonroot, read-only root, private state, scoped ingestion, secure cookies, assets and private checksum-bound attachments')
     finally:
         subprocess.run(['docker','rm','-f',container],check=True,stdout=subprocess.DEVNULL)
 
