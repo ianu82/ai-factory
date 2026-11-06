@@ -1,11 +1,16 @@
 # Bounded planning reports
 
-Planner role version 4 investigates enough source to propose a plan, rather than
+Planner role version 5 investigates enough source to propose a plan, rather than
 implementing or proving the eventual fix. Historical versions remain unchanged.
 The controller supplies remaining request/time budgets on every planning request.
 After actual investigation, only the structured report tool is offered on the
-last allowed request or when at most 30 seconds remain. An unoffered command is
+last allowed request or when at most 60 seconds remain. An unoffered command is
 rejected before execution, even if the provider returns it.
+
+The earlier reporting window accounts for setup time and a response followed by
+a command crossing the previous 30-second threshold. It reserves capacity inside
+the same work deadline; it grants no extra time, requests or tokens. Investigation
+is still required before reporting, and insufficient evidence still blocks a plan.
 
 `ready` describes a justified implementation plan with every original criterion
 mapped to future validation. It is not implementation approval or proof that any

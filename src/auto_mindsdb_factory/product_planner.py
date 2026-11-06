@@ -7,8 +7,8 @@ from .product_agent import AgentSessionError, ProductAgent, RoleSnapshotError, T
 from .product_plan import PLAN_SCHEMA, ProductPlan
 from .product_roles import select_role
 
-PLANNER_VERSION = "4"
-REPORT_RESERVE_SECONDS = 30
+PLANNER_VERSION = "5"
+REPORT_RESERVE_SECONDS = 60
 
 
 class ProductPlanner(ProductAgent):

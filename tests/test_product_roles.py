@@ -62,6 +62,15 @@ def test_historical_report_planner_remains_immutable():
     assert select_role("planner", "3")["digest"] == "05ab39ecfd767cd7668917159e4f568de9123a1a4a147f679104aab1e15a9314"
 
 
+def test_report_window_keeps_the_historical_readiness_contract():
+    previous = select_role("planner", "4")
+    assert previous["digest"] == "0638fd9b00fdd10b630773b7442c7f20306c1910257fb283cfceed2fe61679bb"
+    current = select_role("planner", "5")
+    assert current["instructions"] == previous["instructions"].replace("last 30 seconds", "last 60 seconds")
+    assert {k: v for k, v in current.items() if k not in {"version", "digest", "instructions"}} == {
+        k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
+
+
 def test_candidate_files_and_cwd_cannot_replace_trusted_registry(tmp_path):
     (tmp_path / "product_roles.py").write_text("raise RuntimeError('candidate role executed')")
     package = tmp_path / "auto_mindsdb_factory"

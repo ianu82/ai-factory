@@ -51,7 +51,7 @@ def test_planner_uses_frozen_role_and_shared_accounting(tmp_path):
     assert 0 < agent.deadline - time.monotonic() <= 120
 
 
-@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "report-planner", "forged"])
+@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "report-planner", "readiness-planner", "forged"])
 def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, mutation):
     agent, requests, journal = setup(tmp_path, [])
     manifest = json.loads((journal.root / "manifest.json").read_text())
@@ -63,6 +63,8 @@ def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, 
         manifest["planner_role_snapshot"] = select_role("planner", "2")
     elif mutation == "report-planner":
         manifest["planner_role_snapshot"] = select_role("planner", "3")
+    elif mutation == "readiness-planner":
+        manifest["planner_role_snapshot"] = select_role("planner", "4")
     else:
         manifest["planner_role_snapshot"]["instructions"] = "write code"
     (journal.root / "manifest.json").write_text(json.dumps(manifest))
@@ -122,6 +124,33 @@ def test_time_reservation_requires_report_before_the_last_request(tmp_path, monk
     assert json.loads(requests[-1]["input"][-1]["content"])["planning_budget"] == {
         "requests_remaining": 7, "seconds_remaining": 20, "report_only": True}
     assert journal.summary()["usage_complete"] is True
+
+
+def test_setup_and_investigation_leave_time_for_a_slow_final_report(tmp_path, monkeypatch):
+    agent, requests, journal = setup(tmp_path, [("run", {"command": ["cat", "parser.py"]}),
+                                               ("finish", plan())])
+    deadline = agent.deadline
+    # Setup has consumed 48 seconds of the 100-second work window. A source
+    # request and read leave 45 seconds; another request/command could use 26.
+    clock = {"now": deadline - 52}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    original_request = agent.connector.request_response
+    def request(body, **kwargs):
+        clock["now"] += 6 if not requests else 20
+        return original_request(body, **kwargs)
+    agent.connector.request_response = request
+    commands = []
+    def investigate(argv):
+        commands.append(argv)
+        clock["now"] += 1
+        return {"exit_code": 0}
+    assert agent.run("planner", agent.task.public_context, investigate) == plan()
+    assert len(commands) == 1 and len(requests) == 2
+    assert [tool["name"] for tool in requests[0]["tools"]] == ["run", "finish"]
+    assert [tool["name"] for tool in requests[1]["tools"]] == ["finish"]
+    assert clock["now"] == deadline - 25 and agent.deadline == deadline
+    assert agent.max_turns == 8 and agent.max_total_tokens == 1000
+    assert journal.summary()["total_tokens"] == 20 and journal.summary()["usage_complete"]
 
 
 def test_provider_cannot_execute_an_unoffered_last_turn_command(tmp_path):

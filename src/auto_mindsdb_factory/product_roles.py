@@ -105,6 +105,14 @@ _DEFINITIONS = {
     ),
 }
 
+# Retain the exact earlier contracts, including their original time guidance.
+_previous_planner = _DEFINITIONS[("planner", "4")]
+_DEFINITIONS[("planner", "5")] = _definition(
+    "planner", "5", _previous_planner["instructions"].replace("last 30 seconds", "last 60 seconds"),
+    **{key: _previous_planner[key] for key in
+       ("purpose", "required_evidence", "supported_tools", "constraints")},
+)
+
 
 # Keep historical definitions in _DEFINITIONS when changing an active version.
 _DEFAULT_VERSIONS = {"builder": "1", "verifier": "1", "planner": "1"}
