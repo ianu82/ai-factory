@@ -87,5 +87,14 @@ and acknowledge tool completion before another inference is admitted. Changed,
 duplicate, unsolicited and overlapping callbacks stop the session. Thread/turn
 ownership and actual tool execution remain the session's responsibilities.
 
+`codex_rpc.codex_turn` binds callbacks to its owned thread/turn and verified
+model, effort and read-only/network-disabled settings. It returns command results
+using the pinned CLI's generated `contentItems`/`inputText`/`success` schema;
+a command's nonzero exit remains a successful tool transport carrying that exit.
+Only the exact approved run/finish action is dispatched. Unknown server requests
+are rejected and bounded asynchronous pipes close on every exit. Actual CLI
+round trips cover both zero and nonzero command results. Report acceptance,
+process/proxy/client ownership and live certification remain separate gates.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

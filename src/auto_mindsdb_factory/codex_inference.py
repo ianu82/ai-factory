@@ -19,7 +19,7 @@ class CodexStopped(BaseException):
 
 _REASONS = {"cancelled_or_deadline", "evidence_unavailable", "usage_unknown_or_exhausted",
             "overlapping_requests_or_limit", "request_policy", "request_cancelled", "response_policy",
-            "unconsumed_action", "unapproved_callback"}
+            "unconsumed_action", "unapproved_callback", "rpc_policy"}
 
 
 class CodexInference:
