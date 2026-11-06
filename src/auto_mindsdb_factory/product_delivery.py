@@ -215,6 +215,7 @@ class ProductDelivery:
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
                             "role_snapshots": snapshot_roles(), **planning_manifest(self.profile),
                             **execution_manifest(self.settings),
+                            "publication_transport": getattr(self, "publication_transport", "controller-github-v1"),
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""

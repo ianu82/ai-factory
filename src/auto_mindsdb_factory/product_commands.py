@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,14 @@ def _bounded_int(minimum, maximum):
 
 
 def register_product_commands(subparsers) -> None:
+    handoff = subparsers.add_parser("product-github-handoff")
+    for name in ("request", "receipts-dir", "target-root"):
+        handoff.add_argument("--" + name, type=Path, required=True)
+    for name in ("repository", "run-id", "base-sha", "candidate-sha"):
+        handoff.add_argument("--" + name, required=True)
+    handoff.add_argument("--base-branch", default="main")
+    handoff.add_argument("--bundle", type=Path)
+    handoff.add_argument("--bundle-sha256")
     cancel = subparsers.add_parser("product-cancel")
     cancel.add_argument("--store-dir", type=Path, required=True)
     cancel.add_argument("--run-id", required=True)
@@ -53,6 +62,8 @@ def register_product_commands(subparsers) -> None:
         if name == "product-deliver":
             parser.add_argument("--task", type=Path, required=True)
             parser.add_argument("--publish", action="store_true", help="Publish a PR; the trusted profile controls automatic merge")
+            parser.add_argument("--base-sha", help="Full preloaded commit SHA; remote promotion still requires exact-base CAS")
+            parser.add_argument("--github-transport", choices=["controller", "operator-handoff"], default="controller")
         if name == "product-replay":
             parser.add_argument("--suite", type=Path, required=True)
             parser.add_argument("--repetitions", type=int, default=1)
@@ -83,7 +94,18 @@ def handle_product_command(args, *, parse_env) -> int | None:
     if not args.command.startswith("product-"):
         return None
     try:
-        if args.command == "product-cancel":
+        if args.command == "product-github-handoff":
+            from .github_handoff import PublicationScope
+            from .github_handoff_channel import read_document
+            from .github_handoff_executor import execute_request
+            scope = PublicationScope(args.repository, args.run_id, args.base_sha, args.candidate_sha, args.base_branch)
+            request = read_document(args.request)
+            scope.validate_request(request)
+            args.receipts_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            result = execute_request(scope, request, args.target_root,
+                args.receipts_dir / (request["id"] + ".response.json"),
+                bundle=args.bundle, bundle_sha256=args.bundle_sha256)
+        elif args.command == "product-cancel":
             result = request_cancellation(args.store_dir, args.run_id)
         elif args.command == "product-improvements":
             result = {"proposals": propose_improvements(args.store_dir, min_failures=args.min_failures,
@@ -159,18 +181,28 @@ def handle_product_command(args, *, parse_env) -> int | None:
                 result = run_suite(profile, args.target_root, args.store_dir, args.suite,
                     repetitions=args.repetitions, delivery_factory=delivery_factory)
             else:
+                if args.base_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", args.base_sha):
+                    raise ValueError("Preloaded base requires a full commit SHA")
+                if args.github_transport == "operator-handoff" and not args.publish:
+                    raise ValueError("Operator GitHub handoff requires --publish")
                 task = ProductTask.load(args.task, target_root=args.target_root)
                 delivery_factory = ProductDelivery
                 if args.runner == "railway":
                     from .railway_runner import RailwayDelivery
                     delivery_factory = RailwayDelivery
                 delivery = delivery_factory(profile, args.target_root, args.store_dir)
+                delivery.publication_transport = "operator-handoff-v1" if args.github_transport == "operator-handoff" else "controller-github-v1"
                 def publish(candidate, journal):
                     delivery.check_cancelled()
+                    transport = None
+                    if args.github_transport == "operator-handoff":
+                        from .github_handoff_channel import GitHubHandoff
+                        transport = GitHubHandoff(profile, task, args.target_root,
+                            deadline=delivery.deadline, check_cancelled=delivery.check_cancelled)
                     return GitHubPromotion(profile, task, args.target_root, args.store_dir,
                         smoke=delivery.smoke, deadline=delivery.deadline,
-                        before_merge=delivery.check_cancelled)(candidate, journal)
-                result = delivery.run(task, promote=publish if args.publish else None)
+                        before_merge=delivery.check_cancelled, transport=transport)(candidate, journal)
+                result = delivery.run(task, promote=publish if args.publish else None, base_sha=args.base_sha)
         print(json.dumps(result, indent=2))
         return 1 if result.get("total") is not None and result["correct"] != result["total"] else 0
     except KeyboardInterrupt:
