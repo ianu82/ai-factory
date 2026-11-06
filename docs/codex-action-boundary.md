@@ -20,5 +20,11 @@ app-server, frozen instructions/configuration, scoped inference transport, actua
 SDK integration tests and real coding/negative/cancellation proofs remain required.
 Codex selection remains unavailable; no native or Anton behavior is changed.
 
+The controller image installs the official CLI from `codex_bridge/package-lock.json`
+using `npm ci --ignore-scripts`. The wrapper and every platform package are fixed
+at 0.167.0 with npm integrity hashes. Linux CI runs `--version` with an empty,
+temporary home and no authentication variables. Installation and this version
+check do not establish runtime isolation, protocol integration or certification.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

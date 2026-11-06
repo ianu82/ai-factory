@@ -1,0 +1,8 @@
+{
+  "name": "ai-factory-codex-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@openai/codex": "0.167.0"
+  }
+}

@@ -14,6 +14,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  codex:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefix src/auto_mindsdb_factory/codex_bridge --ignore-scripts --no-audit --no-fund
+      - name: Check the pinned official CLI without authentication
+        run: |
+          probe_root=$(mktemp -d)
+          trap 'rm -rf "$probe_root"' EXIT
+          env -i HOME="$probe_root" PATH="$PATH" src/auto_mindsdb_factory/codex_bridge/node_modules/.bin/codex --version | tee "$probe_root/version"
+          test "$(cat "$probe_root/version")" = 'codex-cli 0.167.0'
+
   anton:
     runs-on: ubuntu-latest
     timeout-minutes: 10
