@@ -33,5 +33,10 @@ before streaming any action. The fixture terminates its owned process group and
 joins its reader/server threads. Dedicated Linux CI requires the installed CLI;
 an ordinary test environment without the optional CLI reports a capability skip.
 
+`codex_stream.codex_sse` returns immutable SSE bytes after detaching and validating
+the complete response. It yields no early executable item. The real-CLI tests use
+this encoder directly. Admission, usage accounting, cancellation and lifetime
+checks are still required before a future bridge sends these bytes to app-server.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

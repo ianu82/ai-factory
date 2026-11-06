@@ -14,6 +14,7 @@ import time
 import pytest
 
 from auto_mindsdb_factory.codex_actions import CodexActionError, codex_action
+from auto_mindsdb_factory.codex_stream import codex_sse
 from auto_mindsdb_factory.product_agent import REPORT_SCHEMA
 
 
@@ -69,6 +70,7 @@ def test_real_codex_response_is_gated_before_tool_execution(codex_root, permitte
             try:
                 assert len(requests) == 1
                 action = codex_action(response, model=MODEL)
+                out = codex_sse(response, model=MODEL)
             except CodexActionError:
                 decisions.append("rejected")
                 out = b'{"error":{"message":"Factory policy stopped the offline response","type":"invalid_request_error"}}'
@@ -76,18 +78,6 @@ def test_real_codex_response_is_gated_before_tool_execution(codex_root, permitte
             else:
                 decisions.append("allowed")
                 assert action == ("finish", REPORT, "call_probe")
-                events = [
-                    {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
-                    {"type": "response.output_item.added", "output_index": 0,
-                     "item": {**call, "input": "", "status": "in_progress"}},
-                    {"type": "response.custom_tool_call_input.delta", "output_index": 0,
-                     "item_id": "ctc_probe", "delta": code},
-                    {"type": "response.custom_tool_call_input.done", "output_index": 0,
-                     "item_id": "ctc_probe", "input": code},
-                    {"type": "response.output_item.done", "output_index": 0, "item": call},
-                    {"type": "response.completed", "response": response},
-                ]
-                out = "".join("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n" for e in events).encode()
                 self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
 
