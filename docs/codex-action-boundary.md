@@ -60,6 +60,8 @@ home/work directories. It allows only the controller's canonical loopback proxy,
 inherits only HOME/PATH, disables optional tools/background daemons, and retires
 the group on normal or exceptional exit. The session still owns JSON-RPC reading,
 thread sandbox policy, the scoped proxy, global lifetime and tool dispatch.
+The real-CLI loopback action tests use this production process owner directly,
+including both the accepted report callback and rejected built-in response.
 
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
