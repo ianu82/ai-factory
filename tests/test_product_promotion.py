@@ -525,7 +525,7 @@ def test_deadline_expiring_in_guard_stops_main_push(promotion_case):
 
 
 @pytest.mark.parametrize("mutated", [False, True])
-def test_real_delivery_promotion_third_smoke_runner_failure(promotion_case, tmp_path, monkeypatch, mutated):
+def test_real_delivery_promotion_third_smoke_runner_failure(promotion_case, tmp_path, monkeypatch, mutated, investigating_planner):
     from contextlib import contextmanager
     from pathlib import Path
     from shutil import copytree, rmtree
@@ -552,10 +552,10 @@ def test_real_delivery_promotion_third_smoke_runner_failure(promotion_case, tmp_
     def sandbox(*args, **kwargs):
         yield None
     delivery = ProductDelivery(promotion.profile, promotion.target, promotion.store,
-                               agent_factory=lambda *args: Agent(), sandbox_factory=sandbox)
+                               agent_factory=lambda *args: Agent(), sandbox_factory=sandbox, planner_factory=investigating_planner)
     delivery.settings["smoke"] = [["first"], ["second"], ["third"]]
-    def prepare(sha, workspace, journal):
-        calls.append("prepare")
+    def prepare(sha, workspace, journal, **kwargs):
+        if not kwargs: calls.append("prepare")
         workspace.mkdir()
         return {}
     monkeypatch.setattr(delivery, "_prepare", prepare)
@@ -568,8 +568,8 @@ def test_real_delivery_promotion_third_smoke_runner_failure(promotion_case, tmp_
     if mutated:
         error.phase, error.error_type = "exit", "OSError"
         error.args = ("Railway exit failed (OSError)",)
-    def command(sandbox, command):
-        calls.append(command[0])
+    def command(sandbox, command, **kwargs):
+        if not kwargs: calls.append(command[0])
         if command == ["third"]:
             raise error
         return {"command": command, "exit_code": 0}

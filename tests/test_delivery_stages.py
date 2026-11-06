@@ -1,5 +1,6 @@
 """Stage callbacks follow real delivery boundaries and fail closed."""
 from contextlib import contextmanager
+from types import SimpleNamespace
 from pathlib import Path
 from shutil import copytree
 import subprocess
@@ -13,7 +14,7 @@ from auto_mindsdb_factory.run_journal import RunJournal
 
 
 @pytest.fixture
-def delivery(tmp_path, monkeypatch):
+def delivery(tmp_path, monkeypatch, investigating_planner):
     # Source exports intentionally omit the controller checkout's Git metadata.
     controller = tmp_path / "controller"
     subprocess.run(["git", "init", "-q", str(controller)], check=True)
@@ -38,10 +39,10 @@ def delivery(tmp_path, monkeypatch):
             return {"status": "passed", "findings": []}
     @contextmanager
     def sandbox(*args, **kwargs):
-        yield None
+        yield SimpleNamespace(run=lambda cmd: {"command": cmd, "exit_code": 0})
     instance = ProductDelivery(profile, target, tmp_path / "store",
-                               agent_factory=lambda *args: Agent(), sandbox_factory=sandbox)
-    def prepare(sha, workspace, journal):
+                               agent_factory=lambda *args: Agent(), sandbox_factory=sandbox, planner_factory=investigating_planner)
+    def prepare(sha, workspace, journal, **kwargs):
         workspace.mkdir()
         return {}
     monkeypatch.setattr(instance, "_prepare", prepare)
@@ -109,9 +110,9 @@ def test_ack_write_failure_aborts_without_retry_or_publication(delivery, monkeyp
     stages = ["building", "verifying", "merging"]
     observed = []
     prepare = instance._prepare
-    def record_prepare(*args):
-        calls.append("prepare")
-        return prepare(*args)
+    def record_prepare(*args, **kwargs):
+        if not kwargs: calls.append("prepare")  # implementation stages only
+        return prepare(*args, **kwargs)
     monkeypatch.setattr(instance, "_prepare", record_prepare)
     append = RunJournal.append
     def failing_append(journal, kind, **data):
@@ -263,12 +264,12 @@ def test_terminal_smoke_runner_facts_fail_closed(delivery, monkeypatch, variant)
             raise RuntimeError("secret-provider-body")
         monkeypatch.setattr(railway, "railway_failure_facts", unavailable)
     prepare = instance._prepare
-    def counted_prepare(*args):
-        calls.append("prepare")
-        return prepare(*args)
+    def counted_prepare(*args, **kwargs):
+        if not kwargs: calls.append("prepare")  # implementation and smoke stages
+        return prepare(*args, **kwargs)
     monkeypatch.setattr(instance, "_prepare", counted_prepare)
-    def command(sandbox, cmd):
-        calls.append(cmd[0])
+    def command(sandbox, cmd, **kwargs):
+        if not kwargs: calls.append(cmd[0])
         if cmd == ["third"]:
             raise error
         return {"command": cmd, "exit_code": 0}

@@ -12,7 +12,7 @@ from auto_mindsdb_factory.run_journal import RunJournal
 
 
 @pytest.mark.parametrize("classified", [False, True])
-def test_runner_failure_journals_only_safe_classification(tmp_path, monkeypatch, classified):
+def test_runner_failure_journals_only_safe_classification(tmp_path, monkeypatch, classified, investigating_planner):
     import auto_mindsdb_factory.product_delivery as module
     from auto_mindsdb_factory.docker_runner import RunnerError
     from auto_mindsdb_factory.railway_runner import RailwayOperationError
@@ -24,18 +24,20 @@ def test_runner_failure_journals_only_safe_classification(tmp_path, monkeypatch,
         "image": "node@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]], "max_attempts": 1})
     task = ProductTask.from_document({"id": "runner-failed", "title": "Fix", "goal": "fix",
         "acceptance_criteria": [{"id": "a", "description": "works", "command": ["true"]}]})
-    delivery = ProductDelivery(profile, target, tmp_path / "store")
+    delivery = ProductDelivery(profile, target, tmp_path / "store", planner_factory=investigating_planner)
     error = RailwayOperationError({"action": "request", "request": {"action": "run"}}, "ExecInterruptedError") if classified else RunnerError("provider-private-body")
-    def unavailable(*args):
+    def unavailable(*args, **kwargs):
         raise error
     monkeypatch.setattr(delivery, "_prepare", unavailable)
     monkeypatch.setattr(module, "git", lambda *args: "a" * 40)
-    with pytest.raises(DeliveryError):
+    with pytest.raises(RunnerError) as raised:
         delivery.run(task, base_sha="a" * 40)
+    assert raised.value is error
     journal = RunJournal(tmp_path / "store", "runner-failed")
-    failure = next(e for e in journal.events() if e["kind"] == "attempt_finished")
-    expected = "Railway run failed (ExecInterruptedError)" if classified else "RunnerError"
-    assert failure["data"]["reason"] == expected
+    failure = journal.events()[-1]["data"]
+    assert journal.summary()["attempts"] == 0 and failure["status"] == "blocked"
+    assert (failure["runner_operation"], failure["runner_category"]) == (
+        ("run", "ExecInterruptedError") if classified else ("unknown", "UnknownError"))
     assert all("provider-private-body" not in p.read_text() for p in journal.root.glob("*.json"))
 
 
@@ -63,12 +65,12 @@ def test_real_agent_factory_respects_builder_and_reviewer_configuration(tmp_path
 
 
 @pytest.mark.parametrize("verdict", ["failed", "unverified"])
-def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monkeypatch, verdict):
+def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monkeypatch, verdict, investigating_planner):
     import auto_mindsdb_factory.product_delivery as module
     delivery = object.__new__(ProductDelivery)
     delivery.settings = {"checks": {"unit": ["true"]}, "image": "unused", "platform": "linux/amd64"}
     delivery.target = tmp_path
-    def prepare(sha, workspace, journal):
+    def prepare(sha, workspace, journal, **kwargs):
         workspace.mkdir()
         (workspace / "app.txt").write_text("source")
         return {"app.txt": b"source"}
@@ -79,7 +81,7 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
         def __enter__(self): return self
         def __exit__(self, *args): pass
     delivery.sandbox_factory = Sandbox
-    delivery._command = lambda sandbox, command: {"command": command, "exit_code": 0}
+    delivery._command = lambda sandbox, command, **kwargs: {"command": command, "exit_code": 0}
     class Verifier:
         def run(self, *args):
             assert args[1]["prior_attempt_feedback"] == "earlier unresolved finding"
@@ -91,7 +93,14 @@ def test_verifier_reproduction_details_are_retained_for_revision(tmp_path, monke
         {"id": "rounding", "description": "round consistently", "command": ["true"]}]})
     from auto_mindsdb_factory.product_roles import snapshot_roles
     journal = RunJournal(tmp_path, "revision")
-    journal.create({"role_snapshots": snapshot_roles()})
+    from auto_mindsdb_factory.product_planning import planning_manifest
+    delivery.profile = ProductProfile.from_document({"version": 1, "name": "feedback", "repository": "owner/product",
+        "image": "node@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]]})
+    delivery.settings = delivery.profile.document
+    delivery.deadline = __import__("time").monotonic() + 60
+    delivery.planner_factory = investigating_planner
+    journal.create({"role_snapshots": snapshot_roles(), **planning_manifest(delivery.profile)})
+    delivery.plan(task, "b" * 40, journal)
     with pytest.raises(module.DeliveryError) as error:
         delivery.verify(task, "a" * 40, "b" * 40, journal, prior_feedback="earlier unresolved finding")
     assert "99.99 times 0.5" in str(error.value)
@@ -135,7 +144,7 @@ def test_task_rejects_duplicate_criteria_and_internal_executable_requests(tmp_pa
 @pytest.mark.skipif(not os.environ.get("AI_FACTORY_TEST_IMAGE"), reason="requires a pinned Docker image")
 @pytest.mark.parametrize("builder_status", ["passed", "unverified"])
 @pytest.mark.parametrize("variant", ["correct", "broken", "out-of-scope", "known-finding"])
-def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant, builder_status):
+def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant, builder_status, investigating_planner):
     target = tmp_path / "product"
     target.mkdir()
     subprocess.run(["git", "init", "-q", str(target)], check=True)
@@ -174,7 +183,7 @@ def test_actual_delivery_verifies_a_separate_repository(tmp_path, variant, build
             assert result["exit_code"] == 0, result
             return {"status": builder_status if role == "builder" else "passed", "summary": "checked",
                     "criteria": [], "findings": ["Known defect"] if role == "builder" and variant == "known-finding" else []}
-    delivery = ProductDelivery(profile, target, tmp_path / "store", agent_factory=lambda *args: Agent())
+    delivery = ProductDelivery(profile, target, tmp_path / "store", agent_factory=lambda *args: Agent(), planner_factory=investigating_planner)
     if variant == "correct":
         result = delivery.run(task, base_sha=base)
         assert result["status"] == "verified"

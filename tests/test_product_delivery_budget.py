@@ -9,6 +9,7 @@ import pytest
 from auto_mindsdb_factory.product_agent import ProductAgent
 from auto_mindsdb_factory.product_delivery import DeliveryError, ProductDelivery
 from auto_mindsdb_factory.product_profile import ProductProfile
+from auto_mindsdb_factory.product_planning import PlanningStopped
 from auto_mindsdb_factory.product_task import ProductTask
 from auto_mindsdb_factory.product_workspace import git
 from auto_mindsdb_factory.run_journal import RunJournal
@@ -38,7 +39,7 @@ def product_root():
 
 
 @pytest.fixture
-def delivery_case(product_root, monkeypatch):
+def delivery_case(product_root, monkeypatch, investigating_planner):
     tmp_path = product_root
     import auto_mindsdb_factory.product_delivery as module
 
@@ -87,11 +88,11 @@ def delivery_case(product_root, monkeypatch):
             reasoning_effort="low", timeout_seconds=10), request_response=request)
         return ProductAgent(connector, journal, max_turns=5, max_total_tokens=1000, deadline=delivery.deadline)
 
-    delivery = ProductDelivery(profile, target, tmp_path / "store", agent_factory=agent, sandbox_factory=Sandbox)
+    delivery = ProductDelivery(profile, target, tmp_path / "store", agent_factory=agent, sandbox_factory=Sandbox, planner_factory=investigating_planner)
     real_prepare = delivery._prepare
-    def prepare(sha, workspace, journal):
+    def prepare(sha, workspace, journal, **kwargs):
         prepares.append(sha)
-        return real_prepare(sha, workspace, journal)
+        return real_prepare(sha, workspace, journal, **kwargs)
     monkeypatch.setattr(delivery, "_prepare", prepare)
     journal = RunJournal(tmp_path / "store", "budget")
     return SimpleNamespace(delivery=delivery, task=task, base=base, journal=journal, requests=requests,
@@ -117,7 +118,7 @@ def test_preexisting_exhausted_or_unknown_usage_prevents_first_attempt(delivery_
             real_append(journal, "model_response", role="prior", usage=prior)
         return result
     monkeypatch.setattr(RunJournal, "append", append)
-    with pytest.raises(DeliveryError, match="unknown" if prior is None else "token budget exhausted"):
+    with pytest.raises(PlanningStopped, match="unknown" if prior is None else "token budget exhausted"):
         run(case)
     assert not case.prepares and not case.sandboxes and not case.commands and not case.requests and not case.stages
     assert case.journal.summary()["status"] == "blocked"
@@ -145,8 +146,8 @@ def test_verifier_response_stops_retry_without_losing_evidence(delivery_case, to
     assert case.journal.summary()["status"] == "blocked" and case.journal.summary()["attempts"] == 1
     assert case.journal.summary()["total_tokens"] == 20 + (tokens["total_tokens"] if tokens else 0)
     assert case.journal.summary()["usage_complete"] is (tokens is not None)
-    assert len(case.requests) == 3 and len(case.prepares) == 2
-    assert len(case.sandboxes) == 4 and case.commands.count(["setup"]) == 2
+    assert len(case.requests) == 3 and len(case.prepares) == 3
+    assert len(case.sandboxes) == 6 and case.commands.count(["setup"]) == 3
     assert case.stages == ["building", "verifying"]
 
 
@@ -161,10 +162,13 @@ def test_failed_candidate_with_remaining_budget_retries_and_passes(delivery_case
     failures = [e["data"] for e in events if e["kind"] == "attempt_finished"]
     assert failures[0]["status"] == "failed" and "defect" in failures[0]["reason"]
     assert failures[1]["status"] == "verified"
-    assert len(case.prepares) == 4 and len(case.sandboxes) == 8 and len(case.requests) == 8
-    assert case.commands.count(["setup"]) == 4
+    assert len(case.prepares) == 5 and len(case.sandboxes) == 10 and len(case.requests) == 8
+    assert case.commands.count(["setup"]) == 5
     assert case.stages == ["building", "verifying", "building", "verifying"]
     assert "defect" in json.loads(case.requests[4][1]["input"][0]["content"])["revision_feedback"]
+    frozen = [e for e in events if e["kind"] == "plan_frozen"]
+    assert len(frozen) == 1 and frozen[0]["sequence"] < next(e["sequence"] for e in events if e["kind"] == "attempt_started")
+    assert {json.loads(body["input"][0]["content"])["plan"]["digest"] for _, body in case.requests} == {frozen[0]["data"]["digest"]}
 
 
 def test_failed_verifier_at_exact_cap_keeps_report_and_stops_retry(delivery_case):
@@ -179,8 +183,8 @@ def test_failed_verifier_at_exact_cap_keeps_report_and_stops_retry(delivery_case
     assert verifier_report == report("failed") and "defect" in failure["reason"]
     assert case.journal.summary()["total_tokens"] == 1000
     assert case.journal.summary()["status"] == "blocked" and case.journal.summary()["attempts"] == 1
-    assert len(case.requests) == 4 and len(case.prepares) == 2 and len(case.sandboxes) == 4
-    assert case.commands.count(["setup"]) == 2 and case.stages == ["building", "verifying"]
+    assert len(case.requests) == 4 and len(case.prepares) == 3 and len(case.sandboxes) == 6
+    assert case.commands.count(["setup"]) == 3 and case.stages == ["building", "verifying"]
 
 
 def test_provider_failure_unknown_usage_stops_retry(delivery_case):
@@ -194,5 +198,36 @@ def test_provider_failure_unknown_usage_stops_retry(delivery_case):
     assert failure["reason"] == "RuntimeError"
     assert case.journal.summary()["usage_complete"] is False
     assert case.journal.summary()["status"] == "blocked" and case.journal.summary()["attempts"] == 1
-    assert len(case.requests) == 3 and len(case.prepares) == 2 and len(case.sandboxes) == 4
-    assert case.commands.count(["setup"]) == 2 and case.stages == ["building", "verifying"]
+    assert len(case.requests) == 3 and len(case.prepares) == 3 and len(case.sandboxes) == 6
+    assert case.commands.count(["setup"]) == 3 and case.stages == ["building", "verifying"]
+
+
+def test_plan_tampering_on_retry_stops_before_another_environment(delivery_case, monkeypatch):
+    case = delivery_case
+    case.responses.extend(builder() + [response(usage(10)), response(usage(10), "finish", report("failed"))])
+    append = RunJournal.append
+    def tamper(journal, kind, **data):
+        result = append(journal, kind, **data)
+        if kind == "attempt_finished" and data["status"] == "failed":
+            path = journal.root / "plan.json"
+            path.write_text("{}")
+        return result
+    monkeypatch.setattr(RunJournal, "append", tamper)
+    with pytest.raises(PlanningStopped):
+        run(case)
+    assert len(case.requests) == 4 and len(case.prepares) == 3
+    assert case.journal.summary()["attempts"] == 1
+
+
+def test_blocked_plan_never_starts_builder_or_promotion(delivery_case):
+    case = delivery_case
+    original = case.delivery.planner_factory
+    def blocked(*args):
+        planner = original(*args)
+        run_planner = planner.run
+        planner.run = lambda *args: {**run_planner(*args), "status": "blocked", "questions": ["Clarify contract"]}
+        return planner
+    case.delivery.planner_factory = blocked
+    with pytest.raises(PlanningStopped):
+        case.delivery.run(case.task, base_sha=case.base, promote=lambda *args: pytest.fail("promoted"))
+    assert not case.requests and case.journal.summary()["attempts"] == 0

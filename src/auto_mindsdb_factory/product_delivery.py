@@ -15,6 +15,7 @@ from .docker_runner import DockerSandbox, RunnerError
 from .intake import repo_root
 from .product_agent import ProductAgent, AgentSessionError, HarnessStopped, RoleSnapshotError, execution_role
 from .product_profile import ProductProfile
+from .product_planning import planning_manifest, plan_delivery, retained_plan
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
 from .product_task import ProductTask
@@ -56,7 +57,7 @@ def _report_feedback(report: dict) -> str:
 class ProductDelivery:
     def __init__(self, profile: ProductProfile, target_root: Path, store: Path, *,
                  agent_factory: Callable[[str, RunJournal], AgentHarness] | None = None,
-                 sandbox_factory: Callable = DockerSandbox) -> None:
+                 sandbox_factory: Callable = DockerSandbox, planner_factory: Callable | None = None) -> None:
         self.profile = profile
         self.settings = profile.document
         self.target = target_root.resolve()
@@ -66,7 +67,11 @@ class ProductDelivery:
         profile.validate_repository(self.target)
         self.agent_factory = agent_factory or self._agent
         self.sandbox_factory = sandbox_factory
+        self.planner_factory = planner_factory
         self.deadline = 0.0
+
+    def plan(self, task, base, journal):
+        return plan_delivery(self, task, base, journal, planner_factory=self.planner_factory)
 
     def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
         resolve_harness(self.settings, role)
@@ -141,6 +146,7 @@ class ProductDelivery:
 
     def verify(self, task: ProductTask, sha: str, base: str, journal: RunJournal, *, prior_feedback: str = "") -> dict:
         execution_role(journal, "verifier")
+        plan = retained_plan(self, task, base, journal)
         with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
             workspace = Path(temporary) / "source"
             original = self._prepare(sha, workspace, journal)
@@ -161,7 +167,7 @@ class ProductDelivery:
                 if not diff or len(diff) > 60000:
                     raise DeliveryError("Candidate diff is empty or too large to review")
                 context = {**task.public_context, "base_sha": base, "candidate_sha": sha, "diff": diff,
-                           "required_checks": self.settings["checks"], "prior_attempt_feedback": prior_feedback,
+                           "required_checks": self.settings["checks"], "prior_attempt_feedback": prior_feedback, "plan": plan,
                            "controller_checks": [{"name": c["name"], "exit_code": c["exit_code"]} for c in checks]}
                 report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
             if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
@@ -191,7 +197,7 @@ class ProductDelivery:
                                 "improvement" if task.document.get("origin") == "improvement" else "delivery"), "replay": replay,
                             "task": task.document, "base_sha": base_sha, "profile": self.settings,
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
-                            "role_snapshots": snapshot_roles(),
+                            "role_snapshots": snapshot_roles(), **planning_manifest(self.profile),
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""
@@ -201,6 +207,7 @@ class ProductDelivery:
                         git(self.target, "fetch", "--no-tags", "origin", self.settings["base_branch"])
                         base_sha = git(self.target, "rev-parse", f"origin/{self.settings['base_branch']}")
                     journal.append("base_resolved", commit_sha=base_sha)
+                    self.plan(task, base_sha, journal)
                     for attempt in range(1, self.settings["max_attempts"] + 1):
                         # A previous response (including a failed verifier response) can
                         # exhaust the shared budget. Check before any attempt setup.
@@ -209,6 +216,7 @@ class ProductDelivery:
                             raise DeliveryError("Prior model usage is unknown; cannot continue within a token budget")
                         if usage["total_tokens"] >= self.settings["max_total_tokens"]:
                             raise DeliveryError("Run token budget exhausted")
+                        plan = retained_plan(self, task, base_sha, journal)
                         journal.append("attempt_started", attempt=attempt, base_sha=base_sha)
                         try:
                             execution_role(journal, "builder")
@@ -218,8 +226,9 @@ class ProductDelivery:
                                 original = self._prepare(base_sha, workspace, journal)
                                 original_executables = executable_paths(workspace, original)
                                 context = {**task.public_context, "required_checks": self.settings["checks"],
-                                           "allowed_paths": self.settings["allowed_paths"], "revision_feedback": feedback}
+                                           "allowed_paths": self.settings["allowed_paths"], "revision_feedback": feedback, "plan": plan}
                                 with self.sandbox_factory(workspace, self.settings["image"], writable=True, platform=self.settings["platform"]) as sandbox:
+                                    context["plan"] = retained_plan(self, task, base_sha, journal)
                                     report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
                                 if report["status"] not in {"passed", "unverified"} or report["findings"]:
                                     raise DeliveryError("Builder did not complete the task: " + _report_feedback(report))

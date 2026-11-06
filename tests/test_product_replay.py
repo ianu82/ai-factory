@@ -37,6 +37,8 @@ def test_replays_pin_inputs_preserve_scores_and_keep_failures_honest(tmp_path):
             j.create({"purpose": "replay", "replay": kwargs["replay"]})
             j.append("run_finished", status="verified")
             return {"status": "verified"}
+        def plan(self, task, base, journal):
+            assert base == "a" * 40
         def verify(self, task, candidate, base, journal):
             if candidate == "b" * 40:
                 raise VerificationFailed("assertion failed")

@@ -90,12 +90,12 @@ def agent_factory(monkeypatch, requests, manifests, *, change_defaults=False, fa
     return factory, sessions
 
 
-def test_delivery_attempts_and_verification_replay_use_their_own_frozen_snapshots(tmp_path, monkeypatch):
+def test_delivery_attempts_and_verification_replay_use_their_own_frozen_snapshots(tmp_path, monkeypatch, investigating_planner):
     target, base, profile, task = setup(tmp_path, monkeypatch)
     store = tmp_path / "store"
     requests, manifests = [], []
     factory, sessions = agent_factory(monkeypatch, requests, manifests, change_defaults=True, fail_first=True)
-    delivery = ProductDelivery(profile, target, store, agent_factory=factory, sandbox_factory=Sandbox)
+    delivery = ProductDelivery(profile, target, store, agent_factory=factory, sandbox_factory=Sandbox, planner_factory=investigating_planner)
     original = product_roles.snapshot_roles()
     result = delivery.run(task, base_sha=base)
     assert result["status"] == "verified"
@@ -125,7 +125,7 @@ def test_delivery_attempts_and_verification_replay_use_their_own_frozen_snapshot
     suite_path = tmp_path / "suite.json"
     suite_path.write_text(json.dumps(suite))
     score = product_replay.run_suite(profile, target, store, suite_path,
-        delivery_factory=lambda p, t, s: ProductDelivery(p, t, s, agent_factory=replay_factory, sandbox_factory=Sandbox))
+        delivery_factory=lambda p, t, s: ProductDelivery(p, t, s, agent_factory=replay_factory, sandbox_factory=Sandbox, planner_factory=investigating_planner))
     assert score["correct"] == 1 and replay_sessions == ["verifier"]
     assert len(set(replay_manifests)) == 1
     assert json.loads(replay_manifests[0])["role_snapshots"] == replay_roles
@@ -134,7 +134,7 @@ def test_delivery_attempts_and_verification_replay_use_their_own_frozen_snapshot
 
 
 @pytest.mark.parametrize("mutation", ["missing", "malformed", "forged", "unknown", "historical-changed"])
-def test_invalid_snapshots_block_delivery_and_verification_before_side_effects(tmp_path, monkeypatch, mutation):
+def test_invalid_snapshots_block_delivery_and_verification_before_side_effects(tmp_path, monkeypatch, mutation, investigating_planner):
     target, base, profile, task = setup(tmp_path, monkeypatch)
     store = tmp_path / "store"
     created = RunJournal.create
@@ -157,7 +157,7 @@ def test_invalid_snapshots_block_delivery_and_verification_before_side_effects(t
             monkeypatch.setitem(product_roles._DEFINITIONS, ("verifier", "1"), changed)
     monkeypatch.setattr(RunJournal, "create", create)
     calls = []
-    delivery = ProductDelivery(profile, target, store, agent_factory=lambda *a: calls.append("provider"), sandbox_factory=Sandbox)
+    delivery = ProductDelivery(profile, target, store, agent_factory=lambda *a: calls.append("provider"), sandbox_factory=Sandbox, planner_factory=investigating_planner)
     delivery._prepare = lambda *a: calls.append("prepare")
     with pytest.raises(RoleSnapshotError, match="snapshot"):
         delivery.run(task, base_sha=base)
@@ -174,17 +174,17 @@ def test_invalid_snapshots_block_delivery_and_verification_before_side_effects(t
     assert (journal.root / "manifest.json").read_bytes() == before and not calls
 
 
-def test_tampering_between_build_and_verify_blocks_before_verification(tmp_path, monkeypatch):
+def test_tampering_between_build_and_verify_blocks_before_verification(tmp_path, monkeypatch, investigating_planner):
     target, base, profile, task = setup(tmp_path, monkeypatch)
     store = tmp_path / "store"
     requests, manifests = [], []
     factory, sessions = agent_factory(monkeypatch, requests, manifests)
-    delivery = ProductDelivery(profile, target, store, agent_factory=factory, sandbox_factory=Sandbox)
+    delivery = ProductDelivery(profile, target, store, agent_factory=factory, sandbox_factory=Sandbox, planner_factory=investigating_planner)
     prepared = []
     prepare = delivery._prepare
-    def count_prepare(*args):
+    def count_prepare(*args, **kwargs):
         prepared.append(args[0])
-        return prepare(*args)
+        return prepare(*args, **kwargs)
     delivery._prepare = count_prepare
     tampered = []
     def stage(name):
@@ -198,6 +198,6 @@ def test_tampering_between_build_and_verify_blocks_before_verification(tmp_path,
         delivery.run(task, base_sha=base, on_stage=stage)
     journal = RunJournal(store, "frozen")
     assert (journal.root / "manifest.json").read_bytes() == tampered[0]
-    assert len(prepared) == 1 and sessions == ["builder"]
+    assert len(prepared) == 2 and sessions == ["builder"]
     assert journal.summary()["attempts"] == 1 and journal.summary()["status"] == "blocked"
     assert "Unknown" in journal.events()[-1]["data"]["reason"]

@@ -41,9 +41,12 @@ task/criteria, base commit, profile and trusted historical planner role. Every
 criterion needs a validation mapping. Ready guidance requires investigated source,
 constraints, intended changes, risks and no unresolved questions. Blocked and
 unverified guidance retains its reason. Plans cannot change executable policy.
-The journal freezes `plan.json` once; matching reads do not rewrite it and conflicts
-or tampering fail closed. This contract alone does not enable planner execution
-or alter legacy runs. Delivery integration follows separately.
+New delivery and verification replay runs investigate the base read-only and
+freeze `plan.json` before implementation. Native planning uses the configured
+builder model, at most eight calls, 100,000 shared tokens and 120 seconds, bounded
+further by the run limits. Every builder retry and verifier checks the original
+acknowledged plan; unresolved guidance stops execution. Plans cannot change task
+criteria or controller policy. Legacy runs remain inspectable and are never resumed.
 
 The embedded Anton SDK checks VCS provenance at `537cc1fb11849e9d152870738af22ca55c1d59d8`.
 It exposes only isolated `run` and validated `finish`; native scratchpads, web,
