@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import sys
 import time
+import threading
 from urllib.parse import urlsplit
 
 if __package__ in {None, ''}:
@@ -29,6 +30,7 @@ class ConsoleServer(ThreadingHTTPServer):
             raise ValueError('Configure independent preview and bridge credentials of at least 20 characters')
         self.store, self.access_key, self.bridge_token = store, access_key, bridge_token
         self.secure, self.attempts = secure, {}
+        self.attempt_lock = threading.Lock()
         super().__init__(address, Handler)
 
 
@@ -38,15 +40,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # No query strings, request bodies or credentials in server logs.
 
-    def send(self, status, value, content_type='application/json; charset=utf-8', cookie=None):
+    def send(self, status, value, content_type='application/json; charset=utf-8', cookie=None, download=None):
         body = value if isinstance(value, bytes) else json.dumps(value, allow_nan=False).encode()
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length',str(len(body)))
-        self.send_header('Cache-Control','no-store' if not self.path.startswith('/assets/') else 'public,max-age=3600')
+        self.send_header('Cache-Control','no-store' if not self.path.startswith('/assets/') else 'no-cache')
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        if download:
+            self.send_header('Content-Disposition', 'attachment; filename='+download)
         if cookie:
             self.send_header('Set-Cookie',cookie)
         self.end_headers()
@@ -91,6 +95,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200,{'authenticated':self.authorized()})
         if path == '/api/state':
             return self.send(200,self.server.store.state()) if self.authorized() else self.send(401,{'error':'Preview access required'})
+        if path.startswith('/api/evidence/'):
+            if not self.authorized():
+                return self.send(401,{'error':'Preview access required'})
+            try:
+                result = self.server.store.attachment(path.split('/')[-1])
+                if not result:
+                    return self.send(404,{'error':'Evidence not found'})
+                metadata, body = result
+                return self.send(200,body,metadata['mime'],download='evidence.txt' if metadata['mime'].startswith('text/') else None)
+            except ValueError:
+                return self.send(503,{'error':'Evidence integrity check failed'})
         target = STATIC/'index.html' if path == '/' else STATIC/path.removeprefix('/assets/') if path.startswith('/assets/') else None
         if not target or target.is_symlink() or not target.resolve().is_relative_to(STATIC) or not target.is_file():
             return self.send(404,{'error':'Not found'})
@@ -113,11 +128,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(404,{'error':'Not found'})
             if not self.same_origin():
                 return self.send(403,{'error':'Same-origin request required'})
+            if path != '/api/access' and not self.authorized():
+                return self.send(401,{'error':'Preview access required'})
             body = self.body()
             if path == '/api/access':
                 return self.access(body)
-            if not self.authorized():
-                return self.send(401,{'error':'Preview access required'})
             if path == '/api/logout':
                 with self.server.store.connect() as db:
                     import hashlib
@@ -129,6 +144,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/items' or path.startswith('/api/items/'):
                 key = path.split('/')[-1] if path!='/api/items' else None
                 return self.send(200,self.server.store.item(body,key))
+            if path == '/api/evidence':
+                return self.send(200,self.server.store.attach(body.get('target_kind'),body.get('target_id'),body))
             if path == '/api/messages':
                 return self.send(200,self.server.store.message(body.get('workspace_id'),body.get('content','')))
             self.send(404,{'error':'Not found'})
@@ -142,13 +159,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def access(self, body):
         ip, current = self.client_address[0], time.monotonic()
-        recent = [stamp for stamp in self.server.attempts.get(ip,[]) if stamp>current-300]
-        if len(recent)>=10:
-            return self.send(429,{'error':'Too many attempts. Try again in five minutes.'})
-        recent.append(current)
-        if len(self.server.attempts)>1000:
-            self.server.attempts.clear()
-        self.server.attempts[ip]=recent
+        with self.server.attempt_lock:
+            recent = [stamp for stamp in self.server.attempts.get(ip,[]) if stamp>current-300]
+            if len(recent)>=10:
+                return self.send(429,{'error':'Too many attempts. Try again in five minutes.'})
+            recent.append(current)
+            if len(self.server.attempts)>1000:
+                self.server.attempts.clear()
+            self.server.attempts[ip]=recent
         key = body.get('access_key')
         if not isinstance(key,str) or not secrets.compare_digest(key,self.server.access_key):
             return self.send(401,{'error':'That preview code is not correct.'})

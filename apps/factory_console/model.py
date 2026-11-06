@@ -45,6 +45,7 @@ def repositories(value):
 def projection(value):
     if not isinstance(value, dict) or value.get('version') != 1:
         raise ValueError('Unsupported Factory projection')
+    from .evidence import check, environment, review
     observed = timestamp(value.get('observed_at'))
     if datetime.fromisoformat(observed).timestamp() > datetime.now(timezone.utc).timestamp() + 30:
         raise ValueError('Factory observation is in the future')
@@ -74,9 +75,8 @@ def projection(value):
             'usage_complete': run.get('usage_complete') is True,
             'summary': text(run.get('summary'), 2000),
             'pull_request_url': github_url(run.get('pull_request_url')),
-            'checks': [{'name': text(c.get('name'), 150), 'status': check_state(c.get('status')),
-                        'at': timestamp(c['at']) if c.get('at') else None}
-                       for c in run.get('checks', [])[:50] if isinstance(c, dict)],
+            'environment': environment(run.get('environment')), 'review': review(run.get('review')),
+            'checks': [check(c) for c in run.get('checks', [])[:50] if isinstance(c, dict)],
             'timeline': [{'kind': text(e.get('kind'), 100), 'label': text(e.get('label'), 300),
                           'at': timestamp(e.get('at')), 'status': check_state(e.get('status'))}
                          for e in run.get('timeline', [])[-100:] if isinstance(e, dict)]})
