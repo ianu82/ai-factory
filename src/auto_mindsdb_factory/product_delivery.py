@@ -79,14 +79,14 @@ class ProductDelivery:
             max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
             deadline=self.deadline, pricing=self.settings["pricing"])
 
-    def _command(self, sandbox, command: list[str]) -> dict:
-        remaining = self.deadline - time.monotonic()
+    def _command(self, sandbox, command: list[str], *, deadline=None) -> dict:
+        remaining = min(self.deadline, deadline if deadline is not None else self.deadline) - time.monotonic()
         if remaining < 1:
             raise DeliveryError("Run time budget exhausted")
         sandbox.timeout = min(self.settings["command_timeout_seconds"], int(remaining))
         return sandbox.run(command)
 
-    def _prepare(self, sha: str, workspace: Path, journal: RunJournal) -> dict[str, bytes]:
+    def _prepare(self, sha: str, workspace: Path, journal: RunJournal, *, deadline=None) -> dict[str, bytes]:
         export_source(self.target, sha, workspace)
         original = source_files(workspace)
         original_executables = executable_paths(workspace, original)
@@ -94,7 +94,7 @@ class ProductDelivery:
             with self.sandbox_factory(workspace, self.settings["image"], writable=True,
                                       network=self.settings["setup_network"], platform=self.settings["platform"]) as sandbox:
                 for command in self.settings["setup"]:
-                    result = self._command(sandbox, command)
+                    result = self._command(sandbox, command, deadline=deadline)
                     journal.append("setup_command", commit_sha=sha, **result)
                     if result["exit_code"]:
                         raise DeliveryError("Candidate environment setup failed")
