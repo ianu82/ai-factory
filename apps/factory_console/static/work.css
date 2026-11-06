@@ -15,12 +15,12 @@
   margin-top: 7px;
 }
 .quiet-label {
-  font-size: 10px;
+  font-size: 11px;
   color: #909a97;
 }
 .board {
   display: grid;
-  grid-template-columns: repeat(6, minmax(170px, 1fr));
+  grid-template-columns: repeat(6, minmax(200px, 1fr));
   gap: 14px;
   overflow-x: auto;
   padding: 1px 1px 20px;
@@ -41,7 +41,7 @@
   color: #6d7976;
 }
 .column-count {
-  font: 10px var(--mono);
+  font: 11px var(--mono);
   color: #a5afaa;
   margin-left: auto;
 }
@@ -88,7 +88,7 @@
   justify-content: space-between;
   gap: 6px;
   margin-bottom: 10px;
-  font-size: 9px;
+  font-size: 11px;
   color: #8a9691;
 }
 .work-card-meta .priority {
@@ -98,11 +98,11 @@
   display: none;
 }
 .work-card h3 {
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.6;
 }
 .work-card > p {
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.7;
   margin: 8px 0 12px;
   display: -webkit-box;
@@ -120,7 +120,7 @@
   border-top: 1px solid #eef0eb;
   padding-top: 11px;
   margin-top: 12px;
-  font-size: 9px;
+  font-size: 11px;
   color: #98a29d;
 }
 .work-card footer > span:first-child {
@@ -129,27 +129,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.column-empty {
-  font-size: 10px;
-  line-height: 1.8;
-  color: #a2ada6;
-  padding: 14px 6px;
-}
-.board-footnote {
-  display: flex;
-  align-items: flex-start;
-  gap: 7px;
-  color: #8d9992;
-  font-size: 10px;
-  margin-top: 12px;
-}
-.board-footnote .icon {
-  width: 13px;
-  height: 13px;
-}
+
 .mono {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   overflow-wrap: anywhere;
 }
 .runs-table {
@@ -165,7 +148,7 @@
 .runs-table-heading {
   padding: 12px 13px;
   color: #8d9792;
-  font-size: 10px;
+  font-size: 11px;
   border-bottom: 1px solid var(--line);
 }
 .run-row {
@@ -178,13 +161,13 @@
   background: #f0f5f1;
 }
 .run-row h3 {
-  color: #263d35;
-  font-size: 12px;
+  color: var(--ink);
+  font-size: 14px;
   margin-bottom: 5px;
 }
 .run-row small {
   display: block;
-  font-size: 9px;
+  font-size: 11px;
   color: #97a197;
   margin-top: 5px;
 }
@@ -197,13 +180,7 @@
   width: 13px;
   height: 13px;
 }
-.page-note {
-  font-size: 10px;
-  color: #9aa39d;
-  line-height: 1.8;
-  margin-top: 23px;
-  max-width: 700px;
-}
+
 .back-link {
   display: inline-flex;
   align-items: center;
@@ -226,14 +203,14 @@
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
-  font-size: 10px;
+  font-size: 11px;
   color: #849189;
 }
 .pipeline {
   padding: 0;
   list-style: none;
   display: flex;
-  margin: 15px 0 37px;
+  margin: 15px 0 26px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
@@ -245,9 +222,9 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 16px 16px;
+  padding: 12px 16px;
   color: #99a49c;
-  font-size: 10px;
+  font-size: 11px;
 }
 .pipeline li + li {
   border-left: 1px solid #edf0ea;
@@ -259,7 +236,7 @@
   place-items: center;
   border: 1px solid #dfe5df;
   border-radius: 50%;
-  font: 10px var(--mono);
+  font: 11px var(--mono);
   flex-shrink: 0;
 }
 .pipeline .active {
@@ -315,41 +292,7 @@
 .section-title .quiet-label {
   margin-left: auto;
 }
-.outcome-copy {
-  font-size: 12px;
-  line-height: 1.9;
-  color: #617267;
-  white-space: pre-wrap;
-}
-.notice {
-  display: flex;
-  gap: 11px;
-  padding: 14px 15px;
-  margin: 18px 0;
-  border-radius: 6px;
-  font-size: 11px;
-  background: #eaf4f2;
-  color: #416d61;
-}
-.notice .icon {
-  width: 17px;
-  height: 17px;
-  margin-top: 2px;
-}
-.notice.warning {
-  background: #fbf2e4;
-  color: #85682e;
-}
-.notice strong {
-  font-size: 11px;
-  font-weight: 550;
-}
-.notice p {
-  font-size: 10px;
-  line-height: 1.7;
-  margin-top: 3px;
-  color: inherit;
-}
+
 .checks > div {
   display: flex;
   align-items: center;
@@ -362,7 +305,7 @@
   flex: 1;
 }
 .checks small {
-  font-size: 9px;
+  font-size: 11px;
   color: #a0aa9f;
 }
 .quiet-copy {
@@ -421,7 +364,7 @@
 .timeline time {
   margin-left: auto;
   white-space: nowrap;
-  font-size: 9px;
+  font-size: 11px;
   color: #99a497;
   margin-top: 2px;
 }
@@ -435,7 +378,7 @@
   margin-bottom: 22px;
 }
 .run-inspector dt {
-  font-size: 10px;
+  font-size: 11px;
   color: #939f92;
   margin-bottom: 5px;
 }
@@ -445,13 +388,7 @@
   overflow-wrap: anywhere;
   color: #59705e;
 }
-.run-inspector > p {
-  font-size: 9.5px;
-  line-height: 1.8;
-  color: #9ca696;
-  border-top: 1px solid var(--line);
-  padding-top: 20px;
-}
+
 .settings-content {
   max-width: 850px;
 }
@@ -502,22 +439,7 @@
 .settings-repos a {
   margin-left: auto;
 }
-.settings-policy {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 10px;
-  color: #6b8470;
-  margin-top: 22px;
-}
-.settings-policy .icon {
-  width: 13px;
-  height: 13px;
-}
-.settings-policy > span {
-  margin-right: 15px;
-}
+
 @media (max-width: 1100px) {
   .runs-table-heading,
   .run-row {
@@ -553,10 +475,7 @@
     margin-right: -20px;
     padding-right: 20px;
   }
-  .board-footnote {
-    font-size: 9px;
-    line-height: 1.7;
-  }
+
   .runs-table-heading {
     display: none;
   }
@@ -570,13 +489,13 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 9px;
+    font-size: 11px;
   }
   .run-row > div:nth-child(3) > small {
     margin: 0;
   }
   .run-row .mono {
-    font-size: 9px;
+    font-size: 11px;
   }
   .run-heading .page-heading {
     gap: 10px;
@@ -592,7 +511,7 @@
   .pipeline li {
     padding: 12px 8px;
     gap: 7px;
-    font-size: 9px;
+    font-size: 11px;
   }
   .pipeline li:nth-child(n + 4) {
     border-top: 1px solid var(--line);
@@ -600,7 +519,7 @@
   .pipeline li > span {
     width: 20px;
     height: 20px;
-    font-size: 9px;
+    font-size: 11px;
   }
   .run-detail-grid {
     grid-template-columns: 1fr;
@@ -619,7 +538,7 @@
     margin: 0;
   }
   .checks > div {
-    font-size: 10px;
+    font-size: 11px;
   }
   .checks small {
     display: none;
@@ -629,16 +548,16 @@
     font-size: 11px;
   }
   .settings-repos > div {
-    font-size: 10px;
+    font-size: 11px;
   }
   .section-title .quiet-label {
-    font-size: 9px;
+    font-size: 11px;
   }
   .timeline h3 {
-    font-size: 10px;
+    font-size: 11px;
   }
   .timeline time {
-    font-size: 8px;
+    font-size: 11px;
   }
 }
 .attention-detail-meta {
@@ -660,4 +579,8 @@
   margin-bottom: 20px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.section-heading > button:only-child {
+  margin-left: auto;
 }
