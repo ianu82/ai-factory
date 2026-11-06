@@ -18,6 +18,7 @@ import {
 import { chat, bindChat } from "./chat.js";
 let data = null;
 export const refresh = async () => {
+  const nextData = await api("/api/state");
   const hash = location.hash;
   const focused = document.activeElement;
   const focusSelector = focused?.id
@@ -34,7 +35,7 @@ export const refresh = async () => {
   const atBottom = history
     ? history.scrollHeight - history.clientHeight - history.scrollTop < 50
     : true;
-  data = await api("/api/state");
+  data = nextData;
   render();
   if (location.hash === hash) {
     if (focusSelector) {
@@ -120,18 +121,21 @@ function render() {
   else if (view === "settings" && ws) container.innerHTML = settings(data, ws);
   else if (view === "chat") container.innerHTML = chat(data, ws);
   else
-    container.innerHTML = `<div class="page-heading">
-<div>
-<span class="eyebrow">${ws ? "WORKSPACE" : "MASTER VIEW"}</span>
-<h1>${e(title)}</h1>
-<p>Preparing the workspace view.</p>
-</div>
-</div>`;
+    container.innerHTML = `<section class="empty-state"><h1>Page not found</h1><a class="button secondary" href="#/inbox">Inbox</a></section>`;
   bindViews(data, ws, refresh);
   bindWorkViews(data, ws);
   bindChat(data, ws, refresh);
-  document.querySelector("#refresh").onclick = () =>
-    refresh().catch((err) => notify(err.message));
+  document.querySelector("#refresh").onclick = async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      await refresh();
+    } catch (error) {
+      notify(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  };
   document.querySelector("#logout").onclick = async () => {
     await api("/api/logout", {});
     location.reload();
@@ -211,8 +215,13 @@ export function workspaceDialog(ws = null) {
 <button class="button primary">${ws ? "Save changes" : "Create workspace"}</button>
 </div>
 </form>`);
+  let saving = false;
   document.querySelector("#workspace-form").onsubmit = async (event) => {
     event.preventDefault();
+    if (saving) return;
+    saving = true;
+    const submit = event.target.querySelector(".button.primary");
+    submit.disabled = true;
     const b = Object.fromEntries(new FormData(event.target));
     b.repositories = b.repositories
       .split("\n")
@@ -222,9 +231,13 @@ export function workspaceDialog(ws = null) {
       const w = await api("/api/workspaces" + (ws ? "/" + ws.id : ""), b);
       document.querySelector("#dialog").close();
       await refresh();
-      location.hash = `#/workspace/${w.id}/chat`;
+      if (!ws) location.hash = `#/workspace/${w.id}/chat`;
+      else notify("Workspace saved");
     } catch (err) {
       notify(err.message);
+    } finally {
+      saving = false;
+      submit.disabled = false;
     }
   };
   document
@@ -271,8 +284,13 @@ export function itemDialog(ws = null, item = null) {
       document.querySelector("#item-form").elements.mode.value =
         data.workspaces.find((w) => w.id === event.target.value).mode;
     };
+  let saving = false;
   document.querySelector("#item-form").onsubmit = async (event) => {
     event.preventDefault();
+    if (saving) return;
+    saving = true;
+    const submit = event.target.querySelector(".button.primary");
+    submit.disabled = true;
     const b = { ...item, ...Object.fromEntries(new FormData(event.target)) };
     b.needs_attention = event.target.elements.needs_attention.checked;
     if (item?.attention_at) b.resolved = !b.needs_attention;
@@ -283,6 +301,9 @@ export function itemDialog(ws = null, item = null) {
       notify(item ? "Work updated" : "Added to backlog");
     } catch (err) {
       notify(err.message);
+    } finally {
+      saving = false;
+      submit.disabled = false;
     }
   };
   document

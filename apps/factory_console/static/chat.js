@@ -9,6 +9,7 @@ import {
 } from "./core.js";
 import { itemDialog } from "./app.js";
 let selected = sessionStorage.getItem("factory-chat-workspace") || "factory";
+const pending = new Set();
 export function chat(data, workspace) {
   const ws =
     workspace ||
@@ -18,6 +19,7 @@ export function chat(data, workspace) {
   const messages = data.messages.filter((m) => m.workspace_id === ws.id);
   const available =
     data.connection.connected && data.connection.controller.chat_available;
+  const saving = pending.has(ws.id);
   return `${workspace ? "" : '<div class="page-heading chat-page-heading"><h1>Master chat</h1></div>'}
 <div class="chat-layout ${workspace ? "scoped" : ""}">
 <section class="chat-main" aria-label="Master chat">
@@ -32,11 +34,11 @@ ${
 <div class="chat-history" id="chat-history" aria-live="polite">${messages.length ? messages.map((m) => message(m)).join("") : `<section class="chat-welcome"><h2>${available ? "What would you like to work on?" : "Start with a brief"}</h2></section>`}</div>
 <div class="composer-area">
 ${available ? "" : '<p class="chat-policy">Orchestrator replies aren’t connected yet.</p>'}
-<form id="chat-form">
+<form id="chat-form" data-workspace="${e(ws.id)}">
 <label class="sr-only" for="chat-message">${available ? "Message the Orchestrator" : "Save a brief"}</label>
-<textarea id="chat-message" name="content" maxlength="8000" required rows="3" placeholder="${available ? "Message the Orchestrator…" : "Describe what you want to build or change…"}">${e(sessionStorage.getItem("factory-chat-draft-" + ws.id) || "")}</textarea>
+<textarea id="chat-message" name="content" maxlength="8000" required rows="3" ${saving ? "disabled" : ""} placeholder="${available ? "Message the Orchestrator…" : "Describe what you want to build or change…"}">${e(sessionStorage.getItem("factory-chat-draft-" + ws.id) || "")}</textarea>
 <div class="composer-footer"><span>${ws.mode === "non-coding" ? "Non-coding" : "Engineering"}</span>
-<button class="button primary" aria-label="${available ? "Send message" : "Save brief"}">${available ? "Send" : "Save brief"}${icon(available ? "send" : "plus")}</button></div>
+<button class="button primary" ${saving ? "disabled" : ""} aria-label="${available ? "Send message" : "Save brief"}">${available ? "Send" : "Save brief"}${icon(available ? "send" : "plus")}</button></div>
 </form>
 </div></section></div>`;
 }
@@ -80,24 +82,37 @@ export function bindChat(data, workspace, refresh) {
   };
   document.querySelector("#chat-form").onsubmit = async (event) => {
     event.preventDefault();
+    if (pending.has(ws.id)) return;
     const content = textarea.value.trim();
     if (!content) return;
+    pending.add(ws.id);
     const button = event.target.querySelector("button");
     button.disabled = true;
+    textarea.disabled = true;
     try {
       const message = await api("/api/messages", {
         workspace_id: ws.id,
         content,
       });
       sessionStorage.removeItem("factory-chat-draft-" + ws.id);
+      textarea.value = "";
       await refresh();
-      document.querySelector("#chat-message")?.focus({ preventScroll: true });
-      const history = document.querySelector("#chat-history");
-      history.scrollTop = history.scrollHeight;
+      if (document.querySelector("#chat-form")?.dataset.workspace === ws.id) {
+        const history = document.querySelector("#chat-history");
+        history.scrollTop = history.scrollHeight;
+      }
       if (message.status === "saved") notify("Brief saved");
     } catch (err) {
       notify(err.message);
-      button.disabled = false;
+    } finally {
+      pending.delete(ws.id);
+      const form = document.querySelector("#chat-form");
+      if (form?.dataset.workspace === ws.id) {
+        form.querySelector("button").disabled = false;
+        const current = form.querySelector("textarea");
+        current.disabled = false;
+        current.focus({ preventScroll: true });
+      }
     }
   };
   document.querySelectorAll("[data-task-from-message]").forEach(
