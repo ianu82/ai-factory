@@ -58,6 +58,10 @@ def test_planner_is_read_only_contract():
     assert any("not enabled" in item.lower() for item in planner["constraints"])
 
 
+def test_historical_report_planner_remains_immutable():
+    assert select_role("planner", "3")["digest"] == "05ab39ecfd767cd7668917159e4f568de9123a1a4a147f679104aab1e15a9314"
+
+
 def test_candidate_files_and_cwd_cannot_replace_trusted_registry(tmp_path):
     (tmp_path / "product_roles.py").write_text("raise RuntimeError('candidate role executed')")
     package = tmp_path / "auto_mindsdb_factory"

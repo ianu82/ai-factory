@@ -7,7 +7,7 @@ from .product_agent import AgentSessionError, ProductAgent, RoleSnapshotError, T
 from .product_plan import PLAN_SCHEMA, ProductPlan
 from .product_roles import select_role
 
-PLANNER_VERSION = "3"
+PLANNER_VERSION = "4"
 REPORT_RESERVE_SECONDS = 30
 
 

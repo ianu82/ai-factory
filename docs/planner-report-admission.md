@@ -1,11 +1,19 @@
 # Bounded planning reports
 
-Planner role version 3 investigates enough source to propose a plan, rather than
+Planner role version 4 investigates enough source to propose a plan, rather than
 implementing or proving the eventual fix. Historical versions remain unchanged.
 The controller supplies remaining request/time budgets on every planning request.
 After actual investigation, only the structured report tool is offered on the
 last allowed request or when at most 30 seconds remain. An unoffered command is
 rejected before execution, even if the provider returns it.
+
+`ready` describes a justified implementation plan with every original criterion
+mapped to future validation. It is not implementation approval or proof that any
+check ran. The controller supplies its exported-base binding and read-only/no-Git
+environment facts; the planner records these limits and deferred checks honestly.
+Missing source evidence, unresolved product questions or infeasible validation
+still require `unverified` or `blocked`. No later delivery gate is waived, and an
+earlier unverified report is never relabelled or reused.
 
 The existing eight-request, 100,000-token and 120-second phase limits remain.
 Planning consumes the shared run budget. A one-request allocation cannot support

@@ -99,6 +99,8 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                     investigated = True
                     return result
                 content = planner.run("planner", {**task.public_context, "base_sha": base,
+                    "source_environment": {"source_access": "read_only", "git_metadata": "absent",
+                                           "base_binding": "controller_export"},
                     "required_checks": delivery.settings["checks"],
                     "allowed_paths": delivery.settings["allowed_paths"]}, command)
             checks = {"investigated": investigated, "source_unchanged": source_files(workspace) == original,

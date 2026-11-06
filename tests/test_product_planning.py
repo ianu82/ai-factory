@@ -79,6 +79,19 @@ def test_unresolved_plan_retained_but_never_admitted(phase, status):
     assert json.loads((p.journal.root / "plan.json").read_text())["plan"]["content"]["status"] == status
 
 
+def test_planning_exposes_controller_binding_without_manufacturing_validation(phase):
+    p = phase
+    p.content["risks"] = ["Git metadata is absent; full implementation checks remain unrun"]
+    result = execute(p)
+    assert p.contexts[0]["source_environment"] == {
+        "source_access": "read_only", "git_metadata": "absent", "base_binding": "controller_export"}
+    assert p.contexts[0]["base_sha"] == p.base
+    assert p.contexts[0]["required_checks"] == p.delivery.settings["checks"]
+    assert result["guidance"] == p.content
+    assert not any(e["kind"] in {"verification_check", "agent_report", "candidate_verified",
+                                  "merge_confirmed", "post_merge_smoke"} for e in p.journal.events())
+
+
 @pytest.mark.parametrize("mode", ["unknown", "exhausted", "expired", "missing-role"])
 def test_admission_stops_before_environment_or_provider(phase, mode):
     p = phase

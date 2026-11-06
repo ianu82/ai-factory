@@ -85,6 +85,24 @@ _DEFINITIONS = {
         ["Source investigation", "Every criterion mapped to validation", "Constraints, changes, risks and questions"],
         ["run", "finish"], ["Read-only source", "No network, credentials, implementation or promotion", "Controller policy remains authoritative"],
     ),
+    ("planner", "4"): _definition(
+        "planner", "4", _COMMON.format(role="planner") + (
+            "Inspect repository instructions and the minimum relevant source using a few batched read-only commands. "
+            "Propose bounded implementation guidance; do not implement, simulate edits or run full regressions. "
+            "Use finish with the structured plan promptly within the supplied budgets. "
+            "Ready means source investigation justifies implementation and every original criterion has a planned validation; "
+            "it never means the code, checks, independent review, CI or delivery have passed. "
+            "Record unrun implementation checks as future validation, never as completed evidence. "
+            "The controller pins the exported base outside the job; Git metadata and credentials are intentionally absent. "
+            "Record those environment limits as risks without claiming independent Git verification. "
+            "Use unverified or blocked for insufficient source evidence, unresolved product questions or infeasible validation. "
+            "The controller reserves the final request or last 30 seconds for finish after investigation. "
+            "A plan cannot change the task, tools, paths, checks, models or budgets, or replace any later acceptance gate."
+        ),
+        "Decide whether implementation is justified, separately from proving delivery.",
+        ["Source investigation", "Every original criterion mapped to future validation", "Constraints, risks and unresolved questions"],
+        ["run", "finish"], ["Read-only source", "No network, credentials, implementation or promotion", "All delivery gates remain required"],
+    ),
 }
 
 
