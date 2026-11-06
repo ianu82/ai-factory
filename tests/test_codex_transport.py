@@ -69,13 +69,13 @@ def test_real_codex_response_is_gated_before_tool_execution(codex_root, permitte
             try:
                 assert len(requests) == 1
                 action = codex_action(response, model=MODEL)
-                assert action == ("finish", REPORT, "call_probe")
-                decisions.append("allowed")
-            except (CodexActionError, AssertionError):
+            except CodexActionError:
                 decisions.append("rejected")
                 out = b'{"error":{"message":"Factory policy stopped the offline response","type":"invalid_request_error"}}'
                 self.send_response(400); self.send_header("Content-Type", "application/json")
             else:
+                decisions.append("allowed")
+                assert action == ("finish", REPORT, "call_probe")
                 events = [
                     {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
                     {"type": "response.output_item.added", "output_index": 0,
