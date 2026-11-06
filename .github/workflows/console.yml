@@ -1,0 +1,38 @@
+name: Validate Factory Console
+on:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - '.github/workflows/console.yml'
+  push:
+    branches: ['codex/factory-console-deployment']
+    paths:
+      - 'apps/**'
+      - '.github/workflows/console.yml'
+permissions:
+  contents: read
+concurrency:
+  group: console-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: '3.13'
+      - run: uv sync --locked --extra dev
+      - run: uv run --locked pytest apps/factory_console/tests -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.3'
+      - name: Validate frontend modules
+        run: for file in apps/factory_console/static/*.js; do node --check "$file"; done
+      - name: Build the pinned console image
+        run: docker build -t factory-console-ci apps/factory_console
+      - name: Qualify the actual private console container
+        run: python apps/factory_console/tests/container_smoke.py

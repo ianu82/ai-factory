@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import sys
 import time
+import threading
 from urllib.parse import urlsplit
 
 if __package__ in {None, ''}:
@@ -29,6 +30,7 @@ class ConsoleServer(ThreadingHTTPServer):
             raise ValueError('Configure independent preview and bridge credentials of at least 20 characters')
         self.store, self.access_key, self.bridge_token = store, access_key, bridge_token
         self.secure, self.attempts = secure, {}
+        self.attempt_lock = threading.Lock()
         super().__init__(address, Handler)
 
 
@@ -43,7 +45,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length',str(len(body)))
-        self.send_header('Cache-Control','no-store' if not self.path.startswith('/assets/') else 'public,max-age=3600')
+        self.send_header('Cache-Control','no-store' if not self.path.startswith('/assets/') else 'no-cache')
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
@@ -142,13 +144,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def access(self, body):
         ip, current = self.client_address[0], time.monotonic()
-        recent = [stamp for stamp in self.server.attempts.get(ip,[]) if stamp>current-300]
-        if len(recent)>=10:
-            return self.send(429,{'error':'Too many attempts. Try again in five minutes.'})
-        recent.append(current)
-        if len(self.server.attempts)>1000:
-            self.server.attempts.clear()
-        self.server.attempts[ip]=recent
+        with self.server.attempt_lock:
+            recent = [stamp for stamp in self.server.attempts.get(ip,[]) if stamp>current-300]
+            if len(recent)>=10:
+                return self.send(429,{'error':'Too many attempts. Try again in five minutes.'})
+            recent.append(current)
+            if len(self.server.attempts)>1000:
+                self.server.attempts.clear()
+            self.server.attempts[ip]=recent
         key = body.get('access_key')
         if not isinstance(key,str) or not secrets.compare_digest(key,self.server.access_key):
             return self.send(401,{'error':'That preview code is not correct.'})
