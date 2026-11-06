@@ -1,6 +1,7 @@
 """Validate the pinned CLI's request before a future bridge admits inference."""
 
 import json
+import re
 
 
 class CodexRequestError(ValueError):
@@ -26,13 +27,14 @@ def _tools(tools, namespace=None):
             found |= _tools(tool.get("tools"), "functions")
         elif kind == "function" and namespace == "functions":
             if (set(tool) - {"type", "name", "description", "parameters", "strict", "defer_loading"}
-                    or type(tool.get("name")) is not str or type(tool.get("parameters")) is not dict):
+                    or type(tool.get("name")) is not str or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", tool["name"]) is None
+                    or type(tool.get("parameters")) is not dict):
                 raise CodexRequestError("Codex function declaration is invalid")
         elif kind == "custom" and namespace == "functions" and tool.get("name") == "exec":
             fmt = tool.get("format")
             if (set(tool) - {"type", "name", "description", "format"} or type(fmt) is not dict
                     or set(fmt) != {"type", "syntax", "definition"} or fmt["type"] != "grammar"
-                    or fmt["syntax"] != "lark" or type(fmt["definition"]) is not str):
+                    or fmt["syntax"] != "lark" or type(fmt["definition"]) is not str or not fmt["definition"]):
                 raise CodexRequestError("Codex Code Mode declaration is invalid")
             found = True
         else:
@@ -48,7 +50,7 @@ def codex_request(body: dict, *, model: str, effort: str, max_output_tokens: int
     and enforce cancellation, deadlines, request limits and retained ownership.
     No inference, tool execution or evidence write occurs here.
     """
-    if (type(body) is not dict or type(model) is not str or not model or type(effort) is not str
+    if (type(body) is not dict or type(model) is not str or not model or type(effort) is not str or not effort
             or type(max_output_tokens) is not int or max_output_tokens < 1
             or type(remaining_tokens) is not int or remaining_tokens < 1):
         raise CodexRequestError("Codex request configuration is invalid")

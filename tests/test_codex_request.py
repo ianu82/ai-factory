@@ -62,7 +62,7 @@ def test_unknown_history_or_compaction_cannot_hide_a_new_request(kind):
 
 
 @pytest.mark.parametrize("setting", [{"remaining_tokens": 0}, {"remaining_tokens": False},
-                                    {"max_output_tokens": -1}, {"max_output_tokens": True}])
+                                    {"max_output_tokens": -1}, {"max_output_tokens": True}, {"effort": ""}])
 def test_invalid_or_empty_budget_stops_before_a_request(setting):
     with pytest.raises(CodexRequestError): prepare(body(), **setting)
 
@@ -71,3 +71,15 @@ def test_missing_or_malformed_catalogue_fails_closed():
     for value in [None, [], [{"type": "namespace", "name": "functions", "tools": []}]]:
         b = body(); b["input"][0]["tools"] = value
         with pytest.raises(CodexRequestError): prepare(b)
+
+
+@pytest.mark.parametrize("name", ["", "bad\nname", "x" * 129])
+def test_malformed_function_names_stop_before_provider_validation(name):
+    b = body()
+    b["input"][0]["tools"][0]["tools"].append({"type": "function", "name": name, "parameters": {}})
+    with pytest.raises(CodexRequestError): prepare(b)
+
+
+def test_empty_code_mode_grammar_is_invalid():
+    b = body(); b["input"][0]["tools"][0]["tools"][0]["format"]["definition"] = ""
+    with pytest.raises(CodexRequestError): prepare(b)
