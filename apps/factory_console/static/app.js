@@ -2,7 +2,6 @@ import {
   api,
   escape as e,
   icon,
-  badge,
   notify,
   route,
   relative,
@@ -75,13 +74,10 @@ function render() {
 <span>MindsHub<small>FACTORY</small>
 </span>
 </a>
-<div class="team-switch">${icon("layers")}<span>MindsHub team<small>Internal workspace</small>
-</span>
-</div>
-<div class="nav-label">Master view</div>
-<nav aria-label="Master navigation">${nav("inbox", "Inbox", "inbox", attention().length)}${nav("chat", "Master chat", "chat")}${nav("runs", "All runs", "runs", active)}${nav("workspaces", "Workspaces", "grid")}</nav>
+<button class="icon-button sidebar-close" data-close-nav aria-label="Close navigation">${icon("close")}</button>
+<nav aria-label="Master navigation">${nav("inbox", "Inbox", "inbox", attention().length)}${nav("chat", "Master chat", "chat")}${nav("runs", "Runs", "runs", active)}</nav>
 <div class="workspace-label">
-<span class="nav-label">Workspaces</span>
+<a class="nav-label" href="#/workspaces">Workspaces</a>
 <button class="icon-button" data-new-workspace aria-label="Add workspace">${icon("plus")}</button>
 </div>
 <nav aria-label="Workspaces">${data.workspaces
@@ -95,35 +91,16 @@ function render() {
     )
     .join("")}</nav>
 <div class="sidebar-bottom">
-<div class="connection ${data.connection.connected ? "live" : ""}">
-<span class="status-dot">
-</span>
-<span>${data.connection.connected ? "Factory connected" : data.connection.stale ? "Factory feed stale" : "Awaiting Factory feed"}<small>${data.connection.observed_at ? `Updated ${relative(data.connection.observed_at)}` : "Live state will appear here"}</small>
-</span>
-</div>
-<div class="profile">
-<span class="avatar">M</span>
-<span>MindsHub<small>Private preview</small>
-</span>
-<button class="icon-button" id="logout" aria-label="Leave preview">${icon("logout")}</button>
-</div>
+<span class="connection-label">${data.connection.stale ? "Updates unavailable" : ""}</span>
+<button class="icon-button" id="refresh" aria-label="Refresh Factory state" title="${data.connection.observed_at ? "Last updated " + relative(data.connection.observed_at) : "Refresh Factory state"}">${icon("refresh")}</button>
+<button class="icon-button" id="logout" aria-label="Sign out" title="Sign out">${icon("logout")}</button>
 </div>
 </aside>
+<button class="nav-scrim" data-close-nav aria-label="Close navigation"></button>
 <div class="main-shell">
 <header class="topbar">
-<button id="mobile-menu" class="icon-button" aria-label="Toggle navigation">${icon("menu")}</button>
-<div class="breadcrumb">${
-    ws
-      ? `<a href="#/workspaces">Workspaces</a>
-<span>/</span>
-<strong>${e(ws.name)}</strong>`
-      : `<span>Factory</span>
-<span>/</span>
-<strong>${e(title)}</strong>`
-  }</div>
-<div class="topbar-end">
-<span class="preview-label">Internal preview</span>${data.connection.connected ? badge(data.connection.controller.mode === "paused" ? "ready" : "building", data.connection.controller.mode === "paused" ? "Intake paused" : "Feed current") : badge("unknown", "Feed not connected")}<button class="icon-button" id="refresh" aria-label="Refresh Factory state">${icon("refresh")}</button>
-</div>
+<button id="mobile-menu" class="icon-button" aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar">${icon("menu")}</button>
+<a class="mobile-brand" href="#/inbox"><img src="/assets/minds-icon.svg" alt="" width="24" height="24">Factory</a>
 </header>
 <main id="main">
 <div id="view">
@@ -159,8 +136,20 @@ function render() {
     await api("/api/logout", {});
     location.reload();
   };
-  document.querySelector("#mobile-menu").onclick = () =>
-    document.querySelector("#sidebar").classList.toggle("open");
+  document.querySelector("#mobile-menu").onclick = (event) =>
+    event.currentTarget.setAttribute(
+      "aria-expanded",
+      document.querySelector("#sidebar").classList.toggle("open"),
+    );
+  document.querySelectorAll("[data-close-nav]").forEach(
+    (button) =>
+      (button.onclick = () => {
+        document.querySelector("#sidebar").classList.remove("open");
+        document
+          .querySelector("#mobile-menu")
+          .setAttribute("aria-expanded", "false");
+      }),
+  );
   document
     .querySelectorAll("[data-new-workspace]")
     .forEach((b) => (b.onclick = () => workspaceDialog()));
@@ -175,7 +164,6 @@ function nav(path, label, name, count = 0) {
 function workspaceHeader(ws, view) {
   return `<section class="workspace-heading">
 <div>
-<span class="eyebrow">WORKSPACE</span>
 <h1>${e(ws.name)}</h1>
 <p>${e(ws.description)}</p>
 </div>
@@ -268,10 +256,9 @@ export function itemDialog(ws = null, item = null) {
 </div>
 <label class="check-label">
 <input type="checkbox" name="needs_attention" ${item?.attention_at && !item.resolved ? "checked" : ""}>Needs my attention</label>
-<p class="field-note">Saved to the backlog. Execution follows the workspace's delivery gates.</p>
 <div class="dialog-footer">
 <button type="button" class="button secondary" data-close>Cancel</button>
-<button class="button primary">${item ? "Save changes" : "Add to backlog"}</button>
+<button class="button primary">${item ? "Save changes" : "Save to backlog"}</button>
 </div>
 </form>`);
   if (!item)
@@ -308,15 +295,13 @@ async function access() {
 <span>MindsHub Factory</span>
 </div>
 <form id="access-form">
-<span class="eyebrow">PRIVATE PREVIEW</span>
-<h1>Your work, moving forward.</h1>
-<p>Enter the preview code to open the team's Factory.</p>
+<h1>Open Factory</h1>
 <label>Preview code<input name="access_key" type="password" autocomplete="current-password" required>
 </label>
 <p id="access-error" role="alert">
 </p>
 <button class="button primary">Open Factory ${icon("arrow")}</button>
-<small>MindsHub sign-in is coming next.</small>
+
 </form>
 </main>`;
   document.querySelector("#access-form").onsubmit = async (event) => {
@@ -338,6 +323,12 @@ window.addEventListener("hashchange", () => {
   if (data) render();
 });
 window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    document.querySelector("#sidebar")?.classList.remove("open");
+    document
+      .querySelector("#mobile-menu")
+      ?.setAttribute("aria-expanded", "false");
+  }
   if (
     event.key === "/" &&
     !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)

@@ -22,10 +22,8 @@ export function inbox(data, workspace) {
   ).length;
   return `<div class="page-heading">
 <div>
-<span class="eyebrow">${workspace ? "WORKSPACE ATTENTION" : "MASTER VIEW"}</span>
 <h1>${workspace ? "Attention" : "Inbox"}<span class="heading-count">${count}</span>
 </h1>
-<p>${workspace ? "Decisions and blockers for this workspace." : "Your next action, across every workspace."}</p>
 </div>
 <button class="button primary" data-new-work>${icon("plus")}New work</button>
 </div>
@@ -35,7 +33,7 @@ export function inbox(data, workspace) {
 <button data-order="oldest">${icon("clock")}Chronological</button>
 </div>
 <div class="toolbar-filters">${
-    workspace
+    workspace || data.workspaces.length < 2
       ? ""
       : `<select id="workspace-filter" aria-label="Filter workspace">
 <option value="">All workspaces</option>${data.workspaces.map((w) => `<option value="${e(w.id)}">${e(w.name)}</option>`).join("")}</select>`
@@ -43,29 +41,13 @@ export function inbox(data, workspace) {
 <option value="oldest">Oldest first</option>
 <option value="newest">Newest first</option>
 </select>
-<label class="search-box">${icon("search")}<input data-search placeholder="Search attention" aria-label="Search attention">
+<label class="search-box">${icon("search")}<input data-search placeholder="Search inbox" aria-label="Search inbox">
 </label>
 </div>
 </div>
-<div class="inbox-layout">
 <section id="attention-list" aria-label="Items needing attention">
 </section>
-<aside class="inbox-context">
-<span class="eyebrow">FACTORY AT A GLANCE</span>
-<h2>${data.connection.connected ? (data.connection.controller.mode === "paused" ? "Ready for your next move." : "Your Factory, in view.") : "A clear view of your work."}</h2>
-<p>${data.connection.connected ? (data.connection.controller.mode === "paused" ? "Intake is deliberately paused. Existing work and its evidence stay available." : "Inspect the last recorded stage and the evidence behind it.") : "The live connection is being prepared. Saved workspaces and requests remain available."}</p>
-<div class="context-stats">
-<a href="#/runs">
-<strong>${data.connection.observed_at ? data.runs.filter((r) => !["complete", "blocked"].includes(r.status)).length : "—"}</strong>
-<span>Open runs</span>${icon("arrow")}</a>
-<a href="#/workspaces">
-<strong>${data.workspaces.length}</strong>
-<span>Workspaces</span>${icon("arrow")}</a>
-</div>
-<div class="context-note">${icon("info")}<p>Highest priority comes first. When priorities match, the oldest request for attention wins.</p>
-</div>
-</aside>
-</div>`;
+`;
 }
 function attentionList(
   data,
@@ -93,18 +75,8 @@ function attentionList(
         : a.attention_at.localeCompare(b.attention_at),
   );
   if (!list.length)
-    return empty(
-      "checkcircle",
-      search || filter ? "No matching items" : "You're clear for now.",
-      search || filter
-        ? "Try a different workspace or search."
-        : "Decisions, approvals and blockers will appear here when they need you.",
-      `<a class="button secondary" href="#/runs">View Factory runs ${icon("arrow")}</a>`,
-    );
-  return `<div class="list-caption">
-<span>${list.length} ${list.length === 1 ? "item needs" : "items need"} your attention</span>
-<span>${order === "priority" ? "Priority · oldest first" : order === "oldest" ? "Oldest first" : "Newest first"}</span>
-</div>${list
+    return empty("inbox", search || filter ? "No matches" : "No items", "");
+  return `${list
     .map((i) => {
       const w = data.workspaces.find((w) => w.id === i.workspace_id);
       return `<button class="attention-row" data-item="${e(i.id)}">
@@ -112,11 +84,10 @@ function attentionList(
 <div class="row-content">
 <div class="row-meta">
 <span>${e(w?.name || "Workspace")}</span>
-<span>·</span>
-<span>${i.kind === "failure" ? "Run needs review" : i.mode === "non-coding" ? "Non-coding task" : "Engineering task"}</span>
+${i.mode === "non-coding" ? "<span>· Non-coding</span>" : ""}
 </div>
 <h3>${e(i.title)}</h3>
-<p>${e(i.description || "Open the item to review the next action.")}</p>
+${i.description && !i.run_id ? `<p>${e(i.description)}</p>` : ""}
 <div class="row-bottom">${badge(i.status)}<span title="${e(fullDate(i.attention_at))}">${icon("clock")}${relative(i.attention_at)}</span>
 </div>
 </div>${icon("chevron", "row-chevron")}</button>`;
@@ -126,9 +97,7 @@ function attentionList(
 export function workspaces(data) {
   return `<div class="page-heading">
 <div>
-<span class="eyebrow">MINDSHUB TEAM</span>
 <h1>Workspaces</h1>
-<p>Products, repositories and the work that moves them forward.</p>
 </div>
 <button class="button primary" data-new-workspace>${icon("plus")}New workspace</button>
 </div>
@@ -139,7 +108,7 @@ export function workspaces(data) {
 <div class="workspace-card-top">
 <span class="workspace-monogram large">${e(w.name.slice(0, 2).toUpperCase())}</span>${icon("arrow")}</div>
 <h2>${e(w.name)}</h2>
-<p>${e(w.description || "A shared home for this product’s work.")}</p>
+${w.description ? `<p>${e(w.description)}</p>` : ""}
 <div class="repo-list">${w.repositories.map((r) => `<span>${icon("git")}${e(r)}</span>`).join("")}</div>
 <footer>
 <span>${w.mode === "non-coding" ? "Non-coding" : "Engineering"}</span>
@@ -192,10 +161,10 @@ export function bindViews(data, workspace, refresh) {
             (item) => item.id === button.dataset.item,
           );
           const ws = data.workspaces.find((ws) => ws.id === item.workspace_id);
-          showDialog(`<div class="dialog-heading"><h2>Needs attention</h2><button class="icon-button" data-close aria-label="Close">${icon("close")}</button></div>
+          showDialog(`<div class="dialog-heading"><h2>${e(item.title)}</h2><button class="icon-button" data-close aria-label="Close">${icon("close")}</button></div>
         <div class="attention-detail-meta">${priority(item.priority)}<span>${e(ws.name)}</span>${badge(item.status)}</div>
-        <h3 class="attention-title">${e(item.title)}</h3><p class="attention-description">${e(item.description)}</p>
-        <p class="field-note">First needed attention ${e(fullDate(item.attention_at))}. Editing this item preserves its original age.</p>
+        ${item.description && !item.run_id ? `<p class="attention-description">${e(item.description)}</p>` : ""}
+        <p class="field-note">Since ${e(fullDate(item.attention_at))}</p>
         <div class="dialog-footer"><button class="button secondary" id="edit-attention">Edit details</button>
         ${item.run_id ? `<a class="button secondary" href="#/run/${e(item.run_id)}">Inspect run ${icon("arrow")}</a>` : ""}
         <button class="button primary" id="handle-attention">Mark handled</button></div>`);
@@ -211,9 +180,7 @@ export function bindViews(data, workspace, refresh) {
               await api("/api/items/" + item.id, { ...item, resolved: true });
               document.querySelector("#dialog").close();
               await refresh();
-              notify(
-                "Marked handled. The original work and run outcome are retained.",
-              );
+              notify("Marked handled");
             } catch (error) {
               notify(error.message);
               event.target.disabled = false;

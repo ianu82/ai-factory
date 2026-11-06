@@ -102,7 +102,7 @@ export const empty = (
 ) => `<section class="empty-state">
 <div class="empty-symbol">${icon(name)}</div>
 <h2>${escape(title)}</h2>
-<p>${escape(copy)}</p>${action}</section>`;
+${copy ? `<p>${escape(copy)}</p>` : ""}${action}</section>`;
 export function showDialog(content) {
   const dialog = document.querySelector("#dialog");
   dialog.innerHTML = content;
@@ -110,13 +110,9 @@ export function showDialog(content) {
   dialog
     .querySelector("[data-close]")
     ?.addEventListener("click", () => dialog.close());
-  dialog.addEventListener(
-    "click",
-    (e) => {
-      if (e.target === dialog) dialog.close();
-    },
-    { once: true },
-  );
+  dialog.onclick = (event) => {
+    if (event.target === dialog) dialog.close();
+  };
 }
 export const priority = (
   p,
