@@ -21,11 +21,7 @@ def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, 
     binaries.mkdir(parents=True)
     (binaries / "python").symlink_to(sys.executable)
     if version:
-        uv = binaries / "uv"
-        uv.touch()
-        uv.chmod(0o755)
-        # Keep the version response fake without executing scripts from a
-        # sandbox's temporary filesystem; the real uv integration runs separately.
+        # The real uv executable is covered by the invalid-lock integration.
         command = command[:-1] + [
             "import subprocess\nsubprocess.check_output = lambda *args, **kwargs: "
             + repr(version) + "\n" + command[-1]
@@ -33,8 +29,9 @@ def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, 
     # This marker stands in for pytest, so a failure cannot accidentally run it.
     marker = tmp_path / "regressions-ran"
     (tmp_path / "pytest.py").write_text(
-        "import shutil\nfrom pathlib import Path\n"
-        "assert Path(shutil.which('uv')) == Path('.venv/bin/uv').absolute()\n"
+        "import os\nfrom pathlib import Path\n"
+        "if os.environ['PATH'].split(os.pathsep)[0] != str(Path('.venv/bin').absolute()):\n"
+        "    raise RuntimeError('venv binaries must lead PATH')\n"
         "Path('regressions-ran').write_text('started')\n"
     )
     result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True,
