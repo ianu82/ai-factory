@@ -77,6 +77,10 @@ class ProductDelivery:
         self.check_cancelled()
         return plan_delivery(self, task, base, journal, planner_factory=self.planner_factory)
 
+    def prepare_runner(self, journal):
+        """Default runners need no separate hardware bootstrap."""
+        self.check_cancelled()
+
     def cancelled(self):
         return getattr(self, "_cancellation", lambda: False)()
 

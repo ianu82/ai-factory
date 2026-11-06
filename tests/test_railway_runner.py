@@ -50,6 +50,71 @@ def test_setup_is_retained_but_fresh_exports_use_fresh_vms(tmp_path):
     assert [r["id"] for r in provider.calls if r["action"] == "destroy"] == ["1", "2"]
 
 
+def test_prepared_worker_is_the_first_source_worker_without_extra_allocation(tmp_path):
+    provider = Provider()
+    pool = RailwayPool(provider)
+    try:
+        assert pool.warm(timeout=23) == "1" and pool.warm() == "1"
+        assert pool.workspace is None
+        first, second = tmp_path / "first", tmp_path / "second"
+        first.mkdir(); second.mkdir()
+        pool.open(first)
+        assert pool.id == "1" and provider.serial == 1
+        pool.open(second)
+        assert pool.id == "2" and provider.serial == 2
+        assert provider.calls[0] == {"action": "create", "timeout": 23}
+    finally:
+        pool.close()
+    with pytest.raises(RunnerError, match="closed"):
+        pool.warm()
+    assert [r["id"] for r in provider.calls if r["action"] == "destroy"] == ["1", "2"]
+
+
+def test_cancelled_runner_preparation_retires_late_creation_and_cannot_continue(tmp_path):
+    import time
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    from auto_mindsdb_factory.railway_runner import RailwayDelivery
+    from auto_mindsdb_factory.run_journal import RunJournal
+    started, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+    calls, errors = [], []
+    def provider(request):
+        calls.append(request)
+        if request["action"] == "create":
+            started.set()
+            assert release.wait(3)
+            return {"id": "late-worker"}
+        return {}
+    pool = RailwayPool(provider)
+    delivery = object.__new__(RailwayDelivery)
+    delivery._railway_pool, delivery.deadline = pool, time.monotonic() + 10
+    delivery.cancelled = cancelled.is_set
+    journal = RunJournal(tmp_path, "cancel-preparation")
+    journal.create({})
+    def prepare():
+        try:
+            delivery.prepare_runner(journal)
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=prepare)
+    thread.start()
+    try:
+        assert started.wait(3)
+        cancelled.set()
+        assert pool.stopped.wait(3)
+        release.set()
+        thread.join(timeout=3)
+        assert not thread.is_alive() and len(errors) == 1 and isinstance(errors[0], HarnessStopped)
+        assert pool.id is None
+        assert [r["id"] for r in calls if r["action"] == "destroy"] == ["late-worker"]
+        assert [e["kind"] for e in journal.events()] == ["runner_preparation_started"]
+        with pytest.raises(RunnerError, match="closed"):
+            pool.open(tmp_path)
+    finally:
+        release.set()
+        thread.join(timeout=3)
+        pool.close()
+
+
 def test_candidate_edits_are_imported_after_container_stop(tmp_path):
     provider = Provider()
     (tmp_path / "x").write_text("before")

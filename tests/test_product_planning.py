@@ -35,7 +35,7 @@ def phase(tmp_path):
         assert (sandbox.workspace / "parser.py").read_text() == "original"
         return {"exit_code": 0}
     delivery = SimpleNamespace(profile=profile, settings=profile.document, deadline=time.monotonic() + 300,
-        _prepare=prepare, sandbox_factory=sandbox, _command=command)
+        _prepare=prepare, sandbox_factory=sandbox, _command=command, prepare_runner=lambda journal: None)
     content = {"status": "ready", "reason": "Inspected parser", "goal": "Reject invalid input",
         "constraints": ["Keep API"], "source_paths": ["parser.py"], "changes": ["Validate input"],
         "risks": ["Preserve valid input"], "questions": [],
@@ -93,6 +93,41 @@ def test_admission_stops_before_environment_or_provider(phase, mode):
     with pytest.raises(PlanningStopped):
         execute(p)
     assert not p.calls and not p.contexts
+
+
+def test_worker_bootstrap_uses_existing_run_budget_before_the_bounded_planning_phase(phase, monkeypatch):
+    p = phase
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    p.delivery.deadline = 300
+    def bootstrap(journal):
+        assert journal is p.journal
+        clock["now"] = 150
+    p.delivery.prepare_runner = bootstrap
+    execute(p)
+    assert p.delivery.deadline == 300  # Hardware preparation never extends the run.
+    assert p.calls[0][1]["deadline"] == 270  # Setup/investigation/inference share 120 seconds.
+    start = next(e["data"] for e in p.journal.events() if e["kind"] == "planning_started")
+    assert start == {"max_seconds": 120, "remaining_run_seconds": 150}
+
+
+def test_bootstrap_cannot_reset_an_exhausted_global_deadline(phase, monkeypatch):
+    p = phase
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    p.delivery.deadline = 100
+    p.delivery.prepare_runner = lambda journal: clock.update(now=101)
+    with pytest.raises(PlanningStopped, match="during runner preparation"):
+        execute(p)
+    assert p.delivery.deadline == 100 and not p.calls and not p.contexts
+
+
+def test_no_preparation_is_admitted_after_usage_exhaustion(phase):
+    p = phase
+    p.delivery.prepare_runner = lambda journal: pytest.fail("Exhausted run allocated a worker")
+    p.journal.append("model_response", usage={"total_tokens": p.delivery.settings["max_total_tokens"]})
+    with pytest.raises(PlanningStopped):
+        execute(p)
 
 
 @pytest.mark.parametrize("mode", ["self-consistent-tamper", "missing-ack", "changed-task", "legacy"])

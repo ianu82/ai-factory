@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from uuid import uuid4
 from weakref import WeakKeyDictionary
@@ -18,6 +19,7 @@ from weakref import WeakKeyDictionary
 from .docker_runner import RunnerError
 from .product_delivery import ProductDelivery
 from .source_transfer import pack_source, write_source
+from .product_cancellation import run_cancellable
 
 
 # Keep constructor facts outside mutable exception state without retaining its
@@ -136,6 +138,21 @@ class RailwayPool:
             self.id = self.workspace = None
             self.failure = None
 
+    def warm(self, *, timeout=300):
+        if type(timeout) is not int or not 1 <= timeout <= 300:
+            raise RunnerError("Invalid worker preparation timeout")
+        with self.lock:
+            if self.stopped.is_set():
+                raise RunnerError("Railway worker pool is closed")
+            if self.failure:
+                raise self.failure
+            if self.id is None:
+                self.id = self.transport({"action": "create", "timeout": timeout})["id"]
+                if self.stopped.is_set():
+                    self._discard()
+                    raise RunnerError("Railway worker creation was cancelled")
+            return self.id
+
     def open(self, workspace):
         with self.lock:
             if self.stopped.is_set():
@@ -143,11 +160,9 @@ class RailwayPool:
             if self.failure:
                 raise self.failure
             if self.workspace != workspace:
-                self._discard()
-                self.id = self.transport({"action": "create", "timeout": 300})["id"]
-                if self.stopped.is_set():
+                if self.workspace is not None:
                     self._discard()
-                    raise RunnerError("Railway worker creation was cancelled")
+                self.warm()
                 self.workspace = workspace
                 self.call({"action": "upload", "source": pack_source(workspace)}, timeout=120)
 
@@ -242,7 +257,33 @@ class RailwaySandbox:
             write_source(self.workspace, response["source"])
 
 
+class _WorkerPreparation:
+    def __init__(self, pool, timeout):
+        self.pool, self.timeout = pool, timeout
+
+    def run(self, command):
+        return self.pool.warm(timeout=self.timeout)
+
+    def abort(self):
+        self.pool.abort()
+
+
 class RailwayDelivery(ProductDelivery):
+    def prepare_runner(self, journal):
+        self.check_cancelled()
+        remaining = self.deadline - time.monotonic()
+        if remaining < 1:
+            raise RunnerError("Run time budget exhausted before worker preparation")
+        pool = self._railway_pool
+        if pool.id is not None:
+            return
+        journal.append("runner_preparation_started", budget="shared_run_deadline")
+        started = time.monotonic()
+        identity = run_cancellable(_WorkerPreparation(pool, min(300, int(remaining))), [],
+            cancelled=self.cancelled, deadline=self.deadline)
+        journal.append("runner_preparation_finished", worker_id=identity,
+                       duration_seconds=round(time.monotonic() - started, 3))
+
     def _in_pool(self, operation, *args, **kwargs):
         if getattr(self, "_railway_pool", None) is not None:
             return operation(*args, **kwargs)

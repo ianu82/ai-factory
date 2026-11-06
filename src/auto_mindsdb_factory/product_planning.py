@@ -23,6 +23,7 @@ def planning_manifest(profile):
     settings = profile.document
     return {"planner_role_snapshot": select_role("planner", "2"), "planning_limits": {
         "harness": "native", "model": settings["builder_model"],
+        "runner_preparation_budget": "shared_run_deadline",
         "max_turns": min(8, settings["max_agent_turns"]),
         "max_tokens": min(100000, settings["max_total_tokens"]), "max_seconds": 120}}
 
@@ -54,13 +55,20 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         usage = journal.summary()
         if not usage["usage_complete"] or usage["total_tokens"] >= delivery.settings["max_total_tokens"]:
             raise PlanningStopped("Planning usage is unknown or its token budget exhausted")
-        deadline = min(delivery.deadline, time.monotonic() + 120)
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= delivery.deadline:
             raise PlanningStopped("Run time budget exhausted before planning")
         if (journal.root / "plan.json").exists() or any(e["kind"] == "plan_frozen" for e in journal.events()):
             raise PlanningStopped("Planning cannot replace an existing run plan")
+        config = execution_config(delivery.settings, "planner", journal) if planner_factory is None else None
+        # Allocate the first worker under the already-running global deadline.
+        # Source setup, investigation and inference remain within the planning phase.
+        delivery.prepare_runner(journal)
+        deadline = min(delivery.deadline, time.monotonic() + 120)
+        if time.monotonic() >= deadline:
+            raise PlanningStopped("Run time budget exhausted during runner preparation")
+        journal.append("planning_started", max_seconds=120,
+                       remaining_run_seconds=round(delivery.deadline - time.monotonic(), 3))
         if planner_factory is None:
-            config = execution_config(delivery.settings, "planner", journal)
             planner = ProductPlanner(OpenAIResponsesAgentConnector(config), journal, task=task,
                 base_sha=base, profile=delivery.profile, deadline=deadline, cancelled=delivery.cancelled)
         else:
