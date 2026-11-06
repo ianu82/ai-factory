@@ -40,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # No query strings, request bodies or credentials in server logs.
 
-    def send(self, status, value, content_type='application/json; charset=utf-8', cookie=None):
+    def send(self, status, value, content_type='application/json; charset=utf-8', cookie=None, download=None):
         body = value if isinstance(value, bytes) else json.dumps(value, allow_nan=False).encode()
         self.send_response(status)
         self.send_header('Content-Type', content_type)
@@ -49,6 +49,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        if download:
+            self.send_header('Content-Disposition', 'attachment; filename='+download)
         if cookie:
             self.send_header('Set-Cookie',cookie)
         self.end_headers()
@@ -93,6 +95,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200,{'authenticated':self.authorized()})
         if path == '/api/state':
             return self.send(200,self.server.store.state()) if self.authorized() else self.send(401,{'error':'Preview access required'})
+        if path.startswith('/api/evidence/'):
+            if not self.authorized():
+                return self.send(401,{'error':'Preview access required'})
+            try:
+                result = self.server.store.attachment(path.split('/')[-1])
+                if not result:
+                    return self.send(404,{'error':'Evidence not found'})
+                metadata, body = result
+                return self.send(200,body,metadata['mime'],download='evidence.txt' if metadata['mime'].startswith('text/') else None)
+            except ValueError:
+                return self.send(503,{'error':'Evidence integrity check failed'})
         target = STATIC/'index.html' if path == '/' else STATIC/path.removeprefix('/assets/') if path.startswith('/assets/') else None
         if not target or target.is_symlink() or not target.resolve().is_relative_to(STATIC) or not target.is_file():
             return self.send(404,{'error':'Not found'})
@@ -131,6 +144,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/items' or path.startswith('/api/items/'):
                 key = path.split('/')[-1] if path!='/api/items' else None
                 return self.send(200,self.server.store.item(body,key))
+            if path == '/api/evidence':
+                return self.send(200,self.server.store.attach(body.get('target_kind'),body.get('target_id'),body))
             if path == '/api/messages':
                 return self.send(200,self.server.store.message(body.get('workspace_id'),body.get('content','')))
             self.send(404,{'error':'Not found'})

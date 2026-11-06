@@ -7,6 +7,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 
+from . import artifacts
 from .model import MODES, PRIORITIES, attention_sort, identifier, now, projection, repositories, text
 
 
@@ -21,6 +22,7 @@ class Store:
             db.close()
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS records(kind TEXT,id TEXT,document TEXT,PRIMARY KEY(kind,id))')
+            artifacts.install(db)
             db.execute('CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,expires REAL)')
             if not self.get(db, 'meta', 'created'):
                 self.put(db, 'meta', 'created', {'at': now()})
@@ -59,12 +61,15 @@ class Store:
         with self.connect() as db:
             snapshot = self.get(db, 'snapshot', 'factory')
             workspaces, items = self.all(db, 'workspace'), self.all(db, 'item')
-            run_map = {r['id']:r for r in snapshot['runs']} if snapshot else {}
+            run_map = {r['id']:r for r in self.all(db, 'run')}
+            if snapshot:
+                run_map.update({r['id']:r for r in snapshot['runs']})
             for item in items:
                 if item.get('run_id') in run_map:
                     item['run'] = run_map[item['run_id']]
             age = max(0, datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(snapshot['observed_at']).timestamp()) if snapshot else None
             return {'workspaces':workspaces, 'items':items, 'runs':list(run_map.values()),
+                'artifacts':artifacts.metadata(db),
                 'connection':{'connected':snapshot is not None and age < 90,
                     'observed_at':snapshot['observed_at'] if snapshot else None,
                     'stale':age is not None and age >= 90,
@@ -80,6 +85,7 @@ class Store:
             started = self.get(db, 'meta', 'created')['at']
             workspaces = self.all(db, 'workspace')
             for run in snapshot['runs']:
+                self.put(db, 'run', run['id'], run)
                 if run['status'] != 'blocked' or not run['finished_at'] or run['finished_at'] < started:
                     continue
                 key = 'run-' + run['id']
@@ -94,6 +100,20 @@ class Store:
                         'updated_at':run['finished_at'],'run_id':run['id'],'resolved':False})
             self.put(db, 'snapshot', 'factory', snapshot)
         return {'accepted':True,'observed_at':snapshot['observed_at'],'run_count':len(snapshot['runs'])}
+
+    def attach(self, kind, target, document):
+        with self.connect() as db:
+            # Migrate a target from an older console snapshot without altering its evidence.
+            snapshot = self.get(db, 'snapshot', 'factory')
+            if kind == 'run' and snapshot and not self.get(db, 'run', target):
+                run = next((r for r in snapshot['runs'] if r['id'] == target), None)
+                if run:
+                    self.put(db, 'run', target, run)
+            return artifacts.save(db, kind, target, document)
+
+    def attachment(self, key):
+        with self.connect() as db:
+            return artifacts.load(db, key)
 
     def workspace(self, document, key=None):
         name = document.get('name','').strip()
