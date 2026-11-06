@@ -38,5 +38,11 @@ the complete response. It yields no early executable item. The real-CLI tests us
 this encoder directly. Admission, usage accounting, cancellation and lifetime
 checks are still required before a future bridge sends these bytes to app-server.
 
+`codex_request.codex_request` rejects model/reasoning/storage/tool-policy drift,
+hosted tool declarations and unsupported history before inference. It detaches
+context without changing it and supplies a missing output cap from the caller's
+trusted limit and remaining aggregate tokens; a smaller explicit cap is preserved.
+The caller still owns complete usage accounting, admission, deadlines and cleanup.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

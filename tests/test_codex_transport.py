@@ -15,6 +15,7 @@ import pytest
 
 from auto_mindsdb_factory.codex_actions import CodexActionError, codex_action
 from auto_mindsdb_factory.codex_stream import codex_sse
+from auto_mindsdb_factory.codex_request import codex_request
 from auto_mindsdb_factory.product_agent import REPORT_SCHEMA
 
 
@@ -61,6 +62,8 @@ def test_real_codex_response_is_gated_before_tool_execution(codex_root, permitte
             assert self.path == "/v1/responses"
             assert requests[-1]["model"] == MODEL
             assert requests[-1]["reasoning"]["effort"] == "high"
+            prepared = codex_request(requests[-1], model=MODEL, effort="high", max_output_tokens=10000, remaining_tokens=50000)
+            assert prepared.pop("max_output_tokens") == 10000 and prepared == requests[-1]
             code = "text(await tools.finish(" + json.dumps(REPORT) + "))" if permitted else 'text(await tools.apply_patch("forbidden"))'
             call = {"type": "custom_tool_call", "id": "ctc_probe", "call_id": "call_probe",
                     "name": "exec", "namespace": "functions", "input": code, "status": "completed"}
