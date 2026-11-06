@@ -30,6 +30,18 @@ STAGES = {'base_resolved':'planning','plan_frozen':'planning','attempt_started':
     'promotion_requested':'ci','merge_confirmed':'smoking','post_merge_smoke':'smoking'}
 
 
+def _terminal_outcome(value, stage):
+    status = {'complete':'complete', 'blocked':'blocked', 'unverified':'blocked',
+              'rejected':'blocked', 'verified':'review', 'pr_ready':'review'}.get(value, 'unknown') if isinstance(value,str) else 'unknown'
+    if status == 'complete':
+        return status, 'Controller recorded complete; inspect retained verification and delivery evidence.', 'passed'
+    if status == 'blocked':
+        return status, 'The run ended '+value+' during '+stage+'. Its original evidence is retained.', 'blocked'
+    if status == 'review':
+        return status, 'The run ended ready for review; complete delivery is not recorded.', 'unverified'
+    return status, 'The run ended with an unknown terminal outcome during '+stage+'. Its original evidence is retained.', 'unverified'
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         raise HTTPError(request.full_url, code, 'Console redirects are refused', headers, response)
@@ -66,7 +78,7 @@ class Publisher:
             return None
         created = manifest.get('created_at',events[0]['at'])
         stage, terminal, checks, timeline, candidate, pr = 'planning',None,[],[],None,None
-        review, review_report = None, None
+        review, review_report, outcome = None, None, None
         expected_criteria = manifest.get('task',{}).get('acceptance_criteria',[])
         expected_ids = [c.get('id') for c in expected_criteria if isinstance(c,dict)]
         valid_contract = bool(expected_ids) and len(expected_ids)==len(expected_criteria) and passed_criteria(
@@ -78,7 +90,11 @@ class Publisher:
                 candidate=digest(data.get('commit_sha'),40)
                 review, review_report = None, None
             if kind=='pull_request_published':pr=data.get('url')
-            if kind=='run_finished':terminal=event
+            if kind=='run_finished':
+                terminal=event
+                outcome=_terminal_outcome(data.get('status'),stage)
+                if review and (outcome[0]=='unknown' or data.get('status') in ('unverified','rejected')):
+                    review['accepted']=False
             status = 'passed'
             if kind in {'verification_check','post_merge_smoke'}:
                 result = data.get('exit_code')
@@ -101,15 +117,11 @@ class Publisher:
                     review['accepted']=accepted
                 status='passed' if accepted else 'unverified'
             if kind=='plan_frozen':status='passed' if data.get('status')=='ready' else 'unverified'
-            if kind=='run_finished':status='passed' if data.get('status')=='complete' else 'blocked'
+            if kind=='run_finished':status=outcome[2]
             if kind in LABELS:
                 timeline.append({'kind':kind,'label':LABELS[kind],'at':at,'status':status})
-        status = {'complete':'complete','blocked':'blocked','verified':'review','pr_ready':'review'}.get(
-            terminal['data'].get('status'),'unknown') if terminal else stage
-        reason = ('Controller recorded complete; inspect retained verification and delivery evidence.' if status=='complete' else
-                  'The run ended blocked during '+stage+'. Its original evidence is retained.' if status=='blocked' else
-                  'The candidate is ready for review; complete delivery is not yet recorded.' if status=='review' else
-                  'No terminal outcome has been recorded. Activity does not establish process liveness.')
+        status, reason = outcome[:2] if outcome is not None else (
+            stage, 'No terminal outcome has been recorded. Activity does not establish process liveness.')
         value = {'id':directory.name,'title':manifest.get('task',{}).get('title',directory.name),
             'repository':manifest.get('profile',{}).get('repository'),'status':status,'stage':stage,
             'created_at':created,'updated_at':events[-1]['at'],'finished_at':terminal['at'] if terminal else None,
