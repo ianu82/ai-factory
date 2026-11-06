@@ -27,6 +27,13 @@ def test_authenticated_utf8_body_is_preserved_without_transport_fields():
     assert parse(request(json.dumps(body, ensure_ascii=False).encode())) == body
 
 
+def test_exact_maximum_body_size_remains_supported():
+    prefix, suffix = b'{"text":"', b'"}'
+    payload = prefix + b'x' * (8_000_000 - len(prefix) - len(suffix)) + suffix
+    assert len(payload) == 8_000_000
+    assert len(parse(request(payload))["text"]) == 8_000_000 - len(prefix) - len(suffix)
+
+
 @pytest.mark.parametrize("old,new", [(b"POST ", b"GET "), (b"/v1/responses", b"/v1/compact"),
     (b"HTTP/1.1", b"HTTP/1.0"), (HOST.encode(), b"attacker.invalid"), (TOKEN.encode(), b"incorrect"),
     (b"Content-Type: application/json", b"Content-Type: text/plain"),

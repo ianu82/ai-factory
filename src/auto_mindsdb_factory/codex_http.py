@@ -32,12 +32,21 @@ def _float(value):
 
 
 def _check_depth(payload):
-    depth = 0
-    for match in re.finditer(rb'"(?:[^"\\]|\\.)*"|[{}\[\]]', payload, re.DOTALL):
-        if match.end() - match.start() != 1: continue  # Ignore complete JSON strings.
-        depth += 1 if payload[match.start()] in (91, 123) else -1
-        if not 0 <= depth <= 128:
-            raise ValueError("JSON nesting bound exceeded")
+    depth, quoted, escaped_through = 0, False, -1
+    # Scan structural bytes with constant auxiliary memory, including huge strings.
+    for match in re.finditer(rb'["\\{}\[\]]', payload):
+        index = match.start()
+        if index <= escaped_through: continue
+        value = payload[index]
+        if quoted:
+            if value == 92: escaped_through = index + 1
+            elif value == 34: quoted = False
+        elif value == 34:
+            quoted = True
+        elif value in (91, 123, 93, 125):
+            depth += 1 if value in (91, 123) else -1
+            if not 0 <= depth <= 128:
+                raise ValueError("JSON nesting bound exceeded")
 
 
 async def read_codex_http(reader, *, token, host, timeout):
