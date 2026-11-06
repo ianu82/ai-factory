@@ -88,7 +88,8 @@ def open_codex_process(provider_url, *, deadline, binary=None):
         raise CodexProcessError("Codex requires its controller-owned loopback proxy")
     if type(deadline) not in (int, float) or not math.isfinite(deadline) or time.monotonic() >= deadline:
         raise CodexProcessError("Codex startup deadline exhausted")
-    executable = Path(binary or Path(__file__).with_name("codex_bridge") / "node_modules/.bin/codex").resolve()
+    default = Path(__file__).with_name("codex_bridge") / "node_modules/.bin/codex"
+    executable = Path(default if binary is None else binary).resolve()
     node = shutil.which("node")
     if not executable.is_file() or node is None:
         raise CodexProcessError("The pinned Codex installation is unavailable")

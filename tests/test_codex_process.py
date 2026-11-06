@@ -33,6 +33,12 @@ def test_unknown_binary_cannot_be_used_as_a_compatible_fallback():
             pytest.fail("App-server started")
 
 
+def test_explicit_empty_binary_cannot_silently_select_the_default():
+    with pytest.raises(CodexProcessError, match="unavailable"):
+        with open_codex_process("http://127.0.0.1:1/v1", deadline=time.monotonic() + 10, binary=""):
+            pytest.fail("App-server started")
+
+
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_real_pinned_process_uses_owned_empty_directories_and_retires_its_group(monkeypatch, interrupt):
     configured = os.environ.get("AI_FACTORY_CODEX_TEST_BINARY")
