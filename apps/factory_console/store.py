@@ -148,7 +148,11 @@ class Store:
             if len(pending)>=20:
                 raise ValueError('The Orchestrator queue is full; wait for a reply')
             value = {'id':secrets.token_hex(12),'workspace_id':workspace_id,'role':'user',
-                'content':text(content,8000),'created_at':now(),'status':'pending'}
+                'content':text(content,8000),'created_at':now(),'status':'saved'}
+            snapshot = self.get(db, 'snapshot', 'factory')
+            if (snapshot and snapshot['controller']['chat_available']
+                    and datetime.now(timezone.utc).timestamp()-datetime.fromisoformat(snapshot['observed_at']).timestamp()<90):
+                value['status']='pending'
             self.put(db,'message',value['id'],value)
         return value
 
