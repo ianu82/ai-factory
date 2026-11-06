@@ -84,17 +84,11 @@ function attentionList(
     .map((i) => {
       const w = data.workspaces.find((w) => w.id === i.workspace_id);
       return `<button class="attention-row" data-item="${e(i.id)}">
-<div class="row-leading">${priority(i.priority)}</div>
-<div class="row-content">
-<div class="row-meta">
-<span>${e(w?.name || "Workspace")}</span>
-${i.mode === "non-coding" ? "<span>· Non-coding</span>" : ""}
-</div>
-<h3>${e(i.title)}</h3>
-${i.description && !i.run_id && i.description.trim() !== i.title.trim() ? `<p>${e(i.description)}</p>` : ""}
-<div class="row-bottom">${badge(i.status)}<span title="${e(fullDate(i.attention_at))}">${icon("clock")}${relative(i.attention_at)}</span>
-</div>
-</div>${icon("chevron", "row-chevron")}</button>`;
+<span class="row-leading">${priority(i.priority)}</span>
+<span class="row-workspace">${e(w?.name || "Workspace")}</span>
+<span class="row-content"><span class="row-title">${e(i.title)}</span></span>
+${badge(i.status)}<time title="${e(fullDate(i.attention_at))}">${relative(i.attention_at)}</time>
+${icon("chevron", "row-chevron")}</button>`;
     })
     .join("")}`;
 }
