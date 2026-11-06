@@ -1,5 +1,6 @@
 """Bounded read-only journal publisher. No inference, execution or claim mutation."""
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -112,14 +113,15 @@ class Publisher:
             if not root.is_dir() or root.is_symlink():continue
             directories.extend((store,p) for p in root.iterdir() if p.is_dir() and not p.is_symlink() and (p/'manifest.json').is_file())
         directories.sort(key=lambda pair:(pair[1]/'manifest.json').stat().st_mtime_ns,reverse=True)
+        identities=Counter(directory.name for _,directory in directories)
         runs, unavailable = [], 0
         for store,directory in directories[:50]:
             try:
+                if identities[directory.name]>1:
+                    raise ValueError('Ambiguous run identity across configured stores')
                 value=self.run(store,directory)
                 if value:
                     checked=projection({'version':1,'observed_at':stamp,'controller':{'mode':'unknown'},'runs':[value]})['runs'][0]
-                    if any(run['id']==checked['id'] for run in runs):
-                        raise ValueError('Ambiguous run identity across configured stores')
                     runs.append(checked)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 unavailable+=1

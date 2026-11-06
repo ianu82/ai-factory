@@ -101,3 +101,18 @@ def test_minimal_journal_does_not_suppress_valid_runs(tmp_path):
     assert [run['id'] for run in result['runs']]==['valid']
     assert result['controller']['unreadable_runs']==1
     assert before=={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in store.rglob('*') if p.is_file()}
+
+
+def test_all_conflicting_global_identities_are_suppressed_across_actual_stores(tmp_path):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    stores=[tmp_path/name for name in ('first','second','third')]
+    for index,store in enumerate(stores):
+        journal=RunJournal(store,'same-id')
+        journal.create({'task':{'title':'Ambiguous'},'profile':{'repository':f'owner/repo-{index}'}})
+        journal.append('attempt_started')
+    valid=RunJournal(stores[0],'distinct')
+    valid.create({'task':{'title':'Unambiguous'},'profile':{'repository':'owner/repo'}})
+    valid.append('attempt_started')
+    result=Publisher(stores,tmp_path/'no-status').snapshot()
+    assert [run['id'] for run in result['runs']]==['distinct']
+    assert result['controller']['unreadable_runs']==3
