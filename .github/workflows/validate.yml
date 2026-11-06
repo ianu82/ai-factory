@@ -49,6 +49,14 @@ jobs:
       - run: uv sync --locked --extra dev
       - run: .venv/bin/python scripts/install_anton.py .venv/bin/python
       - run: .venv/bin/python -m pytest -q tests/test_anton_session.py tests/test_anton_inference.py tests/test_anton_runtime.py tests/test_anton_transport.py tests/test_product_execution.py tests/test_codex_inference_transport.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefix src/auto_mindsdb_factory/codex_bridge --ignore-scripts --no-audit --no-fund
+      - name: Exercise the combined pinned CLI and client through the scoped proxy
+        env:
+          AI_FACTORY_CODEX_TEST_BINARY: src/auto_mindsdb_factory/codex_bridge/node_modules/.bin/codex
+        run: .venv/bin/python -m pytest -q tests/test_codex_proxy_transport.py
 
   validate:
     runs-on: ubuntu-latest

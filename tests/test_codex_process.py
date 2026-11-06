@@ -39,6 +39,14 @@ def test_explicit_empty_binary_cannot_silently_select_the_default():
             pytest.fail("App-server started")
 
 
+@pytest.mark.parametrize("token", ["", "x" * 44, "controller-test-only", "t" * 42 + "\n"])
+def test_invalid_proxy_capability_never_reaches_a_child(token, monkeypatch):
+    monkeypatch.setattr("auto_mindsdb_factory.codex_process.subprocess.Popen", lambda *a, **k: pytest.fail("spawned"))
+    with pytest.raises(CodexProcessError, match="Invalid local proxy capability"):
+        with open_codex_process("http://127.0.0.1:1/v1", deadline=time.monotonic() + 10, proxy_token=token):
+            pytest.fail("App-server started")
+
+
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_real_pinned_process_uses_owned_empty_directories_and_retires_its_group(monkeypatch, interrupt):
     configured = os.environ.get("AI_FACTORY_CODEX_TEST_BINARY")

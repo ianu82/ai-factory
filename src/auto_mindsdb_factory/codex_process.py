@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -68,10 +69,11 @@ def _owned_process(command, *, work, env):
 
 
 @contextmanager
-def open_codex_process(provider_url, *, deadline, binary=None):
+def open_codex_process(provider_url, *, deadline, binary=None, proxy_token=None):
     """Launch only the pinned CLI, with a new empty home/work and no inherited keys.
 
     provider_url must identify the owning controller's loopback proxy. The caller
+    supplies only a fresh local proxy capability, never a provider API key.
     owns JSON-RPC reading, thread policy, inference admission and the global run
     lifetime. No request or tool is dispatched here. stderr is discarded, so raw
     SDK/provider diagnostics cannot become evidence or block on an unread pipe.
@@ -86,6 +88,8 @@ def open_codex_process(provider_url, *, deadline, binary=None):
         valid = False
     if not valid:
         raise CodexProcessError("Codex requires its controller-owned loopback proxy")
+    if proxy_token is not None and (type(proxy_token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", proxy_token) is None):
+        raise CodexProcessError("Invalid local proxy capability")
     if type(deadline) not in (int, float) or not math.isfinite(deadline) or time.monotonic() >= deadline:
         raise CodexProcessError("Codex startup deadline exhausted")
     default = Path(__file__).with_name("codex_bridge") / "node_modules/.bin/codex"
@@ -116,7 +120,10 @@ def open_codex_process(provider_url, *, deadline, binary=None):
                     "requires_openai_auth": False, "supports_websockets": False,
                     "request_max_retries": 0, "stream_max_retries": 0}
         command.extend(["-c", "model_providers.factory_guarded={" + ",".join(
-            key + "=" + json.dumps(value) for key, value in provider.items()) + "}", "app-server"])
+            key + "=" + json.dumps(value) for key, value in provider.items()) + "}"])
+        if proxy_token is not None:
+            command.extend(["-c", "model_providers.factory_guarded.http_headers.X-Factory-Session=" + json.dumps(proxy_token)])
+        command.append("app-server")
         if time.monotonic() >= deadline:
             raise CodexProcessError("Codex startup deadline exhausted")
         with _owned_process(command, work=work, env=env) as process:

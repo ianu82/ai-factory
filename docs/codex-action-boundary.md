@@ -75,5 +75,11 @@ It authenticates each request, routes inference through the accounting gate and
 buffers the validated SSE. Stop/deadline, disconnect and context exit cancel and
 drain active provider work; the owning session still closes the provider client.
 
+The combined transport tests connect the real pinned CLI to this proxy with a
+fresh local capability header, then the accounting gate and actual pinned client
+with a mock upstream. They check report delivery, pre-stream built-in rejection,
+in-flight cancel/drain and cleanup. No actual provider key reaches app-server,
+and this remains local integration evidence rather than live coding certification.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
