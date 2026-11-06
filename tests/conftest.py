@@ -1,5 +1,8 @@
 """Explicit planning doubles for delivery component tests; no provider requests."""
 
+import subprocess
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,3 +23,15 @@ def investigating_planner():
                                for c in context["acceptance_criteria"]]}
         return SimpleNamespace(run=run)
     return factory
+
+
+@pytest.fixture
+def validation_checkout():
+    # Keep Git metadata out of the exported source tree, even with --basetemp.
+    with tempfile.TemporaryDirectory(prefix="product-validate-", dir="/tmp") as directory:
+        root = Path(directory)
+        target = root / "target"
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
+                        "git@github.com:owner/product.git"], check=True)
+        yield root, target

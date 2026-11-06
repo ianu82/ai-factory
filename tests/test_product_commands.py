@@ -2,7 +2,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -11,18 +10,6 @@ from auto_mindsdb_factory import product_commands
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.__main__ import _load_local_env_files, main
 from auto_mindsdb_factory.run_journal import RunJournal
-
-
-@pytest.fixture
-def validation_checkout():
-    # Keep Git metadata out of the exported source tree, even with --basetemp.
-    with tempfile.TemporaryDirectory(prefix="product-validate-", dir="/tmp") as directory:
-        root = Path(directory)
-        target = root / "target"
-        subprocess.run(["git", "init", "-q", str(target)], check=True)
-        subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
-                        "git@github.com:owner/product.git"], check=True)
-        yield root, target
 
 
 def run_product_validate(profile, target):

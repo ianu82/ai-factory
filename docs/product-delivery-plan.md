@@ -71,6 +71,9 @@ the backend; live coding and safe release evidence remain required for certifica
 candidate. `--publish` enables GitHub publication; `auto_merge` in the trusted
 profile decides whether it stops at PR-ready or promotes the change. Existing
 Linear/staged automation retains its separate PR-ready boundary.
+Direct delivery and replay support explicit `--runner railway` without Linear.
+Docker remains the default. Planning, implementation and verification own their
+worker lifecycle; standalone verification replay also closes each phase's pool.
 
 `product-inspect` reads a run summary and optionally its event history. Product
 commands never discover `.env` files in the target working directory. Use process

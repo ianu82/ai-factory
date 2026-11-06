@@ -214,10 +214,27 @@ class RailwaySandbox:
 
 
 class RailwayDelivery(ProductDelivery):
-    def run(self, *args, **kwargs):
+    def _in_pool(self, operation, *args, **kwargs):
+        if getattr(self, "_railway_pool", None) is not None:
+            return operation(*args, **kwargs)
         pool = RailwayPool()
+        previous = self.sandbox_factory
+        self._railway_pool = pool
         self.sandbox_factory = pool
         try:
-            return super().run(*args, **kwargs)
+            return operation(*args, **kwargs)
         finally:
-            pool.close()
+            try:
+                pool.close()
+            finally:
+                self.sandbox_factory = previous
+                self._railway_pool = None
+
+    def run(self, *args, **kwargs):
+        return self._in_pool(super().run, *args, **kwargs)
+
+    def plan(self, *args, **kwargs):
+        return self._in_pool(super().plan, *args, **kwargs)
+
+    def verify(self, *args, **kwargs):
+        return self._in_pool(super().verify, *args, **kwargs)

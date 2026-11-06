@@ -45,6 +45,7 @@ def register_product_commands(subparsers) -> None:
         if name != "product-validate":
             parser.add_argument("--store-dir", type=Path, default=Path(".factory-automation"))
             parser.add_argument("--env-file", type=Path, help="Explicit controller environment file outside target source")
+            parser.add_argument("--runner", choices=["docker", "railway"], default="docker")
         if name == "product-deliver":
             parser.add_argument("--task", type=Path, required=True)
             parser.add_argument("--publish", action="store_true", help="Publish a PR; the trusted profile controls automatic merge")
@@ -145,10 +146,19 @@ def handle_product_command(args, *, parse_env) -> int | None:
                           "builder_harness": resolve_harness(document, "builder"),
                           "reviewer_harness": resolve_harness(document, "verifier")}
             elif args.command == "product-replay":
-                result = run_suite(profile, args.target_root, args.store_dir, args.suite, repetitions=args.repetitions)
+                delivery_factory = ProductDelivery
+                if args.runner == "railway":
+                    from .railway_runner import RailwayDelivery
+                    delivery_factory = RailwayDelivery
+                result = run_suite(profile, args.target_root, args.store_dir, args.suite,
+                    repetitions=args.repetitions, delivery_factory=delivery_factory)
             else:
                 task = ProductTask.load(args.task, target_root=args.target_root)
-                delivery = ProductDelivery(profile, args.target_root, args.store_dir)
+                delivery_factory = ProductDelivery
+                if args.runner == "railway":
+                    from .railway_runner import RailwayDelivery
+                    delivery_factory = RailwayDelivery
+                delivery = delivery_factory(profile, args.target_root, args.store_dir)
                 def publish(candidate, journal):
                     return GitHubPromotion(profile, task, args.target_root, args.store_dir,
                         smoke=delivery.smoke, deadline=delivery.deadline)(candidate, journal)
