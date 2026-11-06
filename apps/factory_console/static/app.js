@@ -1,43 +1,370 @@
-import {api,escape as e,icon,badge,notify,route,relative,showDialog} from './core.js';
-import {inbox,workspaces,bindViews} from './views.js';
-import {board,runs,runDetail,settings,bindWorkViews} from './workviews.js';
-import {chat,bindChat} from './chat.js';
-let data=null, selectedWorkspace=null;
-export const refresh=async()=>{data=await api('/api/state');render();};
-const attention = () => data.items.filter(i=>i.attention_at&&!i.resolved);
+import {
+  api,
+  escape as e,
+  icon,
+  badge,
+  notify,
+  route,
+  relative,
+  showDialog,
+} from "./core.js";
+import { inbox, workspaces, bindViews } from "./views.js";
+import {
+  board,
+  runs,
+  runDetail,
+  settings,
+  bindWorkViews,
+} from "./workviews.js";
+import { chat, bindChat } from "./chat.js";
+let data = null;
+export const refresh = async () => {
+  const hash = location.hash;
+  const focused = document.activeElement;
+  const focusSelector = focused?.id
+    ? "#" + CSS.escape(focused.id)
+    : focused?.matches("[data-search]")
+      ? "[data-search]"
+      : null;
+  const selection =
+    focused && typeof focused.selectionStart === "number"
+      ? [focused.selectionStart, focused.selectionEnd]
+      : null;
+  const history = document.querySelector("#chat-history");
+  const scroll = history?.scrollTop;
+  const atBottom = history
+    ? history.scrollHeight - history.clientHeight - history.scrollTop < 50
+    : true;
+  data = await api("/api/state");
+  render();
+  if (location.hash === hash) {
+    if (focusSelector) {
+      const next = document.querySelector(focusSelector);
+      next?.focus({ preventScroll: true });
+      if (selection && next?.setSelectionRange)
+        next.setSelectionRange(...selection);
+    }
+    const nextHistory = document.querySelector("#chat-history");
+    if (nextHistory && !atBottom && scroll !== undefined)
+      nextHistory.scrollTop = scroll;
+  }
+};
+const attention = () => data.items.filter((i) => i.attention_at && !i.resolved);
 function render() {
- const r=route(), ws=r[0]==='workspace'?data.workspaces.find(w=>w.id===r[1]):null;
- selectedWorkspace=ws;
- const view=ws?(r[2] || 'chat'):(r[0] || 'inbox');
- const active=data.runs.filter(x=>!['complete','blocked'].includes(x.status)).length;
- const title=ws?ws.name:({inbox:'Inbox',workspaces:'Workspaces',runs:'Runs',chat:'Master chat'}[view]||'Factory');
- document.title=`${title} · Factory`;
- document.querySelector('#app').innerHTML=`<div class="app-shell"><aside class="sidebar" id="sidebar"><a class="brand" href="#/inbox"><img src="/assets/minds-icon.svg" alt="MindsHub" width="42" height="42"><span>MindsHub<small>FACTORY</small></span></a><div class="team-switch">${icon('layers')}<span>MindsHub team<small>Internal workspace</small></span></div><div class="nav-label">Master view</div><nav aria-label="Master navigation">${nav('inbox','Inbox','inbox',attention().length)}${nav('chat','Master chat','chat')}${nav('runs','All runs','runs',active)}${nav('workspaces','Workspaces','grid')}</nav><div class="workspace-label"><span class="nav-label">Workspaces</span><button class="icon-button" data-new-workspace aria-label="Add workspace">${icon('plus')}</button></div><nav aria-label="Workspaces">${data.workspaces.map(w=>`<a class="nav-link ${ws?.id===w.id?'active':''}" href="#/workspace/${e(w.id)}/chat"><span class="workspace-monogram">${e(w.name.slice(0,2).toUpperCase())}</span><span>${e(w.name)}</span></a>`).join('')}</nav><div class="sidebar-bottom"><div class="connection ${data.connection.connected?'live':''}"><span class="status-dot"></span><span>${data.connection.connected?'Factory connected':data.connection.stale?'Factory feed stale':'Awaiting Factory feed'}<small>${data.connection.observed_at?`Updated ${relative(data.connection.observed_at)}`:'Live state will appear here'}</small></span></div><div class="profile"><span class="avatar">M</span><span>MindsHub<small>Private preview</small></span><button class="icon-button" id="logout" aria-label="Leave preview">${icon('logout')}</button></div></div></aside><div class="main-shell"><header class="topbar"><button id="mobile-menu" class="icon-button" aria-label="Toggle navigation">${icon('menu')}</button><div class="breadcrumb">${ws?`<a href="#/workspaces">Workspaces</a><span>/</span><strong>${e(ws.name)}</strong>`:`<span>Factory</span><span>/</span><strong>${e(title)}</strong>`}</div><div class="topbar-end"><span class="preview-label">Internal preview</span>${data.connection.connected?badge(data.connection.controller.mode==='paused'?'ready':'building',data.connection.controller.mode==='paused'?'Factory paused':'Factory live'):badge('unknown','Feed not connected')}<button class="icon-button" id="refresh" aria-label="Refresh Factory state">${icon('refresh')}</button></div></header><main id="main"><div id="view"></div></main></div></div>`;
- if(ws) document.querySelector('#view').innerHTML=workspaceHeader(ws,view);
- const container=ws?document.querySelector('#workspace-view'):document.querySelector('#view');
- if(view==='inbox')container.innerHTML=inbox(data,ws);
- else if(view==='workspaces')container.innerHTML=workspaces(data);
- else if(view==='board'&&ws)container.innerHTML=board(data,ws);
- else if(view==='runs')container.innerHTML=runs(data,ws);
- else if(view==='run')container.innerHTML=runDetail(data,r[1]);
- else if(view==='settings'&&ws)container.innerHTML=settings(data,ws);
- else if(view==='chat')container.innerHTML=chat(data,ws);
- else container.innerHTML=`<div class="page-heading"><div><span class="eyebrow">${ws?'WORKSPACE':'MASTER VIEW'}</span><h1>${e(title)}</h1><p>Preparing the workspace view.</p></div></div>`;
- bindViews(data,ws,refresh);
- bindWorkViews(data,ws);
- bindChat(data,ws,refresh);
- document.querySelector('#refresh').onclick=()=>refresh().catch(err=>notify(err.message));
- document.querySelector('#logout').onclick=async()=>{await api('/api/logout',{});location.reload();};
- document.querySelector('#mobile-menu').onclick=()=>document.querySelector('#sidebar').classList.toggle('open');
- document.querySelectorAll('[data-new-workspace]').forEach(b=>b.onclick=()=>workspaceDialog());
- document.querySelectorAll('[data-new-work]').forEach(b=>b.onclick=()=>itemDialog(ws));
+  const r = route(),
+    ws =
+      r[0] === "workspace" ? data.workspaces.find((w) => w.id === r[1]) : null;
+  const view = ws ? r[2] || "chat" : r[0] || "inbox";
+  const active = data.runs.filter(
+    (x) => !["complete", "blocked"].includes(x.status),
+  ).length;
+  const title = ws
+    ? ws.name
+    : {
+        inbox: "Inbox",
+        workspaces: "Workspaces",
+        runs: "Runs",
+        chat: "Master chat",
+        run: "Run detail",
+      }[view] || "Factory";
+  document.title = `${title} · Factory`;
+  document.querySelector("#app").innerHTML = `<div class="app-shell">
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="#/inbox">
+<img src="/assets/minds-icon.svg" alt="MindsHub" width="42" height="42">
+<span>MindsHub<small>FACTORY</small>
+</span>
+</a>
+<div class="team-switch">${icon("layers")}<span>MindsHub team<small>Internal workspace</small>
+</span>
+</div>
+<div class="nav-label">Master view</div>
+<nav aria-label="Master navigation">${nav("inbox", "Inbox", "inbox", attention().length)}${nav("chat", "Master chat", "chat")}${nav("runs", "All runs", "runs", active)}${nav("workspaces", "Workspaces", "grid")}</nav>
+<div class="workspace-label">
+<span class="nav-label">Workspaces</span>
+<button class="icon-button" data-new-workspace aria-label="Add workspace">${icon("plus")}</button>
+</div>
+<nav aria-label="Workspaces">${data.workspaces
+    .map(
+      (
+        w,
+      ) => `<a class="nav-link ${ws?.id === w.id ? "active" : ""}" href="#/workspace/${e(w.id)}/chat">
+<span class="workspace-monogram">${e(w.name.slice(0, 2).toUpperCase())}</span>
+<span>${e(w.name)}</span>
+</a>`,
+    )
+    .join("")}</nav>
+<div class="sidebar-bottom">
+<div class="connection ${data.connection.connected ? "live" : ""}">
+<span class="status-dot">
+</span>
+<span>${data.connection.connected ? "Factory connected" : data.connection.stale ? "Factory feed stale" : "Awaiting Factory feed"}<small>${data.connection.observed_at ? `Updated ${relative(data.connection.observed_at)}` : "Live state will appear here"}</small>
+</span>
+</div>
+<div class="profile">
+<span class="avatar">M</span>
+<span>MindsHub<small>Private preview</small>
+</span>
+<button class="icon-button" id="logout" aria-label="Leave preview">${icon("logout")}</button>
+</div>
+</div>
+</aside>
+<div class="main-shell">
+<header class="topbar">
+<button id="mobile-menu" class="icon-button" aria-label="Toggle navigation">${icon("menu")}</button>
+<div class="breadcrumb">${
+    ws
+      ? `<a href="#/workspaces">Workspaces</a>
+<span>/</span>
+<strong>${e(ws.name)}</strong>`
+      : `<span>Factory</span>
+<span>/</span>
+<strong>${e(title)}</strong>`
+  }</div>
+<div class="topbar-end">
+<span class="preview-label">Internal preview</span>${data.connection.connected ? badge(data.connection.controller.mode === "paused" ? "ready" : "building", data.connection.controller.mode === "paused" ? "Intake paused" : "Feed current") : badge("unknown", "Feed not connected")}<button class="icon-button" id="refresh" aria-label="Refresh Factory state">${icon("refresh")}</button>
+</div>
+</header>
+<main id="main">
+<div id="view">
+</div>
+</main>
+</div>
+</div>`;
+  if (ws) document.querySelector("#view").innerHTML = workspaceHeader(ws, view);
+  const container = ws
+    ? document.querySelector("#workspace-view")
+    : document.querySelector("#view");
+  if (view === "inbox") container.innerHTML = inbox(data, ws);
+  else if (view === "workspaces") container.innerHTML = workspaces(data);
+  else if (view === "board" && ws) container.innerHTML = board(data, ws);
+  else if (view === "runs") container.innerHTML = runs(data, ws);
+  else if (view === "run") container.innerHTML = runDetail(data, r[1]);
+  else if (view === "settings" && ws) container.innerHTML = settings(data, ws);
+  else if (view === "chat") container.innerHTML = chat(data, ws);
+  else
+    container.innerHTML = `<div class="page-heading">
+<div>
+<span class="eyebrow">${ws ? "WORKSPACE" : "MASTER VIEW"}</span>
+<h1>${e(title)}</h1>
+<p>Preparing the workspace view.</p>
+</div>
+</div>`;
+  bindViews(data, ws, refresh);
+  bindWorkViews(data, ws);
+  bindChat(data, ws, refresh);
+  document.querySelector("#refresh").onclick = () =>
+    refresh().catch((err) => notify(err.message));
+  document.querySelector("#logout").onclick = async () => {
+    await api("/api/logout", {});
+    location.reload();
+  };
+  document.querySelector("#mobile-menu").onclick = () =>
+    document.querySelector("#sidebar").classList.toggle("open");
+  document
+    .querySelectorAll("[data-new-workspace]")
+    .forEach((b) => (b.onclick = () => workspaceDialog()));
+  document
+    .querySelectorAll("[data-new-work]")
+    .forEach((b) => (b.onclick = () => itemDialog(ws)));
 }
-function nav(path,label,name,count=0) {const current=route()[0]||'inbox';return `<a class="nav-link ${current===path?'active':''}" href="#/${path}">${icon(name)}<span>${label}</span>${count?`<span class="nav-count">${count}</span>`:''}</a>`;}
-function workspaceHeader(ws,view){return `<section class="workspace-heading"><div><span class="eyebrow">WORKSPACE</span><h1>${e(ws.name)}</h1><p>${e(ws.description)}</p></div><div class="workspace-repos">${icon('git')}<span>${ws.repositories.length} repositories</span></div></section><nav class="tabs" aria-label="Workspace views">${[['chat','Master chat'],['board','Board'],['inbox','Attention'],['runs','Runs'],['settings','Settings']].map(([v,l])=>`<a href="#/workspace/${e(ws.id)}/${v}" class="${v===view?'selected':''}">${l}</a>`).join('')}</nav><div id="workspace-view"></div>`;}
-export function workspaceDialog(ws=null){showDialog(`<form id="workspace-form"><div class="dialog-heading"><h2>${ws?'Workspace settings':'New workspace'}</h2><button type="button" class="icon-button" data-close aria-label="Close">${icon('close')}</button></div><label>Name<input name="name" required maxlength="100" value="${e(ws?.name||'')}" placeholder="e.g. MindsHub Cowork"></label><label>Description<textarea name="description" maxlength="1000" rows="2" placeholder="What are we building?">${e(ws?.description||'')}</textarea></label><label>Repositories<span class="field-note">One owner/repository per line. A workspace can span multiple repositories.</span><textarea name="repositories" required rows="3" placeholder="mindsdb/cowork&#10;mindsdb/cowork-server">${e(ws?.repositories.join('\n')||'')}</textarea></label><label>Default mode<select name="mode"><option value="engineering" ${ws?.mode==='engineering'?'selected':''}>Engineering</option><option value="non-coding" ${ws?.mode==='non-coding'?'selected':''}>Non-coding</option></select></label><div class="dialog-footer"><button type="button" class="button secondary" data-close>Cancel</button><button class="button primary">${ws?'Save changes':'Create workspace'}</button></div></form>`);document.querySelector('#workspace-form').onsubmit=async event=>{event.preventDefault();const b=Object.fromEntries(new FormData(event.target));b.repositories=b.repositories.split('\n').map(s=>s.trim()).filter(Boolean);try{const w=await api('/api/workspaces'+(ws?'/'+ws.id:''),b);document.querySelector('#dialog').close();await refresh();location.hash=`#/workspace/${w.id}/chat`;}catch(err){notify(err.message);}};document.querySelectorAll('#dialog [data-close]').forEach(b=>b.onclick=()=>document.querySelector('#dialog').close());}
-export function itemDialog(ws=null,item=null){showDialog(`<form id="item-form"><div class="dialog-heading"><h2>${item?'Edit work':'New work'}</h2><button type="button" class="icon-button" data-close aria-label="Close">${icon('close')}</button></div><label>Workspace<select name="workspace_id">${data.workspaces.map(w=>`<option value="${e(w.id)}" ${w.id===(item?.workspace_id||ws?.id)?'selected':''}>${e(w.name)}</option>`).join('')}</select></label><label>Title<input name="title" required maxlength="500" placeholder="What needs to be done?" value="${e(item?.title||'')}"></label><label>Brief<textarea name="description" rows="4" maxlength="8000" placeholder="Describe the outcome and what good looks like.">${e(item?.description||'')}</textarea></label><div class="form-row"><label>Priority<select name="priority">${['urgent','high','medium','low'].map(p=>`<option ${p===(item?.priority||'medium')?'selected':''}>${p}</option>`).join('')}</select></label><label>Mode<select name="mode"><option value="engineering">Engineering</option><option value="non-coding" ${item?.mode==='non-coding'?'selected':''}>Non-coding</option></select></label></div><label class="check-label"><input type="checkbox" name="needs_attention" ${item?.attention_at?'checked':''}>Needs my attention</label><p class="field-note">Saved to the backlog. Execution follows the workspace's delivery gates.</p><div class="dialog-footer"><button type="button" class="button secondary" data-close>Cancel</button><button class="button primary">${item?'Save changes':'Add to backlog'}</button></div></form>`);document.querySelector('#item-form').onsubmit=async event=>{event.preventDefault();const b={...item,...Object.fromEntries(new FormData(event.target))};b.needs_attention=event.target.elements.needs_attention.checked;try{await api('/api/items'+(item?'/'+item.id:''),b);document.querySelector('#dialog').close();await refresh();notify(item?'Work updated':'Added to backlog');}catch(err){notify(err.message);}};document.querySelectorAll('#dialog [data-close]').forEach(b=>b.onclick=()=>document.querySelector('#dialog').close());}
-async function access(){document.querySelector('#app').innerHTML=`<main class="access-screen"><div class="access-brand"><img src="/assets/minds-icon.svg" alt="MindsHub" width="72" height="72"><span>MindsHub Factory</span></div><form id="access-form"><span class="eyebrow">PRIVATE PREVIEW</span><h1>Your work, moving forward.</h1><p>Enter the preview code to open the team's Factory.</p><label>Preview code<input name="access_key" type="password" autocomplete="current-password" required></label><p id="access-error" role="alert"></p><button class="button primary">Open Factory ${icon('arrow')}</button><small>MindsHub sign-in is coming next.</small></form></main>`;document.querySelector('#access-form').onsubmit=async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('/api/access',Object.fromEntries(new FormData(event.target)));await refresh();}catch(err){document.querySelector('#access-error').textContent=err.message;button.disabled=false;}};}
-window.addEventListener('hashchange',()=>{if(data)render();});
-window.addEventListener('keydown',event=>{if(event.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)){event.preventDefault();document.querySelector('[data-search]')?.focus();}});
-try{const session=await api('/api/session');if(session.authenticated)await refresh();else await access();}catch(err){notify(err.message);await access();}
-setInterval(async()=>{if(data&&!document.querySelector('#dialog').open&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)){try{await refresh();}catch{document.querySelector('.connection')?.classList.remove('live');}}},10000);
+function nav(path, label, name, count = 0) {
+  const current = route()[0] === "run" ? "runs" : route()[0] || "inbox";
+  return `<a class="nav-link ${current === path ? "active" : ""}" href="#/${path}">${icon(name)}<span>${label}</span>${count ? `<span class="nav-count">${count}</span>` : ""}</a>`;
+}
+function workspaceHeader(ws, view) {
+  return `<section class="workspace-heading">
+<div>
+<span class="eyebrow">WORKSPACE</span>
+<h1>${e(ws.name)}</h1>
+<p>${e(ws.description)}</p>
+</div>
+<div class="workspace-repos">${icon("git")}<span>${ws.repositories.length} repositories</span>
+</div>
+</section>
+<nav class="tabs" aria-label="Workspace views">${[
+    ["chat", "Master chat"],
+    ["board", "Board"],
+    ["inbox", "Attention"],
+    ["runs", "Runs"],
+    ["settings", "Settings"],
+  ]
+    .map(
+      ([v, l]) =>
+        `<a href="#/workspace/${e(ws.id)}/${v}" class="${v === view ? "selected" : ""}">${l}</a>`,
+    )
+    .join("")}</nav>
+<div id="workspace-view">
+</div>`;
+}
+export function workspaceDialog(ws = null) {
+  showDialog(`<form id="workspace-form">
+<div class="dialog-heading">
+<h2>${ws ? "Workspace settings" : "New workspace"}</h2>
+<button type="button" class="icon-button" data-close aria-label="Close">${icon("close")}</button>
+</div>
+<label>Name<input name="name" required maxlength="100" value="${e(ws?.name || "")}" placeholder="e.g. MindsHub Cowork">
+</label>
+<label>Description<textarea name="description" maxlength="1000" rows="2" placeholder="What are we building?">${e(ws?.description || "")}</textarea>
+</label>
+<label>Repositories<span class="field-note">One owner/repository per line. A workspace can span multiple repositories.</span>
+<textarea name="repositories" required rows="3" placeholder="mindsdb/cowork&#10;mindsdb/cowork-server">${e(ws?.repositories.join("\n") || "")}</textarea>
+</label>
+<label>Default mode<select name="mode">
+<option value="engineering" ${ws?.mode === "engineering" ? "selected" : ""}>Engineering</option>
+<option value="non-coding" ${ws?.mode === "non-coding" ? "selected" : ""}>Non-coding</option>
+</select>
+</label>
+<div class="dialog-footer">
+<button type="button" class="button secondary" data-close>Cancel</button>
+<button class="button primary">${ws ? "Save changes" : "Create workspace"}</button>
+</div>
+</form>`);
+  document.querySelector("#workspace-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const b = Object.fromEntries(new FormData(event.target));
+    b.repositories = b.repositories
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    try {
+      const w = await api("/api/workspaces" + (ws ? "/" + ws.id : ""), b);
+      document.querySelector("#dialog").close();
+      await refresh();
+      location.hash = `#/workspace/${w.id}/chat`;
+    } catch (err) {
+      notify(err.message);
+    }
+  };
+  document
+    .querySelectorAll("#dialog [data-close]")
+    .forEach(
+      (b) => (b.onclick = () => document.querySelector("#dialog").close()),
+    );
+}
+export function itemDialog(ws = null, item = null) {
+  const initialWorkspace =
+    data.workspaces.find((w) => w.id === (item?.workspace_id || ws?.id)) ||
+    data.workspaces[0];
+  showDialog(`<form id="item-form">
+<div class="dialog-heading">
+<h2>${item ? "Edit work" : "New work"}</h2>
+<button type="button" class="icon-button" data-close aria-label="Close">${icon("close")}</button>
+</div>
+<label>Workspace<select name="workspace_id">${data.workspaces.map((w) => `<option value="${e(w.id)}" ${w.id === (item?.workspace_id || ws?.id) ? "selected" : ""}>${e(w.name)}</option>`).join("")}</select>
+</label>
+<label>Title<input name="title" required maxlength="500" placeholder="What needs to be done?" value="${e(item?.title || "")}">
+</label>
+<label>Brief<textarea name="description" rows="4" maxlength="8000" placeholder="Describe the outcome and what good looks like.">${e(item?.description || "")}</textarea>
+</label>
+<div class="form-row">
+<label>Priority<select name="priority">${["urgent", "high", "medium", "low"].map((p) => `<option ${p === (item?.priority || "medium") ? "selected" : ""}>${p}</option>`).join("")}</select>
+</label>
+<label>Mode<select name="mode">
+<option value="engineering">Engineering</option>
+<option value="non-coding" ${(item?.mode || initialWorkspace.mode) === "non-coding" ? "selected" : ""}>Non-coding</option>
+</select>
+</label>
+</div>
+<label class="check-label">
+<input type="checkbox" name="needs_attention" ${item?.attention_at && !item.resolved ? "checked" : ""}>Needs my attention</label>
+<p class="field-note">Saved to the backlog. Execution follows the workspace's delivery gates.</p>
+<div class="dialog-footer">
+<button type="button" class="button secondary" data-close>Cancel</button>
+<button class="button primary">${item ? "Save changes" : "Add to backlog"}</button>
+</div>
+</form>`);
+  if (!item)
+    document.querySelector("#item-form").elements.workspace_id.onchange = (
+      event,
+    ) => {
+      document.querySelector("#item-form").elements.mode.value =
+        data.workspaces.find((w) => w.id === event.target.value).mode;
+    };
+  document.querySelector("#item-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const b = { ...item, ...Object.fromEntries(new FormData(event.target)) };
+    b.needs_attention = event.target.elements.needs_attention.checked;
+    if (item?.attention_at) b.resolved = !b.needs_attention;
+    try {
+      await api("/api/items" + (item ? "/" + item.id : ""), b);
+      document.querySelector("#dialog").close();
+      await refresh();
+      notify(item ? "Work updated" : "Added to backlog");
+    } catch (err) {
+      notify(err.message);
+    }
+  };
+  document
+    .querySelectorAll("#dialog [data-close]")
+    .forEach(
+      (b) => (b.onclick = () => document.querySelector("#dialog").close()),
+    );
+}
+async function access() {
+  document.querySelector("#app").innerHTML = `<main class="access-screen">
+<div class="access-brand">
+<img src="/assets/minds-icon.svg" alt="MindsHub" width="72" height="72">
+<span>MindsHub Factory</span>
+</div>
+<form id="access-form">
+<span class="eyebrow">PRIVATE PREVIEW</span>
+<h1>Your work, moving forward.</h1>
+<p>Enter the preview code to open the team's Factory.</p>
+<label>Preview code<input name="access_key" type="password" autocomplete="current-password" required>
+</label>
+<p id="access-error" role="alert">
+</p>
+<button class="button primary">Open Factory ${icon("arrow")}</button>
+<small>MindsHub sign-in is coming next.</small>
+</form>
+</main>`;
+  document.querySelector("#access-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const button = event.target.querySelector("button");
+    button.disabled = true;
+    try {
+      await api("/api/access", Object.fromEntries(new FormData(event.target)));
+      await refresh();
+    } catch (err) {
+      document.querySelector("#access-error").textContent = err.message;
+      button.disabled = false;
+    }
+  };
+}
+window.addEventListener("hashchange", () => {
+  if (document.querySelector("#dialog").open)
+    document.querySelector("#dialog").close();
+  if (data) render();
+});
+window.addEventListener("keydown", (event) => {
+  if (
+    event.key === "/" &&
+    !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)
+  ) {
+    event.preventDefault();
+    document.querySelector("[data-search]")?.focus();
+  }
+});
+try {
+  const session = await api("/api/session");
+  if (session.authenticated) await refresh();
+  else await access();
+} catch (err) {
+  notify(err.message);
+  await access();
+}
+setInterval(async () => {
+  if (data && !document.querySelector("#dialog").open) {
+    try {
+      await refresh();
+    } catch {
+      const wasConnected = data.connection.connected;
+      data.connection.connected = false;
+      data.connection.stale = Boolean(data.connection.observed_at);
+      render();
+      if (wasConnected)
+        notify("Connection interrupted. Showing the last received state.");
+    }
+  }
+}, 10000);
