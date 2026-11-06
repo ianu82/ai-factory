@@ -13,7 +13,7 @@ from .automation import FactoryRunStore
 from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
 from .docker_runner import DockerSandbox, RunnerError
 from .intake import repo_root
-from .product_agent import ProductAgent, AgentSessionError, RoleSnapshotError, execution_role
+from .product_agent import ProductAgent, AgentSessionError, HarnessStopped, RoleSnapshotError, execution_role
 from .product_profile import ProductProfile
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
@@ -232,7 +232,7 @@ class ProductDelivery:
                             stage("verifying")
                             verification = self.verify(task, sha, base_sha, journal, prior_feedback=feedback)
                             journal.append("candidate_verified", attempt=attempt, **verification)
-                        except (DeliveryStageError, RoleSnapshotError):
+                        except (DeliveryStageError, RoleSnapshotError, HarnessStopped):
                             raise
                         except Exception as exc:
                             # No service secrets are sent to candidate commands; avoid storing provider error bodies.

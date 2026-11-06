@@ -7,7 +7,7 @@ import pytest
 from auto_mindsdb_factory import anton_session
 from auto_mindsdb_factory.anton_session import ANTON_COMMIT, AntonAgent, validate_anton_installation
 from auto_mindsdb_factory.connectors import OpenAIResponsesAgentConfig
-from auto_mindsdb_factory.product_agent import AgentSessionError
+from auto_mindsdb_factory.product_agent import AgentSessionError, HarnessStopped
 from auto_mindsdb_factory.product_roles import snapshot_roles
 from auto_mindsdb_factory.run_journal import RunJournal
 
@@ -97,3 +97,17 @@ def test_home_environment_overrides_fail_before_execution(monkeypatch):
     monkeypatch.setenv("ANTON_SETTINGS", "candidate-controlled")
     with pytest.raises(AgentSessionError, match="environment"):
         validate_anton_installation()
+
+
+def test_command_evidence_failure_cannot_repeat_execution(tmp_path, monkeypatch):
+    agent, journal, requests, transports, commands, command = harness(tmp_path, monkeypatch,
+        [("run", {"command": ["cat", "parser.py"]}), ("finish", REPORT)])
+    append = journal.append
+    def record(kind, **data):
+        if kind == "agent_command":
+            raise OSError("evidence unavailable")
+        return append(kind, **data)
+    monkeypatch.setattr(journal, "append", record)
+    with pytest.raises(HarnessStopped):
+        agent.run("builder", CONTEXT, command)
+    assert len(commands) == len(requests) == 1 and all(t.closed for t in transports)

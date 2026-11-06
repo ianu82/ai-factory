@@ -12,7 +12,7 @@ from uuid import uuid4
 from jsonschema import validate
 
 from .anton_inference import AntonInference, AntonStopped
-from .product_agent import AgentSessionError, ProductAgent, REPORT_SCHEMA, COMMAND_SCHEMA, TOOLS, execution_role
+from .product_agent import AgentSessionError, HarnessStopped, ProductAgent, REPORT_SCHEMA, COMMAND_SCHEMA, TOOLS, execution_role
 
 
 ANTON_COMMIT = "537cc1fb11849e9d152870738af22ca55c1d59d8"
@@ -48,8 +48,8 @@ class AntonAgent:
         validate_anton_installation()
         try:
             return asyncio.run(self._run(role, context, command, instructions))
-        except AntonStopped:
-            raise AgentSessionError("Anton execution stopped by Factory policy") from None
+        except (AntonStopped, TimeoutError, asyncio.CancelledError):
+            raise HarnessStopped("Anton execution stopped by Factory policy") from None
 
     async def _run(self, role, context, command, instructions):
         from anton.core.session import ChatSession, ChatSessionConfig
@@ -91,7 +91,7 @@ class AntonAgent:
             validate(arguments, COMMAND_SCHEMA)
             result = command(arguments["command"])
             investigated = True
-            self.journal.append("agent_command", role=role, **result)
+            gate.record("agent_command", role=role, **result)
             return json.dumps(result)
 
         async def finish_tool(session, arguments):
@@ -132,7 +132,7 @@ class AntonAgent:
                 await client.aclose()
                 raise
             try:
-                self.journal.append("harness_started", role=role, harness="anton", version=ANTON_COMMIT,
+                gate.record("harness_started", role=role, harness="anton", version=ANTON_COMMIT,
                     session_id=session._session_id, model=self.config.model, resume_supported=False)
                 async with asyncio.timeout(max(0, self.deadline - time.monotonic())):
                     try:
@@ -146,8 +146,11 @@ class AntonAgent:
                     except _ReportReady:
                         pass
             finally:
-                await session.close()
+                try:
+                    await session.close()
+                except BaseException:
+                    raise AntonStopped("Anton cleanup did not complete") from None
             if report is None:
                 raise AgentSessionError("Anton ended without a validated criterion report")
-            self.journal.append("agent_report", role=role, report=report)
+            gate.record("agent_report", role=role, report=report)
             return report

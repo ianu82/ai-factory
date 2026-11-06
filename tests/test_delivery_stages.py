@@ -73,6 +73,19 @@ def test_boundaries_and_retry_return_to_building(delivery, monkeypatch):
         "building", "verifying", "building", "verifying", "merging"]
 
 
+def test_harness_policy_stop_cannot_retry_or_promote(delivery):
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    instance, task, calls = delivery
+    def stop(*args):
+        raise HarnessStopped("cancelled")
+    instance.agent_factory = stop
+    with pytest.raises(HarnessStopped):
+        instance.run(task, base_sha="a" * 40, promote=lambda *args: pytest.fail("promoted"))
+    events = RunJournal(instance.store, task.document["id"]).events()
+    assert sum(e["kind"] == "attempt_started" for e in events) == 1
+    assert not calls and not any(e["kind"] == "candidate_created" for e in events)
+
+
 @pytest.mark.parametrize("failed_stage", ["building", "verifying", "merging"])
 def test_sync_failure_aborts_without_code_retry_or_publication(delivery, failed_stage):
     instance, task, calls = delivery

@@ -19,6 +19,10 @@ class AgentSessionError(RuntimeError):
     pass
 
 
+class HarnessStopped(AgentSessionError):
+    """An interruption or evidence fault must not start another implementation attempt."""
+
+
 class RoleSnapshotError(AgentSessionError):
     """Execution cannot proceed with missing or untrusted historical roles."""
 
