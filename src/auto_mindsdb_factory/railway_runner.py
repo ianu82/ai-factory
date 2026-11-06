@@ -13,27 +13,67 @@ import sys
 import threading
 from pathlib import Path
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from .docker_runner import RunnerError
 from .product_delivery import ProductDelivery
 from .source_transfer import pack_source, write_source
 
 
+# Keep constructor facts outside mutable exception state without retaining its
+# traceback after callers release it. This is controller-local provenance.
+_original_failure_facts = WeakKeyDictionary()
+
+
 class RailwayOperationError(RunnerError):
     def __init__(self, request, error_type):
-        phase = request.get("request", {}).get("action", request.get("action"))
-        self.phase = phase if phase in {"create", "destroy", "heartbeat", "upload", "download", "enter", "run", "exit"} else "unknown"
+        if type(self) is RailwayOperationError and self in _original_failure_facts:
+            raise TypeError("Railway failure facts are already initialized")
+        phase = None
+        if type(request) is dict and all(type(key) is str for key in request):
+            nested = request.get("request", {})
+            if type(nested) is dict and all(type(key) is str for key in nested):
+                phase = nested.get("action", request.get("action"))
+        self.phase = phase if type(phase) is str and phase in {"create", "destroy", "heartbeat", "upload", "download", "enter", "run", "exit"} else "unknown"
         known = {"RailwayError", "RailwayAuthError", "RailwayGraphQLError", "RailwayConnectionError",
             "ExecNotStartedError", "ExecControlUnsupportedError", "ExecInterruptedError", "StaleEnvironmentError",
             "SandboxNotFoundError", "SandboxFailedError", "SandboxTemplateBuildError", "SandboxFilesError",
             "SandboxFileNotFoundError", "SandboxTimeoutError", "RunnerError", "WorkspaceError", "Error",
             "ValueError", "KeyError", "TypeError", "RuntimeError", "OSError", "PermissionError", "FileNotFoundError",
             "TimeoutExpired", "InvalidJSON", "InvalidResponse", "BridgeProcessError"}
-        self.error_type = error_type if isinstance(error_type, str) and error_type in known else "UnknownError"
-        super().__init__(self.public_reason())
+        self.error_type = error_type if type(error_type) is str and error_type in known else "UnknownError"
+        reason = f"Railway {self.phase} failed ({self.error_type})"
+        super().__init__(reason)
+        if type(self) is RailwayOperationError:
+            _original_failure_facts[self] = (self.phase, self.error_type, reason)
 
     def public_reason(self):
-        return f"Railway {self.phase} failed ({self.error_type})"
+        phase, category = railway_failure_facts(self)
+        return f"Railway {phase} failed ({category})"
+
+
+def railway_failure_facts(error):
+    """Return original bounded facts only for an intact constructor-issued error.
+
+    Mutable copies, args and public formatting cannot attest to each other.
+    This does not provide a boundary against code executing in the controller.
+    """
+    unknown = ("unknown", "UnknownError")
+    if type(error) is not RailwayOperationError:
+        return unknown
+    original = _original_failure_facts.get(error)
+    if original is None:
+        return unknown
+    attrs, args = vars(error), error.args
+    if type(attrs) is not dict or any(type(key) is not str for key in attrs):
+        return unknown
+    values = (attrs.get("phase"), attrs.get("error_type"))
+    if (any(type(value) is not str for value in values) or type(args) is not tuple
+            or len(args) != 1 or type(args[0]) is not str):
+        return unknown
+    if values != original[:2] or args != (original[2],):
+        return unknown
+    return original[:2]
 
 
 def bridge(request):

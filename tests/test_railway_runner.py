@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from auto_mindsdb_factory.docker_runner import RunnerError
-from auto_mindsdb_factory.railway_runner import RailwayOperationError, RailwayPool, bridge
+from auto_mindsdb_factory.railway_runner import RailwayOperationError, RailwayPool, bridge, railway_failure_facts
 from auto_mindsdb_factory.source_transfer import pack_source
 
 
@@ -196,6 +196,7 @@ def test_bridge_retains_only_approved_error_classification(monkeypatch, payload,
     with pytest.raises(RailwayOperationError) as failure:
         bridge({"action": "request", "request": {"action": "run"}})
     assert failure.value.public_reason() == f"Railway run failed ({expected})"
+    assert railway_failure_facts(failure.value) == ("run", expected)
     assert "provider-private-body" not in str(failure.value)
 
 
@@ -218,3 +219,97 @@ def test_original_transport_error_survives_context_and_cleanup_failures(tmp_path
     finally:
         pool.close()
     assert "private cleanup response" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("action", ["create", "destroy", "heartbeat", "upload", "download", "enter", "run", "exit"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_original_runner_facts_bind_each_operation(action, nested):
+    operation = {"action": action}
+    error = RailwayOperationError({"request": operation} if nested else operation, "OSError")
+    assert railway_failure_facts(error) == (action, "OSError")
+    assert error.args == (f"Railway {action} failed (OSError)",)
+    assert error.public_reason() == error.args[0]
+
+
+class HostileFact(str):
+    def __eq__(self, other):
+        raise AssertionError("untrusted equality executed")
+
+    def __str__(self):
+        raise AssertionError("untrusted formatting executed")
+
+
+class HostileMapping(dict):
+    def get(self, *args):
+        raise AssertionError("untrusted mapping executed")
+
+
+@pytest.mark.parametrize("payload", [None, [], "https://private-token", {"request": None},
+    HostileMapping(action="run"), {"request": HostileMapping(action="run")},
+    {"action": []}, {"action": HostileFact("run")}, {"request": {"action": "https://private-token"}}])
+def test_malformed_request_does_not_format_or_trust_unbounded_facts(payload):
+    error = RailwayOperationError(payload, HostileFact("OSError"))
+    assert railway_failure_facts(error) == ("unknown", "UnknownError")
+    assert error.public_reason() == "Railway unknown failed (UnknownError)"
+    assert "private-token" not in str(error)
+
+
+@pytest.mark.parametrize("category", [None, [], "https://private-token", HostileFact("OSError")])
+def test_untrusted_categories_cannot_escape_constructor_allowlist(category):
+    error = RailwayOperationError({"action": "run"}, category)
+    assert railway_failure_facts(error) == ("run", "UnknownError")
+    assert error.public_reason() == "Railway run failed (UnknownError)"
+
+
+@pytest.mark.parametrize("changes", [
+    {"phase": "exit"}, {"error_type": "OSError"}, {"args": ("private-token",)},
+    {"phase": "exit", "error_type": "OSError", "args": ("Railway exit failed (OSError)",)},
+    {"phase": "https://private-token"}, {"error_type": HostileFact("ExecInterruptedError")},
+    {"phase": None}, {"args": (HostileFact("Railway run failed (ExecInterruptedError)"),)},
+    {"args": ()}, {"args": ("one", "two")},
+])
+def test_mutated_runner_facts_fail_closed_even_when_copies_agree(changes):
+    error = RailwayOperationError({"action": "run"}, "ExecInterruptedError")
+    for name, value in changes.items():
+        object.__setattr__(error, name, value)
+    # Adding another alleged original to the error cannot replace the witness.
+    error.__dict__["_original_failure_facts"] = (error.phase, error.error_type)
+    assert railway_failure_facts(error) == ("unknown", "UnknownError")
+    assert error.public_reason() == "Railway unknown failed (UnknownError)"
+
+
+def test_missing_or_forged_runner_state_is_not_constructor_provenance():
+    error = RailwayOperationError.__new__(RailwayOperationError)
+    error.phase, error.error_type = "run", "OSError"
+    error.args = ("Railway run failed (OSError)",)
+    assert railway_failure_facts(error) == ("unknown", "UnknownError")
+    class DerivedError(RailwayOperationError):
+        pass
+    assert railway_failure_facts(DerivedError({"action": "run"}, "OSError")) == ("unknown", "UnknownError")
+    issued = RailwayOperationError({"action": "run"}, "OSError")
+    issued.__dict__.clear()
+    assert railway_failure_facts(issued) == ("unknown", "UnknownError")
+    issued.__dict__ = HostileMapping(phase="run", error_type="OSError")
+    assert railway_failure_facts(issued) == ("unknown", "UnknownError")
+
+
+def test_reinitialization_cannot_replace_original_runner_facts():
+    error = RailwayOperationError({"action": "run"}, "ExecInterruptedError")
+    with pytest.raises(TypeError, match="already initialized"):
+        error.__init__({"action": "exit"}, "OSError")
+    assert railway_failure_facts(error) == ("run", "ExecInterruptedError")
+
+
+def test_constructor_witness_does_not_retain_exception_or_traceback():
+    import gc
+    import weakref
+    def raised_error():
+        try:
+            raise RailwayOperationError({"action": "run"}, "OSError")
+        except RailwayOperationError as error:
+            assert error.__traceback__ is not None
+            assert railway_failure_facts(error) == ("run", "OSError")
+            return weakref.ref(error)
+    reference = raised_error()
+    gc.collect()
+    assert reference() is None
