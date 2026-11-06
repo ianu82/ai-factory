@@ -1,6 +1,7 @@
 import {api,escape as e,icon,badge,notify,route,relative,showDialog} from './core.js';
 import {inbox,workspaces,bindViews} from './views.js';
 import {board,runs,runDetail,settings,bindWorkViews} from './workviews.js';
+import {chat,bindChat} from './chat.js';
 let data=null, selectedWorkspace=null;
 export const refresh=async()=>{data=await api('/api/state');render();};
 const attention = () => data.items.filter(i=>i.attention_at&&!i.resolved);
@@ -20,9 +21,11 @@ function render() {
  else if(view==='runs')container.innerHTML=runs(data,ws);
  else if(view==='run')container.innerHTML=runDetail(data,r[1]);
  else if(view==='settings'&&ws)container.innerHTML=settings(data,ws);
+ else if(view==='chat')container.innerHTML=chat(data,ws);
  else container.innerHTML=`<div class="page-heading"><div><span class="eyebrow">${ws?'WORKSPACE':'MASTER VIEW'}</span><h1>${e(title)}</h1><p>Preparing the workspace view.</p></div></div>`;
  bindViews(data,ws,refresh);
  bindWorkViews(data,ws);
+ bindChat(data,ws,refresh);
  document.querySelector('#refresh').onclick=()=>refresh().catch(err=>notify(err.message));
  document.querySelector('#logout').onclick=async()=>{await api('/api/logout',{});location.reload();};
  document.querySelector('#mobile-menu').onclick=()=>document.querySelector('#sidebar').classList.toggle('open');
