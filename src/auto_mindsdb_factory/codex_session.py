@@ -12,10 +12,11 @@ import time
 from uuid import uuid4
 
 from .codex_inference import CodexInference, CodexStopped
-from .codex_process import open_codex_process
+from .codex_process import CODEX_VERSION, open_codex_process
 from .codex_proxy import open_codex_proxy
 from .codex_rpc import codex_turn
 from .product_agent import AgentSessionError, HarnessStopped, ProductAgent, execution_role
+from .product_execution import require_codex_execution
 
 
 def validate_codex_dependencies():
@@ -57,6 +58,7 @@ class CodexAgent:
 
     def run(self, role, context, command):
         instructions = execution_role(self.journal, role)["instructions"]
+        require_codex_execution(self.config, role, self.journal)
         if not callable(getattr(command, "abort", None)):
             raise AgentSessionError("Codex requires an abortable owned job command")
         try:
@@ -109,7 +111,7 @@ class CodexAgent:
             # Exit the proxy (draining provider work) BEFORE waiting for the process.
             async with open_codex_proxy(gate, client) as proxy:
                 owner = ownership.enter_context(open_codex_process(proxy.base_url, proxy_token=proxy.token, deadline=gate.deadline))
-                gate.record("harness_started", version="0.167.0", session_id=identity,
+                gate.record("harness_started", version=CODEX_VERSION, session_id=identity,
                     model=self.config.model, resume_supported=False)
                 async with asyncio.timeout(max(0, gate.deadline - time.monotonic())):
                     report = await codex_turn(owner, gate, instructions=instructions, context=context, command=run_command)

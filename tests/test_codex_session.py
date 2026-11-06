@@ -14,6 +14,7 @@ from auto_mindsdb_factory import codex_session
 from auto_mindsdb_factory.product_agent import AgentSessionError, HarnessStopped
 from auto_mindsdb_factory.connectors import OpenAIResponsesAgentConfig
 from auto_mindsdb_factory.product_roles import snapshot_roles
+from auto_mindsdb_factory.product_execution import codex_execution_snapshot
 from auto_mindsdb_factory.run_journal import RunJournal
 
 
@@ -30,7 +31,8 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     aborted = threading.Event()
     config = OpenAIResponsesAgentConfig(api_key="controller-test-only", reasoning_effort="high", max_output_tokens=10000)
     frozen_model, role = config.model, "builder" if mode == "builder" else "verifier"
-    journal = RunJournal(tmp_path, "session"); journal.create({"role_snapshots": snapshot_roles()})
+    journal = RunJournal(tmp_path, "session"); journal.create({"role_snapshots": snapshot_roles(),
+        "execution_snapshots": {role: codex_execution_snapshot(config) for role in ("builder", "verifier")}})
     report = {"status": "passed", "summary": "Checked", "findings": [],
               "criteria": [{"id": "a", "status": "passed", "evidence": "Executed the job"}]}
     if mode == "missing": report["criteria"] = []
@@ -92,8 +94,9 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
 
 
 def test_unsupported_command_and_dependency_drift_fail_before_start(tmp_path, monkeypatch):
-    journal = RunJournal(tmp_path, "preflight"); journal.create({"role_snapshots": snapshot_roles()})
     config = OpenAIResponsesAgentConfig(api_key="test")
+    journal = RunJournal(tmp_path, "preflight"); journal.create({"role_snapshots": snapshot_roles(),
+        "execution_snapshots": {"builder": codex_execution_snapshot(config)}})
     agent = codex_session.CodexAgent(config, journal, max_turns=3, max_total_tokens=500, deadline=time.monotonic()+5)
     with pytest.raises(AgentSessionError, match="abortable"): agent.run("builder", {}, lambda args: {})
     class Command:

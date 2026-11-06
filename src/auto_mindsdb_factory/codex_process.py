@@ -19,6 +19,9 @@ class CodexProcessError(RuntimeError):
     pass
 
 
+CODEX_VERSION = "0.167.0"
+
+
 _FEATURES = ("shell_tool", "apps", "plugins", "memories", "goals", "multi_agent", "hooks", "remote_plugin",
              "view_image", "sleep_tool", "browser_use", "computer_use", "daemon_auto_start")
 
@@ -108,7 +111,7 @@ def open_codex_process(provider_url, *, deadline, binary=None, proxy_token=None)
                 output, _ = version.communicate(timeout=max(0, min(10, deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
                 raise CodexProcessError("Codex version check timed out") from None
-            if version.returncode != 0 or output.strip() != "codex-cli 0.167.0":
+            if version.returncode != 0 or output.strip() != "codex-cli " + CODEX_VERSION:
                 raise CodexProcessError("Codex installation differs from the pinned version")
         config = {"model_provider": "factory_guarded", "web_search": "disabled", "agents.enabled": False,
                   "skills.bundled.enabled": False, "analytics.enabled": False, "feedback.enabled": False,

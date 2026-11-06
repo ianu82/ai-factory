@@ -111,5 +111,12 @@ Delivery supplies an abortable command callback to each role. Its abort signal
 latches a local stop; the existing job-command watcher remains the sole owner of
 sandbox retirement. Repeated signals cannot issue duplicate retirement calls.
 
+`codex_execution_snapshot` binds the exact CLI version, both installation locks,
+model, effort, output/timeout limits and provider configuration without credentials.
+CodexAgent requires an exact retained receipt before resources or inference;
+missing, changed or ambiguous JSON fails closed. This receipt supports truthful
+qualification manifests. It does not enable the public selection or replace
+the delivery's frozen plan, role, source, profile and environment checks.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
