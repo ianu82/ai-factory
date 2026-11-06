@@ -65,3 +65,19 @@ by returning them to Ready or dispatching them again.
 The deployed profile pins GPT-6.1-terra for builder and reviewer, limits PRs to 300
 changed lines, protects deployment/credentials/dependencies, and requires both
 `validate` and `sandbox` CI plus fresh post-merge smoke before reporting completion.
+
+The Linux amd64 job setup also installs uv 0.12.5 from its hash-pinned binary
+wheel. Regression and smoke commands require that exact version and add the job's
+`.venv/bin` to PATH before pytest. This runs the invalid-dependency-lock regression
+inside source exports; missing uv must fail the command rather than skip coverage.
+For an independent manual run, use the trusted profile's regression command so
+the same capability check and PATH apply. Git metadata and Docker integration
+limitations still require the separate exact-commit CI gates.
+
+Existing volume profiles are not updated by a code release. Apply this setup
+change only while intake is paused and all deliveries and reporting are idle.
+Retain the old profile and activation, copy only the reviewed setup and regression
+command changes, validate the new profile with the unchanged route, and write a
+fresh activation for their exact fingerprints. Verify a source-export run executes
+the invalid-lock test without a skip before accepting another task. Old claims
+keep their original profile fingerprints and must not be replayed.
