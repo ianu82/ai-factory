@@ -44,5 +44,11 @@ context without changing it and supplies a missing output cap from the caller's
 trusted limit and remaining aggregate tokens; a smaller explicit cap is preserved.
 The caller still owns complete usage accounting, admission, deadlines and cleanup.
 
+`codex_inference.CodexInference` admits and journals each controller-side request,
+disables SDK retries, preserves unknown usage/cost, enforces aggregate tokens and
+request/deadline/cancellation limits, and drains an interrupted request. It buffers
+the provider response before returning validated SSE. The session must still own
+and close the client and credential-free app-server; no backend is enabled here.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
