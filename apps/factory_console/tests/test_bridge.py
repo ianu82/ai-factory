@@ -47,3 +47,41 @@ def test_publisher_is_https_projection_only_and_never_returns_provider_errors():
     assert calls==['https://console.example/bridge/snapshot']
     for endpoint in ['http://console.example','https://user:password@console.example','https://console.example?token=x']:
         with pytest.raises(ValueError):publish(endpoint,'ui-only-token',{},opener=opener)
+
+
+@pytest.mark.parametrize('code',[302,303])
+def test_redirect_cannot_forward_token_or_projection_to_another_https_origin(code):
+    from email.message import Message
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from urllib.request import HTTPSHandler, build_opener
+    from urllib.response import addinfourl
+    from apps.factory_console.bridge import NoRedirect
+    calls=[]
+    class Network(HTTPSHandler):
+        def https_open(self,request):
+            calls.append((request.full_url,request.headers.get('Authorization'),request.data))
+            headers=Message();headers['Location']='https://another.example/steal'
+            response=addinfourl(BytesIO(b''),headers,request.full_url,code)
+            response.msg='Redirect'
+            return response
+    with pytest.raises(HTTPError):
+        publish('https://console.example','private-ui-token',{'private':'projection'},
+                opener=build_opener(NoRedirect(),Network()).open)
+    assert len(calls)==1 and calls[0][0]=='https://console.example/bridge/snapshot'
+    assert not any('another.example' in url for url,_,_ in calls)
+
+
+@pytest.mark.parametrize('exit_code,expected',[(0,'passed'),(1,'failed'),(False,'unverified'),(None,'unverified'),('0','unverified')])
+def test_check_outcomes_require_exact_integer_evidence(tmp_path,exit_code,expected):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    from datetime import datetime,timezone
+    store=tmp_path/'evidence'
+    journal=RunJournal(store,'checks')
+    journal.create({'task':{'title':'Check provenance'},'profile':{'repository':'owner/repo'}})
+    journal.append('verification_check',name='unit',exit_code=exit_code,stdout='not projected')
+    publisher=Publisher([store],tmp_path/'absent-status')
+    before={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in journal.root.iterdir()}
+    run=publisher.snapshot()['runs'][0]
+    assert run['checks'][0]['status']==expected
+    assert before=={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in journal.root.iterdir()}

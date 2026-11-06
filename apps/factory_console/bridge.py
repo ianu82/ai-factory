@@ -6,7 +6,8 @@ from pathlib import Path
 import sys
 import time
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -24,6 +25,11 @@ STAGES = {'base_resolved':'planning','plan_frozen':'planning','attempt_started':
     'candidate_created':'verifying','verification_check':'verifying','candidate_verified':'verifying',
     'publication_requested':'ci','pull_request_published':'ci','github_checks_passed':'ci',
     'promotion_requested':'ci','merge_confirmed':'smoking','post_merge_smoke':'smoking'}
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        raise HTTPError(request.full_url, code, 'Console redirects are refused', headers, response)
 
 
 class Publisher:
@@ -60,7 +66,8 @@ class Publisher:
             if kind=='run_finished':terminal=event
             status = 'passed'
             if kind in {'verification_check','post_merge_smoke'}:
-                status = 'passed' if data.get('exit_code')==0 else 'failed'
+                result = data.get('exit_code')
+                status = ('passed' if result==0 else 'failed') if type(result) is int else 'unverified'
                 checks.append({'name':data.get('name') if kind=='verification_check' else 'Smoke '+str(data.get('index')),
                                'status':status,'at':at})
             if kind=='plan_frozen':status='passed' if data.get('status')=='ready' else 'unverified'
@@ -69,7 +76,7 @@ class Publisher:
                 timeline.append({'kind':kind,'label':LABELS[kind],'at':at,'status':status})
         status = {'complete':'complete','blocked':'blocked','verified':'review','pr_ready':'review'}.get(
             terminal['data'].get('status'),'unknown') if terminal else stage
-        reason = ('Delivery recorded complete after its required gates.' if status=='complete' else
+        reason = ('Controller recorded complete; inspect retained verification and delivery evidence.' if status=='complete' else
                   'The run ended blocked during '+stage+'. Its original evidence is retained.' if status=='blocked' else
                   'The candidate is ready for review; complete delivery is not yet recorded.' if status=='review' else
                   'No terminal outcome has been recorded. Activity does not establish process liveness.')
@@ -111,10 +118,12 @@ class Publisher:
             'runtime_sha':self.runtime_sha,'chat_available':False,'unreadable_runs':unavailable},'runs':runs})
 
 
-def publish(endpoint, token, document, *, opener=urlopen):
+def publish(endpoint, token, document, *, opener=None):
     parsed=urlsplit(endpoint)
-    if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+    if (parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.path not in {'','/'}):
         raise ValueError('Use the exact HTTPS console origin')
+    opener = opener or build_opener(NoRedirect()).open
     request=Request(endpoint.rstrip('/')+'/bridge/snapshot',data=json.dumps(document,allow_nan=False).encode(),
                     headers={'Content-Type':'application/json','Authorization':'Bearer '+token},method='POST')
     with opener(request,timeout=10) as response:
