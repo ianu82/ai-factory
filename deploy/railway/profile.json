@@ -26,7 +26,7 @@
     "regressions": [
       ".venv/bin/python",
       "-c",
-      "import os, subprocess\nfrom pathlib import Path\nif subprocess.check_output(['.venv/bin/uv', '--version'], text=True).strip() != 'uv 0.12.5':\n    raise RuntimeError('Expected pinned uv 0.12.5')\nos.environ['PATH'] = str(Path('.venv/bin').absolute()) + os.pathsep + os.environ.get('PATH', os.defpath)\nos.execv('.venv/bin/python', ['.venv/bin/python', '-m', 'pytest', '-p', 'no:cacheprovider'])\n"
+      "import os, subprocess\nfrom pathlib import Path\nif subprocess.check_output(['.venv/bin/uv', '--version'], text=True).split()[:2] != ['uv', '0.12.5']:\n    raise RuntimeError('Expected pinned uv 0.12.5')\nos.environ['PATH'] = str(Path('.venv/bin').absolute()) + os.pathsep + os.environ.get('PATH', os.defpath)\nos.execv('.venv/bin/python', ['.venv/bin/python', '-m', 'pytest', '-p', 'no:cacheprovider'])\n"
     ],
     "contracts": [
       ".venv/bin/python",
@@ -37,7 +37,7 @@
     [
       ".venv/bin/python",
       "-c",
-      "import os, subprocess\nfrom pathlib import Path\nif subprocess.check_output(['.venv/bin/uv', '--version'], text=True).strip() != 'uv 0.12.5':\n    raise RuntimeError('Expected pinned uv 0.12.5')\nos.environ['PATH'] = str(Path('.venv/bin').absolute()) + os.pathsep + os.environ.get('PATH', os.defpath)\nos.execv('.venv/bin/python', ['.venv/bin/python', '-m', 'pytest', '-p', 'no:cacheprovider'])\n"
+      "import os, subprocess\nfrom pathlib import Path\nif subprocess.check_output(['.venv/bin/uv', '--version'], text=True).split()[:2] != ['uv', '0.12.5']:\n    raise RuntimeError('Expected pinned uv 0.12.5')\nos.environ['PATH'] = str(Path('.venv/bin').absolute()) + os.pathsep + os.environ.get('PATH', os.defpath)\nos.execv('.venv/bin/python', ['.venv/bin/python', '-m', 'pytest', '-p', 'no:cacheprovider'])\n"
     ],
     [
       ".venv/bin/python",

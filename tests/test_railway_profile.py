@@ -9,8 +9,11 @@ import pytest
 
 
 @pytest.mark.parametrize("optimize", ["", "1"])
-@pytest.mark.parametrize("version", [None, "uv 0.12.4", "uv 0.12.5"])
-def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, optimize):
+@pytest.mark.parametrize("version, expected", [
+    (None, False), ("uv 0.12.4", False), ("uv 0.12.50", False),
+    ("uv 0.12.5", True), ("uv 0.12.5 (x86_64-unknown-linux-gnu)", True),
+])
+def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, expected, optimize):
     profile = json.loads((Path(__file__).parents[1] / "deploy/railway/profile.json").read_text())
     command = profile["checks"]["regressions"]
     assert command == profile["smoke"][0]
@@ -30,5 +33,5 @@ def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, 
     )
     result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True,
                             env={**os.environ, "PYTHONPATH": str(tmp_path), "PYTHONOPTIMIZE": optimize})
-    assert marker.exists() == (version == "uv 0.12.5")
-    assert (result.returncode == 0) == (version == "uv 0.12.5")
+    assert marker.exists() == expected
+    assert (result.returncode == 0) == expected
