@@ -144,7 +144,7 @@ p {
   gap: 7px;
   padding: 0 8px 30px;
 }
-.sidebar-close,
+.sidebar .sidebar-close,
 .nav-scrim {
   display: none;
 }
@@ -916,7 +916,7 @@ textarea {
     transform: none;
     visibility: visible;
   }
-  .sidebar-close {
+  .sidebar .sidebar-close {
     display: inline-flex;
     position: absolute;
     right: 7px;
