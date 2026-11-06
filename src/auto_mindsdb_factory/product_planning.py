@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
+from .docker_runner import RunnerError
 from .product_agent import HarnessStopped
 from .product_plan import ProductPlan, freeze_plan, read_plan
 from .product_planner import ProductPlanner
@@ -87,7 +88,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         freeze_plan(journal, plan, task=task, base_sha=base, profile_sha=delivery.profile.digest)
         journal.append("plan_frozen", digest=plan.digest, status=content["status"])
         return retained_plan(delivery, task, base, journal)
-    except PlanningStopped:
+    except (PlanningStopped, RunnerError):
         raise
     except Exception:
         raise PlanningStopped("Planning failed; implementation is not authorized") from None
