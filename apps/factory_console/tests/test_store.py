@@ -41,6 +41,8 @@ def test_bridge_cache_rejects_old_observations_and_marks_stale(tmp_path):
 
 def test_chat_claim_is_exclusive_and_history_is_workspace_scoped(tmp_path):
     store = Store(tmp_path/'console.db')
+    store.ingest({'version':1,'observed_at':datetime.now(timezone.utc).isoformat(),
+        'controller':{'mode':'paused','chat_available':True},'runs':[]})
     other = store.workspace({'name':'Other','repositories':['owner/other']})
     message = store.message('factory','Summarise the current blockers')
     store.message(other['id'],'Private other context')
