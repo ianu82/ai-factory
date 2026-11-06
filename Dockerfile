@@ -16,6 +16,7 @@ RUN test -n "$RAILWAY_GIT_COMMIT_SHA" \
     && git diff --exit-code HEAD -- . \
     && git config --system --add safe.directory /app \
     && uv sync --locked --no-install-project \
+    && .venv/bin/python scripts/install_anton.py .venv/bin/python \
     && node /opt/npm/bin/npm-cli.js ci --prefix src/auto_mindsdb_factory/railway_bridge --ignore-scripts --no-audit --no-fund
 ENV PATH="/app/.venv/bin:${PATH}" PYTHONPATH=/app/src HOME=/home/factory PYTHONUNBUFFERED=1
 # Root only initializes ownership of the newly mounted volume. start.py drops to

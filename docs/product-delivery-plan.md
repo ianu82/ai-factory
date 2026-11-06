@@ -50,6 +50,11 @@ It exposes only isolated `run` and validated `finish`; native scratchpads, web,
 memory, personal settings and telemetry are disabled.
 Every provider call, including SDK helpers, passes shared accounting and admission.
 Active request cancellation closes transport. Selection awaits runtime and delivery qualification; SDK skips are not evidence.
+The controller build installs the exact binary dependency hashes in
+`anton_requirements.txt`, then builds only the pinned SDK commit without resolving
+dependencies. Runtime validation rejects changed package versions. The dedicated
+`anton` CI job installs that same environment and imports the SDK before testing.
+Candidate setup and credential isolation remain separate from this controller SDK.
 
 ## Supported product workflow
 

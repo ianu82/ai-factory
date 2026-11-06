@@ -27,6 +27,11 @@ def validate_anton_installation():
                 or metadata.get("url", "").removesuffix(".git") != "https://github.com/mindsdb/anton"
                 or metadata.get("vcs_info", {}).get("commit_id") != ANTON_COMMIT):
             raise ValueError("unreviewed installation")
+        for line in Path(__file__).with_name("anton_requirements.txt").read_text().splitlines():
+            if line and not line.startswith("#"):
+                name, version = line.split()[0].split("==")
+                if distribution(name).version != version:
+                    raise ValueError("unreviewed dependency version")
     except (ValueError, TypeError, OSError, LookupError, ImportError, AttributeError):
         raise AgentSessionError("Anton requires the reviewed pinned SDK installation") from None
 
