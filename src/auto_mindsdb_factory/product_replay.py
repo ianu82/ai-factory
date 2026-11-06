@@ -16,6 +16,7 @@ from .product_delivery import ProductDelivery, VerificationFailed
 from .product_agent import RoleSnapshotError
 from .product_profile import ProductProfile
 from .product_planning import planning_manifest
+from .product_execution import execution_manifest
 from .product_roles import snapshot_roles
 from .product_task import ProductTask, TASK_SCHEMA
 from .reliability import OperationTracker, write_json_atomic
@@ -80,7 +81,7 @@ def run_suite(profile: ProductProfile, target: Path, store: Path, suite_path: Pa
                         journal.create({"purpose": "replay", "replay": metadata, "profile": profile.document,
                             "profile_sha": profile.digest, "task": task.document, "base_sha": case["base_sha"],
                             "candidate_sha": case["candidate_sha"], "role_snapshots": snapshot_roles(),
-                            **planning_manifest(profile)})
+                            **planning_manifest(profile), **execution_manifest(profile.document)})
                         with OperationTracker(store, run_id, "delivery", "replay-verification"):
                             try:
                                 journal.append("base_resolved", commit_sha=case["base_sha"])

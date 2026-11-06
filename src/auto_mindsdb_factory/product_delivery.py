@@ -18,6 +18,7 @@ from .product_profile import ProductProfile
 from .product_planning import planning_manifest, plan_delivery, retained_plan
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
+from .product_execution import execution_manifest, execution_config
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
@@ -74,12 +75,15 @@ class ProductDelivery:
         return plan_delivery(self, task, base, journal, planner_factory=self.planner_factory)
 
     def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
-        resolve_harness(self.settings, role)
-        model_key = {"builder": "builder_model", "verifier": "reviewer_model"}[role]
-        config = OpenAIResponsesAgentConfig.from_env(model=self.settings[model_key],
-            max_output_tokens=self.settings["agent_max_output_tokens"])
-        if config.fallback_model:
-            raise DeliveryError("Product delivery requires pinned role models; fallback routing is not enabled")
+        name = resolve_harness(self.settings, role)
+        config = execution_config(self.settings, role, journal)
+        if name == "anton":
+            from .anton_session import AntonAgent
+            config.validated()
+            agent = AntonAgent(config, journal,
+                max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
+                deadline=self.deadline, pricing=self.settings["pricing"])
+            return agent
         return ProductAgent(OpenAIResponsesAgentConnector(config), journal,
             max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
             deadline=self.deadline, pricing=self.settings["pricing"])
@@ -198,6 +202,7 @@ class ProductDelivery:
                             "task": task.document, "base_sha": base_sha, "profile": self.settings,
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
                             "role_snapshots": snapshot_roles(), **planning_manifest(self.profile),
+                            **execution_manifest(self.settings),
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
                 feedback = ""

@@ -52,12 +52,17 @@ The embedded Anton SDK checks VCS provenance at `537cc1fb11849e9d152870738af22ca
 It exposes only isolated `run` and validated `finish`; native scratchpads, web,
 memory, personal settings and telemetry are disabled.
 Every provider call, including SDK helpers, passes shared accounting and admission.
-Active request cancellation closes transport. Selection awaits runtime and delivery qualification; SDK skips are not evidence.
+Active request cancellation closes transport. SDK skips are not evidence.
 The controller build installs the exact binary dependency hashes in
 `anton_requirements.txt`, then builds only the pinned SDK commit without resolving
 dependencies. Runtime validation rejects changed package versions. The dedicated
 `anton` CI job installs that same environment and imports the SDK before testing.
 Candidate setup and credential isolation remain separate from this controller SDK.
+Trusted profiles may select `anton` independently for builder and reviewer;
+omitted selections keep native execution. Each new manifest freezes all three
+roles' harness/version, dependency digest, model, reasoning and provider identity.
+Runtime or configuration drift blocks execution without fallback. This enables
+the backend; live coding and safe release evidence remain required for certification.
 
 ## Supported product workflow
 

@@ -66,7 +66,7 @@ def test_product_validate_reports_effective_models(validation_checkout, override
 
 
 @pytest.mark.parametrize("role", ["builder_harness", "reviewer_harness"])
-@pytest.mark.parametrize("harness", ["anton", "codex", "typo"])
+@pytest.mark.parametrize("harness", ["codex", "typo"])
 def test_product_validate_rejects_unavailable_harnesses(validation_checkout, role, harness):
     root, target = validation_checkout
     document = {

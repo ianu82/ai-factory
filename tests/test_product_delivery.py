@@ -58,6 +58,8 @@ def test_real_agent_factory_respects_builder_and_reviewer_configuration(tmp_path
         "builder_model": "builder-snapshot", "reviewer_model": "reviewer-snapshot", "agent_max_output_tokens": 9000}).document
     delivery.deadline = 999999999
     journal = RunJournal(tmp_path, "factory-config")
+    from auto_mindsdb_factory.product_execution import execution_manifest
+    journal.create(execution_manifest(delivery.settings))
     assert delivery._agent("builder", journal).connector.config.model == "builder-snapshot"
     verifier = delivery._agent("verifier", journal)
     assert verifier.connector.config.model == "reviewer-snapshot"

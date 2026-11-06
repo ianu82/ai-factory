@@ -66,7 +66,7 @@ def test_explicit_harness_is_frozen_per_role(profile_document, field, role, othe
 
 
 @pytest.mark.parametrize("field", ["builder_harness", "reviewer_harness"])
-@pytest.mark.parametrize("harness", ["anton", "codex", "typo", None, [], 1])
+@pytest.mark.parametrize("harness", ["codex", "typo", None, [], 1])
 def test_profile_rejects_unknown_or_unavailable_harness(profile_document, field, harness):
     with pytest.raises(ProfileError):
         ProductProfile.from_document({**profile_document, field: harness})

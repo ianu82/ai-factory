@@ -16,7 +16,6 @@ def test_resolution_does_not_mutate_trusted_configuration():
 
 @pytest.mark.parametrize("role,document", [
     ("planner", {}),
-    ("builder", {"builder_harness": "anton"}),
     ("verifier", {"reviewer_harness": "codex"}),
     ("builder", {"builder_harness": "unknown"}),
 ])

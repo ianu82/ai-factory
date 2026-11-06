@@ -5,13 +5,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from .connectors import OpenAIResponsesAgentConfig, OpenAIResponsesAgentConnector
+from .connectors import OpenAIResponsesAgentConnector
 from .docker_runner import RunnerError
 from .product_agent import HarnessStopped
 from .product_plan import ProductPlan, freeze_plan, read_plan
 from .product_planner import ProductPlanner
 from .product_roles import select_role
 from .product_workspace import source_files, executable_paths
+from .product_execution import execution_config
 
 
 class PlanningStopped(HarnessStopped):
@@ -59,8 +60,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         if (journal.root / "plan.json").exists() or any(e["kind"] == "plan_frozen" for e in journal.events()):
             raise PlanningStopped("Planning cannot replace an existing run plan")
         if planner_factory is None:
-            config = OpenAIResponsesAgentConfig.from_env(model=delivery.settings["builder_model"],
-                max_output_tokens=delivery.settings["agent_max_output_tokens"])
+            config = execution_config(delivery.settings, "planner", journal)
             planner = ProductPlanner(OpenAIResponsesAgentConnector(config), journal, task=task,
                 base_sha=base, profile=delivery.profile, deadline=deadline)
         else:

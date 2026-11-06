@@ -23,7 +23,7 @@ def resolve_harness(document: Mapping[str, Any], role: str) -> str:
     name = document.get(_ROLE_FIELDS[role], "native")
     if name not in HARNESS_NAMES:
         raise HarnessSelectionError("Unknown product agent harness")
-    # Reserve names, but fail before execution until their adapters are ready.
-    if name != "native":
+    # Codex remains reserved until its supported adapter is qualified.
+    if name == "codex":
         raise HarnessSelectionError(f"Product agent harness is unavailable: {name}")
     return name

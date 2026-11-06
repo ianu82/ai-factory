@@ -137,6 +137,9 @@ def handle_product_command(args, *, parse_env) -> int | None:
                     time.sleep(args.poll_seconds)
             if args.command == "product-validate":
                 document = profile.document
+                if any(resolve_harness(document, role) == "anton" for role in ("builder", "verifier")):
+                    from .anton_session import validate_anton_installation
+                    validate_anton_installation()
                 result = {"status": "valid", "profile_sha": profile.digest, "repository": document["repository"],
                           "builder_model": document["builder_model"], "reviewer_model": document["reviewer_model"],
                           "builder_harness": resolve_harness(document, "builder"),
