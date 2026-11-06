@@ -1,5 +1,6 @@
 import json
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -207,3 +208,67 @@ def test_malformed_candidate_cannot_approve_review_or_timeline(tmp_path):
     run=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
     assert run['candidate_sha'] is None and run['review']['accepted'] is False
     assert run['timeline'][-1]['status']=='unverified'
+
+
+@pytest.mark.parametrize('terminal,status,wording,activity',[
+    ('unverified','blocked','ended unverified','blocked'),
+    ('rejected','blocked','ended rejected','blocked'),
+    ('future-outcome','unknown','unknown terminal outcome','unverified'),
+    ('','unknown','unknown terminal outcome','unverified'),
+    ('private-terminal-payload','unknown','unknown terminal outcome','unverified'),
+    ('complete','complete','Controller recorded complete','passed'),
+    ('blocked','blocked','ended blocked','blocked'),
+    ('verified','review','ended ready for review','unverified'),
+    ('pr_ready','review','ended ready for review','unverified')])
+def test_real_terminal_journal_is_never_projected_as_nonterminal(tmp_path,terminal,status,wording,activity):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'terminal')
+    journal.create({'task':{'title':'Delivery'},'profile':{'repository':'owner/repo'}})
+    journal.append('attempt_started')
+    finished=journal.append('run_finished',status=terminal,reason='private-terminal-payload')
+    before={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in journal.root.iterdir()}
+    run=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert run['status']==status and wording in run['summary']
+    assert datetime.fromisoformat(run['finished_at'])==datetime.fromisoformat(finished['at'].replace('Z','+00:00'))
+    assert run['stage']=='building'
+    assert 'No terminal outcome' not in run['summary'] and 'private-terminal-payload' not in str(run)
+    assert run['review'] is None and run['timeline'][-1]['status']==activity
+    assert before=={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in journal.root.iterdir()}
+
+
+def test_real_nonterminal_journal_retains_unknown_liveness_without_finished_time(tmp_path):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'active')
+    journal.create({'task':{'title':'Delivery'},'profile':{'repository':'owner/repo'}})
+    journal.append('attempt_started')
+    run=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert run['status']=='building' and run['finished_at'] is None
+    assert run['summary']=='No terminal outcome has been recorded. Activity does not establish process liveness.'
+    assert all(e['kind']!='run_finished' for e in run['timeline'])
+
+
+@pytest.mark.parametrize('terminal',[None,True,{'secret':'private-terminal-payload'},['private-terminal-payload']])
+def test_malformed_terminal_journal_keeps_existing_readonly_validation(tmp_path,terminal):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'malformed-terminal')
+    journal.create({'task':{'title':'Delivery'},'profile':{'repository':'owner/repo'}})
+    journal.append('run_finished',status=terminal)
+    result=Publisher([store],tmp_path/'none').snapshot()
+    assert result['runs']==[] and result['controller']['unreadable_runs']==1
+    assert 'private-terminal-payload' not in str(result)
+
+
+@pytest.mark.parametrize('terminal,accepted',[('unverified',False),('rejected',False),('future-outcome',False),('blocked',True)])
+def test_terminal_nonapproval_preserves_report_history_without_current_approval(tmp_path,terminal,accepted):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'terminal-review')
+    journal.create({'task':{'title':'Delivery','acceptance_criteria':[{'id':'one'}]},'profile':{'repository':'owner/repo'}})
+    report={'status':'passed','criteria':[{'id':'one','status':'passed'}],'findings':[]}
+    journal.append('candidate_created',commit_sha='a'*40)
+    journal.append('agent_report',role='verifier',report=report)
+    journal.append('candidate_verified',commit_sha='a'*40,report=report)
+    journal.append('run_finished',status=terminal)
+    run=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert run['review']['accepted'] is accepted and run['review']['status']=='passed'
+    assert run['timeline'][-2]['kind']=='candidate_verified' and run['timeline'][-2]['status']=='passed'
+    assert run['status']!='complete' and run['finished_at'] is not None
