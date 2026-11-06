@@ -78,10 +78,13 @@ export function bindChat(data, workspace, refresh) {
       document.querySelector("#chat-form").requestSubmit();
     }
   };
+  let saving = false;
   document.querySelector("#chat-form").onsubmit = async (event) => {
     event.preventDefault();
+    if (saving) return;
     const content = textarea.value.trim();
     if (!content) return;
+    saving = true;
     const button = event.target.querySelector("button");
     button.disabled = true;
     try {
@@ -97,6 +100,8 @@ export function bindChat(data, workspace, refresh) {
       if (message.status === "saved") notify("Brief saved");
     } catch (err) {
       notify(err.message);
+    } finally {
+      saving = false;
       button.disabled = false;
     }
   };
