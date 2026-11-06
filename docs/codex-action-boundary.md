@@ -50,5 +50,10 @@ request/deadline/cancellation limits, and drains an interrupted request. It buff
 the provider response before returning validated SSE. The session must still own
 and close the client and credential-free app-server; no backend is enabled here.
 
+The pinned-client transport tests exercise actual HTTP serialization, disabled
+retries, active request cancellation/deadline drain and client closure. They use
+only a local mock transport and test credentials; they provide no live-model or
+isolated app-server certification credit.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
