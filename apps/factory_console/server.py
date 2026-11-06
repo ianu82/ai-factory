@@ -128,11 +128,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(404,{'error':'Not found'})
             if not self.same_origin():
                 return self.send(403,{'error':'Same-origin request required'})
+            if path != '/api/access' and not self.authorized():
+                return self.send(401,{'error':'Preview access required'})
             body = self.body()
             if path == '/api/access':
                 return self.access(body)
-            if not self.authorized():
-                return self.send(401,{'error':'Preview access required'})
             if path == '/api/logout':
                 with self.server.store.connect() as db:
                     import hashlib
