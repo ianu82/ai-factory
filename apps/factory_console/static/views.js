@@ -91,7 +91,7 @@ function attentionList(
 ${i.mode === "non-coding" ? "<span>· Non-coding</span>" : ""}
 </div>
 <h3>${e(i.title)}</h3>
-${i.description && !i.run_id ? `<p>${e(i.description)}</p>` : ""}
+${i.description && !i.run_id && i.description.trim() !== i.title.trim() ? `<p>${e(i.description)}</p>` : ""}
 <div class="row-bottom">${badge(i.status)}<span title="${e(fullDate(i.attention_at))}">${icon("clock")}${relative(i.attention_at)}</span>
 </div>
 </div>${icon("chevron", "row-chevron")}</button>`;

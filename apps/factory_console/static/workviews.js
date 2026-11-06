@@ -59,7 +59,7 @@ export function board(data, workspace) {
                 ) => `<button class="work-card ${c.status === "blocked" ? "blocked" : ""}" ${c.run_id ? `data-open-run="${e(c.run_id)}"` : `data-edit-item="${e(c.id)}"`}>
 <div class="work-card-meta">
 <span>${c.run_id ? "Run" : "Draft"}</span>${c.priority ? priority(c.priority) : ""}</div>
-<h3>${e(c.title)}</h3>${c.description ? `<p>${e(c.description)}</p>` : ""}${badge(c.status)}<footer>
+<h3>${e(c.title)}</h3>${c.description && c.description.trim() !== c.title.trim() ? `<p>${e(c.description)}</p>` : ""}${column(c.status) === "progress" ? badge(c.status) : ""}<footer>
 <span>${c.run_id ? e(c.repository.split("/")[1]) : c.mode === "non-coding" ? "Non-coding" : "Engineering"}</span>
 <span>${relative(c.updated_at)}</span>
 </footer>
