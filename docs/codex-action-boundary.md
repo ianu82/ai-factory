@@ -63,5 +63,12 @@ thread sandbox policy, the scoped proxy, global lifetime and tool dispatch.
 The real-CLI loopback action tests use this production process owner directly,
 including both the accepted report callback and rejected built-in response.
 
+`codex_http.read_codex_http` limits the future loopback proxy to an authenticated,
+bounded JSON POST on its exact host/path (16KiB headers, 8MB body, 128 nested
+containers). It rejects ambiguous framing/JSON,
+browser-origin, compressed and upgraded requests without leaking raw errors.
+The local session capability is separate from the controller's provider key.
+This parser alone starts no listener, inference, tool or enabled backend.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
