@@ -22,8 +22,14 @@ def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, 
     (binaries / "python").symlink_to(sys.executable)
     if version:
         uv = binaries / "uv"
-        uv.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version}'\n")
+        uv.touch()
         uv.chmod(0o755)
+        # Keep the version response fake without executing scripts from a
+        # sandbox's temporary filesystem; the real uv integration runs separately.
+        command = command[:-1] + [
+            "import subprocess\nsubprocess.check_output = lambda *args, **kwargs: "
+            + repr(version) + "\n" + command[-1]
+        ]
     # This marker stands in for pytest, so a failure cannot accidentally run it.
     marker = tmp_path / "regressions-ran"
     (tmp_path / "pytest.py").write_text(
@@ -33,5 +39,5 @@ def test_regressions_require_pinned_uv_before_running_pytest(tmp_path, version, 
     )
     result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True,
                             env={**os.environ, "PYTHONPATH": str(tmp_path), "PYTHONOPTIMIZE": optimize})
-    assert marker.exists() == expected
-    assert (result.returncode == 0) == expected
+    assert marker.exists() == expected, result.stderr
+    assert (result.returncode == 0) == expected, result.stderr
