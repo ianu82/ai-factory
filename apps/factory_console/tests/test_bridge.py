@@ -174,3 +174,36 @@ def test_accepted_review_covers_exact_unique_original_acceptance_ids(tmp_path,cr
     assert result['accepted'] is expected
     timeline=Publisher([store],tmp_path/'none').snapshot()['runs'][0]['timeline']
     assert timeline[-1]['status']==('passed' if expected else 'unverified')
+
+
+@pytest.mark.parametrize('wrong',[
+    {'commit_sha':'d'*40}, {'commit_sha':'garbage'},
+    {'report':{'status':'passed','criteria':[{'id':'one','status':'passed'}],'findings':[],'summary':'changed'}},
+    {'report':{'status':'passed','criteria':[{'id':'one','status':'passed'}],'findings':[],'extra':True}}])
+def test_each_acknowledgement_rebinds_its_own_sha_and_exact_report(tmp_path,wrong):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'ack')
+    journal.create({'task':{'title':'Delivery','acceptance_criteria':[{'id':'one'}]},'profile':{'repository':'owner/repo'}})
+    report={'status':'passed','criteria':[{'id':'one','status':'passed'}],'findings':[],'extra':1}
+    journal.append('candidate_created',commit_sha='a'*40)
+    journal.append('agent_report',role='verifier',report=report)
+    journal.append('candidate_verified',commit_sha='a'*40,report=report)
+    before=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert before['review']['accepted'] and before['timeline'][-1]['status']=='passed'
+    journal.append('candidate_verified',**{'commit_sha':'a'*40,'report':report,**wrong})
+    after=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert after['review']['accepted'] is False and after['timeline'][-1]['status']=='unverified'
+    assert after['timeline'][-2]['status']=='passed'
+
+
+def test_malformed_candidate_cannot_approve_review_or_timeline(tmp_path):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'malformed')
+    journal.create({'task':{'title':'Delivery','acceptance_criteria':[{'id':'one'}]},'profile':{'repository':'owner/repo'}})
+    report={'status':'passed','criteria':[{'id':'one','status':'passed'}],'findings':[]}
+    journal.append('candidate_created',commit_sha='garbage')
+    journal.append('agent_report',role='verifier',report=report)
+    journal.append('candidate_verified',commit_sha='garbage',report=report)
+    run=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert run['candidate_sha'] is None and run['review']['accepted'] is False
+    assert run['timeline'][-1]['status']=='unverified'

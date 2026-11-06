@@ -13,10 +13,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
     from apps.factory_console.model import now, projection
-    from apps.factory_console.evidence import record_hash, passed_criteria
+    from apps.factory_console.evidence import record_hash, passed_criteria, digest
 else:
     from .model import now, projection
-    from .evidence import record_hash, passed_criteria
+    from .evidence import record_hash, passed_criteria, digest
 
 LABELS = {'base_resolved':'Source pinned','plan_frozen':'Plan retained',
     'attempt_started':'Implementation attempt started','candidate_created':'Candidate retained',
@@ -75,7 +75,7 @@ class Publisher:
             kind, data, at = event['kind'], event['data'], event['at']
             stage = STAGES.get(kind,stage)
             if kind=='candidate_created':
-                candidate=data.get('commit_sha')
+                candidate=digest(data.get('commit_sha'),40)
                 review, review_report = None, None
             if kind=='pull_request_published':pr=data.get('url')
             if kind=='run_finished':terminal=event
@@ -92,10 +92,14 @@ class Publisher:
                 report=review_report=data['report']
                 review={'status':report.get('status'),'at':at,'candidate_sha':candidate,
                         'record_sha256':record_hash(event),'accepted':False,'criteria':report.get('criteria',[])}
-            if kind=='candidate_verified' and review and candidate and data.get('commit_sha')==candidate and data.get('report')==review_report:
-                review['accepted']=(valid_contract and review['status']=='passed' and review_report.get('findings')==[]
-                                    and passed_criteria(review['criteria'],expected_ids))
-            if kind=='candidate_verified':status='passed' if review and review['accepted'] else 'unverified'
+            if kind=='candidate_verified':
+                accepted=bool(review and candidate and data.get('commit_sha')==candidate
+                    and record_hash(data.get('report'))==record_hash(review_report)
+                    and valid_contract and review['status']=='passed' and review_report.get('findings')==[]
+                    and passed_criteria(review['criteria'],expected_ids))
+                if review:
+                    review['accepted']=accepted
+                status='passed' if accepted else 'unverified'
             if kind=='plan_frozen':status='passed' if data.get('status')=='ready' else 'unverified'
             if kind=='run_finished':status='passed' if data.get('status')=='complete' else 'blocked'
             if kind in LABELS:
