@@ -35,6 +35,18 @@ class DeliveryStageError(DeliveryError):
     """A controller stage observer or acknowledgement failed; never retry as a code defect."""
 
 
+def _terminal_runner_facts(error: Exception) -> dict:
+    if not isinstance(error, RunnerError):
+        return {}
+    try:
+        # Railway imports ProductDelivery; defer this import to the failure boundary.
+        from .railway_runner import railway_failure_facts
+        operation, category = railway_failure_facts(error)
+    except Exception:
+        operation, category = "unknown", "UnknownError"
+    return {"runner_operation": operation, "runner_category": category}
+
+
 def _report_feedback(report: dict) -> str:
     details = {"summary": report["summary"], "findings": report["findings"],
         "criteria": [criterion for criterion in report["criteria"] if criterion["status"] != "passed"]}
@@ -242,7 +254,11 @@ class ProductDelivery:
                         return {**result, "evidence_dir": str(journal.root), "usage": journal.summary()}
                     raise DeliveryError("No candidate passed independent verification within the attempt budget")
                 except Exception as exc:
-                    journal.append("run_finished", status="blocked", reason=str(exc) if isinstance(exc, RoleSnapshotError) else type(exc).__name__, duration_seconds=round(time.monotonic() - started, 3))
+                    try:
+                        journal.append("run_finished", status="blocked", reason=str(exc) if isinstance(exc, RoleSnapshotError) else type(exc).__name__, duration_seconds=round(time.monotonic() - started, 3), **_terminal_runner_facts(exc))
+                    except Exception:
+                        # A failed or ambiguous diagnostic write must not mask the primary failure.
+                        pass
                     raise
 
     def smoke(self, sha: str, journal: RunJournal) -> None:

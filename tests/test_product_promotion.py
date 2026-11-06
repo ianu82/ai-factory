@@ -522,3 +522,73 @@ def test_deadline_expiring_in_guard_stops_main_push(promotion_case):
     assert not any(e["kind"] == "promotion_requested" for e in journal.events())
     assert git(remote, "rev-parse", "refs/heads/main") == candidate["base_sha"]
     assert not smoked
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_real_delivery_promotion_third_smoke_runner_failure(promotion_case, tmp_path, monkeypatch, mutated):
+    from contextlib import contextmanager
+    from pathlib import Path
+    from shutil import copytree, rmtree
+    from auto_mindsdb_factory.product_delivery import ProductDelivery
+    from auto_mindsdb_factory.railway_runner import RailwayOperationError
+
+    promotion, candidate, old_journal, remote, _, _, _ = promotion_case
+    # The fixture's GitHub API is local; the real promotion still pushes to its bare remote.
+    controller = tmp_path / "controller"
+    subprocess.run(["git", "init", "-q", str(controller)], check=True)
+    copytree(Path(__file__).resolve().parents[1] / "schemas", controller / "schemas")
+    git(controller, "add", "schemas")
+    git(controller, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-qm", "controller fixture")
+    monkeypatch.setattr("auto_mindsdb_factory.product_delivery.repo_root", lambda: controller)
+    monkeypatch.setattr("auto_mindsdb_factory.product_promotion.repo_root", lambda: controller)
+    rmtree(old_journal.root)
+    calls = []
+    class Agent:
+        def run(self, *args):
+            calls.append("builder")
+            return {"status": "passed", "findings": []}
+    @contextmanager
+    def sandbox(*args, **kwargs):
+        yield None
+    delivery = ProductDelivery(promotion.profile, promotion.target, promotion.store,
+                               agent_factory=lambda *args: Agent(), sandbox_factory=sandbox)
+    delivery.settings["smoke"] = [["first"], ["second"], ["third"]]
+    def prepare(sha, workspace, journal):
+        calls.append("prepare")
+        workspace.mkdir()
+        return {}
+    monkeypatch.setattr(delivery, "_prepare", prepare)
+    monkeypatch.setattr(delivery, "_commit", lambda *args: (candidate["candidate_sha"], candidate["changed_paths"]))
+    def verify(*args, **kwargs):
+        calls.append("verifier")
+        return candidate["verification"]
+    monkeypatch.setattr(delivery, "verify", verify)
+    error = RailwayOperationError({"action": "run"}, "ExecInterruptedError")
+    if mutated:
+        error.phase, error.error_type = "exit", "OSError"
+        error.args = ("Railway exit failed (OSError)",)
+    def command(sandbox, command):
+        calls.append(command[0])
+        if command == ["third"]:
+            raise error
+        return {"command": command, "exit_code": 0}
+    monkeypatch.setattr(delivery, "_command", command)
+    promotion.smoke = delivery.smoke
+    with pytest.raises(RailwayOperationError) as raised:
+        delivery.run(promotion.task, base_sha=candidate["base_sha"], promote=promotion, on_stage=lambda s: None)
+    assert raised.value is error
+    assert calls == ["prepare", "builder", "verifier", "prepare", "first", "second", "third"]
+    assert git(remote, "rev-parse", "refs/heads/main") == candidate["candidate_sha"]
+    journal = RunJournal(delivery.store, promotion.task.document["id"])
+    events = journal.events()
+    assert journal.summary()["status"] == "blocked" and journal.summary()["attempts"] == 1
+    assert sum(e["kind"] == "promotion_requested" for e in events) == 1
+    assert sum(e["kind"] == "merge_confirmed" for e in events) == 1
+    assert [e["data"]["index"] for e in events if e["kind"] == "post_merge_smoke"] == [1, 2]
+    assert events[-1]["kind"] == "run_finished"
+    data = events[-1]["data"]
+    assert data["status"] == "blocked" and data["reason"] == "RailwayOperationError"
+    assert (data["runner_operation"], data["runner_category"]) == (
+        ("unknown", "UnknownError") if mutated else ("run", "ExecInterruptedError"))
+    assert not any(e["kind"] == "run_finished" and e["data"]["status"] == "complete" for e in events)

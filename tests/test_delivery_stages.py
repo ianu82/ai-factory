@@ -209,3 +209,106 @@ def test_real_build_and_verification_replay_manifests(delivery, tmp_path, monkey
     for path, original in zip(paths, originals):
         assert stored_role_snapshots(json.loads(path.read_bytes()))["verifier"]["version"] == "1"
         assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("variant", ["known", "generic", "missing", "wrong_type", "phase", "category",
+                                     "args", "coordinated", "forged", "subclass", "secret", "unavailable"])
+def test_terminal_smoke_runner_facts_fail_closed(delivery, monkeypatch, variant):
+    from auto_mindsdb_factory.docker_runner import RunnerError
+    from auto_mindsdb_factory.railway_runner import RailwayOperationError
+    import auto_mindsdb_factory.railway_runner as railway
+
+    instance, task, calls = delivery
+    instance.settings["smoke"] = [["first"], ["second"], ["third"]]
+    error = RailwayOperationError({"action": "run"}, "ExecInterruptedError")
+    if variant == "generic":
+        error = RunnerError("secret-provider-body")
+    elif variant == "missing":
+        del error.phase
+    elif variant == "wrong_type":
+        error.phase = ["run"]
+    elif variant == "phase":
+        error.phase = "secret-provider-body"
+    elif variant == "category":
+        error.error_type = "OSError"
+    elif variant == "args":
+        error.args = ("secret-provider-body",)
+    elif variant == "coordinated":
+        error.phase, error.error_type = "exit", "OSError"
+        error.args = ("Railway exit failed (OSError)",)
+    elif variant == "forged":
+        error = RailwayOperationError.__new__(RailwayOperationError)
+        error.phase, error.error_type, error.args = "run", "OSError", ("Railway run failed (OSError)",)
+    elif variant == "subclass":
+        class DerivedError(RailwayOperationError):
+            pass
+        error = DerivedError({"action": "run"}, "OSError")
+    elif variant == "secret":
+        error = RailwayOperationError({"action": "secret-provider-body"}, "secret-provider-body")
+    elif variant == "unavailable":
+        def unavailable(*args):
+            raise RuntimeError("secret-provider-body")
+        monkeypatch.setattr(railway, "railway_failure_facts", unavailable)
+    prepare = instance._prepare
+    def counted_prepare(*args):
+        calls.append("prepare")
+        return prepare(*args)
+    monkeypatch.setattr(instance, "_prepare", counted_prepare)
+    def command(sandbox, cmd):
+        calls.append(cmd[0])
+        if cmd == ["third"]:
+            raise error
+        return {"command": cmd, "exit_code": 0}
+    monkeypatch.setattr(instance, "_command", command)
+    def promote(candidate, journal):
+        calls.append("promotion")
+        journal.append("merge_confirmed", commit_sha=candidate["candidate_sha"])
+        instance.smoke(candidate["candidate_sha"], journal)
+        pytest.fail("failed smoke must not return")
+    with pytest.raises(RunnerError) as raised:
+        instance.run(task, base_sha="a" * 40, promote=promote, on_stage=lambda s: None)
+    assert raised.value is error
+    assert calls == ["prepare", "builder", "verifier", "promotion", "prepare", "first", "second", "third"]
+    journal = RunJournal(instance.store, task.document["id"])
+    events = journal.events()
+    assert journal.summary()["status"] == "blocked" and journal.summary()["attempts"] == 1
+    assert [e["data"]["index"] for e in events if e["kind"] == "post_merge_smoke"] == [1, 2]
+    data = events[-1]["data"]
+    assert events[-1]["kind"] == "run_finished" and data["status"] == "blocked"
+    assert data["reason"] == type(error).__name__
+    assert (data["runner_operation"], data["runner_category"]) == (
+        ("run", "ExecInterruptedError") if variant == "known" else ("unknown", "UnknownError"))
+    assert not any(e["kind"] == "run_finished" and e["data"]["status"] == "complete" for e in events)
+    assert "secret-provider-body" not in str(events)
+
+
+@pytest.mark.parametrize("failure", ["construction", "write_before", "write_after"])
+def test_terminal_diagnostic_failure_preserves_primary(delivery, monkeypatch, failure):
+    import auto_mindsdb_factory.product_delivery as module
+    from auto_mindsdb_factory.railway_runner import RailwayOperationError
+    instance, task, calls = delivery
+    error = RailwayOperationError({"action": "run"}, "OSError")
+    def promote(*args):
+        calls.append("promotion")
+        raise error
+    def broken(*args, **kwargs):
+        raise OSError("secret-diagnostic-failure")
+    if failure == "construction":
+        monkeypatch.setattr(module, "_terminal_runner_facts", broken)
+    else:
+        append = RunJournal.append
+        def failing_append(journal, kind, **data):
+            if kind == "run_finished":
+                if failure == "write_after":
+                    append(journal, kind, **data)
+                broken()
+            return append(journal, kind, **data)
+        monkeypatch.setattr(RunJournal, "append", failing_append)
+    with pytest.raises(RailwayOperationError) as raised:
+        instance.run(task, base_sha="a" * 40, promote=promote)
+    assert raised.value is error
+    assert calls == ["builder", "verifier", "promotion"]
+    journal = RunJournal(instance.store, task.document["id"])
+    assert journal.summary()["status"] == ("blocked" if failure == "write_after" else "incomplete")
+    assert sum(e["kind"] == "run_finished" for e in journal.events()) == (failure == "write_after")
+    assert "secret-diagnostic-failure" not in str(journal.events())
