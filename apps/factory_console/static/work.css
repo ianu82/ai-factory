@@ -505,3 +505,5 @@
 }
 
 @media (max-width:760px) { .board-column { flex-basis: 268px; } .board-toolbar { flex-wrap: wrap; gap: 12px; } .board-toolbar .search-box { flex: 1; } .board-empty-toggle { margin-left: 0; } }
+
+.card-evidence { display: inline-flex; align-items: center; gap: 3px; margin-right: 6px; }

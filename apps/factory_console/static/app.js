@@ -7,7 +7,7 @@ import {
   relative,
   showDialog,
 } from "./core.js";
-import { inbox, workspaces, bindViews } from "./views.js";
+import { inbox, workspaces, bindViews, itemDetail, bindItem } from "./views.js";
 import {
   board,
   runs,
@@ -15,6 +15,7 @@ import {
   settings,
   bindWorkViews,
 } from "./workviews.js";
+import { bindEvidence } from "./evidence.js";
 import { chat, bindChat } from "./chat.js";
 let data = null;
 export const refresh = async () => {
@@ -35,9 +36,13 @@ export const refresh = async () => {
   const atBottom = history
     ? history.scrollHeight - history.clientHeight - history.scrollTop < 50
     : true;
+  const receipts = [...document.querySelectorAll("details[data-receipt][open]")].map(n => n.dataset.receipt);
+  const boardScroll = document.querySelector("#work-board")?.scrollLeft;
   data = nextData;
   render();
   if (location.hash === hash) {
+    document.querySelectorAll("details[data-receipt]").forEach(n => {n.open = receipts.includes(n.dataset.receipt);});
+    if (boardScroll !== undefined && document.querySelector("#work-board")) document.querySelector("#work-board").scrollLeft = boardScroll;
     if (focusSelector) {
       const next = document.querySelector(focusSelector);
       next?.focus({ preventScroll: true });
@@ -67,6 +72,7 @@ function render() {
         runs: "Runs",
         chat: "Master chat",
         run: "Run detail",
+        item: "Work item",
       }[view] || "Factory";
   document.title = `${title} · Factory`;
   document.querySelector("#app").innerHTML = `<div class="app-shell">
@@ -118,11 +124,14 @@ function render() {
   else if (view === "workspaces") container.innerHTML = workspaces(data);
   else if (view === "board") container.innerHTML = board(data, ws);
   else if (view === "runs") container.innerHTML = runs(data, ws);
+  else if (view === "item") container.innerHTML = itemDetail(data, r[1]);
   else if (view === "run") container.innerHTML = runDetail(data, r[1]);
   else if (view === "settings" && ws) container.innerHTML = settings(data, ws);
   else if (view === "chat") container.innerHTML = chat(data, ws);
   else
     container.innerHTML = `<section class="empty-state"><h1>Page not found</h1><a class="button secondary" href="#/inbox">Inbox</a></section>`;
+  if (view === "item") {bindItem(data,r[1],refresh); bindEvidence(data,"item",data.items.find(i => i.id === r[1]),refresh);}
+  if (view === "run") bindEvidence(data,"run",data.runs.find(i => i.id === r[1]),refresh);
   bindViews(data, ws, refresh);
   bindWorkViews(data, ws);
   bindChat(data, ws, refresh);

@@ -1,0 +1,27 @@
+.section-title > .button { margin-left: auto; }
+.button.small { min-height: 30px; padding: 6px 10px; font-size: 11px; }
+.evidence-receipt { border-bottom: 1px solid var(--line); }
+.evidence-receipt summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 9px; font-size: 12px; }
+.evidence-receipt summary::after { content: "+"; margin-left: 3px; color: var(--muted); }
+.evidence-receipt[open] summary::after { content: "−"; }
+.evidence-receipt summary .badge { margin-left: auto; font-size: 11px; }
+.evidence-receipt summary .icon { width: 15px; height: 15px; }
+.receipt-body { padding: 8px 0 18px; font-size: 12px; }
+.receipt-body > p { margin-bottom: 14px; line-height: 1.8; }
+.receipt-fields { display: grid; grid-template-columns: 115px minmax(0,1fr); gap: 10px 16px; font-size: 11px; }
+.receipt-fields dt { color: var(--muted); }
+.receipt-fields dd { margin: 0; overflow-wrap: anywhere; }
+.evidence-files { display: grid; grid-template-columns: repeat(auto-fill,minmax(160px,1fr)); gap: 12px; margin-top: 18px; }
+.evidence-file { text-align: left; min-width: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #fff; }
+.evidence-file:hover { border-color: #9bb6b3; }
+.evidence-file img, .evidence-file-icon { width: 100%; height: 112px; object-fit: cover; object-position: top; background: #edf0ed; }
+.evidence-file-icon { display: grid; place-items: center; color: var(--muted); }
+.evidence-file-name { display: block; padding: 10px 10px 4px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.evidence-file small { display: block; padding: 0 10px 10px; color: var(--muted); font-size: 10px; }
+.evidence-preview { display: block; max-width: 100%; max-height: 55vh; margin: 0 auto 16px; object-fit: contain; }
+#evidence-error { color: var(--danger); font-size: 12px; }
+.ticket-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; font-size: 12px; color: var(--muted); }
+.ticket-content { max-width: 900px; }
+@media(max-width:760px) { .receipt-fields { grid-template-columns: 85px minmax(0,1fr); gap: 10px; } .evidence-receipt summary { font-size: 11px; } }
+
+.evidence-receipt summary > span:first-child { min-width: 0; overflow-wrap: anywhere; line-height: 1.5; }

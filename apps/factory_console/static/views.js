@@ -12,6 +12,7 @@ import {
   showDialog,
 } from "./core.js";
 import { itemDialog } from "./app.js";
+import { evidence } from "./evidence.js";
 const ranks = { urgent: 0, high: 1, medium: 2, low: 3 };
 export function inbox(data, workspace) {
   const count = data.items.filter(
@@ -158,32 +159,7 @@ export function bindViews(data, workspace, refresh) {
           const item = data.items.find(
             (item) => item.id === button.dataset.item,
           );
-          const ws = data.workspaces.find((ws) => ws.id === item.workspace_id);
-          showDialog(`<div class="dialog-heading"><h2>${e(item.title)}</h2><button class="icon-button" data-close aria-label="Close">${icon("close")}</button></div>
-        <div class="attention-detail-meta">${priority(item.priority)}<span>${e(ws.name)}</span>${badge(item.status)}</div>
-        ${item.description && !item.run_id ? `<p class="attention-description">${e(item.description)}</p>` : ""}
-        <p class="field-note">Since ${e(fullDate(item.attention_at))}</p>
-        <div class="dialog-footer"><button class="button secondary" id="edit-attention">Edit details</button>
-        ${item.run_id ? `<a class="button secondary" href="#/run/${e(item.run_id)}">Inspect run ${icon("arrow")}</a>` : ""}
-        <button class="button primary" id="handle-attention">Mark handled</button></div>`);
-          document.querySelector("#edit-attention").onclick = () => {
-            document.querySelector("#dialog").close();
-            itemDialog(ws, item);
-          };
-          document.querySelector("#handle-attention").onclick = async (
-            event,
-          ) => {
-            event.target.disabled = true;
-            try {
-              await api("/api/items/" + item.id, { ...item, resolved: true });
-              document.querySelector("#dialog").close();
-              await refresh();
-              notify("Marked handled");
-            } catch (error) {
-              notify(error.message);
-              event.target.disabled = false;
-            }
-          };
+          location.hash = `#/item/${item.id}`;
         }),
     );
   };
@@ -209,4 +185,26 @@ export function bindViews(data, workspace, refresh) {
     redraw();
   };
   redraw();
+}
+
+export function itemDetail(data, id) {
+  const item = data.items.find(i => i.id === id);
+  if (!item) return empty("search", "Item not found", "", `<a class="button secondary" href="#/inbox">Inbox</a>`);
+  const ws = data.workspaces.find(w => w.id === item.workspace_id);
+  return `<div class="ticket-content"><a class="back-link" href="#/inbox">${icon("arrow")}Inbox</a><div class="page-heading"><h1>${e(item.title)}</h1><button class="button secondary" data-edit-ticket>Edit</button></div>
+  <div class="ticket-meta">${priority(item.priority)}<a href="#/workspace/${e(ws.id)}/board">${e(ws.name)}</a>${badge(item.status)}${item.attention_at ? `<span>Since ${e(fullDate(item.attention_at))}</span>` : ""}</div>
+  ${item.description && !item.run_id ? `<p class="attention-description">${e(item.description)}</p>` : ""}
+  ${item.run_id ? `<p class="detail-section"><a class="button secondary" href="#/run/${e(item.run_id)}">Inspect run ${icon("arrow")}</a></p>` : ""}
+  ${evidence(data,"item",item)}${item.attention_at && !item.resolved ? `<button class="button secondary" data-handle-ticket>Mark handled</button>` : ""}</div>`;
+}
+export function bindItem(data,id,refresh) {
+  const item = data.items.find(i => i.id === id);
+  if (!item) return;
+  const ws = data.workspaces.find(w => w.id === item.workspace_id);
+  document.querySelector("[data-edit-ticket]")?.addEventListener("click", () => itemDialog(ws,item));
+  document.querySelector("[data-handle-ticket]")?.addEventListener("click", async event => {
+    event.currentTarget.disabled = true;
+    try { await api("/api/items/"+item.id,{...item,resolved:true}); await refresh(); notify("Marked handled"); }
+    catch(error) {event.target.disabled=false; notify(error.message);}
+  });
 }

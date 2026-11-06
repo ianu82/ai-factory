@@ -9,6 +9,7 @@ import {
   scopedRuns,
 } from "./core.js";
 import { workspaceDialog, itemDialog } from "./app.js";
+import { evidence } from "./evidence.js";
 const boardFilters = new Map();
 const columns = [
   ["backlog", "Backlog"], ["ready", "Ready"], ["building", "Building"],
@@ -30,6 +31,7 @@ function boardCards(data, workspace, state) {
     ...data.items.filter(i => !i.run_id && (!scope || i.workspace_id === scope.id)),
     ...scopedRuns(data, scope).map(r => ({...r, run_id: r.id, priority: null})),
   ].filter(c => `${c.title} ${c.id} ${c.repository || ""}`.toLowerCase().includes(state.query.toLowerCase()));
+  if (!cards.length && state.query) return empty("search", "No matches", "");
   const groups = [...columns, ...(cards.some(c => !columns.some(([key]) => boardStage(c.status) === key)) ? [["unknown", "Unverified"]] : [])];
   return groups.map(([key, label]) => {
     const list = cards.filter(c => (columns.some(([k]) => k === boardStage(c.status)) ? boardStage(c.status) : "unknown") === key);
@@ -37,12 +39,12 @@ function boardCards(data, workspace, state) {
     return `<section class="board-column"><header><span class="column-dot ${key}"></span><h3>${label}</h3><span class="column-count">${list.length}</span>${key === "backlog" ? `<button class="icon-button" data-new-board-item aria-label="Add to backlog">${icon("plus")}</button>` : ""}</header>
     <div class="board-cards">${list.sort((a,b) => b.updated_at.localeCompare(a.updated_at)).map(c => {
       const ws = data.workspaces.find(w => w.id === c.workspace_id || w.repositories.includes(c.repository));
-      return `<a class="work-card" ${c.run_id ? `href="#/run/${e(c.id)}"` : `href="#/item/${e(c.id)}" data-edit-item="${e(c.id)}"`} title="${e(c.title)}">
+      return `<a class="work-card" href="#/${c.run_id ? "run" : "item"}/${e(c.id)}" title="${e(c.title)}">
       <div class="work-card-meta"><span class="mono" title="${e(c.id)}">${e(reference(c.id))}</span>${c.priority ? priority(c.priority) : ""}</div>
-      <h3>${e(c.title)}</h3><footer><span title="${e(c.repository || ws?.name)}">${e(!workspace ? ws?.name || c.repository : c.repository?.split("/")[1] || (c.mode === "non-coding" ? "Non-coding" : "Engineering"))}</span>
-      <span>${c.checks?.length ? `${icon("checkcircle")} ${c.checks.filter(x => x.status === "passed").length}/${c.checks.length}` : ""}${relative(c.updated_at)}</span></footer></a>`;
+      <h3>${e(c.title)}</h3><footer><span title="${e(c.repository || ws?.name)}">${e(c.repository?.split("/")[1] || ws?.name || (c.mode === "non-coding" ? "Non-coding" : "Engineering"))}</span>
+      <span>${c.checks?.length ? `<span class="card-evidence" title="Recorded checks">${icon("checkcircle")} ${c.checks.filter(x => x.status === "passed").length}/${c.checks.length}</span>` : ""}<time>${relative(c.updated_at)}</time></span></footer></a>`;
     }).join("")}</div></section>`;
-  }).join("") || empty("search", "No matches", "");
+  }).join("") || empty("board", state.query ? "No matches" : "No work yet", "");
 }
 export function runs(data, workspace) {
   const list = scopedRuns(data, workspace).sort((a, b) =>
@@ -129,20 +131,7 @@ export function runDetail(data, id) {
 <div class="run-detail-grid">
 <div>
 ${r.pull_request_url ? `<section class="detail-section"><a class="button secondary" href="${e(r.pull_request_url)}" target="_blank" rel="noopener noreferrer">${icon("git")}Pull request ${icon("external")}</a></section>` : ""}
-<section class="detail-section">
-<div class="section-title">${icon("checkcircle")}<h2>Verification</h2>
-${r.checks.length ? `<span class="quiet-label">${r.checks.length} checks</span>` : ""}
-</div>${
-    r.checks.length
-      ? `<div class="checks">${r.checks
-          .map(
-            (c) => `<div>
-<span>${e(c.name)}</span>${badge(c.status)}<small>${c.at ? relative(c.at) : ""}</small>
-</div>`,
-          )
-          .join("")}</div>`
-      : `<p class="quiet-copy">No checks recorded</p>`
-  }</section>
+${evidence(data,"run",r)}
 <section class="detail-section">
 <div class="section-title">${icon("clock")}<h2>Activity</h2>
 </div>${
@@ -214,7 +203,7 @@ export function bindWorkViews(data, workspace) {
   const boardNode = document.querySelector("#work-board");
   if (boardNode) {
     const key = workspace?.id || "all";
-    const state = boardFilters.get(key) || {workspace: "", query: "", hideEmpty: false};
+    const state = boardFilters.get(key) || {workspace: "", query: "", hideEmpty: true};
     boardFilters.set(key, state);
     const search = document.querySelector("[data-search]");
     const filter = document.querySelector("#board-workspace");
