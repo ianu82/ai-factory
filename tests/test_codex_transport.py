@@ -65,7 +65,10 @@ def test_real_codex_response_is_gated_before_tool_execution(codex_root, permitte
             call = {"type": "custom_tool_call", "id": "ctc_probe", "call_id": "call_probe",
                     "name": "exec", "namespace": "functions", "input": code, "status": "completed"}
             response = {"id": "resp_probe", "object": "response", "created_at": 0,
-                        "status": "completed", "model": MODEL, "output": [call],
+                        "status": "completed", "model": MODEL, "output": [
+                            {"type": "reasoning", "id": "rs_probe", "summary": [], "encrypted_content": "opaque"},
+                            {"type": "message", "id": "msg_probe", "role": "assistant", "status": "completed",
+                             "content": [{"type": "output_text", "text": "Bounded transport fixture", "annotations": []}]}, call],
                         "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
             try:
                 assert len(requests) == 1
