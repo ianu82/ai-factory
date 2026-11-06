@@ -26,7 +26,7 @@ class GitHubPromotion:
     """Publish a candidate; before_merge() may raise to cancel automatic promotion."""
 
     def __init__(self, profile: ProductProfile, task: ProductTask, target: Path,
-                 store: Path, *, smoke, deadline: float, api=None, before_merge=None) -> None:
+                 store: Path, *, smoke, deadline: float, api=None, before_merge=None, transport=None) -> None:
         self.profile = profile
         self.settings = profile.document
         self.task = task
@@ -34,7 +34,11 @@ class GitHubPromotion:
         self.store = store
         self.smoke = smoke
         self.deadline = deadline
-        self.api = api or self._api
+        if api is not None and transport is not None:
+            raise PromotionError("Select one trusted GitHub transport")
+        self.transport = transport
+        self.api = transport.api if transport is not None else (api or self._api)
+        self.remote_git = transport.git if transport is not None else lambda *args: git(self.target, *args)
         self.before_merge = before_merge
         self.repo = self.settings["repository"]
 
@@ -77,7 +81,7 @@ class GitHubPromotion:
         raise AssertionError("Unreachable request attempt")
 
     def _branch_sha(self, branch: str) -> str | None:
-        rows = git(self.target, "ls-remote", "--heads", "origin", f"refs/heads/{branch}").splitlines()
+        rows = self.remote_git("ls-remote", "--heads", "origin", f"refs/heads/{branch}").splitlines()
         return rows[0].split("\t")[0] if rows else None
 
     def _validate(self, candidate: dict) -> None:
@@ -140,6 +144,8 @@ class GitHubPromotion:
         self._check_deadline()
         self.profile.validate_repository(self.target)
         self._validate(candidate)
+        if self.transport is not None:
+            self.transport.bind(candidate, journal)
         sha, base = candidate["candidate_sha"], candidate["base_sha"]
         branch = "codex/factory-" + self.task.document["id"]
         journal.append("publication_requested", candidate_sha=sha, branch=branch)
@@ -148,7 +154,7 @@ class GitHubPromotion:
             raise PromotionError("Delivery branch changed; refusing to replace it")
         if remote is None:
             self._check_deadline()
-            git(self.target, "push", f"--force-with-lease=refs/heads/{branch}:", "origin", f"{sha}:refs/heads/{branch}")
+            self.remote_git("push", f"--force-with-lease=refs/heads/{branch}:", "origin", f"{sha}:refs/heads/{branch}")
         prs = self._request("pulls?" + urlencode({"state": "all", "head": self.repo.split('/')[0] + ':' + branch}), journal)
         if len(prs) > 1:
             raise PromotionError("Delivery branch has ambiguous pull request history")
@@ -193,7 +199,7 @@ class GitHubPromotion:
                     # Parent validation above makes this a fast-forward. The lease is an
                     # atomic compare-and-swap on the tested base, including remote writers.
                     # GitHub branch protections still apply; no bypass is requested.
-                    git(self.target, "push", f"--force-with-lease=refs/heads/{self.settings['base_branch']}:{base}",
+                    self.remote_git("push", f"--force-with-lease=refs/heads/{self.settings['base_branch']}:{base}",
                         "origin", f"{sha}:refs/heads/{self.settings['base_branch']}")
                 except WorkspaceError:
                     if self._branch_sha(self.settings["base_branch"]) != sha:

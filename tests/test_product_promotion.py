@@ -101,6 +101,41 @@ def test_promotion_confirms_merge_before_smoke(promotion_case):
     assert journal.events()[-1]["kind"] == "merge_confirmed"
 
 
+def test_scoped_transport_changes_only_network_execution_not_promotion_gates(promotion_case):
+    original, candidate, journal, remote, _, _, smoked = promotion_case
+    calls = []
+    class Transport:
+        def bind(self, supplied, supplied_journal):
+            assert supplied == candidate and supplied_journal is journal
+            calls.append("bind")
+        def api(self, *args):
+            calls.append("api")
+            return original.api(*args)
+        def git(self, *args):
+            assert args[0] in {"ls-remote", "push"}
+            calls.append(args[0])
+            return git(original.target, *args)
+    promotion = GitHubPromotion(original.profile, original.task, original.target, original.store,
+        smoke=original.smoke, deadline=original.deadline, transport=Transport())
+    result = promotion(candidate, journal)
+    assert result["status"] == "complete" and calls[0] == "bind"
+    assert calls.count("push") == 2 and git(remote, "rev-parse", "refs/heads/main") == candidate["candidate_sha"]
+    assert smoked == [candidate["candidate_sha"]]
+
+
+def test_invalid_candidate_cannot_authorize_a_publication_transport(promotion_case):
+    original, candidate, journal, remote, _, _, _ = promotion_case
+    def forbidden(*args):
+        pytest.fail("Invalid candidate reached a network transport")
+    transport = SimpleNamespace(api=forbidden, git=forbidden, bind=forbidden)
+    promotion = GitHubPromotion(original.profile, original.task, original.target, original.store,
+        smoke=original.smoke, deadline=original.deadline, transport=transport)
+    with pytest.raises(PromotionError, match="different profile"):
+        promotion({**candidate, "profile_sha": "0" * 64}, journal)
+    assert git(remote, "rev-parse", "refs/heads/main") == candidate["base_sha"]
+    assert journal.events() == []
+
+
 @pytest.mark.parametrize("variant", ["stale-base", "stale-head", "failed-evidence", "wrong-task", "race"])
 def test_stale_or_unverified_candidates_never_promote(promotion_case, variant, monkeypatch):
     promotion, candidate, journal, remote, other, pr, smoked = promotion_case
