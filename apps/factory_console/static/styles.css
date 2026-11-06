@@ -90,6 +90,7 @@ h2,
 h3,
 p {
   margin: 0;
+  overflow-wrap: anywhere;
 }
 h1 {
   font-size: 27px;
