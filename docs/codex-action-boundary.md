@@ -96,5 +96,14 @@ are rejected and bounded asynchronous pipes close on every exit. Actual CLI
 round trips cover both zero and nonzero command results. Report acceptance,
 process/proxy/client ownership and live certification remain separate gates.
 
+`codex_session.CodexAgent` owns that client/proxy/process/turn lifetime, uses the
+frozen historical role and shared report acceptance, and requires an abortable
+owned job-command callback. Command work runs off-loop; interruption signals its
+owner and waits for confirmed completion. Provider work drains before process
+waits, and the client closes on every exit. Dependency drift fails before startup.
+Local full-session tests cover report rejection, active provider/command stop and
+cleanup. This still enables no selection or runtime; production wiring, exact
+configuration/environment qualification and live delivery proofs remain required.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

@@ -99,6 +99,7 @@ async def codex_turn(owner, gate, *, instructions, context, command):
                     thread = message["result"]["thread"]["id"]
                     if type(thread) is not str or not 1 <= len(thread) <= 200:
                         gate.stop("rpc_policy")
+                    gate.record("harness_thread_started", thread_id=thread, resume_supported=False)
                     await send({"id": 3, "method": "turn/start", "params": {"threadId": thread,
                         "model": gate.config.model, "effort": gate.config.reasoning_effort, "approvalPolicy": "never",
                         "cwd": str(owner.work), "input": [{"type": "text", "text": json.dumps(context, allow_nan=False)}]}})
@@ -107,6 +108,7 @@ async def codex_turn(owner, gate, *, instructions, context, command):
                     turn = message["result"]["turn"]["id"]
                     if type(turn) is not str or not 1 <= len(turn) <= 200:
                         gate.stop("rpc_policy")
+                    gate.record("harness_turn_started", thread_id=thread, turn_id=turn)
                     expected = None
                 else:
                     gate.stop("rpc_policy")
