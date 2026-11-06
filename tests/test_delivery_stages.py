@@ -191,6 +191,10 @@ def test_real_build_and_verification_replay_manifests(delivery, tmp_path, monkey
     from auto_mindsdb_factory import product_roles
     from auto_mindsdb_factory.product_roles import select_role, stored_role_snapshots
     instance, task, _ = delivery
+    # Both manifest creation and admission refer to the isolated controller.
+    from auto_mindsdb_factory import product_delivery, product_replay
+    monkeypatch.setattr(product_replay, "repo_root", product_delivery.repo_root)
+    monkeypatch.setattr(instance, "_verify_candidate", instance.verify)
     suite = {"version": 1, "cases": [
         {"name": "build", "mode": "build", "base_sha": "a" * 40, "task": task.document, "expected": "verified"},
         {"name": "verify", "mode": "verify", "base_sha": "a" * 40, "candidate_sha": "b" * 40,
@@ -200,7 +204,7 @@ def test_real_build_and_verification_replay_manifests(delivery, tmp_path, monkey
     path.write_text(json.dumps(suite))
     result = run_suite(instance.profile, instance.target, instance.store, path,
                        delivery_factory=lambda *args: instance)
-    assert result["correct"] == result["total"] == 2
+    assert result["correct"] == result["total"] == 2, result["results"]
     paths = [instance.store / "delivery" / score["run_id"] / "manifest.json" for score in result["results"]]
     originals = [path.read_bytes() for path in paths]
     for index, (score, original) in enumerate(zip(result["results"], originals)):
@@ -208,7 +212,7 @@ def test_real_build_and_verification_replay_manifests(delivery, tmp_path, monkey
         assert manifest["purpose"] == "replay" and manifest["base_sha"] == "a" * 40
         assert manifest["profile"] == instance.profile.document and manifest["profile_sha"] == instance.profile.digest
         assert manifest["task"] == {**task.document, "id": score["run_id"]}
-        assert manifest["replay"] == {k: score[k] for k in ("suite_sha", "case", "repetition", "original_task_sha")}
+        assert manifest["replay"] == {k: score[k] for k in ("suite_sha", "case", "repetition", "mode", "original_task_sha")}
         if index == 0:
             assert manifest["task_sha"] and len(manifest["runtime_sha"]) == 40
         else:

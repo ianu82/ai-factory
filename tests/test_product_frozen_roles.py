@@ -35,6 +35,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(product_delivery, "git", lambda root, *args: "f" * 40
                         if root == product_delivery.repo_root() and args == ("rev-parse", "HEAD")
                         else real_git(root, *args))
+    monkeypatch.setattr(product_replay, "git", product_delivery.git)
     return target, base, profile, task
 
 
