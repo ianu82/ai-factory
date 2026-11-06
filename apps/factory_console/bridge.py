@@ -13,14 +13,14 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
     from apps.factory_console.model import now, projection
-    from apps.factory_console.evidence import record_hash
+    from apps.factory_console.evidence import record_hash, passed_criteria
 else:
     from .model import now, projection
-    from .evidence import record_hash
+    from .evidence import record_hash, passed_criteria
 
 LABELS = {'base_resolved':'Source pinned','plan_frozen':'Plan retained',
     'attempt_started':'Implementation attempt started','candidate_created':'Candidate retained',
-    'candidate_verified':'Independent verification passed','publication_requested':'Publication requested',
+    'candidate_verified':'Verification acknowledged','publication_requested':'Publication requested',
     'pull_request_published':'Pull request published','github_checks_passed':'GitHub checks passed',
     'promotion_requested':'Exact-base promotion requested','merge_confirmed':'Exact merge confirmed',
     'post_merge_smoke':'Post-merge smoke check','run_finished':'Run finished'}
@@ -67,6 +67,10 @@ class Publisher:
         created = manifest.get('created_at',events[0]['at'])
         stage, terminal, checks, timeline, candidate, pr = 'planning',None,[],[],None,None
         review, review_report = None, None
+        expected_criteria = manifest.get('task',{}).get('acceptance_criteria',[])
+        expected_ids = [c.get('id') for c in expected_criteria if isinstance(c,dict)]
+        valid_contract = bool(expected_ids) and len(expected_ids)==len(expected_criteria) and passed_criteria(
+            [{'id':i,'status':'passed'} for i in expected_ids])
         for event in events:
             kind, data, at = event['kind'], event['data'], event['at']
             stage = STAGES.get(kind,stage)
@@ -80,16 +84,18 @@ class Publisher:
                 result = data.get('exit_code')
                 status = ('passed' if result==0 else 'failed') if type(result) is int else 'unverified'
                 checks.append({'name':data.get('name') if kind=='verification_check' else 'Smoke '+str(data.get('index')),
-                               'status':status,'at':at, 'commit_sha': data.get('commit_sha'),
-                               'exit_code': result, 'duration_seconds': data.get('duration_seconds'),
-                               'sequence': event.get('sequence'), 'record_sha256': record_hash(event)})
+                               'status':status,'at':at, 'exit_code': result,
+                               **{k:data[k] for k in ('commit_sha','duration_seconds') if k in data},
+                               **({'sequence':event['sequence']} if 'sequence' in event else {}),
+                               'record_sha256': record_hash(event)})
             if kind=='agent_report' and data.get('role')=='verifier' and isinstance(data.get('report'),dict):
                 report=review_report=data['report']
                 review={'status':report.get('status'),'at':at,'candidate_sha':candidate,
                         'record_sha256':record_hash(event),'accepted':False,'criteria':report.get('criteria',[])}
             if kind=='candidate_verified' and review and candidate and data.get('commit_sha')==candidate and data.get('report')==review_report:
-                review['accepted']=review['status']=='passed' and review_report.get('findings')==[] and bool(review['criteria']) and all(
-                    c.get('status')=='passed' for c in review['criteria'])
+                review['accepted']=(valid_contract and review['status']=='passed' and review_report.get('findings')==[]
+                                    and passed_criteria(review['criteria'],expected_ids))
+            if kind=='candidate_verified':status='passed' if review and review['accepted'] else 'unverified'
             if kind=='plan_frozen':status='passed' if data.get('status')=='ready' else 'unverified'
             if kind=='run_finished':status='passed' if data.get('status')=='complete' else 'blocked'
             if kind in LABELS:
