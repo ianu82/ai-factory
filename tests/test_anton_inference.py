@@ -97,9 +97,9 @@ def test_exhaustion_and_cancellation_stop_before_another_request(tmp_path):
         guard.admit()
 
 
-def test_deadline_interrupts_active_request_and_retains_unknown_usage(tmp_path):
+def test_request_timeout_interrupts_active_work_and_retains_unknown_usage(tmp_path):
     guard = boundary(tmp_path)
-    guard.deadline = time.monotonic() + 0.02
+    guard.config.timeout_seconds = 0.02
     sdk, calls, _ = client(USAGE, delay=10)
     with pytest.raises(TimeoutError):
         asyncio.run(guard.request(sdk, BODY))

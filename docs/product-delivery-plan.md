@@ -45,15 +45,11 @@ The journal freezes `plan.json` once; matching reads do not rewrite it and confl
 or tampering fail closed. This contract alone does not enable planner execution
 or alter legacy runs. Delivery integration follows separately.
 
-The embedded Anton session is pinned to commit
-`537cc1fb11849e9d152870738af22ca55c1d59d8` and checks installed VCS provenance.
-It exposes only the controller's isolated `run` and validated `finish` tools.
-Native scratchpads, web tools, memory, personal settings and telemetry are disabled.
-Every provider call passes the shared admission/accounting boundary, including
-SDK helpers; active request cancellation closes the transport task. The backend
-remains unavailable for trusted profile selection until its dependency/runtime
-installation and delivery integration are qualified. SDK integration tests must
-also run with the pinned SDK installed; an optional-dependency skip is not proof.
+The embedded Anton SDK checks VCS provenance at `537cc1fb11849e9d152870738af22ca55c1d59d8`.
+It exposes only isolated `run` and validated `finish`; native scratchpads, web,
+memory, personal settings and telemetry are disabled.
+Every provider call, including SDK helpers, passes shared accounting and admission.
+Active request cancellation closes transport. Selection awaits runtime and delivery qualification; SDK skips are not evidence.
 
 ## Supported product workflow
 
