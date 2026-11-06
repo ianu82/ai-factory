@@ -116,3 +116,28 @@ def test_all_conflicting_global_identities_are_suppressed_across_actual_stores(t
     result=Publisher(stores,tmp_path/'no-status').snapshot()
     assert [run['id'] for run in result['runs']]==['distinct']
     assert result['controller']['unreadable_runs']==3
+
+
+def test_independent_review_requires_matching_candidate_and_report_acknowledgement(tmp_path):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'receipt')
+    journal.create({'task':{'title':'Actual delivery'},'profile':{'repository':'owner/repo','platform':'linux/amd64'},
+                    'profile_sha':'b'*64,'runtime_sha':'c'*40})
+    sha='a'*40
+    report={'status':'passed','criteria':[{'id':'acceptance','status':'passed','evidence':'private prose'}],'findings':[]}
+    journal.append('candidate_created',commit_sha=sha)
+    journal.append('agent_report',role='builder',report=report)
+    assert Publisher([store],tmp_path/'none').snapshot()['runs'][0]['review'] is None
+    journal.append('agent_report',role='verifier',report=report)
+    journal.append('candidate_verified',commit_sha='d'*40,report=report)
+    assert Publisher([store],tmp_path/'none').snapshot()['runs'][0]['review']['accepted'] is False
+    journal.append('candidate_verified',commit_sha=sha,report=report)
+    journal.append('verification_check',name='contracts',commit_sha=sha,exit_code=0,duration_seconds=2.5,stdout='private')
+    value=Publisher([store],tmp_path/'none').snapshot()['runs'][0]
+    assert value['review']['accepted'] is True and value['review']['candidate_sha']==sha
+    assert value['checks'][0]['commit_sha']==sha and value['checks'][0]['duration_seconds']==2.5
+    assert len(value['checks'][0]['record_sha256'])==64
+    assert value['environment']['profile_sha256']=='b'*64
+    assert 'private' not in str(value)
+    journal.append('candidate_created',commit_sha='e'*40)
+    assert Publisher([store],tmp_path/'none').snapshot()['runs'][0]['review'] is None
