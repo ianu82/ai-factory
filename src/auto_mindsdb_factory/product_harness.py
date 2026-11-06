@@ -23,7 +23,7 @@ def resolve_harness(document: Mapping[str, Any], role: str) -> str:
     name = document.get(_ROLE_FIELDS[role], "native")
     if name not in HARNESS_NAMES:
         raise HarnessSelectionError("Unknown product agent harness")
-    # Codex remains reserved until its supported adapter is qualified.
-    if name == "codex":
+    # Live certification uses an explicit manual lane; ordinary intake stays closed.
+    if name == "codex" and document.get("execution_lane") != "codex-qualification":
         raise HarnessSelectionError(f"Product agent harness is unavailable: {name}")
     return name

@@ -1,4 +1,4 @@
-"""Factory-owned Codex sessions; selection remains disabled until qualification."""
+"""Factory-owned Codex sessions, including the explicit manual qualification lane."""
 
 import asyncio
 from contextlib import ExitStack
@@ -32,6 +32,12 @@ def validate_codex_dependencies():
                     raise ValueError("changed dependency")
     except (ValueError, TypeError, OSError, LookupError, ImportError, AttributeError):
         raise AgentSessionError("Codex requires the reviewed pinned client dependencies") from None
+
+
+def validate_codex_installation():
+    from .codex_process import validate_codex_process_installation
+    validate_codex_dependencies()
+    validate_codex_process_installation()
 
 
 async def _drain(awaitable):

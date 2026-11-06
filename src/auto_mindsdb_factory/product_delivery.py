@@ -90,9 +90,15 @@ class ProductDelivery:
         if self.cancelled():
             raise HarnessStopped("Delivery was cancelled")
 
-    def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
+    def _agent(self, role: str, journal: RunJournal) -> AgentHarness:
         name = resolve_harness(self.settings, role)
         config = execution_config(self.settings, role, journal)
+        if name == "codex":
+            from .codex_session import CodexAgent
+            config.validated()
+            return CodexAgent(config, journal,
+                max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
+                deadline=self.deadline, pricing=self.settings["pricing"], cancelled=self.cancelled)
         if name == "anton":
             from .anton_session import AntonAgent
             config.validated()
@@ -190,8 +196,10 @@ class ProductDelivery:
                     or manifest.get("task_sha") != task.digest
                     or ProductTask.from_document(manifest["task"]).digest != task.digest
                     or manifest.get("profile_sha") != self.profile.digest
-                    or ProductProfile.from_document(manifest["profile"]).digest != self.profile.digest
-                    or ProductProfile.from_document(self.settings).digest != self.profile.digest
+                    or ProductProfile.from_document(manifest["profile"], codex_qualification=(
+                        self.settings.get("execution_lane") == "codex-qualification")).digest != self.profile.digest
+                    or ProductProfile.from_document(self.settings, codex_qualification=(
+                        self.settings.get("execution_lane") == "codex-qualification")).digest != self.profile.digest
                     or manifest.get("base_sha") != base or manifest.get("candidate_sha") != sha
                     or not all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) for value in (base, sha))
                     or manifest.get("runtime_sha") != git(repo_root(), "rev-parse", "HEAD")

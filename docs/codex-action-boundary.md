@@ -1,4 +1,4 @@
-# Codex action boundary (preparation only)
+# Codex action boundary and manual qualification
 
 The isolated official CLI 0.167.0 loopback probe confirmed that dynamic tools use
 the supported app-server `item/tool/call` callback. Its request catalogue can still
@@ -18,7 +18,7 @@ every request and enforce cancellation/deadline and cleanup outside prompts.
 This parser is not an enabled adapter or a sandbox. A credential-free, isolated
 app-server, frozen instructions/configuration, scoped inference transport, actual
 SDK integration tests and real coding/negative/cancellation proofs remain required.
-Codex selection remains unavailable; no native or Anton behavior is changed.
+Ordinary Codex selection remains unavailable; native remains the default.
 
 The controller image installs the official CLI from `codex_bridge/package-lock.json`
 using `npm ci --ignore-scripts`. The wrapper and every platform package are fixed
@@ -120,3 +120,14 @@ the delivery's frozen plan, role, source, profile and environment checks.
 
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+Manual certification uses the normal `product-validate`, `product-deliver` and
+`product-replay` paths with BOTH `--codex-qualification` and a trusted profile
+containing `"execution_lane":"codex-qualification"` plus at least one explicit
+Codex role. The lane is retained in the canonical profile/hash. Ordinary loading
+and automatic Linear intake reject it. The selected role uses CodexAgent and its
+truthful execution receipt; planning stays native. Missing installation or drift
+fails closed. This opt-in authorizes no claim replay or release: all planning,
+isolation, independent QA, CI, exact merge, smoke, budget and audit gates remain.
+Source and mock-inference qualifications do not establish live coding or deployed
+certification. Production remains paused pending those proofs and release gates.

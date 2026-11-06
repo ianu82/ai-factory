@@ -21,6 +21,10 @@ def snapshot(settings, role, config):
     if config.fallback_model:
         raise HarnessStopped("Delivery requires pinned models without fallback")
     version, dependencies = "1", None
+    if name == "codex":
+        from .codex_session import validate_codex_installation
+        validate_codex_installation()
+        return codex_execution_snapshot(config)
     if name == "anton":
         from .anton_session import ANTON_COMMIT, validate_anton_installation
         validate_anton_installation()

@@ -106,13 +106,7 @@ def open_codex_process(provider_url, *, deadline, binary=None, proxy_token=None)
         env = {"HOME": str(home), "PATH": str(Path(node).resolve().parent) + os.pathsep + os.defpath}
         if time.monotonic() >= deadline:
             raise CodexProcessError("Codex startup deadline exhausted")
-        with _owned_process([str(executable), "--version"], work=work, env=env) as version:
-            try:
-                output, _ = version.communicate(timeout=max(0, min(10, deadline - time.monotonic())))
-            except subprocess.TimeoutExpired:
-                raise CodexProcessError("Codex version check timed out") from None
-            if version.returncode != 0 or output.strip() != "codex-cli " + CODEX_VERSION:
-                raise CodexProcessError("Codex installation differs from the pinned version")
+        _check_version(executable, work, env, deadline)
         config = {"model_provider": "factory_guarded", "web_search": "disabled", "agents.enabled": False,
                   "skills.bundled.enabled": False, "analytics.enabled": False, "feedback.enabled": False,
                   **{"features." + feature: False for feature in _FEATURES}}
@@ -131,3 +125,24 @@ def open_codex_process(provider_url, *, deadline, binary=None, proxy_token=None)
             raise CodexProcessError("Codex startup deadline exhausted")
         with _owned_process(command, work=work, env=env) as process:
             yield CodexProcess(process, home, work)
+
+
+def _check_version(executable, work, env, deadline):
+    with _owned_process([str(executable), "--version"], work=work, env=env) as version:
+        try:
+            output, _ = version.communicate(timeout=max(0, min(10, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            raise CodexProcessError("Codex version check timed out") from None
+        if version.returncode != 0 or output.strip() != "codex-cli " + CODEX_VERSION:
+            raise CodexProcessError("Codex installation differs from the pinned version")
+
+
+def validate_codex_process_installation():
+    """Check the actual default binary with no credentials or app-server startup."""
+    executable = Path(__file__).with_name("codex_bridge") / "node_modules/.bin/codex"
+    node = shutil.which("node")
+    if not executable.is_file() or node is None:
+        raise CodexProcessError("The pinned Codex installation is unavailable")
+    with tempfile.TemporaryDirectory(prefix="factory-codex-version-") as temporary:
+        env = {"HOME": temporary, "PATH": str(Path(node).resolve().parent) + os.pathsep + os.defpath}
+        _check_version(executable.resolve(), Path(temporary), env, time.monotonic() + 10)

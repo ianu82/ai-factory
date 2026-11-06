@@ -55,6 +55,8 @@ def register_product_commands(subparsers) -> None:
         parser = subparsers.add_parser(name)
         parser.add_argument("--profile", type=Path, required=True)
         parser.add_argument("--target-root", type=Path, required=True)
+        parser.add_argument("--codex-qualification", action="store_true",
+                            help="Explicit manual certification lane; requires a matching trusted profile")
         if name != "product-validate":
             parser.add_argument("--store-dir", type=Path, default=Path(".factory-automation"))
             parser.add_argument("--env-file", type=Path, help="Explicit controller environment file outside target source")
@@ -118,7 +120,8 @@ def handle_product_command(args, *, parse_env) -> int | None:
             if args.events:
                 result["timeline"] = journal.events()
         else:
-            profile = ProductProfile.load(args.profile, target_root=args.target_root)
+            profile = ProductProfile.load(args.profile, target_root=args.target_root,
+                codex_qualification=getattr(args, "codex_qualification", False))
             profile.validate_repository(args.target_root)
             if args.command == "product-linear-worker":
                 route = LinearProductRoute.load(args.route, target_root=args.target_root)
@@ -169,10 +172,15 @@ def handle_product_command(args, *, parse_env) -> int | None:
                 if any(resolve_harness(document, role) == "anton" for role in ("builder", "verifier")):
                     from .anton_session import validate_anton_installation
                     validate_anton_installation()
+                if any(resolve_harness(document, role) == "codex" for role in ("builder", "verifier")):
+                    from .codex_session import validate_codex_installation
+                    validate_codex_installation()
                 result = {"status": "valid", "profile_sha": profile.digest, "repository": document["repository"],
                           "builder_model": document["builder_model"], "reviewer_model": document["reviewer_model"],
                           "builder_harness": resolve_harness(document, "builder"),
                           "reviewer_harness": resolve_harness(document, "verifier")}
+                if "execution_lane" in document:
+                    result["execution_lane"] = document["execution_lane"]
             elif args.command == "product-replay":
                 delivery_factory = ProductDelivery
                 if args.runner == "railway":

@@ -52,6 +52,7 @@ SCHEMA = {
         "reviewer_model": {"type": "string", "minLength": 1},
         "builder_harness": {"enum": list(HARNESS_NAMES)},
         "reviewer_harness": {"enum": list(HARNESS_NAMES)},
+        "execution_lane": {"const": "codex-qualification"},
         "max_attempts": {"type": "integer", "minimum": 1, "maximum": 5},
         "max_agent_turns": {"type": "integer", "minimum": 1, "maximum": 100},
         "agent_max_output_tokens": {"type": "integer", "minimum": 256, "maximum": 32000},
@@ -80,10 +81,14 @@ class ProductProfile:
     canonical_json: str
 
     @classmethod
-    def from_document(cls, document: dict[str, Any]) -> "ProductProfile":
+    def from_document(cls, document: dict[str, Any], *, codex_qualification: bool = False) -> "ProductProfile":
         errors = sorted(Draft202012Validator(SCHEMA).iter_errors(document), key=lambda e: str(e.path))
         if errors:
             raise ProfileError(f"Invalid product profile at {list(errors[0].path)}: {errors[0].message}")
+        qualification = document.get("execution_lane") == "codex-qualification"
+        if qualification != codex_qualification or (qualification and not any(
+                document.get(field) == "codex" for field in ("builder_harness", "reviewer_harness"))):
+            raise ProfileError("Codex qualification requires its explicit profile lane and manual command option")
         try:
             for role in ("builder", "verifier"):
                 resolve_harness(document, role)
@@ -99,11 +104,11 @@ class ProductProfile:
         return cls(json.dumps(resolved, sort_keys=True, separators=(",", ":"), allow_nan=False))
 
     @classmethod
-    def load(cls, path: Path, *, target_root: Path | None = None) -> "ProductProfile":
+    def load(cls, path: Path, *, target_root: Path | None = None, codex_qualification: bool = False) -> "ProductProfile":
         if target_root and path.resolve().is_relative_to(target_root.resolve()):
             raise ProfileError("Product profile must be outside the candidate repository")
         try:
-            return cls.from_document(json.loads(path.read_text(encoding="utf-8")))
+            return cls.from_document(json.loads(path.read_text(encoding="utf-8")), codex_qualification=codex_qualification)
         except (OSError, json.JSONDecodeError) as exc:
             raise ProfileError("Could not read product profile") from exc
 
