@@ -107,5 +107,9 @@ Local full-session tests cover report rejection, active provider/command stop an
 cleanup. This still enables no selection or runtime; production wiring, exact
 configuration/environment qualification and live delivery proofs remain required.
 
+Delivery supplies an abortable command callback to each role. Its abort signal
+latches a local stop; the existing job-command watcher remains the sole owner of
+sandbox retirement. Repeated signals cannot issue duplicate retirement calls.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

@@ -6,6 +6,7 @@ import fnmatch
 import json
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -103,13 +104,21 @@ class ProductDelivery:
             max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
             deadline=self.deadline, pricing=self.settings["pricing"], cancelled=self.cancelled)
 
-    def _command(self, sandbox, command: list[str], *, deadline=None) -> dict:
+    def _command(self, sandbox, command: list[str], *, deadline=None, cancelled=None) -> dict:
         remaining = min(self.deadline, deadline if deadline is not None else self.deadline) - time.monotonic()
         if remaining < 1:
             raise DeliveryError("Run time budget exhausted")
         sandbox.timeout = min(self.settings["command_timeout_seconds"], int(remaining))
-        return run_cancellable(sandbox, command, cancelled=self.cancelled,
+        return run_cancellable(sandbox, command, cancelled=self.cancelled if cancelled is None else cancelled,
             deadline=min(self.deadline, deadline if deadline is not None else self.deadline))
+
+    def _agent_command(self, sandbox):
+        stopped = threading.Event()
+        def command(arguments):
+            return self._command(sandbox, arguments, cancelled=lambda: stopped.is_set() or self.cancelled())
+        # Signal the existing command watcher; it remains the sole abort owner.
+        command.abort = stopped.set
+        return command
 
     def _prepare(self, sha: str, workspace: Path, journal: RunJournal, *, deadline=None) -> dict[str, bytes]:
         export_source(self.target, sha, workspace)
@@ -229,7 +238,7 @@ class ProductDelivery:
                            "controller_checks": [{"name": c["name"], "exit_code": c["exit_code"]} for c in checks]}
                 if plan is not None:
                     context["plan"] = plan
-                report = self.agent_factory("verifier", journal).run("verifier", context, lambda cmd: self._command(sandbox, cmd))
+                report = self.agent_factory("verifier", journal).run("verifier", context, self._agent_command(sandbox))
             if (source_files(workspace) != original or executable_paths(workspace, original) != original_executables):
                 raise DeliveryError("Verifier changed candidate source")
             if report["status"] == "failed":
@@ -292,7 +301,7 @@ class ProductDelivery:
                                            "allowed_paths": self.settings["allowed_paths"], "revision_feedback": feedback, "plan": plan}
                                 with self.sandbox_factory(workspace, self.settings["image"], writable=True, platform=self.settings["platform"]) as sandbox:
                                     context["plan"] = retained_plan(self, task, base_sha, journal)
-                                    report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
+                                    report = self.agent_factory("builder", journal).run("builder", context, self._agent_command(sandbox))
                                 self.check_cancelled()
                                 if report["status"] not in {"passed", "unverified"} or report["findings"]:
                                     raise DeliveryError("Builder did not complete the task: " + _report_feedback(report))
