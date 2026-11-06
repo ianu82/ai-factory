@@ -1,9 +1,7 @@
 """Qualify the real console container without provider credentials or inference."""
 import json
 import subprocess
-import tempfile
 import time
-from pathlib import Path
 from datetime import datetime,timezone
 from urllib.error import HTTPError
 from urllib.request import Request,urlopen
@@ -18,12 +16,12 @@ def main():
         '--tmpfs','/tmp:rw,nosuid,noexec,size=16m','--memory','256m','--cpus','1','--pids-limit','64',
         '-p','127.0.0.1::8080','factory-console-ci')
     try:
-        with tempfile.TemporaryDirectory(prefix='console-ci-') as directory:
-            config=Path(directory)/'credentials.json'
-            config.write_text(json.dumps({'FACTORY_CONSOLE_ACCESS_KEY':'ci-preview-only-never-production',
-                'FACTORY_CONSOLE_BRIDGE_TOKEN':'ci-bridge-only-never-production'}))
-            config.chmod(0o600)
-            run('docker','cp',str(config),container+':/data/credentials.json')
+        # docker cp refuses a read-only root even for a writable tmpfs mount.
+        # Write only the test configuration into that mount via the exec channel.
+        subprocess.run(['docker','exec','-i',container,'python','-c',
+            "import sys;from pathlib import Path;p=Path('/data/credentials.json');p.write_text(sys.stdin.read());p.chmod(0o600)"],
+            input=json.dumps({'FACTORY_CONSOLE_ACCESS_KEY':'ci-preview-only-never-production',
+                'FACTORY_CONSOLE_BRIDGE_TOKEN':'ci-bridge-only-never-production'}),text=True,check=True)
         port=run('docker','port',container,'8080/tcp').split(':')[-1]
         origin='http://127.0.0.1:'+port
         def request(path,body=None,headers=None):
