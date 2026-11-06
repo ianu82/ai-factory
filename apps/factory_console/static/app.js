@@ -62,6 +62,7 @@ function render() {
     ? ws.name
     : {
         inbox: "Inbox",
+        board: "Board",
         workspaces: "Workspaces",
         runs: "Runs",
         chat: "Master chat",
@@ -76,7 +77,7 @@ function render() {
 </span>
 </a>
 <button class="icon-button sidebar-close" data-close-nav aria-label="Close navigation">${icon("close")}</button>
-<nav aria-label="Master navigation">${nav("inbox", "Inbox", "inbox", attention().length)}${nav("chat", "Master chat", "chat")}${nav("runs", "Runs", "runs", active)}</nav>
+<nav aria-label="Master navigation">${nav("inbox", "Inbox", "inbox", attention().length)}${nav("board", "Board", "board")}${nav("chat", "Master chat", "chat")}${nav("runs", "Runs", "runs", active)}</nav>
 <div class="workspace-label">
 <a class="nav-label" href="#/workspaces">Workspaces</a>
 <button class="icon-button" data-new-workspace aria-label="Add workspace">${icon("plus")}</button>
@@ -115,7 +116,7 @@ function render() {
     : document.querySelector("#view");
   if (view === "inbox") container.innerHTML = inbox(data, ws);
   else if (view === "workspaces") container.innerHTML = workspaces(data);
-  else if (view === "board" && ws) container.innerHTML = board(data, ws);
+  else if (view === "board") container.innerHTML = board(data, ws);
   else if (view === "runs") container.innerHTML = runs(data, ws);
   else if (view === "run") container.innerHTML = runDetail(data, r[1]);
   else if (view === "settings" && ws) container.innerHTML = settings(data, ws);

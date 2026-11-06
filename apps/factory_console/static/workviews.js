@@ -9,68 +9,40 @@ import {
   scopedRuns,
 } from "./core.js";
 import { workspaceDialog, itemDialog } from "./app.js";
+const boardFilters = new Map();
+const columns = [
+  ["backlog", "Backlog"], ["ready", "Ready"], ["building", "Building"],
+  ["verifying", "Verifying"], ["ci", "CI / Merge"], ["blocked", "Blocked"],
+  ["complete", "Merged"], ["canceled", "Canceled"], ["duplicate", "Duplicate"],
+];
+const boardStage = (status) => ({planning: "building", smoking: "ci", review: "verifying"})[status] || status;
+const reference = (id) => id.length > 24 ? id.slice(0, 10) + "…" + id.slice(-10) : id;
 export function board(data, workspace) {
-  const runs = scopedRuns(data, workspace),
-    local = data.items.filter(
-      (i) => i.workspace_id === workspace.id && !i.run_id,
-    );
+  return `${workspace ? "" : `<div class="page-heading"><h1>Board</h1><button class="button primary" data-new-work>${icon("plus")}New work</button></div>`}
+  <div class="board-toolbar">${!workspace && data.workspaces.length > 1 ? `<select id="board-workspace" aria-label="Filter workspace"><option value="">All workspaces</option>${data.workspaces.map(w => `<option value="${e(w.id)}">${e(w.name)}</option>`).join("")}</select>` : ""}
+  <label class="search-box">${icon("search")}<input data-search placeholder="Search board" aria-label="Search board"></label>
+  <label class="board-empty-toggle"><input type="checkbox" id="board-empty">Hide empty stages</label></div>
+  <div class="board" id="work-board" aria-label="Work board"></div>`;
+}
+function boardCards(data, workspace, state) {
+  const scope = workspace || data.workspaces.find(w => w.id === state.workspace);
   const cards = [
-    ...local,
-    ...runs.map((r) => ({
-      ...r,
-      run_id: r.id,
-      priority: null,
-      mode: "engineering",
-      description: "",
-    })),
-  ];
-  const column = (s) =>
-    ["planning", "building", "verifying", "ci", "smoking", "unknown"].includes(
-      s,
-    )
-      ? "progress"
-      : s === "complete"
-        ? "complete"
-        : s;
-  return `<div class="board" aria-label="Work board">${[
-    ["backlog", "Backlog"],
-    ["ready", "Ready"],
-    ["progress", "In progress"],
-    ["blocked", "Blocked"],
-    ["review", "Review"],
-    ["complete", "Delivered"],
-  ]
-    .map(([key, label]) => {
-      const list = cards.filter((c) => column(c.status) === key);
-      return `<section class="board-column">
-<header>
-<span class="column-dot ${key}">
-</span>
-<h3>${label}</h3>
-<span class="column-count">${list.length}</span>
-</header>
-<div class="board-cards">${
-        list.length
-          ? list
-              .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-              .map(
-                (
-                  c,
-                ) => `<button class="work-card ${c.status === "blocked" ? "blocked" : ""}" ${c.run_id ? `data-open-run="${e(c.run_id)}"` : `data-edit-item="${e(c.id)}"`}>
-<div class="work-card-meta">
-<span>${c.run_id ? "Run" : "Draft"}</span>${c.priority ? priority(c.priority) : ""}</div>
-<h3>${e(c.title)}</h3>${c.description && c.description.trim() !== c.title.trim() ? `<p>${e(c.description)}</p>` : ""}${column(c.status) === "progress" ? badge(c.status) : ""}<footer>
-<span>${c.run_id ? e(c.repository.split("/")[1]) : c.mode === "non-coding" ? "Non-coding" : "Engineering"}</span>
-<span>${relative(c.updated_at)}</span>
-</footer>
-</button>`,
-              )
-              .join("")
-          : ""
-      }</div>
-</section>`;
-    })
-    .join("")}</div>`;
+    ...data.items.filter(i => !i.run_id && (!scope || i.workspace_id === scope.id)),
+    ...scopedRuns(data, scope).map(r => ({...r, run_id: r.id, priority: null})),
+  ].filter(c => `${c.title} ${c.id} ${c.repository || ""}`.toLowerCase().includes(state.query.toLowerCase()));
+  const groups = [...columns, ...(cards.some(c => !columns.some(([key]) => boardStage(c.status) === key)) ? [["unknown", "Unverified"]] : [])];
+  return groups.map(([key, label]) => {
+    const list = cards.filter(c => (columns.some(([k]) => k === boardStage(c.status)) ? boardStage(c.status) : "unknown") === key);
+    if (state.hideEmpty && !list.length) return "";
+    return `<section class="board-column"><header><span class="column-dot ${key}"></span><h3>${label}</h3><span class="column-count">${list.length}</span>${key === "backlog" ? `<button class="icon-button" data-new-board-item aria-label="Add to backlog">${icon("plus")}</button>` : ""}</header>
+    <div class="board-cards">${list.sort((a,b) => b.updated_at.localeCompare(a.updated_at)).map(c => {
+      const ws = data.workspaces.find(w => w.id === c.workspace_id || w.repositories.includes(c.repository));
+      return `<a class="work-card" ${c.run_id ? `href="#/run/${e(c.id)}"` : `href="#/item/${e(c.id)}" data-edit-item="${e(c.id)}"`} title="${e(c.title)}">
+      <div class="work-card-meta"><span class="mono" title="${e(c.id)}">${e(reference(c.id))}</span>${c.priority ? priority(c.priority) : ""}</div>
+      <h3>${e(c.title)}</h3><footer><span title="${e(c.repository || ws?.name)}">${e(!workspace ? ws?.name || c.repository : c.repository?.split("/")[1] || (c.mode === "non-coding" ? "Non-coding" : "Engineering"))}</span>
+      <span>${c.checks?.length ? `${icon("checkcircle")} ${c.checks.filter(x => x.status === "passed").length}/${c.checks.length}` : ""}${relative(c.updated_at)}</span></footer></a>`;
+    }).join("")}</div></section>`;
+  }).join("") || empty("search", "No matches", "");
 }
 export function runs(data, workspace) {
   const list = scopedRuns(data, workspace).sort((a, b) =>
@@ -239,6 +211,26 @@ export function settings(data, workspace) {
 </div>`;
 }
 export function bindWorkViews(data, workspace) {
+  const boardNode = document.querySelector("#work-board");
+  if (boardNode) {
+    const key = workspace?.id || "all";
+    const state = boardFilters.get(key) || {workspace: "", query: "", hideEmpty: false};
+    boardFilters.set(key, state);
+    const search = document.querySelector("[data-search]");
+    const filter = document.querySelector("#board-workspace");
+    const hideEmpty = document.querySelector("#board-empty");
+    search.value = state.query;
+    hideEmpty.checked = state.hideEmpty;
+    if (filter) filter.value = state.workspace;
+    const redraw = () => {
+      boardNode.innerHTML = boardCards(data, workspace, state);
+      boardNode.querySelector("[data-new-board-item]")?.addEventListener("click", () => itemDialog(workspace || data.workspaces.find(w => w.id === state.workspace)));
+    };
+    search.oninput = () => {state.query = search.value; redraw();};
+    hideEmpty.onchange = () => {state.hideEmpty = hideEmpty.checked; redraw();};
+    if (filter) filter.onchange = () => {state.workspace = filter.value; redraw();};
+    redraw();
+  }
   document
     .querySelectorAll("[data-open-run]")
     .forEach(
@@ -246,11 +238,12 @@ export function bindWorkViews(data, workspace) {
     );
   document.querySelectorAll("[data-edit-item]").forEach(
     (b) =>
-      (b.onclick = () =>
+      (b.onclick = (event) => {
+        event.preventDefault();
         itemDialog(
           workspace,
           data.items.find((i) => i.id === b.dataset.editItem),
-        )),
+        ); }),
   );
   document
     .querySelector("[data-edit-workspace]")
