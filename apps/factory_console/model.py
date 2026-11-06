@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import re
 
 PRIORITIES = {'urgent': 0, 'high': 1, 'medium': 2, 'low': 3}
-STATES = {'backlog', 'ready', 'planning', 'building', 'verifying', 'ci', 'smoking', 'complete', 'blocked', 'unknown'}
+STATES = {'backlog', 'ready', 'planning', 'building', 'verifying', 'ci', 'smoking', 'review', 'complete', 'blocked', 'unknown'}
 MODES = {'engineering', 'non-coding'}
 SECRET = re.compile(r'(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|Bearer\s+\S+)', re.I)
 
@@ -85,6 +85,7 @@ def projection(value):
     runtime = controller.get('runtime_sha', '')
     return {'version': 1, 'observed_at': observed, 'controller': {'mode': mode,
         'runtime_sha': runtime if isinstance(runtime, str) and re.fullmatch(r'[0-9a-f]{40}', runtime) else None,
+        'unreadable_runs': controller.get('unreadable_runs') if type(controller.get('unreadable_runs')) is int and 0 <= controller['unreadable_runs'] <= 1000 else 0,
         'chat_available': controller.get('chat_available') is True}, 'runs': clean}
 
 
