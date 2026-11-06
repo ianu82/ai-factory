@@ -86,7 +86,8 @@ def delivery_case(product_root, monkeypatch, investigating_planner):
             return result
         connector = SimpleNamespace(config=SimpleNamespace(model="fake", max_output_tokens=1000,
             reasoning_effort="low", timeout_seconds=10), request_response=request)
-        return ProductAgent(connector, journal, max_turns=5, max_total_tokens=1000, deadline=delivery.deadline)
+        return ProductAgent(connector, journal, max_turns=5, max_total_tokens=1000,
+                            deadline=delivery.deadline, cancelled=delivery.cancelled)
 
     delivery = ProductDelivery(profile, target, tmp_path / "store", agent_factory=agent, sandbox_factory=Sandbox, planner_factory=investigating_planner)
     real_prepare = delivery._prepare
@@ -231,3 +232,33 @@ def test_blocked_plan_never_starts_builder_or_promotion(delivery_case):
     with pytest.raises(PlanningStopped):
         case.delivery.run(case.task, base_sha=case.base, promote=lambda *args: pytest.fail("promoted"))
     assert not case.requests and case.journal.summary()["attempts"] == 0
+
+
+def test_cancellation_after_real_builder_command_prevents_retry_and_promotion(delivery_case, monkeypatch):
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    from auto_mindsdb_factory.product_cancellation import request_cancellation
+    case = delivery_case
+    case.responses.extend(builder())
+    original = case.delivery._command
+    def command(sandbox, argv, **kwargs):
+        result = original(sandbox, argv, **kwargs)
+        if argv == ["edit"]:
+            request_cancellation(case.delivery.store, case.task.document["id"])
+        return result
+    monkeypatch.setattr(case.delivery, "_command", command)
+    with pytest.raises(HarnessStopped):
+        case.delivery.run(case.task, base_sha=case.base, promote=lambda *a: pytest.fail("promoted"))
+    assert len(case.requests) == 1 and case.commands.count(["edit"]) == 1
+    assert case.journal.summary()["attempts"] == 1 and case.journal.summary()["status"] == "blocked"
+    assert not any(e["kind"] == "candidate_created" for e in case.journal.events())
+
+
+def test_keyboard_interrupt_records_blocked_outcome_without_retry(delivery_case):
+    case = delivery_case
+    def interrupt(*args):
+        raise KeyboardInterrupt
+    case.delivery.agent_factory = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        run(case)
+    assert case.journal.summary()["status"] == "blocked" and case.journal.summary()["attempts"] == 1
+    assert case.journal.events()[-1]["data"]["reason"] == "KeyboardInterrupt"

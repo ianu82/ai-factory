@@ -74,6 +74,12 @@ Linear/staged automation retains its separate PR-ready boundary.
 Direct delivery and replay support explicit `--runner railway` without Linear.
 Docker remains the default. Planning, implementation and verification own their
 worker lifecycle; standalone verification replay also closes each phase's pool.
+`product-cancel --store-dir … --run-id …` requests cancellation of an existing
+nonterminal direct run. Its retained marker stops new inference, commands, retries
+and promotion. Active commands retire their owned environment; active Anton HTTP
+requests are cancelled and drained. An already active native HTTP request can
+finish or reach its existing transport timeout before stopping; observed usage is
+retained. Cancellation cannot undo an external merge that has already happened.
 
 `product-inspect` reads a run summary and optionally its event history. Product
 commands never discover `.env` files in the target working directory. Use process

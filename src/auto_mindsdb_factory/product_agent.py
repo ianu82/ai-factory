@@ -69,13 +69,15 @@ class ProductAgent:
     report_event = "agent_report"
 
     def __init__(self, connector: OpenAIResponsesAgentConnector, journal: RunJournal,
-                 *, max_turns: int, max_total_tokens: int, deadline: float, pricing: dict | None = None) -> None:
+                 *, max_turns: int, max_total_tokens: int, deadline: float, pricing: dict | None = None,
+                 cancelled: Callable[[], bool] = lambda: False) -> None:
         self.connector = connector
         self.journal = journal
         self.max_turns = max_turns
         self.max_total_tokens = max_total_tokens
         self.deadline = deadline
         self.pricing = pricing or {}
+        self.cancelled = cancelled
 
     def _instructions(self, role: str) -> str:
         return execution_role(self.journal, role)["instructions"]
@@ -96,6 +98,8 @@ class ProductAgent:
         items: list[dict] = [{"role": "user", "content": json.dumps(context)}]
         ran_command = False
         for turn in range(self.max_turns):
+            if self.cancelled():
+                raise HarnessStopped("Agent execution was cancelled")
             if time.monotonic() >= self.deadline:
                 raise AgentSessionError("Run time budget exhausted")
             usage = self.journal.summary()
@@ -127,6 +131,8 @@ class ProductAgent:
                 status=payload.get("status"), incomplete_details=payload.get("incomplete_details"),
                 duration_seconds=round(time.monotonic() - started, 3),
                 cost_estimate_usd=estimate_cost(payload.get("usage"), rate), pricing=rate)
+            if self.cancelled():
+                raise HarnessStopped("Agent execution was cancelled after an observed response")
             if payload.get("status") != "completed":
                 raise AgentSessionError("Model response did not complete")
             if not self.journal.summary()["usage_complete"]:

@@ -22,6 +22,7 @@ from .product_task import ProductTask
 from .product_outcomes import outcome_metrics
 from .product_improvements import propose_improvements
 from .run_journal import RunJournal
+from .product_cancellation import request_cancellation
 
 
 def _bounded_int(minimum, maximum):
@@ -38,6 +39,9 @@ def _bounded_int(minimum, maximum):
 
 
 def register_product_commands(subparsers) -> None:
+    cancel = subparsers.add_parser("product-cancel")
+    cancel.add_argument("--store-dir", type=Path, required=True)
+    cancel.add_argument("--run-id", required=True)
     for name in ["product-validate", "product-deliver", "product-replay"]:
         parser = subparsers.add_parser(name)
         parser.add_argument("--profile", type=Path, required=True)
@@ -79,7 +83,9 @@ def handle_product_command(args, *, parse_env) -> int | None:
     if not args.command.startswith("product-"):
         return None
     try:
-        if args.command == "product-improvements":
+        if args.command == "product-cancel":
+            result = request_cancellation(args.store_dir, args.run_id)
+        elif args.command == "product-improvements":
             result = {"proposals": propose_improvements(args.store_dir, min_failures=args.min_failures,
                 limit=args.limit, cooldown_hours=args.cooldown_hours)}
         elif args.command == "product-metrics":
@@ -160,8 +166,10 @@ def handle_product_command(args, *, parse_env) -> int | None:
                     delivery_factory = RailwayDelivery
                 delivery = delivery_factory(profile, args.target_root, args.store_dir)
                 def publish(candidate, journal):
+                    delivery.check_cancelled()
                     return GitHubPromotion(profile, task, args.target_root, args.store_dir,
-                        smoke=delivery.smoke, deadline=delivery.deadline)(candidate, journal)
+                        smoke=delivery.smoke, deadline=delivery.deadline,
+                        before_merge=delivery.check_cancelled)(candidate, journal)
                 result = delivery.run(task, promote=publish if args.publish else None)
         print(json.dumps(result, indent=2))
         return 1 if result.get("total") is not None and result["correct"] != result["total"] else 0

@@ -19,6 +19,7 @@ from .product_planning import planning_manifest, plan_delivery, retained_plan
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
 from .product_execution import execution_manifest, execution_config
+from .product_cancellation import RunCancellation, run_cancellable
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
@@ -72,7 +73,16 @@ class ProductDelivery:
         self.deadline = 0.0
 
     def plan(self, task, base, journal):
+        self._cancellation = RunCancellation(journal)
+        self.check_cancelled()
         return plan_delivery(self, task, base, journal, planner_factory=self.planner_factory)
+
+    def cancelled(self):
+        return getattr(self, "_cancellation", lambda: False)()
+
+    def check_cancelled(self):
+        if self.cancelled():
+            raise HarnessStopped("Delivery was cancelled")
 
     def _agent(self, role: str, journal: RunJournal) -> ProductAgent:
         name = resolve_harness(self.settings, role)
@@ -82,18 +92,19 @@ class ProductDelivery:
             config.validated()
             agent = AntonAgent(config, journal,
                 max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
-                deadline=self.deadline, pricing=self.settings["pricing"])
+                deadline=self.deadline, pricing=self.settings["pricing"], cancelled=self.cancelled)
             return agent
         return ProductAgent(OpenAIResponsesAgentConnector(config), journal,
             max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
-            deadline=self.deadline, pricing=self.settings["pricing"])
+            deadline=self.deadline, pricing=self.settings["pricing"], cancelled=self.cancelled)
 
     def _command(self, sandbox, command: list[str], *, deadline=None) -> dict:
         remaining = min(self.deadline, deadline if deadline is not None else self.deadline) - time.monotonic()
         if remaining < 1:
             raise DeliveryError("Run time budget exhausted")
         sandbox.timeout = min(self.settings["command_timeout_seconds"], int(remaining))
-        return sandbox.run(command)
+        return run_cancellable(sandbox, command, cancelled=self.cancelled,
+            deadline=min(self.deadline, deadline if deadline is not None else self.deadline))
 
     def _prepare(self, sha: str, workspace: Path, journal: RunJournal, *, deadline=None) -> dict[str, bytes]:
         export_source(self.target, sha, workspace)
@@ -150,6 +161,7 @@ class ProductDelivery:
 
     def verify(self, task: ProductTask, sha: str, base: str, journal: RunJournal, *, prior_feedback: str = "") -> dict:
         execution_role(journal, "verifier")
+        self.check_cancelled()
         plan = retained_plan(self, task, base, journal)
         with tempfile.TemporaryDirectory(prefix="ai-factory-verify-") as temporary:
             workspace = Path(temporary) / "source"
@@ -214,6 +226,7 @@ class ProductDelivery:
                     journal.append("base_resolved", commit_sha=base_sha)
                     self.plan(task, base_sha, journal)
                     for attempt in range(1, self.settings["max_attempts"] + 1):
+                        self.check_cancelled()
                         # A previous response (including a failed verifier response) can
                         # exhaust the shared budget. Check before any attempt setup.
                         usage = journal.summary()
@@ -235,6 +248,7 @@ class ProductDelivery:
                                 with self.sandbox_factory(workspace, self.settings["image"], writable=True, platform=self.settings["platform"]) as sandbox:
                                     context["plan"] = retained_plan(self, task, base_sha, journal)
                                     report = self.agent_factory("builder", journal).run("builder", context, lambda cmd: self._command(sandbox, cmd))
+                                self.check_cancelled()
                                 if report["status"] not in {"passed", "unverified"} or report["findings"]:
                                     raise DeliveryError("Builder did not complete the task: " + _report_feedback(report))
                                 if report["status"] == "unverified":
@@ -261,13 +275,15 @@ class ProductDelivery:
                                      "profile_sha": self.profile.digest, "task_sha": task.digest,
                                      "changed_paths": paths, "verification": verification}
                         lease.heartbeat()
+                        self.check_cancelled()
                         if promote is not None:
                             stage("merging")
                         result = promote(candidate, journal) if promote else {"status": "verified", **candidate}
+                        self.check_cancelled()
                         journal.append("run_finished", status=result["status"], duration_seconds=round(time.monotonic() - started, 3))
                         return {**result, "evidence_dir": str(journal.root), "usage": journal.summary()}
                     raise DeliveryError("No candidate passed independent verification within the attempt budget")
-                except Exception as exc:
+                except (Exception, KeyboardInterrupt) as exc:
                     try:
                         journal.append("run_finished", status="blocked", reason=str(exc) if isinstance(exc, RoleSnapshotError) else type(exc).__name__, duration_seconds=round(time.monotonic() - started, 3), **_terminal_runner_facts(exc))
                     except Exception:

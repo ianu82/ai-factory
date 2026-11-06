@@ -62,7 +62,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         if planner_factory is None:
             config = execution_config(delivery.settings, "planner", journal)
             planner = ProductPlanner(OpenAIResponsesAgentConnector(config), journal, task=task,
-                base_sha=base, profile=delivery.profile, deadline=deadline)
+                base_sha=base, profile=delivery.profile, deadline=deadline, cancelled=delivery.cancelled)
         else:
             planner = planner_factory(task, base, journal, deadline)
         with tempfile.TemporaryDirectory(prefix="ai-factory-plan-") as temporary:

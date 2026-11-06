@@ -14,7 +14,7 @@ class ProductPlanner(ProductAgent):
     tools = [TOOLS[0], {**TOOLS[1], "parameters": PLAN_SCHEMA,
                       "description": "Finish with bounded planning guidance; unresolved questions block implementation."}]
 
-    def __init__(self, connector, journal, *, task, base_sha, profile, deadline):
+    def __init__(self, connector, journal, *, task, base_sha, profile, deadline, cancelled=lambda: False):
         settings = profile.document
         usage = journal.summary()
         if not usage["usage_complete"] or usage["total_tokens"] >= settings["max_total_tokens"]:
@@ -25,7 +25,7 @@ class ProductPlanner(ProductAgent):
             raise AgentSessionError("Planning requires the pinned builder model without fallback")
         super().__init__(connector, journal, max_turns=min(8, settings["max_agent_turns"]),
             max_total_tokens=min(settings["max_total_tokens"], usage["total_tokens"] + 100000),
-            deadline=min(deadline, time.monotonic() + 120), pricing=settings["pricing"])
+            deadline=min(deadline, time.monotonic() + 120), pricing=settings["pricing"], cancelled=cancelled)
         self.task, self.base_sha, self.profile = task, base_sha, profile
 
     def _instructions(self, role):
