@@ -20,13 +20,17 @@ export function inbox(data, workspace) {
       !i.resolved &&
       (!workspace || i.workspace_id === workspace.id),
   ).length;
-  return `<div class="page-heading">
+  return `${
+    workspace
+      ? ""
+      : `<div class="page-heading">
 <div>
-<h1>${workspace ? "Attention" : "Inbox"}<span class="heading-count">${count}</span>
+<h1>Inbox<span class="heading-count">${count}</span>
 </h1>
 </div>
 <button class="button primary" data-new-work>${icon("plus")}New work</button>
-</div>
+</div>`
+  }
 <div class="inbox-toolbar">
 <div class="segments" aria-label="Inbox order">
 <button class="selected" data-order="priority">${icon("layers")}Priority</button>

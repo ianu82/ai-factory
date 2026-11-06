@@ -21,10 +21,14 @@ export function chat(data, workspace) {
   return `${workspace ? "" : '<div class="page-heading chat-page-heading"><h1>Master chat</h1></div>'}
 <div class="chat-layout ${workspace ? "scoped" : ""}">
 <section class="chat-main" aria-label="Master chat">
-<header class="chat-scope">
-${workspace ? "" : `<select id="chat-workspace" aria-label="Chat workspace">${data.workspaces.map((w) => `<option value="${e(w.id)}" ${w.id === ws.id ? "selected" : ""}>${e(w.name)}</option>`).join("")}</select>`}
+${
+  workspace
+    ? ""
+    : `<header class="chat-scope">
+<select id="chat-workspace" aria-label="Chat workspace">${data.workspaces.map((w) => `<option value="${e(w.id)}" ${w.id === ws.id ? "selected" : ""}>${e(w.name)}</option>`).join("")}</select>
 <button class="context-button" data-chat-context aria-label="Workspace context">${icon("git")}${ws.repositories.length} repositories</button>
-</header>
+</header>`
+}
 <div class="chat-history" id="chat-history" aria-live="polite">${messages.length ? messages.map((m) => message(m)).join("") : `<section class="chat-welcome"><h2>${available ? "What would you like to work on?" : "Start with a brief"}</h2></section>`}</div>
 <div class="composer-area">
 ${available ? "" : '<p class="chat-policy">Orchestrator replies aren’t connected yet.</p>'}
@@ -106,8 +110,10 @@ export function bindChat(data, workspace, refresh) {
         form.elements.description.value = m.content;
       }),
   );
-  document.querySelector("[data-chat-context]").onclick = () =>
-    showDialog(`<div class="dialog-heading">
+  const contextButton = document.querySelector("[data-chat-context]");
+  if (contextButton)
+    contextButton.onclick = () =>
+      showDialog(`<div class="dialog-heading">
 <h2>${e(ws.name)}</h2>
 <button class="icon-button" data-close aria-label="Close">${icon("close")}</button>
 </div>
