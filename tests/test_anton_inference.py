@@ -129,3 +129,14 @@ def test_malformed_or_undeclared_calls_are_rejected_before_sdk_dispatch(tmp_path
     with pytest.raises(AntonStopped):
         asyncio.run(guard.request(sdk, BODY))
     assert len(calls) == 1 and guard.journal.summary()["total_tokens"] == 10
+
+
+def test_evidence_failure_cannot_trigger_sdk_recovery(tmp_path, monkeypatch):
+    guard = boundary(tmp_path)
+    sdk, calls, _ = client(USAGE)
+    def fail(*args, **kwargs):
+        raise OSError("diagnostic write failed")
+    monkeypatch.setattr(guard.journal, "append", fail)
+    with pytest.raises(AntonStopped):
+        asyncio.run(guard.request(sdk, BODY))
+    assert not calls

@@ -25,10 +25,19 @@ class AntonInference:
     def admit(self):
         if self.cancelled() or time.monotonic() >= self.deadline:
             raise AntonStopped("Anton execution cancelled or timed out")
-        usage = self.journal.summary()
+        try:
+            usage = self.journal.summary()
+        except Exception:
+            raise AntonStopped("Anton execution evidence is unavailable") from None
         if not usage["usage_complete"] or usage["total_tokens"] >= self.max_total_tokens:
             raise AntonStopped("Anton usage is unknown or its shared budget is exhausted")
         return usage
+
+    def record(self, kind, **data):
+        try:
+            return self.journal.append(kind, **data)
+        except Exception:
+            raise AntonStopped("Anton execution evidence could not be retained") from None
 
     async def request(self, client, supplied):
         usage = self.admit()
@@ -46,7 +55,7 @@ class AntonInference:
                 "reasoning": {**reasoning, "effort": self.config.reasoning_effort},
                 "include": sorted(set(supplied.get("include", [])) | {"reasoning.encrypted_content"})}
         self.calls += 1
-        self.journal.append("model_requested", role=self.role, turn=self.calls, harness="anton",
+        self.record("model_requested", role=self.role, turn=self.calls, harness="anton",
             model=self.config.model, reasoning_effort=self.config.reasoning_effort,
             max_output_tokens=body["max_output_tokens"],
             input_sha=hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest())
@@ -67,7 +76,7 @@ class AntonInference:
                         request.cancel()
                         await asyncio.gather(request, return_exceptions=True)
         except BaseException:
-            self.journal.append("model_failed", role=self.role, turn=self.calls, harness="anton", model=self.config.model)
+            self.record("model_failed", role=self.role, turn=self.calls, harness="anton", model=self.config.model)
             raise
         raw_usage = getattr(response, "usage", None)
         recorded = raw_usage.model_dump() if hasattr(raw_usage, "model_dump") else None
@@ -78,7 +87,7 @@ class AntonInference:
             recorded = None
         model = getattr(response, "model", None)
         rate = self.pricing.get(model)
-        self.journal.append("model_response", role=self.role, turn=self.calls, harness="anton",
+        self.record("model_response", role=self.role, turn=self.calls, harness="anton",
             response_id=getattr(response, "id", None), model=model, usage=recorded,
             status=getattr(response, "status", None), duration_seconds=round(time.monotonic() - started, 3),
             cost_estimate_usd=estimate_cost(recorded, rate), pricing=rate)
