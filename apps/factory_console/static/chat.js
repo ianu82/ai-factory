@@ -1,10 +1,8 @@
 import {
   escape as e,
   icon,
-  badge,
   relative,
   fullDate,
-  scopedRuns,
   api,
   notify,
   showDialog,
@@ -18,98 +16,28 @@ export function chat(data, workspace) {
     data.workspaces[0];
   selected = ws.id;
   const messages = data.messages.filter((m) => m.workspace_id === ws.id);
-  const active = scopedRuns(data, ws).filter(
-    (r) => !["complete", "blocked"].includes(r.status),
-  );
   const available =
     data.connection.connected && data.connection.controller.chat_available;
-  return `${
-    workspace
-      ? ""
-      : `<div class="page-heading chat-page-heading">
-<div>
-<span class="eyebrow">MASTER VIEW</span>
-<h1>Master chat</h1>
-<p>A place to shape the work and keep it moving.</p>
-</div>
-</div>`
-  }<div class="chat-layout ${workspace ? "scoped" : ""}">
+  return `${workspace ? "" : '<div class="page-heading chat-page-heading"><h1>Master chat</h1></div>'}
+<div class="chat-layout ${workspace ? "scoped" : ""}">
 <section class="chat-main" aria-label="Master chat">
 <header class="chat-scope">
-<div>${icon("chat")}<span>Orchestrator</span>
-<span class="chat-availability">${available ? "Available" : "Requests saved"}</span>
-</div>
-<label class="scope-select">
-<span>Workspace</span>
-<select id="chat-workspace" aria-label="Chat workspace">${data.workspaces.map((w) => `<option value="${e(w.id)}" ${w.id === ws.id ? "selected" : ""}>${e(w.name)}</option>`).join("")}</select>
-</label>
-<button class="icon-button" data-chat-context aria-label="Show workspace context">${icon("info")}</button>
+${workspace ? "" : `<select id="chat-workspace" aria-label="Chat workspace">${data.workspaces.map((w) => `<option value="${e(w.id)}" ${w.id === ws.id ? "selected" : ""}>${e(w.name)}</option>`).join("")}</select>`}
+<button class="context-button" data-chat-context aria-label="Workspace context">${icon("git")}${ws.repositories.length} repositories</button>
 </header>
-<div class="chat-history" id="chat-history" aria-live="polite">${
-    messages.length
-      ? messages.map((m) => message(m, available)).join("")
-      : `<section class="chat-welcome">
-<div class="orchestrator-mark">${icon("layers")}</div>
-<h2>What are we building next?</h2>
-<p>Bring a goal, a bug or a question.<br>Keep the conversation and its context together.</p>
-<div class="suggestions">
-<button data-suggestion="Summarise the current state of this workspace and what needs attention.">${icon("inbox")}What needs attention? ${icon("arrow")}</button>
-<button data-suggestion="Help me break the next product goal into small, verifiable pieces of work.">${icon("board")}Plan the next piece of work ${icon("arrow")}</button>
-<button data-suggestion="Help me define a non-coding deliverable with clear acceptance criteria and independent verification.">${icon("file")}Shape a non-coding task ${icon("arrow")}</button>
-</div>
-</section>`
-  }</div>
-<div class="composer-area">${
-    available
-      ? ""
-      : `<div class="chat-policy">${icon("info")}<span>Requests are saved to this workspace. Live Orchestrator replies are not enabled yet.</span>
-</div>`
-  }<form id="chat-form">
-<label class="sr-only" for="chat-message">Message the Orchestrator</label>
-<textarea id="chat-message" name="content" maxlength="8000" required rows="3" placeholder="Describe the outcome you want…">${e(sessionStorage.getItem("factory-chat-draft-" + ws.id) || "")}</textarea>
-<div class="composer-footer">
-<span>${icon(ws.mode === "non-coding" ? "file" : "git")}${ws.mode === "non-coding" ? "Non-coding" : "Engineering"}<span class="composer-repos">· ${ws.repositories.length} repositories</span>
-</span>
-<button class="send-button" aria-label="Send message">${icon("send")}</button>
-</div>
+<div class="chat-history" id="chat-history" aria-live="polite">${messages.length ? messages.map((m) => message(m)).join("") : `<section class="chat-welcome"><h2>${available ? "What would you like to work on?" : "Start with a brief"}</h2></section>`}</div>
+<div class="composer-area">
+${available ? "" : '<p class="chat-policy">Orchestrator replies aren’t connected yet.</p>'}
+<form id="chat-form">
+<label class="sr-only" for="chat-message">${available ? "Message the Orchestrator" : "Save a brief"}</label>
+<textarea id="chat-message" name="content" maxlength="8000" required rows="3" placeholder="${available ? "Message the Orchestrator…" : "Describe what you want to build or change…"}">${e(sessionStorage.getItem("factory-chat-draft-" + ws.id) || "")}</textarea>
+<div class="composer-footer"><span>${ws.mode === "non-coding" ? "Non-coding" : "Engineering"}</span>
+<button class="button primary" aria-label="${available ? "Send message" : "Save brief"}">${available ? "Send" : "Save brief"}${icon(available ? "send" : "plus")}</button></div>
 </form>
-<div class="composer-hint">
-<span>Enter to send · Shift + Enter for a new line</span>
-<span>Execution follows workspace permissions.</span>
-</div>
-</div>
-</section>
-<aside class="chat-context">
-<div>
-<span class="eyebrow">WORKSPACE CONTEXT</span>
-<h2>${e(ws.name)}</h2>
-<p>${e(ws.description)}</p>
-</div>
-<section>
-<h3>Repositories <span>${ws.repositories.length}</span>
-</h3>
-<div class="repo-list">${ws.repositories.map((r) => `<span>${icon("git")}${e(r)}</span>`).join("")}</div>
-<a class="quiet-link" href="#/workspace/${e(ws.id)}/settings">Workspace settings ${icon("arrow")}</a>
-</section>
-<section>
-<h3>Work in progress <span>${active.length}</span>
-</h3>${
-    active.length
-      ? active
-          .slice(0, 4)
-          .map(
-            (r) => `<a class="chat-run" href="#/run/${e(r.id)}">
-<strong>${e(r.title)}</strong>${badge(r.status)}</a>`,
-          )
-          .join("")
-      : `<p class="context-empty">${data.connection.connected ? "No open runs in the current feed." : "Awaiting the Factory feed."}</p>`
-  }</section>
-<section class="context-permissions">${icon("checkcircle")}<p>Plans, verification and delivery decisions stay connected to their recorded evidence.</p>
-</section>
-</aside>
-</div>`;
+</div></section></div>`;
 }
-function message(m, available) {
+
+function message(m) {
   return `<article class="chat-message ${m.role}">
 <div class="message-avatar">${m.role === "user" ? "M" : icon("layers")}</div>
 <div class="message-body">
@@ -131,11 +59,13 @@ export function bindChat(data, workspace, refresh) {
       data.workspaces[0],
     textarea = document.querySelector("#chat-message");
   if (!textarea) return;
-  document.querySelector("#chat-workspace").onchange = (event) => {
-    selected = event.target.value;
-    sessionStorage.setItem("factory-chat-workspace", selected);
-    location.hash = `#/workspace/${selected}/chat`;
-  };
+  const workspaceSelect = document.querySelector("#chat-workspace");
+  if (workspaceSelect)
+    workspaceSelect.onchange = (event) => {
+      selected = event.target.value;
+      sessionStorage.setItem("factory-chat-workspace", selected);
+      location.hash = `#/workspace/${selected}/chat`;
+    };
   textarea.oninput = () =>
     sessionStorage.setItem("factory-chat-draft-" + ws.id, textarea.value);
   textarea.onkeydown = (event) => {
@@ -160,21 +90,12 @@ export function bindChat(data, workspace, refresh) {
       document.querySelector("#chat-message")?.focus({ preventScroll: true });
       const history = document.querySelector("#chat-history");
       history.scrollTop = history.scrollHeight;
-      if (message.status === "saved")
-        notify("Saved to workspace. You can add this request to the backlog.");
+      if (message.status === "saved") notify("Brief saved");
     } catch (err) {
       notify(err.message);
       button.disabled = false;
     }
   };
-  document.querySelectorAll("[data-suggestion]").forEach(
-    (b) =>
-      (b.onclick = () => {
-        textarea.value = b.dataset.suggestion;
-        textarea.dispatchEvent(new Event("input"));
-        textarea.focus();
-      }),
-  );
   document.querySelectorAll("[data-task-from-message]").forEach(
     (b) =>
       (b.onclick = () => {
