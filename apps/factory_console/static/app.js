@@ -36,9 +36,13 @@ export const refresh = async () => {
   const atBottom = history
     ? history.scrollHeight - history.clientHeight - history.scrollTop < 50
     : true;
+  const receipts = [...document.querySelectorAll("details[data-receipt][open]")].map(n => n.dataset.receipt);
+  const boardScroll = document.querySelector("#work-board")?.scrollLeft;
   data = nextData;
   render();
   if (location.hash === hash) {
+    document.querySelectorAll("details[data-receipt]").forEach(n => {n.open = receipts.includes(n.dataset.receipt);});
+    if (boardScroll !== undefined && document.querySelector("#work-board")) document.querySelector("#work-board").scrollLeft = boardScroll;
     if (focusSelector) {
       const next = document.querySelector(focusSelector);
       next?.focus({ preventScroll: true });

@@ -31,6 +31,7 @@ function boardCards(data, workspace, state) {
     ...data.items.filter(i => !i.run_id && (!scope || i.workspace_id === scope.id)),
     ...scopedRuns(data, scope).map(r => ({...r, run_id: r.id, priority: null})),
   ].filter(c => `${c.title} ${c.id} ${c.repository || ""}`.toLowerCase().includes(state.query.toLowerCase()));
+  if (!cards.length && state.query) return empty("search", "No matches", "");
   const groups = [...columns, ...(cards.some(c => !columns.some(([key]) => boardStage(c.status) === key)) ? [["unknown", "Unverified"]] : [])];
   return groups.map(([key, label]) => {
     const list = cards.filter(c => (columns.some(([k]) => k === boardStage(c.status)) ? boardStage(c.status) : "unknown") === key);
