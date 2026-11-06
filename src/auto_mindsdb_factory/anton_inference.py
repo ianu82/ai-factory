@@ -85,8 +85,12 @@ class AntonInference:
         self.admit()
         if model != self.config.model or getattr(response, "status", None) != "completed":
             raise AntonStopped("Anton model response did not complete")
-        calls = [item for item in getattr(response, "output", []) if getattr(item, "type", None) == "function_call"]
-        if len(calls) > 1 or any(call.name not in {"run", "finish"} for call in calls):
+        output = getattr(response, "output", None)
+        if not isinstance(output, list) or any(getattr(item, "type", None) not in
+                {"message", "reasoning", "function_call"} for item in output):
+            raise AntonStopped("Anton returned unsupported response items")
+        calls = [item for item in output if item.type == "function_call"]
+        if len(calls) > 1 or any(getattr(call, "name", None) not in {"run", "finish"} for call in calls):
             raise AntonStopped("Anton returned unsupported tool calls")
         for call in calls:
             try:
