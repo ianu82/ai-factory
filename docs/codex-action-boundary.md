@@ -101,6 +101,8 @@ frozen historical role and shared report acceptance, and requires an abortable
 owned job-command callback. Command work runs off-loop; interruption signals its
 owner and waits for confirmed completion. Provider work drains before process
 waits, and the client closes on every exit. Dependency drift fails before startup.
+Client configuration, pricing and task context are detached; unreviewed SDK
+environment overrides are rejected before they can alter headers or logging.
 Local full-session tests cover report rejection, active provider/command stop and
 cleanup. This still enables no selection or runtime; production wiring, exact
 configuration/environment qualification and live delivery proofs remain required.

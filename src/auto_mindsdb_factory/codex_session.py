@@ -2,7 +2,11 @@
 
 import asyncio
 from contextlib import ExitStack
+from copy import deepcopy
+from dataclasses import replace
 from importlib.metadata import distribution
+import json
+import os
 from pathlib import Path
 import time
 from uuid import uuid4
@@ -16,6 +20,9 @@ from .product_agent import AgentSessionError, HarnessStopped, ProductAgent, exec
 
 def validate_codex_dependencies():
     """Reuse the image's reviewed, hash-pinned client dependency set."""
+    if any(key.startswith("OPENAI_") and key not in {"OPENAI_API_KEY", "OPENAI_ORGANIZATION", "OPENAI_PROJECT"}
+           for key in os.environ):
+        raise AgentSessionError("Codex does not permit unreviewed client environment overrides")
     try:
         for line in Path(__file__).with_name("anton_requirements.txt").read_text().splitlines():
             if line and not line.startswith("#"):
@@ -44,14 +51,18 @@ class CodexAgent:
     def __init__(self, config, journal, *, max_turns, max_total_tokens, deadline, pricing=None, cancelled=lambda: False):
         if config.fallback_model:
             raise AgentSessionError("Codex does not permit fallback models")
-        self.config, self.journal = config, journal
+        self.config, self.journal = replace(config), journal
         self.max_turns, self.max_total_tokens, self.deadline = max_turns, max_total_tokens, deadline
-        self.pricing, self.cancelled = pricing or {}, cancelled
+        self.pricing, self.cancelled = deepcopy(pricing or {}), cancelled
 
     def run(self, role, context, command):
         instructions = execution_role(self.journal, role)["instructions"]
         if not callable(getattr(command, "abort", None)):
             raise AgentSessionError("Codex requires an abortable owned job command")
+        try:
+            context = json.loads(json.dumps(context, allow_nan=False))
+        except (ValueError, TypeError, RecursionError):
+            raise AgentSessionError("Codex requires a frozen JSON task context") from None
         self.config.validated()
         validate_codex_dependencies()
         try:
