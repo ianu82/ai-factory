@@ -73,7 +73,7 @@ def open_codex_process(provider_url, *, deadline, binary=None, proxy_token=None)
     """Launch only the pinned CLI, with a new empty home/work and no inherited keys.
 
     provider_url must identify the owning controller's loopback proxy. The caller
-    supplies only a fresh local proxy capability, never a provider API key.
+    supplies only a fresh local proxy capability, never a provider API key, and
     owns JSON-RPC reading, thread policy, inference admission and the global run
     lifetime. No request or tool is dispatched here. stderr is discarded, so raw
     SDK/provider diagnostics cannot become evidence or block on an unread pipe.
