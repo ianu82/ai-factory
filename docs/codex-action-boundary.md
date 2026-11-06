@@ -81,5 +81,11 @@ with a mock upstream. They check report delivery, pre-stream built-in rejection,
 in-flight cancel/drain and cleanup. No actual provider key reaches app-server,
 and this remains local integration evidence rather than live coding certification.
 
+The inference gate also retains the approved action from the same detached
+snapshot used to encode SSE. A session must consume that exact callback once
+and acknowledge tool completion before another inference is admitted. Changed,
+duplicate, unsolicited and overlapping callbacks stop the session. Thread/turn
+ownership and actual tool execution remain the session's responsibilities.
+
 Protocol references: [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

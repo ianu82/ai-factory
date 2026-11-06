@@ -6,7 +6,11 @@ from .codex_actions import CodexActionError, codex_action
 
 
 def codex_sse(response: dict, *, model: str) -> bytes:
-    """Return immutable SSE only after the complete detached response passes.
+    return codex_response(response, model=model)[0]
+
+
+def codex_response(response: dict, *, model: str) -> tuple[bytes, tuple[str, dict, str]]:
+    """Return immutable SSE and its action from one validated detached snapshot.
 
     This is deliberately not a generator. Inference admission, observed usage,
     cancellation and lifetime enforcement remain the caller's prerequisites.
@@ -20,7 +24,7 @@ def codex_sse(response: dict, *, model: str) -> bytes:
         snapshot = json.loads(document)
     except (ValueError, TypeError, RecursionError):
         raise CodexActionError("Codex response cannot be encoded safely") from None
-    codex_action(snapshot, model=model)
+    action = codex_action(snapshot, model=model)
     if type(snapshot.get("id")) is not str or not 1 <= len(snapshot["id"]) <= 200:
         raise CodexActionError("Codex stream response identity is invalid")
     identities = [item.get("id") for item in snapshot["output"]]
@@ -40,4 +44,5 @@ def codex_sse(response: dict, *, model: str) -> bytes:
             ])
         events.append({"type": "response.output_item.done", "output_index": index, "item": item})
     events.append({"type": "response.completed", "response": snapshot})
-    return "".join("event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n" for event in events).encode()
+    wire = "".join("event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n" for event in events).encode()
+    return wire, action

@@ -4,7 +4,7 @@ import json
 import pytest
 
 from auto_mindsdb_factory.codex_actions import CodexActionError
-from auto_mindsdb_factory.codex_stream import codex_sse
+from auto_mindsdb_factory.codex_stream import codex_response, codex_sse
 
 
 MODEL = "gpt-6.1-terra"
@@ -42,6 +42,14 @@ def test_payload_text_cannot_inject_a_stream_event():
     r["output"][1]["input"] = "text(await tools.run(" + json.dumps({"command": ["printf", text]}) + "))"
     events = decode(codex_sse(r, model=MODEL))
     assert len(events) == 8 and events[-1]["response"] == r
+
+
+def test_action_and_wire_share_one_detached_snapshot():
+    supplied = response()
+    wire, action = codex_response(supplied, model=MODEL)
+    supplied["output"][1]["input"] = 'text(await tools.run({"command":["false"]}))'
+    action[1]["command"][0] = "caller-change"
+    assert decode(wire)[-1]["response"]["output"][1]["input"] == 'text(await tools.run({"command":["true"]}))'
 
 
 @pytest.mark.parametrize("change", ["unsafe-first", "unsafe-last", "model", "status", "nonfinite", "large",

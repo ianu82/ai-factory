@@ -9,7 +9,7 @@ import time
 
 from .codex_actions import CodexActionError
 from .codex_request import CodexRequestError, codex_request
-from .codex_stream import codex_sse
+from .codex_stream import codex_response
 from .product_costs import estimate_cost
 
 
@@ -18,7 +18,8 @@ class CodexStopped(BaseException):
 
 
 _REASONS = {"cancelled_or_deadline", "evidence_unavailable", "usage_unknown_or_exhausted",
-            "overlapping_requests_or_limit", "request_policy", "request_cancelled", "response_policy"}
+            "overlapping_requests_or_limit", "request_policy", "request_cancelled", "response_policy",
+            "unconsumed_action", "unapproved_callback"}
 
 
 class CodexInference:
@@ -33,6 +34,7 @@ class CodexInference:
         self.max_requests, self.max_total_tokens, self.deadline = max_requests, max_total_tokens, deadline
         self.pricing, self.cancelled = pricing or {}, cancelled
         self.calls, self._busy, self._stopped = 0, False, False
+        self._pending_action, self._tool_active = None, False
 
     @property
     def stopped(self):
@@ -65,6 +67,30 @@ class CodexInference:
             self.stop("usage_unknown_or_exhausted")
         return usage
 
+    def take_action(self, name, arguments):
+        """Consume the exact approved action once; return detached trusted JSON.
+
+        The session separately binds the callback to its owned thread and turn.
+        Provider and app-server call IDs need not be the same identifier.
+        """
+        self.admit()
+        try:
+            supplied = json.dumps([name, arguments], sort_keys=True, allow_nan=False)
+        except (ValueError, TypeError, RecursionError):
+            self.stop("unapproved_callback")
+        if self._pending_action is None or self._tool_active or supplied != self._pending_action:
+            self.stop("unapproved_callback")
+        approved = json.loads(self._pending_action)
+        self._pending_action, self._tool_active = None, True
+        return approved[0], approved[1]
+
+    def action_finished(self):
+        """Allow another inference only after the admitted tool has completed."""
+        self.admit()
+        if not self._tool_active:
+            self.stop("unapproved_callback")
+        self._tool_active = False
+
     async def request(self, client, supplied):
         """Account one non-streaming provider call, then return validated SSE bytes.
 
@@ -73,6 +99,8 @@ class CodexInference:
         No provider response or exception text is retained in the journal.
         """
         usage = self.admit()
+        if self._pending_action is not None or self._tool_active:
+            self.stop("unconsumed_action")
         if self._busy or self.calls >= self.max_requests:
             self.stop("overlapping_requests_or_limit")
         try:
@@ -133,6 +161,8 @@ class CodexInference:
             cost_estimate_usd=estimate_cost(recorded, rate), pricing=rate)
         self.admit()
         try:
-            return codex_sse(response, model=self.config.model)
+            wire, (name, arguments, _) = codex_response(response, model=self.config.model)
+            self._pending_action = json.dumps([name, arguments], sort_keys=True, allow_nan=False)
+            return wire
         except CodexActionError:
             self.stop("response_policy")

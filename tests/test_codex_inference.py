@@ -144,6 +144,56 @@ def test_overlapping_helper_cannot_escape_accounting(tmp_path):
     assert len(calls) == 1 and drained == [True]
 
 
+def test_two_actions_require_consumption_and_completed_tool(tmp_path):
+    gate = boundary(tmp_path)
+    sdk, calls, _, _ = client()
+    for _ in range(2):
+        asyncio.run(gate.request(sdk, BODY))
+        supplied = {"command": ["true"]}
+        name, approved = gate.take_action("run", supplied)
+        supplied["command"][0] = "changed"
+        assert (name, approved) == ("run", {"command": ["true"]})
+        gate.action_finished()
+    assert len(calls) == 2 and gate.journal.summary()["total_tokens"] == 20 and not gate.stopped
+
+
+@pytest.mark.parametrize("phase", ["pending", "executing"])
+def test_helper_request_cannot_overtake_an_approved_action(tmp_path, phase):
+    gate = boundary(tmp_path)
+    sdk, calls, _, _ = client()
+    asyncio.run(gate.request(sdk, BODY))
+    if phase == "executing": gate.take_action("run", {"command": ["true"]})
+    with pytest.raises(CodexStopped): asyncio.run(gate.request(sdk, BODY))
+    assert len(calls) == 1 and gate.stopped
+
+
+@pytest.mark.parametrize("change", ["tool", "arguments", "duplicate", "unsolicited", "nonfinite", "bool"])
+def test_callback_must_match_once_without_argument_aliases(tmp_path, change):
+    gate = boundary(tmp_path)
+    response = copy.deepcopy(RESPONSE)
+    sdk, calls, _, _ = client(response)
+    args = {"command": ["true"]}
+    if change != "unsolicited": asyncio.run(gate.request(sdk, BODY))
+    if change == "duplicate": gate.take_action("run", args); gate.action_finished()
+    if change == "arguments": args["command"] = ["false"]
+    if change == "nonfinite": args["command"] = [float("nan")]
+    if change == "bool": args["command"] = [True]
+    with pytest.raises(CodexStopped): gate.take_action("finish" if change == "tool" else "run", args)
+    assert gate.stopped and len(calls) == (0 if change == "unsolicited" else 1)
+    with pytest.raises(CodexStopped): asyncio.run(gate.request(sdk, BODY))
+
+
+def test_unsolicited_tool_completion_and_cancelled_callback_stop(tmp_path):
+    gate = boundary(tmp_path)
+    with pytest.raises(CodexStopped): gate.action_finished()
+    gate = boundary(tmp_path / "cancel")
+    sdk, calls, _, _ = client()
+    asyncio.run(gate.request(sdk, BODY))
+    gate.cancelled = lambda: True
+    with pytest.raises(CodexStopped): gate.take_action("run", {"command": ["true"]})
+    assert len(calls) == 1 and gate.stopped
+
+
 @pytest.mark.parametrize("cached,cost", [(5, 10.0), (8, None)])
 def test_explicit_cost_requires_valid_observed_cache_coverage(tmp_path, cached, cost):
     gate = boundary(tmp_path, pricing={MODEL: {"input": 1000000, "cached_input": 1000000, "output": 1000000, "max_input_tokens": 100}})

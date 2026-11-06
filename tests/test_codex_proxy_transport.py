@@ -105,7 +105,9 @@ def test_real_cli_proxy_and_pinned_client_are_one_guarded_path(tmp_path, mode):
                         elif message.get("method") == "turn/completed": terminal = message["params"]["turn"]["status"]; break
                     assert len(requests) == 1 and settings["model"] == config.model and settings["effort"] == "high"
                     assert settings["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
-                    if mode == "report": assert len(callbacks) == 1 and callbacks[0]["tool"] == "finish" and callbacks[0]["arguments"] == REPORT
+                    if mode == "report":
+                        assert len(callbacks) == 1
+                        assert gate.take_action(callbacks[0]["tool"], callbacks[0]["arguments"]) == ("finish", REPORT)
                     else: assert not callbacks and terminal == "failed" and gate.stopped
                     if mode == "cancel": assert drained.is_set()
                     assert proxy.token not in str(requests[0].headers) + requests[0].content.decode() + json.dumps(gate.journal.events())
