@@ -113,3 +113,22 @@ def test_execution_requires_original_ready_acknowledgement(phase, mode):
         p.task = ProductTask.from_document({**p.task.document, "goal": "different task"})
     with pytest.raises(PlanningStopped):
         retained_plan(p.delivery, p.task, p.base, p.journal)
+
+
+@pytest.mark.parametrize("mode", ["no-investigation", "source-write", "mode-write", "ack-write"])
+def test_investigation_and_durable_acknowledgement_are_required(phase, monkeypatch, mode):
+    p = phase
+    if mode == "no-investigation":
+        p.factory = lambda *args: SimpleNamespace(run=lambda *args: p.content)
+    elif mode in {"source-write", "mode-write"}:
+        def mutate(sandbox, argv, **kwargs):
+            path = sandbox.workspace / "parser.py"
+            path.write_text("changed") if mode == "source-write" else path.chmod(0o755)
+            return {"exit_code": 0}
+        p.delivery._command = mutate
+    else:
+        monkeypatch.setattr(p.journal, "append", lambda *args, **kwargs: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(PlanningStopped):
+        execute(p)
+    with pytest.raises(PlanningStopped):
+        retained_plan(p.delivery, p.task, p.base, p.journal)
