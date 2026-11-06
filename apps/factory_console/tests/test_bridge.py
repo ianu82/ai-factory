@@ -141,3 +141,14 @@ def test_independent_review_requires_matching_candidate_and_report_acknowledgeme
     assert 'private' not in str(value)
     journal.append('candidate_created',commit_sha='e'*40)
     assert Publisher([store],tmp_path/'none').snapshot()['runs'][0]['review'] is None
+
+
+def test_review_with_findings_is_not_rendered_as_accepted(tmp_path):
+    from auto_mindsdb_factory.run_journal import RunJournal
+    store=tmp_path/'evidence';journal=RunJournal(store,'review')
+    journal.create({'task':{'title':'Delivery'},'profile':{'repository':'owner/repo'}})
+    report={'status':'passed','criteria':[{'id':'acceptance','status':'passed'}],'findings':['unresolved']}
+    journal.append('candidate_created',commit_sha='a'*40)
+    journal.append('agent_report',role='verifier',report=report)
+    journal.append('candidate_verified',commit_sha='a'*40,report=report)
+    assert Publisher([store],tmp_path/'none').snapshot()['runs'][0]['review']['accepted'] is False
