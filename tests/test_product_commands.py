@@ -10,6 +10,7 @@ from auto_mindsdb_factory import product_commands
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.__main__ import _load_local_env_files, main
 from auto_mindsdb_factory.run_journal import RunJournal
+from test_product_inference_runtime import inputs
 
 
 def run_product_validate(profile, target):
@@ -494,8 +495,8 @@ def test_linear_requires_named_ci_policy_before_side_effects(linear_cli, monkeyp
 
 
 @pytest.fixture
-def bound_delivery(validation_checkout):
-    from auto_mindsdb_factory.product_inference_runtime import MindsHubExecutionContext, MindsHubQualificationConfig
+def bound_delivery(validation_checkout, inputs):
+    from auto_mindsdb_factory.product_inference_runtime import resolve_execution_context, MindsHubQualificationConfig
     root, target = validation_checkout
     policy = {"version": 1, "scope": "controller", "provider": "mindshub", "protocol": "responses",
         "endpoint": MindsHubQualificationConfig.base_url,
@@ -503,9 +504,8 @@ def bound_delivery(validation_checkout):
     profile = ProductProfile.from_document({"version": 1, "name": "bound", "repository": "owner/product",
         "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]],
         "builder_harness": "anton", "reviewer_harness": "anton", "inference": policy})
-    config = MindsHubQualificationConfig(("mdb_synthetic.private", json.dumps({"policy": policy})),
-        profile.document["builder_model"], "high", profile.document["agent_max_output_tokens"], 180)
-    context = MindsHubExecutionContext(profile.canonical_json, config)
+    _, options = inputs
+    context = resolve_execution_context(profile.document, **{**options, "target_root": target})
     path, task = root / "profile.json", root / "task.json"
     path.write_text(profile.canonical_json)
     task.write_text(json.dumps({"id": "bound", "title": "Useful task", "goal": "Check parser",
