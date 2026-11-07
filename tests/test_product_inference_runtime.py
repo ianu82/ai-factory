@@ -365,3 +365,32 @@ def test_native_mindshub_invalid_admission_never_opens_client(inputs, monkeypatc
             connector.request_response(body, timeout_seconds=timeout)
     with pytest.raises(HarnessStopped, match="configuration mismatch"):
         connector.request_response({**body, "model": "other"})
+
+
+def test_normal_delivery_uses_one_context_for_planning_and_independent_anton_roles(inputs, tmp_path, monkeypatch):
+    pytest.importorskip("anton.core.session")
+    import time
+    from auto_mindsdb_factory.product_profile import ProductProfile
+    from auto_mindsdb_factory.product_delivery import ProductDelivery
+    from auto_mindsdb_factory.anton_session import AntonAgent
+    from auto_mindsdb_factory.mindshub_native import MindsHubNativeConnector
+    from auto_mindsdb_factory.run_journal import RunJournal
+    settings, kwargs = inputs
+    profile = ProductProfile.from_document({"version": 1, "name": "bound", "repository": "owner/product",
+        "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]],
+        "builder_harness": "anton", "reviewer_harness": "anton", **settings})
+    context = runtime.resolve_execution_context(profile.document, **kwargs)
+    monkeypatch.setattr(ProductProfile, "validate_repository", lambda *args: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong-global")
+    delivery = ProductDelivery(profile, tmp_path / "target", tmp_path / "store", inference_context=context)
+    delivery.deadline = time.monotonic() + 60
+    journal = RunJournal(tmp_path / "store", "bound-roles")
+    journal.create(delivery._execution_manifest())
+    builder, verifier = (delivery._agent(role, journal) for role in ("builder", "verifier"))
+    assert isinstance(builder, AntonAgent) and isinstance(verifier, AntonAgent) and builder is not verifier
+    assert builder.config.api_key == verifier.config.api_key == KEY
+    assert builder.config.model == settings["builder_model"] and verifier.config.model == settings["reviewer_model"]
+    planning = delivery._connector(delivery._execution_config("planner", journal), deadline=delivery.deadline - 20)
+    assert isinstance(planning, MindsHubNativeConnector) and planning.config.api_key == KEY
+    assert planning.deadline == delivery.deadline - 20 and planning.cancelled == delivery.cancelled
+    assert KEY not in json.dumps(json.loads((journal.root / "manifest.json").read_text()))

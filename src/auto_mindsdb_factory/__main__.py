@@ -510,7 +510,11 @@ def _parse_metric_overrides(values: list[str]) -> dict[str, float | int]:
     return overrides
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, inference_context=None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if inference_context is not None and (not arguments or arguments[0] != "product-deliver"):
+        print("Product workflow failed: Trusted inference context is supported only for product-deliver", file=sys.stderr)
+        return 1
     try:
         _load_local_env_files(argv)
     except EnvironmentSetupError as exc:
@@ -519,7 +523,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    product_result = handle_product_command(args, parse_env=_parse_env_file)
+    options = {} if inference_context is None else {"inference_context": inference_context}
+    product_result = handle_product_command(args, parse_env=_parse_env_file, **options)
     if product_result is not None:
         return product_result
 

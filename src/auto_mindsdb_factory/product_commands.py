@@ -100,10 +100,12 @@ def register_product_commands(subparsers) -> None:
     improvements.add_argument("--cooldown-hours", type=float, default=24)
 
 
-def handle_product_command(args, *, parse_env) -> int | None:
+def handle_product_command(args, *, parse_env, inference_context=None) -> int | None:
     if not args.command.startswith("product-"):
         return None
     try:
+        if inference_context is not None and args.command != "product-deliver":
+            raise ValueError("Trusted inference context is supported only for product-deliver")
         if args.command == "product-github-handoff":
             from .github_handoff import PublicationScope
             from .github_handoff_channel import read_document
@@ -150,7 +152,11 @@ def handle_product_command(args, *, parse_env) -> int | None:
                 codex_qualification=getattr(args, "codex_qualification", False))
             profile.validate_repository(args.target_root)
             if args.command != "product-validate":
-                require_inference_execution(profile.document)
+                if inference_context is None:
+                    require_inference_execution(profile.document)
+                else:
+                    from .product_execution import role_config
+                    role_config(profile.document, "planner", inference_context=inference_context)
             if args.command == "product-linear-worker":
                 route = LinearProductRoute.load(args.route, target_root=args.target_root)
                 if profile.document.get("auto_merge") is not True:
@@ -228,7 +234,8 @@ def handle_product_command(args, *, parse_env) -> int | None:
                 if args.runner == "railway":
                     from .railway_runner import RailwayDelivery
                     delivery_factory = RailwayDelivery
-                delivery = delivery_factory(profile, args.target_root, args.store_dir)
+                options = {} if inference_context is None else {"inference_context": inference_context}
+                delivery = delivery_factory(profile, args.target_root, args.store_dir, **options)
                 delivery.publication_transport = "operator-handoff-v1" if args.github_transport == "operator-handoff" else "controller-github-v1"
                 def publish(candidate, journal):
                     delivery.check_cancelled()

@@ -403,3 +403,20 @@ def test_investigation_and_durable_acknowledgement_are_required(phase, monkeypat
         execute(p)
     with pytest.raises(PlanningStopped):
         retained_plan(p.delivery, p.task, p.base, p.journal)
+
+
+def test_normal_planning_connector_receives_existing_work_deadline(phase, monkeypatch):
+    from auto_mindsdb_factory import product_planning
+    observed = []
+    phase.delivery._execution_config = lambda role, journal: "bound-config"
+    def connector(config, *, deadline):
+        assert config == "bound-config"
+        observed.append(deadline)
+        return "bound-connector"
+    phase.delivery._connector = connector
+    def planner(supplied, journal, *, deadline, **options):
+        assert supplied == "bound-connector" and deadline == observed[0]
+        assert deadline < phase.delivery.deadline and deadline - time.monotonic() < 120
+        return phase.factory(phase.task, phase.base, journal, deadline)
+    monkeypatch.setattr(product_planning, "ProductPlanner", planner)
+    assert plan_delivery(phase.delivery, phase.task, phase.base, phase.journal)["guidance"]["status"] == "ready"

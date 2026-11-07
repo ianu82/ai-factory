@@ -491,3 +491,59 @@ def test_linear_requires_named_ci_policy_before_side_effects(linear_cli, monkeyp
     monkeypatch.setenv("LINEAR_API_KEY", "key")
     assert main(argv + ["--once"]) == 1
     assert not calls
+
+
+@pytest.fixture
+def bound_delivery(validation_checkout):
+    from auto_mindsdb_factory.product_inference_runtime import MindsHubExecutionContext, MindsHubQualificationConfig
+    root, target = validation_checkout
+    policy = {"version": 1, "scope": "controller", "provider": "mindshub", "protocol": "responses",
+        "endpoint": MindsHubQualificationConfig.base_url,
+        "credential_ref": {"id": "00000000-0000-4000-8000-000000000001", "revision": 1}}
+    profile = ProductProfile.from_document({"version": 1, "name": "bound", "repository": "owner/product",
+        "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["true"]}, "smoke": [["true"]],
+        "builder_harness": "anton", "reviewer_harness": "anton", "inference": policy})
+    config = MindsHubQualificationConfig(("mdb_synthetic.private", json.dumps({"policy": policy})),
+        profile.document["builder_model"], "high", profile.document["agent_max_output_tokens"], 180)
+    context = MindsHubExecutionContext(profile.canonical_json, config)
+    path, task = root / "profile.json", root / "task.json"
+    path.write_text(profile.canonical_json)
+    task.write_text(json.dumps({"id": "bound", "title": "Useful task", "goal": "Check parser",
+        "acceptance_criteria": [{"id": "a", "description": "Parse input", "command": ["true"]}]}))
+    args = ["product-deliver", "--profile", str(path), "--task", str(task), "--target-root", str(target),
+        "--store-dir", str(root / "store"), "--runner", "railway", "--publish", "--base-sha", "a" * 40]
+    return profile, context, args
+
+
+@pytest.mark.parametrize("mode", ["bound", "drift", "missing", "plain-object"])
+def test_normal_main_dispatches_only_exact_trusted_context(bound_delivery, monkeypatch, capsys, mode):
+    from auto_mindsdb_factory import railway_runner
+    profile, context, args = bound_delivery
+    calls = []
+    class Delivery:
+        def __init__(self, supplied, target, store, *, inference_context):
+            assert supplied.digest == profile.digest and inference_context is context
+            calls.append("constructor")
+        def run(self, task, *, promote, base_sha):
+            assert callable(promote) and base_sha == "a" * 40
+            assert self.publication_transport == "controller-github-v1"
+            calls.append("normal-publication-callback")
+            return {"status": "test-only"}
+    monkeypatch.setattr(railway_runner, "RailwayDelivery", Delivery)
+    if mode == "drift":
+        path = Path(args[2]); document = json.loads(path.read_text()); document["name"] = "changed"
+        path.write_text(json.dumps(document))
+    supplied = {} if mode == "missing" else {"inference_context": {} if mode == "plain-object" else context}
+    assert main(args, **supplied) == (0 if mode == "bound" else 1)
+    assert calls == (["constructor", "normal-publication-callback"] if mode == "bound" else [])
+    assert "mdb_synthetic.private" not in str(capsys.readouterr())
+
+
+def test_context_cannot_admit_replay_linear_inspection_or_other_commands(bound_delivery, capsys):
+    from types import SimpleNamespace
+    _, context, _ = bound_delivery
+    for command in ("product-replay", "product-linear-worker", "product-validate", "product-inspect"):
+        assert product_commands.handle_product_command(SimpleNamespace(command=command),
+            parse_env=lambda path: {}, inference_context=context) == 1
+    assert main(["validate-contracts"], inference_context=context) == 1
+    assert "supported only for product-deliver" in capsys.readouterr().err

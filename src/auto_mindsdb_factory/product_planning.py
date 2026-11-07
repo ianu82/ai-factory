@@ -5,14 +5,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from .connectors import OpenAIResponsesAgentConnector
 from .docker_runner import RunnerError
 from .product_agent import AgentSessionError, HarnessStopped
 from .product_plan import PlanError, ProductPlan, freeze_plan, read_plan
 from .product_planner import ProductPlanner, PLANNER_VERSION, REPORT_RESERVE_SECONDS
 from .product_roles import select_role
 from .product_workspace import source_files, executable_paths
-from .product_execution import execution_config
 from .product_cancellation import enter_cancellable
 from .run_journal import JournalError
 
@@ -85,7 +83,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
             raise PlanningStopped("Planning needs an investigation request and a report request")
         if (journal.root / "plan.json").exists() or any(e["kind"] == "plan_frozen" for e in journal.events()):
             raise PlanningStopped("Planning cannot replace an existing run plan")
-        config = execution_config(delivery.settings, "planner", journal) if planner_factory is None else None
+        config = delivery._execution_config("planner", journal) if planner_factory is None else None
         # Allocate the first worker under the already-running global deadline.
         # Source setup, investigation and inference remain within the planning phase.
         phase = "worker_preparation"
@@ -103,7 +101,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                        finalization_reserve_seconds=FINALIZATION_RESERVE_SECONDS,
                        remaining_run_seconds=round(delivery.deadline - time.monotonic(), 3))
         if planner_factory is None:
-            planner = ProductPlanner(OpenAIResponsesAgentConnector(config), journal, task=task,
+            planner = ProductPlanner(delivery._connector(config, deadline=work_deadline), journal, task=task,
                 base_sha=base, profile=delivery.profile, deadline=work_deadline, cancelled=delivery.cancelled)
         else:
             planner = planner_factory(task, base, journal, work_deadline)

@@ -20,7 +20,7 @@ from .product_profile import ProductProfile
 from .product_planning import planning_manifest, plan_delivery, retained_plan
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
-from .product_execution import execution_manifest, execution_config
+from .product_execution import execution_manifest, execution_config, role_config
 from .product_cancellation import RunCancellation, run_cancellable, enter_cancellable
 from .planning_preparation import preparation_operation
 from .product_task import ProductTask
@@ -63,10 +63,15 @@ def _report_feedback(report: dict) -> str:
 class ProductDelivery:
     def __init__(self, profile: ProductProfile, target_root: Path, store: Path, *,
                  agent_factory: Callable[[str, RunJournal], AgentHarness] | None = None,
-                 sandbox_factory: Callable = DockerSandbox, planner_factory: Callable | None = None) -> None:
+                 sandbox_factory: Callable = DockerSandbox, planner_factory: Callable | None = None,
+                 inference_context=None) -> None:
         self.profile = profile
         self.settings = profile.document
-        require_inference_execution(self.settings)
+        if inference_context is None:
+            require_inference_execution(self.settings)
+        else:
+            role_config(self.settings, "planner", inference_context=inference_context)
+        self._inference_context = inference_context
         self.target = target_root.resolve()
         self.store = store.resolve()
         if self.store.is_relative_to(self.target):
@@ -93,9 +98,25 @@ class ProductDelivery:
         if self.cancelled():
             raise HarnessStopped("Delivery was cancelled")
 
+    def _execution_options(self):
+        context = getattr(self, "_inference_context", None)
+        return {} if context is None else {"inference_context": context}
+
+    def _execution_config(self, role, journal):
+        return execution_config(self.settings, role, journal, **self._execution_options())
+
+    def _execution_manifest(self):
+        return execution_manifest(self.settings, **self._execution_options())
+
+    def _connector(self, config, *, deadline):
+        if getattr(config, "inference_binding_sha256", None) is not None:
+            from .mindshub_native import MindsHubNativeConnector
+            return MindsHubNativeConnector(config, cancelled=self.cancelled, deadline=deadline)
+        return OpenAIResponsesAgentConnector(config)
+
     def _agent(self, role: str, journal: RunJournal) -> AgentHarness:
         name = resolve_harness(self.settings, role)
-        config = execution_config(self.settings, role, journal)
+        config = self._execution_config(role, journal)
         if name == "codex":
             from .codex_session import CodexAgent
             config.validated()
@@ -109,7 +130,7 @@ class ProductDelivery:
                 max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
                 deadline=self.deadline, pricing=self.settings["pricing"], cancelled=self.cancelled)
             return agent
-        return ProductAgent(OpenAIResponsesAgentConnector(config), journal,
+        return ProductAgent(self._connector(config, deadline=self.deadline), journal,
             max_turns=self.settings["max_agent_turns"], max_total_tokens=self.settings["max_total_tokens"],
             deadline=self.deadline, pricing=self.settings["pricing"], cancelled=self.cancelled)
 
@@ -221,7 +242,7 @@ class ProductDelivery:
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             raise DeliveryError("Frozen verification-only replay inputs are required") from None
         execution_role(journal, "verifier")
-        execution_config(self.settings, "verifier", journal)
+        self._execution_config("verifier", journal)
         self._cancellation = RunCancellation(journal)
         self.check_cancelled()
         usage = journal.summary()
@@ -287,7 +308,7 @@ class ProductDelivery:
                             "task": task.document, "base_sha": base_sha, "profile": self.settings,
                             "profile_sha": self.profile.digest, "task_sha": task.digest,
                             "role_snapshots": snapshot_roles(), **planning_manifest(self.profile),
-                            **execution_manifest(self.settings),
+                            **self._execution_manifest(),
                             "publication_transport": getattr(self, "publication_transport", "controller-github-v1"),
                             "runtime_sha": git(repo_root(), "rev-parse", "HEAD")})
             with OperationTracker(self.store, task_id, "delivery", "product-delivery"):
