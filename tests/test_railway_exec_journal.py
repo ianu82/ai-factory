@@ -133,3 +133,53 @@ def test_untrusted_failure_metadata_is_explicitly_unknown_in_durable_event(tmp_p
         assert journal.events()[-1]["data"] == {"operation": "unknown", "category": "UnknownError", "exec_observations": None}
     finally:
         pool.close()
+
+
+def test_accepted_heartbeat_failure_is_journaled_before_cached_rethrow(tmp_path):
+    journal = RunJournal(tmp_path, "heartbeat-failure"); journal.create({})
+    primary = RailwayOperationError({"action": "heartbeat"}, "RailwayConnectionError")
+    def transport(request):
+        if request["action"] == "heartbeat": raise primary
+        return {"id": "owned"} if request["action"] == "create" else {}
+    pool = RailwayPool(transport)
+    try:
+        delivery_for(pool, tmp_path).prepare_runner(journal)
+        pool._keep_alive()
+        events = [e for e in journal.events() if e["kind"] == "runner_transport_failed"]
+        assert [e["data"] for e in events] == [{"operation": "heartbeat",
+            "category": "RailwayConnectionError", "exec_observations": None}]
+        with pytest.raises(RailwayOperationError) as raised:
+            pool.call({"action": "run"})
+        assert raised.value is primary
+        assert journal.events()[-1] == events[0]
+    finally:
+        pool.close()
+
+
+def test_retired_worker_heartbeat_failure_is_not_attributed_to_replacement(tmp_path):
+    from test_railway_runner import Provider
+    provider, started, release = Provider(), threading.Event(), threading.Event()
+    journal = RunJournal(tmp_path, "late-heartbeat"); journal.create({})
+    def transport(request):
+        if request["action"] == "heartbeat":
+            started.set()
+            assert release.wait(3)
+            raise RuntimeError("private-retired-worker-detail")
+        return provider(request)
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    pool = RailwayPool(transport)
+    heartbeat = None
+    try:
+        delivery_for(pool, tmp_path).prepare_runner(journal)
+        pool.open(first)
+        heartbeat = threading.Thread(target=pool._keep_alive); heartbeat.start()
+        assert started.wait(3)
+        pool.open(second)
+        release.set(); heartbeat.join(3)
+        assert not heartbeat.is_alive() and pool.failure is None
+        assert not any(e["kind"] == "runner_transport_failed" for e in journal.events())
+    finally:
+        release.set()
+        if heartbeat is not None: heartbeat.join(3)
+        pool.close()

@@ -175,8 +175,10 @@ class RailwayPool:
                 # retired worker must never poison its replacement.
                 with self.lock:
                     if self.id == identity:
-                        self.failure = error if isinstance(error, RailwayOperationError) else RailwayOperationError(
+                        failure = error if isinstance(error, RailwayOperationError) else RailwayOperationError(
                             {"action": "heartbeat"}, type(error).__name__)
+                        self.failure = failure
+                        self._record_failure(failure)
 
     def _discard(self):
         if self.id:
