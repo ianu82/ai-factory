@@ -45,7 +45,7 @@ def register_product_commands(subparsers) -> None:
     inference = subparsers.add_parser("product-inference-check")
     for name in ("profile", "target-root"):
         inference.add_argument("--" + name, type=Path, required=True)
-    inference.add_argument("--auth-workspace-id", required=True)
+    inference.add_argument("--auth-workspace-id")
     inference.add_argument("--env-file", type=Path)
     inference.add_argument("--codex-qualification", action="store_true")
     handoff = subparsers.add_parser("product-github-handoff")

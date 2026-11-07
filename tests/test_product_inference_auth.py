@@ -19,18 +19,59 @@ REFERENCE = "00000000-0000-4000-8000-000000000003"
 KEY = "mdb_example.private-test-value"
 
 
-def policy_document():
-    return {"version": 1, "provider": "mindshub", "protocol": "responses",
+def policy_document(*, controller=False):
+    result = {"version": 1, "provider": "mindshub", "protocol": "responses",
         "endpoint": "https://api.mindshub.ai/v1/responses", "workspace_id": FACTORY_WORKSPACE,
         "credential_ref": {"workspace_id": FACTORY_WORKSPACE, "id": REFERENCE, "revision": 1}}
+    if controller:
+        result.pop("workspace_id")
+        result["credential_ref"].pop("workspace_id")
+        result["scope"] = "controller"
+    return result
 
 
-def profile_file(root):
+def profile_file(root, *, controller=False):
     path = root / "profile.json"
     path.write_text(json.dumps({"version": 1, "name": "sample", "repository": "owner/product",
         "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["true"]},
-        "smoke": [["true"]], "inference": policy_document()}))
+        "smoke": [["true"]], "inference": policy_document(controller=controller)}))
     return path
+
+
+def test_public_controller_check_discovers_upstream_identity_without_workspace_setup(
+        validation_checkout, monkeypatch, capsys):
+    root, target = validation_checkout
+    monkeypatch.setenv("AI_FACTORY_MINDSHUB_API_KEY", KEY)
+    async def checked(key):
+        assert key == KEY
+        return identity()
+    monkeypatch.setattr(auth, "_read_identity", checked)
+    assert main(["product-inference-check", "--profile", str(profile_file(root, controller=True)),
+        "--target-root", str(target)]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["scope"] == "controller" and receipt["execution_ready"] is False
+    assert receipt["mindshub_identity"]["workspace_id"] == AUTH_WORKSPACE
+    assert receipt["mindshub_identity"]["organization_id"] == FACTORY_WORKSPACE
+    assert KEY not in json.dumps(receipt)
+
+
+@pytest.mark.parametrize("controller,workspace", [(False, None), (True, ""), (True, False)])
+def test_scope_does_not_silently_ignore_missing_or_invalid_explicit_workspace(controller, workspace, monkeypatch):
+    async def forbidden(*args):
+        raise AssertionError("Must stop before SDK or network")
+    monkeypatch.setattr(auth, "_read_identity", forbidden)
+    policy = InferencePolicy.from_document(policy_document(controller=controller))
+    with pytest.raises(InferencePolicyError, match="canonical MindsHub Auth workspace"):
+        asyncio.run(auth.check_credential(policy, KEY, workspace))
+
+
+def test_controller_scope_preserves_explicit_workspace_mismatch_guard(monkeypatch):
+    async def checked(*args):
+        return identity()
+    monkeypatch.setattr(auth, "_read_identity", checked)
+    policy = InferencePolicy.from_document(policy_document(controller=True))
+    with pytest.raises(InferencePolicyError, match="configured Auth workspace"):
+        asyncio.run(auth.check_credential(policy, KEY, REFERENCE))
 
 
 def test_missing_mindshub_key_never_borrows_openai(validation_checkout, monkeypatch, capsys):
@@ -124,7 +165,8 @@ def pinned_http():
 
 
 @pytest.mark.parametrize("case", [200, 302, 401, 403, 429, 503, "malformed", "duplicate", "oversized"])
-def test_pinned_readonly_auth_transport_closes_and_never_retries(pinned_http, monkeypatch, case):
+@pytest.mark.parametrize("controller", [False, True])
+def test_pinned_readonly_auth_transport_closes_and_never_retries(pinned_http, monkeypatch, case, controller):
     http = pinned_http
     clients, calls = [], []
     raw = json.dumps(identity()).encode()
@@ -142,7 +184,8 @@ def test_pinned_readonly_auth_transport_closes_and_never_retries(pinned_http, mo
         clients.append(original(transport=http.MockTransport(respond), **options))
         return clients[-1]
     monkeypatch.setattr(http, "AsyncClient", factory)
-    action = auth.check_credential(InferencePolicy.from_document(policy_document()), KEY, AUTH_WORKSPACE)
+    action = auth.check_credential(InferencePolicy.from_document(policy_document(controller=controller)),
+        KEY, None if controller else AUTH_WORKSPACE)
     if case == 200:
         assert asyncio.run(action)["status"] == "credential_identity_verified"
     else:
@@ -153,7 +196,8 @@ def test_pinned_readonly_auth_transport_closes_and_never_retries(pinned_http, mo
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-def test_pinned_auth_deadline_or_cancel_drains_and_closes(pinned_http, monkeypatch, cancel):
+@pytest.mark.parametrize("controller", [False, True])
+def test_pinned_auth_deadline_or_cancel_drains_and_closes(pinned_http, monkeypatch, cancel, controller):
     http = pinned_http
     clients, stopped = [], []
     entered = asyncio.Event()
@@ -170,7 +214,8 @@ def test_pinned_auth_deadline_or_cancel_drains_and_closes(pinned_http, monkeypat
     monkeypatch.setattr(http, "AsyncClient", factory)
     monkeypatch.setattr(auth, "AUTH_TIMEOUT_SECONDS", 5.0 if cancel else 0.02)
     async def exercise():
-        task = asyncio.create_task(auth.check_credential(InferencePolicy.from_document(policy_document()), KEY, AUTH_WORKSPACE))
+        task = asyncio.create_task(auth.check_credential(InferencePolicy.from_document(
+            policy_document(controller=controller)), KEY, None if controller else AUTH_WORKSPACE))
         await entered.wait()
         if cancel:
             task.cancel()

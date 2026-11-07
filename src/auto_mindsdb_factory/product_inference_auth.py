@@ -80,7 +80,15 @@ async def _read_identity(key):
             return json.loads(data, object_pairs_hook=_object, parse_constant=_constant)
 
 
+def _validate_workspace(policy, auth_workspace_id):
+    if auth_workspace_id is None and policy.document.get("scope") == "controller":
+        return
+    if not _identifier(auth_workspace_id):
+        raise InferencePolicyError("A canonical MindsHub Auth workspace UUID is required")
+
+
 def _receipt(policy, key, auth_workspace_id, payload):
+    _validate_workspace(policy, auth_workspace_id)
     if (type(payload) is not dict or payload.get("valid") is not True
             or payload.get("auth_method") != "api_key"
             or (payload.get("key_type"), payload.get("principal_kind"), payload.get("credential_kind"))
@@ -90,7 +98,7 @@ def _receipt(policy, key, auth_workspace_id, payload):
             or not re.fullmatch(r"mdb_[A-Za-z0-9_-]{1,64}", payload["key_prefix"])
             or payload["key_prefix"] != key.partition(".")[0]):
         raise InferencePolicyError("MindsHub credential identity is invalid")
-    if payload["workspace_id"] != auth_workspace_id:
+    if auth_workspace_id is not None and payload["workspace_id"] != auth_workspace_id:
         raise InferencePolicyError("MindsHub credential does not match the configured Auth workspace")
     identity = {"issuer": AUTH_URL, **{k: payload[k] for k in (
         "user_id", "organization_id", "workspace_id", "principal_kind", "key_type", "credential_kind", "key_prefix")}}
@@ -100,10 +108,9 @@ def _receipt(policy, key, auth_workspace_id, payload):
     return safe
 
 
-async def check_credential(policy, key, auth_workspace_id):
+async def check_credential(policy, key, auth_workspace_id=None):
     require_controller_import_path()
-    if not _identifier(auth_workspace_id):
-        raise InferencePolicyError("A canonical MindsHub Auth workspace UUID is required")
+    _validate_workspace(policy, auth_workspace_id)
     if not key:
         raise InferencePolicyError("MindsHub API key is not configured")
     if (type(key) is not str or not key.startswith("mdb_") or "." not in key or len(key) > 4096

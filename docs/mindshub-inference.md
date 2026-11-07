@@ -12,6 +12,12 @@ Factory records; membership, record issuance and secret resolution are separate
 work. A reference neither contains a key nor grants access. Raw keys, other
 fields and credential-bearing URLs are rejected without echoing their values.
 
+For one Factory-wide bootstrap key, explicitly set `scope: controller` instead
+of `workspace_id`, and omit `workspace_id` from `credential_ref` as well. Its
+opaque reference ID and revision still identify the trusted controller input.
+Combining the two scopes is rejected. This mode does not grant tenant access or
+change the legacy workspace-bound policy and its canonical hash.
+
 `product-validate` reports the safe metadata, its digest, `status: configured`
 and `execution_ready: false`. Explicit policies currently stop delivery, replay,
 automatic intake and direct role initialization before credential resolution,
@@ -34,6 +40,10 @@ credential is borrowed. `--auth-workspace-id` explicitly identifies the expected
 MindsHub workspace, separate from Factory's opaque record IDs. The safe receipt
 binds the policy/reference digest to Auth's principal, organization, workspace
 and public key prefix. It contains no key, email or entitlement payload.
+Only an explicit controller-scoped policy may omit `--auth-workspace-id`:
+MindsHub's actual organization and workspace are recorded automatically in that
+case. An explicitly supplied expected workspace is always checked. A
+workspace-bound policy still requires it; omission never changes its scope.
 The check uses the existing pinned controller HTTP client, one request, no
 redirects and a five-second total request budget. It creates no secret store,
 grant, model request or job. Identity verification still reports execution not

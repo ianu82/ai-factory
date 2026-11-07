@@ -23,17 +23,25 @@ class InferencePolicy:
 
     @classmethod
     def from_document(cls, document):
-        fields = {"version", "provider", "protocol", "endpoint", "workspace_id", "credential_ref"}
+        if type(document) is not dict:
+            raise InferencePolicyError("Invalid inference policy")
+        controller = document.get("scope") == "controller"
+        fields = {"version", "provider", "protocol", "endpoint", "credential_ref"}
+        fields |= {"scope"} if controller else {"workspace_id"}
         fixed = {"provider": "mindshub", "protocol": "responses",
                  "endpoint": "https://api.mindshub.ai/v1/responses"}
-        if (type(document) is not dict or set(document) != fields
+        if controller:
+            fixed["scope"] = "controller"
+        if (set(document) != fields
                 or type(document["version"]) is not int or document["version"] != 1
                 or any(type(document[k]) is not str or document[k] != v for k, v in fixed.items())
-                or not _identifier(document["workspace_id"])):
+                or (not controller and not _identifier(document["workspace_id"]))):
             raise InferencePolicyError("Invalid inference policy")
         ref = document["credential_ref"]
-        if (type(ref) is not dict or set(ref) != {"workspace_id", "id", "revision"}
-                or not _identifier(ref["workspace_id"]) or ref["workspace_id"] != document["workspace_id"]
+        ref_fields = {"id", "revision"} | (set() if controller else {"workspace_id"})
+        if (type(ref) is not dict or set(ref) != ref_fields
+                or (not controller and (not _identifier(ref["workspace_id"])
+                    or ref["workspace_id"] != document["workspace_id"]))
                 or not _identifier(ref["id"])
                 or type(ref["revision"]) is not int or not 1 <= ref["revision"] <= 2**31 - 1):
             raise InferencePolicyError("Invalid inference policy")

@@ -23,6 +23,33 @@ def policy():
         "credential_ref": {"workspace_id": WORKSPACE, "id": REFERENCE, "revision": 1}}
 
 
+def controller_policy():
+    result = policy()
+    result.pop("workspace_id")
+    result["credential_ref"].pop("workspace_id")
+    return {**result, "scope": "controller"}
+
+
+def test_controller_scope_is_explicit_and_preserves_legacy_workspace_identity():
+    profile = ProductProfile.from_document(document(inference=controller_policy()))
+    assert profile.document["inference"] == controller_policy()
+    assert profile.digest != ProductProfile.from_document(document(inference=policy())).digest
+    changed = controller_policy()
+    changed["credential_ref"]["revision"] = 2
+    assert ProductProfile.from_document(document(inference=changed)).digest != profile.digest
+
+
+@pytest.mark.parametrize("value", [
+    {**controller_policy(), "scope": "global"}, {**controller_policy(), "scope": True},
+    {**controller_policy(), "workspace_id": WORKSPACE},
+    {**controller_policy(), "credential_ref": policy()["credential_ref"]},
+    {**policy(), "scope": "controller"}, {**policy(), "scope": "workspace"},
+])
+def test_ambiguous_controller_and_workspace_scope_is_rejected(value):
+    with pytest.raises(ProfileError, match="Invalid inference policy"):
+        ProductProfile.from_document(document(inference=value))
+
+
 def document(**extra):
     return {"version": 1, "name": "sample", "repository": "owner/product",
         "image": "python@sha256:" + "a" * 64, "checks": {"unit": ["python", "-m", "unittest"]},
@@ -75,9 +102,10 @@ def forbidden(*args, **kwargs):
 
 
 @pytest.mark.parametrize("role", ["planner", "builder", "verifier"])
-def test_unready_policy_never_resolves_legacy_credentials(role, monkeypatch):
+@pytest.mark.parametrize("inference", [policy(), controller_policy()])
+def test_unready_policy_never_resolves_legacy_credentials(role, inference, monkeypatch):
     monkeypatch.setattr(OpenAIResponsesAgentConfig, "from_env", forbidden)
-    settings = ProductProfile.from_document(document(inference=policy())).document
+    settings = ProductProfile.from_document(document(inference=inference)).document
     with pytest.raises(ValueError, match="not execution-ready"):
         role_config(settings, role)
     with pytest.raises(ValueError, match="not execution-ready"):
