@@ -1,5 +1,15 @@
 // Metadata only. These counters never authorize execution or prove delivery.
 import WebSocket from 'ws';
+import {ExecNotStartedError, ExecInterruptedError, ExecControlUnsupportedError} from 'railway';
+
+export function execFailureObservations(error, observations) {
+  try {
+    if ([ExecNotStartedError, ExecInterruptedError, ExecControlUnsupportedError].includes(error?.constructor)) {
+      return {exec_observations: observations.snapshot()};
+    }
+  } catch { /* Diagnostics cannot replace the primary bridge failure. */ }
+  return {};
+}
 
 export function execObservations() {
   const state = {

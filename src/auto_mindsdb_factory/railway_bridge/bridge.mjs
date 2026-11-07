@@ -2,9 +2,11 @@
 import {readFile} from 'node:fs/promises';
 import {Sandbox, SandboxNotFoundError} from 'railway';
 import {clientOptions} from './client.mjs';
+import {execObservations, execFailureObservations} from './exec-observations.mjs';
 
 const MAX_MESSAGE_BYTES = 100 * 1024 * 1024;
-const options = clientOptions();
+const observations = execObservations();
+const options = {...clientOptions(), webSocketImpl: observations.WebSocketImpl};
 
 async function checkedExec(sandbox, command, input, timeoutSec, maxOutputBytes = 65536) {
   const handle = sandbox.exec(command, {
@@ -84,6 +86,6 @@ try {
   const response = await dispatch(JSON.parse(Buffer.concat(chunks)));
   process.stdout.write(JSON.stringify(response));
 } catch (error) {
-  process.stdout.write(JSON.stringify({error: error.constructor.name}));
+  process.stdout.write(JSON.stringify({error: error.constructor.name, ...execFailureObservations(error, observations)}));
   process.exitCode = 1;
 }

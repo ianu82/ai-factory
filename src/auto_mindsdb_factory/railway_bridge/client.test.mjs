@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import test from 'node:test';
-import {Sandbox, ExecInterruptedError, ExecNotStartedError} from 'railway';
+import {Sandbox, ExecInterruptedError, ExecNotStartedError, ExecControlUnsupportedError} from 'railway';
 import {WebSocketServer} from 'ws';
 import {clientOptions} from './client.mjs';
-import {execObservations} from './exec-observations.mjs';
+import {execObservations, execFailureObservations} from './exec-observations.mjs';
 
 async function fixture(t, mode, observations) {
   const server = createServer();
@@ -92,7 +92,11 @@ test('metadata observation preserves prestart rejection and bounded HTTP facts',
   const {sandbox, observed} = await fixture(t, 'reject', observations);
   await assert.rejects(sandbox.exec('private-command-must-not-run', {
     ephemeral: true, signal: AbortSignal.timeout(5000),
-  }), ExecNotStartedError);
+  }), error => {
+    assert.equal(error.constructor, ExecNotStartedError);
+    assert.equal(execFailureObservations(error, observations).exec_observations.last_http_status, 503);
+    return true;
+  });
   assert.deepEqual(observed, {attempts: 2, commands: 0});
   const facts = observations.snapshot();
   assert.equal(facts.connections, 2);
@@ -132,4 +136,19 @@ test('metadata observation never adds retry after command dispatch', async t => 
   assert.deepEqual(observed, {attempts: 1, commands: 1});
   assert.equal(observations.snapshot().init_send_attempts, 1);
   assert.equal(observations.snapshot().http_rejections, 0);
+});
+
+test('failure metadata is absent for unrelated, derived or unavailable observations', () => {
+  const observations = execObservations();
+  class Derived extends ExecNotStartedError {}
+  for (const error of [new Error('private-text'), new Derived('private-text'), null]) {
+    assert.deepEqual(execFailureObservations(error, observations), {});
+  }
+  const error = new ExecNotStartedError('private-text');
+  assert.deepEqual(execFailureObservations(error, {snapshot() { throw new Error('private-text'); }}), {});
+  for (const ErrorType of [ExecNotStartedError, ExecInterruptedError, ExecControlUnsupportedError]) {
+    const facts = execFailureObservations(new ErrorType('private-text'), observations);
+    assert.deepEqual(facts.exec_observations, observations.snapshot());
+    assert.doesNotMatch(JSON.stringify(facts), /private-text/);
+  }
 });

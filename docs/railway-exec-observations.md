@@ -8,8 +8,12 @@ changing emit return values, retries or SDK execution policy. Snapshots are deta
 Counters cover the collector's lifetime; code zero means unknown/unobserved, and
 the last observed codes do not describe current health.
 
-This preparatory module is not enabled by the production bridge. Subsequent
-reviewed bridge/error integration must validate and retain only this fixed schema.
+The controller bridge enables the collector and returns its fixed snapshot only
+for exact pinned SDK execution-start/interruption/control errors. Python accepts
+only the complete bounded schema and freezes primitive values outside the mutable
+exception. The accessor requires intact original failure provenance and returns a
+detached copy; absent or malformed snapshots remain unknown. Journal persistence
+before cancellation replaces an error requires a separate delivery integration.
 A send returning is not remote acknowledgement. Counts can saturate, control
 frames can be unclassified, and missing observations remain unknown. These facts
 cannot approve a task, establish liveness or diagnose an earlier failed run.

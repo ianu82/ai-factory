@@ -25,10 +25,29 @@ from .product_cancellation import run_cancellable
 # Keep constructor facts outside mutable exception state without retaining its
 # traceback after callers release it. This is controller-local provenance.
 _original_failure_facts = WeakKeyDictionary()
+_exec_categories = {"ExecNotStartedError", "ExecInterruptedError", "ExecControlUnsupportedError"}
+_exec_counters = ("connections", "opened", "errors", "closed", "http_rejections",
+    "capabilities_frames", "typed_error_frames", "hello_send_attempts", "init_send_attempts",
+    "init_send_returned", "unclassified_control_sends")
+_exec_fields = _exec_counters + ("last_http_status", "last_close_code", "counters_saturated", "observation_failed")
+
+
+def _freeze_exec_observations(value):
+    if (type(value) is not dict or any(type(key) is not str for key in value)
+            or set(value) != set(_exec_fields)):
+        return None
+    if any(type(value[key]) is not int or not 0 <= value[key] <= 65535 for key in _exec_counters):
+        return None
+    for key, low, high in (("last_http_status", 100, 599), ("last_close_code", 1000, 4999)):
+        if type(value[key]) is not int or not (value[key] == 0 or low <= value[key] <= high):
+            return None
+    if any(type(value[key]) is not bool for key in ("counters_saturated", "observation_failed")):
+        return None
+    return tuple(value[key] for key in _exec_fields)
 
 
 class RailwayOperationError(RunnerError):
-    def __init__(self, request, error_type):
+    def __init__(self, request, error_type, *, exec_observations=None):
         if type(self) is RailwayOperationError and self in _original_failure_facts:
             raise TypeError("Railway failure facts are already initialized")
         phase = None
@@ -47,7 +66,13 @@ class RailwayOperationError(RunnerError):
         reason = f"Railway {self.phase} failed ({self.error_type})"
         super().__init__(reason)
         if type(self) is RailwayOperationError:
-            _original_failure_facts[self] = (self.phase, self.error_type, reason)
+            observations = None
+            try:
+                if self.error_type in _exec_categories:
+                    observations = _freeze_exec_observations(exec_observations)
+            except Exception:
+                pass  # Diagnostic failure must preserve the original runner error.
+            _original_failure_facts[self] = (self.phase, self.error_type, reason, observations)
 
     def public_reason(self):
         phase, category = railway_failure_facts(self)
@@ -78,6 +103,15 @@ def railway_failure_facts(error):
     return original[:2]
 
 
+def railway_exec_observations(error):
+    """Detached metadata from an intact constructor witness; None is unknown."""
+    operation, category = railway_failure_facts(error)
+    if operation == "unknown" or category not in _exec_categories:
+        return None
+    values = _original_failure_facts[error][3]
+    return dict(zip(_exec_fields, values)) if values is not None else None
+
+
 def bridge(request):
     environment = {name: os.environ[name] for name in
         ("PATH", "RAILWAY_API_TOKEN", "RAILWAY_ENVIRONMENT_ID") if name in os.environ}
@@ -96,7 +130,8 @@ def bridge(request):
     if not isinstance(response, dict):
         raise RailwayOperationError(request, "InvalidResponse")
     if result.returncode or "error" in response:
-        raise RailwayOperationError(request, response.get("error", "BridgeProcessError"))
+        raise RailwayOperationError(request, response.get("error", "BridgeProcessError"),
+            exec_observations=response.get("exec_observations"))
     return response
 
 
