@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from .product_agent import HarnessStopped
 from .run_journal import RunJournal
@@ -85,7 +85,8 @@ def run_cancellable(sandbox, command, *, cancelled, deadline):
 
 
 @contextmanager
-def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=None, on_finalization_failure=None):
+def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=None, on_finalization_failure=None,
+                      observe=None):
     """Watch entry and finalization; commands retain their sole abort owner.
 
     Drain each lifecycle operation before proceeding. No watcher spans the body.
@@ -111,9 +112,10 @@ def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=Non
 
     entry = Entry()
     try:
-        sandbox = run_cancellable(entry, [], cancelled=cancelled, deadline=deadline)
-        # Entry can return just before the watcher next wakes. Admit no body
-        # after the deadline, even when that last polling interval did not run.
+        with observe("setup_entry") if observe is not None else nullcontext():
+            sandbox = run_cancellable(entry, [], cancelled=cancelled, deadline=deadline)
+        # Include observation retention in admission; it may finish after entry.
+        # A return between watcher polls still cannot admit an expired body.
         if time.monotonic() >= deadline:
             raise HarnessStopped("Sandbox entry exceeded its deadline")
     except BaseException as error:
@@ -139,7 +141,8 @@ def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=Non
         finalizer = Finalization()
         end = deadline if finalization_deadline is None else finalization_deadline
         try:
-            result = run_cancellable(finalizer, [], cancelled=cancelled, deadline=end)
+            with observe("setup_finalization") if observe is not None else nullcontext():
+                result = run_cancellable(finalizer, [], cancelled=cancelled, deadline=end)
             if time.monotonic() >= end:
                 raise HarnessStopped("Sandbox finalization exceeded its deadline")
             return result

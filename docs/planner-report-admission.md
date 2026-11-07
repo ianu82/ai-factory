@@ -71,5 +71,15 @@ even when they replace an earlier planner exception.
 Confirmed draining can take time; this does not claim that cleanup always ends
 within the phase deadline or establish the cause of an earlier failed run.
 
+Planning source preparation records fixed operation starts and finishes for
+export, inventory, setup entry, each setup command, finalization and validation.
+Finishes retain elapsed time and whether that operation returned, without command
+arguments, exception text, source or provider content. Entry can include upload
+and remote entry; finalization can include remote exit and download. A return is
+not admission or proof of source integrity, cleanup or deadline compliance. A
+missing finish leaves the operation outcome unknown. Observation writes fail
+closed, and the existing cancellation owners, limits and ready-plan gates remain.
+These operation observations describe activity; they do not establish liveness.
+
 Builder and verifier prompts, tools and budgets are unchanged. Existing failed
 runs stay terminal; a new planning policy requires a fresh intake and fresh proof.

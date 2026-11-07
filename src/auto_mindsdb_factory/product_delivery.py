@@ -22,6 +22,7 @@ from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
 from .product_execution import execution_manifest, execution_config
 from .product_cancellation import RunCancellation, run_cancellable, enter_cancellable
+from .planning_preparation import preparation_operation
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
@@ -126,22 +127,29 @@ class ProductDelivery:
         command.abort = stopped.set
         return command
 
-    def _prepare(self, sha: str, workspace: Path, journal: RunJournal, *, deadline=None) -> dict[str, bytes]:
-        export_source(self.target, sha, workspace)
-        original = source_files(workspace)
-        original_executables = executable_paths(workspace, original)
+    def _prepare(self, sha: str, workspace: Path, journal: RunJournal, *, deadline=None,
+                 planning=False) -> dict[str, bytes]:
+        observations = journal if planning else None
+        with preparation_operation(observations, "source_export"):
+            export_source(self.target, sha, workspace)
+        with preparation_operation(observations, "source_inventory"):
+            original = source_files(workspace)
+            original_executables = executable_paths(workspace, original)
         if self.settings["setup"]:
             manager = self.sandbox_factory(workspace, self.settings["image"], writable=True,
                 network=self.settings["setup_network"], platform=self.settings["platform"])
             with enter_cancellable(manager, cancelled=self.cancelled,
-                    deadline=min(self.deadline, deadline if deadline is not None else self.deadline)) as sandbox:
+                    deadline=min(self.deadline, deadline if deadline is not None else self.deadline),
+                    observe=lambda operation: preparation_operation(observations, operation)) as sandbox:
                 for command in self.settings["setup"]:
-                    result = self._command(sandbox, command, deadline=deadline)
+                    with preparation_operation(observations, "setup_command"):
+                        result = self._command(sandbox, command, deadline=deadline)
                     journal.append("setup_command", commit_sha=sha, **result)
                     if result["exit_code"]:
                         raise DeliveryError("Candidate environment setup failed")
-            if source_files(workspace) != original or executable_paths(workspace, original) != original_executables:
-                raise DeliveryError("Environment setup changed source files")
+            with preparation_operation(observations, "setup_validation"):
+                if source_files(workspace) != original or executable_paths(workspace, original) != original_executables:
+                    raise DeliveryError("Environment setup changed source files")
         return original
 
     def _commit(self, task: ProductTask, base: str, original: dict, modified: dict, attempt: int,

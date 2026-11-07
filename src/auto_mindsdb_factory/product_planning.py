@@ -110,7 +110,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         with tempfile.TemporaryDirectory(prefix="ai-factory-plan-") as temporary:
             workspace = Path(temporary) / "source"
             phase = "source_preparation"
-            original = delivery._prepare(base, workspace, journal, deadline=work_deadline)
+            original = delivery._prepare(base, workspace, journal, deadline=work_deadline, planning=True)
             modes = executable_paths(workspace, original)
             investigated = False
             phase = "investigation_or_sandbox"

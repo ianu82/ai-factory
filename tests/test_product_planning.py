@@ -224,6 +224,7 @@ def test_phase_freezes_after_readonly_investigation_and_reuses_without_writes(ph
     assert [kind for kind, _ in p.calls] == ["prepare", "sandbox", "command", "closed"]
     assert p.calls[1][1]["writable"] is False
     assert p.calls[0][1]["deadline"] == p.calls[2][1]["deadline"]
+    assert p.calls[0][1]["planning"] is True
     assert p.contexts[0]["acceptance_criteria"] == p.task.public_context["acceptance_criteria"]
     before = {file.name: file.read_bytes() for file in p.journal.root.iterdir()}
     assert retained_plan(p.delivery, p.task, p.base, p.journal) == result
