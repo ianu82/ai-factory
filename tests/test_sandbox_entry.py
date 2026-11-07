@@ -58,7 +58,38 @@ def test_entry_return_between_polls_still_retires_at_deadline(monkeypatch, faile
     with pytest.raises(HarnessStopped) as raised:
         with cancellation.enter_cancellable(Manager(), cancelled=lambda: False, deadline=1):
             pytest.fail("Expired entry admitted work")
-    assert calls == ["abort"] and "private" not in str(raised.value)
+    assert 1 <= len(calls) <= (2 if failed_cleanup else 1)
+    assert set(calls) == {"abort"} and "private" not in str(raised.value)
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_actual_docker_late_creation_is_removed_after_early_abort_failed(tmp_path, monkeypatch, stop):
+    import subprocess
+    from auto_mindsdb_factory import docker_runner
+    clock, requested, early_removal = [0], threading.Event(), threading.Event()
+    created, removals = [], []
+    monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(docker_runner.os, "getuid", lambda: 10001)
+    class Docker(docker_runner.DockerSandbox):
+        def _docker(self, *args, **kwargs):
+            assert args[0] == "run"
+            clock[0] = 2 if stop == "deadline" else 0
+            requested.set()
+            assert early_removal.wait(2)
+            created.append(self.name)
+        def _remove(self):
+            removals.append(bool(created))
+            if not created:
+                early_removal.set()
+                return subprocess.CompletedProcess([], 1)
+            created.clear()
+            return subprocess.CompletedProcess([], 0)
+    with pytest.raises(HarnessStopped):
+        with cancellation.enter_cancellable(Docker(tmp_path, "node@sha256:" + "a" * 64),
+                cancelled=lambda: stop == "cancel" and requested.is_set(), deadline=1):
+            pytest.fail("Cancelled late container admitted work")
+    assert removals == [False, True] and not created
+    assert not any(t.name == "factory-command-cancellation" for t in threading.enumerate())
 
 
 def test_entry_watcher_finishes_before_command_owner_and_preserves_context_exit():

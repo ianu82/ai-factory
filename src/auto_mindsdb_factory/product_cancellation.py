@@ -92,7 +92,10 @@ def enter_cancellable(manager, *, cancelled, deadline):
     download and cleanup; a cancelled entry must never reach that download path.
     """
     class Entry:
-        completed = aborted = False
+        completed = retired = False
+
+        def __init__(self):
+            self.retirement = threading.Lock()
 
         def run(self, command):
             result = manager.__enter__()
@@ -100,8 +103,10 @@ def enter_cancellable(manager, *, cancelled, deadline):
             return result
 
         def abort(self):
-            self.aborted = True
-            manager.abort()
+            with self.retirement:
+                if not self.retired:
+                    manager.abort()
+                    self.retired = True
 
     entry = Entry()
     try:
@@ -110,12 +115,16 @@ def enter_cancellable(manager, *, cancelled, deadline):
         # after the deadline, even when that last polling interval did not run.
         if time.monotonic() >= deadline:
             raise HarnessStopped("Sandbox entry exceeded its deadline")
-    except BaseException:
-        if entry.completed and not entry.aborted:
+    except BaseException as error:
+        if entry.completed and not entry.retired:
+            # Removal can race creation and fail before the resource exists.
+            # Retry only after entry drains, never treating an attempt as proof.
             try:
                 entry.abort()
             except BaseException:
                 raise HarnessStopped("Sandbox entry cleanup could not be confirmed") from None
+            if isinstance(error, HarnessStopped):
+                raise HarnessStopped("Sandbox entry interrupted; late environment retired") from None
         raise
     try:
         yield sandbox

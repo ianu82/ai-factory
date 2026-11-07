@@ -55,6 +55,8 @@ watcher under the same work deadline. The entry operation drains before any
 body or inference is admitted; a late entry retires its owned environment and
 cannot download source as a successful context exit. The entry watcher ends
 before command execution, whose existing watcher remains its sole abort owner.
+If removal races creation and fails, retirement is retried after entry drains;
+an attempted removal is never treated as confirmed cleanup.
 Normal context cleanup and source validation still run on successful entry.
 Confirmed draining can take time; this does not claim that cleanup always ends
 within the phase deadline or establish the cause of an earlier failed run.
