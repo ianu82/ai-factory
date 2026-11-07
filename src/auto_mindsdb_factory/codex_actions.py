@@ -25,8 +25,18 @@ _REJECTIONS = {
     "action_arguments": "Codex action arguments are invalid",
 }
 REJECTION_REASONS = frozenset(_REJECTIONS)
-METADATA_REJECTION_DETAILS = frozenset({"fields_async", "fields_caller", "fields_async_and_caller",
-    "fields_other", "status", "item_id", "name", "namespace", "call_id", "input"})
+_EXTRA_FIELD_DETAILS = {
+    frozenset({"async"}): "fields_async",
+    frozenset({"caller"}): "fields_caller",
+    frozenset({"async", "caller"}): "fields_async_and_caller",
+    frozenset({"created_by"}): "fields_created_by",
+    frozenset({"async", "created_by"}): "fields_async_and_created_by",
+    frozenset({"caller", "created_by"}): "fields_caller_and_created_by",
+    frozenset({"async", "caller", "created_by"}): "fields_async_caller_and_created_by",
+}
+METADATA_REJECTION_DETAILS = frozenset(_EXTRA_FIELD_DETAILS.values()) | frozenset({
+    "fields_other", "fields_other_one", "fields_other_two", "fields_other_many",
+    "status", "item_id", "name", "namespace", "call_id", "input"})
 _ACTION_FIELDS = frozenset({"type", "name", "namespace", "call_id", "input", "id", "status"})
 
 
@@ -44,8 +54,11 @@ def _metadata_detail(call):
     """Classify an already rejected action; never serialize its keys or values."""
     extra = set(call) - _ACTION_FIELDS
     if extra:
-        return {frozenset({"async"}): "fields_async", frozenset({"caller"}): "fields_caller",
-                frozenset({"async", "caller"}): "fields_async_and_caller"}.get(frozenset(extra), "fields_other")
+        known = _EXTRA_FIELD_DETAILS.get(frozenset(extra))
+        if known is not None:
+            return known
+        # Count all extra fields, including any known ones, without retaining names.
+        return ("fields_other_one", "fields_other_two", "fields_other_many")[min(len(extra), 3) - 1]
     if "status" in call and (type(call["status"]) is not str or call["status"] != "completed"):
         return "status"
     if "id" in call and (type(call["id"]) is not str or not 1 <= len(call["id"]) <= 200):

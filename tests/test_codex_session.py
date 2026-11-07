@@ -21,7 +21,7 @@ from auto_mindsdb_factory.run_journal import RunJournal
 
 @pytest.mark.parametrize("mode", [
     "ok", "builder", "frozen", "slow", "slow-unknown-usage", "no-investigation", "missing", "findings",
-    "provider-cancel", "command-cancel", "command-deadline",
+    "provider-cancel", "command-cancel", "command-deadline", "metadata-actor", "metadata-other",
 ])
 def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     configured = os.environ.get("AI_FACTORY_CODEX_TEST_BINARY")
@@ -56,9 +56,11 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
         finish = len(requests) == 2 or mode == "no-investigation"
         code = ("text(await tools.finish(" + json.dumps(report) + "))" if finish
                 else 'text(await tools.run({"command":["inspect"]}))')
+        rejected_metadata = ({"created_by": "private actor"} if mode == "metadata-actor" else
+                             {"private field": "private value", "created_by": None} if mode == "metadata-other" else {})
         return httpx2.Response(200, json={"id": "resp_session", "status": "completed", "model": frozen_model,
             "output": [{"id": "ctc_session", "call_id": "call_session", "type": "custom_tool_call",
-                "name": "exec", "namespace": "functions", "input": code}],
+                "name": "exec", "namespace": "functions", "input": code, **rejected_metadata}],
             "usage": None if mode == "slow-unknown-usage" else {
                 "input_tokens": 7, "output_tokens": 3, "total_tokens": 10}})
     actual_client, actual_process = openai.AsyncOpenAI, codex_session.open_codex_process
@@ -95,7 +97,8 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     assert len(clients) == 1 and clients[0].is_closed()
     assert drained == ([True] if mode == "provider-cancel" else [])
     assert aborted.is_set() is (mode in {"command-cancel", "command-deadline"})
-    assert len(requests) == (1 if mode in {"no-investigation", "provider-cancel", "command-cancel", "command-deadline", "slow-unknown-usage"} else 2)
+    assert len(requests) == (1 if mode.startswith("metadata-") or mode in {
+        "no-investigation", "provider-cancel", "command-cancel", "command-deadline", "slow-unknown-usage"} else 2)
     events = journal.events()
     assert any(e["kind"] == "agent_report" for e in events) is accepted
     assert any(e["kind"] == "harness_closed" for e in events)
@@ -103,6 +106,13 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     assert all(request["model"] == frozen_model for request in requests)
     assert config.api_key not in json.dumps(events)
     assert journal.summary()["usage_complete"] is (mode not in {"provider-cancel", "slow-unknown-usage"})
+    if mode.startswith("metadata-"):
+        assert commands == [] and journal.summary()["total_tokens"] == 10
+        stops = [e["data"] for e in events if e["kind"] == "harness_policy_stopped"]
+        assert stops == [{"role": "verifier", "harness": "codex", "reason": "response_policy",
+            "response_rejection": "action_metadata", "response_rejection_detail":
+                "fields_created_by" if mode == "metadata-actor" else "fields_other_two"}]
+        assert "private actor" not in json.dumps(events) and "private field" not in json.dumps(events)
     if mode == "slow":
         assert commands == [["inspect"]] and journal.summary()["total_tokens"] == 20
         assert not any(e["kind"] == "harness_policy_stopped" for e in events)

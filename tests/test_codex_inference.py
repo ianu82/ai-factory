@@ -164,7 +164,11 @@ def test_rejection_code_is_retained_without_provider_content_or_retry(tmp_path, 
 
 @pytest.mark.parametrize("change,detail", [
     ({"async": False, "caller": {"type": "direct"}}, "fields_async_and_caller"),
-    ({"private field name": "private value"}, "fields_other"),
+    ({"created_by": "private actor"}, "fields_created_by"),
+    ({"async": None, "caller": None, "created_by": None}, "fields_async_caller_and_created_by"),
+    ({"private field name": "private value"}, "fields_other_one"),
+    ({"private field name": None, "created_by": None}, "fields_other_two"),
+    ({"private field name": None, "async": None, "created_by": None}, "fields_other_many"),
 ])
 def test_rejected_metadata_fields_are_accounted_without_stream_or_retry(tmp_path, change, detail):
     gate = boundary(tmp_path)

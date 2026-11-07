@@ -24,11 +24,19 @@ stops the session and admits no retry. Historical coarse stops cannot establish
 which response shape or program was rejected.
 
 Action-metadata rejection can additionally retain a fixed
-`response_rejection_detail`: unsupported `async`/`caller` field combinations,
-other unsupported fields, or the failed status/identifier/name/namespace/input
-check. Arbitrary field names and all values remain excluded. This classifies
+`response_rejection_detail`: exact unsupported `async`/`caller`/`created_by`
+field combinations, or the failed status/identifier/name/namespace/input check.
+Other combinations use `fields_other_one`, `fields_other_two` or
+`fields_other_many` (three or more), counting ALL extra fields, including known
+ones. These count buckets do not identify or exclude any particular field.
+Arbitrary field names and all values remain excluded. This classifies
 only an already rejected action: even null or false unsupported fields still
 stop before streaming, without retry. Missing historical details stay unknown.
+The pinned SDK's `ResponseCustomToolCallItem` extends `ResponseCustomToolCall`
+with `created_by`, also declared in the
+[official response-item schema](https://developers.openai.com/api/reference/typescript/resources/responses).
+Schema membership does not authorize this metadata. It remains rejected, and
+historical `fields_other` cannot establish that it was present in an old response.
 
 Before the first inference, the app-server receives the historical frozen role
 verbatim followed by controller-owned guidance declaring that exact expression

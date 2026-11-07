@@ -105,7 +105,14 @@ def test_rejects_forged_or_unbounded_action_metadata(field, value):
     ({"async": None}, "fields_async"),
     ({"caller": {"type": "private caller"}}, "fields_caller"),
     ({"async": False, "caller": None}, "fields_async_and_caller"),
-    ({"private field name": "private value", "async": False}, "fields_other"),
+    ({"created_by": None}, "fields_created_by"),
+    ({"async": False, "created_by": "private actor"}, "fields_async_and_created_by"),
+    ({"caller": None, "created_by": None}, "fields_caller_and_created_by"),
+    ({"async": None, "caller": None, "created_by": None}, "fields_async_caller_and_created_by"),
+    ({"private field name": "private value"}, "fields_other_one"),
+    ({"private field name": "private value", "async": False}, "fields_other_two"),
+    ({"private field name": None, "caller": None, "created_by": None}, "fields_other_many"),
+    ({"private field name": None, "async": None, "caller": None, "created_by": None}, "fields_other_many"),
     ({"status": "private status"}, "status"),
     ({"id": None}, "item_id"),
     ({"name": "private name"}, "name"),
@@ -121,6 +128,15 @@ def test_metadata_diagnostic_is_fixed_and_changes_no_rejection(change, detail):
         codex_action(r, model=MODEL)
     assert caught.value.reason == "action_metadata" and caught.value.detail == detail
     assert "private" not in str(caught.value) and r == before
+
+
+@pytest.mark.parametrize("value", [None, False, "private actor", {"private": "body"}])
+def test_actor_metadata_never_authorizes_execution_even_when_empty(value):
+    r = response('text(await tools.run({"command":["true"]}))')
+    r["output"][1]["created_by"] = value
+    with pytest.raises(CodexActionError) as caught:
+        codex_action(r, model=MODEL)
+    assert caught.value.detail == "fields_created_by" and "private" not in str(caught.value)
 
 
 def test_missing_action_and_excessive_json_nesting_fail_closed():
