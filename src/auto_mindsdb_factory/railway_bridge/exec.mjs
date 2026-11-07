@@ -1,4 +1,11 @@
 // The controller owns the lifecycle deadline; the SDK owns its request drain.
+export function execBudget(budgetMs) {
+  if (budgetMs === undefined) return () => undefined;
+  if (!Number.isSafeInteger(budgetMs) || budgetMs < 1) throw new TypeError('Invalid execution budget');
+  const deadline = performance.now() + budgetMs;
+  return () => Math.floor(deadline - performance.now());
+}
+
 export async function checkedExec(sandbox, command, input, timeoutSec, maxOutputBytes = 65536, budgetMs) {
   let signalMs = (timeoutSec + 30) * 1000;
   if (budgetMs !== undefined) {

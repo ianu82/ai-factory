@@ -47,9 +47,16 @@ def request_cancellation(store, run_id):
     return {"status": "cancellation_requested", "run_id": run_id}
 
 
+def _set_deadline(owner, deadline):
+    setter = getattr(owner, "set_deadline", None)
+    if setter is not None:
+        setter(deadline)
+
+
 def run_cancellable(sandbox, command, *, cancelled, deadline):
     if cancelled() or time.monotonic() >= deadline:
         raise HarnessStopped("Execution cancelled or its deadline expired")
+    _set_deadline(sandbox, deadline)
     finished, interrupted = threading.Event(), threading.Event()
     cleanup_errors = []
     def watch():
@@ -99,6 +106,9 @@ def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=Non
         def __init__(self):
             self.retirement = threading.Lock()
 
+        def set_deadline(self, end):
+            _set_deadline(manager, end)
+
         def run(self, command):
             result = manager.__enter__()
             self.completed = True
@@ -133,6 +143,8 @@ def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=Non
     def exit_context(exception):
         class Finalization:
             interrupted = False
+            def set_deadline(self, end):
+                _set_deadline(manager, end)
             def run(self, command):
                 return manager.__exit__(*exception)
             def abort(self):

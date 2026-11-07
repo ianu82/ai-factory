@@ -7,6 +7,7 @@ processes stop heartbeating and Railway expires their workers after five minutes
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -112,15 +113,44 @@ def railway_exec_observations(error):
     return dict(zip(_exec_fields, values)) if values is not None else None
 
 
+def _bounded_bridge(command, *, input, env, timeout, deadline):
+    # Node waits for the complete stdin request before dispatch. Recalculate
+    # after spawn so a slow process launch cannot admit an expired operation.
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env) as process:
+        remaining = deadline - time.monotonic()
+        try:
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, 0)
+            stdout, stderr = process.communicate(input, timeout=min(timeout, remaining))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise  # Preserve the primary interruption after reaping the child.
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def bridge(request):
     environment = {name: os.environ[name] for name in
         ("PATH", "RAILWAY_API_TOKEN", "RAILWAY_ENVIRONMENT_ID") if name in os.environ}
     if not all(environment.get(name) for name in ("RAILWAY_API_TOKEN", "RAILWAY_ENVIRONMENT_ID")):
         raise RunnerError("Railway project token and environment ID are required")
     timeout = request.get("timeout", 150) + 60
+    request = dict(request)
+    deadline = request.pop("deadline", None)
     try:
-        result = subprocess.run(["node", str(Path(__file__).with_name("railway_bridge") / "bridge.mjs")],
-            input=json.dumps(request), capture_output=True, text=True, env=environment, timeout=timeout)
+        command = ["node", str(Path(__file__).with_name("railway_bridge") / "bridge.mjs")]
+        if deadline is None:
+            result = subprocess.run(command, input=json.dumps(request), capture_output=True,
+                text=True, env=environment, timeout=timeout)
+        else:
+            _execution_budget(deadline, timeout)  # Validate before allocating a bridge process.
+            result = _bounded_bridge(command, input=json.dumps(request), env=environment,
+                timeout=timeout, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RailwayOperationError(request, type(error).__name__) from None
     try:
@@ -133,6 +163,17 @@ def bridge(request):
         raise RailwayOperationError(request, response.get("error", "BridgeProcessError"),
             exec_observations=response.get("exec_observations"))
     return response
+
+
+def _execution_budget(deadline, timeout):
+    if deadline is None:
+        return {}
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise RunnerError("Invalid Railway execution deadline")
+    milliseconds = int(min(deadline - time.monotonic(), timeout + 30) * 1000)
+    if milliseconds < 1:
+        raise RunnerError("Railway execution deadline expired")
+    return {"budget_ms": milliseconds, "deadline": deadline}
 
 
 class RailwayPool:
@@ -207,20 +248,22 @@ class RailwayPool:
                     raise RunnerError("Railway worker creation was cancelled")
             return self.id
 
-    def open(self, workspace):
+    def open(self, workspace, *, deadline=None):
         with self.lock:
             if self.stopped.is_set():
                 raise RunnerError("Railway worker pool is closed")
             if self.failure:
                 raise self.failure
+            _execution_budget(deadline, 120)  # No late allocation after waiting for the lock.
             if self.workspace != workspace:
                 if self.workspace is not None:
                     self._discard()
+                _execution_budget(deadline, 120)  # Retirement may have consumed the remaining budget.
                 self.warm()
                 self.workspace = workspace
-                self.call({"action": "upload", "source": pack_source(workspace)}, timeout=120)
+                self.call({"action": "upload", "source": pack_source(workspace)}, timeout=120, deadline=deadline)
 
-    def call(self, request, *, timeout=120):
+    def call(self, request, *, timeout=120, deadline=None):
         with self.lock:
             if self.stopped.is_set():
                 raise RunnerError("Railway worker pool is closed")
@@ -230,7 +273,7 @@ class RailwayPool:
                 raise RunnerError("Railway worker is unavailable")
             try:
                 response = self.transport({"action": "request", "id": self.id,
-                                           "request": request, "timeout": timeout})
+                    "request": request, "timeout": timeout, **_execution_budget(deadline, timeout)})
                 if "error" in response:
                     raise RailwayOperationError({"request": request}, response["error"])
                 return response
@@ -286,13 +329,21 @@ class RailwaySandbox:
         self.pool, self.workspace = pool, Path(workspace).resolve()
         self.options = {"name": "ai-factory-" + uuid4().hex, "image": image, **options}
         self.timeout = options["timeout"]
+        self.deadline = None
+
+    def set_deadline(self, deadline):
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise RunnerError("Invalid Railway execution deadline")
+        self.deadline = deadline
 
     def _call(self, action, **fields):
         request = {"action": action, "sandbox": {**self.options, "timeout": self.timeout}, **fields}
-        return self.pool.call(request, timeout=self.timeout + 45 if action == "run" else 150)
+        limits = {} if self.deadline is None else {"deadline": self.deadline}
+        return self.pool.call(request, timeout=self.timeout + 45 if action == "run" else 150, **limits)
 
     def __enter__(self):
-        self.pool.open(self.workspace)
+        limits = {} if self.deadline is None else {"deadline": self.deadline}
+        self.pool.open(self.workspace, **limits)
         self._call("enter")
         return self
 

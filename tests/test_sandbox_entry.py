@@ -13,6 +13,7 @@ from auto_mindsdb_factory.railway_runner import RailwayPool
 def test_actual_pool_retires_late_entry_once_before_any_body(tmp_path, monkeypatch, operation, stop):
     clock, requested, retired, drained = [0], threading.Event(), threading.Event(), threading.Event()
     monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr("auto_mindsdb_factory.railway_runner.time", cancellation.time)
     calls = []
     def transport(request):
         action = request.get("request", {}).get("action", request["action"])
@@ -123,6 +124,7 @@ def test_cancelled_entry_does_not_allocate_a_sandbox():
 def test_actual_pool_finalization_is_aborted_and_drained(tmp_path, monkeypatch, operation, stop):
     clock, requested, retired, drained = [0], threading.Event(), threading.Event(), threading.Event()
     monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr("auto_mindsdb_factory.railway_runner.time", cancellation.time)
     calls = []
     def transport(request):
         action = request.get("request", {}).get("action", request["action"])

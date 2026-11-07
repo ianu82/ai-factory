@@ -5,7 +5,7 @@ import {Sandbox, ExecInterruptedError, ExecNotStartedError, ExecControlUnsupport
 import {WebSocketServer} from 'ws';
 import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
-import {checkedExec} from './exec.mjs';
+import {checkedExec, execBudget} from './exec.mjs';
 
 async function fixture(t, mode, observations) {
   const server = createServer();
@@ -84,9 +84,22 @@ test('invalid controller budgets fail before SDK admission', async () => {
   let calls = 0;
   const sandbox = {exec() { calls++; }};
   for (const budget of [0, -1, 1.5, NaN, Infinity, '80', null, true]) {
+    assert.throws(() => execBudget(budget), TypeError);
     await assert.rejects(checkedExec(sandbox, 'must-not-run', undefined, 2, 65536, budget), TypeError);
   }
   assert.equal(calls, 0);
+});
+
+test('control-plane lookup consumes the budget and cannot admit a late exec', async t => {
+  let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  const remaining = execBudget(80);
+  now = 125;
+  assert.equal(remaining(), 55);
+  now = 181;
+  await assert.rejects(checkedExec({exec() { assert.fail('expired exec dispatched'); }},
+    'must-not-run', undefined, 2, 65536, remaining()), TypeError);
+  assert.equal(execBudget(undefined)(), undefined);
 });
 
 test('optional budget preserves defaults and cannot extend the existing signal limit', async t => {

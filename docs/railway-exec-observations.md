@@ -26,6 +26,14 @@ cannot approve a task, establish liveness or diagnose an earlier failed run.
 The bridge accepts an optional positive integer `budget_ms` for its existing SDK
 abort signal. It can shorten the existing `timeoutSec + 30` signal limit and
 covers connection negotiation and stdin as well as execution. Without it,
-behavior is unchanged. Python phase propagation is a separate integration step.
+behavior is unchanged. Lifecycle/command owners bind the existing absolute phase
+or run deadline. Python recalculates the remaining budget under the pool lock
+before each upload, entry, command, exit and download; finalization receives its
+existing reserve. The bridge deducts time spent looking up the sandbox before
+admitting exec. No budget is sent to candidate code, heartbeat or destruction.
+The Python bridge also bounds and reaps its Node child at that deadline,
+rechecking after process spawn and excluding the absolute deadline from stdin.
+A killed bridge has unknown transport metadata; the pool still owns VM retirement.
+Worker bootstrap retains its separately bounded preparation owner.
 SDK request draining and owned VM retirement remain necessary; this timer does
 not establish a cleanup wall-time guarantee or diagnose an earlier failure.

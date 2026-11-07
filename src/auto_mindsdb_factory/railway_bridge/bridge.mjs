@@ -3,13 +3,14 @@ import {readFile} from 'node:fs/promises';
 import {Sandbox, SandboxNotFoundError} from 'railway';
 import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
-import {checkedExec} from './exec.mjs';
+import {checkedExec, execBudget} from './exec.mjs';
 
 const MAX_MESSAGE_BYTES = 100 * 1024 * 1024;
 const observations = execObservations();
 const options = {...clientOptions(), webSocketImpl: observations.WebSocketImpl};
 
 async function dispatch(request) {
+  const remainingBudget = execBudget(request.budget_ms);
   if (request.action === 'create') {
     const sandbox = await Sandbox.create({
       ...options, resources: {cpu: 4, memoryGB: 8}, idleTimeoutMinutes: 5,
@@ -56,7 +57,8 @@ async function dispatch(request) {
   if (request.action !== 'request') throw new Error('Unknown bridge operation');
   const output = await checkedExec(sandbox,
     'cd /opt/ai-factory && runuser -u factory -- /usr/bin/python3 -m auto_mindsdb_factory.railway_remote',
-    JSON.stringify(request.request), request.timeout, MAX_MESSAGE_BYTES, request.budget_ms);
+    JSON.stringify(request.request), request.timeout, MAX_MESSAGE_BYTES,
+    remainingBudget());
   return JSON.parse(output);
 }
 
