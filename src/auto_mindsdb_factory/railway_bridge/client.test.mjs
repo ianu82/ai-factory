@@ -5,6 +5,7 @@ import {Sandbox, ExecInterruptedError, ExecNotStartedError, ExecControlUnsupport
 import {WebSocketServer} from 'ws';
 import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
+import {checkedExec} from './exec.mjs';
 
 async function fixture(t, mode, observations) {
   const server = createServer();
@@ -17,10 +18,14 @@ async function fixture(t, mode, observations) {
       return;
     }
     sockets.handleUpgrade(request, socket, head, connection => {
+      // Release a failed deadline regression promptly, without an SDK retry.
+      const fallback = mode === 'stalled' ? setTimeout(() => connection.close(1008), 600) : undefined;
+      connection.on('close', () => clearTimeout(fallback));
       connection.on('message', (bytes, binary) => {
         if (binary) return;
         const frame = JSON.parse(bytes.toString());
         if (frame.type === 'exec_hello') {
+          if (mode === 'stalled') return;
           connection.send(JSON.stringify({type: 'exec_capabilities', data: {
             version: 2, stdin_chunk_bytes: 16384, stdin_chunks: 64,
           }}));
@@ -62,6 +67,42 @@ test('rejected handshakes fail before execution without crashing Node', async t 
     ephemeral: true, signal: AbortSignal.timeout(5000),
   }), ExecNotStartedError);
   assert.deepEqual(observed, {attempts: 2, commands: 0});
+});
+
+for (const input of [undefined, 'private-input']) {
+  test(`controller budget stops a stalled handshake with stdin=${input !== undefined}`, async t => {
+    const {sandbox, observed} = await fixture(t, 'stalled');
+    const started = performance.now();
+    await assert.rejects(checkedExec(sandbox, 'must-not-run', input, 2, 65536, 80),
+      error => error.name === 'TimeoutError');
+    assert.ok(performance.now() - started < 500);
+    assert.deepEqual(observed, {attempts: 1, commands: 0});
+  });
+}
+
+test('invalid controller budgets fail before SDK admission', async () => {
+  let calls = 0;
+  const sandbox = {exec() { calls++; }};
+  for (const budget of [0, -1, 1.5, NaN, Infinity, '80', null, true]) {
+    await assert.rejects(checkedExec(sandbox, 'must-not-run', undefined, 2, 65536, budget), TypeError);
+  }
+  assert.equal(calls, 0);
+});
+
+test('optional budget preserves defaults and cannot extend the existing signal limit', async t => {
+  const signalMs = [];
+  const timeout = AbortSignal.timeout;
+  t.mock.method(AbortSignal, 'timeout', ms => { signalMs.push(ms); return timeout(ms); });
+  const options = [];
+  const sandbox = {exec(command, supplied) {
+    options.push(supplied);
+    return {exitCode: 0, timedOut: false, truncated: false, stdout: 'result'};
+  }};
+  for (const budget of [undefined, 1000000, 80]) {
+    assert.equal(await checkedExec(sandbox, 'command', undefined, 2, 17, budget), 'result');
+  }
+  assert.deepEqual(signalMs, [32000, 32000, 80]);
+  assert.ok(options.every(o => o.ephemeral && !o.stdin && o.timeoutSec === 2 && o.maxOutputBytes === 17));
 });
 
 test('a transient rejected handshake recovers and executes exactly once', async t => {

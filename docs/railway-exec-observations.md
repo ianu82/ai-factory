@@ -20,3 +20,12 @@ retirement; missing evidence remains unknown, including a killed bridge process.
 A send returning is not remote acknowledgement. Counts can saturate, control
 frames can be unclassified, and missing observations remain unknown. These facts
 cannot approve a task, establish liveness or diagnose an earlier failed run.
+
+# Controller execution budget
+
+The bridge accepts an optional positive integer `budget_ms` for its existing SDK
+abort signal. It can shorten the existing `timeoutSec + 30` signal limit and
+covers connection negotiation and stdin as well as execution. Without it,
+behavior is unchanged. Python phase propagation is a separate integration step.
+SDK request draining and owned VM retirement remain necessary; this timer does
+not establish a cleanup wall-time guarantee or diagnose an earlier failure.

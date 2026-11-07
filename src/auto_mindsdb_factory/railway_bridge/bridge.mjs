@@ -3,26 +3,11 @@ import {readFile} from 'node:fs/promises';
 import {Sandbox, SandboxNotFoundError} from 'railway';
 import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
+import {checkedExec} from './exec.mjs';
 
 const MAX_MESSAGE_BYTES = 100 * 1024 * 1024;
 const observations = execObservations();
 const options = {...clientOptions(), webSocketImpl: observations.WebSocketImpl};
-
-async function checkedExec(sandbox, command, input, timeoutSec, maxOutputBytes = 65536) {
-  const handle = sandbox.exec(command, {
-    ephemeral: true, stdin: input !== undefined, timeoutSec, maxOutputBytes,
-    signal: AbortSignal.timeout((timeoutSec + 30) * 1000),
-  });
-  if (input !== undefined) {
-    await handle.stdin.write(input);
-    await handle.stdin.end();
-  }
-  const result = await handle;
-  if (result.exitCode !== 0 || result.timedOut || result.truncated) {
-    throw new Error('Remote execution was incomplete');
-  }
-  return result.stdout;
-}
 
 async function dispatch(request) {
   if (request.action === 'create') {
@@ -71,7 +56,7 @@ async function dispatch(request) {
   if (request.action !== 'request') throw new Error('Unknown bridge operation');
   const output = await checkedExec(sandbox,
     'cd /opt/ai-factory && runuser -u factory -- /usr/bin/python3 -m auto_mindsdb_factory.railway_remote',
-    JSON.stringify(request.request), request.timeout, MAX_MESSAGE_BYTES);
+    JSON.stringify(request.request), request.timeout, MAX_MESSAGE_BYTES, request.budget_ms);
   return JSON.parse(output);
 }
 
