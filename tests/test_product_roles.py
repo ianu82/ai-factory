@@ -71,6 +71,15 @@ def test_report_window_keeps_the_historical_readiness_contract():
         k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
 
 
+def test_portable_planner_retains_prior_policy_and_historical_digest():
+    previous = select_role("planner", "5")
+    assert previous["digest"] == "788c7c7a1017f9b80b2305e30a728bf43f23f8cc41dd3c51882b4c33578ae853"
+    current = select_role("planner", "6")
+    assert current["instructions"].startswith(previous["instructions"])
+    assert {k: v for k, v in current.items() if k not in {"version", "digest", "instructions"}} == {
+        k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
+
+
 def test_candidate_files_and_cwd_cannot_replace_trusted_registry(tmp_path):
     (tmp_path / "product_roles.py").write_text("raise RuntimeError('candidate role executed')")
     package = tmp_path / "auto_mindsdb_factory"

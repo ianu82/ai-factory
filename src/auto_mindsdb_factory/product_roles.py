@@ -113,6 +113,22 @@ _DEFINITIONS[("planner", "5")] = _definition(
        ("purpose", "required_evidence", "supported_tools", "constraints")},
 )
 
+_previous_planner = _DEFINITIONS[("planner", "5")]
+_DEFINITIONS[("planner", "6")] = _definition(
+    "planner", "6", _previous_planner["instructions"] + (
+        " Keep repository discovery inside /workspace; do not search parent or system directories. "
+        "Minimal job images may lack optional utilities such as rg. Use available portable find, grep, sed or cat, "
+        "or the declared project runtime; check optional utilities before use and include a fallback in the same batch. "
+        "In the first bounded read-only batch, read applicable repository guidance, the relevant source, "
+        "surrounding test patterns and referenced requirements. Prune generated dependency/cache directories "
+        "from discovery and bound output. A file listing alone does not establish its contents. "
+        "If required evidence remains unread or a command fails, retain the uncertainty in the report; "
+        "tool availability never waives investigation or any ready-plan requirement."
+    ),
+    **{key: _previous_planner[key] for key in
+       ("purpose", "required_evidence", "supported_tools", "constraints")},
+)
+
 
 # Keep historical definitions in _DEFINITIONS when changing an active version.
 _DEFAULT_VERSIONS = {"builder": "1", "verifier": "1", "planner": "1"}
