@@ -121,13 +121,18 @@ class DockerSandbox:
             if self._removed:
                 return subprocess.CompletedProcess(command, 0)
             result = subprocess.run(command, capture_output=True, timeout=30)
-            self._removed = result.returncode == 0
+            code = getattr(result, "returncode", None)
+            self._removed = type(code) is int and code == 0
             return result
 
     def abort(self) -> None:
         """Stop the owned container, including processes behind a blocked exec client."""
-        if self._remove().returncode:
+        result = self._remove()
+        if type(getattr(result, "returncode", None)) is not int or result.returncode != 0:
             raise RunnerError("Sandbox cancellation cleanup could not be confirmed")
 
     def __exit__(self, *exc) -> None:
-        self.abort()
+        try:
+            self.abort()
+        except RunnerError:
+            raise RunnerError("Container cleanup was not confirmed") from None

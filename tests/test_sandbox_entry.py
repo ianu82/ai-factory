@@ -239,6 +239,18 @@ def test_docker_failed_removal_is_never_cached_as_confirmed(tmp_path, monkeypatc
     assert calls == [True, True] and not results
 
 
+@pytest.mark.parametrize("result", [None, SimpleNamespace(returncode=None), SimpleNamespace(returncode=False)])
+def test_unknown_docker_retirement_result_cannot_confirm_exit(tmp_path, monkeypatch, result):
+    from auto_mindsdb_factory import docker_runner
+    results = [result, SimpleNamespace(returncode=0)]
+    monkeypatch.setattr(docker_runner.subprocess, "run", lambda *a, **kw: results.pop(0))
+    sandbox = docker_runner.DockerSandbox(tmp_path, "node@sha256:" + "a" * 64)
+    with pytest.raises(docker_runner.RunnerError, match="not confirmed"):
+        sandbox.__exit__(None, None, None)
+    sandbox.abort()
+    assert not results
+
+
 def test_new_docker_entry_requires_new_removal_confirmation(tmp_path, monkeypatch):
     import subprocess
     from auto_mindsdb_factory import docker_runner
