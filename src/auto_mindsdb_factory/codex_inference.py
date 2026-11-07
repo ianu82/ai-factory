@@ -7,7 +7,7 @@ import math
 import re
 import time
 
-from .codex_actions import CodexActionError, REJECTION_REASONS
+from .codex_actions import CodexActionError, METADATA_REJECTION_DETAILS, REJECTION_REASONS
 from .codex_request import CodexRequestError, codex_request
 from .codex_stream import codex_response
 from .product_costs import estimate_cost
@@ -47,12 +47,15 @@ class CodexInference:
             self._stopped = True
             raise CodexStopped("Codex execution evidence could not be retained") from None
 
-    def stop(self, reason, *, response_rejection=None):
+    def stop(self, reason, *, response_rejection=None, response_rejection_detail=None):
         self._stopped = True
         data = {}
         if type(reason) is str and reason == "response_policy":
             data["response_rejection"] = (response_rejection if type(response_rejection) is str
                 and response_rejection in REJECTION_REASONS else "unknown")
+            if (data["response_rejection"] == "action_metadata" and type(response_rejection_detail) is str
+                    and response_rejection_detail in METADATA_REJECTION_DETAILS):
+                data["response_rejection_detail"] = response_rejection_detail
         self.record("harness_policy_stopped", reason=reason if type(reason) is str and reason in _REASONS else "unknown", **data)
         raise CodexStopped("Codex execution stopped by Factory policy")
 
@@ -173,4 +176,4 @@ class CodexInference:
             self._pending_action = json.dumps([name, arguments], sort_keys=True, allow_nan=False)
             return wire
         except CodexActionError as exc:
-            self.stop("response_policy", response_rejection=exc.reason)
+            self.stop("response_policy", response_rejection=exc.reason, response_rejection_detail=exc.detail)

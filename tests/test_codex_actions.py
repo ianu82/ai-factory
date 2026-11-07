@@ -101,6 +101,28 @@ def test_rejects_forged_or_unbounded_action_metadata(field, value):
         codex_action(r, model=MODEL)
 
 
+@pytest.mark.parametrize("change,detail", [
+    ({"async": None}, "fields_async"),
+    ({"caller": {"type": "private caller"}}, "fields_caller"),
+    ({"async": False, "caller": None}, "fields_async_and_caller"),
+    ({"private field name": "private value", "async": False}, "fields_other"),
+    ({"status": "private status"}, "status"),
+    ({"id": None}, "item_id"),
+    ({"name": "private name"}, "name"),
+    ({"namespace": "private namespace"}, "namespace"),
+    ({"call_id": []}, "call_id"),
+    ({"input": None}, "input"),
+])
+def test_metadata_diagnostic_is_fixed_and_changes_no_rejection(change, detail):
+    r = response('text(await tools.run({"command":["true"]}))')
+    r["output"][1].update(change)
+    before = copy.deepcopy(r)
+    with pytest.raises(CodexActionError) as caught:
+        codex_action(r, model=MODEL)
+    assert caught.value.reason == "action_metadata" and caught.value.detail == detail
+    assert "private" not in str(caught.value) and r == before
+
+
 def test_missing_action_and_excessive_json_nesting_fail_closed():
     with pytest.raises(CodexActionError):
         codex_action({"model": MODEL, "status": "completed", "output": []}, model=MODEL)

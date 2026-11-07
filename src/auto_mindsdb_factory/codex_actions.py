@@ -25,14 +25,37 @@ _REJECTIONS = {
     "action_arguments": "Codex action arguments are invalid",
 }
 REJECTION_REASONS = frozenset(_REJECTIONS)
+METADATA_REJECTION_DETAILS = frozenset({"fields_async", "fields_caller", "fields_async_and_caller",
+    "fields_other", "status", "item_id", "name", "namespace", "call_id", "input"})
+_ACTION_FIELDS = frozenset({"type", "name", "namespace", "call_id", "input", "id", "status"})
 
 
 class CodexActionError(ValueError):
     """A fixed diagnostic code; never include rejected provider content."""
 
-    def __init__(self, reason):
+    def __init__(self, reason, *, detail=None):
         self.reason = reason if type(reason) is str and reason in REJECTION_REASONS else "unknown"
+        self.detail = (detail if self.reason == "action_metadata" and type(detail) is str
+                       and detail in METADATA_REJECTION_DETAILS else None)
         super().__init__(_REJECTIONS.get(self.reason, "Codex response rejected"))
+
+
+def _metadata_detail(call):
+    """Classify an already rejected action; never serialize its keys or values."""
+    extra = set(call) - _ACTION_FIELDS
+    if extra:
+        return {frozenset({"async"}): "fields_async", frozenset({"caller"}): "fields_caller",
+                frozenset({"async", "caller"}): "fields_async_and_caller"}.get(frozenset(extra), "fields_other")
+    if "status" in call and (type(call["status"]) is not str or call["status"] != "completed"):
+        return "status"
+    if "id" in call and (type(call["id"]) is not str or not 1 <= len(call["id"]) <= 200):
+        return "item_id"
+    for key, value in {"name": "exec", "namespace": "functions"}.items():
+        if type(call.get(key)) is not str or call[key] != value:
+            return key
+    if type(call.get("call_id")) is not str or not 1 <= len(call["call_id"]) <= 200:
+        return "call_id"
+    return "input"
 
 
 _ACTION = re.compile(
@@ -76,14 +99,14 @@ def codex_action(response: dict, *, model: str) -> tuple[str, dict, str]:
     if len(calls) != 1:
         raise CodexActionError("action_count")
     call = calls[0]
-    if (set(call) - {"type", "name", "namespace", "call_id", "input", "id", "status"}
+    if (set(call) - _ACTION_FIELDS
             or ("status" in call and (type(call["status"]) is not str or call["status"] != "completed"))
             or ("id" in call and (type(call["id"]) is not str or not 1 <= len(call["id"]) <= 200))
             or any(type(call.get(key)) is not str or call[key] != value
             for key, value in {"name": "exec", "namespace": "functions"}.items())
             or type(call.get("call_id")) is not str or not 1 <= len(call["call_id"]) <= 200
             or type(call.get("input")) is not str or len(call["input"]) > 1_000_000):
-        raise CodexActionError("action_metadata")
+        raise CodexActionError("action_metadata", detail=_metadata_detail(call))
     # Trim the suffix separately: adjacent optional whitespace patterns would
     # allow quadratic regex backtracking on a large rejected program.
     program = call["input"].strip(" \t\r\n")

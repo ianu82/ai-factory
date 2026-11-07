@@ -23,6 +23,13 @@ Unknown codes remain `unknown`. Rejection still releases no executable bytes,
 stops the session and admits no retry. Historical coarse stops cannot establish
 which response shape or program was rejected.
 
+Action-metadata rejection can additionally retain a fixed
+`response_rejection_detail`: unsupported `async`/`caller` field combinations,
+other unsupported fields, or the failed status/identifier/name/namespace/input
+check. Arbitrary field names and all values remain excluded. This classifies
+only an already rejected action: even null or false unsupported fields still
+stop before streaming, without retry. Missing historical details stay unknown.
+
 Before the first inference, the app-server receives the historical frozen role
 verbatim followed by controller-owned guidance declaring that exact expression
 format, literal JSON, single-call restriction and isolated-job command location.

@@ -156,8 +156,43 @@ def test_rejection_code_is_retained_without_provider_content_or_retry(tmp_path, 
     assert len(calls) == 1 and gate.stopped and gate.journal.summary()["total_tokens"] == 10
     stops = [e["data"] for e in gate.journal.events() if e["kind"] == "harness_policy_stopped"]
     assert stops == [{"role": "builder", "harness": "codex", "reason": "response_policy",
-                      "response_rejection": expected}]
+                      "response_rejection": expected, **({"response_rejection_detail":
+                          "namespace" if "namespace" in change["action"] else "item_id"}
+                          if expected == "action_metadata" else {})}]
     assert "private" not in json.dumps(gate.journal.events())
+
+
+@pytest.mark.parametrize("change,detail", [
+    ({"async": False, "caller": {"type": "direct"}}, "fields_async_and_caller"),
+    ({"private field name": "private value"}, "fields_other"),
+])
+def test_rejected_metadata_fields_are_accounted_without_stream_or_retry(tmp_path, change, detail):
+    gate = boundary(tmp_path)
+    response = copy.deepcopy(RESPONSE)
+    response["output"][0].update(change)
+    sdk, calls, _, _ = client(response)
+    for _ in range(2):
+        with pytest.raises(CodexStopped):
+            asyncio.run(gate.request(sdk, BODY))
+    assert len(calls) == 1 and gate.journal.summary()["total_tokens"] == 10
+    assert gate.journal.events()[-1]["data"] == {"role": "builder", "harness": "codex",
+        "reason": "response_policy", "response_rejection": "action_metadata",
+        "response_rejection_detail": detail}
+    assert "private" not in json.dumps(gate.journal.events())
+
+
+@pytest.mark.parametrize("detail", [None, [], {"private": "body"}, "private value", "name"])
+def test_metadata_detail_cannot_escape_its_fixed_category(tmp_path, detail):
+    gate = boundary(tmp_path)
+    with pytest.raises(CodexStopped):
+        gate.stop("response_policy", response_rejection="action_expression", response_rejection_detail=detail)
+    assert "response_rejection_detail" not in gate.journal.events()[-1]["data"]
+    gate = boundary(tmp_path / "metadata")
+    with pytest.raises(CodexStopped):
+        gate.stop("response_policy", response_rejection="action_metadata", response_rejection_detail=detail)
+    expected = {"response_rejection_detail": "name"} if detail == "name" else {}
+    assert gate.journal.events()[-1]["data"] == {"role": "builder", "harness": "codex",
+        "reason": "response_policy", "response_rejection": "action_metadata", **expected}
 
 
 @pytest.mark.parametrize("untrusted", [None, [], {"private": "body"}, "private exception message"])
