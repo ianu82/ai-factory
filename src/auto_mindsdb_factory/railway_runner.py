@@ -143,8 +143,21 @@ class RailwayPool:
         self.stopped = threading.Event()
         self.failure = None
         self._aborting = None
+        self._journal = None
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.thread.start()
+
+    def _record_failure(self, error):
+        if self._journal is None:
+            return
+        try:
+            operation, category = railway_failure_facts(error)
+            self._journal.append("runner_transport_failed", operation=operation, category=category,
+                exec_observations=railway_exec_observations(error))
+        except BaseException:
+            # A primary transport failure is already in flight. Even an evidence
+            # write interruption cannot replace it or prevent owned retirement.
+            pass
 
     def _heartbeat(self):
         while not self.stopped.wait(60):
@@ -182,7 +195,11 @@ class RailwayPool:
             if self.failure:
                 raise self.failure
             if self.id is None:
-                self.id = self.transport({"action": "create", "timeout": timeout})["id"]
+                try:
+                    self.id = self.transport({"action": "create", "timeout": timeout})["id"]
+                except BaseException as error:
+                    self._record_failure(error)
+                    raise
                 if self.stopped.is_set():
                     self._discard()
                     raise RunnerError("Railway worker creation was cancelled")
@@ -215,7 +232,10 @@ class RailwayPool:
                 if "error" in response:
                     raise RailwayOperationError({"request": request}, response["error"])
                 return response
-            except BaseException:
+            except BaseException as error:
+                # Retain bounded facts before cleanup/cancellation replaces the
+                # runner error. An observation is never execution acknowledgement.
+                self._record_failure(error)
                 # A lost docker-exec transport cannot prove the candidate stopped.
                 # Retire its whole VM and prevent further use of this source export.
                 try:
@@ -304,12 +324,17 @@ class _WorkerPreparation:
 
 
 class RailwayDelivery(ProductDelivery):
+    def _prepare(self, sha, workspace, journal, **kwargs):
+        self._railway_pool._journal = journal
+        return super()._prepare(sha, workspace, journal, **kwargs)
+
     def prepare_runner(self, journal):
         self.check_cancelled()
         remaining = self.deadline - time.monotonic()
         if remaining < 1:
             raise RunnerError("Run time budget exhausted before worker preparation")
         pool = self._railway_pool
+        pool._journal = journal
         if pool.id is not None:
             return
         journal.append("runner_preparation_started", budget="shared_run_deadline")

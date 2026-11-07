@@ -12,8 +12,11 @@ The controller bridge enables the collector and returns its fixed snapshot only
 for exact pinned SDK execution-start/interruption/control errors. Python accepts
 only the complete bounded schema and freezes primitive values outside the mutable
 exception. The accessor requires intact original failure provenance and returns a
-detached copy; absent or malformed snapshots remain unknown. Journal persistence
-before cancellation replaces an error requires a separate delivery integration.
+detached copy; absent or malformed snapshots remain unknown. The pool binds the
+current preparation journal and records fixed failure facts before cleanup or
+cancellation can replace the runner error. This includes worker bootstrap and
+source preparation. Diagnostic write failure preserves the primary error and
+retirement; missing evidence remains unknown, including a killed bridge process.
 A send returning is not remote acknowledgement. Counts can saturate, control
 frames can be unclassified, and missing observations remain unknown. These facts
 cannot approve a task, establish liveness or diagnose an earlier failed run.
