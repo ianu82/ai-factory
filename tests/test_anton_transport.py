@@ -140,6 +140,7 @@ def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path
         assert len(requests) == 1 and not commands
     assert clients and all(c.is_closed and not c.follow_redirects for c in clients)
     assert all(r.headers["authorization"] == "Bearer mdb_synthetic.private" for r in requests)
+    assert all(r.headers.get("x-mindshub-allow-failover") == "false" for r in requests)
     assert all("openai-organization" not in r.headers and "openai-project" not in r.headers for r in requests)
     events = journal.events()
     assert all(value not in json.dumps(events) for value in

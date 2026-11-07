@@ -14,6 +14,7 @@ def gateway_evidence(headers):
 
 
 async def create_response(client, body):
-    raw = await client.responses.with_raw_response.create(**body)
+    raw = await client.responses.with_raw_response.create(**body,
+        extra_headers={"X-MindsHub-Allow-Failover": "false"})
     # The reviewed OpenAI 3.46.0 legacy raw-response API parses synchronously.
     return raw.parse(), gateway_evidence(raw.headers)
