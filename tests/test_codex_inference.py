@@ -125,6 +125,53 @@ def test_stop_reason_cannot_disclose_provider_text(tmp_path):
     assert gate.journal.events()[-1]["data"]["reason"] == "unknown"
 
 
+@pytest.mark.parametrize("change,expected", [
+    ({"model": "private model"}, "model_or_status"),
+    ({"status": "private status"}, "model_or_status"),
+    ({"output": [{"type": "private tool"}]}, "output_items"),
+    ({"output": []}, "action_count"),
+    ({"id": None}, "response_identity"),
+    ({"extra": float("nan")}, "response_encoding"),
+    ({"extra": object()}, "response_encoding"),
+    ({"action": {"namespace": "private namespace"}}, "action_metadata"),
+    ({"action": {"input": 'const result = await tools.run({"command":["private command"]}); text(result)'}},
+     "action_expression"),
+    ({"action": {"input": 'text(await tools.run({"private argument":"private body"}))'}}, "action_arguments"),
+    ({"action": {"id": None}}, "action_metadata"),
+    ({"action": {"id": "same"}, "reasoning": True}, "item_identities"),
+])
+def test_rejection_code_is_retained_without_provider_content_or_retry(tmp_path, change, expected):
+    gate = boundary(tmp_path)
+    response = copy.deepcopy(RESPONSE)
+    response.update({k: v for k, v in change.items() if k not in {"action", "reasoning"}})
+    response["private response field"] = "private response body"
+    if "action" in change:
+        response["output"][0].update(change["action"])
+    if change.get("reasoning"):
+        response["output"].append({"type": "reasoning", "id": "same", "summary": ["private reasoning"]})
+    sdk, calls, _, _ = client(response)
+    for _ in range(2):
+        with pytest.raises(CodexStopped):
+            asyncio.run(gate.request(sdk, BODY))
+    assert len(calls) == 1 and gate.stopped and gate.journal.summary()["total_tokens"] == 10
+    stops = [e["data"] for e in gate.journal.events() if e["kind"] == "harness_policy_stopped"]
+    assert stops == [{"role": "builder", "harness": "codex", "reason": "response_policy",
+                      "response_rejection": expected}]
+    assert "private" not in json.dumps(gate.journal.events())
+
+
+@pytest.mark.parametrize("untrusted", [None, [], {"private": "body"}, "private exception message"])
+def test_unknown_rejection_detail_cannot_become_journal_content(tmp_path, untrusted):
+    from auto_mindsdb_factory.codex_actions import CodexActionError
+    error = CodexActionError(untrusted)
+    assert error.reason == "unknown" and str(error) == "Codex response rejected"
+    gate = boundary(tmp_path)
+    with pytest.raises(CodexStopped):
+        gate.stop("response_policy", response_rejection=untrusted)
+    assert gate.journal.events()[-1]["data"]["response_rejection"] == "unknown"
+    assert "private" not in json.dumps(gate.journal.events())
+
+
 def test_exhausted_total_is_recorded_but_releases_no_executable_bytes(tmp_path):
     gate = boundary(tmp_path, max_total_tokens=10)
     sdk, calls, _, _ = client()

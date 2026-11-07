@@ -15,6 +15,14 @@ a future inference bridge: that bridge must buffer and validate the complete
 response before sending **any** executable stream item to app-server, account for
 every request and enforce cancellation/deadline and cleanup outside prompts.
 
+Rejected complete responses retain a fixed `response_rejection` code on the
+existing `harness_policy_stopped` event. It distinguishes envelope/identity,
+output-item, action-metadata, expression and argument failures without recording
+provider text, programs, arguments, arbitrary field names or exception messages.
+Unknown codes remain `unknown`. Rejection still releases no executable bytes,
+stops the session and admits no retry. Historical coarse stops cannot establish
+which response shape or program was rejected.
+
 This parser is not an enabled adapter or a sandbox. A credential-free, isolated
 app-server, frozen instructions/configuration, scoped inference transport, actual
 SDK integration tests and real coding/negative/cancellation proofs remain required.

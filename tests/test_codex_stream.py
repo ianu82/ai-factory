@@ -52,6 +52,17 @@ def test_action_and_wire_share_one_detached_snapshot():
     assert decode(wire)[-1]["response"]["output"][1]["input"] == 'text(await tools.run({"command":["true"]}))'
 
 
+def test_nonobject_and_missing_item_identity_have_fixed_diagnostic_codes():
+    with pytest.raises(CodexActionError) as caught:
+        codex_sse(["private response"], model=MODEL)
+    assert caught.value.reason == "response_object"
+    r = response()
+    del r["output"][0]["id"]
+    with pytest.raises(CodexActionError) as caught:
+        codex_sse(r, model=MODEL)
+    assert caught.value.reason == "item_identities"
+
+
 @pytest.mark.parametrize("change", ["unsafe-first", "unsafe-last", "model", "status", "nonfinite", "large",
                                    "nonjson", "response-id", "action-id", "duplicate-id"])
 def test_invalid_complete_response_never_returns_even_a_partial_stream(change):

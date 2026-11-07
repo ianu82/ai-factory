@@ -127,3 +127,8 @@ def test_real_cli_proxy_and_pinned_client_are_one_guarded_path(tmp_path, mode):
     assert gate.journal.summary()["total_tokens"] == (0 if mode == "cancel" else 10)
     assert gate.journal.summary()["cost_usd"] is None
     assert config.api_key not in json.dumps(gate.journal.events())
+    if mode == "builtin":
+        stops = [e["data"] for e in gate.journal.events() if e["kind"] == "harness_policy_stopped"]
+        assert stops == [{"role": "verifier", "harness": "codex", "reason": "response_policy",
+                          "response_rejection": "action_expression"}]
+        assert "forbidden" not in json.dumps(gate.journal.events())
