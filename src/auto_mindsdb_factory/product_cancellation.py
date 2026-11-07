@@ -85,7 +85,7 @@ def run_cancellable(sandbox, command, *, cancelled, deadline):
 
 
 @contextmanager
-def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=None):
+def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=None, on_finalization_failure=None):
     """Watch entry and finalization; commands retain their sole abort owner.
 
     Drain each lifecycle operation before proceeding. No watcher spans the body.
@@ -146,11 +146,15 @@ def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=Non
         except BaseException:
             # A pre-expired call or a return between watcher polls still owns a
             # resource. Never duplicate an abort already attempted by the watcher.
-            if not finalizer.interrupted:
-                try:
-                    finalizer.abort()
-                except BaseException:
-                    raise HarnessStopped("Sandbox finalization cleanup could not be confirmed") from None
+            try:
+                if not finalizer.interrupted:
+                    try:
+                        finalizer.abort()
+                    except BaseException:
+                        raise HarnessStopped("Sandbox finalization cleanup could not be confirmed") from None
+            finally:
+                if on_finalization_failure is not None:
+                    on_finalization_failure()
             raise
     try:
         yield sandbox

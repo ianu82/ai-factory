@@ -116,8 +116,11 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
             phase = "investigation_or_sandbox"
             manager = delivery.sandbox_factory(workspace, delivery.settings["image"], writable=False,
                     platform=delivery.settings["platform"])
+            def finalization_failed():
+                nonlocal phase
+                phase = "sandbox_finalization"
             with enter_cancellable(manager, cancelled=delivery.cancelled, deadline=work_deadline,
-                    finalization_deadline=deadline) as sandbox:
+                    finalization_deadline=deadline, on_finalization_failure=finalization_failed) as sandbox:
                 def command(argv):
                     nonlocal investigated
                     result = delivery._command(sandbox, argv, deadline=work_deadline)
@@ -128,7 +131,6 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                                            "base_binding": "controller_export"},
                     "required_checks": delivery.settings["checks"],
                     "allowed_paths": delivery.settings["allowed_paths"]}, command)
-                phase = "sandbox_finalization"
             phase = "source_validation"
             checks = {"investigated": investigated, "source_unchanged": source_files(workspace) == original,
                       "modes_unchanged": executable_paths(workspace, original) == modes,

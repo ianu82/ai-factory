@@ -65,6 +65,9 @@ reserve. An already expired exit retires the environment before starting a
 download. An interrupted exit/download drains before failure is reported, and
 a completion between polls still cannot admit work after its deadline. Failed
 retirement remains unconfirmed and stops execution. No watcher spans the body.
+Confirmed Docker removal is reused across command and finalization cleanup;
+failed removals remain retryable. Cleanup failures retain the finalization phase
+even when they replace an earlier planner exception.
 Confirmed draining can take time; this does not claim that cleanup always ends
 within the phase deadline or establish the cause of an earlier failed run.
 

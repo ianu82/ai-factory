@@ -93,6 +93,30 @@ def test_cancel_during_sandbox_entry_drains_before_failure_and_never_starts_plan
     assert not (phase.journal.root / "plan.json").exists()
 
 
+@pytest.mark.parametrize("cleanup", ["error", "cancel", "deadline"])
+def test_cleanup_failure_after_planner_error_has_finalization_phase(phase, monkeypatch, cleanup):
+    clock, requested, retired = [0], threading.Event(), threading.Event()
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    phase.delivery.deadline = 300
+    class Manager:
+        def __enter__(self): return self
+        def __exit__(self, *args):
+            if cleanup == "error": raise RunnerError("private cleanup failure")
+            clock[0] = 121 if cleanup == "deadline" else 0
+            requested.set()
+            assert retired.wait(1), "Planner error left finalization unwatched"
+        def abort(self): retired.set()
+    phase.delivery.sandbox_factory = lambda *a, **kw: Manager()
+    phase.delivery.cancelled = lambda: cleanup == "cancel" and requested.is_set()
+    def fail(*args, **kwargs): raise AgentSessionError("private planner failure")
+    phase.delivery._command = fail
+    with pytest.raises(RunnerError if cleanup == "error" else PlanningStopped): execute(phase)
+    assert phase.journal.events()[-1]["data"] == {"role": "planner", "phase": "sandbox_finalization",
+        "category": "runner_error" if cleanup == "error" else "harness_stopped"}
+    assert not (phase.journal.root / "plan.json").exists()
+    assert "private" not in json.dumps(phase.journal.events())
+
+
 @pytest.mark.parametrize("fault,section,category", [
     ("admission", "admission", "invalid_data"),
     ("worker", "worker_preparation", "runner_error"),

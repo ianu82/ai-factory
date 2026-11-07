@@ -198,6 +198,62 @@ def test_failed_finalization_abort_is_not_repeated_or_reported_as_cleaned():
     assert not any(t.name == "factory-command-cancellation" for t in threading.enumerate())
 
 
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_docker_command_retirement_stays_confirmed_during_finalization(tmp_path, monkeypatch, stop):
+    import subprocess
+    from auto_mindsdb_factory import docker_runner
+    clock, requested, removed, calls = [0], threading.Event(), threading.Event(), []
+    monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(docker_runner.os, "getuid", lambda: 10001)
+    def remove(*args, **kwargs):
+        calls.append(True)
+        removed.set()
+        return subprocess.CompletedProcess([], 0 if len(calls) == 1 else 1)
+    monkeypatch.setattr(docker_runner.subprocess, "run", remove)
+    class Docker(docker_runner.DockerSandbox):
+        def _docker(self, *args, **kwargs): pass
+        def run(self, command):
+            clock[0] = 2 if stop == "deadline" else 0
+            requested.set()
+            assert removed.wait(2)
+            raise RuntimeError("private interrupted command")
+    with pytest.raises(HarnessStopped) as caught:
+        with cancellation.enter_cancellable(Docker(tmp_path, "node@sha256:" + "a" * 64),
+                cancelled=lambda: stop == "cancel" and requested.is_set(), deadline=1) as sandbox:
+            cancellation.run_cancellable(sandbox, [],
+                cancelled=lambda: stop == "cancel" and requested.is_set(), deadline=1)
+    assert calls == [True] and "cleanup could not be confirmed" not in str(caught.value)
+
+
+def test_docker_failed_removal_is_never_cached_as_confirmed(tmp_path, monkeypatch):
+    import subprocess
+    from auto_mindsdb_factory import docker_runner
+    results, calls = [1, 0], []
+    def remove(*args, **kwargs):
+        calls.append(True)
+        return subprocess.CompletedProcess([], results.pop(0))
+    monkeypatch.setattr(docker_runner.subprocess, "run", remove)
+    sandbox = docker_runner.DockerSandbox(tmp_path, "node@sha256:" + "a" * 64)
+    with pytest.raises(docker_runner.RunnerError): sandbox.__exit__(None, None, None)
+    sandbox.abort(); sandbox.abort()
+    assert calls == [True, True] and not results
+
+
+def test_new_docker_entry_requires_new_removal_confirmation(tmp_path, monkeypatch):
+    import subprocess
+    from auto_mindsdb_factory import docker_runner
+    calls = []
+    monkeypatch.setattr(docker_runner.os, "getuid", lambda: 10001)
+    def remove(*args, **kwargs):
+        calls.append(True)
+        return subprocess.CompletedProcess([], 0)
+    monkeypatch.setattr(docker_runner.subprocess, "run", remove)
+    sandbox = docker_runner.DockerSandbox(tmp_path, "node@sha256:" + "a" * 64)
+    monkeypatch.setattr(sandbox, "_docker", lambda *a, **kw: None)
+    for _ in range(2): sandbox.__enter__(); sandbox.abort()
+    assert calls == [True, True]
+
+
 def test_real_setup_exit_cannot_reuse_source_after_deadline(tmp_path, monkeypatch):
     from auto_mindsdb_factory import product_delivery as module
     clock, calls = [0], []

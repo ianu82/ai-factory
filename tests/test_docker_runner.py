@@ -53,6 +53,7 @@ def test_abort_terminates_an_active_command_and_its_container(tmp_path):
                 time.sleep(0.02)
             assert (tmp_path / "started").exists(), "candidate command never started"
             sandbox.abort()
+            sandbox.abort()  # Confirmed retirement remains valid for the next owner.
         finally:
             sandbox._remove()
             thread.join(timeout=10)

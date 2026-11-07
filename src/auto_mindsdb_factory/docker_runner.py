@@ -33,6 +33,7 @@ class DockerSandbox:
             raise RunnerError("Unsupported runner platform")
         self.platform = platform
         self.name = "ai-factory-" + uuid4().hex
+        self._removal_lock, self._removed = threading.Lock(), False
 
     def _docker(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
         try:
@@ -49,6 +50,8 @@ class DockerSandbox:
         uid = os.getuid()
         if uid == 0:
             raise RunnerError("Run the product controller as a non-root user")
+        with self._removal_lock:
+            self._removed = False
         mount = f"type=bind,source={self.workspace},target=/workspace"
         if not self.writable:
             mount += ",readonly"
@@ -113,7 +116,13 @@ class DockerSandbox:
                 "duration_seconds": round(time.monotonic() - started, 3)}
 
     def _remove(self) -> subprocess.CompletedProcess:
-        return subprocess.run(["docker", "rm", "--force", self.name], capture_output=True, timeout=30)
+        command = ["docker", "rm", "--force", self.name]
+        with self._removal_lock:
+            if self._removed:
+                return subprocess.CompletedProcess(command, 0)
+            result = subprocess.run(command, capture_output=True, timeout=30)
+            self._removed = result.returncode == 0
+            return result
 
     def abort(self) -> None:
         """Stop the owned container, including processes behind a blocked exec client."""
@@ -121,4 +130,4 @@ class DockerSandbox:
             raise RunnerError("Sandbox cancellation cleanup could not be confirmed")
 
     def __exit__(self, *exc) -> None:
-        self._remove()
+        self.abort()
