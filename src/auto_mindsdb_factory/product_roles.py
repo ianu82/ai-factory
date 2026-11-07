@@ -129,6 +129,24 @@ _DEFINITIONS[("planner", "6")] = _definition(
        ("purpose", "required_evidence", "supported_tools", "constraints")},
 )
 
+# Describe the existing capture boundary without changing historical guidance.
+_previous_planner = _DEFINITIONS[("planner", "6")]
+_DEFINITIONS[("planner", "7")] = _definition(
+    "planner", "7", _previous_planner["instructions"] + (
+        " Before the first command, budget its entire stdout and stderr against the controller's command_output "
+        "byte limit per stream. Only the tail is retained on overflow, so early evidence can disappear. "
+        "Leave margin for labels, discovery and diagnostics; per-file line limits alone do not bound a batch, "
+        "especially with long lines or multibyte text. Use small relevant excerpts or the project runtime to "
+        "measure and bound the combined UTF-8 output before printing it. Prioritize applicable instructions "
+        "and the complete relevant source/control flow, then concise configuration, test patterns and requirement "
+        "excerpts; avoid concatenating entire test files or documents. A truncated result is incomplete evidence, "
+        "even with exit code zero. Never assume another investigation request remains after the first batch. "
+        "If essential evidence is missing, report unverified or blocked; no budget or readiness gate is waived."
+    ),
+    **{key: _previous_planner[key] for key in
+       ("purpose", "required_evidence", "supported_tools", "constraints")},
+)
+
 
 # Keep historical definitions in _DEFINITIONS when changing an active version.
 _DEFAULT_VERSIONS = {"builder": "1", "verifier": "1", "planner": "1"}

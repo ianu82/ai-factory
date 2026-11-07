@@ -1,6 +1,6 @@
 # Bounded planning reports
 
-Planner role version 6 investigates enough source to propose a plan, rather than
+Planner role version 7 investigates enough source to propose a plan, rather than
 implementing or proving the eventual fix. Historical versions remain unchanged.
 Repository discovery stays inside `/workspace`, prunes generated directories and
 bounds output. The first read-only batch should read applicable guidance, source,
@@ -8,6 +8,17 @@ test patterns and referenced requirements. Minimal images may lack `rg`; the rol
 requires available portable tools or the project runtime, with checked optional
 tools and a fallback in the same batch. This guidance grants no new capability
 and does not prove a model followed it. Unread evidence still blocks readiness.
+
+Before the first command and on every later request, the controller supplies the
+existing command capture policy: at most 12,000 bytes per stdout/stderr stream,
+retaining its tail and decoding UTF-8 with replacement. Both Docker and Railway
+execution use the same Docker capture implementation. Overflow can discard early
+source even when the command succeeds. The new role budgets the whole batch,
+including labels and discovery, with margin; individual line limits alone do not
+bound combined bytes. It prioritizes essential guidance and source control flow,
+then concise configuration, test patterns and requirement excerpts. A truncated
+result remains incomplete evidence. These are planning instructions, not proof
+that an actual model obeyed them. Capture limits and all readiness gates remain.
 
 The controller supplies remaining request/time budgets on every planning request.
 After actual investigation, only the structured report tool is offered on the

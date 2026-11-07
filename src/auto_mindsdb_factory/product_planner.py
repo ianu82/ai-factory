@@ -6,8 +6,9 @@ import time
 from .product_agent import AgentSessionError, ProductAgent, RoleSnapshotError, TOOLS
 from .product_plan import PLAN_SCHEMA, ProductPlan
 from .product_roles import select_role
+from .docker_runner import DockerSandbox
 
-PLANNER_VERSION = "6"
+PLANNER_VERSION = "7"
 REPORT_RESERVE_SECONDS = 60
 
 
@@ -50,7 +51,9 @@ class ProductPlanner(ProductAgent):
         report_only = investigated and (turn == self.max_turns - 1 or remaining <= REPORT_RESERVE_SECONDS)
         return (self.tools[1:] if report_only else self.tools), {"planning_budget": {
             "requests_remaining": self.max_turns - turn, "seconds_remaining": round(remaining, 3),
-            "report_only": report_only}}
+            "report_only": report_only}, "command_output": {
+                "max_bytes_per_stream": DockerSandbox.MAX_CAPTURED_OUTPUT_BYTES,
+                "retains": "tail", "text_encoding": "utf-8", "decode_errors": "replace"}}
 
     def _accept_report(self, arguments, context, ran_command):
         if not ran_command:

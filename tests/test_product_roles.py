@@ -80,6 +80,15 @@ def test_portable_planner_retains_prior_policy_and_historical_digest():
         k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
 
 
+def test_output_budget_planner_preserves_historical_portable_role():
+    previous = select_role("planner", "6")
+    assert previous["digest"] == "e62dcb80b7df9816f4baaa4e06c321a6bcced03ddd6b072241968662b676bd25"
+    current = select_role("planner", "7")
+    assert current["instructions"].startswith(previous["instructions"])
+    assert {k: v for k, v in current.items() if k not in {"version", "digest", "instructions"}} == {
+        k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
+
+
 def test_candidate_files_and_cwd_cannot_replace_trusted_registry(tmp_path):
     (tmp_path / "product_roles.py").write_text("raise RuntimeError('candidate role executed')")
     package = tmp_path / "auto_mindsdb_factory"

@@ -51,7 +51,7 @@ def test_planner_uses_frozen_role_and_shared_accounting(tmp_path):
     assert 0 < agent.deadline - time.monotonic() <= 120
 
 
-@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "report-planner", "readiness-planner", "window-planner", "forged"])
+@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "report-planner", "readiness-planner", "window-planner", "portable-planner", "forged"])
 def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, mutation):
     agent, requests, journal = setup(tmp_path, [])
     manifest = json.loads((journal.root / "manifest.json").read_text())
@@ -67,12 +67,33 @@ def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, 
         manifest["planner_role_snapshot"] = select_role("planner", "4")
     elif mutation == "window-planner":
         manifest["planner_role_snapshot"] = select_role("planner", "5")
+    elif mutation == "portable-planner":
+        manifest["planner_role_snapshot"] = select_role("planner", "6")
     else:
         manifest["planner_role_snapshot"]["instructions"] = "write code"
     (journal.root / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(RoleSnapshotError):
         agent.run("planner", agent.task.public_context, lambda cmd: pytest.fail("command invoked"))
     assert not requests
+
+
+def test_capture_policy_is_supplied_before_first_command_and_on_report(tmp_path):
+    from auto_mindsdb_factory.docker_runner import DockerSandbox
+    agent, requests, journal = setup(tmp_path, [("run", {"command": ["cat", "parser.py"]}),
+                                               ("finish", plan())], max_agent_turns=2)
+    before = (journal.root / "manifest.json").read_bytes()
+    def investigate(argv):
+        assert len(requests) == 1
+        assert json.loads(requests[0]["input"][-1]["content"])["command_output"] == {
+            "max_bytes_per_stream": DockerSandbox.MAX_CAPTURED_OUTPUT_BYTES,
+            "retains": "tail", "text_encoding": "utf-8", "decode_errors": "replace"}
+        return {"exit_code": 0}
+    assert agent.run("planner", agent.task.public_context, investigate) == plan()
+    policies = [json.loads(r["input"][-1]["content"]) for r in requests]
+    assert policies[0]["command_output"] == policies[1]["command_output"]
+    assert policies[0]["planning_budget"]["report_only"] is False
+    assert policies[1]["planning_budget"]["report_only"] is True
+    assert (journal.root / "manifest.json").read_bytes() == before
 
 
 @pytest.mark.parametrize("mode", ["no-investigation", "bad-mapping", "unknown-usage", "exhausted", "deadline"])

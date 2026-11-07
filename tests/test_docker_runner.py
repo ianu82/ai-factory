@@ -26,9 +26,9 @@ def test_real_sandbox_has_no_credentials_network_or_source_writes(tmp_path, monk
 def test_timeout_destroys_container_and_output_is_bounded(tmp_path):
     import subprocess
     with DockerSandbox(tmp_path, os.environ["AI_FACTORY_TEST_IMAGE"], timeout=1) as sandbox:
-        result = sandbox.run(["node", "-e", "process.stdout.write('x'.repeat(100000))"])
+        result = sandbox.run(["node", "-e", "process.stdout.write('prefix'+'x'.repeat(99990)+'tail')"])
         assert result["exit_code"] == 0
-        assert len(result["stdout"]) <= 12000
+        assert result["stdout"] == 'x' * (DockerSandbox.MAX_CAPTURED_OUTPUT_BYTES - 4) + 'tail'
         assert result["stdout_bytes"] == 100000
         assert result["stdout_truncated"] is True
         assert result["stderr_truncated"] is False
