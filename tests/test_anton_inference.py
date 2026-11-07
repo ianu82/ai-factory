@@ -193,3 +193,19 @@ def test_unknown_diagnostic_cannot_serialize_supplied_text(tmp_path):
         guard.stop("private provider content")
     assert guard.journal.events()[-1]["data"]["reason"] == "unknown"
     assert "private provider content" not in json.dumps(guard.journal.events())
+
+
+@pytest.mark.parametrize("headers", [
+    {"x-mindshub-attempts": "01", "x-mindshub-failover": "false"},
+    {"x-mindshub-attempts": "-1", "x-mindshub-failover": "false"},
+    {"x-mindshub-attempts": "١", "x-mindshub-failover": "false"},
+    {"x-mindshub-attempts": "9" * 100, "x-mindshub-failover": "false"},
+    {"x-mindshub-attempts": "1", "x-mindshub-failover": "FALSE"},
+    {"x-mindshub-attempts": "1", "x-mindshub-failover": "false", "x-mindshub-dropped-params": ""},
+])
+def test_gateway_metadata_is_bounded_and_fail_closed(headers):
+    from auto_mindsdb_factory.mindshub_transport import gateway_evidence
+    evidence = gateway_evidence(headers)
+    assert (not evidence["single_attempt"] or not evidence["requested_model"] or evidence["dropped_params"])
+    assert len(json.dumps(evidence)) < 300
+    assert all(type(v) in (bool, int, type(None)) for v in evidence.values())

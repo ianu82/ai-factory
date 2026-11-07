@@ -69,3 +69,15 @@ def test_read_only_open_and_mutators_never_create_evidence(tmp_path):
     assert list(writable.root.iterdir()) == []
     writable.append("event")
     assert readonly.events() == writable.events()
+
+
+def test_gateway_unknown_coverage_preserves_observed_tokens_and_cost(tmp_path):
+    journal = RunJournal(tmp_path, "gateway")
+    journal.append("model_requested", role="builder")
+    journal.append("model_response", role="builder", usage={"total_tokens": 50}, cost_estimate_usd=0.01)
+    assert journal.summary()["usage_complete"] and journal.summary()["cost_complete"]
+    journal.append("inference_usage_unknown", role="builder", reason="gateway_attempt_coverage")
+    summary = journal.summary()
+    assert summary["total_tokens"] == 50 and summary["known_inference_cost_usd"] == 0.01
+    assert not summary["usage_complete"] and not summary["cost_complete"]
+    assert summary["cost_usd"] is None

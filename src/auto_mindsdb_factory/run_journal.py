@@ -91,7 +91,7 @@ class RunJournal:
         terminal = [event for event in events if event["kind"] == "run_finished"]
         responses = [event["data"] for event in events if event["kind"] == "model_response"]
         usage_complete = (sum(event["kind"] == "model_requested" for event in events) <= len(responses)
-            and not any(event["kind"] == "model_failed" for event in events)
+            and not any(event["kind"] in {"model_failed", "inference_usage_unknown"} for event in events)
             and all(isinstance(item, dict) and "total_tokens" in item for item in usage))
         known_cost = round(sum(item.get("cost_estimate_usd") or 0 for item in responses), 8)
         cost_complete = usage_complete and all(item.get("cost_estimate_usd") is not None for item in responses)

@@ -17,7 +17,7 @@ class AntonStopped(BaseException):
 
 STOP_REASONS = frozenset({"cancelled_or_deadline", "evidence_unavailable", "usage_unknown_or_exhausted",
     "unapproved_model", "unapproved_reasoning", "unsupported_request_tools", "unapproved_tool_schema",
-    "request_cancelled", "model_or_status_mismatch", "unsupported_response_items", "unsupported_tool_calls",
+    "request_cancelled", "gateway_policy_mismatch", "model_or_status_mismatch", "unsupported_response_items", "unsupported_tool_calls",
     "malformed_tool_arguments", "request_limit", "scratchpad_blocked", "cleanup_unconfirmed"})
 
 
@@ -79,11 +79,19 @@ class AntonInference:
             max_output_tokens=body["max_output_tokens"],
             input_sha=hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest())
         started = time.monotonic()
+        gateway = None
+        async def create():
+            nonlocal gateway
+            transport = client.with_options(max_retries=0, timeout=min(self.config.timeout_seconds, remaining))
+            if getattr(self.config, "inference_binding_sha256", None) is not None:
+                from .mindshub_transport import create_response
+                response, gateway = await create_response(transport, body)
+                return response
+            return await transport.responses.create(**body)
         try:
             async with asyncio.timeout(min(self.config.timeout_seconds, remaining)):
                 # No SDK retries or Anton compatibility retries can hide extra requests.
-                request = asyncio.create_task(client.with_options(max_retries=0, timeout=min(
-                    self.config.timeout_seconds, remaining)).responses.create(**body))
+                request = asyncio.create_task(create())
                 try:
                     while not request.done():
                         await asyncio.wait({request}, timeout=0.05)
@@ -110,6 +118,14 @@ class AntonInference:
             response_id=getattr(response, "id", None), model=model, usage=recorded,
             status=getattr(response, "status", None), duration_seconds=round(time.monotonic() - started, 3),
             cost_estimate_usd=estimate_cost(recorded, rate), pricing=rate)
+        if gateway is not None:
+            self.record("inference_gateway", role=self.role, turn=self.calls, harness="anton", **gateway)
+            if not gateway["single_attempt"] or not gateway["requested_model"]:
+                self.record("inference_usage_unknown", role=self.role, turn=self.calls, harness="anton",
+                    reason="gateway_attempt_coverage")
+            if (not gateway["single_attempt"] or not gateway["requested_model"]
+                    or any(gateway[k] for k in ("dropped_params", "dropped_content", "clamped_params", "chain_truncated"))):
+                self.stop("gateway_policy_mismatch")
         self.admit()
         if model != self.config.model or getattr(response, "status", None) != "completed":
             self.stop("model_or_status_mismatch")

@@ -116,6 +116,10 @@ class AntonAgent:
         provider = Provider(api_key=self.config.api_key,
             base_url=self.config.base_url.removesuffix("/responses"), flavor=OpenAIProvider.FLAVOR_OPENAI,
             reasoning_effort=self.config.reasoning_effort)
+        if getattr(self.config, "inference_binding_sha256", None) is not None:
+            # The pinned SDK defaults to following redirects, which could resend
+            # a controller credential or hide a changed endpoint.
+            provider._client._client.follow_redirects = False
         provider._emit_trace_headers = False
         provider._client = provider._client.with_options(organization=self.config.organization, project=self.config.project)
         client = LLMClient(planning_provider=provider, planning_model=self.config.model,
