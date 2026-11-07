@@ -1,10 +1,10 @@
-"""Trusted, qualification-only configuration; does not unlock product delivery.
+"""Trusted inference configuration; public execution still requires admission.
 
 The receipt hash and credential-file version must come from approved controller
 evidence. A receipt is not reauthentication or proof of model compatibility.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -117,3 +117,57 @@ def resolve_qualification_config(settings, role, *, reasoning_effort, timeout_se
         raise
     except (OSError, ValueError, KeyError, TypeError):
         raise InferencePolicyError("Could not bind MindsHub qualification configuration") from None
+
+
+def _canonical_settings(settings):
+    return json.dumps(settings, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+@dataclass(frozen=True)
+class MindsHubExecutionContext:
+    """One trusted bootstrap's private binding, reusable after dropping privileges."""
+    _settings: str = field(repr=False)
+    _config: MindsHubQualificationConfig = field(repr=False)
+
+    def role_config(self, settings, role):
+        try:
+            if role not in ("planner", "builder", "verifier") or _canonical_settings(settings) != self._settings:
+                raise ValueError()
+            policy = InferencePolicy.from_document(settings.get("inference"))
+            if (policy.document != self._config.inference_binding["policy"]
+                    or self._config.model != settings["builder_model"]
+                    or self._config.max_output_tokens != settings["agent_max_output_tokens"]):
+                raise ValueError()
+            model = settings["reviewer_model" if role == "verifier" else "builder_model"]
+            if type(model) is not str or not model:
+                raise ValueError()
+            return replace(self._config, model=model).validated()
+        except (ValueError, TypeError, KeyError):
+            raise InferencePolicyError("Missing or changed MindsHub execution context") from None
+
+    def inspect(self):
+        safe = {"profile_sha256": hashlib.sha256(self._settings.encode()).hexdigest(),
+            "inference_binding_sha256": self._config.inference_binding_sha256}
+        contract = {**safe, "reasoning_effort": self._config.reasoning_effort,
+            "timeout_seconds": self._config.timeout_seconds,
+            "max_output_tokens": self._config.max_output_tokens}
+        return {**safe, "contract_sha256": hashlib.sha256(_canonical_settings(contract).encode()).hexdigest()}
+
+
+def resolve_execution_context(settings, *, reasoning_effort, timeout_seconds,
+        receipt_path, receipt_sha256, credential_file, credential_version, target_root,
+        auth_workspace_id=None):
+    """Read the private credential once before the controller drops privileges."""
+    if any(type(settings.get(field)) is not str or not settings[field]
+            for field in ("builder_model", "reviewer_model")):
+        raise InferencePolicyError("Invalid MindsHub execution role models")
+    canonical = _canonical_settings(settings)
+    config = resolve_qualification_config(settings, "builder", reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout_seconds, receipt_path=receipt_path, receipt_sha256=receipt_sha256,
+        credential_file=credential_file, credential_version=credential_version,
+        target_root=target_root, auth_workspace_id=auth_workspace_id)
+    context = MindsHubExecutionContext(canonical, config)
+    # Validate both configured model roles before admitting any phase.
+    for role in ("planner", "builder", "verifier"):
+        context.role_config(settings, role)
+    return context

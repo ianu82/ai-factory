@@ -149,3 +149,89 @@ def test_credential_change_during_read_is_rejected(inputs, monkeypatch, change):
     monkeypatch.setattr(runtime.os, "read", raced)
     with pytest.raises(InferencePolicyError):
         runtime.resolve_qualification_config(settings, "builder", **kwargs)
+
+
+def test_context_resolves_once_and_derives_roles_without_file_access(inputs, monkeypatch, tmp_path):
+    from auto_mindsdb_factory.product_execution import execution_manifest, execution_config
+    from auto_mindsdb_factory.run_journal import RunJournal
+    settings, kwargs = inputs
+    reads = []
+    original = runtime._read_owned
+    def counted(*args, **options):
+        reads.append(options.get("credential", False))
+        return original(*args, **options)
+    monkeypatch.setattr(runtime, "_read_owned", counted)
+    context = runtime.resolve_execution_context(settings, **kwargs)
+    assert reads.count(True) == 1
+    def denied(*args, **options): raise AssertionError("No file reads after privilege drop")
+    monkeypatch.setattr(runtime, "_read_owned", denied)
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong-global")
+    monkeypatch.setenv("AI_FACTORY_OPENAI_REASONING_EFFORT", "low")
+    monkeypatch.setenv("AI_FACTORY_OPENAI_TIMEOUT_SECONDS", "1")
+    manifest = execution_manifest(settings, inference_context=context)
+    journal = RunJournal(tmp_path, "context")
+    journal.create(manifest)
+    for role in ("planner", "builder", "verifier"):
+        config = execution_config(settings, role, journal, inference_context=context)
+        assert config.api_key == KEY and config.reasoning_effort == "high" and config.timeout_seconds == 180
+        assert config.model == settings["reviewer_model" if role == "verifier" else "builder_model"]
+    assert KEY not in repr(context) + json.dumps(context.inspect()) + json.dumps(manifest)
+    with pytest.raises(FrozenInstanceError): context._settings = "changed"
+    with pytest.raises(InferencePolicyError, match="not execution-ready"):
+        role_config(settings, "builder")
+
+
+@pytest.mark.parametrize("change", ["policy", "builder", "reviewer", "output", "scope", "role", "absent"])
+def test_context_rejects_settings_or_authority_drift(inputs, change):
+    settings, kwargs = inputs
+    context = runtime.resolve_execution_context(settings, **kwargs)
+    role = "builder"
+    if change == "policy": settings["inference"]["credential_ref"]["revision"] = 2
+    elif change == "builder": settings["builder_model"] = "other"
+    elif change == "reviewer": settings["reviewer_model"] = "other"
+    elif change == "output": settings["agent_max_output_tokens"] += 1
+    elif change == "scope": settings["allowed_paths"] = ["**"]
+    elif change == "role": role = "other"
+    elif change == "absent": del settings["inference"]
+    with pytest.raises(InferencePolicyError, match="execution context"):
+        role_config(settings, role, inference_context=context)
+
+
+def test_context_rotation_or_limits_cannot_reuse_frozen_execution(inputs, tmp_path):
+    from auto_mindsdb_factory.product_execution import execution_manifest, execution_config
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    from auto_mindsdb_factory.run_journal import RunJournal
+    settings, kwargs = inputs
+    first = runtime.resolve_execution_context(settings, **kwargs)
+    journal = RunJournal(tmp_path, "context-drift")
+    journal.create(execution_manifest(settings, inference_context=first))
+    for override in ({"reasoning_effort": "low"}, {"timeout_seconds": 1}):
+        changed = runtime.resolve_execution_context(settings, **{**kwargs, **override})
+        assert changed.inspect()["contract_sha256"] != first.inspect()["contract_sha256"]
+        with pytest.raises(HarnessStopped, match="frozen execution"):
+            execution_config(settings, "builder", journal, inference_context=changed)
+    key = kwargs["credential_file"]
+    key.write_text("AI_FACTORY_MINDSHUB_API_KEY=mdb_synthetic.rotated\n")
+    kwargs["credential_version"] = runtime._version(key.stat())
+    changed = runtime.resolve_execution_context(settings, **kwargs)
+    with pytest.raises(HarnessStopped, match="frozen execution"):
+        execution_config(settings, "builder", journal, inference_context=changed)
+    assert execution_config(settings, "builder", journal, inference_context=first).api_key == KEY
+    assert not journal.events()
+
+
+@pytest.mark.parametrize("model", [None, 1, True, ""])
+def test_context_rejects_invalid_reviewer_before_credential_read(inputs, monkeypatch, model):
+    settings, kwargs = inputs
+    settings["reviewer_model"] = model
+    def denied(*args, **options): raise AssertionError("Invalid role must not resolve credential")
+    monkeypatch.setattr(runtime, "_read_owned", denied)
+    with pytest.raises(InferencePolicyError, match="role models"):
+        runtime.resolve_execution_context(settings, **kwargs)
+
+
+def test_plain_profile_object_cannot_supply_trusted_context(inputs):
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    settings, _ = inputs
+    with pytest.raises(HarnessStopped, match="trusted inference context"):
+        role_config(settings, "builder", inference_context={"api_key": KEY})

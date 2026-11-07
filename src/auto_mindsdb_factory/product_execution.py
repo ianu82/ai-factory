@@ -12,7 +12,12 @@ from .codex_process import CODEX_VERSION
 from .product_inference import require_inference_execution
 
 
-def role_config(settings, role):
+def role_config(settings, role, *, inference_context=None):
+    if inference_context is not None:
+        from .product_inference_runtime import MindsHubExecutionContext
+        if type(inference_context) is not MindsHubExecutionContext:
+            raise HarnessStopped("Invalid trusted inference context")
+        return inference_context.role_config(settings, role)
     require_inference_execution(settings)
     return OpenAIResponsesAgentConfig.from_env(model=settings[
         "reviewer_model" if role == "verifier" else "builder_model"],
@@ -89,13 +94,14 @@ def require_codex_execution(config, role, journal):
         raise HarnessStopped("Missing or changed frozen Codex execution configuration") from None
 
 
-def execution_manifest(settings):
-    return {"execution_snapshots": {role: snapshot(settings, role, role_config(settings, role))
+def execution_manifest(settings, *, inference_context=None):
+    return {"execution_snapshots": {role: snapshot(settings, role, role_config(
+                settings, role, inference_context=inference_context))
                                     for role in ("planner", "builder", "verifier")}}
 
 
-def execution_config(settings, role, journal):
-    config = role_config(settings, role)
+def execution_config(settings, role, journal, *, inference_context=None):
+    config = role_config(settings, role, inference_context=inference_context)
     try:
         manifest = json.loads((journal.root / "manifest.json").read_text())
         if manifest["execution_snapshots"][role] != snapshot(settings, role, config):
