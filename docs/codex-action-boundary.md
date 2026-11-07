@@ -147,8 +147,13 @@ duplicate, unsolicited and overlapping callbacks stop the session. Thread/turn
 ownership and actual tool execution remain the session's responsibilities.
 
 `codex_rpc.codex_turn` binds callbacks to its owned thread/turn and verified
-model, effort and read-only/network-disabled settings. It returns command results
-using the pinned CLI's generated `contentItems`/`inputText`/`success` schema;
+model, effort and read-only/network-disabled settings. A static developer
+instruction distinguishes those app-server host restrictions from the separately
+enforced isolated-job policy. The pinned
+CLI test verifies this clarification follows its generated permission notice;
+it grants no access and leaves host built-ins disabled. A model's claimed
+permission denial is not evidence that a remote job command was attempted.
+Command results use the pinned CLI's generated `contentItems`/`inputText`/`success` schema;
 a command's nonzero exit remains a successful tool transport carrying that exit.
 Only the exact approved run/finish action is dispatched. Unknown server requests
 are rejected and bounded asynchronous pipes close on every exit. Actual CLI

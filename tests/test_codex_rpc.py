@@ -43,6 +43,14 @@ def test_real_cli_receives_job_result_then_finishes(tmp_path, exit_code):
             texts = [part["text"] for item in requests[-1]["input"] if item["type"] == "message"
                      for part in item["content"] if part["type"] == "input_text"]
             assert any("Use only the supplied tools.\n\n" + ACTION_INSTRUCTIONS in text for text in texts)
+            developer_text = "\n".join(part["text"] for item in requests[-1]["input"]
+                if item.get("type") == "message" and item.get("role") == "developer"
+                for part in item["content"] if part["type"] == "input_text")
+            # The pinned CLI adds its host permission notice after baseInstructions.
+            # The remote callback's scope must be explained after that notice.
+            assert "sandbox_mode` is `read-only`" in developer_text
+            assert developer_text.index("Factory remote job boundary:") > developer_text.index("</permissions instructions>")
+            assert "grants no additional access" in developer_text
             if number == 2:
                 history = json.dumps(requests[-1]["input"])
                 assert "custom_tool_call_output" in history and "job-result-marker" in history
@@ -108,14 +116,15 @@ def test_rpc_boundary_rejects_before_dispatch(tmp_path, fault):
     script = '''import json,sys
 def send(value): print(json.dumps(value),flush=True)
 sys.stdin.readline();send({"id":1,"result":{}})
-sys.stdin.readline();sys.stdin.readline();send({"id":2,"result":{"thread":{"id":"thread"}}})
+sys.stdin.readline();open(sys.argv[2],'w').write(sys.stdin.readline());send({"id":2,"result":{"thread":{"id":"thread"}}})
 sys.stdin.readline();send({"id":3,"result":{"turn":{"id":"turn"}}})
 for packet in json.load(open(sys.argv[1])): print(packet,flush=True)
 '''
     # Keep the large framing fixture out of operating-system argument limits.
     packet_file = tmp_path / "packets.json"
     packet_file.write_text(json.dumps(packets))
-    process = subprocess.Popen([sys.executable, "-c", script, str(packet_file)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    start_file = tmp_path / "thread-start.json"
+    process = subprocess.Popen([sys.executable, "-c", script, str(packet_file), str(start_file)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True, env={"HOME": str(tmp_path), "PATH": os.defpath})
     owner = SimpleNamespace(process=process, work=tmp_path)
     async def run():
@@ -128,3 +137,8 @@ for packet in json.load(open(sys.argv[1])): print(packet,flush=True)
         process.stdin.close(); process.stdout.close()
     assert not called and gate.stopped
     assert gate.journal.events()[-1]["data"]["reason"] == "rpc_policy"
+    start = json.loads(start_file.read_text())["params"]
+    assert start["sandbox"] == "read-only" and start["approvalPolicy"] == "never"
+    assert start["baseInstructions"] == "Frozen instructions\n\n" + ACTION_INSTRUCTIONS
+    assert "Factory remote job boundary:" in start["developerInstructions"]
+    assert "grants no additional access" in start["developerInstructions"]

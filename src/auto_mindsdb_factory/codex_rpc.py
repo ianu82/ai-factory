@@ -17,6 +17,18 @@ ACTION_INSTRUCTIONS = (
 )
 
 
+JOB_BOUNDARY_INSTRUCTIONS = (
+    "Factory remote job boundary: the read-only filesystem and restricted network policy "
+    "of this app-server describes its host environment. The supplied run tool is a "
+    "controller-mediated callback into a separate isolated job, never a host shell. "
+    "That job's access is enforced by the frozen Factory role, task and job policy; "
+    "this explanation grants no additional access. Use run only for work authorized "
+    "by that policy. Do not infer a remote job permission denial from the host sandbox "
+    "notice. Preserve actual tool failures and report unverified when work cannot be "
+    "completed. Built-in host tools remain unavailable."
+)
+
+
 def _object(pairs):
     result = {}
     for key, value in pairs:
@@ -106,6 +118,7 @@ async def codex_turn(owner, gate, *, instructions, context, command):
                         "modelProvider": "factory_guarded", "allowProviderModelFallback": False, "ephemeral": True,
                         "cwd": str(owner.work), "approvalPolicy": "never", "sandbox": "read-only",
                         "baseInstructions": instructions + "\n\n" + ACTION_INSTRUCTIONS,
+                        "developerInstructions": JOB_BOUNDARY_INSTRUCTIONS,
                         "dynamicTools": [{"name": tool["name"], "description": tool["description"],
                                           "inputSchema": tool["parameters"]} for tool in TOOLS]}})
                     expected = 2
