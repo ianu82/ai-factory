@@ -89,7 +89,8 @@ def test_real_cli_receives_job_result_then_finishes(tmp_path, exit_code):
         # Check outside the mock provider so failures retain their actual assertion.
         assert "sandbox_mode` is `read-only`" in developer_text
         assert "Factory remote job boundary:" in developer_text
-        assert developer_text.index("Factory remote job boundary:") > developer_text.index("</permissions instructions>")
+        # Custom context must not replace the CLI's authoritative host restrictions.
+        assert developer_text.index("Factory remote job boundary:") < developer_text.index("<permissions instructions>")
         assert "grants no additional access" in developer_text
 
 

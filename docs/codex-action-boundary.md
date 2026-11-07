@@ -150,7 +150,7 @@ ownership and actual tool execution remain the session's responsibilities.
 model, effort and read-only/network-disabled settings. A static developer
 instruction distinguishes those app-server host restrictions from the separately
 enforced isolated-job policy. The pinned
-CLI test verifies this clarification follows its generated permission notice;
+CLI test verifies its generated host permission notice remains after custom context;
 it grants no access and leaves host built-ins disabled. A model's claimed
 permission denial is not evidence that a remote job command was attempted.
 Command results use the pinned CLI's generated `contentItems`/`inputText`/`success` schema;
