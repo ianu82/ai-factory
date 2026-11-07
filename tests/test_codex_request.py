@@ -96,12 +96,14 @@ def generation_pattern():
     fmt = prepare(body())["input"][0]["tools"][0]["tools"][0]["format"]
     # The pre-fix fixture's SOURCE rule admits every nonempty program, as did
     # the actual pinned CLI grammar captured by the isolated write/read test.
-    if fmt["syntax"] == "lark":
-        assert fmt["definition"] == r"start: /[\s\S]+/"
+    if fmt["definition"] == r"start: /[\s\S]+/":
         return re.compile(r"[\s\S]+")
     assert set(fmt) == {"type", "syntax", "definition"}
-    assert fmt["type"] == "grammar" and fmt["syntax"] == "regex"
-    return re.compile(fmt["definition"])
+    assert fmt["type"] == "grammar" and fmt["syntax"] == "lark"
+    # Exercise the single Lark terminal's regular language without a new parser
+    # dependency. Pinned CLI/client fixtures and a live proof cover transport.
+    assert fmt["definition"].startswith("start: /") and fmt["definition"].endswith("/")
+    return re.compile(fmt["definition"][8:-1].replace(r"\/", "/"))
 
 
 @pytest.mark.parametrize("program", [
@@ -153,3 +155,10 @@ def test_generation_declaration_expansion_cannot_exceed_transport_bound():
     assert len(json.dumps(b)) < 8_000_000
     with pytest.raises(CodexRequestError, match='transport bound'):
         prepare(b)
+
+
+def test_generation_preserves_the_pinned_cli_lark_dialect():
+    original = body()
+    fmt = prepare(original)["input"][0]["tools"][0]["tools"][0]["format"]
+    assert fmt["syntax"] == original["input"][0]["tools"][0]["tools"][0]["format"]["syntax"] == "lark"
+    assert fmt["definition"] != original["input"][0]["tools"][0]["tools"][0]["format"]["definition"]

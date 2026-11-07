@@ -49,7 +49,7 @@ def test_real_codex_response_is_gated_before_tool_execution(permitted):
                     for namespace, old in zip(item["tools"], original["tools"]):
                         for tool, old_tool in zip(namespace["tools"], old["tools"]):
                             if tool["type"] == "custom" and tool["name"] == "exec":
-                                assert tool["format"]["syntax"] == "regex"
+                                assert tool["format"]["syntax"] == "lark"
                                 old_tool["format"] = tool["format"]
             assert prepared.pop("max_output_tokens") == 10000 and prepared == expected
             code = "text(await tools.finish(" + json.dumps(REPORT) + "))" if permitted else 'text(await tools.apply_patch("forbidden"))'

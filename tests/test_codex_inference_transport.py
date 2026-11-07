@@ -65,7 +65,7 @@ def test_actual_client_request_accounting_and_transport_drain(tmp_path, mode):
     actual = json.loads(request.content)
     expected = copy.deepcopy(body)
     grammar = actual["input"][0]["tools"][0]["tools"][0]["format"]
-    assert grammar["type"] == "grammar" and grammar["syntax"] == "regex"
+    assert grammar["type"] == "grammar" and grammar["syntax"] == "lark"
     expected["input"][0]["tools"][0]["tools"][0]["format"] = grammar
     assert actual == {**expected, "stream": False, "max_output_tokens": 100}
     assert drained == ([True] if mode in {"cancel", "deadline"} else [])

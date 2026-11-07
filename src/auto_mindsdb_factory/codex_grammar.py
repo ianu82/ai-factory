@@ -24,5 +24,8 @@ _COMMAND = _object([("command", _array(_STRING, required=True))])
 _CRITERION = _object([("id", _STRING), ("status", _STATUS), ("evidence", _STRING)])
 _REPORT = _object([("status", _STATUS), ("summary", _STRING),
                    ("criteria", _array(_CRITERION)), ("findings", _array(_STRING))])
-ACTION_GRAMMAR = (r"^text\(await tools\.(?:run\(" + _COMMAND
-                  + r"\)|finish\(" + _REPORT + r"\))\)$")
+_ACTION = (r"text\(await tools\.(?:run\(" + _COMMAND
+           + r"\)|finish\(" + _REPORT + r"\))\)")
+# Keep the CLI's Lark dialect. One terminal consumes the complete start rule;
+# regex document anchors are unnecessary, and delimiter slashes must be escaped.
+ACTION_GRAMMAR = "start: /" + _ACTION.replace("/", r"\/") + "/"

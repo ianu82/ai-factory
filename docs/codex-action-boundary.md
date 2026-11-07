@@ -16,7 +16,7 @@ response before sending **any** executable stream item to app-server, account fo
 every request and enforce cancellation/deadline and cleanup outside prompts.
 
 The inference gate also narrows the detached producer declaration to a supported
-regex grammar for canonical run/finish JSON objects. It constrains field names,
+Lark grammar for canonical run/finish JSON objects. It constrains field names,
 types, report statuses, nonempty command arrays and JSON string escaping before
 sampling. Arbitrary JavaScript, duplicate/extra keys and malformed arguments are
 outside that generation language. Existing action parsing, callback ownership,
@@ -24,6 +24,11 @@ criterion validation and acceptance remain mandatory and unchanged. Function
 declarations, task context and smaller explicit output caps are preserved.
 The isolated live write/read diagnostic captured the CLI's broad SOURCE grammar;
 it does not establish the exact arguments rejected by historical delivery M.
+Keep the pinned CLI's Lark dialect: a single regular terminal recognizes the
+complete canonical action. The earlier regex-dialect live proof stopped before
+any command; a separate fixed-callback probe returned incomplete/max_output_tokens
+with zero reported tokens. Its internal cause remains unknown. Private/mock
+validation does not establish live grammar compatibility, and caps stay fixed.
 
 Rejected complete responses retain a fixed `response_rejection` code on the
 existing `harness_policy_stopped` event. It distinguishes envelope/identity,

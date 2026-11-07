@@ -40,7 +40,7 @@ def _tools(tools, namespace=None):
                 raise CodexRequestError("Codex Code Mode declaration is invalid")
             # Narrow the detached producer declaration. The original action
             # parser, callback ownership and report validation remain mandatory.
-            tool["format"] = {"type": "grammar", "syntax": "regex", "definition": ACTION_GRAMMAR}
+            tool["format"] = {"type": "grammar", "syntax": "lark", "definition": ACTION_GRAMMAR}
             found = True
         else:
             # Hosted tools could execute at the provider before response validation.
