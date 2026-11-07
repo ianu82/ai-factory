@@ -7,12 +7,13 @@ from pathlib import Path
 
 from .connectors import OpenAIResponsesAgentConnector
 from .docker_runner import RunnerError
-from .product_agent import HarnessStopped
-from .product_plan import ProductPlan, freeze_plan, read_plan
+from .product_agent import AgentSessionError, HarnessStopped
+from .product_plan import PlanError, ProductPlan, freeze_plan, read_plan
 from .product_planner import ProductPlanner, PLANNER_VERSION, REPORT_RESERVE_SECONDS
 from .product_roles import select_role
 from .product_workspace import source_files, executable_paths
 from .product_execution import execution_config
+from .run_journal import JournalError
 
 
 class PlanningStopped(HarnessStopped):
@@ -20,6 +21,22 @@ class PlanningStopped(HarnessStopped):
 
 
 FINALIZATION_RESERVE_SECONDS = 20
+_FAILURE_PHASES = {"admission", "worker_preparation", "planning_initialization", "source_preparation",
+                   "investigation_or_sandbox", "source_validation", "plan_freeze", "ready_check"}
+
+
+def _record_failure(journal, phase, error):
+    # Do not format exception text, provider data or mutable runner attributes.
+    categories = ((PlanningStopped, "planning_stopped"), (HarnessStopped, "harness_stopped"),
+                  (AgentSessionError, "agent_error"), (RunnerError, "runner_error"),
+                  (PlanError, "plan_error"), (JournalError, "evidence_error"),
+                  (TimeoutError, "timeout"), (OSError, "io_error"), (ValueError, "invalid_data"))
+    category = next((label for kind, label in categories if isinstance(error, kind)), "unknown")
+    try:
+        journal.append("planning_failed", role="planner", category=category,
+            phase=phase if type(phase) is str and phase in _FAILURE_PHASES else "unknown")
+    except Exception:
+        raise PlanningStopped("Planning failure evidence could not be retained") from None
 
 
 def planning_manifest(profile):
@@ -53,6 +70,7 @@ def retained_plan(delivery, task, base, journal):
 
 def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
     """One bounded investigation, outside candidate source and before implementation."""
+    phase = "admission"
     try:
         manifest = json.loads((journal.root / "manifest.json").read_text())
         if any(manifest.get(k) != v for k, v in planning_manifest(delivery.profile).items()):
@@ -69,7 +87,9 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
         config = execution_config(delivery.settings, "planner", journal) if planner_factory is None else None
         # Allocate the first worker under the already-running global deadline.
         # Source setup, investigation and inference remain within the planning phase.
+        phase = "worker_preparation"
         delivery.prepare_runner(journal)
+        phase = "planning_initialization"
         deadline = min(delivery.deadline, time.monotonic() + 120)
         if time.monotonic() >= deadline:
             raise PlanningStopped("Run time budget exhausted during runner preparation")
@@ -88,9 +108,11 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
             planner = planner_factory(task, base, journal, work_deadline)
         with tempfile.TemporaryDirectory(prefix="ai-factory-plan-") as temporary:
             workspace = Path(temporary) / "source"
+            phase = "source_preparation"
             original = delivery._prepare(base, workspace, journal, deadline=work_deadline)
             modes = executable_paths(workspace, original)
             investigated = False
+            phase = "investigation_or_sandbox"
             with delivery.sandbox_factory(workspace, delivery.settings["image"], writable=False,
                     platform=delivery.settings["platform"]) as sandbox:
                 def command(argv):
@@ -103,6 +125,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                                            "base_binding": "controller_export"},
                     "required_checks": delivery.settings["checks"],
                     "allowed_paths": delivery.settings["allowed_paths"]}, command)
+            phase = "source_validation"
             checks = {"investigated": investigated, "source_unchanged": source_files(workspace) == original,
                       "modes_unchanged": executable_paths(workspace, original) == modes,
                       "within_deadline": time.monotonic() < deadline}
@@ -111,12 +134,16 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                 raise PlanningStopped("Planning did not complete unchanged read-only investigation")
         if time.monotonic() >= deadline:
             raise PlanningStopped("Planning finalization exceeded its phase deadline")
+        phase = "plan_freeze"
         plan = ProductPlan.create(content, task=task, base_sha=base, profile_sha=delivery.profile.digest,
                                   planner_role=select_role("planner", PLANNER_VERSION))
         freeze_plan(journal, plan, task=task, base_sha=base, profile_sha=delivery.profile.digest)
         journal.append("plan_frozen", digest=plan.digest, status=content["status"])
+        phase = "ready_check"
         return retained_plan(delivery, task, base, journal)
-    except (PlanningStopped, RunnerError):
+    except (PlanningStopped, RunnerError) as error:
+        _record_failure(journal, phase, error)
         raise
-    except Exception:
+    except Exception as error:
+        _record_failure(journal, phase, error)
         raise PlanningStopped("Planning failed; implementation is not authorized") from None

@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -8,7 +9,9 @@ import pytest
 from auto_mindsdb_factory.product_planning import PlanningStopped, plan_delivery, planning_manifest, retained_plan
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.product_task import ProductTask
-from auto_mindsdb_factory.run_journal import RunJournal
+from auto_mindsdb_factory.run_journal import JournalError, RunJournal
+from auto_mindsdb_factory.product_agent import AgentSessionError, HarnessStopped
+from auto_mindsdb_factory.docker_runner import RunnerError
 
 
 @pytest.fixture
@@ -53,6 +56,119 @@ def phase(tmp_path):
 
 def execute(p):
     return plan_delivery(p.delivery, p.task, p.base, p.journal, planner_factory=p.factory)
+
+
+def test_interrupted_investigation_retains_bounded_failure_without_ready_plan(phase):
+    def stop(*args, **kwargs):
+        raise HarnessStopped("private command or provider detail")
+    phase.delivery._command = stop
+    with pytest.raises(PlanningStopped):
+        execute(phase)
+    failures = [e["data"] for e in phase.journal.events() if e["kind"] == "planning_failed"]
+    assert failures == [{"role": "planner", "phase": "investigation_or_sandbox", "category": "harness_stopped"}]
+    assert "private" not in json.dumps(phase.journal.events())
+    assert not (phase.journal.root / "plan.json").exists()
+
+
+@pytest.mark.parametrize("fault,section,category", [
+    ("admission", "admission", "invalid_data"),
+    ("worker", "worker_preparation", "runner_error"),
+    ("source", "source_preparation", "io_error"),
+    ("protocol", "investigation_or_sandbox", "agent_error"),
+    ("timeout", "investigation_or_sandbox", "timeout"),
+    ("unknown", "investigation_or_sandbox", "unknown"),
+    ("plan", "plan_freeze", "plan_error"),
+    ("blocked", "ready_check", "planning_stopped"),
+    ("evidence", "admission", "evidence_error"),
+])
+def test_failure_sections_preserve_guards_and_exclude_error_messages(phase, monkeypatch, fault, section, category):
+    p, closed = phase, []
+    summary = p.journal.summary
+    @contextmanager
+    def sandbox(workspace, *args, **kwargs):
+        try:
+            yield SimpleNamespace(workspace=workspace)
+        finally:
+            closed.append(True)
+    p.delivery.sandbox_factory = sandbox
+    def fail(error):
+        def raise_error(*args, **kwargs):
+            raise error
+        return raise_error
+    error = RunnerError("private runner details")
+    if fault == "admission": (p.journal.root / "manifest.json").write_text("{}")
+    elif fault == "worker": p.delivery.prepare_runner = fail(error)
+    elif fault == "source": p.delivery._prepare = fail(OSError("private file"))
+    elif fault == "evidence": monkeypatch.setattr(p.journal, "summary", fail(JournalError("private journal")))
+    elif fault == "plan": p.content["validation"] = []
+    elif fault == "blocked": p.content.update(status="blocked", questions=["Need clarification"])
+    else:
+        errors = {"protocol": AgentSessionError("private response"),
+                  "timeout": TimeoutError("private connection"), "unknown": RuntimeError("private exception")}
+        p.delivery._command = fail(errors[fault])
+    with pytest.raises(RunnerError if fault == "worker" else PlanningStopped) as caught:
+        execute(p)
+    if fault == "worker": assert caught.value is error  # Preserve existing runner provenance.
+    failures = [e["data"] for e in p.journal.events() if e["kind"] == "planning_failed"]
+    assert failures == [{"role": "planner", "phase": section, "category": category}]
+    assert "private" not in json.dumps(p.journal.events())
+    assert bool(closed) is (fault not in {"admission", "worker", "source", "evidence"})
+    assert (p.journal.root / "plan.json").exists() is (fault == "blocked")
+    assert not any(e["kind"] in {"agent_report", "candidate_created", "attempt_started"} for e in p.journal.events())
+    assert summary()["total_tokens"] == 0
+
+
+def test_actual_command_stop_drains_before_failure_evidence(phase, monkeypatch):
+    from auto_mindsdb_factory.product_cancellation import run_cancellable
+    started, released, drained = threading.Event(), threading.Event(), threading.Event()
+    aborts = []
+    class Active:
+        def run(self, command):
+            started.set()
+            try:
+                assert released.wait(2)
+                raise RuntimeError("private interrupted transport")
+            finally:
+                drained.set()
+        def abort(self):
+            aborts.append(True)
+            released.set()
+    phase.delivery._command = lambda sandbox, argv, **kw: run_cancellable(
+        Active(), argv, cancelled=started.is_set, deadline=kw["deadline"])
+    append = phase.journal.append
+    def record(kind, **data):
+        if kind == "planning_failed": assert drained.is_set() and aborts == [True]
+        return append(kind, **data)
+    monkeypatch.setattr(phase.journal, "append", record)
+    with pytest.raises(PlanningStopped): execute(phase)
+    assert phase.journal.events()[-1]["data"]["category"] == "harness_stopped"
+    assert not (phase.journal.root / "plan.json").exists()
+
+
+def test_missing_failure_evidence_still_stops_without_disclosing_the_error(phase, monkeypatch):
+    def stop(*args, **kwargs): raise HarnessStopped("private interruption")
+    phase.delivery._command = stop
+    append = phase.journal.append
+    writes = []
+    def record(kind, **data):
+        if kind == "planning_failed":
+            writes.append(True)
+            raise OSError("private storage error")
+        return append(kind, **data)
+    monkeypatch.setattr(phase.journal, "append", record)
+    with pytest.raises(PlanningStopped, match="failure evidence could not be retained"):
+        execute(phase)
+    assert writes == [True] and not (phase.journal.root / "plan.json").exists()
+    assert "private" not in json.dumps(phase.journal.events())
+
+
+def test_unknown_failure_metadata_never_formats_untrusted_objects(phase):
+    from auto_mindsdb_factory.product_planning import _record_failure
+    class Unprintable(RuntimeError):
+        def __str__(self): raise AssertionError("Exception text must not be inspected")
+    _record_failure(phase.journal, Unprintable("private phase"), Unprintable("private error"))
+    assert phase.journal.events()[-1]["data"] == {
+        "role": "planner", "phase": "unknown", "category": "unknown"}
 
 
 def test_phase_freezes_after_readonly_investigation_and_reuses_without_writes(phase):

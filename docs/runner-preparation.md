@@ -19,3 +19,12 @@ manifest explicitly records that runner preparation uses the shared run deadline
 worker identity and bootstrap duration; `planning_started` records its phase
 limit and remaining run time. Unknown/exhausted usage or a retained plan cannot
 admit another preparation. Historical runs remain inspectable and cannot resume.
+
+Failures while preparing a new plan append `planning_failed` with the fixed last-entered
+controller section and a bounded exception category. It records no exception
+message, provider content or command arguments. `investigation_or_sandbox`
+includes sandbox entry and cleanup; it is not an execution acknowledgement.
+`harness_stopped` covers interruption and evidence faults, without asserting that
+cancellation or cleanup succeeded. Missing failure-evidence writes still stop
+planning. This metadata changes no budgets, readiness checks or retry authority;
+historical coarse failures remain unknown and are not reclassified.
