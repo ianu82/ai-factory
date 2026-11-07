@@ -136,6 +136,19 @@ class ProductAgent:
                 status=payload.get("status"), incomplete_details=payload.get("incomplete_details"),
                 duration_seconds=round(time.monotonic() - started, 3),
                 cost_estimate_usd=estimate_cost(payload.get("usage"), rate), pricing=rate)
+            if getattr(self.connector.config, "inference_binding_sha256", None) is not None:
+                from .mindshub_native import MindsHubPayload
+                from .mindshub_transport import gateway_evidence
+                complete = type(payload) is MindsHubPayload and payload.transport_complete
+                gateway = payload.gateway if type(payload) is MindsHubPayload else gateway_evidence({})
+                self.journal.append("inference_gateway", role=role, turn=turn + 1, harness="native", transport_complete=complete, **gateway)
+                if not gateway["single_attempt"] or not gateway["requested_model"]:
+                    self.journal.append("inference_usage_unknown", role=role, turn=turn + 1,
+                        harness="native", reason="gateway_attempt_coverage")
+                if (not complete or not gateway["single_attempt"] or not gateway["requested_model"]
+                        or any(gateway[k] for k in ("dropped_params", "dropped_content", "clamped_params", "chain_truncated"))
+                        or payload.get("model") != self.connector.config.model):
+                    raise HarnessStopped("MindsHub gateway policy mismatch")
             if self.cancelled():
                 raise HarnessStopped("Agent execution was cancelled after an observed response")
             if payload.get("status") != "completed":

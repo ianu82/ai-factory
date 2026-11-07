@@ -273,3 +273,97 @@ def test_bound_codex_is_rejected_before_receipt_or_credential_resolution(inputs,
     with pytest.raises(InferencePolicyError, match="Codex"):
         runtime.resolve_execution_context(settings, **kwargs)
     assert not reads
+
+
+@pytest.mark.parametrize("mode", ["success", "drop", "attempts", "redirect", "error", "cancel", "timeout", "read-cancel", "cleanup", "bad-usage"])
+def test_native_mindshub_transport_uses_bound_request_and_closes(inputs, tmp_path, monkeypatch, mode):
+    pytest.importorskip("anton.core.session")
+    import asyncio
+    import time
+    import httpx2
+    from auto_mindsdb_factory.mindshub_native import MindsHubNativeConnector
+    from auto_mindsdb_factory.product_agent import ProductAgent, HarnessStopped, AgentSessionError
+    from auto_mindsdb_factory.connectors import FactoryConnectorError
+    from auto_mindsdb_factory.product_roles import snapshot_roles
+    from auto_mindsdb_factory.run_journal import RunJournal
+    settings, kwargs = inputs
+    config = runtime.resolve_qualification_config(settings, "builder", **kwargs)
+    requests, clients, commands, cancelled, reading = [], [], [], [], []
+    report = {"status": "passed", "summary": "Checked", "findings": [],
+        "criteria": [{"id": "a", "status": "passed", "evidence": "Read source"}]}
+    class PendingBody(httpx2.AsyncByteStream):
+        async def __aiter__(self):
+            reading.append(True)
+            try:
+                yield b'{"id":'
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+    async def respond(request):
+        requests.append(request)
+        if mode == "cancel":
+            try: await asyncio.Event().wait()
+            finally: cancelled.append(True)
+        if mode == "redirect": return httpx2.Response(307, headers={"location": "https://other.invalid"})
+        if mode == "error": return httpx2.Response(503, text="private error content")
+        headers = {"x-mindshub-attempts": "2" if mode == "attempts" else "1", "x-mindshub-failover": "false"}
+        if mode == "drop": headers["x-mindshub-dropped-params"] = "private dropped field"
+        if mode in {"read-cancel", "timeout"}: return httpx2.Response(200, headers=headers, stream=PendingBody())
+        name, args = ("finish", report) if len(requests) == 2 else ("run", {"command": ["true"]})
+        return httpx2.Response(200, headers=headers, json={"id": "r", "model": config.model, "status": "completed",
+            "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 11 if mode == "bad-usage" else 10}, "output": [
+                {"type": "function_call", "call_id": str(len(requests)), "name": name, "arguments": json.dumps(args)}]})
+    actual = httpx2.AsyncClient
+    def client(**options):
+        value = actual(**options, transport=httpx2.MockTransport(respond))
+        clients.append(value)
+        if mode == "cleanup":
+            class BrokenClose:
+                async def __aenter__(self): return await value.__aenter__()
+                async def __aexit__(self, *args):
+                    await value.__aexit__(*args)
+                    raise RuntimeError("private close error")
+            return BrokenClose()
+        return value
+    monkeypatch.setattr(httpx2, "AsyncClient", client)
+    journal = RunJournal(tmp_path, "native-http")
+    journal.create({"role_snapshots": snapshot_roles()})
+    connector = MindsHubNativeConnector(config, deadline=time.monotonic() + (0.2 if mode == "timeout" else 3),
+        cancelled=lambda: bool(requests) if mode == "cancel" else bool(reading) if mode == "read-cancel" else False)
+    agent = ProductAgent(connector, journal, max_turns=3, max_total_tokens=1000, deadline=time.monotonic() + 3)
+    def command(argv):
+        commands.append(argv)
+        return {"exit_code": 0}
+    started = time.monotonic()
+    if mode == "success":
+        assert agent.run("builder", {"acceptance_criteria": [{"id": "a", "description": "Read source"}]}, command) == report
+        assert commands == [["true"]] and len(requests) == 2
+        assert any(i.get("type") == "function_call_output" for i in json.loads(requests[1].content)["input"])
+    else:
+        with pytest.raises((AgentSessionError, FactoryConnectorError)):
+            agent.run("builder", {}, command)
+        assert len(requests) == 1 and not commands
+    assert time.monotonic() - started < 1
+    assert clients and all(c.is_closed and not c.follow_redirects for c in clients)
+    assert all(str(r.url) == config.base_url and r.headers["authorization"] == "Bearer " + KEY for r in requests)
+    assert cancelled == ([True] if mode in {"cancel", "read-cancel", "timeout"} else [])
+    evidence = json.dumps(journal.events())
+    assert all(text not in evidence for text in (KEY, "private error content", "private dropped field", "private close error"))
+    assert journal.summary()["total_tokens"] == (20 if mode == "success" else 10 if mode in {"drop", "attempts", "cleanup"} else 0)
+    assert journal.summary()["usage_complete"] is (mode in {"success", "drop", "cleanup"})
+
+
+def test_native_mindshub_invalid_admission_never_opens_client(inputs, monkeypatch):
+    from auto_mindsdb_factory import mindshub_native
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    settings, kwargs = inputs
+    config = runtime.resolve_qualification_config(settings, "builder", **kwargs)
+    def denied(): raise AssertionError("Invalid admission must not open client")
+    monkeypatch.setattr(mindshub_native, "_trusted_http_client", denied)
+    connector = mindshub_native.MindsHubNativeConnector(config)
+    body = {"model": config.model, "reasoning": {"effort": config.reasoning_effort}}
+    for timeout in (0, -1, True, float("inf"), float("nan")):
+        with pytest.raises(HarnessStopped, match="deadline"):
+            connector.request_response(body, timeout_seconds=timeout)
+    with pytest.raises(HarnessStopped, match="configuration mismatch"):
+        connector.request_response({**body, "model": "other"})

@@ -151,3 +151,34 @@ def test_agent_refuses_untrusted_manifest_before_provider_or_command(tmp_path, m
         agent.run("verifier", CONTEXT, commands.append)
     assert not commands and not requests
     assert (path.read_bytes() if path.exists() else None) == before
+
+
+@pytest.mark.parametrize("mode", ["body-forgery", "attempts", "drop", "wrong-model", "success"])
+def test_bound_native_gateway_is_checked_after_usage_before_tools(tmp_path, mode):
+    from auto_mindsdb_factory.mindshub_native import MindsHubPayload
+    from auto_mindsdb_factory.product_agent import HarnessStopped
+    replies = [response("run", {"command": ["true"]}), response("finish", REPORT)]
+    headers = {"x-mindshub-attempts": "2" if mode == "attempts" else "1", "x-mindshub-failover": "false"}
+    if mode == "drop": headers["x-mindshub-dropped-params"] = "private-header-text"
+    if mode == "wrong-model": replies[0]["model"] = "other"
+    if mode == "body-forgery":
+        replies[0]["gateway"] = {"single_attempt": True, "requested_model": True}
+    else:
+        for reply in replies: reply["usage"] = {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+        replies = [MindsHubPayload(reply, headers) for reply in replies]
+    agent, requests, journal = session(tmp_path, replies)
+    agent.connector.config.inference_binding_sha256 = "a" * 64
+    commands = []
+    def command(argv):
+        commands.append(argv)
+        return {"exit_code": 0}
+    if mode == "success":
+        assert agent.run("builder", CONTEXT, command) == REPORT
+        assert commands == [["true"]]
+    else:
+        with pytest.raises(HarnessStopped, match="gateway policy"):
+            agent.run("builder", CONTEXT, command)
+        assert len(requests) == 1 and not commands
+    assert journal.summary()["total_tokens"] == (20 if mode == "success" else 10)
+    assert journal.summary()["usage_complete"] is (mode not in {"attempts", "body-forgery"})
+    assert "private-header-text" not in json.dumps(journal.events())
