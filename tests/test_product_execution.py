@@ -1,5 +1,6 @@
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,16 @@ from auto_mindsdb_factory.product_delivery import ProductDelivery
 from auto_mindsdb_factory.product_execution import execution_manifest, execution_config
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.run_journal import RunJournal
+
+
+def test_execution_snapshot_distinguishes_explicit_credential_binding():
+    from auto_mindsdb_factory.connectors import OpenAIResponsesAgentConfig
+    from auto_mindsdb_factory.product_execution import codex_execution_snapshot
+    from dataclasses import asdict
+    fields = asdict(OpenAIResponsesAgentConfig(api_key="synthetic-only"))
+    first = SimpleNamespace(**fields, inference_binding_sha256="a" * 64)
+    second = SimpleNamespace(**fields, inference_binding_sha256="b" * 64)
+    assert codex_execution_snapshot(first) != codex_execution_snapshot(second)
 
 
 def settings(**overrides):

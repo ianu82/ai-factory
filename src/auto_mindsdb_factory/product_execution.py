@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from .connectors import OpenAIResponsesAgentConfig
@@ -36,8 +37,13 @@ def snapshot(settings, role, config):
 
 
 def _configuration(name, version, dependencies, config):
-    provider = json.dumps({"base_url": config.base_url, "organization": config.organization,
-                           "project": config.project}, sort_keys=True).encode()
+    provider_fields = {"base_url": config.base_url, "organization": config.organization, "project": config.project}
+    binding = getattr(config, "inference_binding_sha256", None)
+    if binding is not None:
+        if type(binding) is not str or not re.fullmatch("[0-9a-f]{64}", binding):
+            raise HarnessStopped("Invalid inference configuration binding")
+        provider_fields["inference_binding_sha256"] = binding
+    provider = json.dumps(provider_fields, sort_keys=True).encode()
     return {"harness": name, "version": version, "dependencies_sha256": dependencies,
         "model": config.model, "reasoning_effort": config.reasoning_effort,
         "max_output_tokens": config.max_output_tokens, "timeout_seconds": config.timeout_seconds,
