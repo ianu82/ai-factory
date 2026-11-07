@@ -4,17 +4,42 @@ The receipt hash and credential-file version must come from approved controller
 evidence. A receipt is not reauthentication or proof of model compatibility.
 """
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+from weakref import WeakSet
 
 from .connectors import OpenAIResponsesAgentConfig
 from .product_inference import InferencePolicy, InferencePolicyError
 from .product_inference_auth import _constant, _object, _receipt, require_auth_workspace, require_controller_import_path
+
+
+_config_issuance, _context_issuance = WeakSet(), WeakSet()
+
+
+class _ResolverIssued:
+    def __post_init__(self):
+        raise InferencePolicyError("MindsHub configuration must be resolver-issued")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("Private MindsHub configuration cannot be serialized")
+
+
+def _require_issued(value, registry):
+    if value not in registry:
+        raise InferencePolicyError("MindsHub configuration must be resolver-issued")
+
+
+def _issue(cls, registry, **values):
+    value = object.__new__(cls)
+    for key, item in values.items():
+        object.__setattr__(value, key, item)
+    registry.add(value)
+    return value
 
 
 def _version(info):
@@ -42,10 +67,10 @@ def _read_owned(path, target, limit, *, credential=False, version=None):
         os.close(descriptor)
 
 
-@dataclass(frozen=True)
-class MindsHubQualificationConfig:
-    # Keep the key and its binding together; dataclasses.replace used by Codex
-    # preserves this immutable pair. The controller is trusted, not sandboxed.
+@dataclass(frozen=True, eq=False)
+class MindsHubQualificationConfig(_ResolverIssued):
+    # Keep key and binding together; only the resolver may issue or derive them.
+    # Identity guards are an API boundary, not a sandbox for compromised Python.
     _credential: tuple[str, str] = field(repr=False)
     model: str
     reasoning_effort: str
@@ -57,17 +82,21 @@ class MindsHubQualificationConfig:
 
     @property
     def api_key(self):
+        _require_issued(self, _config_issuance)
         return self._credential[0]
 
     @property
     def inference_binding(self):
+        _require_issued(self, _config_issuance)
         return json.loads(self._credential[1])
 
     @property
     def inference_binding_sha256(self):
+        _require_issued(self, _config_issuance)
         return hashlib.sha256(self._credential[1].encode()).hexdigest()
 
     def validated(self):
+        _require_issued(self, _config_issuance)
         OpenAIResponsesAgentConfig.validated(self)
         return self
 
@@ -77,6 +106,7 @@ def resolve_qualification_config(settings, role, *, reasoning_effort, timeout_se
         auth_workspace_id=None):
     """Resolve an explicit private file without environment fallback or networking."""
     require_controller_import_path(target_root)
+    _require_supported_harnesses(settings)
     policy = InferencePolicy.from_document(settings.get("inference"))
     require_auth_workspace(policy, auth_workspace_id)
     try:
@@ -111,25 +141,34 @@ def resolve_qualification_config(settings, role, *, reasoning_effort, timeout_se
             raise ValueError()
         binding = {"policy": policy.document, "identity_sha256": receipt["identity_sha256"],
             "receipt_sha256": receipt_sha256, "credential_version": list(credential_version)}
-        return MindsHubQualificationConfig((key, json.dumps(binding, sort_keys=True)),
-            model, reasoning_effort, output, timeout_seconds).validated()
+        return _issue(MindsHubQualificationConfig, _config_issuance,
+            _credential=(key, json.dumps(binding, sort_keys=True)), model=model,
+            reasoning_effort=reasoning_effort, max_output_tokens=output, timeout_seconds=timeout_seconds).validated()
     except InferencePolicyError:
         raise
     except (OSError, ValueError, KeyError, TypeError):
         raise InferencePolicyError("Could not bind MindsHub qualification configuration") from None
 
 
+def _require_supported_harnesses(settings):
+    if any(settings.get(field) == "codex" for field in ("builder_harness", "reviewer_harness")):
+        raise InferencePolicyError("Bound MindsHub Codex execution is unsupported")
+
+
 def _canonical_settings(settings):
     return json.dumps(settings, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-@dataclass(frozen=True)
-class MindsHubExecutionContext:
+@dataclass(frozen=True, eq=False)
+class MindsHubExecutionContext(_ResolverIssued):
     """One trusted bootstrap's private binding, reusable after dropping privileges."""
     _settings: str = field(repr=False)
     _config: MindsHubQualificationConfig = field(repr=False)
 
     def role_config(self, settings, role):
+        _require_issued(self, _context_issuance)
+        _require_supported_harnesses(settings)
+        self._config.validated()
         try:
             if role not in ("planner", "builder", "verifier") or _canonical_settings(settings) != self._settings:
                 raise ValueError()
@@ -141,11 +180,14 @@ class MindsHubExecutionContext:
             model = settings["reviewer_model" if role == "verifier" else "builder_model"]
             if type(model) is not str or not model:
                 raise ValueError()
-            return replace(self._config, model=model).validated()
+            return _issue(MindsHubQualificationConfig, _config_issuance,
+                _credential=self._config._credential, model=model, reasoning_effort=self._config.reasoning_effort,
+                max_output_tokens=self._config.max_output_tokens, timeout_seconds=self._config.timeout_seconds).validated()
         except (ValueError, TypeError, KeyError):
             raise InferencePolicyError("Missing or changed MindsHub execution context") from None
 
     def inspect(self):
+        _require_issued(self, _context_issuance)
         safe = {"profile_sha256": hashlib.sha256(self._settings.encode()).hexdigest(),
             "inference_binding_sha256": self._config.inference_binding_sha256}
         contract = {**safe, "reasoning_effort": self._config.reasoning_effort,
@@ -158,6 +200,7 @@ def resolve_execution_context(settings, *, reasoning_effort, timeout_seconds,
         receipt_path, receipt_sha256, credential_file, credential_version, target_root,
         auth_workspace_id=None):
     """Read the private credential once before the controller drops privileges."""
+    _require_supported_harnesses(settings)
     if any(type(settings.get(field)) is not str or not settings[field]
             for field in ("builder_model", "reviewer_model")):
         raise InferencePolicyError("Invalid MindsHub execution role models")
@@ -166,7 +209,7 @@ def resolve_execution_context(settings, *, reasoning_effort, timeout_seconds,
         timeout_seconds=timeout_seconds, receipt_path=receipt_path, receipt_sha256=receipt_sha256,
         credential_file=credential_file, credential_version=credential_version,
         target_root=target_root, auth_workspace_id=auth_workspace_id)
-    context = MindsHubExecutionContext(canonical, config)
+    context = _issue(MindsHubExecutionContext, _context_issuance, _settings=canonical, _config=config)
     # Validate both configured model roles before admitting any phase.
     for role in ("planner", "builder", "verifier"):
         context.role_config(settings, role)

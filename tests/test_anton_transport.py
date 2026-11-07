@@ -12,6 +12,7 @@ from auto_mindsdb_factory.product_agent import HarnessStopped
 from auto_mindsdb_factory.product_agent import TOOLS
 from auto_mindsdb_factory.product_roles import snapshot_roles
 from auto_mindsdb_factory.run_journal import RunJournal
+from test_product_inference_runtime import inputs
 
 
 REPORT = {"status": "passed", "summary": "Parser checked", "findings": [],
@@ -84,7 +85,7 @@ def test_real_sdk_http_protocol_accounting_and_cleanup(tmp_path, monkeypatch, mo
 
 @pytest.mark.parametrize("change", [None, "dropped-params", "dropped-content", "clamped-params",
     "chain-truncated", "failover", "attempts", "missing-attempts", "missing-failover", "malformed-attempts", "malformed-failover", "redirect"])
-def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path, monkeypatch, change):
+def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path, monkeypatch, change, inputs):
     from auto_mindsdb_factory.product_inference_runtime import MindsHubQualificationConfig
     pytest.importorskip("anton.core.session")
     import httpx2
@@ -122,8 +123,10 @@ def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path
     monkeypatch.setattr(provider.openai, "AsyncOpenAI", create_client)
     monkeypatch.setenv("OPENAI_ORG_ID", "unapproved-global-org")
     monkeypatch.setenv("OPENAI_PROJECT_ID", "unapproved-global-project")
-    config = MindsHubQualificationConfig(("mdb_synthetic.private", '{"policy":"synthetic"}'),
-        "pinned", "high", 1000, 10)
+    from auto_mindsdb_factory.product_inference_runtime import resolve_qualification_config
+    settings, options = inputs
+    settings["builder_model"] = "pinned"
+    config = resolve_qualification_config(settings, "builder", **options)
     journal = RunJournal(tmp_path, "gateway")
     journal.create({"role_snapshots": snapshot_roles()})
     agent = AntonAgent(config, journal, max_turns=4, max_total_tokens=1000, deadline=time.monotonic() + 10)
@@ -139,7 +142,7 @@ def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path
             agent.run("builder", context, command)
         assert len(requests) == 1 and not commands
     assert clients and all(c.is_closed and not c.follow_redirects for c in clients)
-    assert all(r.headers["authorization"] == "Bearer mdb_synthetic.private" for r in requests)
+    assert all(r.headers["authorization"] == "Bearer " + config.api_key for r in requests)
     assert all(r.headers.get("x-mindshub-allow-failover") == "false" for r in requests)
     assert all("openai-organization" not in r.headers and "openai-project" not in r.headers for r in requests)
     events = journal.events()

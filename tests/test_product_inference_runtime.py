@@ -53,7 +53,8 @@ def test_resolved_config_is_frozen_secret_safe_and_ignores_global_provider(input
     assert config.api_key == KEY and config.fallback_model is None
     assert (config.model, config.reasoning_effort, config.max_output_tokens, config.timeout_seconds) == (
         "gpt-6.1-terra", "high", 10000, 180)
-    assert replace(config).api_key == KEY  # Actual Codex ownership-copy contract.
+    with pytest.raises(InferencePolicyError):
+        replace(config)  # Copies cannot manufacture a new resolver-issued capability.
     assert KEY not in repr(config) + json.dumps(config.inference_binding) + json.dumps(codex_execution_snapshot(config))
     with pytest.raises(FrozenInstanceError):
         config.api_key = "changed"
@@ -235,3 +236,40 @@ def test_plain_profile_object_cannot_supply_trusted_context(inputs):
     settings, _ = inputs
     with pytest.raises(HarnessStopped, match="trusted inference context"):
         role_config(settings, "builder", inference_context={"api_key": KEY})
+
+
+def test_unresolved_public_construction_cannot_authorize_execution(inputs):
+    settings, _ = inputs
+    with pytest.raises(InferencePolicyError):
+        config = runtime.MindsHubQualificationConfig((KEY, json.dumps({"policy": settings["inference"]})),
+            settings["builder_model"], "high", settings["agent_max_output_tokens"], 180)
+        context = runtime.MindsHubExecutionContext(runtime._canonical_settings(settings), config)
+        role_config(settings, "builder", inference_context=context)
+
+
+def test_replaced_or_identity_forged_context_cannot_authorize_execution(inputs):
+    settings, kwargs = inputs
+    context = runtime.resolve_execution_context(settings, **kwargs)
+    with pytest.raises(InferencePolicyError): replace(context)
+    import pickle
+    with pytest.raises(TypeError): pickle.dumps(context)
+    with pytest.raises(TypeError): pickle.dumps(context._config)
+    forged = object.__new__(runtime.MindsHubExecutionContext)
+    for key, value in vars(context).items(): object.__setattr__(forged, key, value)
+    with pytest.raises(InferencePolicyError):
+        role_config(settings, "builder", inference_context=forged)
+
+
+@pytest.mark.parametrize("field", ["builder_harness", "reviewer_harness"])
+def test_bound_codex_is_rejected_before_receipt_or_credential_resolution(inputs, monkeypatch, field):
+    settings, kwargs = inputs
+    settings.update({field: "codex", "execution_lane": "codex-qualification"})
+    reads = []
+    original = runtime._read_owned
+    def counted(*args, **options):
+        reads.append(options.get("credential", False))
+        return original(*args, **options)
+    monkeypatch.setattr(runtime, "_read_owned", counted)
+    with pytest.raises(InferencePolicyError, match="Codex"):
+        runtime.resolve_execution_context(settings, **kwargs)
+    assert not reads
