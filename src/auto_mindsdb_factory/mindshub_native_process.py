@@ -31,6 +31,7 @@ def exchange(packet, *, deadline, cancelled):
         raise RuntimeError("Inference process admission refused")
     process = subprocess.Popen(_command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, cwd=root.parent, env=env, start_new_session=True, bufsize=0)
+    spawn_late = time.monotonic() >= deadline
     state = {"ready": False, "observed": None, "payload": None, "retired": False}
     pending, buffer, total = memoryview(raw), bytearray(), 0
     sent, eof, failed, forced = False, False, False, False
@@ -88,6 +89,7 @@ def exchange(packet, *, deadline, cancelled):
     except Exception:
         failed = True
     finally:
+        retirement_started = time.monotonic()
         if process.poll() is None:
             forced = True
             try:
@@ -97,11 +99,14 @@ def exchange(packet, *, deadline, cancelled):
             except OSError:
                 failed = True
         try:
-            process.wait(timeout=max(0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
+            # Match the runner's terminal owned-child retirement: an expired
+            # admission cannot skip reaping. OS kill/reap has no wall-time
+            # guarantee; it grants no more inference work or deadline success.
+            process.wait()
+        except OSError:
             failed = True
         try:
-            while not eof and time.monotonic() < deadline:
+            while not eof:
                 try: read()
                 except BlockingIOError: break
         except Exception:
@@ -111,5 +116,8 @@ def exchange(packet, *, deadline, cancelled):
     complete = (not failed and not forced and state["retired"] and process.returncode == 0
                 and time.monotonic() < deadline and not cancelled())
     facts = {"pid": process.pid, "reaped": process.returncode is not None, "forced": forced,
-             "packet_sent": sent and not pending}
+             "packet_sent": sent and not pending, "spawn_late": spawn_late,
+             "deadline_exceeded": time.monotonic() >= deadline,
+             "retirement_ms": round((time.monotonic() - retirement_started) * 1000),
+             "deadline_overrun_ms": max(0, round((time.monotonic() - deadline) * 1000))}
     return state["observed"], state["payload"], complete, facts

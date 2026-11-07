@@ -77,3 +77,28 @@ emit({"kind":"retired"})
     assert complete and facts["reaped"] and not facts["forced"]
     assert payload["output"] == "\U0001f600" * 400000
     assert observed["summary"]["usage"]["total_tokens"] == 10
+
+
+@pytest.mark.parametrize("attempt", range(3))
+def test_late_spawn_is_killed_and_reaped_without_sending_packet(monkeypatch, attempt):
+    original, children = process.subprocess.Popen, []
+    monkeypatch.setattr(process, "_command", lambda: [sys.executable, "-I", "-c", "import time;time.sleep(30)"])
+    def late_spawn(*args, **kwargs):
+        child = original(*args, **kwargs)
+        children.append(child)
+        time.sleep(.08)
+        return child
+    monkeypatch.setattr(process.subprocess, "Popen", late_spawn)
+    start = time.monotonic()
+    try:
+        observed, payload, complete, facts = process.exchange({"api_key": "synthetic"},
+            deadline=start + .02, cancelled=lambda: False)
+        assert not complete and observed is payload is None
+        assert facts["forced"] and facts["reaped"] and not facts["packet_sent"]
+        assert facts["spawn_late"] and facts["deadline_exceeded"]
+        assert facts["deadline_overrun_ms"] >= 50 and facts["retirement_ms"] >= 0
+        with pytest.raises(ChildProcessError): os.waitpid(facts["pid"], os.WNOHANG)
+    finally:
+        for child in children:
+            if child.poll() is None: child.kill()
+            child.wait(timeout=1)
