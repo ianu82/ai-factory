@@ -135,12 +135,15 @@ def test_key_rotation_requires_new_frozen_execution_receipt(inputs, tmp_path):
     assert not journal.events()
 
 
-def test_credential_change_during_read_is_rejected(inputs, monkeypatch):
+@pytest.mark.parametrize("change", ["write", "short-read"])
+def test_credential_change_during_read_is_rejected(inputs, monkeypatch, change):
     settings, kwargs = inputs
     read = runtime.os.read
     def raced(descriptor, count):
         data = read(descriptor, count)
         if data.startswith(b"AI_FACTORY_MINDSHUB_API_KEY="):
+            if change == "short-read":
+                return data[:-1]
             kwargs["credential_file"].write_text("AI_FACTORY_MINDSHUB_API_KEY=mdb_synthetic.changed\n")
         return data
     monkeypatch.setattr(runtime.os, "read", raced)

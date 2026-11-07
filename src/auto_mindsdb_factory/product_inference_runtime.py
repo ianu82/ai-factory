@@ -35,7 +35,7 @@ def _read_owned(path, target, limit, *, credential=False, version=None):
                 or mode & 0o022 or (credential and (mode != 0o600 or _version(before) != version))):
             raise ValueError()
         data = os.read(descriptor, limit + 1)
-        if len(data) > limit or _version(os.fstat(descriptor)) != _version(before):
+        if len(data) > limit or len(data) != before.st_size or _version(os.fstat(descriptor)) != _version(before):
             raise ValueError()
         return data
     finally:
