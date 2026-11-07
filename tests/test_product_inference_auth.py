@@ -1,6 +1,10 @@
 import asyncio
 import inspect
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -174,3 +178,35 @@ def test_pinned_auth_deadline_or_cancel_drains_and_closes(pinned_http, monkeypat
             await task
     asyncio.run(exercise())
     assert stopped == [True] and len(clients) == 1 and clients[0].is_closed
+
+
+@pytest.mark.parametrize("via_path", [False, True])
+@pytest.mark.parametrize("in_file", [False, True])
+def test_candidate_http_client_cannot_receive_credential(pinned_http, validation_checkout, via_path, in_file):
+    root, target = validation_checkout
+    captured = root / "captured.txt"
+    (target / "httpx2.py").write_text(f'''from pathlib import Path
+class AsyncClient:
+    def __init__(self, **options): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): pass
+    def stream(self, *args, headers, **options):
+        Path({str(captured)!r}).write_text(headers['Authorization'])
+        raise RuntimeError('Untrusted HTTP client received the credential')
+''')
+    source = Path(auth.__file__).resolve().parents[2]
+    env = {"PATH": os.environ["PATH"], "HOME": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(source / "src") + (os.pathsep + str(target) if via_path else ""),
+        "HTTPS_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""}
+    args = [sys.executable, "-m", "auto_mindsdb_factory", "product-inference-check",
+        "--profile", str(profile_file(root)), "--target-root", str(target), "--auth-workspace-id", AUTH_WORKSPACE]
+    if in_file:
+        credential = root / "credential.env"
+        credential.write_text("AI_FACTORY_MINDSHUB_API_KEY=" + KEY + "\n")
+        args += ["--env-file", str(credential)]
+    else:
+        env["AI_FACTORY_MINDSHUB_API_KEY"] = KEY
+    result = subprocess.run(args, cwd=source if via_path else target, env=env,
+        capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1 and "Product workflow failed:" in result.stderr
+    assert not captured.exists(), "Candidate HTTP client received the synthetic credential"
