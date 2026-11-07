@@ -128,6 +128,8 @@ class ProductAgent:
                 payload = self.connector.request_response(body, timeout_seconds=min(
                     self.connector.config.timeout_seconds, max(1, self.deadline - time.monotonic())))
             except Exception:
+                if getattr(self.connector.config, "inference_binding_sha256", None) is not None and getattr(self.connector, "worker_facts", None):
+                    self.journal.append("inference_process", role=role, turn=turn + 1, **self.connector.worker_facts)
                 self.journal.append("model_failed", role=role, turn=turn + 1, model=body["model"])
                 raise
             rate = self.pricing.get(payload.get("model"))
@@ -141,6 +143,8 @@ class ProductAgent:
                 duration_seconds=round(time.monotonic() - started, 3),
                 cost_estimate_usd=estimate_cost(payload.get("usage"), rate), pricing=rate)
             if getattr(self.connector.config, "inference_binding_sha256", None) is not None:
+                if getattr(self.connector, "worker_facts", None):
+                    self.journal.append("inference_process", role=role, turn=turn + 1, **self.connector.worker_facts)
                 from .mindshub_native import MindsHubPayload
                 from .mindshub_transport import gateway_evidence
                 complete = type(payload) is MindsHubPayload and payload.transport_complete
