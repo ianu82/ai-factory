@@ -158,6 +158,7 @@ def test_bound_native_gateway_is_checked_after_usage_before_tools(tmp_path, mode
     from auto_mindsdb_factory.mindshub_native import MindsHubPayload
     from auto_mindsdb_factory.product_agent import HarnessStopped
     replies = [response("run", {"command": ["true"]}), response("finish", REPORT)]
+    replies[0]["incomplete_details"] = {"reason": "max_output_tokens", "message": "private-provider-detail"}
     headers = {"x-mindshub-attempts": "2" if mode == "attempts" else "1", "x-mindshub-failover": "false"}
     if mode == "drop": headers["x-mindshub-dropped-params"] = "private-header-text"
     if mode == "wrong-model": replies[0]["model"] = "other"
@@ -182,3 +183,4 @@ def test_bound_native_gateway_is_checked_after_usage_before_tools(tmp_path, mode
     assert journal.summary()["total_tokens"] == (20 if mode == "success" else 10)
     assert journal.summary()["usage_complete"] is (mode not in {"attempts", "body-forgery"})
     assert "private-header-text" not in json.dumps(journal.events())
+    assert "private-provider-detail" not in json.dumps(journal.events())

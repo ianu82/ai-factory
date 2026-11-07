@@ -131,9 +131,13 @@ class ProductAgent:
                 self.journal.append("model_failed", role=role, turn=turn + 1, model=body["model"])
                 raise
             rate = self.pricing.get(payload.get("model"))
+            details = payload.get("incomplete_details")
+            if getattr(self.connector.config, "inference_binding_sha256", None) is not None:
+                reason = details.get("reason") if type(details) is dict else None
+                details = {"reason": reason} if reason in ("max_output_tokens", "content_filter") else None
             self.journal.append("model_response", role=role, turn=turn + 1,
                 response_id=payload.get("id"), model=payload.get("model"), usage=payload.get("usage"),
-                status=payload.get("status"), incomplete_details=payload.get("incomplete_details"),
+                status=payload.get("status"), incomplete_details=details,
                 duration_seconds=round(time.monotonic() - started, 3),
                 cost_estimate_usd=estimate_cost(payload.get("usage"), rate), pricing=rate)
             if getattr(self.connector.config, "inference_binding_sha256", None) is not None:
