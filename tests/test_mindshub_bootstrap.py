@@ -115,3 +115,17 @@ def test_prepare_context_is_same_drop_boundary_without_dispatch(admission):
     assert type(admitted) is tuple and list(admitted) == admission.argv
     assert context is not None and admission.state["uid"] == admission.state["gid"] == 10001
     assert admission.events.count("resolve-once") == 1 and "normal-main" not in admission.events
+
+
+def test_bootstrap_import_rejects_shadow_dependency_before_execution(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    marker = tmp_path / "shadow-ran"
+    (tmp_path / "jsonschema.py").write_text("from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n")
+    source = Path(__file__).resolve().parents[1] / "src"
+    result = subprocess.run([sys.executable, "-c", "import auto_mindsdb_factory.mindshub_bootstrap"],
+        cwd=tmp_path, env={"PATH": os.defpath, "PYTHONPATH": str(source)}, capture_output=True, text=True, timeout=3)
+    assert not marker.exists()
+    assert result.returncode != 0 and "trusted controller imports" in result.stderr

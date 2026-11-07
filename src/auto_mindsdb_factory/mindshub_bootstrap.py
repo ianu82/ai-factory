@@ -1,5 +1,8 @@
 """Trusted root bootstrap; retain one frozen binding after permanent privilege drop."""
 
+from .controller_imports import require_controller_import_path
+require_controller_import_path()
+
 import argparse
 import hashlib
 import json
@@ -10,7 +13,7 @@ import sys
 
 from .__main__ import build_parser, main as product_main
 from .product_profile import ProductProfile
-from .product_inference_auth import require_controller_import_path, _object, _constant
+from .product_inference_auth import _object, _constant
 from .product_inference_runtime import _read_owned, resolve_execution_context, MindsHubQualificationConfig
 
 
