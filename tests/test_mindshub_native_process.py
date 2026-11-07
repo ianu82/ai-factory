@@ -58,3 +58,22 @@ def test_expired_or_oversized_packet_never_spawns(monkeypatch):
     for packet, deadline in (({}, time.monotonic() - 1), ({"data": "x" * process.MAX_BYTES}, time.monotonic() + 1)):
         with pytest.raises(RuntimeError, match="admission"):
             process.exchange(packet, deadline=deadline, cancelled=lambda: False)
+
+
+def test_utf8_response_below_body_limit_stays_within_owned_pipe_limit(monkeypatch):
+    program = r'''import json,sys
+from auto_mindsdb_factory.mindshub_native_worker import emit
+emit({"kind":"ready"})
+json.load(sys.stdin)
+payload={"output":"\U0001f600"*400000,"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}
+assert len(json.dumps(payload,ensure_ascii=False).encode()) < 2*1024*1024
+emit({"kind":"observed","summary":{"usage":payload["usage"]}})
+emit({"kind":"payload","payload":payload})
+emit({"kind":"retired"})
+'''
+    monkeypatch.setattr(process, "_command", lambda: [sys.executable, "-c", program])
+    start = time.monotonic()
+    observed, payload, complete, facts = process.exchange({}, deadline=start + 3, cancelled=lambda: False)
+    assert complete and facts["reaped"] and not facts["forced"]
+    assert payload["output"] == "\U0001f600" * 400000
+    assert observed["summary"]["usage"]["total_tokens"] == 10

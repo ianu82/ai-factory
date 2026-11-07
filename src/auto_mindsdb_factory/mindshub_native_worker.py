@@ -17,7 +17,7 @@ MAX_BYTES = 2 * 1024 * 1024
 
 
 def emit(message):
-    sys.stdout.write(json.dumps(message, allow_nan=False) + "\n")
+    sys.stdout.write(json.dumps(message, allow_nan=False, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
