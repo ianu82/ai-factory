@@ -116,12 +116,13 @@ def handle_product_command(args, *, parse_env) -> int | None:
                 args.receipts_dir / (request["id"] + ".response.json"),
                 bundle=args.bundle, bundle_sha256=args.bundle_sha256)
         elif args.command == "product-inference-check":
-            from .product_inference_auth import check_credential, require_controller_import_path
+            from .product_inference_auth import check_credential, require_auth_workspace, require_controller_import_path
             require_controller_import_path(args.target_root)
             profile = ProductProfile.load(args.profile, target_root=args.target_root,
                 codex_qualification=args.codex_qualification)
             profile.validate_repository(args.target_root)
             policy = InferencePolicy.from_document(profile.document.get("inference"))
+            require_auth_workspace(policy, args.auth_workspace_id)
             key = os.environ.get("AI_FACTORY_MINDSHUB_API_KEY", "")
             if args.env_file:
                 if args.env_file.resolve().is_relative_to(args.target_root.resolve()):

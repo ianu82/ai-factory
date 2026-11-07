@@ -74,6 +74,25 @@ def test_controller_scope_preserves_explicit_workspace_mismatch_guard(monkeypatc
         asyncio.run(auth.check_credential(policy, KEY, REFERENCE))
 
 
+@pytest.mark.parametrize("controller,workspace", [(False, None), (True, "invalid")])
+def test_public_workspace_validation_precedes_credential_file_read(
+        validation_checkout, monkeypatch, capsys, controller, workspace):
+    from auto_mindsdb_factory import __main__ as cli
+    root, target = validation_checkout
+    reads = []
+    def forbidden(path):
+        reads.append(path)
+        raise AssertionError("Credential file must not be read")
+    monkeypatch.setattr(cli, "_parse_env_file", forbidden)
+    args = ["product-inference-check", "--profile", str(profile_file(root, controller=controller)),
+        "--target-root", str(target), "--env-file", str(root / "controller.env")]
+    if workspace is not None:
+        args += ["--auth-workspace-id", workspace]
+    assert main(args) == 1
+    assert reads == []
+    assert "canonical MindsHub Auth workspace" in capsys.readouterr().err
+
+
 def test_missing_mindshub_key_never_borrows_openai(validation_checkout, monkeypatch, capsys):
     root, target = validation_checkout
     monkeypatch.delenv("AI_FACTORY_MINDSHUB_API_KEY", raising=False)

@@ -80,7 +80,7 @@ async def _read_identity(key):
             return json.loads(data, object_pairs_hook=_object, parse_constant=_constant)
 
 
-def _validate_workspace(policy, auth_workspace_id):
+def require_auth_workspace(policy, auth_workspace_id):
     if auth_workspace_id is None and policy.document.get("scope") == "controller":
         return
     if not _identifier(auth_workspace_id):
@@ -88,7 +88,7 @@ def _validate_workspace(policy, auth_workspace_id):
 
 
 def _receipt(policy, key, auth_workspace_id, payload):
-    _validate_workspace(policy, auth_workspace_id)
+    require_auth_workspace(policy, auth_workspace_id)
     if (type(payload) is not dict or payload.get("valid") is not True
             or payload.get("auth_method") != "api_key"
             or (payload.get("key_type"), payload.get("principal_kind"), payload.get("credential_kind"))
@@ -110,7 +110,7 @@ def _receipt(policy, key, auth_workspace_id, payload):
 
 async def check_credential(policy, key, auth_workspace_id=None):
     require_controller_import_path()
-    _validate_workspace(policy, auth_workspace_id)
+    require_auth_workspace(policy, auth_workspace_id)
     if not key:
         raise InferencePolicyError("MindsHub API key is not configured")
     if (type(key) is not str or not key.startswith("mdb_") or "." not in key or len(key) > 4096
