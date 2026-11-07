@@ -33,3 +33,15 @@ def test_guard_runs_before_synthetic_dependency_shadow(tmp_path):
         env={"PATH": os.defpath, "PYTHONPATH": str(source)}, capture_output=True, text=True, timeout=3)
     assert result.returncode != 0 and "trusted controller imports" in result.stderr
     assert not marker.exists()
+
+
+def test_guard_rejects_mutable_symlink_alias_into_trusted_source(tmp_path, monkeypatch):
+    source = Path(guard.__file__).resolve().parents[1]
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    alias = candidate / "imports"
+    alias.symlink_to(source, target_is_directory=True)
+    monkeypatch.setattr(guard.sys, "path", [str(alias)])
+    with pytest.raises(ValueError, match="trusted controller imports"):
+        guard.require_controller_import_path(candidate)
+    assert guard.sys.path == [str(alias)]

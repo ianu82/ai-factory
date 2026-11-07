@@ -26,7 +26,11 @@ def require_controller_import_path(target_root=None):
     for entry in sys.path:
         if type(entry) is not str:
             raise ValueError(IMPORT_ERROR)
-        path = os.path.realpath(entry or cwd)
-        if ((target is not None and _within(path, target))
-                or not any(_within(path, root) for root in roots)):
+        lexical = os.path.abspath(entry or cwd)
+        path = os.path.realpath(lexical)
+        # Python retains the original entry: a mutable alias can be retargeted
+        # after admission. Admit only the actual canonical search directory.
+        if (lexical != path or (target is not None and _within(lexical, target))
+                or ((target is not None and _within(path, target))
+                or not any(_within(path, root) for root in roots))):
             raise ValueError(IMPORT_ERROR)
