@@ -4,8 +4,9 @@ import test from 'node:test';
 import {Sandbox, ExecInterruptedError, ExecNotStartedError} from 'railway';
 import {WebSocketServer} from 'ws';
 import {clientOptions} from './client.mjs';
+import {execObservations} from './exec-observations.mjs';
 
-async function fixture(t, mode) {
+async function fixture(t, mode, observations) {
   const server = createServer();
   const sockets = new WebSocketServer({noServer: true});
   const observed = {attempts: 0, commands: 0};
@@ -44,6 +45,7 @@ async function fixture(t, mode) {
   });
   const sandbox = await Sandbox.connect('test-sandbox', {
     ...clientOptions({RAILWAY_API_TOKEN: 'test-only', RAILWAY_ENVIRONMENT_ID: 'test-environment'}),
+    ...(observations ? {webSocketImpl: observations.WebSocketImpl} : {}),
     tcpProxyWsEndpoint: `ws://127.0.0.1:${server.address().port}/ws/exec`,
     fetch: async () => new Response(JSON.stringify({data: {
       sandbox: {id: 'test-sandbox', environmentId: 'test-environment', status: 'RUNNING',
@@ -83,4 +85,51 @@ test('a disconnect after command dispatch is not retried', async t => {
     ephemeral: true, signal: AbortSignal.timeout(5000),
   }), ExecInterruptedError);
   assert.deepEqual(observed, {attempts: 1, commands: 1});
+});
+
+test('metadata observation preserves prestart rejection and bounded HTTP facts', async t => {
+  const observations = execObservations();
+  const {sandbox, observed} = await fixture(t, 'reject', observations);
+  await assert.rejects(sandbox.exec('private-command-must-not-run', {
+    ephemeral: true, signal: AbortSignal.timeout(5000),
+  }), ExecNotStartedError);
+  assert.deepEqual(observed, {attempts: 2, commands: 0});
+  const facts = observations.snapshot();
+  assert.equal(facts.connections, 2);
+  assert.equal(facts.http_rejections, 2);
+  assert.equal(facts.last_http_status, 503);
+  assert.equal(facts.init_send_attempts, 0);
+  assert.equal(facts.observation_failed, false);
+  assert.doesNotMatch(JSON.stringify(facts), /private-command|test-only|shell-token|127\.0\.0\.1/);
+});
+
+test('metadata observation preserves recovery, input and one command dispatch', async t => {
+  const observations = execObservations();
+  const {sandbox, observed} = await fixture(t, 'recover', observations);
+  const handle = sandbox.exec('private-command', {
+    ephemeral: true, stdin: true, timeoutSec: 2, signal: AbortSignal.timeout(5000),
+  });
+  await handle.stdin.write('private-input');
+  await handle.stdin.end();
+  assert.equal((await handle).stdout, 'confirmed result\n');
+  assert.deepEqual(observed, {attempts: 2, commands: 1});
+  const facts = observations.snapshot();
+  assert.equal(facts.http_rejections, 1);
+  assert.equal(facts.capabilities_frames, 1);
+  assert.equal(facts.init_send_attempts, 1);
+  assert.equal(facts.init_send_returned, 1);
+  assert.doesNotMatch(JSON.stringify(facts), /private-command|private-input|test-only|shell-token|confirmed result/);
+  facts.connections = 123;
+  assert.equal(observations.snapshot().connections, 2);
+});
+
+test('metadata observation never adds retry after command dispatch', async t => {
+  const observations = execObservations();
+  const {sandbox, observed} = await fixture(t, 'interrupt', observations);
+  await assert.rejects(sandbox.exec('private-uncertain-command', {
+    ephemeral: true, signal: AbortSignal.timeout(5000),
+  }), ExecInterruptedError);
+  assert.deepEqual(observed, {attempts: 1, commands: 1});
+  assert.equal(observations.snapshot().init_send_attempts, 1);
+  assert.equal(observations.snapshot().http_rejections, 0);
 });
