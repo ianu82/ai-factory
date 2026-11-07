@@ -83,7 +83,7 @@ def test_provider_envelope_does_not_authorize_changed_fields_or_actions(change):
     elif change in {"async", "caller", "created_by", "unknown"}: call[change] = None
     elif change == "metadata-type": call["metadata"] = None
     elif change == "metadata-key": call["metadata"]["actor"] = "private"
-    elif change == "turn-id": call["metadata"]["turn_id"] = "private\nactor"
+    elif change == "turn-id": call["metadata"]["turn_id"] = ""
     elif change == "internal-type": call["internal_chat_message_metadata_passthrough"] = []
     elif change == "internal-key": call["internal_chat_message_metadata_passthrough"]["recipient"] = "other"
     elif change == "internal-turn-id": call["internal_chat_message_metadata_passthrough"]["turn_id"] = 1

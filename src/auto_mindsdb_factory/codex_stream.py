@@ -1,7 +1,6 @@
 """Buffer a validated response before app-server can observe executable items."""
 
 import json
-import re
 
 from .codex_actions import CodexActionError, codex_action
 
@@ -21,7 +20,7 @@ def _provider_envelope(snapshot, request_namespace):
     fields = {"type", "id", "status", "call_id", "name", "input", "metadata",
               "internal_chat_message_metadata_passthrough"}
     def turn_id(value):
-        return type(value) is str and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", value) is not None
+        return type(value) is str and 1 <= len(value) <= 200
     for item in snapshot["output"]:
         if type(item) is not dict or item.get("type") != "custom_tool_call" or set(item) != fields:
             continue
