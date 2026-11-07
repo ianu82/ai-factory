@@ -13,6 +13,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from .product_harness import HARNESS_NAMES, HarnessSelectionError, resolve_harness
+from .product_inference import InferencePolicy, InferencePolicyError
 
 
 class ProfileError(ValueError):
@@ -53,6 +54,7 @@ SCHEMA = {
         "builder_harness": {"enum": list(HARNESS_NAMES)},
         "reviewer_harness": {"enum": list(HARNESS_NAMES)},
         "execution_lane": {"const": "codex-qualification"},
+        "inference": {"type": "object"},
         "max_attempts": {"type": "integer", "minimum": 1, "maximum": 5},
         "max_agent_turns": {"type": "integer", "minimum": 1, "maximum": 100},
         "agent_max_output_tokens": {"type": "integer", "minimum": 256, "maximum": 32000},
@@ -82,6 +84,12 @@ class ProductProfile:
 
     @classmethod
     def from_document(cls, document: dict[str, Any], *, codex_qualification: bool = False) -> "ProductProfile":
+        inference = None
+        if type(document) is dict and "inference" in document:
+            try:
+                inference = InferencePolicy.from_document(document["inference"]).document
+            except InferencePolicyError:
+                raise ProfileError("Invalid inference policy") from None
         errors = sorted(Draft202012Validator(SCHEMA).iter_errors(document), key=lambda e: str(e.path))
         if errors:
             raise ProfileError(f"Invalid product profile at {list(errors[0].path)}: {errors[0].message}")
@@ -95,6 +103,8 @@ class ProductProfile:
         except HarnessSelectionError as exc:
             raise ProfileError(str(exc)) from None
         resolved = {**DEFAULTS, **document}
+        if inference is not None:
+            resolved["inference"] = inference
         branch = resolved["base_branch"]
         if subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True).returncode:
             raise ProfileError("Invalid base branch")

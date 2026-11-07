@@ -17,6 +17,7 @@ from .product_linear_intake import eligibility, issue_fingerprint, task_from_iss
 from .product_linear_state import LinearDeliveryState, LinearStateError, _result
 from .product_promotion import GitHubPromotion
 from .run_journal import RunJournal
+from .product_inference import require_inference_execution
 
 
 class SourceConflict(RuntimeError):
@@ -27,6 +28,7 @@ class LinearProductWorker:
 
     def __init__(self, profile, target_root, store, route, client, *,
                  delivery_factory=ProductDelivery, promotion_factory=GitHubPromotion):
+        require_inference_execution(profile.document)
         if profile.document.get("auto_merge") is not True:
             raise ValueError("Automatic Linear delivery requires auto_merge")
         if (not profile.document.get("required_status_checks")

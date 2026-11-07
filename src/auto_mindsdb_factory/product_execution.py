@@ -8,9 +8,11 @@ from .connectors import OpenAIResponsesAgentConfig
 from .product_agent import HarnessStopped
 from .product_harness import resolve_harness
 from .codex_process import CODEX_VERSION
+from .product_inference import require_inference_execution
 
 
 def role_config(settings, role):
+    require_inference_execution(settings)
     return OpenAIResponsesAgentConfig.from_env(model=settings[
         "reviewer_model" if role == "verifier" else "builder_model"],
         max_output_tokens=settings["agent_max_output_tokens"])

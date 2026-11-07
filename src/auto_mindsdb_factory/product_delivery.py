@@ -26,6 +26,7 @@ from .planning_preparation import preparation_operation
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
+from .product_inference import require_inference_execution
 from .run_journal import RunJournal
 
 
@@ -65,6 +66,7 @@ class ProductDelivery:
                  sandbox_factory: Callable = DockerSandbox, planner_factory: Callable | None = None) -> None:
         self.profile = profile
         self.settings = profile.document
+        require_inference_execution(self.settings)
         self.target = target_root.resolve()
         self.store = store.resolve()
         if self.store.is_relative_to(self.target):

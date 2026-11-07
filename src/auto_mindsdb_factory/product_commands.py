@@ -24,6 +24,7 @@ from .product_outcomes import outcome_metrics
 from .product_improvements import propose_improvements
 from .run_journal import RunJournal
 from .product_cancellation import request_cancellation
+from .product_inference import InferencePolicy, require_inference_execution
 
 
 def _bounded_int(minimum, maximum):
@@ -123,6 +124,8 @@ def handle_product_command(args, *, parse_env) -> int | None:
             profile = ProductProfile.load(args.profile, target_root=args.target_root,
                 codex_qualification=getattr(args, "codex_qualification", False))
             profile.validate_repository(args.target_root)
+            if args.command != "product-validate":
+                require_inference_execution(profile.document)
             if args.command == "product-linear-worker":
                 route = LinearProductRoute.load(args.route, target_root=args.target_root)
                 if profile.document.get("auto_merge") is not True:
@@ -181,6 +184,8 @@ def handle_product_command(args, *, parse_env) -> int | None:
                           "reviewer_harness": resolve_harness(document, "verifier")}
                 if "execution_lane" in document:
                     result["execution_lane"] = document["execution_lane"]
+                if "inference" in document:
+                    result["inference"] = InferencePolicy.from_document(document["inference"]).inspect()
             elif args.command == "product-replay":
                 delivery_factory = ProductDelivery
                 if args.runner == "railway":
