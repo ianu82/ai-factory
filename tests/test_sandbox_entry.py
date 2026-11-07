@@ -118,6 +118,108 @@ def test_cancelled_entry_does_not_allocate_a_sandbox():
             pytest.fail("Cancelled entry admitted work")
 
 
+@pytest.mark.parametrize("operation", ["exit", "download"])
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_actual_pool_finalization_is_aborted_and_drained(tmp_path, monkeypatch, operation, stop):
+    clock, requested, retired, drained = [0], threading.Event(), threading.Event(), threading.Event()
+    monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    calls = []
+    def transport(request):
+        action = request.get("request", {}).get("action", request["action"])
+        calls.append(action)
+        if action == "destroy": retired.set()
+        if action == operation:
+            clock[0] = 2 if stop == "deadline" else 0
+            requested.set()
+            assert retired.wait(1), "Finalization had no cancellation owner"
+            drained.set()
+            raise RuntimeError("private interrupted finalization")
+        return {"id": "owned"} if action == "create" else {}
+    pool = RailwayPool(transport)
+    try:
+        with pytest.raises(HarnessStopped):
+            with cancellation.enter_cancellable(pool(tmp_path, "image"),
+                    cancelled=lambda: stop == "cancel" and requested.is_set(), deadline=1):
+                assert not any(t.name == "factory-command-cancellation" for t in threading.enumerate())
+        assert drained.is_set() and retired.is_set() and pool.id is None
+        assert calls.count("destroy") == 1 and calls.count(operation) == 1
+        if operation == "exit": assert "download" not in calls
+    finally:
+        pool.close()
+    assert not pool.thread.is_alive()
+    assert not any(t.name == "factory-command-cancellation" for t in threading.enumerate())
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_expired_body_retires_without_starting_source_download(monkeypatch, stop):
+    clock, requested, calls = [0], [False], []
+    monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    class Manager:
+        def __enter__(self): return self
+        def __exit__(self, *args): pytest.fail("Expired body started source download")
+        def abort(self): calls.append("abort")
+    with pytest.raises(HarnessStopped):
+        with cancellation.enter_cancellable(Manager(), cancelled=lambda: requested[0], deadline=1):
+            if stop == "cancel": requested[0] = True
+            else: clock[0] = 2
+    assert calls == ["abort"]
+
+
+@pytest.mark.parametrize("cleanup_failed", [False, True])
+def test_finalization_return_between_polls_cannot_admit_work(monkeypatch, cleanup_failed):
+    clock, calls = [0], []
+    monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    class Manager:
+        def __enter__(self): return self
+        def __exit__(self, *args): clock[0] = 2
+        def abort(self):
+            calls.append("abort")
+            if cleanup_failed: raise RuntimeError("private cleanup detail")
+    with pytest.raises(HarnessStopped) as caught:
+        with cancellation.enter_cancellable(Manager(), cancelled=lambda: False, deadline=1): pass
+    assert calls == ["abort"] and "private" not in str(caught.value)
+
+
+def test_failed_finalization_abort_is_not_repeated_or_reported_as_cleaned():
+    requested, released, calls = threading.Event(), threading.Event(), []
+    class Manager:
+        def __enter__(self): return self
+        def __exit__(self, *args):
+            requested.set()
+            assert released.wait(2)
+            raise RuntimeError("private transport detail")
+        def abort(self):
+            calls.append("abort")
+            released.set()
+            raise RuntimeError("private retirement detail")
+    with pytest.raises(HarnessStopped, match="cleanup could not be confirmed") as caught:
+        with cancellation.enter_cancellable(Manager(), cancelled=requested.is_set, deadline=float("inf")): pass
+    assert calls == ["abort"] and "private" not in str(caught.value)
+    assert not any(t.name == "factory-command-cancellation" for t in threading.enumerate())
+
+
+def test_real_setup_exit_cannot_reuse_source_after_deadline(tmp_path, monkeypatch):
+    from auto_mindsdb_factory import product_delivery as module
+    clock, calls = [0], []
+    monkeypatch.setattr(cancellation, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    def export(target, sha, workspace):
+        workspace.mkdir()
+        (workspace / "source.txt").write_text("retained")
+    monkeypatch.setattr(module, "export_source", export)
+    class Manager:
+        def __enter__(self): return self
+        def __exit__(self, *args): clock[0] = 2
+        def abort(self): calls.append("abort")
+    delivery = object.__new__(module.ProductDelivery)
+    delivery.target, delivery.deadline, delivery.cancelled = tmp_path, 100, lambda: False
+    delivery.settings = {"setup": [["npm", "ci"]], "image": "image", "setup_network": True, "platform": None}
+    delivery.sandbox_factory = lambda *a, **kw: Manager()
+    delivery._command = lambda *a, **kw: {"exit_code": 0}
+    with pytest.raises(HarnessStopped):
+        delivery._prepare("base", tmp_path / "source", SimpleNamespace(append=lambda *a, **kw: None), deadline=1)
+    assert calls == ["abort"] and (tmp_path / "source/source.txt").read_text() == "retained"
+
+
 def test_real_setup_path_clamps_entry_to_planning_deadline(tmp_path, monkeypatch):
     from auto_mindsdb_factory import product_delivery as module
     clock, calls = [0], []

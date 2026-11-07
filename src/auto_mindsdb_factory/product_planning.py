@@ -23,7 +23,7 @@ class PlanningStopped(HarnessStopped):
 
 FINALIZATION_RESERVE_SECONDS = 20
 _FAILURE_PHASES = {"admission", "worker_preparation", "planning_initialization", "source_preparation",
-                   "investigation_or_sandbox", "source_validation", "plan_freeze", "ready_check"}
+                   "investigation_or_sandbox", "sandbox_finalization", "source_validation", "plan_freeze", "ready_check"}
 
 
 def _record_failure(journal, phase, error):
@@ -116,7 +116,8 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
             phase = "investigation_or_sandbox"
             manager = delivery.sandbox_factory(workspace, delivery.settings["image"], writable=False,
                     platform=delivery.settings["platform"])
-            with enter_cancellable(manager, cancelled=delivery.cancelled, deadline=work_deadline) as sandbox:
+            with enter_cancellable(manager, cancelled=delivery.cancelled, deadline=work_deadline,
+                    finalization_deadline=deadline) as sandbox:
                 def command(argv):
                     nonlocal investigated
                     result = delivery._command(sandbox, argv, deadline=work_deadline)
@@ -127,6 +128,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                                            "base_binding": "controller_export"},
                     "required_checks": delivery.settings["checks"],
                     "allowed_paths": delivery.settings["allowed_paths"]}, command)
+                phase = "sandbox_finalization"
             phase = "source_validation"
             checks = {"investigated": investigated, "source_unchanged": source_files(workspace) == original,
                       "modes_unchanged": executable_paths(workspace, original) == modes,

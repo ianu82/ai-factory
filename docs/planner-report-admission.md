@@ -58,6 +58,13 @@ before command execution, whose existing watcher remains its sole abort owner.
 If removal races creation and fails, retirement is retried after entry drains;
 an attempted removal is never treated as confirmed cleanup.
 Normal context cleanup and source validation still run on successful entry.
+After the body and command watcher drain, a separate lifecycle watcher owns
+context exit and source download. Setup uses its existing work deadline;
+read-only planning uses the phase deadline, including its existing 20-second
+reserve. An already expired exit retires the environment before starting a
+download. An interrupted exit/download drains before failure is reported, and
+a completion between polls still cannot admit work after its deadline. Failed
+retirement remains unconfirmed and stops execution. No watcher spans the body.
 Confirmed draining can take time; this does not claim that cleanup always ends
 within the phase deadline or establish the cause of an earlier failed run.
 

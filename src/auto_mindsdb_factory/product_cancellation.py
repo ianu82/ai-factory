@@ -85,11 +85,12 @@ def run_cancellable(sandbox, command, *, cancelled, deadline):
 
 
 @contextmanager
-def enter_cancellable(manager, *, cancelled, deadline):
-    """Watch sandbox entry only; commands retain their existing sole abort owner.
+def enter_cancellable(manager, *, cancelled, deadline, finalization_deadline=None):
+    """Watch entry and finalization; commands retain their sole abort owner.
 
-    Drain entry before yielding or failing. Normal context exit still owns source
-    download and cleanup; a cancelled entry must never reach that download path.
+    Drain each lifecycle operation before proceeding. No watcher spans the body.
+    Finalization includes context exit/source download under the supplied phase
+    deadline, or the entry deadline when no separate reserve was provided.
     """
     class Entry:
         completed = retired = False
@@ -126,10 +127,35 @@ def enter_cancellable(manager, *, cancelled, deadline):
             if isinstance(error, HarnessStopped):
                 raise HarnessStopped("Sandbox entry interrupted; late environment retired") from None
         raise
+
+    def exit_context(exception):
+        class Finalization:
+            interrupted = False
+            def run(self, command):
+                return manager.__exit__(*exception)
+            def abort(self):
+                self.interrupted = True
+                entry.abort()
+        finalizer = Finalization()
+        end = deadline if finalization_deadline is None else finalization_deadline
+        try:
+            result = run_cancellable(finalizer, [], cancelled=cancelled, deadline=end)
+            if time.monotonic() >= end:
+                raise HarnessStopped("Sandbox finalization exceeded its deadline")
+            return result
+        except BaseException:
+            # A pre-expired call or a return between watcher polls still owns a
+            # resource. Never duplicate an abort already attempted by the watcher.
+            if not finalizer.interrupted:
+                try:
+                    finalizer.abort()
+                except BaseException:
+                    raise HarnessStopped("Sandbox finalization cleanup could not be confirmed") from None
+            raise
     try:
         yield sandbox
     except BaseException:
-        if not manager.__exit__(*sys.exc_info()):
+        if not exit_context(sys.exc_info()):
             raise
     else:
-        manager.__exit__(None, None, None)
+        exit_context((None, None, None))

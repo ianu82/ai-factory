@@ -300,7 +300,12 @@ def test_report_finalization_is_reserved_but_the_phase_deadline_still_blocks(pha
     def sandbox(*args, **kwargs):
         yield SimpleNamespace(workspace=args[0])
         clock["now"] += cleanup_seconds
-    p.delivery.sandbox_factory = sandbox
+    aborts = []
+    def managed(*args, **kwargs):
+        manager = sandbox(*args, **kwargs)
+        manager.abort = lambda: aborts.append(True)
+        return manager
+    p.delivery.sandbox_factory = managed
     def factory(task, base, journal, deadline):
         assert deadline == 100  # Total phase still ends at 120.
         def run(role, context, command):
@@ -316,9 +321,15 @@ def test_report_finalization_is_reserved_but_the_phase_deadline_still_blocks(pha
         with pytest.raises(PlanningStopped):
             execute(p)
         assert not (p.journal.root / "plan.json").exists()
-    validation = next(e["data"] for e in p.journal.events() if e["kind"] == "planning_validation")
-    assert validation == {"investigated": True, "within_deadline": admitted,
-                          "source_unchanged": True, "modes_unchanged": True}
+    if admitted:
+        validation = next(e["data"] for e in p.journal.events() if e["kind"] == "planning_validation")
+        assert validation == {"investigated": True, "within_deadline": True,
+                              "source_unchanged": True, "modes_unchanged": True}
+    else:
+        assert not any(e["kind"] == "planning_validation" for e in p.journal.events())
+        assert p.journal.events()[-1]["data"] == {
+            "role": "planner", "phase": "sandbox_finalization", "category": "harness_stopped"}
+    assert aborts == ([] if admitted else [True])
     assert p.delivery.deadline == 300
 
 
