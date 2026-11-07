@@ -347,7 +347,7 @@ raise SystemExit(worker.main())
     evidence = json.dumps(journal.events())
     assert all(value not in evidence for value in (KEY, "private provider error", "private dropped field"))
     assert journal.summary()["total_tokens"] == (20 if mode == "success" else 10 if mode in {"drop", "attempts", "cleanup"} else 0)
-    assert journal.summary()["usage_complete"] is (mode in {"success", "drop", "cleanup"})
+    assert journal.summary()["usage_complete"] is (mode in {"success", "drop"})
 
 
 def test_native_mindshub_invalid_admission_never_opens_client(inputs, monkeypatch):

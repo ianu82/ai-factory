@@ -150,6 +150,9 @@ class ProductAgent:
                 complete = type(payload) is MindsHubPayload and payload.transport_complete
                 gateway = payload.gateway if type(payload) is MindsHubPayload else gateway_evidence({})
                 self.journal.append("inference_gateway", role=role, turn=turn + 1, harness="native", transport_complete=complete, **gateway)
+                if not complete:
+                    self.journal.append("inference_usage_unknown", role=role, turn=turn + 1,
+                        harness="native", reason="transport_incomplete")
                 if not gateway["single_attempt"] or not gateway["requested_model"]:
                     self.journal.append("inference_usage_unknown", role=role, turn=turn + 1,
                         harness="native", reason="gateway_attempt_coverage")
