@@ -120,6 +120,8 @@ def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path
         clients.append(http)
         return actual_client(**kwargs, http_client=http)
     monkeypatch.setattr(provider.openai, "AsyncOpenAI", create_client)
+    monkeypatch.setenv("OPENAI_ORG_ID", "unapproved-global-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "unapproved-global-project")
     config = MindsHubQualificationConfig(("mdb_synthetic.private", '{"policy":"synthetic"}'),
         "pinned", "high", 1000, 10)
     journal = RunJournal(tmp_path, "gateway")
@@ -138,6 +140,7 @@ def test_gateway_changes_stop_before_tool_with_usage_and_no_header_leak(tmp_path
         assert len(requests) == 1 and not commands
     assert clients and all(c.is_closed and not c.follow_redirects for c in clients)
     assert all(r.headers["authorization"] == "Bearer mdb_synthetic.private" for r in requests)
+    assert all("openai-organization" not in r.headers and "openai-project" not in r.headers for r in requests)
     events = journal.events()
     assert all(value not in json.dumps(events) for value in
         ("untrusted-private-header", "private-attempt-value", "private-failover-value"))

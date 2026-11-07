@@ -120,6 +120,11 @@ class AntonAgent:
             # The pinned SDK defaults to following redirects, which could resend
             # a controller credential or hide a changed endpoint.
             provider._client._client.follow_redirects = False
+            from openai import omit
+            # Explicit null provider metadata must survive SDK copies, whose
+            # None parameters otherwise re-read global OpenAI routing defaults.
+            provider._client = provider._client.with_options(default_headers={
+                "OpenAI-Organization": omit, "OpenAI-Project": omit})
         provider._emit_trace_headers = False
         provider._client = provider._client.with_options(organization=self.config.organization, project=self.config.project)
         client = LLMClient(planning_provider=provider, planning_model=self.config.model,
