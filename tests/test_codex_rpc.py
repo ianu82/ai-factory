@@ -43,14 +43,6 @@ def test_real_cli_receives_job_result_then_finishes(tmp_path, exit_code):
             texts = [part["text"] for item in requests[-1]["input"] if item["type"] == "message"
                      for part in item["content"] if part["type"] == "input_text"]
             assert any("Use only the supplied tools.\n\n" + ACTION_INSTRUCTIONS in text for text in texts)
-            developer_text = "\n".join(part["text"] for item in requests[-1]["input"]
-                if item.get("type") == "message" and item.get("role") == "developer"
-                for part in item["content"] if part["type"] == "input_text")
-            # The pinned CLI adds its host permission notice after baseInstructions.
-            # The remote callback's scope must be explained after that notice.
-            assert "sandbox_mode` is `read-only`" in developer_text
-            assert developer_text.index("Factory remote job boundary:") > developer_text.index("</permissions instructions>")
-            assert "grants no additional access" in developer_text
             if number == 2:
                 history = json.dumps(requests[-1]["input"])
                 assert "custom_tool_call_output" in history and "job-result-marker" in history
@@ -90,6 +82,15 @@ def test_real_cli_receives_job_result_then_finishes(tmp_path, exit_code):
     assert "Run the job and report honestly." in json.dumps(requests[0])
     assert gate.journal.summary()["total_tokens"] == 20 and gate.journal.summary()["usage_complete"]
     assert not gate.stopped and gate.journal.summary()["cost_usd"] is None
+    for request in requests:
+        developer_text = "\n".join(part["text"] for item in request["input"]
+            if item.get("type") == "message" and item.get("role") == "developer"
+            for part in item["content"] if part["type"] == "input_text")
+        # Check outside the mock provider so failures retain their actual assertion.
+        assert "sandbox_mode` is `read-only`" in developer_text
+        assert "Factory remote job boundary:" in developer_text
+        assert developer_text.index("Factory remote job boundary:") > developer_text.index("</permissions instructions>")
+        assert "grants no additional access" in developer_text
 
 
 @pytest.mark.parametrize("fault", ["thread", "turn", "boolean-id", "numeric-network", "model", "approval", "duplicate-json", "oversized", "eof"])
