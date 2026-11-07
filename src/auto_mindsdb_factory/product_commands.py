@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -41,6 +42,12 @@ def _bounded_int(minimum, maximum):
 
 
 def register_product_commands(subparsers) -> None:
+    inference = subparsers.add_parser("product-inference-check")
+    for name in ("profile", "target-root"):
+        inference.add_argument("--" + name, type=Path, required=True)
+    inference.add_argument("--auth-workspace-id", required=True)
+    inference.add_argument("--env-file", type=Path)
+    inference.add_argument("--codex-qualification", action="store_true")
     handoff = subparsers.add_parser("product-github-handoff")
     for name in ("request", "receipts-dir", "target-root"):
         handoff.add_argument("--" + name, type=Path, required=True)
@@ -108,6 +115,22 @@ def handle_product_command(args, *, parse_env) -> int | None:
             result = execute_request(scope, request, args.target_root,
                 args.receipts_dir / (request["id"] + ".response.json"),
                 bundle=args.bundle, bundle_sha256=args.bundle_sha256)
+        elif args.command == "product-inference-check":
+            from .product_inference_auth import check_credential
+            profile = ProductProfile.load(args.profile, target_root=args.target_root,
+                codex_qualification=args.codex_qualification)
+            profile.validate_repository(args.target_root)
+            policy = InferencePolicy.from_document(profile.document.get("inference"))
+            key = os.environ.get("AI_FACTORY_MINDSHUB_API_KEY", "")
+            if args.env_file:
+                if args.env_file.resolve().is_relative_to(args.target_root.resolve()):
+                    raise ValueError("Controller environment file must be outside candidate source")
+                try:
+                    supplied = parse_env(args.env_file)
+                except Exception:
+                    raise ValueError("Could not read MindsHub controller credential configuration") from None
+                key = key or supplied.get("AI_FACTORY_MINDSHUB_API_KEY", "")
+            result = asyncio.run(check_credential(policy, key, args.auth_workspace_id))
         elif args.command == "product-cancel":
             result = request_cancellation(args.store_dir, args.run_id)
         elif args.command == "product-improvements":

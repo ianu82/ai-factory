@@ -26,3 +26,15 @@ it is not live compatibility evidence. Keep Factory admission/retry/deadline
 policy rather than importing Cowork's retry behavior. Keys stay outside jobs,
 CLI child environments, logs and evidence. No deployment or activation occurs
 when a profile is validated.
+
+`product-inference-check` checks credential identity through the fixed public
+MindsHub Auth endpoint. Bootstrap input is `AI_FACTORY_MINDSHUB_API_KEY` in the
+trusted controller environment or an explicit external `--env-file`; no other
+credential is borrowed. `--auth-workspace-id` explicitly identifies the expected
+MindsHub workspace, separate from Factory's opaque record IDs. The safe receipt
+binds the policy/reference digest to Auth's principal, organization, workspace
+and public key prefix. It contains no key, email or entitlement payload.
+The check uses the existing pinned controller HTTP client, one request, no
+redirects and a five-second total request budget. It creates no secret store,
+grant, model request or job. Identity verification still reports execution not
+ready; live protocol qualification and frozen run receipts remain required.
