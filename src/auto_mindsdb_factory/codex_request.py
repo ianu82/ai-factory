@@ -3,6 +3,8 @@
 import json
 import re
 
+from .codex_grammar import ACTION_GRAMMAR
+
 
 class CodexRequestError(ValueError):
     pass
@@ -36,6 +38,9 @@ def _tools(tools, namespace=None):
                     or set(fmt) != {"type", "syntax", "definition"} or fmt["type"] != "grammar"
                     or fmt["syntax"] != "lark" or type(fmt["definition"]) is not str or not fmt["definition"]):
                 raise CodexRequestError("Codex Code Mode declaration is invalid")
+            # Narrow the detached producer declaration. The original action
+            # parser, callback ownership and report validation remain mandatory.
+            tool["format"] = {"type": "grammar", "syntax": "regex", "definition": ACTION_GRAMMAR}
             found = True
         else:
             # Hosted tools could execute at the provider before response validation.
@@ -84,4 +89,6 @@ def codex_request(body: dict, *, model: str, effort: str, max_output_tokens: int
             raise CodexRequestError("Codex request output limit exceeds the permitted budget")
     else:
         request["max_output_tokens"] = cap
+    if len(json.dumps(request, allow_nan=False)) > 8_000_000:
+        raise CodexRequestError("Codex request exceeds the transport bound")
     return request

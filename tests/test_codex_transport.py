@@ -1,6 +1,7 @@
 """Exercise the pinned real app-server against a credential-free loopback peer."""
 
 import http.server
+import copy
 from contextlib import ExitStack
 import json
 import os
@@ -42,7 +43,15 @@ def test_real_codex_response_is_gated_before_tool_execution(permitted):
             assert requests[-1]["model"] == MODEL
             assert requests[-1]["reasoning"]["effort"] == "high"
             prepared = codex_request(requests[-1], model=MODEL, effort="high", max_output_tokens=10000, remaining_tokens=50000)
-            assert prepared.pop("max_output_tokens") == 10000 and prepared == requests[-1]
+            expected = copy.deepcopy(requests[-1])
+            for item, original in zip(prepared["input"], expected["input"]):
+                if item["type"] == "additional_tools":
+                    for namespace, old in zip(item["tools"], original["tools"]):
+                        for tool, old_tool in zip(namespace["tools"], old["tools"]):
+                            if tool["type"] == "custom" and tool["name"] == "exec":
+                                assert tool["format"]["syntax"] == "regex"
+                                old_tool["format"] = tool["format"]
+            assert prepared.pop("max_output_tokens") == 10000 and prepared == expected
             code = "text(await tools.finish(" + json.dumps(REPORT) + "))" if permitted else 'text(await tools.apply_patch("forbidden"))'
             call = {"type": "custom_tool_call", "id": "ctc_probe", "call_id": "call_probe",
                     "name": "exec", "namespace": "functions", "input": code, "status": "completed"}

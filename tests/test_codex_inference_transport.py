@@ -1,6 +1,7 @@
 """Actual pinned OpenAI client serialization/cancellation, with no provider calls."""
 
 import asyncio
+import copy
 import json
 import time
 
@@ -61,7 +62,12 @@ def test_actual_client_request_accounting_and_transport_drain(tmp_path, mode):
     request = requests[0]
     assert str(request.url) == "https://provider.invalid/v1/responses"
     assert request.headers["authorization"] == "Bearer controller-test-only"
-    assert json.loads(request.content) == {**body, "stream": False, "max_output_tokens": 100}
+    actual = json.loads(request.content)
+    expected = copy.deepcopy(body)
+    grammar = actual["input"][0]["tools"][0]["tools"][0]["format"]
+    assert grammar["type"] == "grammar" and grammar["syntax"] == "regex"
+    expected["input"][0]["tools"][0]["tools"][0]["format"] = grammar
+    assert actual == {**expected, "stream": False, "max_output_tokens": 100}
     assert drained == ([True] if mode in {"cancel", "deadline"} else [])
     summary = gate.journal.summary()
     assert summary["usage_complete"] is (mode in {"success", "unsafe-action"})

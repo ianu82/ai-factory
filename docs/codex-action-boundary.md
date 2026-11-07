@@ -15,6 +15,16 @@ a future inference bridge: that bridge must buffer and validate the complete
 response before sending **any** executable stream item to app-server, account for
 every request and enforce cancellation/deadline and cleanup outside prompts.
 
+The inference gate also narrows the detached producer declaration to a supported
+regex grammar for canonical run/finish JSON objects. It constrains field names,
+types, report statuses, nonempty command arrays and JSON string escaping before
+sampling. Arbitrary JavaScript, duplicate/extra keys and malformed arguments are
+outside that generation language. Existing action parsing, callback ownership,
+criterion validation and acceptance remain mandatory and unchanged. Function
+declarations, task context and smaller explicit output caps are preserved.
+The isolated live write/read diagnostic captured the CLI's broad SOURCE grammar;
+it does not establish the exact arguments rejected by historical delivery M.
+
 Rejected complete responses retain a fixed `response_rejection` code on the
 existing `harness_policy_stopped` event. It distinguishes envelope/identity,
 output-item, action-metadata, expression and argument failures without recording

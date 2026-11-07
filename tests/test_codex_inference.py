@@ -54,7 +54,9 @@ def test_accounts_actual_body_and_preserves_untrusted_context(tmp_path):
     assert type(stream) is bytes and b"response.completed" in stream
     path, kwargs = calls[0]
     assert path == "/responses" and kwargs["cast_to"] is dict
-    assert kwargs["body"] == {**BODY, "stream": False, "max_output_tokens": 32} and BODY == before
+    expected = copy.deepcopy(BODY)
+    expected["input"][0]["tools"][0]["tools"][0]["format"] = kwargs["body"]["input"][0]["tools"][0]["tools"][0]["format"]
+    assert kwargs["body"] == {**expected, "stream": False, "max_output_tokens": 32} and BODY == before
     assert settings[0]["max_retries"] == 0 and settings[0]["timeout"] <= 10
     assert gate.journal.summary()["total_tokens"] == 10 and gate.journal.summary()["usage_complete"]
     assert gate.journal.summary()["cost_usd"] is None

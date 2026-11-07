@@ -1,4 +1,6 @@
 import copy
+import json
+import re
 
 import pytest
 
@@ -25,14 +27,19 @@ def prepare(request, **overrides):
 def test_applies_only_the_trusted_missing_cap_without_mutating_context():
     b = body(); before = copy.deepcopy(b)
     actual = prepare(b, remaining_tokens=17)
-    assert actual.pop("max_output_tokens") == 17 and actual == before and b == before
+    expected = copy.deepcopy(before)
+    expected["input"][0]["tools"][0]["tools"][0]["format"] = actual["input"][0]["tools"][0]["tools"][0]["format"]
+    assert actual.pop("max_output_tokens") == 17 and actual == expected and b == before
     actual["input"].clear()
     assert b == before
 
 
 def test_preserves_a_smaller_explicit_limit():
     b = body(); b["max_output_tokens"] = 12
-    assert prepare(b, remaining_tokens=17) == b
+    actual = prepare(b, remaining_tokens=17)
+    expected = copy.deepcopy(b)
+    expected["input"][0]["tools"][0]["tools"][0]["format"] = actual["input"][0]["tools"][0]["tools"][0]["format"]
+    assert actual == expected and b == body() | {"max_output_tokens": 12}
 
 
 @pytest.mark.parametrize("field,value", [("model", "fallback"), ("store", True), ("stream", False),
@@ -83,3 +90,66 @@ def test_malformed_function_names_stop_before_provider_validation(name):
 def test_empty_code_mode_grammar_is_invalid():
     b = body(); b["input"][0]["tools"][0]["tools"][0]["format"]["definition"] = ""
     with pytest.raises(CodexRequestError): prepare(b)
+
+
+def generation_pattern():
+    fmt = prepare(body())["input"][0]["tools"][0]["tools"][0]["format"]
+    # The pre-fix fixture's SOURCE rule admits every nonempty program, as did
+    # the actual pinned CLI grammar captured by the isolated write/read test.
+    if fmt["syntax"] == "lark":
+        assert fmt["definition"] == r"start: /[\s\S]+/"
+        return re.compile(r"[\s\S]+")
+    assert set(fmt) == {"type", "syntax", "definition"}
+    assert fmt["type"] == "grammar" and fmt["syntax"] == "regex"
+    return re.compile(fmt["definition"])
+
+
+@pytest.mark.parametrize("program", [
+    'text(await tools.run({command:["node","--version"]}))',
+    'text(await tools.run({"command":[]}))',
+    'text(await tools.run({"command":[1]}))',
+    'text(await tools.run({"command":["x"],"command":["y"]}))',
+    'text(await tools.run({"command":["x"],"extra":false}))',
+    'text(await tools.run({"command":["raw\nnewline"]}))',
+    'text(await tools.run({"command":[`template`]}))',
+    'text(await tools.finish({"status":"passed"}))',
+    'text(await tools.finish({"status":"ready","summary":"s","criteria":[],"findings":[]}))',
+    'text(await tools.finish({"status":"passed","summary":"s","criteria":[{}],"findings":[]}))',
+    'text(await tools.apply_patch({"command":["x"]}))',
+    'text(await tools.run({"command":["x"]})); text(await tools.run({"command":["y"]}))',
+])
+def test_generation_blocks_javascript_and_schema_drift_before_sampling(program):
+    assert generation_pattern().fullmatch(program) is None
+
+
+def test_generation_handles_code_payloads_and_preserves_consumer_validation():
+    from auto_mindsdb_factory.codex_actions import codex_action
+    pattern = generation_pattern()
+    texts = ['','a"b',"'quoted'",'\\d+\\path','line one\nline two',
+             '\t\r\0\b\f', '$HOME `literal` ${value}', '☃ café', '\\u1234']
+    for ascii_only in (True, False):
+        for text in texts:
+            for name, args in [('run', {'command': ['node','-e',text]}), ('finish', {
+                'status':'unverified', 'summary':text,
+                'criteria':[{'id':'one','status':'unverified','evidence':text}], 'findings':[text]})]:
+                program = f'text(await tools.{name}({json.dumps(args, ensure_ascii=ascii_only)}))'
+                assert pattern.fullmatch(program), repr(program)
+                response = {'model':MODEL,'status':'completed','output':[{
+                    'type':'custom_tool_call','name':'exec','namespace':'functions',
+                    'call_id':'one','input':program}]}
+                assert codex_action(response, model=MODEL) == (name,args,'one')
+
+
+@pytest.mark.parametrize('status', ['passed', 'failed', 'unverified'])
+def test_generation_preserves_all_report_statuses_and_empty_array_schema(status):
+    args = {'status':status, 'summary':'Schema only, never delivery approval',
+            'criteria':[], 'findings':[]}
+    assert generation_pattern().fullmatch(f'text(await tools.finish({json.dumps(args)}))')
+
+
+def test_generation_declaration_expansion_cannot_exceed_transport_bound():
+    b = body()
+    b['input'][1]['content'] = 'x' * (8_000_000 - len(json.dumps(b)) - 100)
+    assert len(json.dumps(b)) < 8_000_000
+    with pytest.raises(CodexRequestError, match='transport bound'):
+        prepare(b)
