@@ -50,5 +50,14 @@ the earlier deadline. Finalization still fails closed at the original phase
 deadline; exact investigation/source/mode/deadline checks are journaled where
 they are observed, without deriving a cause from exception text.
 
+Setup and read-only planning sandbox entry now use the existing cancellation
+watcher under the same work deadline. The entry operation drains before any
+body or inference is admitted; a late entry retires its owned environment and
+cannot download source as a successful context exit. The entry watcher ends
+before command execution, whose existing watcher remains its sole abort owner.
+Normal context cleanup and source validation still run on successful entry.
+Confirmed draining can take time; this does not claim that cleanup always ends
+within the phase deadline or establish the cause of an earlier failed run.
+
 Builder and verifier prompts, tools and budgets are unchanged. Existing failed
 runs stay terminal; a new planning policy requires a fresh intake and fresh proof.

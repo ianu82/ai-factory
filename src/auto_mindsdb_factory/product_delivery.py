@@ -21,7 +21,7 @@ from .product_planning import planning_manifest, plan_delivery, retained_plan
 from .product_roles import snapshot_roles
 from .product_harness import AgentHarness, resolve_harness
 from .product_execution import execution_manifest, execution_config
-from .product_cancellation import RunCancellation, run_cancellable
+from .product_cancellation import RunCancellation, run_cancellable, enter_cancellable
 from .product_task import ProductTask
 from .product_workspace import controller_worktree, executable_paths, export_source, git, is_git_metadata_path, source_files, source_digest, WorkspaceError
 from .reliability import OperationTracker
@@ -131,8 +131,10 @@ class ProductDelivery:
         original = source_files(workspace)
         original_executables = executable_paths(workspace, original)
         if self.settings["setup"]:
-            with self.sandbox_factory(workspace, self.settings["image"], writable=True,
-                                      network=self.settings["setup_network"], platform=self.settings["platform"]) as sandbox:
+            manager = self.sandbox_factory(workspace, self.settings["image"], writable=True,
+                network=self.settings["setup_network"], platform=self.settings["platform"])
+            with enter_cancellable(manager, cancelled=self.cancelled,
+                    deadline=min(self.deadline, deadline if deadline is not None else self.deadline)) as sandbox:
                 for command in self.settings["setup"]:
                     result = self._command(sandbox, command, deadline=deadline)
                     journal.append("setup_command", commit_sha=sha, **result)

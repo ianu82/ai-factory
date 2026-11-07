@@ -38,7 +38,8 @@ def phase(tmp_path):
         assert (sandbox.workspace / "parser.py").read_text() == "original"
         return {"exit_code": 0}
     delivery = SimpleNamespace(profile=profile, settings=profile.document, deadline=time.monotonic() + 300,
-        _prepare=prepare, sandbox_factory=sandbox, _command=command, prepare_runner=lambda journal: None)
+        _prepare=prepare, sandbox_factory=sandbox, _command=command, prepare_runner=lambda journal: None,
+        cancelled=lambda: False)
     content = {"status": "ready", "reason": "Inspected parser", "goal": "Reject invalid input",
         "constraints": ["Keep API"], "source_paths": ["parser.py"], "changes": ["Validate input"],
         "risks": ["Preserve valid input"], "questions": [],
@@ -67,6 +68,28 @@ def test_interrupted_investigation_retains_bounded_failure_without_ready_plan(ph
     failures = [e["data"] for e in phase.journal.events() if e["kind"] == "planning_failed"]
     assert failures == [{"role": "planner", "phase": "investigation_or_sandbox", "category": "harness_stopped"}]
     assert "private" not in json.dumps(phase.journal.events())
+    assert not (phase.journal.root / "plan.json").exists()
+
+
+def test_cancel_during_sandbox_entry_drains_before_failure_and_never_starts_planner(phase):
+    requested, retired, drained = threading.Event(), threading.Event(), threading.Event()
+    class Manager:
+        def __enter__(self):
+            requested.set()
+            assert retired.wait(2)
+            drained.set()
+            return self
+        def abort(self):
+            retired.set()
+        def __exit__(self, *args):
+            pytest.fail("Cancelled entry attempted source download")
+    phase.delivery.sandbox_factory = lambda *a, **kw: Manager()
+    phase.delivery.cancelled = requested.is_set
+    with pytest.raises(PlanningStopped):
+        execute(phase)
+    assert drained.is_set() and not phase.contexts
+    assert phase.journal.events()[-1]["data"] == {
+        "role": "planner", "phase": "investigation_or_sandbox", "category": "harness_stopped"}
     assert not (phase.journal.root / "plan.json").exists()
 
 

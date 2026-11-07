@@ -13,6 +13,7 @@ from .product_planner import ProductPlanner, PLANNER_VERSION, REPORT_RESERVE_SEC
 from .product_roles import select_role
 from .product_workspace import source_files, executable_paths
 from .product_execution import execution_config
+from .product_cancellation import enter_cancellable
 from .run_journal import JournalError
 
 
@@ -113,8 +114,9 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
             modes = executable_paths(workspace, original)
             investigated = False
             phase = "investigation_or_sandbox"
-            with delivery.sandbox_factory(workspace, delivery.settings["image"], writable=False,
-                    platform=delivery.settings["platform"]) as sandbox:
+            manager = delivery.sandbox_factory(workspace, delivery.settings["image"], writable=False,
+                    platform=delivery.settings["platform"])
+            with enter_cancellable(manager, cancelled=delivery.cancelled, deadline=work_deadline) as sandbox:
                 def command(argv):
                     nonlocal investigated
                     result = delivery._command(sandbox, argv, deadline=work_deadline)

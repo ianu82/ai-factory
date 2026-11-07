@@ -1,8 +1,10 @@
 """Explicit direct-run cancellation, retained outside candidate source."""
 
 import os
+import sys
 import threading
 import time
+from contextlib import contextmanager
 
 from .product_agent import HarnessStopped
 from .run_journal import RunJournal
@@ -80,3 +82,45 @@ def run_cancellable(sandbox, command, *, cancelled, deadline):
     if interrupted.is_set() or cancelled():
         raise HarnessStopped("Active command was cancelled")
     return result
+
+
+@contextmanager
+def enter_cancellable(manager, *, cancelled, deadline):
+    """Watch sandbox entry only; commands retain their existing sole abort owner.
+
+    Drain entry before yielding or failing. Normal context exit still owns source
+    download and cleanup; a cancelled entry must never reach that download path.
+    """
+    class Entry:
+        completed = aborted = False
+
+        def run(self, command):
+            result = manager.__enter__()
+            self.completed = True
+            return result
+
+        def abort(self):
+            self.aborted = True
+            manager.abort()
+
+    entry = Entry()
+    try:
+        sandbox = run_cancellable(entry, [], cancelled=cancelled, deadline=deadline)
+        # Entry can return just before the watcher next wakes. Admit no body
+        # after the deadline, even when that last polling interval did not run.
+        if time.monotonic() >= deadline:
+            raise HarnessStopped("Sandbox entry exceeded its deadline")
+    except BaseException:
+        if entry.completed and not entry.aborted:
+            try:
+                entry.abort()
+            except BaseException:
+                raise HarnessStopped("Sandbox entry cleanup could not be confirmed") from None
+        raise
+    try:
+        yield sandbox
+    except BaseException:
+        if not manager.__exit__(*sys.exc_info()):
+            raise
+    else:
+        manager.__exit__(None, None, None)
