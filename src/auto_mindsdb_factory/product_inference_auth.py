@@ -4,6 +4,11 @@ import asyncio
 import hashlib
 import json
 import re
+import sys
+from importlib import import_module
+from importlib.metadata import distribution
+from importlib.util import find_spec
+from pathlib import Path
 
 from .product_inference import InferencePolicyError, _identifier
 
@@ -11,6 +16,35 @@ from .product_inference import InferencePolicyError, _identifier
 AUTH_URL = "https://auth.mindshub.ai/v1/authenticate/"
 AUTH_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 65536
+IMPORT_ERROR = "MindsHub credential checks require trusted controller imports"
+
+
+def require_controller_import_path(target_root=None):
+    """Require the trusted controller bootstrap, without changing global import state."""
+    roots = (Path(__file__).resolve().parents[2], Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
+    target = Path(target_root).resolve() if target_root is not None else None
+    if target is not None and Path.cwd().resolve().is_relative_to(target):
+        raise InferencePolicyError(IMPORT_ERROR)
+    for entry in sys.path:
+        if type(entry) is not str:
+            raise InferencePolicyError(IMPORT_ERROR)
+        path = Path(entry or Path.cwd()).resolve()
+        if ((target is not None and path.is_relative_to(target))
+                or not any(path.is_relative_to(root) for root in roots)):
+            raise InferencePolicyError(IMPORT_ERROR)
+
+
+def _trusted_http_client():
+    require_controller_import_path()
+    expected = Path(distribution("httpx2").locate_file("httpx2/__init__.py")).resolve()
+    spec = find_spec("httpx2")
+    if (not expected.is_relative_to(Path(sys.prefix).resolve()) or spec is None
+            or type(spec.origin) is not str or Path(spec.origin).resolve() != expected):
+        raise InferencePolicyError(IMPORT_ERROR)
+    module = import_module("httpx2")
+    if type(module.__file__) is not str or Path(module.__file__).resolve() != expected:
+        raise InferencePolicyError(IMPORT_ERROR)
+    return module
 
 
 def _object(pairs):
@@ -29,7 +63,7 @@ def _constant(_):
 async def _read_identity(key):
     from .anton_session import validate_anton_installation
     validate_anton_installation()
-    import httpx2
+    httpx2 = _trusted_http_client()
 
     async with httpx2.AsyncClient(timeout=AUTH_TIMEOUT_SECONDS, follow_redirects=False) as client:
         async with client.stream("GET", AUTH_URL,
@@ -67,6 +101,7 @@ def _receipt(policy, key, auth_workspace_id, payload):
 
 
 async def check_credential(policy, key, auth_workspace_id):
+    require_controller_import_path()
     if not _identifier(auth_workspace_id):
         raise InferencePolicyError("A canonical MindsHub Auth workspace UUID is required")
     if not key:

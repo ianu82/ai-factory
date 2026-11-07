@@ -210,3 +210,43 @@ class AsyncClient:
         capture_output=True, text=True, timeout=15)
     assert result.returncode == 1 and "Product workflow failed:" in result.stderr
     assert not captured.exists(), "Candidate HTTP client received the synthetic credential"
+
+
+def test_unrelated_import_path_stops_before_readiness(monkeypatch, tmp_path):
+    paths = [*sys.path, str(tmp_path)]
+    monkeypatch.setattr(sys, "path", paths)
+    with pytest.raises(InferencePolicyError, match="trusted controller imports"):
+        asyncio.run(auth.check_credential(InferencePolicy.from_document(policy_document()), KEY, AUTH_WORKSPACE))
+    assert sys.path == paths
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_sdk_client_origin_is_checked_before_use(pinned_http, monkeypatch, tmp_path, cached):
+    from importlib.machinery import ModuleSpec
+    from types import SimpleNamespace
+    bad = str(tmp_path / "httpx2.py")
+    paths = list(sys.path)
+    def forbidden(*args):
+        raise AssertionError("Untrusted origin must not be imported")
+    monkeypatch.setattr(auth, "import_module", (lambda name: SimpleNamespace(__file__=bad)) if cached else forbidden)
+    if not cached:
+        monkeypatch.setattr(auth, "find_spec", lambda name: ModuleSpec(name, None, origin=bad))
+    with pytest.raises(InferencePolicyError, match="trusted controller imports"):
+        auth._trusted_http_client()
+    assert sys.path == paths
+
+
+def test_candidate_transitive_http_dependency_is_not_imported(pinned_http, validation_checkout):
+    root, target = validation_checkout
+    captured = root / "imported.txt"
+    (target / "httpcore2.py").write_text(
+        f"from pathlib import Path\nPath({str(captured)!r}).write_text('untrusted dependency executed')\nraise RuntimeError('shadow')\n")
+    source = Path(auth.__file__).resolve().parents[2]
+    env = {"PATH": os.environ["PATH"], "HOME": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(source / "src") + os.pathsep + str(target), "AI_FACTORY_MINDSHUB_API_KEY": KEY,
+        "HTTPS_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""}
+    result = subprocess.run([sys.executable, "-m", "auto_mindsdb_factory", "product-inference-check",
+        "--profile", str(profile_file(root)), "--target-root", str(target), "--auth-workspace-id", AUTH_WORKSPACE],
+        cwd=source, env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1 and "trusted controller imports" in result.stderr
+    assert not captured.exists()

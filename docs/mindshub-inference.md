@@ -38,3 +38,7 @@ The check uses the existing pinned controller HTTP client, one request, no
 redirects and a five-second total request budget. It creates no secret store,
 grant, model request or job. Identity verification still reports execution not
 ready; live protocol qualification and frozen run receipts remain required.
+The checker requires a trusted controller Python bootstrap and source/SDK import
+paths, outside candidate trees. It refuses candidate and unrelated import paths
+before resolving a credential, and checks the HTTP module's resolved SDK origin
+before importing it or passing it a key. These checks do not modify `sys.path`.
