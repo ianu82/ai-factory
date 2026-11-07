@@ -6,6 +6,17 @@ import json
 from .product_agent import TOOLS
 
 
+ACTION_INSTRUCTIONS = (
+    "Factory Codex action transport: the complete functions.exec program must be exactly "
+    "text(await tools.run(JSON)) or text(await tools.finish(JSON)), where JSON is a literal JSON object "
+    "matching the supplied tool schema. For example: text(await tools.run({\"command\":[\"node\",\"--version\"]})). "
+    "Do not declare variables, use aliases, comments, loops, nested expressions, parallel calls, "
+    "other tools or extra statements. Only run and finish are authorized; visible built-in tools "
+    "are unavailable. Factory executes run in the isolated job, not the app-server working directory. "
+    "This transport format does not change the frozen role, plan, criteria, permissions or limits."
+)
+
+
 def _object(pairs):
     result = {}
     for key, value in pairs:
@@ -93,7 +104,8 @@ async def codex_turn(owner, gate, *, instructions, context, command):
                     await send({"method": "initialized", "params": {}})
                     await send({"id": 2, "method": "thread/start", "params": {"model": gate.config.model,
                         "modelProvider": "factory_guarded", "allowProviderModelFallback": False, "ephemeral": True,
-                        "cwd": str(owner.work), "approvalPolicy": "never", "sandbox": "read-only", "baseInstructions": instructions,
+                        "cwd": str(owner.work), "approvalPolicy": "never", "sandbox": "read-only",
+                        "baseInstructions": instructions + "\n\n" + ACTION_INSTRUCTIONS,
                         "dynamicTools": [{"name": tool["name"], "description": tool["description"],
                                           "inputSchema": tool["parameters"]} for tool in TOOLS]}})
                     expected = 2

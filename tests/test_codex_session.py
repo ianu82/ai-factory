@@ -11,6 +11,7 @@ import time
 import pytest
 
 from auto_mindsdb_factory import codex_session
+from auto_mindsdb_factory.codex_rpc import ACTION_INSTRUCTIONS
 from auto_mindsdb_factory.product_agent import AgentSessionError, HarnessStopped
 from auto_mindsdb_factory.connectors import OpenAIResponsesAgentConfig
 from auto_mindsdb_factory.product_roles import snapshot_roles
@@ -42,6 +43,10 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     if mode == "findings": report["findings"] = ["Blocking defect"]
     async def upstream(request):
         requests.append(json.loads(request.content))
+        texts = [part["text"] for item in requests[-1]["input"] if item["type"] == "message"
+                 for part in item["content"] if part["type"] == "input_text"]
+        frozen = snapshot_roles()[role]["instructions"]
+        assert any(frozen + "\n\n" + ACTION_INSTRUCTIONS in text for text in texts)
         if mode.startswith("slow"):
             # Cross several real RPC polling intervals with an unmatched request.
             await asyncio.sleep(0.2)

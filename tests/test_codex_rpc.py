@@ -15,7 +15,7 @@ import pytest
 from auto_mindsdb_factory.codex_inference import CodexInference, CodexStopped
 from auto_mindsdb_factory.codex_process import open_codex_process
 from auto_mindsdb_factory.codex_proxy import open_codex_proxy
-from auto_mindsdb_factory.codex_rpc import codex_turn
+from auto_mindsdb_factory.codex_rpc import ACTION_INSTRUCTIONS, codex_turn
 from auto_mindsdb_factory.connectors import OpenAIResponsesAgentConfig
 from auto_mindsdb_factory.run_journal import RunJournal
 
@@ -40,6 +40,9 @@ def test_real_cli_receives_job_result_then_finishes(tmp_path, exit_code):
             requests.append(json.loads(request.content))
             number = len(requests)
             assert number <= 2
+            texts = [part["text"] for item in requests[-1]["input"] if item["type"] == "message"
+                     for part in item["content"] if part["type"] == "input_text"]
+            assert any("Use only the supplied tools.\n\n" + ACTION_INSTRUCTIONS in text for text in texts)
             if number == 2:
                 history = json.dumps(requests[-1]["input"])
                 assert "custom_tool_call_output" in history and "job-result-marker" in history

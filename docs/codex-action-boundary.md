@@ -23,6 +23,15 @@ Unknown codes remain `unknown`. Rejection still releases no executable bytes,
 stops the session and admits no retry. Historical coarse stops cannot establish
 which response shape or program was rejected.
 
+Before the first inference, the app-server receives the historical frozen role
+verbatim followed by controller-owned guidance declaring that exact expression
+format, literal JSON, single-call restriction and isolated-job command location.
+The guidance is part of the controller source identified by the run's runtime SHA;
+it grants no additional capability and changes no role, criterion or validator.
+Actual CLI/client fixtures check that both roles and subsequent tool-result
+requests receive this guidance. Mock compliance is not live-model compliance,
+and missing historical rejection details cannot be reconstructed from this fix.
+
 This parser is not an enabled adapter or a sandbox. A credential-free, isolated
 app-server, frozen instructions/configuration, scoped inference transport, actual
 SDK integration tests and real coding/negative/cancellation proofs remain required.
