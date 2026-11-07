@@ -52,11 +52,15 @@ class CodexInference:
         self.record("harness_policy_stopped", reason=reason if type(reason) is str and reason in _REASONS else "unknown")
         raise CodexStopped("Codex execution stopped by Factory policy")
 
-    def admit(self):
+    def check_stop(self):
+        """Observe owned work; this does not admit another request or action."""
         if self._stopped:
             raise CodexStopped("Codex session is stopped")
         if self.cancelled() or time.monotonic() >= self.deadline:
             self.stop("cancelled_or_deadline")
+
+    def admit(self):
+        self.check_stop()
         try:
             usage = self.journal.summary()
             valid = (usage["usage_complete"] is True and type(usage["total_tokens"]) is int

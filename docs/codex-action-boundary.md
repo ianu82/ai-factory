@@ -96,6 +96,13 @@ are rejected and bounded asynchronous pipes close on every exit. Actual CLI
 round trips cover both zero and nonzero command results. Report acceptance,
 process/proxy/client ownership and live certification remain separate gates.
 
+Waiting for an owned RPC message checks stop, cancellation and deadline without
+admitting new work. An admitted provider request leaves usage coverage incomplete
+until its response arrives; that waiting interval must not stop the request itself.
+Every new inference, executable command and approved callback still requires full
+usage/budget admission. Delayed local upstream tests cover successful accounting
+and missing usage stopping execution before any job command.
+
 `codex_session.CodexAgent` owns that client/proxy/process/turn lifetime, uses the
 frozen historical role and shared report acceptance, and requires an abortable
 owned job-command callback. Command work runs off-loop; interruption signals its

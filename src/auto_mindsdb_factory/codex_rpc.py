@@ -46,7 +46,9 @@ async def codex_turn(owner, gate, *, instructions, context, command):
             "name": "ai_factory", "version": "1"}, "capabilities": {"experimentalApi": True}}})
         expected, thread, turn, settings = 1, None, None, None
         while True:
-            gate.admit()
+            # Waiting observes an already-admitted inference. Its usage stays
+            # incomplete until the provider responds; callbacks still admit fully.
+            gate.check_stop()
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=0.05)
             except TimeoutError:
