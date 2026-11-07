@@ -1,6 +1,7 @@
 """Buffer a validated response before app-server can observe executable items."""
 
 import json
+import re
 
 from .codex_actions import CodexActionError, codex_action
 
@@ -9,7 +10,32 @@ def codex_sse(response: dict, *, model: str) -> bytes:
     return codex_response(response, model=model)[0]
 
 
-def codex_response(response: dict, *, model: str) -> tuple[bytes, tuple[str, dict, str]]:
+def _provider_envelope(snapshot, request_namespace):
+    """Discard only the observed passive envelope, bound to the validated request.
+
+    No provider metadata reaches app-server or selects an execution namespace.
+    The unchanged action parser still validates every execution-bearing field.
+    """
+    if request_namespace != "functions" or type(snapshot.get("output")) is not list:
+        return
+    fields = {"type", "id", "status", "call_id", "name", "input", "metadata",
+              "internal_chat_message_metadata_passthrough"}
+    def turn_id(value):
+        return type(value) is str and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", value) is not None
+    for item in snapshot["output"]:
+        if type(item) is not dict or item.get("type") != "custom_tool_call" or set(item) != fields:
+            continue
+        metadata, internal = item["metadata"], item["internal_chat_message_metadata_passthrough"]
+        if (type(metadata) is not dict or set(metadata) != {"turn_id"} or not turn_id(metadata["turn_id"])
+                or type(internal) is not dict or set(internal) != {"turn_id", "create_time"}
+                or not turn_id(internal["turn_id"]) or type(internal["create_time"]) not in (int, float)
+                or not 0 <= internal["create_time"] <= 2 ** 53):
+            continue
+        del item["metadata"], item["internal_chat_message_metadata_passthrough"]
+        item["namespace"] = request_namespace
+
+
+def codex_response(response: dict, *, model: str, request_namespace=None) -> tuple[bytes, tuple[str, dict, str]]:
     """Return immutable SSE and its action from one validated detached snapshot.
 
     This is deliberately not a generator. Inference admission, observed usage,
@@ -24,6 +50,7 @@ def codex_response(response: dict, *, model: str) -> tuple[bytes, tuple[str, dic
         snapshot = json.loads(document)
     except (ValueError, TypeError, RecursionError):
         raise CodexActionError("response_encoding") from None
+    _provider_envelope(snapshot, request_namespace)
     action = codex_action(snapshot, model=model)
     if type(snapshot.get("id")) is not str or not 1 <= len(snapshot["id"]) <= 200:
         raise CodexActionError("response_identity")

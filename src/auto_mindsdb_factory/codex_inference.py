@@ -172,7 +172,9 @@ class CodexInference:
             cost_estimate_usd=estimate_cost(recorded, rate), pricing=rate)
         self.admit()
         try:
-            wire, (name, arguments, _) = codex_response(response, model=self.config.model)
+            # codex_request already required the functions.exec Code Mode catalogue.
+            wire, (name, arguments, _) = codex_response(response, model=self.config.model,
+                request_namespace="functions")
             self._pending_action = json.dumps([name, arguments], sort_keys=True, allow_nan=False)
             return wire
         except CodexActionError as exc:

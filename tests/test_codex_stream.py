@@ -52,6 +52,53 @@ def test_action_and_wire_share_one_detached_snapshot():
     assert decode(wire)[-1]["response"]["output"][1]["input"] == 'text(await tools.run({"command":["true"]}))'
 
 
+def provider_response():
+    r = response()
+    call = r["output"][1]
+    del call["namespace"]
+    call.update(metadata={"turn_id": "turn_provider"},
+        internal_chat_message_metadata_passthrough={"turn_id": "turn_provider", "create_time": 123.5})
+    return r
+
+
+def test_provider_metadata_is_removed_from_every_stream_event_after_request_binding():
+    r = provider_response(); before = copy.deepcopy(r)
+    for namespace in (None, "other"):
+        with pytest.raises(CodexActionError):
+            codex_response(r, model=MODEL, request_namespace=namespace)
+    wire, action = codex_response(r, model=MODEL, request_namespace="functions")
+    assert action == ("run", {"command": ["true"]}, "call_test") and r == before
+    assert b"metadata" not in wire and b"turn_provider" not in wire
+    assert decode(wire)[-1]["response"] == response()
+
+
+@pytest.mark.parametrize("change", [
+    "namespace", "name", "async", "caller", "created_by", "unknown", "metadata-type", "metadata-key",
+    "turn-id", "internal-type", "internal-key", "internal-turn-id", "time-bool", "time-negative", "time-large",
+    "status", "program", "arguments", "model", "multiple",
+])
+def test_provider_envelope_does_not_authorize_changed_fields_or_actions(change):
+    r = provider_response(); call = r["output"][1]
+    if change in {"namespace", "name"}: call[change] = "other"
+    elif change in {"async", "caller", "created_by", "unknown"}: call[change] = None
+    elif change == "metadata-type": call["metadata"] = None
+    elif change == "metadata-key": call["metadata"]["actor"] = "private"
+    elif change == "turn-id": call["metadata"]["turn_id"] = "private\nactor"
+    elif change == "internal-type": call["internal_chat_message_metadata_passthrough"] = []
+    elif change == "internal-key": call["internal_chat_message_metadata_passthrough"]["recipient"] = "other"
+    elif change == "internal-turn-id": call["internal_chat_message_metadata_passthrough"]["turn_id"] = 1
+    elif change.startswith("time-"):
+        call["internal_chat_message_metadata_passthrough"]["create_time"] = {
+            "time-bool": True, "time-negative": -1, "time-large": 2 ** 53 + 1}[change]
+    elif change == "status": call["status"] = "in_progress"
+    elif change == "program": call["input"] = 'text(await tools.apply_patch("private"))'
+    elif change == "arguments": call["input"] = 'text(await tools.run({"command":[]}))'
+    elif change == "model": r["model"] = "other"
+    else: r["output"].append(copy.deepcopy(call))
+    with pytest.raises(CodexActionError):
+        codex_response(r, model=MODEL, request_namespace="functions")
+
+
 def test_nonobject_and_missing_item_identity_have_fixed_diagnostic_codes():
     with pytest.raises(CodexActionError) as caught:
         codex_sse(["private response"], model=MODEL)

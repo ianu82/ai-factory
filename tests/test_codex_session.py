@@ -21,7 +21,7 @@ from auto_mindsdb_factory.run_journal import RunJournal
 
 @pytest.mark.parametrize("mode", [
     "ok", "builder", "frozen", "slow", "slow-unknown-usage", "no-investigation", "missing", "findings",
-    "provider-cancel", "command-cancel", "command-deadline", "metadata-actor", "metadata-other",
+    "provider-cancel", "command-cancel", "command-deadline", "metadata-actor", "metadata-other", "provider-envelope",
 ])
 def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     configured = os.environ.get("AI_FACTORY_CODEX_TEST_BINARY")
@@ -58,9 +58,12 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
                 else 'text(await tools.run({"command":["inspect"]}))')
         rejected_metadata = ({"created_by": "private actor"} if mode == "metadata-actor" else
                              {"private field": "private value", "created_by": None} if mode == "metadata-other" else {})
+        envelope = ({"metadata": {"turn_id": "turn_provider"},
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_provider", "create_time": 123.5},
+            "status": "completed"} if mode == "provider-envelope" else {"namespace": "functions"})
         return httpx2.Response(200, json={"id": "resp_session", "status": "completed", "model": frozen_model,
             "output": [{"id": "ctc_session", "call_id": "call_session", "type": "custom_tool_call",
-                "name": "exec", "namespace": "functions", "input": code, **rejected_metadata}],
+                "name": "exec", "input": code, **envelope, **rejected_metadata}],
             "usage": None if mode == "slow-unknown-usage" else {
                 "input_tokens": 7, "output_tokens": 3, "total_tokens": 10}})
     actual_client, actual_process = openai.AsyncOpenAI, codex_session.open_codex_process
@@ -88,7 +91,7 @@ def test_owned_session_acceptance_and_cleanup(tmp_path, monkeypatch, mode):
     agent = codex_session.CodexAgent(config, journal, max_turns=3, max_total_tokens=50000,
         deadline=time.monotonic() + (5 if mode == "command-deadline" else 15), cancelled=cancelled)
     context = {"acceptance_criteria": [{"id": "a", "description": "Check the source"}]}
-    accepted = mode in {"ok", "builder", "frozen", "slow"}
+    accepted = mode in {"ok", "builder", "frozen", "slow", "provider-envelope"}
     if accepted: assert agent.run(role, context, Command()) == report
     else:
         with pytest.raises(HarnessStopped if mode.endswith(("cancel", "deadline")) else AgentSessionError):

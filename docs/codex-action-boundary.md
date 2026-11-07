@@ -23,6 +23,18 @@ Unknown codes remain `unknown`. Rejection still releases no executable bytes,
 stops the session and admits no retry. Historical coarse stops cannot establish
 which response shape or program was rejected.
 
+The live provider also returns a bounded transport envelope with no top-level
+namespace: `metadata` contains only a turn identifier, and
+`internal_chat_message_metadata_passthrough` contains only a turn identifier and
+creation time. After request validation has bound the Code Mode catalogue to
+`functions.exec`, the inference gate can project this exact envelope onto the
+ordinary action schema. It validates both metadata shapes, removes them entirely
+and supplies the namespace from the trusted request. Metadata never selects a
+namespace or reaches app-server. The existing action parser is unchanged;
+additional fields, active caller/async metadata and invalid actions still stop.
+Direct stream encoding remains strict without that request binding. This
+compatibility evidence does not establish any historical rejected response shape.
+
 Action-metadata rejection can additionally retain a fixed
 `response_rejection_detail`: exact unsupported `async`/`caller`/`created_by`
 field combinations, or the failed status/identifier/name/namespace/input check.

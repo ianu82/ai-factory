@@ -61,6 +61,26 @@ def test_accounts_actual_body_and_preserves_untrusted_context(tmp_path):
     assert "never journal" not in json.dumps(gate.journal.events())
 
 
+def test_live_provider_envelope_roundtrip_uses_validated_request_namespace(tmp_path):
+    # Sanitized structural reproduction of the actual live provider response.
+    response = copy.deepcopy(RESPONSE)
+    call = response["output"][0]
+    del call["namespace"]
+    call.update(status="completed", metadata={"turn_id": "turn_provider"},
+        internal_chat_message_metadata_passthrough={"turn_id": "turn_provider", "create_time": 123.5})
+    before = copy.deepcopy(response)
+    gate = boundary(tmp_path)
+    sdk, calls, _, _ = client(response)
+    wire = asyncio.run(gate.request(sdk, BODY))
+    assert gate.take_action("run", {"command": ["true"]}) == ("run", {"command": ["true"]})
+    gate.action_finished()
+    assert response == before and len(calls) == 1
+    assert b'"namespace": "functions"' in wire
+    assert b"metadata" not in wire and b"turn_provider" not in wire
+    assert gate.journal.summary()["total_tokens"] == 10
+    assert "turn_provider" not in json.dumps(gate.journal.events())
+
+
 def test_counts_other_roles_and_requests_before_this_adapter(tmp_path):
     gate = boundary(tmp_path, max_total_tokens=27)
     gate.journal.append("model_requested", role="planner")
