@@ -6,6 +6,7 @@ import {WebSocketServer} from 'ws';
 import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
 import {checkedExec, execBudget} from './exec.mjs';
+import {bridgeProgress} from './progress.mjs';
 
 async function fixture(t, mode, observations) {
   const server = createServer();
@@ -60,6 +61,25 @@ async function fixture(t, mode, observations) {
   });
   return {sandbox, observed};
 }
+
+test('partial progress precedes a real stalled SDK handshake timeout without exposing payloads', async t => {
+  const lines = [];
+  let report = () => {};
+  const observations = execObservations(() => report());
+  report = bridgeProgress('a'.repeat(32), observations.snapshot, line => lines.push(line));
+  const {sandbox} = await fixture(t, 'stalled', observations);
+  report('exec');
+  await assert.rejects(checkedExec(sandbox, 'private-command', 'private-input', 2, 65536, 80),
+    error => error.name === 'TimeoutError');
+  const frames = lines.map(line => JSON.parse(line.slice('FACTORY_BRIDGE_PROGRESS '.length)));
+  assert.ok(frames.some(f => f.exec_observations.hello_send_attempts === 1));
+  assert.ok(frames.every(f => f.stage === 'exec' && f.exec_observations.init_send_attempts === 0));
+  for (let i = 0; i < 100; i++) report('failed');
+  assert.equal(lines.length, 64);
+  assert.ok(!lines.join('').includes('private-'));
+  bridgeProgress(undefined, observations.snapshot, () => assert.fail('legacy output changed'))();
+  bridgeProgress('b'.repeat(32), observations.snapshot, () => { throw new Error('private'); })();
+});
 
 test('rejected handshakes fail before execution without crashing Node', async t => {
   const {sandbox, observed} = await fixture(t, 'reject');

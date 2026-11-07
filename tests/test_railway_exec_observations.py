@@ -107,3 +107,33 @@ def test_metadata_cannot_be_reinitialized_and_does_not_retain_error_lifetime():
     del error
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize('change', [
+    {'nonce': 'b' * 32}, {'sequence': True}, {'sequence': 0}, {'sequence': 65},
+    {'stage': 'private-command'}, {'extra': 'private-text'},
+    {'exec_observations': observations() | {'command': 'private-text'}},
+])
+def test_partial_progress_rejects_foreign_or_unbounded_metadata(change):
+    frame = {'nonce': 'a' * 32, 'sequence': 1, 'stage': 'exec', 'exec_observations': observations()}
+    stderr = 'FACTORY_BRIDGE_PROGRESS ' + json.dumps(frame | change) + '\n'
+    assert runner._bridge_progress(stderr, 'a' * 32) is None
+
+
+def test_partial_progress_is_bounded_detached_and_does_not_become_final_exec_evidence():
+    frame = {'nonce': 'a' * 32, 'sequence': 1, 'stage': 'connect', 'exec_observations': observations()}
+    line = 'FACTORY_BRIDGE_PROGRESS ' + json.dumps(frame) + '\n'
+    for stderr in [line * 2, line + 'x' * 65536, line[:-1], 'FACTORY_BRIDGE_PROGRESS {bad}\n']:
+        assert runner._bridge_progress(stderr, 'a' * 32) is None
+    value = runner._bridge_progress('untrusted-private-text\n' + line, 'a' * 32)
+    error = runner.RailwayOperationError({'action': 'run'}, 'TimeoutExpired', bridge_progress=value)
+    returned = runner.railway_bridge_progress(error)
+    assert returned['stage'] == 'connect' and returned['partial'] is True
+    returned['exec_observations']['opened'] = 999
+    assert runner.railway_bridge_progress(error)['exec_observations']['opened'] == 0
+    assert runner.railway_exec_observations(error) is None
+    error.phase = 'exit'
+    assert runner.railway_bridge_progress(error) is None
+    assert runner.railway_bridge_progress(object()) is None
+    malformed = runner.RailwayOperationError({'action': 'run'}, 'TimeoutExpired', bridge_progress=(1, 'exec', ('private',)))
+    assert runner.railway_bridge_progress(malformed) is None

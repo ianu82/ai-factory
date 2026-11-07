@@ -11,7 +11,7 @@ export function execFailureObservations(error, observations) {
   return {};
 }
 
-export function execObservations() {
+export function execObservations(onChange = () => {}) {
   const state = {
     connections: 0, opened: 0, errors: 0, closed: 0, http_rejections: 0,
     last_http_status: 0, last_close_code: 0, capabilities_frames: 0, typed_error_frames: 0,
@@ -22,6 +22,13 @@ export function execObservations() {
     if (state[key] < 65535) state[key]++;
     else state.counters_saturated = true;
   }
+  let last;
+  function changed() {
+    try {
+      const current = JSON.stringify(state);
+      if (current !== last) { last = current; onChange(); }
+    } catch { /* Observation only. */ }
+  }
   function controlType(data) {
     if (Buffer.isBuffer(data)) {
       if (data.length > 4096) return null;
@@ -31,7 +38,7 @@ export function execObservations() {
     try { return JSON.parse(data)?.type; } catch { return null; }
   }
   class ObservedWebSocket extends WebSocket {
-    constructor(...args) { super(...args); count('connections'); }
+    constructor(...args) { super(...args); count('connections'); changed(); }
     emit(event, ...args) {
       try {
         if (event === 'open') count('opened');
@@ -53,6 +60,7 @@ export function execObservations() {
           if (type === 'error') count('typed_error_frames');
         }
       } catch { state.observation_failed = true; }
+      changed();
       return super.emit(event, ...args);
     }
     send(data, ...args) {
@@ -60,8 +68,10 @@ export function execObservations() {
       if (type === 'exec_hello') count('hello_send_attempts');
       else if (type === 'init_exec') count('init_send_attempts');
       else if (typeof data === 'string') count('unclassified_control_sends');
+      changed();
       const result = super.send(data, ...args);
       if (type === 'init_exec') count('init_send_returned');
+      changed();
       return result;
     }
   }

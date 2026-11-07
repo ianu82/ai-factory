@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -47,8 +48,43 @@ def _freeze_exec_observations(value):
     return tuple(value[key] for key in _exec_fields)
 
 
+def _bridge_progress(stderr, nonce):
+    # Never retain raw stderr, the nonce, or an incomplete/foreign frame.
+    if type(stderr) is not str or len(stderr) > 65536 or type(nonce) is not str:
+        return None
+    latest = None
+    try:
+        for line in stderr.splitlines(keepends=True):
+            if not line.startswith('FACTORY_BRIDGE_PROGRESS ') or not line.endswith('\n'):
+                continue
+            frame = json.loads(line[len('FACTORY_BRIDGE_PROGRESS '):])
+            if (type(frame) is not dict or set(frame) != {'nonce', 'sequence', 'stage', 'exec_observations'}
+                    or frame['nonce'] != nonce or type(frame['sequence']) is not int
+                    or not 1 <= frame['sequence'] <= 64 or (latest and frame['sequence'] <= latest[0])
+                    or type(frame['stage']) is not str
+                    or frame['stage'] not in {'dispatch', 'connect', 'connected', 'exec', 'returned', 'failed'}):
+                return None
+            observations = _freeze_exec_observations(frame['exec_observations'])
+            if observations is None:
+                return None
+            latest = (frame['sequence'], frame['stage'], observations)
+    except Exception:
+        return None
+    return latest
+
+
+def _freeze_bridge_progress(value):
+    if (type(value) is not tuple or len(value) != 3 or type(value[0]) is not int
+            or not 1 <= value[0] <= 64 or type(value[1]) is not str
+            or value[1] not in {'dispatch', 'connect', 'connected', 'exec', 'returned', 'failed'}
+            or type(value[2]) is not tuple or len(value[2]) != len(_exec_fields)):
+        return None
+    observations = _freeze_exec_observations(dict(zip(_exec_fields, value[2])))
+    return (value[0], value[1], observations) if observations is not None else None
+
+
 class RailwayOperationError(RunnerError):
-    def __init__(self, request, error_type, *, exec_observations=None):
+    def __init__(self, request, error_type, *, exec_observations=None, bridge_progress=None):
         if type(self) is RailwayOperationError and self in _original_failure_facts:
             raise TypeError("Railway failure facts are already initialized")
         phase = None
@@ -67,13 +103,14 @@ class RailwayOperationError(RunnerError):
         reason = f"Railway {self.phase} failed ({self.error_type})"
         super().__init__(reason)
         if type(self) is RailwayOperationError:
-            observations = None
+            observations = progress = None
             try:
                 if self.error_type in _exec_categories:
                     observations = _freeze_exec_observations(exec_observations)
+                progress = _freeze_bridge_progress(bridge_progress)
             except Exception:
                 pass  # Diagnostic failure must preserve the original runner error.
-            _original_failure_facts[self] = (self.phase, self.error_type, reason, observations)
+            _original_failure_facts[self] = (self.phase, self.error_type, reason, observations, progress)
 
     def public_reason(self):
         phase, category = railway_failure_facts(self)
@@ -113,6 +150,16 @@ def railway_exec_observations(error):
     return dict(zip(_exec_fields, values)) if values is not None else None
 
 
+def railway_bridge_progress(error):
+    if railway_failure_facts(error)[0] == 'unknown':
+        return None
+    value = _original_failure_facts[error][4]
+    if value is None:
+        return None
+    return {'sequence': value[0], 'stage': value[1], 'partial': True,
+        'exec_observations': dict(zip(_exec_fields, value[2]))}
+
+
 def _bounded_bridge(command, *, input, env, timeout, deadline):
     # Node waits for the complete stdin request before dispatch. Recalculate
     # after spawn so a slow process launch cannot admit an expired operation.
@@ -123,9 +170,9 @@ def _bounded_bridge(command, *, input, env, timeout, deadline):
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, 0)
             stdout, stderr = process.communicate(input, timeout=min(timeout, remaining))
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as error:
             process.kill()
-            process.communicate()
+            _, error.stderr = process.communicate()
             raise
         except BaseException:
             process.kill()
@@ -142,6 +189,7 @@ def bridge(request):
     timeout = request.get("timeout", 150) + 60
     request = dict(request)
     deadline = request.pop("deadline", None)
+    nonce = None
     try:
         command = ["node", str(Path(__file__).with_name("railway_bridge") / "bridge.mjs")]
         if deadline is None:
@@ -149,10 +197,12 @@ def bridge(request):
                 text=True, env=environment, timeout=timeout)
         else:
             _execution_budget(deadline, timeout)  # Validate before allocating a bridge process.
+            nonce = request['progress_nonce'] = secrets.token_hex(16)
             result = _bounded_bridge(command, input=json.dumps(request), env=environment,
                 timeout=timeout, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise RailwayOperationError(request, type(error).__name__) from None
+        raise RailwayOperationError(request, type(error).__name__,
+            bridge_progress=_bridge_progress(getattr(error, 'stderr', None), nonce)) from None
     try:
         response = json.loads(result.stdout)
     except ValueError:
@@ -161,7 +211,8 @@ def bridge(request):
         raise RailwayOperationError(request, "InvalidResponse")
     if result.returncode or "error" in response:
         raise RailwayOperationError(request, response.get("error", "BridgeProcessError"),
-            exec_observations=response.get("exec_observations"))
+            exec_observations=response.get("exec_observations"),
+            bridge_progress=_bridge_progress(getattr(result, 'stderr', None), nonce))
     return response
 
 
@@ -193,8 +244,10 @@ class RailwayPool:
             return
         try:
             operation, category = railway_failure_facts(error)
+            progress = railway_bridge_progress(error)
             self._journal.append("runner_transport_failed", operation=operation, category=category,
-                exec_observations=railway_exec_observations(error))
+                exec_observations=railway_exec_observations(error),
+                **({'bridge_progress': progress} if progress is not None else {}))
         except BaseException:
             # A primary transport failure is already in flight. Even an evidence
             # write interruption cannot replace it or prevent owned retirement.

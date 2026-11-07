@@ -4,9 +4,11 @@ import {Sandbox, SandboxNotFoundError} from 'railway';
 import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
 import {checkedExec, execBudget} from './exec.mjs';
+import {bridgeProgress} from './progress.mjs';
 
 const MAX_MESSAGE_BYTES = 100 * 1024 * 1024;
-const observations = execObservations();
+let progress = () => {};
+const observations = execObservations(() => progress());
 const options = {...clientOptions(), webSocketImpl: observations.WebSocketImpl};
 
 async function dispatch(request) {
@@ -41,7 +43,9 @@ async function dispatch(request) {
   }
   let sandbox;
   try {
+    progress('connect');
     sandbox = await Sandbox.connect(request.id, options);
+    progress('connected');
   } catch (error) {
     if (request.action === 'destroy' && error instanceof SandboxNotFoundError) return {destroyed: true};
     throw error;
@@ -55,10 +59,12 @@ async function dispatch(request) {
     return {alive: true};
   }
   if (request.action !== 'request') throw new Error('Unknown bridge operation');
+  progress('exec');
   const output = await checkedExec(sandbox,
     'cd /opt/ai-factory && runuser -u factory -- /usr/bin/python3 -m auto_mindsdb_factory.railway_remote',
     JSON.stringify(request.request), request.timeout, MAX_MESSAGE_BYTES,
     remainingBudget());
+  progress('returned');
   return JSON.parse(output);
 }
 
@@ -70,9 +76,13 @@ try {
     if (length > MAX_MESSAGE_BYTES) throw new Error('Bridge input exceeds limit');
     chunks.push(chunk);
   }
-  const response = await dispatch(JSON.parse(Buffer.concat(chunks)));
+  const request = JSON.parse(Buffer.concat(chunks));
+  progress = bridgeProgress(request.progress_nonce, observations.snapshot);
+  progress('dispatch');
+  const response = await dispatch(request);
   process.stdout.write(JSON.stringify(response));
 } catch (error) {
+  progress('failed');
   process.stdout.write(JSON.stringify({error: error.constructor.name, ...execFailureObservations(error, observations)}));
   process.exitCode = 1;
 }

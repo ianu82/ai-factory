@@ -165,3 +165,47 @@ def test_bridge_interruption_preserves_primary_error_and_reaps_child(monkeypatch
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+
+def test_actual_killed_bridge_retains_only_nonce_bound_partial_progress(tmp_path, monkeypatch):
+    import json
+    from auto_mindsdb_factory.run_journal import RunJournal
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "test-only")
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "test-only")
+    child = tmp_path / "bridge.py"
+    child.write_text("""import json,sys,time
+r=json.load(sys.stdin)
+facts={'connections':1,'opened':1,'errors':0,'closed':0,'http_rejections':0,
+'capabilities_frames':0,'typed_error_frames':0,'hello_send_attempts':1,
+'init_send_attempts':0,'init_send_returned':0,'unclassified_control_sends':0,
+'last_http_status':0,'last_close_code':0,'counters_saturated':False,'observation_failed':False}
+print('FACTORY_BRIDGE_PROGRESS '+json.dumps({'nonce':r.get('progress_nonce'),'sequence':1,
+'stage':'exec','exec_observations':facts}),file=sys.stderr,flush=True)
+time.sleep(10)
+""")
+    actual_popen, processes = subprocess.Popen, []
+    def spawn(command, **options):
+        process = actual_popen([sys.executable, str(child)], **options)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(runner.subprocess, "Popen", spawn)
+    journal = RunJournal(tmp_path / "evidence", "partial")
+    pool = runner.RailwayPool(lambda request: None)
+    pool._journal = journal
+    started = time.monotonic()
+    try:
+        with pytest.raises(runner.RailwayOperationError) as raised:
+            runner.bridge({"action": "request", "request": {"action": "enter"},
+                "timeout": 150, "budget_ms": 300, "deadline": started + 0.3})
+        pool._record_failure(raised.value)
+        data = journal.events()[-1]["data"]
+        assert (data["operation"], data["category"]) == ("enter", "TimeoutExpired")
+        assert data["exec_observations"] is None
+        assert data["bridge_progress"]["stage"] == "exec"
+        assert data["bridge_progress"]["partial"] is True
+        assert data["bridge_progress"]["exec_observations"]["hello_send_attempts"] == 1
+        assert data["bridge_progress"]["exec_observations"]["init_send_attempts"] == 0
+        assert "nonce" not in json.dumps(data) and "test-only" not in json.dumps(data)
+        assert time.monotonic() - started < 2 and all(p.poll() is not None for p in processes)
+    finally:
+        pool.close()
