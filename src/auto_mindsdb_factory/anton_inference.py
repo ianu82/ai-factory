@@ -79,53 +79,68 @@ class AntonInference:
             max_output_tokens=body["max_output_tokens"],
             input_sha=hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest())
         started = time.monotonic()
-        gateway = None
+        gateway, connector, raw = None, None, None
         async def create():
-            nonlocal gateway
             transport = client.with_options(max_retries=0, timeout=min(self.config.timeout_seconds, remaining))
-            if getattr(self.config, "inference_binding_sha256", None) is not None:
-                from .mindshub_transport import create_response
-                response, gateway = await create_response(transport, body)
-                return response
             return await transport.responses.create(**body)
         try:
-            async with asyncio.timeout(min(self.config.timeout_seconds, remaining)):
-                # No SDK retries or Anton compatibility retries can hide extra requests.
-                request = asyncio.create_task(create())
-                try:
-                    while not request.done():
-                        await asyncio.wait({request}, timeout=0.05)
-                        if self.cancelled():
-                            self.stop("request_cancelled")
-                    response = await request
-                finally:
-                    if not request.done():
-                        request.cancel()
-                        await asyncio.gather(request, return_exceptions=True)
+            if getattr(self.config, "inference_binding_sha256", None) is not None:
+                from .mindshub_native import MindsHubNativeConnector
+                connector = MindsHubNativeConnector(self.config, cancelled=self.cancelled, deadline=self.deadline)
+                # The owned process polls cancellation and retires within this same deadline.
+                raw = connector.request_response(body, timeout_seconds=min(self.config.timeout_seconds, remaining))
+                gateway = raw.gateway
+            else:
+                async with asyncio.timeout(min(self.config.timeout_seconds, remaining)):
+                    # No SDK retries or Anton compatibility retries can hide extra requests.
+                    request = asyncio.create_task(create())
+                    try:
+                        while not request.done():
+                            await asyncio.wait({request}, timeout=0.05)
+                            if self.cancelled():
+                                self.stop("request_cancelled")
+                        response = await request
+                    finally:
+                        if not request.done():
+                            request.cancel()
+                            await asyncio.gather(request, return_exceptions=True)
         except BaseException:
+            if connector is not None and connector.worker_facts is not None:
+                self.record("inference_process", role=self.role, turn=self.calls, **connector.worker_facts)
             self.record("model_failed", role=self.role, turn=self.calls, harness="anton", model=self.config.model)
             raise
-        raw_usage = getattr(response, "usage", None)
-        recorded = raw_usage.model_dump() if hasattr(raw_usage, "model_dump") else None
+        raw_usage = raw.get("usage") if raw is not None else getattr(response, "usage", None)
+        recorded = raw_usage if raw is not None else (raw_usage.model_dump() if hasattr(raw_usage, "model_dump") else None)
         if not isinstance(recorded, dict) or any(type(recorded.get(k)) is not int or recorded[k] < 0
                 for k in ("input_tokens", "output_tokens", "total_tokens")):
             recorded = None
         elif recorded["total_tokens"] != recorded["input_tokens"] + recorded["output_tokens"]:
             recorded = None
-        model = getattr(response, "model", None)
+        model = raw.get("model") if raw is not None else getattr(response, "model", None)
         rate = self.pricing.get(model)
         self.record("model_response", role=self.role, turn=self.calls, harness="anton",
-            response_id=getattr(response, "id", None), model=model, usage=recorded,
-            status=getattr(response, "status", None), duration_seconds=round(time.monotonic() - started, 3),
+            response_id=raw.get("id") if raw is not None else getattr(response, "id", None), model=model, usage=recorded,
+            status=raw.get("status") if raw is not None else getattr(response, "status", None), duration_seconds=round(time.monotonic() - started, 3),
             cost_estimate_usd=estimate_cost(recorded, rate), pricing=rate)
+        if raw is not None:
+            self.record("inference_process", role=self.role, turn=self.calls, **connector.worker_facts)
+            if not raw.transport_complete:
+                self.record("inference_usage_unknown", role=self.role, turn=self.calls, harness="anton",
+                    reason="transport_incomplete")
         if gateway is not None:
             self.record("inference_gateway", role=self.role, turn=self.calls, harness="anton", **gateway)
             if not gateway["single_attempt"] or not gateway["requested_model"]:
                 self.record("inference_usage_unknown", role=self.role, turn=self.calls, harness="anton",
                     reason="gateway_attempt_coverage")
+            if raw is not None and not raw.transport_complete:
+                self.stop("cleanup_unconfirmed")
             if (not gateway["single_attempt"] or not gateway["requested_model"]
                     or any(gateway[k] for k in ("dropped_params", "dropped_content", "clamped_params", "chain_truncated"))):
                 self.stop("gateway_policy_mismatch")
+        if raw is not None:
+            # Match the pinned SDK's recursive loose parsing, only after raw usage is durable.
+            from openai.types.responses import Response
+            response = Response.model_construct(**raw)
         self.admit()
         if model != self.config.model or getattr(response, "status", None) != "completed":
             self.stop("model_or_status_mismatch")
