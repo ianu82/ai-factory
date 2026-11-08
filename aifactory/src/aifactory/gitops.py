@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,6 +184,21 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
             adds += int(parts[0]) if parts[0].isdigit() else 0
             dels += int(parts[1]) if parts[1].isdigit() else 0
     return Patch(diff=diff, files=files, additions=adds, deletions=dels)
+
+
+_CONFLICT_MARKER = re.compile(rb"^\+(<{7}|>{7})( |$)")
+
+
+def conflict_marker_files(patch: Patch) -> list[str]:
+    """Files whose added lines still contain merge conflict markers (``<<<<<<<`` / ``>>>>>>>``)."""
+    files: list[str] = []
+    current = ""
+    for line in patch.diff.splitlines():
+        if line.startswith(b"+++ "):
+            current = line[6:].decode("utf-8", "replace") if line.startswith(b"+++ b/") else ""
+        elif current and current not in files and _CONFLICT_MARKER.match(line):
+            files.append(current)
+    return files
 
 
 def protected_violations(files: list[str], patterns: list[str]) -> list[str]:

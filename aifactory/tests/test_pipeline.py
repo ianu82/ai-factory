@@ -347,26 +347,43 @@ def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
     assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
 
 
-def test_a_requested_revision_that_conflicts_with_main_restarts_from_main(factory):
-    told = []
+def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_overlap(factory):
+    told, saw_markers, rejected = [], [], []
 
     def builder(messages):
-        if step(messages) == 0 and "starts from the latest main" in messages[1]["content"]:
+        prompt = messages[1]["content"]
+        if "Unresolved merge conflict markers" in prompt:
+            rejected.append(True)
+        elif "contain conflict markers" in prompt and "greet.sh" in prompt:
             told.append(True)
+            if step(messages) == 0:
+                return {"content": "", "tool_calls": [call("read_file", {"path": "greet.sh"})]}
+            saw_markers.append(any("<<<<<<< ours" in str(m.get("content")) for m in messages))
+            # first try: finish without resolving, so the policy check must catch the markers
+            return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "left as is"})]}
         return good_builder(messages)
 
     ScriptedModel.scripts["builder"] = builder
     outcome_id, main = _request_changes_after_main_moves(
         factory, lambda: _land_on_main(factory, "greet.sh", "echo 'Hi'\n"))
-    assert told
+    assert told and saw_markers == [True] and rejected
     kinds = _event_kinds(outcome_id)
-    assert "rebuild_on_main" in kinds and "rebased" not in kinds, " ".join(kinds)
+    assert "rebase_conflicts" in kinds and "rebuild_on_main" not in kinds, " ".join(kinds)
+    assert "candidate_rejected" in kinds
     with session_scope() as s:
         assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
     _approve_and_finish(factory, outcome_id)
     bare = factory["remotes"] / "acme/demo.git"
     assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
     assert "land greet.sh" in git("log", "--format=%s", "main", cwd=bare)
+
+
+def test_conflict_markers_are_found_only_at_the_start_of_added_lines():
+    diff = (b"diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1,5 @@\n+<<<<<<< ours\n+x\n+=======\n"
+            b"+y\n+>>>>>>> theirs\ndiff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n"
+            b"+    MARK = '<<<<<<< ours'\ndiff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ /dev/null\n")
+    patch = gitops.Patch(diff=diff, files=["m.py", "t.py", "gone.py"], additions=6, deletions=0)
+    assert gitops.conflict_marker_files(patch) == ["m.py"]
 
 
 def test_a_revision_replays_only_its_own_commits_when_main_was_rewritten(factory):
