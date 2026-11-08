@@ -40,7 +40,7 @@ class Orchestrator:
         self._tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._stopping = False
-        self._last_signal_sync = 0.0
+        self._last_signal_sync = float("-inf")
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -125,7 +125,7 @@ class Orchestrator:
         import time
         from datetime import timedelta
 
-        if time.monotonic() - getattr(self, "_last_cost_reconcile", 0.0) < 600:
+        if time.monotonic() - getattr(self, "_last_cost_reconcile", float("-inf")) < 600:
             return
         self._last_cost_reconcile = time.monotonic()
         from ..inference import InferenceError, ModelClient, resolve_provider
@@ -160,7 +160,7 @@ class Orchestrator:
         import time
 
         interval = int(os.environ.get("AIFACTORY_INSIGHT_INTERVAL_SECONDS", "1800"))
-        if interval <= 0 or time.monotonic() - getattr(self, "_last_analysis", 0.0) < interval:
+        if interval <= 0 or time.monotonic() - getattr(self, "_last_analysis", float("-inf")) < interval:
             return
         self._last_analysis = time.monotonic()
         from .. import insights
@@ -210,7 +210,7 @@ class Orchestrator:
     async def _maybe_inventory(self) -> None:
         import time
 
-        if time.monotonic() - getattr(self, "_last_inventory", 0.0) < 300:
+        if time.monotonic() - getattr(self, "_last_inventory", float("-inf")) < 300:
             return
         self._last_inventory = time.monotonic()
         await asyncio.to_thread(self.log_inventory)
