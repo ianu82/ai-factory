@@ -80,10 +80,31 @@ def apply_bootstrap() -> str | None:
     loop = asyncio.get_running_loop()
     task = loop.create_task(_connect(workspace_id, pending)) if pending else None
     declared = cfg.get("outcomes") or []
+    _cancel_declared(workspace_id, cfg.get("cancel") or [])
     if declared:
         loop.create_task(_declare_outcomes(workspace_id, declared, task))
     log.info("Bootstrap workspace ready: %s", workspace_id)
     return workspace_id
+
+
+def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
+    """Operator cancellation of declared outcomes (e.g. an accidental duplicate)."""
+    if not keys:
+        return
+    from .events import record
+    from .models import Outcome, Task
+
+    with session_scope() as s:
+        for key in keys:
+            outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                              Outcome.signal_id == f"operator:{key}").first()
+            if outcome is None or outcome.status in ("completed", "cancelled", "partially_completed"):
+                continue
+            outcome.status = "cancelled"
+            for t in s.query(Task).filter(Task.outcome_id == outcome.id, Task.status != "completed"):
+                t.status = "cancelled"
+            record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number} (declared key {key})",
+                   outcome_id=outcome.id, actor="operator", level="warn", session=s)
 
 
 async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) -> None:
