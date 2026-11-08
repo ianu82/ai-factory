@@ -81,6 +81,11 @@ def upsert_identity(db: Session, identity: dict[str, Any]) -> User:
         if not allowed:
             raise AuthError("This Factory is not open to your account yet. Ask an administrator for access.")
     user = db.query(User).filter(User.mindshub_user_id == str(identity["user_id"])).one_or_none()
+    if user is None and email:
+        # Adopt an operator-created account for the same (MindsHub-verified) email.
+        user = db.query(User).filter(User.email == email, User.mindshub_user_id.is_(None)).first()
+        if user is not None:
+            user.mindshub_user_id = str(identity["user_id"])
     if user is None:
         user = User(mindshub_user_id=str(identity["user_id"]), email=email,
                     name=identity.get("name") or (email.split("@")[0] if email else "MindsHub user"))
@@ -89,6 +94,23 @@ def upsert_identity(db: Session, identity: dict[str, Any]) -> User:
     else:
         user.email = email or user.email
     user.last_seen_at = utcnow()
+    # Operator invitations (bootstrap): grant the invited role and link the bootstrap
+    # organization to the person's real MindsHub organization the first time they sign in.
+    if email:
+        from .bootstrap import invited_role
+
+        for ws in db.query(Workspace).all():
+            role = invited_role(email, ws)
+            if not role:
+                continue
+            org = db.get(Organization, ws.org_id)
+            if org is not None and not org.mindshub_org_id and org_id and not db.query(Organization).filter(
+                    Organization.mindshub_org_id == org_id).first():
+                org.mindshub_org_id = org_id
+                ws.mindshub_workspace_id = ws.mindshub_workspace_id or identity.get("workspace_id")
+            if not db.query(Membership).filter(Membership.workspace_id == ws.id, Membership.user_id == user.id).first():
+                db.add(Membership(workspace_id=ws.id, user_id=user.id, role=role))
+        db.flush()
     if org_id:
         org = db.query(Organization).filter(Organization.mindshub_org_id == org_id).one_or_none()
         if org is None:

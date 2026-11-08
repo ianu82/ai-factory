@@ -39,6 +39,7 @@ class Orchestrator:
         self._tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._stopping = False
+        self._last_signal_sync = 0.0
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -82,6 +83,7 @@ class Orchestrator:
             try:
                 await asyncio.to_thread(self._promote)
                 self._schedule()
+                await self._maybe_sync_signals()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -89,6 +91,37 @@ class Orchestrator:
             except asyncio.TimeoutError:
                 pass
             self._wake.clear()
+
+    async def _maybe_sync_signals(self) -> None:
+        """Poll GitHub for issues and CI failures every few minutes (intake + feedback)."""
+        import time
+
+        interval = int(os.environ.get("AIFACTORY_SIGNAL_INTERVAL_SECONDS", "180"))
+        if interval <= 0 or time.monotonic() - self._last_signal_sync < interval:
+            return
+        self._last_signal_sync = time.monotonic()
+        from ..db import SessionLocal
+        from ..github import GitHubError, resolve_token
+        from ..models import Repository
+        from ..signals import sync_github
+
+        with session_scope() as s:
+            targets = {r.workspace_id for r in s.query(Repository)}
+            paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
+        for workspace_id in targets - paused:
+            if (workspace_settings(workspace_id).get("signals") or {}).get("auto_sync") is False:
+                continue
+            db = SessionLocal()
+            try:
+                result = await sync_github(db, workspace_id, resolve_token(workspace_id))
+                if result.get("accepted"):
+                    self.wake()
+            except GitHubError as exc:
+                log.warning("signal sync skipped for %s: %s", workspace_id, exc)
+            except Exception:
+                log.exception("signal sync failed for %s", workspace_id)
+            finally:
+                db.close()
 
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""

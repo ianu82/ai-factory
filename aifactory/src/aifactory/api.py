@@ -549,6 +549,7 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
                                          Event.kind.in_(["outcome_completed", "merged", "plan_proposed", "published",
                                                          "decision_resolved", "task_completed", "outcome_created"]))
                   .order_by(Event.id.desc()).limit(50).all())
+    change_outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({e.outcome_id for e in recent if e.outcome_id}))}
     return {
         "decisions": [S.decision(d, {
             "outcome_number": outcomes[d.outcome_id].number if d.outcome_id in outcomes else None,
@@ -558,7 +559,9 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
             "priority": outcomes[d.outcome_id].priority if d.outcome_id in outcomes else 2,
         }) for d in decisions],
         "since": S.ts(since),
-        "changes": [event_dict(e) for e in recent],
+        "changes": [event_dict(e) | ({"outcome_number": change_outcomes[e.outcome_id].number,
+                                       "outcome_title": change_outcomes[e.outcome_id].title}
+                                      if e.outcome_id in change_outcomes else {}) for e in recent],
     }
 
 

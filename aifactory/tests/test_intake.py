@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import asyncio
+import json
+
+from aifactory import auth as auth_module
+from aifactory import signals as signals_module
+from aifactory.bootstrap import apply_bootstrap
+from aifactory.db import SessionLocal, session_scope
+from aifactory.models import Membership, Organization, Outcome, Repository, Signal, Workspace
+
+
+def test_bootstrap_invite_links_real_mindshub_org_on_first_sign_in(client, monkeypatch):
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "MindsDB", "workspace": "AI Factory", "admins": ["Lead@MindsDB.com"],
+        "settings": {"autonomy": {"merge": "approval"}}}))
+
+    async def run():
+        return apply_bootstrap()
+
+    ws_id = asyncio.run(run())
+    assert asyncio.run(run()) == ws_id  # idempotent
+
+    async def identity(bearer):
+        return {"valid": True, "user_id": "u-9", "email": "lead@mindsdb.com", "organization_id": "mh-org-1",
+                "organization_name": "MindsDB", "workspace_id": "mh-ws-1", "roles": []}
+
+    monkeypatch.setattr(auth_module, "mindshub_identity", identity)
+    r = client.post("/auth/api-key", json={"key": "mdb_lead.secretvalue", "use_for_inference": False})
+    assert r.status_code == 200, r.text
+    me = client.get("/api/me").json()
+    assert [w["id"] for w in me["workspaces"]] == [ws_id]
+    assert me["workspaces"][0]["role"] == "owner"
+    assert me["workspaces"][0]["settings"]["autonomy"]["merge"] == "approval"
+    with session_scope() as s:
+        assert s.query(Organization).count() == 1
+        assert s.query(Organization).one().mindshub_org_id == "mh-org-1"
+
+
+def test_labelled_issues_become_outcomes_once_and_plain_label_is_only_proposed(monkeypatch):
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={})
+        s.add(ws)
+        s.flush()
+        s.add(Repository(workspace_id=ws.id, full_name="acme/app", default_branch="main", config={}))
+        ws_id = ws.id
+    comments = []
+
+    class FakeGH:
+        def __init__(self, token):
+            pass
+
+        async def issues(self, full_name, labels="", since=None):
+            if labels == "factory:auto":
+                return [{"number": 7, "title": "Add CSV export", "body": "Please", "html_url": "https://gh/7",
+                         "user": {"login": "ian"}}]
+            if labels == "factory":
+                return [{"number": 8, "title": "Slow log page", "body": "", "html_url": "https://gh/8", "user": {}}]
+            return []
+
+        async def comment(self, full_name, number, body):
+            comments.append((number, body))
+
+        async def request(self, *args, **kwargs):
+            return {"workflow_runs": []}
+
+    monkeypatch.setattr(signals_module, "GitHub", FakeGH)
+    for _ in range(2):
+        db = SessionLocal()
+        result = asyncio.run(signals_module.sync_github(db, ws_id, "t"))
+        db.close()
+    assert result["accepted"] == 0  # second pass does not duplicate
+    with session_scope() as s:
+        outcomes = s.query(Outcome).filter(Outcome.workspace_id == ws_id).all()
+        assert [o.title for o in outcomes] == ["Add CSV export"] and outcomes[0].source == "signal"
+        sigs = {x.external_id: x for x in s.query(Signal)}
+        assert sigs["acme/app#7"].status == "accepted" and sigs["acme/app#8"].status == "new"
+    assert comments == [(7, comments[0][1])] and "outcome #1" in comments[0][1]

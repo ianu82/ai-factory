@@ -58,7 +58,27 @@ def init_engine(url: str | None = None) -> Engine:
     from . import models  # noqa: F401  (register tables)
 
     Base.metadata.create_all(_engine)
+    harden_data_dir()
     return _engine
+
+
+def harden_data_dir() -> None:
+    """Job sandboxes run as other UIDs: they may traverse the data dir but not read it."""
+    import os
+
+    settings = get_settings()
+    root = settings.data_dir
+    try:
+        os.chmod(root, 0o711)
+        for entry in root.iterdir():
+            if entry.name == "jobs":
+                os.chmod(entry, 0o711)
+            elif entry.is_dir():
+                os.chmod(entry, 0o700)
+            else:
+                os.chmod(entry, 0o600)
+    except (FileNotFoundError, PermissionError):
+        pass
 
 
 def engine() -> Engine:

@@ -55,6 +55,9 @@ class ProviderConfig:
     base_url: str
     api_key: str
     label: str
+    # Set when a server bootstrap credential for a different provider is used, so roles
+    # get a model that provider actually serves (recorded on every run).
+    model_override: str | None = None
 
     def headers(self, session_id: str | None = None) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -101,6 +104,7 @@ def resolve_provider(workspace_id: str) -> ProviderConfig:
                 break
         else:
             key, provider = "", preferred
+    override = None
     if not key:
         # Server-level bootstrap keys (explicitly configured by the operator) are a fallback.
         if preferred == "mindshub" and settings.bootstrap_mindshub_key:
@@ -109,12 +113,18 @@ def resolve_provider(workspace_id: str) -> ProviderConfig:
             key, provider = settings.bootstrap_openai_key, "openai"
         elif settings.bootstrap_mindshub_key:
             key, provider = settings.bootstrap_mindshub_key, "mindshub"
+        if key and provider != preferred:
+            import os
+
+            override = os.environ.get(f"AIFACTORY_BOOTSTRAP_{provider.upper()}_MODEL") or (
+                "gpt-6.1-terra" if provider == "openai" else "gpt-terra")
     if not key:
         raise InferenceError(
             "No model provider is configured for this workspace. Add a MindsHub Inference key in Settings."
         )
     base = settings.mindshub_api_base if provider == "mindshub" else settings.openai_api_base
-    return ProviderConfig(provider=provider, base_url=base, api_key=key, label=PROVIDERS[provider]["label"])
+    return ProviderConfig(provider=provider, base_url=base, api_key=key, label=PROVIDERS[provider]["label"],
+                          model_override=override)
 
 
 def price_for(model: str, workspace_settings: dict[str, Any] | None = None) -> tuple[float, float] | None:

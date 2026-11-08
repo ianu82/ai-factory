@@ -29,6 +29,9 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         run = settings.orchestrator_enabled if start_orchestrator is None else start_orchestrator
+        from .bootstrap import apply_bootstrap
+
+        apply_bootstrap()
         if run:
             orchestrator.start()
         yield

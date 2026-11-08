@@ -57,23 +57,66 @@ def upsert_signal(db: Session, workspace_id: str, *, source: str, title: str, bo
 
 
 async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, Any]:
-    """Pull open issues labelled `factory` and recent failing default-branch CI runs as signals."""
+    """Pull GitHub issues and failing default-branch CI runs as signals.
+
+    Issues labelled ``factory`` become proposed signals. Issues labelled ``factory:auto``
+    (pre-authorized work) become outcomes immediately and are acknowledged on the issue.
+    """
+    from .config import get_settings
+
     gh = GitHub(token)
-    created = updated = 0
+    created = updated = accepted = 0
     for repo in db.query(Repository).filter(Repository.workspace_id == workspace_id):
-        label = (repo.config or {}).get("signal_label", "factory")
-        for issue in await gh.issues(repo.full_name, labels=label):
-            _, new = upsert_signal(db, workspace_id, source="github_issue", title=issue["title"],
-                                   body=issue.get("body") or "", url=issue["html_url"],
-                                   external_id=f"{repo.full_name}#{issue['number']}", repo_id=repo.id)
-            created += new
-            updated += not new
+        cfg = repo.config or {}
+        label = cfg.get("signal_label", "factory")
+        auto_label = cfg.get("auto_label", "factory:auto")
+        seen: set[int] = set()
+        for wanted, auto in ((auto_label, True), (label, False)):
+            if not wanted:
+                continue
+            for issue in await gh.issues(repo.full_name, labels=wanted):
+                if issue["number"] in seen:
+                    continue
+                seen.add(issue["number"])
+                sig, new = upsert_signal(db, workspace_id, source="github_issue", title=issue["title"],
+                                         body=issue.get("body") or "", url=issue["html_url"],
+                                         external_id=f"{repo.full_name}#{issue['number']}", repo_id=repo.id)
+                created += new
+                updated += not new
+                if auto and sig.status == "new":
+                    author = (issue.get("user") or {}).get("login", "")
+                    outcome = outcome_from_text(
+                        db, workspace_id, None, issue["title"],
+                        f"{issue.get('body') or ''}\n\nSource: {issue['html_url']} (opened by {author}, labelled {auto_label})",
+                        [repo.id], source="signal", signal_id=sig.id)
+                    sig.status, sig.outcome_id = "accepted", outcome.id
+                    accepted += 1
+                    record(workspace_id, "signal_accepted",
+                           f"Accepted {repo.full_name}#{issue['number']} automatically (label {auto_label})",
+                           outcome_id=outcome.id, session=db, data={"url": issue["html_url"]})
+                    base = get_settings().public_url
+                    link = f"{base}/w/{workspace_id}/outcomes/{outcome.id}" if base.startswith("https") else ""
+                    try:
+                        await gh.comment(repo.full_name, issue["number"],
+                                         f"AI Factory picked this up as outcome #{outcome.number}."
+                                         + (f" Follow progress: {link}" if link else ""))
+                    except Exception:
+                        pass
         try:
             runs = await gh.request("GET", f"/repos/{repo.full_name}/actions/runs",
                                     params={"branch": repo.default_branch, "status": "failure", "per_page": 5})
         except Exception:
             runs = {}
+        latest_ok = None
+        try:
+            ok_runs = await gh.request("GET", f"/repos/{repo.full_name}/actions/runs",
+                                       params={"branch": repo.default_branch, "status": "success", "per_page": 1})
+            latest_ok = (ok_runs.get("workflow_runs") or [{}])[0].get("created_at")
+        except Exception:
+            pass
         for run in (runs or {}).get("workflow_runs", [])[:3]:
+            if latest_ok and run.get("created_at", "") < latest_ok:
+                continue  # already fixed by a later green run
             _, new = upsert_signal(db, workspace_id, source="ci_failure",
                                    title=f"{run.get('name', 'CI')} failing on {repo.default_branch} in {repo.full_name}",
                                    body=f"Run {run.get('html_url')} failed at {run.get('head_sha', '')[:8]}.",
@@ -83,4 +126,4 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
             updated += not new
     db.commit()
     notify(workspace_id, "signal", "sync")
-    return {"created": created, "updated": updated}
+    return {"created": created, "updated": updated, "accepted": accepted}

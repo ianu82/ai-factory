@@ -94,6 +94,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     models = workspace_models(settings)
     model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier}[spec.role]
     provider = resolve_provider(spec.workspace_id)
+    model = provider.model_override or model
     limits = settings["limits"]
     budgets = settings["budgets"]
     with session_scope() as s:

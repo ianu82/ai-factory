@@ -18,6 +18,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "serve":
         import uvicorn
 
+        os.umask(0o077)  # control-plane files stay private; job sandboxes set their own umask
+
         from .app import create_app
 
         uvicorn.run(create_app(), host=args.host, port=args.port, proxy_headers=True, forwarded_allow_ips="*",

@@ -68,7 +68,11 @@ def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None 
             "completed_at": ts(o.completed_at), "progress": {"done": done, "total": len(tasks)},
             "cost_usd": round(sum(r.cost_usd for r in runs), 4), "cost_known": all(r.cost_known for r in runs),
             "open_decisions": open_decisions,
-            "prs": [{"number": t.pr_number, "url": t.pr_url, "task": t.key} for t in tasks if t.pr_url]}
+            "prs": [{"number": t.pr_number, "url": t.pr_url, "task": t.key} for t in tasks if t.pr_url],
+            "track": [{"key": t.key, "status": t.status, "stage": t.stage,
+                       "evidence": {k: {"state": (t.evidence or {}).get(k, {}).get("state")}
+                                    for k in ("ci", "smoke") if (t.evidence or {}).get(k)}}
+                      for t in sorted(tasks, key=lambda t: t.key)]}
 
 
 def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, Any]:
