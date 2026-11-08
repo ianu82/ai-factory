@@ -10,6 +10,8 @@ runs:
         "$RUNNER_TEMP/factory-ci-tools/bin/python" -m pip install \
           --index-url https://pypi.org/simple --only-binary=:all: --no-deps \
           --disable-pip-version-check --no-cache-dir --retries 0 --timeout 20 uv==0.13.7
-        test "$("$RUNNER_TEMP/factory-ci-tools/bin/uv" --version)" = 'uv 0.13.7'
+        version_line="$("$RUNNER_TEMP/factory-ci-tools/bin/uv" --version)"
+        printf '%s\n' "$version_line"
+        [[ "$version_line" =~ ^uv[[:space:]]0\.13\.7([[:space:]]|$) ]]
         printf '%s\n' "$RUNNER_TEMP/factory-ci-tools/bin" >> "$GITHUB_PATH"
         printf '%s\n' 'UV_PYTHON=3.13' >> "$GITHUB_ENV"
