@@ -94,6 +94,12 @@ async def prune_environments(keep_for: str, keep: int = 2) -> list[str]:
     return deleted
 
 
+def vm_work_root() -> str:
+    """Where the checkout lives inside a VM (the image's workdir). Tests point this at a path that can never be a
+    real directory on the machine running them, so a checkout that itself lives at /work is never confused with it."""
+    return os.environ.get("AIFACTORY_VM_WORK", "/work")
+
+
 def vm_available() -> tuple[bool, str]:
     if not shutil.which("node"):
         return False, "Node.js is not installed"
@@ -204,7 +210,7 @@ class RailwayVMSandbox:
         self.vm_id = vm_id
         self.bridge = bridge
         self.region = region
-        self.work = PurePosixPath("/work")
+        self.work = PurePosixPath(vm_work_root())
         self.home = PurePosixPath("/root")
         self.uid = None
         self.prepared: str | None = None  # checkpoint this VM booted from, when it did
@@ -244,7 +250,7 @@ class RailwayVMSandbox:
                 vm = await cls.create(checkpoint=prepared, **kwargs)
                 prune = " -o ".join(f"-name {shlex.quote(name)}" for name in keep)
                 result = await vm.exec(
-                    f"mkdir -p /work && cd /work && find . -mindepth 1 \\( {prune} \\) -prune -o \\( -type f -o -type l \\)"
+                    f"mkdir -p {vm.work} && cd {vm.work} && find . -mindepth 1 \\( {prune} \\) -prune -o \\( -type f -o -type l \\)"
                     " -print0 | xargs -0 -r rm -f", timeout=300, cwd="/")
                 if not result.ok:
                     raise SandboxError(f"Could not reset the prepared checkout: {result.output[-300:]}")
@@ -269,8 +275,8 @@ class RailwayVMSandbox:
                 raise SandboxError("Checkout is too large to upload to a VM")
             await vm.bridge.call("write", {"id": vm.vm_id, "path": "/tmp/work.tgz", "base64": base64.b64encode(data).decode()},
                                  timeout=600)
-            result = await vm.exec("mkdir -p /work && tar xzf /tmp/work.tgz -C /work && rm /tmp/work.tgz "
-                                   "&& git config --global --add safe.directory /work", timeout=300, cwd="/")
+            result = await vm.exec(f"mkdir -p {vm.work} && tar xzf /tmp/work.tgz -C {vm.work} && rm /tmp/work.tgz "
+                                   f"&& git config --global --add safe.directory {vm.work}", timeout=300, cwd="/")
             if not result.ok:
                 raise SandboxError(f"Could not unpack the checkout in the VM: {result.output[-500:]}")
             log.info("VM %s ready with checkout in %.0fs", vm.vm_id, time.monotonic() - started)

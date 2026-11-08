@@ -27,9 +27,9 @@ class FakeBridge:
         import re
 
         # One pass, so a mapped path (which may itself live under /tmp on Linux) is never mapped again.
-        targets = {"/work": str(self.root / "work"), "/tmp/": str(self.root / "tmp") + "/",
+        targets = {"/fake-vm-work": str(self.root / "work"), "/tmp/": str(self.root / "tmp") + "/",
                    "/root": str(self.root / "home")}
-        return re.sub(r"(^|[\s\"'=:;(])(/work|/tmp/|/root)", lambda m: m.group(1) + targets[m.group(2)], text)
+        return re.sub(r"(^|[\s\"'=:;(])(/fake-vm-work|/tmp/|/root)", lambda m: m.group(1) + targets[m.group(2)], text)
 
     async def call(self, op, args=None, timeout=600):
         args = args or {}
@@ -76,7 +76,7 @@ class FakeBridge:
                 data = data[-args["length"]:] if args.get("fromEnd") else data[:args["length"]]
             return {"base64": base64.b64encode(data).decode()}
         if op == "exec":
-            cwd = self._map(args.get("cwd") or "/work")
+            cwd = self._map(args.get("cwd") or "/fake-vm-work")
             if cwd == "/":
                 cwd = str(self.root)
             import os
@@ -90,7 +90,7 @@ class FakeBridge:
         if op == "spawn":
             import os
 
-            proc = await asyncio.create_subprocess_shell(self._map(args["command"]), cwd=self._map(args.get("cwd") or "/work"),
+            proc = await asyncio.create_subprocess_shell(self._map(args["command"]), cwd=self._map(args.get("cwd") or "/fake-vm-work"),
                                                          start_new_session=True, env={**os.environ, **(args.get("env") or {}), "HOME": str(self.root), "PLAYWRIGHT_BROWSERS_PATH": BROWSERS})
             pid = f"p{len(self.procs)}"
             self.procs[pid] = proc
