@@ -277,6 +277,122 @@ def test_ci_failure_returns_to_builder_with_logs(factory):
         FakeGitHub.checks = original
 
 
+def _land_on_main(factory, path, content):
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    (seed / path).write_text(content)
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", f"land {path}", cwd=seed)
+    git("push", "-q", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+    return git("rev-parse", "HEAD", cwd=seed)
+
+
+def _event_kinds(outcome_id):
+    with session_scope() as s:
+        return [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+
+
+def _request_changes_after_main_moves(factory, path, content):
+    """Merge needs approval; while it waits, main moves; the reviewer requests changes. Returns (outcome, main sha)."""
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {"plan": "auto", "merge": "approval", "release": "auto"}}
+    outcome_id = new_outcome(factory)
+
+    def merge_decision():
+        with session_scope() as s:
+            d = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.kind == "approve_merge",
+                                         Decision.status == "open").one_or_none()
+            return d.id if d else None
+
+    assert drive(lambda: merge_decision() is not None)
+    main = _land_on_main(factory, path, content)
+    db = SessionLocal()
+    resolve(db, db.get(Decision, merge_decision()), db.get(User, factory["user"]), "reject",
+            comment="Please also keep the script POSIX-only.")
+    db.close()
+    assert drive(lambda: merge_decision() is not None)
+    return outcome_id, main
+
+
+def _approve_and_finish(factory, outcome_id):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.kind == "approve_merge",
+                                            Decision.status == "open").one()
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision.id), db.get(User, factory["user"]), "approve")
+    db.close()
+    finished = drive(lambda: outcome_status(outcome_id) == "completed")
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert finished, (task.status, task.blocked_reason, " ".join(_event_kinds(outcome_id)))
+
+
+def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
+    outcome_id, main = _request_changes_after_main_moves(factory, "other.txt", "landed meanwhile\n")
+    kinds = _event_kinds(outcome_id)
+    assert "rebased" in kinds and "rebuild_on_main" not in kinds, " ".join(kinds)
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
+def test_a_requested_revision_that_conflicts_with_main_restarts_from_main(factory):
+    told = []
+
+    def builder(messages):
+        if step(messages) == 0 and "starts from the latest main" in messages[1]["content"]:
+            told.append(True)
+        return good_builder(messages)
+
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id, main = _request_changes_after_main_moves(factory, "greet.sh", "echo 'Hi'\n")
+    assert told
+    kinds = _event_kinds(outcome_id)
+    assert "rebuild_on_main" in kinds and "rebased" not in kinds, " ".join(kinds)
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert "land greet.sh" in git("log", "--format=%s", "main", cwd=bare)
+
+
+def test_a_fix_that_gets_no_ci_because_main_moved_is_revalidated_not_blocked(factory):
+    states = iter(["failure", "none"])
+    original = FakeGitHub.checks
+
+    async def checks(self, full_name, sha):
+        state = next(states, "success")
+        if state == "failure":
+            _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        FakeGitHub.check_state = state
+        return await original(self, full_name, sha)
+
+    FakeGitHub.checks = checks
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "require_ci": True}
+    try:
+        outcome_id = new_outcome(factory)
+        assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
+    finally:
+        FakeGitHub.checks = original
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert outcome_status(outcome_id) == "completed", task.blocked_reason
+    kinds = _event_kinds(outcome_id)
+    assert kinds.index("revalidate") < kinds.index("merged"), " ".join(kinds)
+
+
 def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     def planner(messages):
         if step(messages) == 0:
