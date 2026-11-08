@@ -53,6 +53,30 @@ contract validation). Changes since go through pull requests (#198 builder VMs, 
 service has no deploy trigger and is untouched. Declared bootstrap values apply when the operator
 changes them, so settings changed in the app survive redeploys.
 
+## Factory building Factory (overnight, 8–9 November)
+
+Ian filed about twenty ambitious `factory:auto` issues on `ianu82/ai-factory` (Linear intake, onboarding,
+attachments, image-aware workers, Anton tools in the sandbox, evals and measurement, regret-free merge rate,
+risk judge and autonomy levels, decision judges, workstreams, knowledge and skills, Mind, review-comment
+handling, safer parallel delivery and more), and three more were added for evals monitoring (#234), Factory
+health and SLOs (#235) and browser end-to-end tests (#236). The Factory plans each into tasks and builds them
+in Railway VMs (builders and verifiers), on MindsHub models. Merges into `ai-factory` need a person by policy;
+under Ian's standing overnight directive an operator merges a Factory PR only when it is waiting on a person,
+its checks are green and its review comments are addressed (the reviewer bot re-reviews the revised commit
+and finds nothing new).
+
+What the operator did, all recorded in the Factory as decisions "delegated by ian@mindsdb.com":
+- review findings from the reviewer bot were sent back as "Request changes" with the exact findings, so the
+  Factory revised the same branches, re-verified and re-ran CI;
+- tasks that ran out of attempts were retried with specific guidance taken from the verifier's last findings;
+- two planner questions were answered from the issues' own acceptance criteria.
+
+Platform fixes made along the way: verifier VMs failed three tests even on main (a fake-VM path collision and
+the Codex CLI tests), fixed in #247; rebuilds after a parallel merge no longer exhaust the attempt budget (#202);
+PRs merged or closed on GitHub are reconciled (#230); live updates recover after deploys (#230).
+
+Each delivered Factory issue will be listed here with its classification once merged.
+
 ## Roadmap
 
 | Item | Status in v2 | Evidence / remaining |
@@ -66,12 +90,12 @@ changes them, so settings changed in the app survive redeploys.
 | F04 Coding model choice | Models per role from the provider's live list | — |
 | F19 MindsHub sign-in & onboarding | API-key sign-in live; orgs/workspaces from MindsHub Auth; invited admins; setup checklist | OIDC coded; needs the domain on MindsHub's redirect allowlist (deliberately not blocking) |
 | F07 Workspaces | Isolated repos, credentials, policies, budgets, history | Two-workspace live test not yet run |
-| F08 Internal app | Inbox, Outcomes, Runs, Signals, Decisions, Settings; responsive | Rendered with fixtures and live data |
+| F08 Internal app | Inbox (grouped compact rows, inline actions, detail pane), Outcomes, Pull requests (GitHub, grouped by what each needs), Runs, Signals, Decisions, Settings; responsive; live updates that recover after deploys | Rendered with fixtures and live data |
 | F09 Acceptance & recovery | Durable stages; restarts resume without cancelling (an interrupted attempt is redone, not counted); operator retry/resolve; revert on smoke failure; in-app recovery guide (Inbox → How recovery works); costs reconciled from MindsHub usage when it lags | — |
 | F10 Visual & risk review | Runtime QA screenshots/probes as verifier evidence and in PRs; protected paths and change-size limits | Visual diffing against the base not built |
 | F11 Watch & intervene | Live activity, guidance delivered to the active agent, cancel, **take over** from a task or from a stuck task's decision (candidate pushed as an unverified draft PR, task ends `handed_over`) | — |
 | F12 Product signals | GitHub issues, failing main CI, smoke/release failures, **product feedback API** (workspace key) and hand-logged feedback | Analytics/error-tracker connectors not built |
 | F13 Reuse human decisions | Attributed decisions; "remember" → precedents; **improvement proposals** from decisions and run history (policy, team notes, budgets, workers), applied by admins with attribution | — |
 | F14 Bounded remediation | Smoke failure → revert PR (policy or decision); signals → proposed outcomes | Auto-remediation of failing main CI is opt-in via `factory:auto` only |
-| F15 Customer onboarding | Sign-in restricted to `@mindsdb.com`; cross-tenant isolation tested over every workspace route; **Postgres supported** (CI runs the suite on Postgres 17); **builders can run in their own Railway VM** (`build.isolation: "vm"`, enabled for calorie-tracker) | GitHub App onboarding not built (a PAT per workspace). Codex runs in VMs through the public HTTPS gateway (#201; live in #11) |
+| F15 Customer onboarding | Sign-in restricted to `@mindsdb.com`; cross-tenant isolation tested over every workspace route; **Postgres supported** (CI runs the suite on Postgres 17); **builders can run in their own Railway VM** (`build.isolation: "vm"`, enabled for calorie-tracker and ai-factory) | GitHub App onboarding not built (a PAT per workspace). Codex runs in VMs through the public HTTPS gateway (#201; live in #11) |
 | F16/F17 | Deferred | — |
