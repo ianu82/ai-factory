@@ -71,11 +71,14 @@ def apply_bootstrap() -> str | None:
         pending = []
         for entry in cfg.get("repositories", []):
             name, overrides = (entry, {}) if isinstance(entry, str) else (entry.get("full_name"), entry.get("config") or {})
+            branch = None if isinstance(entry, str) else entry.get("default_branch")
             if name in existing:
                 if overrides:
                     existing[name].config = {**(existing[name].config or {}), **overrides}
+                if branch:
+                    existing[name].default_branch = branch
             elif name:
-                pending.append((name, overrides))
+                pending.append((name, {**overrides, **({"_base_branch": branch} if branch else {})}))
         workspace_id = ws.id
     loop = asyncio.get_running_loop()
     task = loop.create_task(_connect(workspace_id, pending)) if pending else None
@@ -186,14 +189,14 @@ async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
         try:
             gh = GitHub(resolve_token(workspace_id))
             info = await gh.repo(name)
-            config = {**await detect(gh, name, info.get("default_branch") or "main"), **overrides}
+            branch = overrides.pop("_base_branch", None) or info.get("default_branch") or "main"
+            config = {**await detect(gh, name, branch), **overrides}
         except GitHubError as exc:
             log.error("Bootstrap could not connect %s: %s", name, exc)
             continue
         with session_scope() as s:
             if not s.query(Repository).filter(Repository.workspace_id == workspace_id,
                                               Repository.full_name == info["full_name"]).first():
-                s.add(Repository(workspace_id=workspace_id, full_name=info["full_name"],
-                                 default_branch=info.get("default_branch") or "main",
+                s.add(Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=branch,
                                  description=info.get("description") or "", config=config))
         log.info("Bootstrap connected %s", name)
