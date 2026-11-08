@@ -4,7 +4,7 @@ import { ExternalLink } from "lucide-react";
 import { api, type Decision } from "../api";
 import { useWs } from "../App";
 import { ago, DECISION_KIND } from "../format";
-import { useToast } from "../ui";
+import { Prose, useToast } from "../ui";
 
 const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
 
@@ -50,7 +50,7 @@ export function DecisionCard({ d, showContext = false, onOpen }: { d: Decision; 
           <button className="linkish" onClick={onOpen}>#{d.outcome_number} {d.outcome_title}{d.task_key ? ` · ${d.task_key}` : ""}</button>
         </div>
       )}
-      {d.body && <div className="prose">{d.body}</div>}
+      {d.body && <Prose text={d.body} />}
       {d.pr_url && <a className="linkish" href={d.pr_url} target="_blank" rel="noreferrer" style={{ marginTop: 6 }}>Review the pull request <ExternalLink /></a>}
       {canAct && (
         <>

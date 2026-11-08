@@ -163,6 +163,29 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
 export const useToast = () => useContext(ToastCtx);
 
+const INLINE = /(\*\*[^*\n]+\*\*|`[^`\n]+`|https?:\/\/[^\s)]+)/g;
+
+function inline(text: string, key: string): ReactNode[] {
+  return text.split(INLINE).filter(Boolean).map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={`${key}-${i}`}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith("`") && part.endsWith("`")) return <code key={`${key}-${i}`} className="mono inline-code">{part.slice(1, -1)}</code>;
+    if (/^https?:\/\//.test(part)) return <a key={`${key}-${i}`} className="linkish" href={part} target="_blank" rel="noreferrer">{part.replace(/^https?:\/\//, "").slice(0, 60)}</a>;
+    return <span key={`${key}-${i}`}>{part}</span>;
+  });
+}
+
+/** Agent-written text: a tiny, safe markdown subset rendered as React elements (no HTML injection). */
+export function Prose({ text, className = "" }: { text: string; className?: string }) {
+  const blocks = (text || "").split(/```[a-z]*\n?/);
+  return (
+    <div className={`prose ${className}`}>
+      {blocks.map((block, i) =>
+        i % 2 === 1 ? <pre key={i} className="log" style={{ margin: "6px 0" }}>{block.replace(/\n$/, "")}</pre>
+          : <span key={i}>{inline(block, String(i))}</span>)}
+    </div>
+  );
+}
+
 export function DiffView({ text }: { text: string }) {
   const lines = text.split("\n").slice(0, 4000);
   return (

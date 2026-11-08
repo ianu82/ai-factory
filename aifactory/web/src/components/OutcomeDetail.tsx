@@ -4,7 +4,7 @@ import { Ban, X } from "lucide-react";
 import { api, type FactoryEvent, type OutcomeDetail as Detail } from "../api";
 import { useWs } from "../App";
 import { ago, clock, HARNESS_LABEL, money } from "../format";
-import { Skeleton, Status, useToast } from "../ui";
+import { Prose, Skeleton, Status, useToast } from "../ui";
 import { DecisionCard } from "./DecisionCard";
 import { TaskCard } from "./TaskCard";
 
@@ -69,7 +69,7 @@ export function OutcomeDetail({ outcomeId, onClose }: { outcomeId: string; onClo
       )}
 
       {outcome.status === "blocked" && outcome.blocked_reason && open.length === 0 && (
-        <section className="p-sec"><div className="prose" style={{ color: "var(--bad)" }}>{outcome.blocked_reason}</div></section>
+        <section className="p-sec"><div style={{ color: "var(--bad)" }}><Prose text={outcome.blocked_reason} /></div></section>
       )}
 
       <section className="p-sec">
@@ -85,7 +85,7 @@ export function OutcomeDetail({ outcomeId, onClose }: { outcomeId: string; onClo
 
       <section className="p-sec">
         <h3>Request</h3>
-        <div className="prose">{outcome.brief || <span className="faint">No description</span>}</div>
+        {outcome.brief ? <Prose text={outcome.brief} /> : <span className="faint">No description</span>}
         {outcome.acceptance.length > 0 && (
           <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--body)" }}>
             {outcome.acceptance.map((a) => <li key={a}>{a}</li>)}
@@ -96,7 +96,7 @@ export function OutcomeDetail({ outcomeId, onClose }: { outcomeId: string; onClo
       {plan && (
         <section className="p-sec">
           <h3>Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : "approved by policy") : plan.status}</span></h3>
-          <div className="prose">{plan.summary}</div>
+          <Prose text={plan.summary} />
           {(plan.content.risks || []).length > 0 && (
             <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--muted)", fontSize: 12.5 }}>
               {(plan.content.risks || []).map((r: string) => <li key={r}>{r}</li>)}
@@ -163,7 +163,7 @@ function Conversation({ outcomeId, messages, active }: { outcomeId: string; mess
           <div key={m.id} className="bubble">
             <div className="by"><b style={{ color: "var(--ink)", fontWeight: 550 }}>{m.author || "Factory"}</b><span>{ago(m.created_at)}</span>
               {m.author_kind === "user" && <span className="faint">{m.delivered ? "· delivered to the agent" : "· waiting for the next agent turn"}</span>}</div>
-            <div className="body">{m.body}</div>
+            <Prose text={m.body} className="body" />
           </div>
         ))}
       </div>

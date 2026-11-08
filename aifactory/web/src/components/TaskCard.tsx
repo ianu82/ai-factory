@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, ExternalLink, GitPullRequest } from "lucide-
 import { api, type Artifact, type Run, type Task } from "../api";
 import { useWs } from "../App";
 import { duration, HARNESS_LABEL, money, tokens } from "../format";
-import { DiffView, GateTrack, Mark, Status } from "../ui";
+import { DiffView, GateTrack, Mark, Prose, Status } from "../ui";
 
 const STAGE_TEXT: Record<string, string> = {
   prepare: "Preparing a fresh checkout", build: "Building", revise: "Revising", checks: "Running checks",
@@ -144,7 +144,7 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
       {task.spec && (
         <details>
           <summary className="linkish" style={{ cursor: "pointer" }}>Specification</summary>
-          <div className="prose" style={{ marginTop: 6, fontSize: 12.5 }}>{task.spec}</div>
+          <div style={{ marginTop: 6, fontSize: 12.5 }}><Prose text={task.spec} /></div>
         </details>
       )}
 
