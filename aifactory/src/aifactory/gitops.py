@@ -78,8 +78,25 @@ async def mirror(full_name: str, token: str) -> Path:
             shutil.rmtree(tmp, ignore_errors=True)
             await git("clone", "--bare", url, str(tmp), env=env, timeout=900)
             tmp.rename(path)
-        await git("fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", cwd=path, env=env, timeout=900)
+        # Jobs copy the mirror while other jobs fetch into it: no background maintenance may touch its files.
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false"), ("fetch.writeCommitGraph", "false")):
+            await git("config", key, value, cwd=path)
+        await git("-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "--prune", "origin",
+                  "+refs/heads/*:refs/heads/*", cwd=path, env=env, timeout=900)
     return path
+
+
+async def clone_mirror(mirror_path: Path, dest: Path, env: dict[str, str]) -> None:
+    """Copy the mirror into a job directory, retrying once if a concurrent fetch was mid-write."""
+    for tries in range(2):
+        try:
+            await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(dest), env=env, timeout=900)
+            return
+        except GitError:
+            if tries:
+                raise
+            shutil.rmtree(dest, ignore_errors=True)
+            await asyncio.sleep(2)
 
 
 async def checkout(sandbox: LocalSandbox, full_name: str, token: str, base_ref: str, branch: str,
@@ -91,7 +108,7 @@ async def checkout(sandbox: LocalSandbox, full_name: str, token: str, base_ref: 
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(dest), env=git_auth_env(token), timeout=900)
+    await clone_mirror(mirror_path, dest, git_auth_env(token))
     await git("checkout", "-q", "-B", branch, base_sha, cwd=dest)
     await git("remote", "set-url", "origin", remote_url(full_name), cwd=dest)
     exclude = dest / ".git" / "info" / "exclude"
@@ -107,7 +124,9 @@ async def apply_in_sandbox(sandbox: LocalSandbox, patch: "Patch") -> None:
     """Apply a candidate patch inside a sandbox checkout (as the sandbox identity)."""
     if patch.empty:
         return
-    sandbox.write_bytes(f"{SCRATCH}/candidate.patch", patch.diff)
+    from .sandbox import write_bytes
+
+    await write_bytes(sandbox, f"{SCRATCH}/candidate.patch", patch.diff)
     # --index stages the candidate so new files are tracked: reviewers see them in `git diff <base>`.
     # Re-owning the checkout to the job identity invalidates git's cached stat data; refresh it first.
     result = await sandbox.exec(f"git update-index -q --refresh >/dev/null 2>&1; "
@@ -144,7 +163,9 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     result = await sandbox.exec(script, timeout=180)
     if not result.ok:
         raise SandboxError(f"Could not read the candidate changes: {result.output[-800:]}")
-    diff = sandbox.resolve(out_file).read_bytes()
+    from .sandbox import read_bytes
+
+    diff = await read_bytes(sandbox, out_file)
     files, adds, dels = [], 0, 0
     for line in result.output.splitlines():
         parts = line.split("\t")
@@ -173,7 +194,7 @@ async def publish(full_name: str, token: str, *, base_sha: str, branch: str, pat
     shutil.rmtree(staging, ignore_errors=True)
     staging.parent.mkdir(parents=True, exist_ok=True)
     env = git_auth_env(token)
-    await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(staging), env=env, timeout=900)
+    await clone_mirror(mirror_path, staging, env)
     try:
         await git("checkout", "-q", "-B", branch, base_sha, cwd=staging)
         await git("apply", "--index", "--binary", "--whitespace=nowarn", "-", cwd=staging, input_bytes=patch.diff)
@@ -192,7 +213,7 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
     staging = get_settings().data_dir / "staging" / (task_id + "-rebase")
     shutil.rmtree(staging, ignore_errors=True)
     env = git_auth_env(token)
-    await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(staging), env=env, timeout=900)
+    await clone_mirror(mirror_path, staging, env)
     try:
         await git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=staging, env=env)
         await git("checkout", "-q", "-B", branch, f"origin/{branch}", cwd=staging)
@@ -215,7 +236,7 @@ async def revert_commit(full_name: str, token: str, *, base: str, sha: str, bran
     staging = get_settings().data_dir / "staging" / (task_id + "-revert")
     shutil.rmtree(staging, ignore_errors=True)
     env = git_auth_env(token)
-    await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(staging), env=env, timeout=900)
+    await clone_mirror(mirror_path, staging, env)
     try:
         await git("checkout", "-q", "-B", branch, f"origin/{base}", cwd=staging)
         parents = (await git("rev-list", "--parents", "-n", "1", sha, cwd=staging)).split()

@@ -247,7 +247,16 @@ class TaskRunner:
         else:
             base_sha = await checkout(self.builder, self.repo.full_name, token, self.repo.default_branch, branch)
             self.update(base_sha=base_sha, branch=branch)
-        setup = await self._run_commands(self.builder, self.cfg.get("setup") or [], "setup", timeout=1200)
+        self.builder = await self._isolate_builder(self.builder)
+        if getattr(self.builder, "prepared", None):
+            self.event("setup_skipped", "Dependencies unchanged since the prepared environment was saved; setup skipped",
+                       level="success", environment=self.builder.prepared)
+            setup = []
+        else:
+            setup = await self._run_commands(self.builder, self.cfg.get("setup") or [], "setup", timeout=1200)
+            key = getattr(self.builder, "environment_key", None)
+            if key and setup and all(c["ok"] for c in setup):
+                await self._save_environment(self.builder, key)
         broken = [c for c in setup if not c["ok"]]
         if broken:
             self.feedback.append("- Note: repository setup failed before you started:\n" + "\n".join(
@@ -384,6 +393,53 @@ class TaskRunner:
                    prepared=vm.prepared)
         return vm
 
+    async def _isolate_builder(self, local: LocalSandbox):
+        """With ``build.isolation: "vm"`` the builder works in its own Railway VM (checkout uploaded, no Factory
+        credentials inside); otherwise, or when VMs are unavailable, in the local per-job sandbox."""
+        build_cfg = self.cfg.get("build") or {}
+        if build_cfg.get("isolation") != "vm":
+            return local
+        if self.task.harness == "codex":
+            self.event("build_vm_skipped", "Codex builders run in a local sandbox", level="warn")
+            return local
+        from ..vm import RailwayVMSandbox, environment_key, vm_available
+
+        ok, why = vm_available()
+        if not ok:
+            self.event("build_vm_unavailable", f"VM isolation requested but unavailable ({why}); building locally",
+                       level="warn")
+            return local
+        key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
+            if self.cfg.get("setup") else None
+        try:
+            vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(build_cfg.get("cpu", 4)),
+                                                   memory_gb=float(build_cfg.get("memory_gb", 8)))
+        except Exception as exc:
+            self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); building locally",
+                       level="warn")
+            return local
+        await local.close()
+        vm.environment_key = key
+        self.event("build_vm_ready", f"Building in VM {vm.vm_id}" + (" from the prepared environment" if vm.prepared else ""),
+                   level="success", vm=vm.vm_id, prepared=vm.prepared)
+        return vm
+
+    async def _save_environment(self, sandbox, key: str) -> None:
+        started = time.monotonic()
+        try:
+            await sandbox.checkpoint(key)
+            self.event("environment_prepared", f"Saved a prepared environment for these dependencies "
+                       f"({time.monotonic() - started:.0f}s)", environment=key)
+            from ..vm import prune_environments
+
+            pruned = await prune_environments(key)
+            if pruned:
+                self.event("environments_pruned", f"Removed {len(pruned)} older prepared environment(s)",
+                           environments=pruned)
+        except Exception as exc:  # an optimisation only
+            self.event("environment_prepare_failed", f"Could not save a prepared environment: {str(exc)[:200]}",
+                       level="warn")
+
     async def _prepare(self, sandbox) -> None:
         """Install dependencies, unless the VM booted from a prepared environment for these exact lockfiles.
         After a clean install in a VM, save it so the next verification starts ready."""
@@ -395,20 +451,7 @@ class TaskRunner:
         results = await self._run_commands(sandbox, setup, "verify_setup", timeout=1200)
         key = getattr(sandbox, "environment_key", None)
         if key and results and all(r["ok"] for r in results):
-            started = time.monotonic()
-            try:
-                await sandbox.checkpoint(key)
-                self.event("environment_prepared", f"Saved a prepared environment for these dependencies "
-                           f"({time.monotonic() - started:.0f}s)", environment=key)
-                from ..vm import prune_environments
-
-                pruned = await prune_environments(key)
-                if pruned:
-                    self.event("environments_pruned", f"Removed {len(pruned)} older prepared environment(s)",
-                               environments=pruned)
-            except Exception as exc:  # an optimisation only
-                self.event("environment_prepare_failed", f"Could not save a prepared environment: {str(exc)[:200]}",
-                           level="warn")
+            await self._save_environment(sandbox, key)
 
     async def _start_app(self, sandbox, qa_cfg: dict[str, Any]) -> AppRun:
         """Boot the candidate in the verifier's sandbox, then let the Factory capture its own evidence first."""

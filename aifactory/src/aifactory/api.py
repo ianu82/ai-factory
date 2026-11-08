@@ -361,7 +361,7 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     for key in ("context", "signal_label"):
         if key in body.config:
             cfg[key] = str(body.config[key] or "")[:8000]
-    for key in ("merge", "release", "qa", "recovery"):
+    for key in ("merge", "release", "qa", "recovery", "build"):
         if key in body.config and isinstance(body.config[key], dict):
             cfg[key] = body.config[key]
     for key in ("require_ci", "max_changed_lines"):

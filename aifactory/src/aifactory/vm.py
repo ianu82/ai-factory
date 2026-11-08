@@ -324,6 +324,15 @@ class RailwayVMSandbox:
         self._procs.append(info["proc"])
         return _VMProcess(info["proc"], exit_future)
 
+    async def kill_all(self) -> None:
+        """Stop every process this handle started (the VM itself is destroyed on close)."""
+        for proc in list(self._procs):
+            try:
+                await self.bridge.call("kill", {"proc": proc}, timeout=60)
+            except Exception:  # already gone
+                pass
+        self._procs.clear()
+
     def stop(self, proc: _VMProcess) -> None:
         asyncio.get_running_loop().create_task(self.bridge.call("kill", {"proc": proc.proc_id}))
 
