@@ -79,3 +79,40 @@ def test_labelled_issues_become_outcomes_once_and_plain_label_is_only_proposed(m
         sigs = {x.external_id: x for x in s.query(Signal)}
         assert sigs["acme/app#7"].status == "accepted" and sigs["acme/app#8"].status == "new"
     assert comments == [(7, comments[0][1])] and "outcome #1" in comments[0][1]
+
+
+def test_issue_already_addressed_by_an_outcome_is_linked_not_duplicated(monkeypatch):
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={}, outcome_seq=1)
+        s.add(ws)
+        s.flush()
+        repo = Repository(workspace_id=ws.id, full_name="acme/app", default_branch="main", config={})
+        s.add(repo)
+        s.flush()
+        s.add(Outcome(workspace_id=ws.id, number=1, title="Declared", brief="Fix it.\n\nSource: https://gh/7",
+                      repo_ids=[repo.id], status="running"))
+        ws_id = ws.id
+
+    class FakeGH:
+        def __init__(self, token):
+            pass
+
+        async def issues(self, full_name, labels="", since=None):
+            return [{"number": 7, "title": "Fix it", "body": "", "html_url": "https://gh/7", "user": {}}] if labels == "factory:auto" else []
+
+        async def comment(self, *a):
+            raise AssertionError("should not comment on a linked issue")
+
+        async def request(self, *args, **kwargs):
+            return {"workflow_runs": []}
+
+    monkeypatch.setattr(signals_module, "GitHub", FakeGH)
+    db = SessionLocal()
+    asyncio.run(signals_module.sync_github(db, ws_id, "t"))
+    db.close()
+    with session_scope() as s:
+        assert s.query(Outcome).filter(Outcome.workspace_id == ws_id).count() == 1
+        assert s.query(Signal).one().status == "accepted"

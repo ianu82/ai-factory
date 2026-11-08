@@ -84,6 +84,7 @@ class Orchestrator:
                 await asyncio.to_thread(self._promote)
                 self._schedule()
                 await self._maybe_sync_signals()
+                await self._maybe_inventory()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -91,6 +92,22 @@ class Orchestrator:
             except asyncio.TimeoutError:
                 pass
             self._wake.clear()
+
+    def log_inventory(self) -> None:
+        """Operator visibility in the server log: open work, its state and what it waits on."""
+        from ..models import Decision
+
+        with session_scope() as s:
+            open_outcomes = s.query(Outcome).filter(Outcome.status.notin_(["completed", "cancelled"])).all()
+            for o in open_outcomes:
+                log.info("inventory outcome #%s %s %s%s", o.number, o.status, o.title[:80],
+                         f" — {o.blocked_reason[:200]}" if o.blocked_reason else "")
+                for t in s.query(Task).filter(Task.outcome_id == o.id):
+                    log.info("inventory   task %s %s/%s attempt=%s pr=%s %s", t.key, t.status, t.stage or "-", t.attempt,
+                             t.pr_number or "-", (t.blocked_reason or "")[:300].replace("\n", " "))
+                for d in s.query(Decision).filter(Decision.outcome_id == o.id, Decision.status == "open"):
+                    log.info("inventory   decision %s: %s — %s", d.kind, d.title[:100], (d.body or "")[:400].replace("\n", " "))
+        log.info("inventory orchestrator %s", self.status())
 
     async def _maybe_sync_signals(self) -> None:
         """Poll GitHub for issues and CI failures every few minutes (intake + feedback)."""
@@ -123,6 +140,14 @@ class Orchestrator:
             finally:
                 db.close()
 
+    async def _maybe_inventory(self) -> None:
+        import time
+
+        if time.monotonic() - getattr(self, "_last_inventory", 0.0) < 300:
+            return
+        self._last_inventory = time.monotonic()
+        await asyncio.to_thread(self.log_inventory)
+
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""
         with session_scope() as s:
@@ -136,9 +161,9 @@ class Orchestrator:
                         if all(d is not None and d.status in DONE_TASK for d in deps):
                             task.status = "queued"
                             notify(outcome.workspace_id, "task", task.id, outcome_id=outcome.id)
-                self._rollup(outcome, tasks)
+                self._rollup(outcome, tasks, s)
 
-    def _rollup(self, outcome: Outcome, tasks: list[Task]) -> None:
+    def _rollup(self, outcome: Outcome, tasks: list[Task], session=None) -> None:
         if not tasks:
             return
         statuses = {t.status for t in tasks}
@@ -147,7 +172,7 @@ class Orchestrator:
             outcome.completed_at = utcnow()
             outcome.summary = f"All {len(tasks)} task(s) merged and verified."
             record(outcome.workspace_id, "outcome_completed", f"Outcome #{outcome.number} delivered",
-                   outcome_id=outcome.id, level="success")
+                   outcome_id=outcome.id, level="success", session=session)
             notify(outcome.workspace_id, "outcome", outcome.id)
             return
         if statuses <= {"cancelled", "abandoned"}:
@@ -215,13 +240,16 @@ class Orchestrator:
                 pass
             except Exception as exc:
                 log.exception("planning crashed")
-                with session_scope() as s:
-                    outcome = s.get(Outcome, outcome_id)
-                    outcome.status = "blocked"
-                    outcome.blocked_reason = f"Planning crashed: {exc}"
-                    ws = outcome.workspace_id
-                open_decision(ws, "unblock", "Planning crashed", str(exc), outcome_id=outcome_id,
-                              options=[{"value": "retry", "label": "Retry planning"}, {"value": "cancel", "label": "Cancel"}])
+                try:
+                    with session_scope() as s:
+                        outcome = s.get(Outcome, outcome_id)
+                        outcome.status = "blocked"
+                        outcome.blocked_reason = f"Planning crashed: {exc}"[:2000]
+                        ws = outcome.workspace_id
+                    open_decision(ws, "unblock", "Planning crashed", str(exc)[:2000], outcome_id=outcome_id,
+                                  options=[{"value": "retry", "label": "Retry planning"}, {"value": "cancel", "label": "Cancel"}])
+                except Exception:
+                    log.exception("could not record the planning crash")
             finally:
                 self._planning.pop(outcome_id, None)
                 self.wake()
@@ -247,13 +275,16 @@ class Orchestrator:
                         task.status = "cancelled" if cancel.is_set() else "queued"
             except Exception as exc:
                 log.exception("task crashed")
-                with session_scope() as s:
-                    task = s.get(Task, task_id)
-                    task.status = "blocked"
-                    task.blocked_reason = f"{type(exc).__name__}: {exc}"
-                open_decision(ws, "unblock", "A task stopped unexpectedly", f"{type(exc).__name__}: {exc}",
-                              outcome_id=outcome_id, task_id=task_id,
-                              options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+                try:
+                    with session_scope() as s:
+                        task = s.get(Task, task_id)
+                        task.status = "blocked"
+                        task.blocked_reason = f"{type(exc).__name__}: {exc}"[:2000]
+                    open_decision(ws, "unblock", "A task stopped unexpectedly", f"{type(exc).__name__}: {exc}"[:2000],
+                                  outcome_id=outcome_id, task_id=task_id,
+                                  options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+                except Exception:
+                    log.exception("could not record the task crash")
             finally:
                 self._tasks.pop(task_id, None)
                 with session_scope() as s:

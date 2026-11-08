@@ -9,6 +9,7 @@ explicitly allowed automatic acceptance for that source.
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,8 @@ from .db import utcnow
 from .events import notify, record
 from .github import GitHub
 from .models import Outcome, Repository, Signal, User, Workspace
+
+log = logging.getLogger(__name__)
 
 
 def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: str, brief: str, repo_ids: list[str],
@@ -74,7 +77,9 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
         for wanted, auto in ((auto_label, True), (label, False)):
             if not wanted:
                 continue
-            for issue in await gh.issues(repo.full_name, labels=wanted):
+            found = await gh.issues(repo.full_name, labels=wanted)
+            log.info("signal sync %s: %d open issue(s) labelled %s", repo.full_name, len(found), wanted)
+            for issue in found:
                 if issue["number"] in seen:
                     continue
                 seen.add(issue["number"])
@@ -83,7 +88,16 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                                          external_id=f"{repo.full_name}#{issue['number']}", repo_id=repo.id)
                 created += new
                 updated += not new
+                db.commit()  # never hold the database write lock across network calls
                 if auto and sig.status == "new":
+                    existing = (db.query(Outcome)
+                                .filter(Outcome.workspace_id == workspace_id, Outcome.status != "cancelled",
+                                        Outcome.brief.contains(issue["html_url"])).first())
+                    if existing is not None:
+                        # Repeated signals attach to the work already addressing them.
+                        sig.status, sig.outcome_id = "accepted", existing.id
+                        db.commit()
+                        continue
                     author = (issue.get("user") or {}).get("login", "")
                     outcome = outcome_from_text(
                         db, workspace_id, None, issue["title"],
@@ -94,6 +108,7 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                     record(workspace_id, "signal_accepted",
                            f"Accepted {repo.full_name}#{issue['number']} automatically (label {auto_label})",
                            outcome_id=outcome.id, session=db, data={"url": issue["html_url"]})
+                    db.commit()
                     base = get_settings().public_url
                     link = f"{base}/w/{workspace_id}/outcomes/{outcome.id}" if base.startswith("https") else ""
                     try:

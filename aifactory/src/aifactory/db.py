@@ -32,7 +32,7 @@ def _configure_sqlite(engine: Engine) -> None:
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=15000")
+        cursor.execute("PRAGMA busy_timeout=60000")
         cursor.close()
 
 
@@ -48,7 +48,7 @@ def init_engine(url: str | None = None) -> Engine:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
     kwargs: dict = {"future": True}
     if url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
     else:
         kwargs["pool_pre_ping"] = True
     _engine = create_engine(url, **kwargs)
