@@ -37,3 +37,12 @@ A killed bridge has unknown transport metadata; the pool still owns VM retiremen
 Worker bootstrap retains its separately bounded preparation owner.
 SDK request draining and owned VM retirement remain necessary; this timer does
 not establish a cleanup wall-time guarantee or diagnose an earlier failure.
+
+The shared controller WebSocket configures the pinned `ws` HTTP handshake timeout
+at 30 seconds, preserving a caller's shorter positive timeout. A silent pending
+upgrade can then fail while the original execution budget still has time for the
+SDK's existing single prestart retry. This does not add retries or retry a sent
+command. The original absolute owner and abort signal still preempt connection
+setup; command runtime, stdin, phase limits and finalization reserves are unchanged.
+The handshake setting is not an absolute cleanup guarantee or a diagnosis of an
+earlier transport failure.

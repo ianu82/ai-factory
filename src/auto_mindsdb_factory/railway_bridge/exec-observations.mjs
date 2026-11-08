@@ -1,5 +1,5 @@
 // Metadata only. These counters never authorize execution or prove delivery.
-import WebSocket from 'ws';
+import {ExecWebSocket} from './client.mjs';
 import {ExecNotStartedError, ExecInterruptedError, ExecControlUnsupportedError} from 'railway';
 
 export function execFailureObservations(error, observations) {
@@ -37,7 +37,7 @@ export function execObservations(onChange = () => {}) {
     if (typeof data !== 'string' || data.length > 4096) return null;
     try { return JSON.parse(data)?.type; } catch { return null; }
   }
-  class ObservedWebSocket extends WebSocket {
+  class ObservedWebSocket extends ExecWebSocket {
     constructor(...args) { super(...args); count('connections'); changed(); }
     emit(event, ...args) {
       try {

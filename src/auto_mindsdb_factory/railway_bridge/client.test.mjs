@@ -61,7 +61,7 @@ async function fixture(t, mode, observations) {
   const observed = {attempts: 0, commands: 0};
   server.on('upgrade', (request, socket, head) => {
     observed.attempts++;
-    if (mode === 'pending-recover' && observed.attempts === 1) return;
+    if (mode === 'pending' || (mode === 'pending-recover' && observed.attempts === 1)) return;
     if (mode === 'reject' || (mode === 'recover' && observed.attempts === 1)) {
       socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       return;
@@ -83,9 +83,15 @@ async function fixture(t, mode, observations) {
           observed.commands++;
           if (mode === 'interrupt') connection.terminate();
         }
-        if (frame.type === 'stdin_close' && ['recover', 'pending-recover'].includes(mode)) {
-          connection.send(Buffer.concat([Buffer.from([1]), Buffer.from('confirmed result\n')]));
-          connection.send(JSON.stringify({type: 'exit', data: {exit_code: 0}}));
+        if (frame.type === 'stdin_close' && ['recover', 'pending-recover', 'delayed-result'].includes(mode)) {
+          const finish = () => {
+            connection.send(Buffer.concat([Buffer.from([1]), Buffer.from('confirmed result\n')]));
+            connection.send(JSON.stringify({type: 'exit', data: {exit_code: 0}}));
+          };
+          if (mode === 'delayed-result') {
+            const timer = setTimeout(finish, 100);
+            connection.once('close', () => clearTimeout(timer));
+          } else finish();
         }
       });
     });
@@ -213,6 +219,32 @@ test('a pending HTTP upgrade leaves time for the existing prestart retry', {time
   assert.equal(observations.snapshot().opened, 1);
   assert.equal(observations.snapshot().hello_send_attempts, 1);
   assert.equal(observations.snapshot().init_send_attempts, 1);
+});
+
+test('the original controller deadline preempts a pending upgrade timeout', async t => {
+  const observations = execObservations();
+  const {sandbox, observed} = await fixture(t, 'pending', observations);
+  await assert.rejects(checkedExec(sandbox, 'must-not-run', 'request', 2, 65536, 80),
+    error => error.name === 'TimeoutError');
+  assert.deepEqual(observed, {attempts: 1, commands: 0});
+  assert.equal(observations.snapshot().opened, 0);
+  assert.equal(observations.snapshot().init_send_attempts, 0);
+});
+
+class ShortHandshake extends clientOptions({}).webSocketImpl {
+  constructor(address, protocols) { super(address, protocols, {handshakeTimeout: 20}); }
+}
+
+test('a shorter caller handshake timeout is preserved', async t => {
+  const {sandbox, observed} = await fixture(t, 'pending', {WebSocketImpl: ShortHandshake});
+  await assert.rejects(checkedExec(sandbox, 'must-not-run', undefined, 2, 65536, 1000), ExecNotStartedError);
+  assert.deepEqual(observed, {attempts: 2, commands: 0});
+});
+
+test('a successful upgrade does not time out the subsequent command', async t => {
+  const {sandbox, observed} = await fixture(t, 'delayed-result', {WebSocketImpl: ShortHandshake});
+  assert.equal(await checkedExec(sandbox, 'one-command', 'request', 2, 65536, 1000), 'confirmed result\n');
+  assert.deepEqual(observed, {attempts: 1, commands: 1});
 });
 
 test('a disconnect after command dispatch is not retried', async t => {
