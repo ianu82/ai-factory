@@ -15,7 +15,7 @@ ian@mindsdb.com)".
 | calorie-tracker #15 → PR #17 | Codex (via gateway) | Same flow end to end, about 3 minutes after pickup | Unattended |
 | calorie-tracker #16 → PR #18 | Anton | Fresh Anton verifier rejected attempt 1 for a real defect (empty body → 500); attempt 2 fixed it; rebased onto #17's merge, rechecked and re-ran CI before merging | Unattended |
 | calorie-tracker Ticket 40 (#6), T2 → PR #20 | Native on MindsHub (`gpt-terra`) | The planner stopped on a genuine product conflict (requested ranges vs DB precision); the answer was given as a delegated operator decision; T2 merged and smoke passed | Assisted (one human product decision, by design) |
-| calorie-tracker Ticket 40 (#6), T1 | Native on MindsHub | Three attempts ended unverified because the production build hit `EAGAIN` in the shared container (48 visible CPUs, 1000-pid cgroup) while the builder's throwaway Postgres was still running. Fixed in the platform (per-job CPU sets, builder processes stopped before verification, boot logs in QA events) and retried with runtime QA in a Railway VM | See "Runtime QA in a VM" below |
+| calorie-tracker Ticket 40 (#6), T1 → PR #22 | Native on MindsHub | First three attempts ended unverified: the production build hit `EAGAIN` in the shared container (48 visible CPUs, 1000-pid cgroup) while the builder's throwaway Postgres was still running. After platform fixes (per-job CPU sets, builder processes stopped before verification, boot logs in QA events) an operator retry built it in one attempt; verification ran in a Railway VM (the verifier started Postgres with Docker inside the VM to run the integration test), CI passed, the Factory merged it and post-merge smoke passed; outcome #6 delivered | Assisted (operator retry after platform fixes) |
 | ai-factory #195 (Factory improving itself) | Codex on MindsHub | Fresh verifiers rejected several candidates for real races; the approved candidate then conflicted on rebase and was abandoned (delegated). PR #196 closed, issue #195 open | Assisted, not delivered |
 
 MindsHub Inference is the workspace provider (`gpt-terra`, failover disabled); per-run cost is read
@@ -29,7 +29,13 @@ task and summarised in the pull request. With `qa.isolation: "vm"` this happens 
 Railway sandbox VM (no Factory credentials inside, destroyed afterwards).
 
 Live: #6 T1 retry, 16:34 UTC — VM `f97dfb4f…` (us-west2) ready with the checkout in 157 s (first
-template build), `npm ci` inside the VM passed, app boot started. RESULT_PENDING
+template build), `npm ci` inside the VM passed, and the app booted inside the VM (`✓ Ready in 570ms`
+in its log). The Factory nevertheless recorded "did not become ready": its readiness check polled
+the control plane's own loopback instead of the VM's. Verification still passed on the verifier's
+own evidence, and PR #22 says "the app did not start" — an honest report of what the Factory saw,
+caused by a platform bug. Fixed in 1301e3a (readiness and probes are now requested from inside the
+VM, and the VM test fails if the control plane ever calls the app directly). The next VM-backed run
+is the first that can show screenshots taken inside a VM.
 
 ## Roadmap
 
