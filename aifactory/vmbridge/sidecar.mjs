@@ -54,7 +54,11 @@ const ops = {
   },
   async checkpoints() {
     const items = await Sandbox.checkpoints(client);
-    return {names: items.map((c) => c.name)};
+    return {items: items.map((c) => ({id: c.id, key: c.key, createdAt: c.createdAt}))};
+  },
+  async deleteCheckpoint(a) {
+    await Sandbox.deleteCheckpoint(a.id, client);
+    return {deleted: true};
   },
   async exec(a) {
     const sandbox = await box(a.id);

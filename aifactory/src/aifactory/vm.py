@@ -68,7 +68,29 @@ def environment_key(work: Path, repo: str, setup: list[str]) -> str:
         for name in sorted(files):
             if name in LOCKFILES:
                 digest.update(str(rel_root / name).encode() + b"\0" + (Path(root) / name).read_bytes() + b"\0")
-    return "aif-env-" + digest.hexdigest()[:24]
+    return f"aif-env-{hashlib.sha256(repo.encode()).hexdigest()[:8]}-{digest.hexdigest()[:16]}"
+
+
+async def prune_environments(keep_for: str, keep: int = 2) -> list[str]:
+    """Delete older prepared environments of the same repository (and legacy unscoped ones), newest kept."""
+    parts = keep_for.split("-")
+    if len(parts) != 4:
+        return []
+    prefix = "-".join(parts[:3]) + "-"
+    bridge = VMBridge.get()
+    items = (await bridge.call("checkpoints", {}, timeout=120)).get("items") or []
+    mine = sorted((c for c in items if str(c.get("key", "")).startswith(prefix)), key=lambda c: c.get("createdAt") or "",
+                  reverse=True)
+    legacy = [c for c in items if len(str(c.get("key", "")).split("-")) == 3 and str(c.get("key", "")).startswith("aif-env-")]
+    doomed = [c for c in mine if c.get("key") != keep_for][max(0, keep - 1):] + legacy
+    deleted = []
+    for c in doomed:
+        try:
+            await bridge.call("deleteCheckpoint", {"id": c["id"]}, timeout=120)
+            deleted.append(c["key"])
+        except Exception as exc:  # pragma: no cover - best effort
+            log.warning("could not delete checkpoint %s: %s", c.get("key"), exc)
+    return deleted
 
 
 def vm_available() -> tuple[bool, str]:

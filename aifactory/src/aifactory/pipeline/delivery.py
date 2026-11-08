@@ -400,6 +400,12 @@ class TaskRunner:
                 await sandbox.checkpoint(key)
                 self.event("environment_prepared", f"Saved a prepared environment for these dependencies "
                            f"({time.monotonic() - started:.0f}s)", environment=key)
+                from ..vm import prune_environments
+
+                pruned = await prune_environments(key)
+                if pruned:
+                    self.event("environments_pruned", f"Removed {len(pruned)} older prepared environment(s)",
+                               environments=pruned)
             except Exception as exc:  # an optimisation only
                 self.event("environment_prepare_failed", f"Could not save a prepared environment: {str(exc)[:200]}",
                            level="warn")

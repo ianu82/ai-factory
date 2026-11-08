@@ -47,6 +47,15 @@ class FakeBridge:
             # Like some real images: a login profile that changes directory. Commands must not depend on it.
             (self.root / ".bash_profile").write_text('cd "$HOME"\n')
             return {"id": "sbx_test", "region": "test"}
+        if op == "checkpoints":
+            base = self.root.parent / "checkpoints"
+            items = sorted(base.iterdir(), key=lambda p: p.stat().st_mtime_ns) if base.exists() else []
+            return {"items": [{"id": p.name, "key": p.name, "createdAt": f"{p.stat().st_mtime_ns:020d}"} for p in items]}
+        if op == "deleteCheckpoint":
+            import shutil
+
+            shutil.rmtree(self.root.parent / "checkpoints" / args["id"])
+            return {"deleted": True}
         if op == "checkpoint":
             import shutil
 
@@ -195,3 +204,23 @@ def test_prepared_environment_keeps_dependencies_and_replaces_the_checkout(tmp_p
         await vm.close()
 
     asyncio.run(go())
+
+
+def test_prepared_environments_are_pruned_per_repository(tmp_path, monkeypatch):
+    import time as _time
+
+    from aifactory.vm import prune_environments
+
+    bridge = FakeBridge(tmp_path / "vm")
+    monkeypatch.setattr("aifactory.vm.VMBridge.get", classmethod(lambda cls: bridge))
+    base = tmp_path / "checkpoints"
+    for name in ["aif-env-aaaaaaaa-0000000000000001", "aif-env-bbbbbbbb-0000000000000009",
+                 "aif-env-aaaaaaaa-0000000000000002", "aif-env-0123456789abcdef01234567",
+                 "aif-env-aaaaaaaa-0000000000000003", "unrelated"]:
+        (base / name).mkdir(parents=True)
+        _time.sleep(0.01)
+    deleted = asyncio.run(prune_environments("aif-env-aaaaaaaa-0000000000000003"))
+    assert sorted(deleted) == ["aif-env-0123456789abcdef01234567", "aif-env-aaaaaaaa-0000000000000001"]
+    assert sorted(p.name for p in base.iterdir()) == ["aif-env-aaaaaaaa-0000000000000002",
+                                                       "aif-env-aaaaaaaa-0000000000000003",
+                                                       "aif-env-bbbbbbbb-0000000000000009", "unrelated"]
