@@ -95,6 +95,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             if resolution == "retry":
                 if task.status == "failed":
                     task.attempt = 0
+                    task.evidence = {k: v for k, v in (task.evidence or {}).items() if k != "attempt_base"}
                     task.stage = "" if not task.pr_number else "revise"
                 guidance(comment)
                 task.status, task.blocked_reason = "queued", ""

@@ -160,7 +160,7 @@ class TaskRunner:
             self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
-            if attempt > max_attempts:
+            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
                 summary = "\n".join(self.feedback[-6:])[:3000]
                 self.block("unblock", f"{self.task.key} did not pass after {max_attempts} attempts",
                            f"The task could not be completed within the attempt limit. Latest feedback:\n\n{summary}",
@@ -388,6 +388,21 @@ class TaskRunner:
                    + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
                    prepared=vm.prepared)
         return vm
+
+    def _fresh_budget_after_base_moved(self, why: str) -> None:
+        """A verified change that other work overtook is not the builder's failure: rebuilding it gets a fresh
+        attempt budget, at most twice per task, after which a person decides."""
+        rebuilds = int((self.task.evidence or {}).get("rebase_rebuilds", 0)) + 1
+        if rebuilds > 2:
+            self.block("unblock", f"{self.task.key} keeps conflicting with newer commits",
+                       f"The verified change {why} on {self.repo.default_branch} again, after {rebuilds - 1} rebuilds.",
+                       status="failed", options=[{"value": "retry", "label": "Rebuild again"},
+                                                 {"value": "take_over", "label": "I'll take it from here"},
+                                                 {"value": "abandon", "label": "Abandon task"}])
+        self.evidence("rebase_rebuilds", rebuilds)
+        self.evidence("attempt_base", self.task.attempt)
+        self.event("rebuild_after_base_moved", f"The verified change {why}; rebuilding with a fresh attempt budget "
+                   f"({rebuilds} of 2)")
 
     async def _isolate_builder(self, local: LocalSandbox):
         """With ``build.isolation: "vm"`` the builder works in its own Railway VM (checkout uploaded, no Factory
@@ -730,6 +745,7 @@ class TaskRunner:
         clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
                                             onto=self.repo.default_branch, task_id=self.task_id)
         if not clean:
+            self._fresh_budget_after_base_moved("conflicts with newer commits")
             self.feedback.append(f"- Your change conflicts with newer commits on {self.repo.default_branch}. "
                                  f"Re-implement it on top of the latest code.\n{detail[-1500:]}")
             self.update(branch=self.task.branch, stage="build")
@@ -747,6 +763,7 @@ class TaskRunner:
         finally:
             await sandbox.close()
         if any(not c["ok"] for c in checks):
+            self._fresh_budget_after_base_moved("fails its checks on top of newer commits")
             self.feedback += [f"- After rebasing onto the latest {self.repo.default_branch}, `{c['command']}` failed:\n"
                               f"```\n{c['tail']}\n```" for c in checks if not c["ok"]]
             await self.deliver(continue_from_branch=True)
