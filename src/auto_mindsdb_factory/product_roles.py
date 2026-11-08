@@ -148,6 +148,23 @@ _DEFINITIONS[("planner", "7")] = _definition(
 )
 
 
+_previous_planner = _DEFINITIONS[("planner", "7")]
+_DEFINITIONS[("planner", "8")] = _definition(
+    "planner", "8", _previous_planner["instructions"] + (
+        " source_inventory supplies raw file byte sizes from the exact controller export, not file contents "
+        "or investigation evidence; omitted_files explicitly counts entries absent from this bounded inventory. "
+        "Use these sizes before the first read to assign an allowance to every output section. "
+        "Sum all allowances, labels and diagnostics below command_output.max_bytes_per_stream with margin. "
+        "Keep the necessary instructions, relevant control flow and complete test-pattern helpers within those "
+        "allowances before adding reference excerpts. If the batch would be too large, select smaller relevant "
+        "line windows per section before printing; do not slice the combined output or drop a necessary section "
+        "to make it fit. Metadata never substitutes for reading. Missing essential evidence still blocks readiness."
+    ),
+    **{key: _previous_planner[key] for key in
+       ("purpose", "required_evidence", "supported_tools", "constraints")},
+)
+
+
 # Keep historical definitions in _DEFINITIONS when changing an active version.
 _DEFAULT_VERSIONS = {"builder": "1", "verifier": "1", "planner": "1"}
 _DEFAULT = object()

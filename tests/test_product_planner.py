@@ -51,7 +51,7 @@ def test_planner_uses_frozen_role_and_shared_accounting(tmp_path):
     assert 0 < agent.deadline - time.monotonic() <= 120
 
 
-@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "report-planner", "readiness-planner", "window-planner", "portable-planner", "forged"])
+@pytest.mark.parametrize("mutation", ["missing", "historical", "previous-planner", "report-planner", "readiness-planner", "window-planner", "portable-planner", "capture-planner", "forged"])
 def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, mutation):
     agent, requests, journal = setup(tmp_path, [])
     manifest = json.loads((journal.root / "manifest.json").read_text())
@@ -69,6 +69,8 @@ def test_planner_rejects_missing_or_nonexecuting_roles_before_request(tmp_path, 
         manifest["planner_role_snapshot"] = select_role("planner", "5")
     elif mutation == "portable-planner":
         manifest["planner_role_snapshot"] = select_role("planner", "6")
+    elif mutation == "capture-planner":
+        manifest["planner_role_snapshot"] = select_role("planner", "7")
     else:
         manifest["planner_role_snapshot"]["instructions"] = "write code"
     (journal.root / "manifest.json").write_text(json.dumps(manifest))

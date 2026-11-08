@@ -89,6 +89,15 @@ def test_output_budget_planner_preserves_historical_portable_role():
         k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
 
 
+def test_inventory_guidance_preserves_historical_capture_role_and_capabilities():
+    previous = select_role("planner", "7")
+    assert previous["digest"] == "41fe7e59c3d5d9f099147bced3fd8ba4e462b4b825bfa61ad14d56f27e947832"
+    current = select_role("planner", "8")
+    assert current["instructions"].startswith(previous["instructions"])
+    assert {k: v for k, v in current.items() if k not in {"version", "digest", "instructions"}} == {
+        k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
+
+
 def test_candidate_files_and_cwd_cannot_replace_trusted_registry(tmp_path):
     (tmp_path / "product_roles.py").write_text("raise RuntimeError('candidate role executed')")
     package = tmp_path / "auto_mindsdb_factory"

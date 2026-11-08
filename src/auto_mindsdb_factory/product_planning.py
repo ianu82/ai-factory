@@ -1,11 +1,12 @@
 """Controller-owned planning phase and retained guidance admission."""
 
+import fnmatch
 import json
 import tempfile
 import time
 from pathlib import Path
 
-from .docker_runner import RunnerError
+from .docker_runner import DockerSandbox, RunnerError
 from .product_agent import AgentSessionError, HarnessStopped
 from .product_plan import PlanError, ProductPlan, freeze_plan, read_plan
 from .product_planner import ProductPlanner, PLANNER_VERSION, REPORT_RESERVE_SECONDS
@@ -22,6 +23,24 @@ class PlanningStopped(HarnessStopped):
 FINALIZATION_RESERVE_SECONDS = 20
 _FAILURE_PHASES = {"admission", "worker_preparation", "planning_initialization", "source_preparation",
                    "investigation_or_sandbox", "sandbox_finalization", "source_validation", "plan_freeze", "ready_check"}
+
+
+def _source_inventory(files, allowed_paths):
+    """Budgeting metadata from the exact export; never source-reading evidence."""
+    result = {"files": {}, "omitted_files": len(files)}
+    remaining = DockerSandbox.MAX_CAPTURED_OUTPUT_BYTES // 2 - len(json.dumps(result).encode())
+    ordered = sorted(files, key=lambda name: (
+        not any(fnmatch.fnmatchcase(name, pattern) for pattern in allowed_paths),
+        name.rsplit("/", 1)[-1] not in {"AGENTS.md", "CLAUDE.md"}, "/" in name, name))
+    for name in ordered:
+        size = len(files[name])
+        # Match ProductAgent's JSON escaping; braces reserve the comma/space too.
+        cost = len(json.dumps({name: size}).encode())
+        if cost <= remaining:
+            result["files"][name] = size
+            result["omitted_files"] -= 1
+            remaining -= cost
+    return result
 
 
 def _record_failure(journal, phase, error):
@@ -127,6 +146,7 @@ def plan_delivery(delivery, task, base, journal, *, planner_factory=None):
                 content = planner.run("planner", {**task.public_context, "base_sha": base,
                     "source_environment": {"source_access": "read_only", "git_metadata": "absent",
                                            "base_binding": "controller_export"},
+                    "source_inventory": _source_inventory(original, delivery.settings["allowed_paths"]),
                     "required_checks": delivery.settings["checks"],
                     "allowed_paths": delivery.settings["allowed_paths"]}, command)
             phase = "source_validation"

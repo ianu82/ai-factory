@@ -256,6 +256,56 @@ def test_planning_exposes_controller_binding_without_manufacturing_validation(ph
                                   "merge_confirmed", "post_merge_smoke"} for e in p.journal.events())
 
 
+def test_planner_knows_exact_file_byte_sizes_before_its_first_read(phase):
+    p = phase
+    prepare = p.delivery._prepare
+    contents = {"guide.md": "Multibyte guidance: 😀".encode(), "asset.png": b"\x89PNG\x00"}
+    def export(base, workspace, journal, **kwargs):
+        original = prepare(base, workspace, journal, **kwargs)
+        for name, raw in contents.items():
+            (workspace / name).write_bytes(raw)
+        return {**original, **contents}
+    p.delivery._prepare = export
+    factory = p.factory
+    def inspect_before_read(*args):
+        planner = factory(*args)
+        def run(role, context, command):
+            assert not any(kind == "command" for kind, _ in p.calls)
+            assert context["source_inventory"] == {
+                "files": {"asset.png": 5, "guide.md": len(contents["guide.md"]), "parser.py": 8},
+                "omitted_files": 0}
+            assert "Multibyte guidance" not in json.dumps(context["source_inventory"])
+            return planner.run(role, context, command)
+        return SimpleNamespace(run=run)
+    p.factory = inspect_before_read
+    execute(p)
+    assert [kind for kind, _ in p.calls].count("command") == 1
+
+
+def test_large_inventory_keeps_scope_and_guidance_and_reports_omissions(phase):
+    p = phase
+    settings = {**p.delivery.settings, "allowed_paths": ["zz/required.py"]}
+    p.delivery.profile = ProductProfile.from_document(settings)
+    p.delivery.settings = p.delivery.profile.document
+    prepare = p.delivery._prepare
+    contents = {"a" + str(i) + "😀" * 50 + ".txt": b"content" for i in range(200)}
+    contents.update({"AGENTS.md": b"guidance", "zz/required.py": b"required"})
+    def export(base, workspace, journal, **kwargs):
+        original = prepare(base, workspace, journal, **kwargs)
+        for name, raw in contents.items():
+            path = workspace / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(raw)
+        return {**original, **contents}
+    p.delivery._prepare = export
+    execute(p)
+    inventory = p.contexts[0]["source_inventory"]
+    assert inventory["files"]["zz/required.py"] == inventory["files"]["AGENTS.md"] == 8
+    # ProductAgent serializes the user context with json.dumps' default escaping.
+    assert len(json.dumps(inventory).encode()) <= 6000
+    assert 0 < inventory["omitted_files"] == 203 - len(inventory["files"])
+
+
 @pytest.mark.parametrize("mode", ["unknown", "exhausted", "expired", "missing-role"])
 def test_admission_stops_before_environment_or_provider(phase, mode):
     p = phase

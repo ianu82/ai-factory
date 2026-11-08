@@ -8,7 +8,7 @@ from .product_plan import PLAN_SCHEMA, ProductPlan
 from .product_roles import select_role
 from .docker_runner import DockerSandbox
 
-PLANNER_VERSION = "7"
+PLANNER_VERSION = "8"
 REPORT_RESERVE_SECONDS = 60
 
 

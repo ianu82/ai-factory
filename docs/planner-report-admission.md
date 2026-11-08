@@ -1,6 +1,6 @@
 # Bounded planning reports
 
-Planner role version 7 investigates enough source to propose a plan, rather than
+Planner role version 8 investigates enough source to propose a plan, rather than
 implementing or proving the eventual fix. Historical versions remain unchanged.
 Repository discovery stays inside `/workspace`, prunes generated directories and
 bounds output. The first read-only batch should read applicable guidance, source,
@@ -19,6 +19,15 @@ bound combined bytes. It prioritizes essential guidance and source control flow,
 then concise configuration, test patterns and requirement excerpts. A truncated
 result remains incomplete evidence. These are planning instructions, not proof
 that an actual model obeyed them. Capture limits and all readiness gates remain.
+
+The first planning context also includes `source_inventory`: raw byte sizes from
+the exact controller export, without file contents. This metadata is bounded to
+6,000 UTF-8 bytes, prioritises permitted source and guidance, and explicitly counts
+omitted entries. It helps allocate each section before reading; it cannot satisfy
+investigation or establish readiness. The role requires allowances for all sections
+and labels before output, rather than slicing a combined batch that loses evidence.
+The actual read-only command, source/mode/deadline checks and report reserve remain
+mandatory and unchanged. An inventory is not proof that the model used it correctly.
 
 The controller supplies remaining request/time budgets on every planning request.
 After actual investigation, only the structured report tool is offered on the
