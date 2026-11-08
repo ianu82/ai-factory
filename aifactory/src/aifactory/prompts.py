@@ -133,6 +133,9 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
         "## The implementer's claims (unverified)",
         str(builder_report.get("summary", ""))[:3000],
     ]
+    context = (repo.config or {}).get("context")
+    if context:
+        lines += ["", "## Team notes about this repository and its test environment", context[:4000]]
     if checks:
         lines += ["", "## Configured checks already run by the factory on this candidate"]
         for check in checks:
