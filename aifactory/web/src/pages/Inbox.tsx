@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { LifeBuoy } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Decision, type FactoryEvent } from "../api";
@@ -7,6 +8,7 @@ import { ago } from "../format";
 import { Empty, Skeleton } from "../ui";
 import { DecisionCard } from "../components/DecisionCard";
 import { SetupChecklist, useSetupState } from "../components/Setup";
+import { RecoveryGuide } from "../components/RecoveryGuide";
 
 type InboxData = { decisions: Decision[]; since: string | null; changes: (FactoryEvent & { outcome_number?: number; outcome_title?: string })[] };
 
@@ -15,6 +17,7 @@ export function InboxPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const setup = useSetupState();
+  const [guide, setGuide] = useState(false);
   const q = useQuery({ queryKey: ["inbox", ws.id], queryFn: () => api<InboxData>(`/api/workspaces/${ws.id}/inbox`) });
   const marked = useRef(false);
   useEffect(() => {
@@ -34,7 +37,10 @@ export function InboxPage() {
       <div className="page-head">
         <h1>Inbox</h1>
         <span className="muted" style={{ fontSize: 12.5 }}>{decisions.length ? `${decisions.length} need${decisions.length === 1 ? "s" : ""} you` : ""}</span>
+        <span className="spacer" />
+        <button className="btn sm ghost" onClick={() => setGuide(true)}><LifeBuoy /> How recovery works</button>
       </div>
+      {guide && <RecoveryGuide onClose={() => setGuide(false)} />}
       <div className="page-body">
         {q.isLoading || setup.loading ? <Skeleton rows={4} /> : (
           <>
