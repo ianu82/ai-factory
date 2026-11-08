@@ -1,0 +1,7 @@
+.venv/
+.aifactory-data/
+__pycache__/
+*.pyc
+web/node_modules/
+web/dist/
+src/aifactory/web/
