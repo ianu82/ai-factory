@@ -2,6 +2,7 @@
 
 import json
 import time
+from copy import deepcopy
 
 from .product_agent import AgentSessionError, ProductAgent, RoleSnapshotError, TOOLS
 from .product_plan import PLAN_SCHEMA, ProductPlan
@@ -33,6 +34,13 @@ class ProductPlanner(ProductAgent):
             max_total_tokens=min(settings["max_total_tokens"], usage["total_tokens"] + 100000),
             deadline=min(deadline, time.monotonic() + 120), pricing=settings["pricing"], cancelled=cancelled)
         self.task, self.base_sha, self.profile = task, base_sha, profile
+        # Offer only admitted criterion IDs; ProductPlan still enforces exactly-once coverage.
+        self.tools = deepcopy(self.tools)
+        validation = self.tools[1]["parameters"]["properties"]["validation"]
+        criterion_ids = [item["id"] for item in task.document["acceptance_criteria"]]
+        validation["minItems"] = validation["maxItems"] = len(criterion_ids)
+        properties = validation["items"]["properties"]
+        properties["criterion_id"] = {**properties["criterion_id"], "enum": criterion_ids}
 
     def _instructions(self, role):
         if role != "planner":

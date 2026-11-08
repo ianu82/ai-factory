@@ -1,10 +1,13 @@
 import json
 import time
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import ValidationError, validate
 
 from auto_mindsdb_factory.product_agent import AgentSessionError, RoleSnapshotError
+from auto_mindsdb_factory.product_plan import PLAN_SCHEMA, PlanError
 from auto_mindsdb_factory.product_planner import ProductPlanner, PLANNER_VERSION
 from auto_mindsdb_factory.product_profile import ProductProfile
 from auto_mindsdb_factory.product_roles import select_role, snapshot_roles
@@ -12,7 +15,7 @@ from auto_mindsdb_factory.product_task import ProductTask
 from auto_mindsdb_factory.run_journal import RunJournal
 
 
-def setup(tmp_path, responses, **settings):
+def setup(tmp_path, responses, *, task_criteria=None, **settings):
     requests = []
     def request(body, **kwargs):
         requests.append(body)
@@ -25,7 +28,8 @@ def setup(tmp_path, responses, **settings):
         "image": "python@sha256:" + "a" * 64, "checks": {"test": ["pytest"]}, "smoke": [["pytest"]],
         "builder_model": "pinned", "max_total_tokens": 1000, **settings})
     task = ProductTask.from_document({"id": "task", "title": "Parser", "goal": "Reject invalid input",
-        "acceptance_criteria": [{"id": "reject", "description": "Reject invalid input", "command": ["pytest"]}]})
+        "acceptance_criteria": task_criteria if task_criteria is not None else [
+            {"id": "reject", "description": "Reject invalid input", "command": ["pytest"]}]})
     journal = RunJournal(tmp_path, "planner")
     journal.create({"role_snapshots": snapshot_roles(), "planner_role_snapshot": select_role("planner", PLANNER_VERSION)})
     return ProductPlanner(connector, journal, task=task, base_sha="b" * 40, profile=profile,
@@ -193,3 +197,53 @@ def test_provider_cannot_execute_an_unoffered_last_turn_command(tmp_path):
 def test_one_request_cannot_authorize_investigation_and_a_report(tmp_path):
     with pytest.raises(AgentSessionError, match="investigation request and a report"):
         setup(tmp_path, [], max_agent_turns=1)
+
+
+@pytest.mark.parametrize("status", ["ready", "blocked", "unverified"])
+def test_offered_finish_schema_rejects_invented_or_missing_criterion(tmp_path, status):
+    ids = ["invalid_dates", "valid_dates", "existing_contract"]
+    proposed = {**plan(), "status": status, "validation": [
+        {"criterion_id": key, "evidence": "Future validation"} for key in ids]}
+    agent, requests, _ = setup(tmp_path, [("run", {"command": ["cat", "parser.py"]}),
+                                         ("finish", proposed)], max_agent_turns=2,
+        task_criteria=[{"id": key, "description": key, "command": ["pytest"]} for key in ids])
+    assert agent.run("planner", agent.task.public_context, lambda _: {"exit_code": 0}) == proposed
+    # The observed failure added source evidence as a fourth acceptance mapping.
+    extra = {"criterion_id": "source_evidence", "evidence": "Required source remains unread"}
+    invalid = [proposed["validation"] + [extra], [extra, *proposed["validation"][1:]],
+               proposed["validation"][:-1]]
+    for request in requests:  # Both investigation and report-only requests.
+        schema = next(tool["parameters"] for tool in request["tools"] if tool["name"] == "finish")
+        validate(proposed, schema)
+        for mappings in invalid:
+            with pytest.raises(ValidationError):
+                validate({**proposed, "validation": mappings}, schema)
+
+
+def test_task_bound_tools_do_not_mutate_shared_or_other_task_schema(tmp_path):
+    original = deepcopy(ProductPlanner.tools)
+    first, _, _ = setup(tmp_path / "first", [])
+    second, _, _ = setup(tmp_path / "second", [], task_criteria=[
+        {"id": "preserve", "description": "Preserve API", "command": ["pytest"]}])
+    first.tools[1]["parameters"]["properties"]["validation"]["items"]["properties"]["criterion_id"]["enum"].append("injected")
+    schema = second.tools[1]["parameters"]
+    validate({**plan(), "validation": [{"criterion_id": "preserve", "evidence": "Future check"}]}, schema)
+    with pytest.raises(ValidationError):
+        validate(plan(), schema)
+    assert ProductPlanner.tools == original
+    assert PLAN_SCHEMA == original[1]["parameters"]
+
+
+def test_consumer_still_rejects_duplicate_mapping_with_different_evidence(tmp_path):
+    proposed = {**plan(), "validation": [
+        {"criterion_id": "reject", "evidence": "First check"},
+        {"criterion_id": "reject", "evidence": "Different check"}]}
+    agent, requests, journal = setup(tmp_path, [("run", {"command": ["cat", "parser.py"]}),
+                                               ("finish", proposed)], task_criteria=[
+        {"id": key, "description": key, "command": ["pytest"]} for key in ("reject", "preserve")])
+    # Enum/cardinality cannot establish exactly-once coverage; the consumer owns it.
+    validate(proposed, agent.tools[1]["parameters"])
+    with pytest.raises(PlanError, match="every criterion exactly once"):
+        agent.run("planner", agent.task.public_context, lambda _: {"exit_code": 0})
+    assert len(requests) == 2
+    assert not any(e["kind"] == "planner_report" for e in journal.events())
