@@ -67,8 +67,15 @@ def apply_bootstrap() -> str | None:
         settings["invites"] = {**(settings.get("invites") or {}),
                                **{e.lower(): "owner" for e in cfg.get("admins", [])}}
         ws.settings = settings
-        existing = {r.full_name for r in s.query(Repository).filter(Repository.workspace_id == ws.id)}
-        pending = [r for r in cfg.get("repositories", []) if r not in existing]
+        existing = {r.full_name: r for r in s.query(Repository).filter(Repository.workspace_id == ws.id)}
+        pending = []
+        for entry in cfg.get("repositories", []):
+            name, overrides = (entry, {}) if isinstance(entry, str) else (entry.get("full_name"), entry.get("config") or {})
+            if name in existing:
+                if overrides:
+                    existing[name].config = {**(existing[name].config or {}), **overrides}
+            elif name:
+                pending.append((name, overrides))
         workspace_id = ws.id
     if pending:
         asyncio.get_running_loop().create_task(_connect(workspace_id, pending))
@@ -76,15 +83,15 @@ def apply_bootstrap() -> str | None:
     return workspace_id
 
 
-async def _connect(workspace_id: str, names: list[str]) -> None:
+async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
     from .github import GitHub, GitHubError, resolve_token
     from .repo_detect import detect
 
-    for name in names:
+    for name, overrides in names:
         try:
             gh = GitHub(resolve_token(workspace_id))
             info = await gh.repo(name)
-            config = await detect(gh, name, info.get("default_branch") or "main")
+            config = {**await detect(gh, name, info.get("default_branch") or "main"), **overrides}
         except GitHubError as exc:
             log.error("Bootstrap could not connect %s: %s", name, exc)
             continue

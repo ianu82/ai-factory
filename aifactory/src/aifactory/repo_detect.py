@@ -42,7 +42,8 @@ async def detect(gh: GitHub, full_name: str, ref: str) -> dict[str, Any]:
             config["setup"].append("npm install --no-audit --no-fund")
         run = {"npm": "npm run", "pnpm": "pnpm", "yarn": "yarn"}[manager]
         for name in ("typecheck", "type-check", "lint", "test"):
-            if name in scripts and "watch" not in scripts[name]:
+            # `next lint` was removed in Next.js 16; skip scripts that cannot run unattended.
+            if name in scripts and "watch" not in scripts[name] and scripts[name].strip() != "next lint":
                 config["checks"].append(f"{run} {name}" if name != "test" else f"{run} test")
         if "build" in scripts:
             config["smoke"].append(f"{run} build")
