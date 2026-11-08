@@ -201,6 +201,8 @@ def _check_failures(db: Session, ws: Workspace, repos: dict[str, Repository]) ->
         task = tasks.get(e.task_id) or (db.get(Task, e.task_id) if e.task_id else None)
         if not command or not task or task.repo_id not in repos:
             continue
+        if command not in ((repos[task.repo_id].config or {}).get("checks") or []):
+            continue  # the repository no longer runs this check: old failures say nothing about today
         tasks[task.id] = task
         counts[(task.repo_id, command)].add(task.id)
         samples[(task.repo_id, command)].append(e)
