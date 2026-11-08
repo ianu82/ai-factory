@@ -604,16 +604,22 @@ class Resolution(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/decisions/{decision_id}/resolve")
-def resolve_decision(workspace_id: str, decision_id: str, body: Resolution, user: User = Depends(current_user),
-                     db: Session = Depends(get_db)):
+async def resolve_decision(workspace_id: str, decision_id: str, body: Resolution, user: User = Depends(current_user),
+                           db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "member")
     d = db.get(Decision, decision_id)
     if d is None or d.workspace_id != workspace_id:
         raise HTTPException(404, "Decision not found")
     try:
-        return resolve(db, d, user, body.resolution, body.comment, body.reusable, body.scope)
+        result = resolve(db, d, user, body.resolution, body.comment, body.reusable, body.scope)
     except DecisionError as exc:
         raise HTTPException(400, str(exc))
+    info = result.pop("handover", None)
+    if info:
+        from .pipeline.handover import publish_candidate
+
+        result["handover"] = await publish_candidate(d.task_id, info)
+    return result
 
 
 @router.get("/workspaces/{workspace_id}/decisions")

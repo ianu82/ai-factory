@@ -166,6 +166,7 @@ class TaskRunner:
                            f"The task could not be completed within the attempt limit. Latest feedback:\n\n{summary}",
                            status="failed",
                            options=[{"value": "retry", "label": "Try again (fresh attempts)"},
+                                    {"value": "take_over", "label": "I'll take it from here"},
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")

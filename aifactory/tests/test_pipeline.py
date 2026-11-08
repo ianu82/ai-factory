@@ -517,3 +517,40 @@ def test_take_over_pushes_the_latest_candidate_as_a_draft_pr_and_stops_the_facto
         assert s.query(Decision).filter(Decision.task_id == task_id).one().status == "superseded"
     with pytest.raises(handover.HandoverError):
         handover.mark_handed_over(task_id, user)
+
+
+def test_a_stuck_task_can_be_taken_over_from_its_decision(factory, client, monkeypatch):
+    from aifactory.models import Artifact, Plan
+    from aifactory.pipeline import handover
+
+    monkeypatch.setattr(handover, "GitHub", FakeGitHub)
+    monkeypatch.setattr(handover, "resolve_token", lambda ws: "token")
+    base = git("rev-parse", "refs/heads/main", cwd=factory["remotes"] / "acme/demo.git")
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="Greeting",
+                    repo_id=factory["repo"], status="failed", base_sha=base, attempt=3)
+        s.add(task)
+        s.flush()
+        s.add(Artifact(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="diff", name="d",
+                       content="diff --git a/greet.sh b/greet.sh\n--- a/greet.sh\n+++ b/greet.sh\n@@ -1 +1 @@\n"
+                               "-echo 'Hello'\n+echo 'Hello, Factory!'\n", data={"files": ["greet.sh"]}))
+        decision = Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="unblock",
+                            title="T1 did not pass after 3 attempts",
+                            options=[{"value": "retry", "label": "Try again"}, {"value": "take_over", "label": "I'll take it"},
+                                     {"value": "abandon", "label": "Abandon"}])
+        s.add(decision)
+        s.flush()
+        task_id, decision_id = task.id, decision.id
+        user = s.get(User, factory["user"])
+        email = user.email
+    assert client.post("/auth/dev", json={"email": email, "name": "Dev"}).status_code == 200
+    r = client.post(f"/api/workspaces/{factory['ws']}/decisions/{decision_id}/resolve", json={"resolution": "take_over"})
+    assert r.status_code == 200, r.text
+    assert r.json()["handover"]["published"] is True
+    with session_scope() as s:
+        assert s.get(Task, task_id).status == "handed_over"
+        assert s.get(Decision, decision_id).status == "resolved"

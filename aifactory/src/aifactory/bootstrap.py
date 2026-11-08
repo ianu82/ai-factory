@@ -219,8 +219,12 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
             if decision is None:
                 continue
             try:
-                resolve(db, decision, operator, item["resolution"], item.get("comment", ""),
-                        bool(item.get("reusable")), item.get("scope", "workspace" if item.get("reusable") else "item"))
+                result = resolve(db, decision, operator, item["resolution"], item.get("comment", ""),
+                                 bool(item.get("reusable")), item.get("scope", "workspace" if item.get("reusable") else "item"))
+                if result.get("handover"):
+                    from .pipeline.handover import publish_candidate
+
+                    asyncio.get_running_loop().create_task(publish_candidate(decision.task_id, result["handover"]))
             except DecisionError as exc:
                 log.error("Delegated decision for #%s not applied: %s", outcome.number, exc)
                 continue

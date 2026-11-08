@@ -34,6 +34,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     decision.scope = scope if scope in ("item", "repository", "workspace") else "item"
     outcome = db.get(Outcome, decision.outcome_id) if decision.outcome_id else None
     task = db.get(Task, decision.task_id) if decision.task_id else None
+    take_over: str | None = None
 
     def guidance(text: str) -> None:
         if text.strip() and outcome:
@@ -99,6 +100,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                 task.status, task.blocked_reason = "queued", ""
             elif resolution == "abandon":
                 task.status = "abandoned"
+            elif resolution == "take_over":
+                take_over = task.id  # finished after this decision is recorded
             elif resolution == "revert":
                 task.status, task.stage, task.blocked_reason = "queued", "revert", ""
             elif resolution in ("acknowledge", "fix"):
@@ -123,5 +126,14 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     notify(decision.workspace_id, "decision", decision.id)
     if outcome:
         notify(decision.workspace_id, "outcome", outcome.id)
+    result: dict[str, Any] = {"ok": True}
+    if take_over:
+        from .pipeline.handover import HandoverError, mark_handed_over
+
+        try:
+            result["handover"] = mark_handed_over(take_over, user)
+            orchestrator.cancel_task(take_over)
+        except HandoverError as exc:
+            result["error"] = str(exc)
     orchestrator.wake()
-    return {"ok": True}
+    return result
