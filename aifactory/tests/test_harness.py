@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import asyncio
+import json
+
+from aifactory.harness.base import HarnessSession
+from aifactory.harness.native import NativeHarness
+from aifactory.harness.schemas import BUILDER_REPORT
+from aifactory.inference import ProviderConfig, UsageLedger
+from aifactory.sandbox import LocalSandbox
+
+from .fakes import call, step
+
+
+class Script:
+    def __init__(self, fn):
+        self.fn = fn
+        self.provider = ProviderConfig("openai", "http://x", "k", "T")
+        self.seen = []
+
+    async def chat(self, *, messages, ledger=None, **_):
+        self.seen.append([dict(m) for m in messages])
+        return self.fn(messages)
+
+
+def make_session(tmp_path, fn, **kw):
+    sb = LocalSandbox("h", root=tmp_path).create()
+    sb.work.mkdir()
+    (sb.work / "a.txt").write_text("one\ntwo\n")
+    client = Script(fn)
+    session = HarnessSession(run_id="r", role="builder", system="sys", prompt="do it", sandbox=sb, model="m",
+                             client=client, ledger=UsageLedger(run_id="r", workspace_settings={}),
+                             report_schema=BUILDER_REPORT, writable=True, **kw)
+    return session, client, sb
+
+
+def test_native_recovers_from_bad_tool_calls_and_bad_report(tmp_path, monkeypatch):
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+
+    def fn(messages):
+        n = step(messages)
+        if n == 0:
+            bad = {"id": "x", "type": "function", "function": {"name": "read_file", "arguments": "{not json"}}
+            return {"content": "", "tool_calls": [bad, call("nope", {}, 1), call("read_file", {"path": "../etc/passwd"}, 2)]}
+        if n == 1:
+            return {"content": "", "tool_calls": [call("edit_file", {"path": "a.txt", "old_text": "two", "new_text": "2"})]}
+        if n == 2:
+            return {"content": "", "tool_calls": [call("finish", {"summary": "missing status"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "edited"})]}
+
+    session, client, sb = make_session(tmp_path, fn)
+    result = asyncio.run(NativeHarness().run(session))
+    assert result.report["status"] == "done"
+    assert (sb.work / "a.txt").read_text() == "one\n2\n"
+    tool_outputs = [m["content"] for m in client.seen[1] if m["role"] == "tool"]
+    assert "not valid JSON" in tool_outputs[0] and "unknown" in tool_outputs[1] and "escapes" in tool_outputs[2]
+    final_outputs = [m["content"] for m in client.seen[3] if m["role"] == "tool"]
+    assert any("missing required fields: status" in o for o in final_outputs)
+
+
+def test_native_delivers_team_guidance_mid_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    notes = [["Prefer small functions"]]
+
+    def fn(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "echo hi"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "ok"})]}
+
+    session, client, _ = make_session(tmp_path, fn, take_guidance=lambda: notes.pop() if notes else [])
+    asyncio.run(NativeHarness().run(session))
+    assert any("Prefer small functions" in str(m.get("content")) for m in client.seen[0])
+
+
+def test_native_forces_a_final_report_when_out_of_turns(tmp_path, monkeypatch):
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    seen_tools = []
+
+    def fn(messages):
+        return {"content": "", "tool_calls": [call("run", {"command": "true"}, step(messages))]}
+
+    def wrapped(messages):
+        if "out of turns" in str(messages[-1].get("content")):
+            return {"content": "", "tool_calls": [call("finish", {"status": "blocked", "summary": "ran out",
+                                                                  "blocked_reason": "time"})]}
+        return fn(messages)
+
+    session, client, _ = make_session(tmp_path, wrapped, max_turns=3)
+    result = asyncio.run(NativeHarness().run(session))
+    assert result.report["status"] == "blocked"
+
+
+def test_model_client_speaks_responses_api_and_round_trips_reasoning(monkeypatch):
+    import httpx
+
+    from aifactory import inference
+    from aifactory.inference import ModelClient
+
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        assert request.url.path.endswith("/responses")
+        if len(seen) == 1:
+            return httpx.Response(200, json={"status": "completed", "usage": {"input_tokens": 50, "output_tokens": 5}, "output": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc", "summary": []},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "run", "arguments": "{\"command\": \"ls\"}"}]})
+        return httpx.Response(200, json={"status": "completed", "usage": {"input_tokens": 60, "output_tokens": 7}, "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(inference.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(upstream), **kw))
+    client = ModelClient(ProviderConfig("openai", "https://api.test/v1", "sk-x", "OpenAI"))
+    tools = [{"type": "function", "function": {"name": "run", "description": "d", "parameters": {"type": "object"}}}]
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    first = asyncio.run(client.chat(model="m", messages=msgs, tools=tools, reasoning_effort="high"))
+    assert first["tool_calls"][0]["id"] == "call_1" and first["tool_calls"][0]["function"]["name"] == "run"
+    assert seen[0]["tools"][0]["name"] == "run" and seen[0]["reasoning"] == {"effort": "high"}
+    assert seen[0]["input"][0] == {"role": "developer", "content": "sys"}
+    msgs += [first, {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"}]
+    second = asyncio.run(client.chat(model="m", messages=msgs, tools=tools))
+    assert second["content"] == "done"
+    replay = seen[1]["input"]
+    assert {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc", "summary": []} in replay
+    assert replay[-1] == {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}
