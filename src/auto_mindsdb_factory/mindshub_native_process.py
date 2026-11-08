@@ -99,14 +99,13 @@ def exchange(packet, *, deadline, cancelled):
             except OSError:
                 failed = True
         try:
-            # Match the runner's terminal owned-child retirement: an expired
-            # admission cannot skip reaping. OS kill/reap has no wall-time
-            # guarantee; it grants no more inference work or deadline success.
-            process.wait()
-        except OSError:
+            # Retirement cannot extend inference's original absolute deadline.
+            # If the OS cannot reap in budget, retain ownership as unconfirmed.
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
             failed = True
         try:
-            while not eof:
+            while not eof and time.monotonic() < deadline:
                 try: read()
                 except BlockingIOError: break
         except Exception:
@@ -115,7 +114,8 @@ def exchange(packet, *, deadline, cancelled):
         process.stdout.close()
     complete = (not failed and not forced and state["retired"] and process.returncode == 0
                 and time.monotonic() < deadline and not cancelled())
-    facts = {"pid": process.pid, "reaped": process.returncode is not None, "forced": forced,
+    facts = {"pid": process.pid, "process_group": process.pid,
+             "retirement_unconfirmed": process.returncode is None, "reaped": process.returncode is not None, "forced": forced,
              "packet_sent": sent and not pending, "spawn_late": spawn_late,
              "deadline_exceeded": time.monotonic() >= deadline,
              "retirement_ms": round((time.monotonic() - retirement_started) * 1000),

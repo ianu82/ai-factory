@@ -7,6 +7,7 @@ import time
 import pytest
 
 from auto_mindsdb_factory import mindshub_native_process as process
+from test_product_inference_runtime import inputs
 
 
 PROGRAM = '''import asyncio,json,os,sys,time
@@ -80,7 +81,7 @@ emit({"kind":"retired"})
 
 
 @pytest.mark.parametrize("attempt", range(3))
-def test_late_spawn_is_killed_and_reaped_without_sending_packet(monkeypatch, attempt):
+def test_late_spawn_is_rejected_with_truthful_retirement_without_sending_packet(monkeypatch, attempt):
     original, children = process.subprocess.Popen, []
     monkeypatch.setattr(process, "_command", lambda: [sys.executable, "-I", "-c", "import time;time.sleep(30)"])
     def late_spawn(*args, **kwargs):
@@ -94,11 +95,87 @@ def test_late_spawn_is_killed_and_reaped_without_sending_packet(monkeypatch, att
         observed, payload, complete, facts = process.exchange({"api_key": "synthetic"},
             deadline=start + .02, cancelled=lambda: False)
         assert not complete and observed is payload is None
-        assert facts["forced"] and facts["reaped"] and not facts["packet_sent"]
+        assert facts["forced"] and not facts["packet_sent"]
+        assert facts["retirement_unconfirmed"] is (not facts["reaped"])
+        assert facts["process_group"] == facts["pid"]
         assert facts["spawn_late"] and facts["deadline_exceeded"]
         assert facts["deadline_overrun_ms"] >= 50 and facts["retirement_ms"] >= 0
-        with pytest.raises(ChildProcessError): os.waitpid(facts["pid"], os.WNOHANG)
+        if facts["reaped"]:
+            with pytest.raises(ChildProcessError): os.waitpid(facts["pid"], os.WNOHANG)
     finally:
         for child in children:
             if child.poll() is None: child.kill()
             child.wait(timeout=1)
+
+
+@pytest.fixture
+def unretirable_child(monkeypatch):
+    original, children = process.subprocess.Popen, []
+    monkeypatch.setattr(process, "_command", lambda: [sys.executable, "-I", "-c", "import time;time.sleep(30)"])
+    def create(*args, **kwargs):
+        child = original(*args, **kwargs)
+        wait = child.wait
+        def bounded_wait(timeout=None):
+            assert timeout is not None, "Retirement must retain the original deadline"
+            return wait(timeout=timeout)
+        child.wait = bounded_wait
+        children.append((child, wait))
+        return child
+    def denied(group, signal): raise OSError("private kill failure")
+    monkeypatch.setattr(process.subprocess, "Popen", create)
+    monkeypatch.setattr(process.os, "killpg", denied)
+    yield children
+    # Capture/assert production facts first; only this fixture retires its test child.
+    for child, wait in children:
+        if child.poll() is None: child.kill()
+        wait(timeout=1)
+
+
+def test_failed_kill_returns_bounded_unconfirmed_ownership(unretirable_child):
+    start = time.monotonic()
+    observed, payload, complete, facts = process.exchange({"api_key": "synthetic-private"},
+        deadline=start + .1, cancelled=lambda: False)
+    assert time.monotonic() - start < .5
+    assert observed is payload is None and not complete and not facts["packet_sent"]
+    assert facts["forced"] and not facts["reaped"] and facts["retirement_unconfirmed"]
+    assert facts["deadline_exceeded"] and facts["process_group"] == facts["pid"]
+    assert "private" not in str(facts)
+
+
+@pytest.mark.parametrize("harness", ["native", "anton"])
+def test_normal_callers_journal_unconfirmed_retirement_and_block_recovery(inputs, tmp_path, unretirable_child, harness):
+    import asyncio
+    import json
+    from auto_mindsdb_factory.anton_inference import AntonInference, AntonStopped
+    from auto_mindsdb_factory.connectors import FactoryConnectorError
+    from auto_mindsdb_factory.mindshub_native import MindsHubNativeConnector
+    from auto_mindsdb_factory.product_agent import ProductAgent, AgentSessionError, TOOLS
+    from auto_mindsdb_factory.product_inference_runtime import resolve_qualification_config
+    from auto_mindsdb_factory.product_roles import snapshot_roles
+    from auto_mindsdb_factory.run_journal import RunJournal
+    settings, options = inputs
+    config = resolve_qualification_config(settings, "builder", **{**options, "timeout_seconds": 1})
+    journal = RunJournal(tmp_path, "unconfirmed-" + harness)
+    journal.create({"role_snapshots": snapshot_roles()})
+    deadline, commands = time.monotonic() + 3, []
+    if harness == "native":
+        agent = ProductAgent(MindsHubNativeConnector(config, deadline=deadline), journal,
+            max_turns=3, max_total_tokens=1000, deadline=deadline)
+        invoke = lambda: agent.run("builder", {}, commands.append)
+        stop = AgentSessionError
+    else:
+        gate = AntonInference(config, journal, role="builder", max_total_tokens=1000, deadline=deadline)
+        invoke = lambda: asyncio.run(gate.request(None, {"model": config.model,
+            "reasoning": {"effort": config.reasoning_effort}, "tools": TOOLS}))
+        stop = AntonStopped
+    with pytest.raises(FactoryConnectorError): invoke()
+    with pytest.raises(stop): invoke()
+    events = RunJournal(tmp_path, "unconfirmed-" + harness).events()
+    facts = [event["data"] for event in events if event["kind"] == "inference_process"]
+    assert len(facts) == len(unretirable_child) == 1 and not commands
+    assert facts[0]["retirement_unconfirmed"] and not facts[0]["reaped"] and not facts[0]["packet_sent"]
+    assert facts[0]["pid"] == facts[0]["process_group"]
+    assert sum(event["kind"] == "model_requested" for event in events) == 1
+    assert not any(event["kind"] in {"agent_tool_requested", "agent_command", "agent_report"} for event in events)
+    assert not journal.summary()["usage_complete"]
+    assert config.api_key not in json.dumps(events) and "private kill failure" not in json.dumps(events)
