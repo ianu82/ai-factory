@@ -269,7 +269,9 @@ class RailwayVMSandbox:
         workdir = str(self.resolve(cwd)) if cwd and cwd != "/" else ("/" if cwd == "/" else str(self.work))
         base_env = {"CI": "1", "TERM": "dumb", "NO_COLOR": "1", "HOME": str(self.home), "LANG": "C.UTF-8"}
         try:
-            result = await self.bridge.call("exec", {"id": self.vm_id, "command": f"bash -lc {_quote(command)}",
+            # Login shell for the image's PATH, then pin the directory: profiles may change it.
+            result = await self.bridge.call("exec", {"id": self.vm_id,
+                                                     "command": f"bash -lc {_quote(f'cd {_quote(workdir)} && {command}')}",
                                                      "timeoutSec": int(max(5, timeout)), "cwd": workdir,
                                                      "env": {**base_env, **(env or {})}}, timeout=timeout + 120)
         except asyncio.TimeoutError:
@@ -292,7 +294,8 @@ class RailwayVMSandbox:
                     cwd: str | None = None) -> _VMProcess:
         log_path = self.resolve(log)
         workdir = str(self.resolve(cwd)) if cwd else str(self.work)
-        wrapped = f"mkdir -p {_quote(str(log_path.parent))} && exec bash -lc {_quote(command)} >> {_quote(str(log_path))} 2>&1"
+        wrapped = (f"cd {_quote(workdir)} && mkdir -p {_quote(str(log_path.parent))} && "
+                   f"exec bash -c {_quote(command)} >> {_quote(str(log_path))} 2>&1")
         info = await self.bridge.call("spawn", {"id": self.vm_id, "command": f"bash -lc {_quote(wrapped)}",
                                                 "cwd": workdir, "env": {"HOME": str(self.home), **(env or {})}})
         exit_future = self.bridge.watch_exit(info["proc"])

@@ -43,6 +43,8 @@ class FakeBridge:
                 shutil.copytree(saved, self.root / "work", symlinks=True)
             (self.root / "work").mkdir(parents=True, exist_ok=True)
             (self.root / "tmp").mkdir(exist_ok=True)
+            # Like some real images: a login profile that changes directory. Commands must not depend on it.
+            (self.root / ".bash_profile").write_text('cd "$HOME"\n')
             return {"id": "sbx_test", "region": "test"}
         if op == "checkpoint":
             import shutil
