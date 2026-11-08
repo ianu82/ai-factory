@@ -85,6 +85,7 @@ def apply_bootstrap() -> str | None:
     declared = cfg.get("outcomes") or []
     _cancel_declared(workspace_id, cfg.get("cancel") or [])
     _retry_declared(workspace_id, cfg.get("retry") or [])
+    _resolve_delegated(workspace_id, cfg.get("resolve") or [], cfg.get("delegated_by", ""))
     if declared:
         loop.create_task(_declare_outcomes(workspace_id, declared, task))
     log.info("Bootstrap workspace ready: %s", workspace_id)
@@ -155,6 +156,56 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
                 d.status, d.resolution, d.comment, d.resolved_at = "resolved", "retry", "Operator retried", utcnow()
             record(workspace_id, "operator_retry", f"Operator retried {what} for #{outcome.number}",
                    outcome_id=outcome.id, actor="operator", session=s, data={"key": key, "nonce": nonce})
+
+
+def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) -> None:
+    """Resolve open decisions as an operator acting under a person's explicit delegation.
+
+    Each item: {"outcome": N, "kind": "approve_merge"|"question"|..., "resolution": "...", "comment": "...",
+    "reusable": bool, "nonce": "..."}. The decision records the operator identity and who delegated it.
+    """
+    if not items:
+        return
+    from .db import SessionLocal
+    from .decisions import DecisionError, resolve
+    from .events import record
+    from .models import Decision, Event, Outcome, User
+
+    db = SessionLocal()
+    try:
+        name = f"Operator (delegated by {delegated_by})" if delegated_by else "Operator"
+        operator = db.query(User).filter(User.is_system.is_(True), User.email == "operator@factory.local").first()
+        if operator is None:
+            operator = User(email="operator@factory.local", name=name, is_system=True)
+            db.add(operator)
+            db.commit()
+        elif operator.name != name:
+            operator.name = name
+            db.commit()
+        for item in items:
+            outcome = db.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                               Outcome.number == int(item.get("outcome", 0))).first()
+            if outcome is None:
+                continue
+            nonce = str(item.get("nonce", ""))
+            if any((e.data or {}).get("nonce") == nonce for e in db.query(Event).filter(
+                    Event.outcome_id == outcome.id, Event.kind == "operator_decision")):
+                continue
+            decision = (db.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open",
+                                                  Decision.kind == item.get("kind")).order_by(Decision.created_at.desc()).first())
+            if decision is None:
+                continue
+            try:
+                resolve(db, decision, operator, item["resolution"], item.get("comment", ""),
+                        bool(item.get("reusable")), item.get("scope", "workspace" if item.get("reusable") else "item"))
+            except DecisionError as exc:
+                log.error("Delegated decision for #%s not applied: %s", outcome.number, exc)
+                continue
+            record(workspace_id, "operator_decision",
+                   f"{name} resolved '{decision.title}': {item['resolution']}", outcome_id=outcome.id,
+                   actor="operator", data={"nonce": nonce, "decision_id": decision.id, "delegated_by": delegated_by})
+    finally:
+        db.close()
 
 
 async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) -> None:

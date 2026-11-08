@@ -116,3 +116,47 @@ def test_issue_already_addressed_by_an_outcome_is_linked_not_duplicated(monkeypa
     with session_scope() as s:
         assert s.query(Outcome).filter(Outcome.workspace_id == ws_id).count() == 1
         assert s.query(Signal).one().status == "accepted"
+
+
+def test_delegated_operator_resolves_a_merge_approval_once(monkeypatch):
+    from aifactory.models import Decision, Event, Plan, Task, User
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={})
+        s.add(ws)
+        s.flush()
+        repo = Repository(workspace_id=ws.id, full_name="acme/app", default_branch="main", config={})
+        s.add(repo)
+        s.flush()
+        o = Outcome(workspace_id=ws.id, number=7, title="Self change", repo_ids=[repo.id], status="attention")
+        s.add(o)
+        s.flush()
+        plan = Plan(outcome_id=o.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key="T1", title="t", repo_id=repo.id,
+                 status="awaiting_approval", stage="merge", pr_number=196)
+        s.add(t)
+        s.flush()
+        s.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="approve_merge", title="Approve merge",
+                       options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}]))
+        ws_id, task_id = ws.id, t.id
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "Acme", "workspace": "Acme", "delegated_by": "ian@mindsdb.com",
+        "resolve": [{"outcome": 7, "kind": "approve_merge", "resolution": "approve", "nonce": "n1"}]}))
+
+    async def run():
+        return apply_bootstrap()
+
+    asyncio.run(run())
+    asyncio.run(run())  # same nonce: applied once
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "queued" and task.stage == "merge"
+        decision = s.query(Decision).one()
+        operator = s.get(User, decision.resolved_by)
+        assert decision.resolution == "approve" and operator.is_system and "ian@mindsdb.com" in operator.name
+        assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
