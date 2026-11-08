@@ -337,3 +337,27 @@ def test_planner_question_with_a_plan_can_be_approved_as_proposed(factory):
     resolve(db, db.get(Decision, decision.id), db.get(User, factory["user"]), "approve", comment="Exclamation mark.")
     db.close()
     assert drive(lambda: outcome_status(outcome_id) == "completed")
+
+
+def test_reviewer_findings_survive_a_retry(factory):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        from aifactory.models import Plan
+
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t", spec="s",
+                    acceptance=["c"], repo_id=factory["repo"], status="queued",
+                    evidence={"attempts": [{"n": 3, "result": "verification_failed", "verdict": {
+                        "verdict": "fail", "summary": "Race on credential save",
+                        "criteria": [{"criterion": "c", "status": "fail", "evidence": "stale token"}],
+                        "findings": [{"severity": "major", "description": "events published before commit"}]}}]})
+        s.add(task)
+        s.flush()
+        task_id = task.id
+    runner = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    joined = "\n".join(runner.feedback)
+    assert "Race on credential save" in joined and "stale token" in joined and "events published before commit" in joined

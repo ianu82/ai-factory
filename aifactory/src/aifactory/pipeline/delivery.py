@@ -47,6 +47,24 @@ class TaskRunner:
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
         self._load()
+        self.feedback = self._prior_feedback()
+
+    def _prior_feedback(self) -> list[str]:
+        """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
+        notes: list[str] = []
+        for attempt in (self.task.evidence or {}).get("attempts", [])[-3:]:
+            verdict = attempt.get("verdict") or {}
+            if attempt.get("result") == "verification_failed" and verdict:
+                notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
+                for c in verdict.get("criteria", []):
+                    if c.get("status") != "pass":
+                        notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
+                for f in verdict.get("findings", []):
+                    if f.get("severity") in ("blocker", "major"):
+                        notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
+            elif attempt.get("result") in ("checks_failed", "policy"):
+                notes.append(f"- An earlier attempt failed: {attempt.get('detail') or attempt.get('result')}")
+        return notes
 
     # state ---------------------------------------------------------------------
     def _load(self) -> None:
