@@ -275,7 +275,7 @@ def test_bound_codex_is_rejected_before_receipt_or_credential_resolution(inputs,
     assert not reads
 
 
-@pytest.mark.parametrize("mode", ["success", "drop", "attempts", "redirect", "error", "cancel", "timeout", "read-cancel", "cleanup", "cleanup-slow-start", "bad-usage"])
+@pytest.mark.parametrize("mode", ["success", "drop", "attempts", "redirect", "error", "cancel", "timeout", "read-cancel", "cleanup", "cleanup-slow-start", "startup-timeout", "bad-usage"])
 def test_native_mindshub_transport_uses_bound_request_and_closes(inputs, tmp_path, monkeypatch, mode):
     pytest.importorskip("anton.core.session")
     import sys
@@ -287,6 +287,7 @@ def test_native_mindshub_transport_uses_bound_request_and_closes(inputs, tmp_pat
     from auto_mindsdb_factory.product_roles import snapshot_roles
     from auto_mindsdb_factory.run_journal import RunJournal
     script = r'''import asyncio,json
+from pathlib import Path
 from auto_mindsdb_factory import mindshub_native_worker as worker
 http=worker._trusted_http_client()
 actual=http.AsyncClient
@@ -318,23 +319,32 @@ class Client:
  async def __aexit__(self,*args):
   await self.client.__aexit__(*args)
   if MODE=="cleanup":
+   Path(CLEANUP_MARKER).touch()
    while True:
     try:await asyncio.sleep(60)
     except asyncio.CancelledError:continue
 http.AsyncClient=lambda **options:Client()
 raise SystemExit(worker.main())
 '''
-    startup = "import time; time.sleep(.5)\n" if mode == "cleanup-slow-start" else ""
-    child_mode = "cleanup" if mode == "cleanup-slow-start" else mode
-    monkeypatch.setattr(mindshub_native_process, "_command", lambda: [sys.executable, "-c", startup + "MODE=" + repr(child_mode) + "\n" + script])
+    cleanup = mode in {"cleanup", "cleanup-slow-start"}
+    cleanup_marker = tmp_path / "cleanup-entered"
+    startup = "import time; time.sleep(.5)\n" if mode in {"cleanup-slow-start", "startup-timeout"} else ""
+    child_mode = "cleanup" if cleanup or mode == "startup-timeout" else mode
+    constants = "MODE=" + repr(child_mode) + "\nCLEANUP_MARKER=" + repr(str(cleanup_marker)) + "\n"
+    monkeypatch.setattr(mindshub_native_process, "_command", lambda: [sys.executable, "-c", startup + constants + script])
     settings, kwargs = inputs
     config = runtime.resolve_qualification_config(settings, "builder", **kwargs)
     journal = RunJournal(tmp_path, "native-http")
     journal.create({"role_snapshots": snapshot_roles()})
     commands, started = [], time.monotonic()
-    bounded = mode in {"cancel", "timeout", "read-cancel", "cleanup", "cleanup-slow-start"}
+    bounded = mode in {"cancel", "timeout", "read-cancel", "startup-timeout"}
+    def cancelled():
+        # Exercise cleanup after observing a response, independently of SDK startup speed.
+        if cleanup:
+            return cleanup_marker.exists()
+        return mode in {"cancel", "read-cancel"} and time.monotonic() - started > .3
     connector = MindsHubNativeConnector(config, deadline=started + (.4 if bounded else 3),
-        cancelled=lambda: mode in {"cancel", "read-cancel"} and time.monotonic() - started > .3)
+        cancelled=cancelled)
     agent = ProductAgent(connector, journal, max_turns=3, max_total_tokens=1000, deadline=started + 3)
     def command(argv):
         commands.append(argv)
@@ -346,6 +356,10 @@ raise SystemExit(worker.main())
         with pytest.raises((AgentSessionError, FactoryConnectorError)): agent.run("builder", {}, command)
         assert not commands
     assert time.monotonic() - started < 3 and connector.worker_facts["reaped"]
+    if cleanup:
+        assert cleanup_marker.exists() and connector.worker_facts["packet_sent"] and connector.worker_facts["forced"]
+    elif mode == "startup-timeout":
+        assert not cleanup_marker.exists() and not connector.worker_facts["packet_sent"]
     evidence = json.dumps(journal.events())
     assert all(value not in evidence for value in (KEY, "private provider error", "private dropped field"))
     assert journal.summary()["total_tokens"] == (20 if mode == "success" else 10 if mode in {"drop", "attempts", "cleanup", "cleanup-slow-start"} else 0), connector.worker_facts
