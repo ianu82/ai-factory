@@ -10,12 +10,12 @@ import { Empty, Skeleton } from "../ui";
 type Filter = "open" | "ready" | "merged" | "all";
 const FILTERS: [Filter, string][] = [["open", "Open"], ["ready", "Ready to merge"], ["merged", "Merged"], ["all", "All"]];
 const GROUPS: [PullRow["group"], string][] = [
-  ["ready", "Ready to merge"], ["attention", "Needs attention"], ["checks", "Waiting on checks"], ["draft", "Draft"], ["merged", "Merged"],
+  ["ready", "Ready to merge"], ["attention", "Needs attention"], ["checks", "In progress"], ["draft", "Draft"], ["merged", "Merged"],
 ];
 const ICON = {
   ready: <GitPullRequest className="pr-ico ready" aria-label="Ready to merge" />,
   attention: <ShieldAlert className="pr-ico attention" aria-label="Needs attention" />,
-  checks: <GitPullRequest className="pr-ico checks" aria-label="Waiting on checks" />,
+  checks: <GitPullRequest className="pr-ico checks" aria-label="In progress" />,
   draft: <GitPullRequestDraft className="pr-ico draft" aria-label="Draft" />,
   merged: <GitMerge className="pr-ico merged" aria-label="Merged" />,
 };
