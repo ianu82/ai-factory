@@ -69,3 +69,24 @@ def test_sandbox_refuses_path_escape(tmp_path):
         sb.read_text("link.txt")
     sb.write_text("dir/new.txt", "ok")
     assert sb.read_text("dir/new.txt") == "ok"
+
+
+def test_candidate_patch_with_new_files_is_visible_to_the_verifier(tmp_path):
+    import subprocess
+
+    from aifactory.gitops import Patch, apply_in_sandbox
+
+    sb = LocalSandbox("v", root=tmp_path).create()
+    sb.work.mkdir()
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+    run = lambda *a: subprocess.run(a, cwd=sb.work, check=True, capture_output=True, text=True, env=env).stdout
+    run("git", "init", "-q")
+    (sb.work / "a.txt").write_text("a\n")
+    run("git", "add", ".")
+    run("git", "commit", "-qm", "base")
+    base = run("git", "rev-parse", "HEAD").strip()
+    diff = (b"diff --git a/new.py b/new.py\nnew file mode 100644\nindex 0000000..3e75765\n--- /dev/null\n"
+            b"+++ b/new.py\n@@ -0,0 +1 @@\n+new\n")
+    asyncio.run(apply_in_sandbox(sb, Patch(diff=diff, files=["new.py"], additions=1, deletions=0)))
+    assert "new.py" in run("git", "diff", "--stat", base)

@@ -120,8 +120,13 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
     with session_scope() as s:
         for item in items:
             key, nonce = str(item.get("key", "")), str(item.get("nonce", ""))
-            outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
-                                              Outcome.signal_id == f"operator:{key}").first()
+            if item.get("outcome"):
+                outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                                  Outcome.number == int(item["outcome"])).first()
+                key = f"#{item['outcome']}"
+            else:
+                outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                                  Outcome.signal_id == f"operator:{key}").first()
             if outcome is None:
                 continue
             done = any((e.data or {}).get("nonce") == nonce for e in s.query(Event).filter(
@@ -130,13 +135,17 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
                 continue
             from .models import Task
 
-            blocked_tasks = s.query(Task).filter(Task.outcome_id == outcome.id, Task.status == "blocked").all()
+            blocked_tasks = s.query(Task).filter(Task.outcome_id == outcome.id,
+                                                 Task.status.in_(["blocked", "failed"])).all()
             if outcome.status == "blocked" and not blocked_tasks:
                 outcome.status, outcome.blocked_reason = "planning", ""
                 what = "planning"
             elif blocked_tasks:
                 for t in blocked_tasks:
-                    t.status, t.blocked_reason = "queued", ""  # resumes at its durable stage
+                    if t.status == "failed":  # attempts exhausted: start fresh attempts
+                        t.attempt = 0
+                        t.stage = "revise" if t.pr_number else ""
+                    t.status, t.blocked_reason = "queued", ""  # otherwise resumes at its durable stage
                 outcome.status = "running"
                 what = ", ".join(t.key for t in blocked_tasks)
             else:

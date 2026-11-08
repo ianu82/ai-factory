@@ -49,7 +49,8 @@ Another engineer implemented a task. You did not write this code and must not tr
 Decide whether the change truly satisfies every acceptance criterion and is safe to merge.
 
 How to work:
-- Inspect the diff (`git diff {base}` shows all changes) and read the surrounding code.
+- Inspect the diff: the candidate is staged in this checkout, so `git diff {base}` (or `git diff --cached {base}`)
+  shows every change including new files; `git status` lists them. Read the surrounding code.
 - Run the tests and any commands needed to gather evidence. Write throwaway checks if useful,
   but do not try to fix the implementation — you are reviewing only.
 - For each acceptance criterion, record pass/fail/unverified with concrete evidence

@@ -108,7 +108,8 @@ async def apply_in_sandbox(sandbox: LocalSandbox, patch: "Patch") -> None:
     if patch.empty:
         return
     sandbox.write_bytes(f"{SCRATCH}/candidate.patch", patch.diff)
-    result = await sandbox.exec(f"git apply --binary --whitespace=nowarn {SCRATCH}/candidate.patch", timeout=120)
+    # --index stages the candidate so new files are tracked: reviewers see them in `git diff <base>`.
+    result = await sandbox.exec(f"git apply --index --binary --whitespace=nowarn {SCRATCH}/candidate.patch", timeout=120)
     if not result.ok:
         raise SandboxError(f"Candidate patch does not apply: {result.output[-600:]}")
 
