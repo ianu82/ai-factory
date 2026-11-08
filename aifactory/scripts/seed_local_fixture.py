@@ -210,6 +210,30 @@ with session_scope() as s:
                  count=3, first_seen_at=ago(3000), last_seen_at=ago(45)))
     s.add(Signal(workspace_id=ws.id, repo_id=app.id, source="ci_failure", fingerprint="f2", title="validate failing on main in ianu82/calorie-tracker",
                  body="Run failed at 4be81f09.", url="https://github.com/ianu82/calorie-tracker/actions", count=1, first_seen_at=ago(20), last_seen_at=ago(20)))
+    # History the Factory learns from: recurring review findings, a check builders keep failing, runtime QA that
+    # cannot boot, and product feedback sent by the app itself.
+    findings = [(o1, t1, "Weight PATCH accepts a date string with trailing whitespace; validate the trimmed canonical form"),
+                (o6, t6, "No regression test covers the removed import path; the typecheck failure would have been caught"),
+                (o5, t5, "Changed API behaviour without updating the route's integration test")]
+    for i, (o, t, text) in enumerate(findings):
+        s.add(Run(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, role="verifier", harness="native", provider="mindshub",
+                  model="gpt-terra", status="succeeded", cost_usd=0.06, started_at=ago(600 + i * 90),
+                  result={"verdict": "fail", "summary": "Rejected", "criteria": [],
+                          "findings": [{"severity": "blocker", "description": text}]}))
+    for i, t, o in ((0, t6, o6), (1, t5, o5), (2, t1, o1)):
+        ev(o, t, "check_result", "✗ npm run typecheck", 700 + i * 50, level="warn", command="npm run typecheck", exit_code=2)
+    for i, (o, t) in enumerate(((o6, t6), (o5, t5))):
+        ev(o, t, "qa_app_failed", "The app did not become ready for runtime QA: Error: connect ECONNREFUSED 127.0.0.1:54321 "
+           "(Supabase is not running in the QA environment)", 500 + i * 120, level="warn")
+    s.add(Signal(workspace_id=ws.id, repo_id=app.id, source="feedback", fingerprint="f3", title="Can't edit a food after logging it",
+                 body="Tapping a logged food opens nothing on iPhone Safari.\n\nReported by a customer via the product.",
+                 count=2, first_seen_at=ago(400), last_seen_at=ago(30)))
     ws.outcome_seq = 6
     member.last_viewed_at = ago(240)
+
+from aifactory import insights  # noqa: E402
+
+with session_scope() as s:
+    ws_id = s.query(Workspace).first().id
+    print("improvements", insights.analyze(s, ws_id))
 print("Seeded local fixture workspace")

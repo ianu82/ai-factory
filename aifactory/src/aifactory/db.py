@@ -58,8 +58,26 @@ def init_engine(url: str | None = None) -> Engine:
     from . import models  # noqa: F401  (register tables)
 
     Base.metadata.create_all(_engine)
+    _add_missing_columns(_engine)
     harden_data_dir()
     return _engine
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    """Additive schema evolution: new nullable model columns are added to existing tables."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            present = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present or not column.nullable:
+                    continue
+                kind = column.type.compile(dialect=engine.dialect)
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {kind}'))
 
 
 def harden_data_dir() -> None:

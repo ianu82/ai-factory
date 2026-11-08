@@ -284,6 +284,12 @@ export interface Signal {
   count: number;
   status: string;
   outcome_id: string | null;
+  repo_id: string | null;
+  data: {
+    rule?: string;
+    action?: { type: "settings" | "repo_config" | "team_note" | "review"; label?: string; note?: string; repo_id?: string; set?: Record<string, unknown> };
+    evidence?: { label: string; detail?: string; outcome_id?: string; task_id?: string; url?: string }[];
+  };
   first_seen_at: string;
   last_seen_at: string;
 }

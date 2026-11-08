@@ -191,9 +191,14 @@ class LocalSandbox:
 
     def _preexec(self):
         uid = self.uid
+        cpus = job_cpus(uid)
 
         def run() -> None:
             os.setsid()
+            if cpus:
+                # Toolchains size worker pools from the CPUs they can see; on a big shared host that exhausts
+                # the container's process limit. A small, per-job CPU set keeps pools proportionate.
+                os.sched_setaffinity(0, cpus)
             if uid is not None:
                 os.setgroups([])
                 os.setgid(uid)
@@ -401,6 +406,22 @@ async def list_files(sandbox, relative: str, pattern: str = "*") -> list[str]:
         return sorted(p.name for p in sandbox.resolve(relative).glob(pattern))
     except OSError:
         return []
+
+
+def job_cpus(uid: int | None) -> set[int] | None:
+    """The CPU set one job's processes may use (AIFACTORY_SANDBOX_CPUS, default 4), spread across jobs by UID."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        width = int(os.environ.get("AIFACTORY_SANDBOX_CPUS", "4"))
+        allowed = sorted(os.sched_getaffinity(0))
+    except (ValueError, OSError):
+        return None
+    if width <= 0 or len(allowed) <= width:
+        return None
+    slots = len(allowed) // width
+    start = ((uid or 0) % slots) * width
+    return set(allowed[start:start + width])
 
 
 def host_capacity() -> dict[str, Any]:

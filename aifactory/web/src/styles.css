@@ -267,6 +267,28 @@ a { color: inherit; text-decoration: none; }
 .decide .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; align-items: center; }
 .decide textarea { margin-top: 10px; background: var(--surface); min-height: 60px; }
 
+/* improvement proposal — something the Factory learned, waiting for an admin */
+.proposals { display: grid; gap: 10px; margin: 0 0 18px; }
+.proposal { border: 1px solid var(--line); background: var(--surface); border-radius: var(--r-lg); padding: 14px 16px; max-width: 880px; }
+.proposal-tag { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+.proposal-tag > span:first-child { font-weight: 600; color: var(--teal-dark); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
+.proposal-tag .mono { font-family: var(--mono); font-size: 11.5px; }
+.proposal h4 { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--ink); }
+.proposal .prose { font-size: 13px; max-width: 72ch; }
+.proposal .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; align-items: center; }
+.proposal .textarea { font-size: 13px; min-height: 64px; }
+.evidence { list-style: none; margin: 10px 0 0; padding: 0; border-top: 1px solid var(--line); }
+.evidence li {
+  display: grid; grid-template-columns: minmax(96px, max-content) minmax(0, 1fr) 18px; gap: 12px; align-items: center;
+  padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12.5px;
+}
+.evidence .ev-label { font-family: var(--mono); font-size: 11.5px; color: var(--ink); white-space: nowrap; }
+.evidence .ev-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.evidence .ev-link { color: var(--faint); display: inline-flex; }
+.evidence .ev-link:hover { color: var(--teal-dark); }
+.evidence .ev-link svg { width: 14px; height: 14px; }
+.stack { display: grid; gap: 14px; }
+
 /* tasks inside an outcome */
 .task { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); }
 .task + .task { margin-top: 8px; }
@@ -428,6 +450,9 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
   .page-head { padding: 12px 14px 8px; }
   .toolbar { padding: 0 14px 10px; }
   .row { padding: 10px 14px; grid-template-columns: 14px minmax(0, 1fr); }
+  .proposals { margin: 0 12px 18px; }
+  .proposal { padding: 12px 14px; }
+  .evidence li { grid-template-columns: minmax(64px, max-content) minmax(0, 1fr) 16px; gap: 8px; }
   .row .meta { grid-column: 2; }
   .p-head, .p-sec { padding-left: 16px; padding-right: 16px; }
   .settings { grid-template-columns: 1fr; padding: 0 14px 40px; }

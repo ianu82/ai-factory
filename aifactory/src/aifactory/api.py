@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from . import insights
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .config import get_settings
@@ -28,7 +29,7 @@ from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
 from .repo_detect import detect
 from .sandbox import isolation_available
 from .security import encrypt, mask
-from .signals import outcome_from_text, sync_github
+from .signals import outcome_from_text, sync_github, upsert_signal
 
 router = APIRouter(prefix="/api")
 SECRET_KINDS = {"mindshub_api_key", "openai_api_key", "github_token"}
@@ -360,7 +361,7 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     for key in ("context", "signal_label"):
         if key in body.config:
             cfg[key] = str(body.config[key] or "")[:8000]
-    for key in ("merge", "release"):
+    for key in ("merge", "release", "qa", "recovery"):
         if key in body.config and isinstance(body.config[key], dict):
             cfg[key] = body.config[key]
     for key in ("require_ci", "max_changed_lines"):
@@ -690,6 +691,94 @@ class SignalAction(BaseModel):
     action: str  # accept|ignore
     title: str | None = None
     brief: str | None = None
+    note: str | None = Field(default=None, max_length=8000)  # edited team note for an improvement
+
+
+@router.post("/workspaces/{workspace_id}/signals/analyze")
+def analyze_signals(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    result = insights.analyze(db, workspace_id)
+    db.commit()
+    return result
+
+
+class FeedbackIn(BaseModel):
+    title: str = Field(min_length=3, max_length=300)
+    body: str = Field(default="", max_length=8000)
+    url: str = Field(default="", max_length=400)
+    repo: str | None = Field(default=None, max_length=200)  # owner/name of a connected repository
+    source_id: str | None = Field(default=None, max_length=200)  # the product's own id; repeats are counted
+    reporter: str | None = Field(default=None, max_length=200)
+
+
+def _record_feedback(db: Session, workspace_id: str, body: FeedbackIn, via: str) -> Signal:
+    repo_id = None
+    if body.repo:
+        repo = db.query(Repository).filter(Repository.workspace_id == workspace_id,
+                                           Repository.full_name == body.repo).one_or_none()
+        repo_id = repo.id if repo else None
+    text = body.body.strip()
+    if body.reporter:
+        text += f"\n\nReported by {body.reporter} via {via}."
+    key = body.source_id or " ".join(body.title.lower().split())
+    sig, _created = upsert_signal(db, workspace_id, source="feedback", title=body.title.strip(), body=text,
+                                  url=body.url, external_id=key, repo_id=repo_id)
+    if sig.status in ("ignored", "resolved"):
+        sig.status = "new"  # it came back
+    db.commit()
+    notify(workspace_id, "signal", sig.id)
+    return sig
+
+
+@router.post("/workspaces/{workspace_id}/signals")
+def add_feedback(workspace_id: str, body: FeedbackIn, user: User = Depends(current_user),
+                 db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    return S.signal(_record_feedback(db, workspace_id, body, user.name or user.email))
+
+
+def _feedback_hash(key: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+@router.post("/workspaces/{workspace_id}/feedback-key")
+def rotate_feedback_key(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Create (or replace) the key a product uses to send user feedback here. Shown once."""
+    import secrets as pysecrets
+
+    _ws(db, user, workspace_id, "admin")
+    key = "aff_" + pysecrets.token_urlsafe(32)
+    sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == "feedback_key").one_or_none()
+    if sec is None:
+        sec = Secret(workspace_id=workspace_id, kind="feedback_key", ciphertext="")
+        db.add(sec)
+    sec.ciphertext, sec.hint, sec.status = _feedback_hash(key), mask(key), "valid"
+    db.commit()
+    record(workspace_id, "feedback_key_rotated", "Product feedback key created", actor=user.id)
+    return {"key": key, "hint": sec.hint, "endpoint": f"/api/feedback/{workspace_id}"}
+
+
+@router.get("/workspaces/{workspace_id}/feedback-key")
+def feedback_key_status(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id)
+    sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == "feedback_key").one_or_none()
+    return {"configured": sec is not None, "hint": sec.hint if sec else "", "endpoint": f"/api/feedback/{workspace_id}",
+            "updated_at": S.ts(sec.updated_at) if sec else None}
+
+
+@router.post("/feedback/{workspace_id}")
+def ingest_feedback(workspace_id: str, body: FeedbackIn, request: Request, db: Session = Depends(get_db)):
+    """Product feedback from a team's own app, authenticated with the workspace feedback key."""
+    import hmac
+
+    supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == "feedback_key").one_or_none()
+    if not supplied or sec is None or not hmac.compare_digest(sec.ciphertext, _feedback_hash(supplied)):
+        raise HTTPException(401, "Invalid feedback key")
+    sig = _record_feedback(db, workspace_id, body, "the product")
+    return {"id": sig.id, "count": sig.count, "status": sig.status}
 
 
 @router.post("/workspaces/{workspace_id}/signals/{signal_id}")
@@ -705,6 +794,15 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         return S.signal(sig)
     if body.action != "accept":
         raise HTTPException(400, "Unknown action")
+    if sig.source == "improvement":
+        _ws(db, user, workspace_id, "admin")
+        try:
+            insights.apply(db, sig, user, note=body.note)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        db.commit()
+        notify(workspace_id, "signal", sig.id)
+        return S.signal(sig)
     repo_ids = [sig.repo_id] if sig.repo_id else [r.id for r in db.query(Repository).filter(
         Repository.workspace_id == workspace_id).limit(1)]
     outcome = outcome_from_text(db, workspace_id, user, body.title or sig.title,

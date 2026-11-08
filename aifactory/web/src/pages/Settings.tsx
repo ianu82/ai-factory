@@ -418,6 +418,7 @@ function WorkspaceSection() {
   const [name, setName] = useState(ws.name);
   const admin = ws.role === "owner" || ws.role === "admin";
   return (
+    <>
     <section className="s-block">
       <h2>Workspace</h2>
       <p>Each workspace has its own repositories, credentials, policies and history.</p>
@@ -428,6 +429,52 @@ function WorkspaceSection() {
       <div className="s-line" style={{ marginTop: 18, borderTop: "1px solid var(--line)" }}>
         <div className="l"><b>{ws.paused ? "Paused" : "Running"}</b><span>Pausing stops new plans and tasks from starting. Running steps finish.</span></div>
         {admin && <button className="btn" onClick={() => save({ paused: !ws.paused }, false)}>{ws.paused ? "Resume" : "Pause workspace"}</button>}
+      </div>
+    </section>
+    <FeedbackIntake />
+    </>
+  );
+}
+
+function FeedbackIntake() {
+  const { ws } = useWs();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [key, setKey] = useState<string | null>(null);
+  const admin = ws.role === "owner" || ws.role === "admin";
+  const q = useQuery({ queryKey: ["feedback-key", ws.id], queryFn: () => api<{ configured: boolean; hint: string; endpoint: string; updated_at: string | null }>(`/api/workspaces/${ws.id}/feedback-key`) });
+  const endpoint = `${location.origin}${q.data?.endpoint || `/api/feedback/${ws.id}`}`;
+  const rotate = async () => {
+    if (q.data?.configured && !confirm("Replace the feedback key? Products using the current key will stop sending feedback until they are updated.")) return;
+    try {
+      const r = await api<{ key: string }>(`/api/workspaces/${ws.id}/feedback-key`, { method: "POST" });
+      setKey(r.key);
+      qc.invalidateQueries({ queryKey: ["feedback-key", ws.id] });
+    } catch (err) {
+      toast((err as Error).message, true);
+    }
+  };
+  const example = `curl -X POST ${endpoint} \\
+  -H "Authorization: Bearer ${key || "<feedback key>"}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"title": "Export does nothing on Safari", "body": "…", "repo": "owner/name", "source_id": "ticket-123"}'`;
+  return (
+    <section className="s-block">
+      <h2>Product feedback</h2>
+      <p>Your product can send what its users report straight to Signals. Repeats of the same <code className="mono">source_id</code> (or title) are counted, not duplicated, and nothing becomes work until someone accepts it.</p>
+      <div className="cred">
+        <div className="cred-top">
+          <Dot tone={q.data?.configured ? "good" : "idle"} />
+          <b>Feedback key</b>
+          {q.data?.configured && <span className="masked">{q.data.hint}</span>}
+          <span style={{ flex: 1 }} />
+          {admin && <button className="btn sm" onClick={rotate}>{q.data?.configured ? "Replace key" : "Create key"}</button>}
+        </div>
+        <div className="muted" style={{ fontSize: 12.5, marginTop: 6 }}>
+          {key ? "Copy it now. It is stored only as a hash and cannot be shown again." : q.data?.configured ? `Created ${ago(q.data.updated_at)}.` : "No key yet. Members can still log feedback by hand on the Signals page."}
+        </div>
+        {key && <input className="input mono" readOnly value={key} onFocus={(e) => e.currentTarget.select()} aria-label="New feedback key" style={{ marginTop: 10 }} />}
+        <pre className="log" style={{ marginTop: 10, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{example}</pre>
       </div>
     </section>
   );

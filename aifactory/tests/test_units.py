@@ -94,3 +94,19 @@ def test_candidate_patch_with_new_files_is_visible_to_the_verifier(tmp_path):
     asyncio.run(apply_in_sandbox(sb, Patch(diff=diff, files=["a.txt", "new.py"], additions=2, deletions=0)))
     stat = run("git", "diff", "--stat", base)
     assert "new.py" in stat and "a.txt" in stat
+
+
+def test_job_cpu_sets_are_small_and_spread_by_uid(monkeypatch):
+    import os
+
+    from aifactory import sandbox
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(48)), raising=False)
+    monkeypatch.setenv("AIFACTORY_SANDBOX_CPUS", "4")
+    a, b = sandbox.job_cpus(20000), sandbox.job_cpus(20001)
+    assert len(a) == len(b) == 4 and a.isdisjoint(b)
+    monkeypatch.setenv("AIFACTORY_SANDBOX_CPUS", "0")
+    assert sandbox.job_cpus(20000) is None
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1}, raising=False)
+    monkeypatch.setenv("AIFACTORY_SANDBOX_CPUS", "4")
+    assert sandbox.job_cpus(20000) is None  # a small host is left alone

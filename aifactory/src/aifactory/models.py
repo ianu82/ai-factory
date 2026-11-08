@@ -290,7 +290,7 @@ class Signal(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workspace_id: Mapped[str] = mapped_column(String(32), index=True)
     repo_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    source: Mapped[str] = mapped_column(String(30))  # github_issue|ci_failure|feedback|smoke_failure
+    source: Mapped[str] = mapped_column(String(30))  # github_issue|ci_failure|feedback|smoke_failure|improvement
     external_id: Mapped[str] = mapped_column(String(200), default="")
     fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(300))
@@ -299,6 +299,7 @@ class Signal(Base):
     count: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(20), default="new")  # new|proposed|accepted|ignored|resolved
     outcome_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=dict)  # improvement proposals
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

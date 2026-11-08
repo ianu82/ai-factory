@@ -86,6 +86,7 @@ class Orchestrator:
                 await asyncio.to_thread(self._promote)
                 self._schedule()
                 await self._maybe_sync_signals()
+                await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_inventory()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
@@ -117,6 +118,27 @@ class Orchestrator:
                 roles = [m.role for m in s.query(Membership).filter(Membership.workspace_id == ws.id)]
                 log.info("inventory workspace %s '%s' members=%s credentials: %s", ws.id[:6], ws.name, roles, creds)
         log.info("inventory orchestrator %s", self.status())
+
+    def _maybe_analyze(self) -> None:
+        """Refresh improvement proposals from delivery history (every 30 minutes by default)."""
+        import time
+
+        interval = int(os.environ.get("AIFACTORY_INSIGHT_INTERVAL_SECONDS", "1800"))
+        if interval <= 0 or time.monotonic() - getattr(self, "_last_analysis", 0.0) < interval:
+            return
+        self._last_analysis = time.monotonic()
+        from .. import insights
+
+        with session_scope() as s:
+            ids = [w.id for w in s.query(Workspace)]
+        for workspace_id in ids:
+            try:
+                with session_scope() as s:
+                    result = insights.analyze(s, workspace_id)
+                if result["created"] or result["updated"]:
+                    log.info("improvements %s %s", workspace_id[:6], result)
+            except Exception:
+                log.exception("improvement analysis failed for %s", workspace_id)
 
     async def _maybe_sync_signals(self) -> None:
         """Poll GitHub for issues and CI failures every few minutes (intake + feedback)."""

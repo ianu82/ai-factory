@@ -97,5 +97,5 @@ def artifact(a: Artifact, content: bool = False) -> dict[str, Any]:
 
 def signal(s: Signal) -> dict[str, Any]:
     return {"id": s.id, "source": s.source, "title": s.title, "body": s.body, "url": s.url, "count": s.count,
-            "status": s.status, "outcome_id": s.outcome_id, "repo_id": s.repo_id,
+            "status": s.status, "outcome_id": s.outcome_id, "repo_id": s.repo_id, "data": s.data or {},
             "first_seen_at": ts(s.first_seen_at), "last_seen_at": ts(s.last_seen_at)}
