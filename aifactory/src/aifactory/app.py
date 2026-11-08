@@ -17,6 +17,7 @@ from .config import get_settings
 from .db import init_engine
 from .gateway import router as gateway_router
 from .onboarding import router as onboarding_router
+from .pulls import router as pulls_router
 from .pipeline.orchestrator import orchestrator
 
 log = logging.getLogger("aifactory")
@@ -54,6 +55,7 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
     app.include_router(auth_router)
     app.include_router(gateway_router)
     app.include_router(onboarding_router)
+    app.include_router(pulls_router)
 
     if (WEB_DIST / "index.html").exists():
         app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
