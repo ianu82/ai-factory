@@ -157,6 +157,14 @@ def test_runtime_qa_runs_inside_the_vm_sandbox(tmp_path, monkeypatch):
         await asyncio.sleep(0.2)
         diagnostics = {"pages": pages, "probe_body": probes[0].get("body", "")[:800], "log": await run.log_tail(),
                        "calls": bridge.calls[-12:], "spawned": bridge.spawned[-2:]}
+        if pages[0].get("title") != "VM app":
+            import json as _json
+            import re as _re
+
+            print("DIAG listing:", _re.findall(r'href="([^"]+)"', diagnostics["probe_body"]))
+            print("DIAG spawned:", _json.dumps(diagnostics["spawned"]))
+            print("DIAG work:", sorted(p.name for p in (tmp_path / "vm" / "work").iterdir()))
+            print("DIAG root:", sorted(p.name for p in (tmp_path / "vm").iterdir()))
         assert pages[0].get("status") == 200 and pages[0].get("title") == "VM app", diagnostics
         assert probes[0]["ok"] and images and images[0][1].startswith("iVBOR")
         assert run.evidence["isolation"].startswith("railway-vm sbx_test")
