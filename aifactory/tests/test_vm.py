@@ -23,7 +23,11 @@ class FakeBridge:
         self.exits = {}
 
     def _map(self, text: str) -> str:
-        return text.replace("/work", str(self.root / "work")).replace("/tmp/", str(self.root / "tmp") + "/")
+        # Only VM-absolute paths (at a word start), never "/work" inside a host path like /home/runner/work/...
+        import re
+
+        text = re.sub(r"(^|[\s\"'=:;(])/work", lambda m: m.group(1) + str(self.root / "work"), text)
+        return re.sub(r"(^|[\s\"'=:;(])/tmp/", lambda m: m.group(1) + str(self.root / "tmp") + "/", text)
 
     async def call(self, op, args=None, timeout=600):
         args = args or {}
