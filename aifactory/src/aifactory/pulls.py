@@ -28,6 +28,12 @@ TTL_SECONDS = 45  # the page's own cache, and how long pending CI is trusted
 SETTLED_TTL_SECONDS = 300  # finished CI and known mergeability can change too (reruns, a moving base branch)
 MAX_PAGES = 10  # GitHub pages of 100 per repository and state
 HUMAN_TASK = {"needs_input", "failed", "blocked", "smoke_failed"}
+SHIPPING_STAGES = {"ci", "merge", "publish", "smoke", "release"}  # Factory stages that ship the PR as it is
+THREADS = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    reviewThreads(first: 100) { nodes { isResolved isOutdated comments(first: 1) { nodes { author { login } } } } }
+  } }
+}"""
 _cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _details: dict[tuple[str, int, str, str], tuple[float, dict[str, Any]]] = {}
 _checks: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
@@ -69,9 +75,25 @@ async def _detail(gh: GitHub, repo: str, pr: dict[str, Any], refresh: bool = Fal
             detail["changes_requested_by"] = sorted(u for u, st in latest.items() if st == "CHANGES_REQUESTED")
         except GitHubError:
             pass
+        detail.update(await _open_threads(gh, repo, pr["number"]))
     if detail["mergeable_state"] != "unknown":  # GitHub computes mergeability lazily; don't cache "unknown"
         _details[key] = (time.monotonic(), detail)
     return detail
+
+
+async def _open_threads(gh: GitHub, repo: str, number: int) -> dict[str, Any]:
+    """Review comments nobody has resolved and the code has not moved past (bots such as Codex review this way)."""
+    owner, _, name = repo.partition("/")
+    try:
+        data = await gh.request("POST", "/graphql", json={"query": THREADS, "variables": {
+            "owner": owner, "name": name, "number": number}})
+        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    except (GitHubError, KeyError, TypeError):
+        return {}
+    open_ = [n for n in nodes if not n.get("isResolved") and not n.get("isOutdated")]
+    authors = {((((n.get("comments") or {}).get("nodes") or [{}])[0].get("author") or {}).get("login") or "")
+               .removesuffix("[bot]") for n in open_}
+    return {"open_threads": len(open_), "open_thread_authors": sorted(a for a in authors if a)}
 
 
 async def _ci(gh: GitHub, repo: str, sha: str, refresh: bool = False) -> dict[str, Any]:
@@ -95,6 +117,8 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
         return "draft", "Draft"
     if factory.get("status") in HUMAN_TASK:
         return "attention", factory.get("blocked_reason") or "Waiting on a decision in AI Factory"
+    if factory.get("status") in ("queued", "running") and factory.get("stage") not in SHIPPING_STAGES:
+        return "checks", "The Factory is revising this"
     if ci.get("state") == "failure":
         names = ", ".join(ci.get("failing") or []) or "a check"
         return "attention", f"Checks failed: {names}"
@@ -102,6 +126,9 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
         return "attention", "Merge conflict with the base branch"
     if detail.get("changes_requested_by"):
         return "attention", f"Changes requested by {', '.join(detail['changes_requested_by'])}"
+    if detail.get("open_threads"):
+        n, who = detail["open_threads"], ", ".join(detail.get("open_thread_authors") or [])
+        return "attention", f"{n} unresolved review comment{'s' if n != 1 else ''}" + (f" from {who}" if who else "")
     if ci.get("state") == "pending":
         waiting = len(ci.get("pending") or []) or ci.get("total") or 0
         return "checks", f"Waiting on {waiting} check{'s' if waiting != 1 else ''}"

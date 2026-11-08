@@ -23,9 +23,17 @@ class FakeGitHub:
 
     async def request(self, method, path, params=None, json=None):
         FakeGitHub.calls.append(path)
+        if path == "/graphql":
+            number = json["variables"]["number"]
+            threads = {10: [(False, False, "chatgpt-codex-connector[bot]"), (True, False, "lead"), (False, True, "lead")],
+                       11: [(False, False, "lead")]}.get(number, [])
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                {"isResolved": r, "isOutdated": o, "comments": {"nodes": [{"author": {"login": a}}]}}
+                for r, o, a in threads]}}}}}
         if path.endswith("/pulls") and (params or {}).get("state") == "open":
             return [_pr(1, "Ready one"), _pr(2, "Failing CI"), _pr(3, "Conflicted"), _pr(4, "Still checking"),
-                    _pr(5, "Work in progress", draft=True), _pr(6, "Factory awaiting approval"), _pr(7, "Reviewed")]
+                    _pr(5, "Work in progress", draft=True), _pr(6, "Factory awaiting approval"), _pr(7, "Reviewed"),
+                    _pr(10, "Unresolved bot finding"), _pr(11, "Factory revising after review")]
         if path.endswith("/pulls"):
             return [_pr(8, "Shipped", state="closed", merged_at="2026-11-08T09:00:00Z"),
                     _pr(9, "Closed unmerged", state="closed")]
@@ -65,11 +73,16 @@ def test_pull_requests_are_grouped_and_linked_to_factory_work(client, signed_in,
         s.add(task)
         s.flush()
         s.add(Decision(workspace_id=ws_id, outcome_id=outcome.id, task_id=task.id, kind="approve_merge", title="Merge?"))
+        s.add(Task(workspace_id=ws_id, outcome_id=outcome.id, plan_id=plan.id, key="T2", title="t2", repo_id=repo.id,
+                   status="queued", stage="revise", pr_number=11))
 
     body = client.get(f"/api/workspaces/{ws_id}/pulls").json()
     by_number = {r["number"]: r for r in body["items"]}
     assert {n: r["group"] for n, r in by_number.items()} == {
-        1: "ready", 2: "attention", 3: "attention", 4: "checks", 5: "draft", 6: "ready", 7: "attention"}
+        1: "ready", 2: "attention", 3: "attention", 4: "checks", 5: "draft", 6: "ready", 7: "attention", 10: "attention",
+        11: "checks"}
+    assert by_number[10]["reason"] == "1 unresolved review comment from chatgpt-codex-connector"
+    assert by_number[11]["reason"] == "The Factory is revising this"
     assert by_number[2]["reason"] == "Checks failed: test"
     assert by_number[3]["reason"].startswith("Merge conflict")
     assert by_number[7]["reason"] == "Changes requested by lead"
@@ -77,7 +90,7 @@ def test_pull_requests_are_grouped_and_linked_to_factory_work(client, signed_in,
     link = by_number[6]["factory"]
     assert link["outcome_number"] == 12 and link["task_key"] == "T1" and link["decision_id"]
     assert by_number[1]["detail"]["additions"] == 10 and by_number[1]["author"]["avatar"].startswith("https://")
-    assert body["counts"] == {"ready": 2, "attention": 3, "checks": 1, "draft": 1}
+    assert body["counts"] == {"ready": 2, "attention": 4, "checks": 2, "draft": 1}
     assert [r["group"] for r in body["items"]][:2] == ["ready", "ready"]  # ready to merge first
 
     calls = len(FakeGitHub.calls)
@@ -106,6 +119,8 @@ class ChangingGitHub(FakeGitHub):
     open_count = 1
 
     async def request(self, method, path, params=None, json=None):
+        if path == "/graphql":
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}
         if path.endswith("/pulls"):
             page = (params or {}).get("page", 1)
             if (params or {}).get("state") != "open":
