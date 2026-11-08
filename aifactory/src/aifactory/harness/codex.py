@@ -12,7 +12,7 @@ import os
 import shlex
 import shutil
 
-from ..sandbox import SCRATCH
+from ..sandbox import SCRATCH, read_text, write_text
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
 from .schemas import validate_report
 
@@ -44,16 +44,17 @@ class CodexHarness:
         return True, "Official Codex CLI via the Factory inference gateway"
 
     async def run(self, session: HarnessSession) -> HarnessResult:
-        ok, why = self.availability()
+        in_vm = getattr(session.sandbox, "kind", "local") == "vm"
+        ok, why = (True, "") if in_vm else self.availability()  # the VM image ships the pinned CLI
         if not ok:
             raise HarnessUnavailable(why)
         if not session.gateway_url or not session.gateway_token:
             raise HarnessUnavailable("Codex requires the Factory inference gateway")
-        if getattr(session.sandbox, "kind", "local") == "vm":
-            raise HarnessUnavailable("Codex sessions run in a local sandbox, not a VM")
+        if in_vm and not session.gateway_url.startswith("https://") and not os.environ.get("AIFACTORY_ALLOW_HTTP_GATEWAY"):
+            raise HarnessUnavailable("Codex in a VM needs the Factory's public HTTPS gateway (AIFACTORY_PUBLIC_URL)")
         sandbox = session.sandbox
         scratch = f"{SCRATCH}/codex"
-        sandbox.write_text(f"{scratch}/schema.json", json.dumps(_strict(session.report_schema)))
+        await write_text(sandbox, f"{scratch}/schema.json", json.dumps(_strict(session.report_schema)))
         codex_home = sandbox.home / ".codex"
         config = "\n".join([
             f'model = "{session.model}"',
@@ -69,18 +70,19 @@ class CodexHarness:
             "stream_max_retries = 2",
             "",
         ])
-        sandbox.write_text(f"{scratch}/config.toml", config)
+        await write_text(sandbox, f"{scratch}/config.toml", config)
         prompt = (
             f"{session.system}\n\n---\n\n{session.prompt}\n\n---\n\n"
             + ("You may modify files in the repository." if session.writable else
                "Do NOT modify any tracked files; you are reviewing only.")
             + " When you are done, reply ONLY with the final JSON report matching the provided schema."
         )
-        sandbox.write_text(f"{scratch}/prompt.md", prompt)
+        await write_text(sandbox, f"{scratch}/prompt.md", prompt)
         work = str(sandbox.work)
+        binary = "codex" if in_vm else CODEX_BIN
         command = (
             f"mkdir -p {shlex.quote(str(codex_home))} && cp {scratch}/config.toml {shlex.quote(str(codex_home))}/config.toml && "
-            f"{shlex.quote(CODEX_BIN)} exec --json --skip-git-repo-check --ephemeral "
+            f"{shlex.quote(binary)} exec --json --skip-git-repo-check --ephemeral "
             f"--dangerously-bypass-approvals-and-sandbox -C {shlex.quote(work)} -m {shlex.quote(session.model)} "
             f"--output-schema {scratch}/schema.json -o {scratch}/last.json - < {scratch}/prompt.md"
         )
@@ -120,7 +122,7 @@ class CodexHarness:
         if result.timed_out:
             raise HarnessFailed("Codex exceeded its time budget")
         try:
-            raw = sandbox.read_text(f"{scratch}/last.json")
+            raw = await read_text(sandbox, f"{scratch}/last.json")
         except Exception:
             raw = ""
         report = _parse_report(raw)

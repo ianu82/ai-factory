@@ -145,7 +145,9 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
         deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
         on_progress=on_progress, take_guidance=take_guidance(spec.outcome_id, spec.task_id),
-        gateway_url=f"{get_settings().internal_url}/gateway/v1", gateway_token=gateway_token,
+        # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.
+        gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
+        gateway_token=gateway_token,
         reasoning_effort=settings.get("reasoning_effort"),
     )
     result: HarnessResult | None = None

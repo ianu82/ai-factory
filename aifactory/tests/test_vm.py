@@ -27,8 +27,9 @@ class FakeBridge:
         import re
 
         # One pass, so a mapped path (which may itself live under /tmp on Linux) is never mapped again.
-        targets = {"/work": str(self.root / "work"), "/tmp/": str(self.root / "tmp") + "/"}
-        return re.sub(r"(^|[\s\"'=:;(])(/work|/tmp/)", lambda m: m.group(1) + targets[m.group(2)], text)
+        targets = {"/work": str(self.root / "work"), "/tmp/": str(self.root / "tmp") + "/",
+                   "/root": str(self.root / "home")}
+        return re.sub(r"(^|[\s\"'=:;(])(/work|/tmp/|/root)", lambda m: m.group(1) + targets[m.group(2)], text)
 
     async def call(self, op, args=None, timeout=600):
         args = args or {}
@@ -80,7 +81,8 @@ class FakeBridge:
                 cwd = str(self.root)
             import os
 
-            proc = await asyncio.create_subprocess_shell(self._map(args["command"]), cwd=cwd, env={**os.environ, **(args.get("env") or {}), "HOME": str(self.root), "PLAYWRIGHT_BROWSERS_PATH": BROWSERS},
+            env = {k: self._map(v) for k, v in (args.get("env") or {}).items()}
+            proc = await asyncio.create_subprocess_shell(self._map(args["command"]), cwd=cwd, env={**os.environ, **env, "HOME": str(self.root), "PLAYWRIGHT_BROWSERS_PATH": BROWSERS},
                                                          stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             out, err = await asyncio.wait_for(proc.communicate(), timeout=args.get("timeoutSec", 60))
             return {"exitCode": proc.returncode, "stdout": out.decode(), "stderr": err.decode(), "timedOut": False,

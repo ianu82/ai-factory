@@ -363,10 +363,6 @@ class TaskRunner:
         wants_vm = (qa_cfg.get("isolation") or (self.settings.get("qa") or {}).get("isolation")) == "vm"
         if not wants_vm:
             return local
-        if self.task.verifier_harness == "codex":
-            self.event("qa_vm_skipped", "Codex verifiers run in a local sandbox; runtime QA stays local for this task",
-                       level="warn")
-            return local
         from ..vm import RailwayVMSandbox, vm_available
 
         ok, why = vm_available()
@@ -398,9 +394,6 @@ class TaskRunner:
         credentials inside); otherwise, or when VMs are unavailable, in the local per-job sandbox."""
         build_cfg = self.cfg.get("build") or {}
         if build_cfg.get("isolation") != "vm":
-            return local
-        if self.task.harness == "codex":
-            self.event("build_vm_skipped", "Codex builders run in a local sandbox", level="warn")
             return local
         from ..vm import RailwayVMSandbox, environment_key, vm_available
 
