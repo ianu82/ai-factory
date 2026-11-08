@@ -531,7 +531,7 @@ class TaskRunner:
         lines += ["", "---",
                   f"Built by **{self.task.harness}**, independently verified by a fresh **{self.task.verifier_harness}** "
                   f"session. Outcome #{self.outcome.number}: {self.outcome.title}. "
-                  f"Cost so far: {'$%.2f' % spent if known else 'unknown'}."]
+                  f"Cost so far: {('$%.2f' % spent) if known else ('at least $%.2f (some runs not priced yet)' % spent) if spent else 'not priced yet'}."]
         url = self._task_url()
         if url:
             lines.append(f"[View in AI Factory]({url})")

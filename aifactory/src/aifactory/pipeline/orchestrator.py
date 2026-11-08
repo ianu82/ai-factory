@@ -87,6 +87,7 @@ class Orchestrator:
                 self._schedule()
                 await self._maybe_sync_signals()
                 await asyncio.to_thread(self._maybe_analyze)
+                await self._maybe_reconcile_costs()
                 await self._maybe_inventory()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
@@ -118,6 +119,41 @@ class Orchestrator:
                 roles = [m.role for m in s.query(Membership).filter(Membership.workspace_id == ws.id)]
                 log.info("inventory workspace %s '%s' members=%s credentials: %s", ws.id[:6], ws.name, roles, creds)
         log.info("inventory orchestrator %s", self.status())
+
+    async def _maybe_reconcile_costs(self) -> None:
+        """Price finished runs whose cost was not known yet (MindsHub usage can lag behind the run)."""
+        import time
+        from datetime import timedelta
+
+        if time.monotonic() - getattr(self, "_last_cost_reconcile", 0.0) < 600:
+            return
+        self._last_cost_reconcile = time.monotonic()
+        from ..inference import InferenceError, ModelClient, resolve_provider
+        from ..models import Run
+
+        since = utcnow() - timedelta(days=7)
+        with session_scope() as s:
+            pending = [(r.id, r.workspace_id) for r in s.query(Run).filter(
+                Run.cost_known.is_(False), Run.provider == "mindshub", Run.finished_at.isnot(None),
+                Run.finished_at >= since).limit(50)]
+        priced = 0
+        clients: dict[str, Any] = {}
+        for run_id, workspace_id in pending:
+            try:
+                if workspace_id not in clients:
+                    clients[workspace_id] = ModelClient(resolve_provider(workspace_id))
+                cost = await clients[workspace_id].session_cost(run_id)
+            except (InferenceError, Exception):  # noqa: BLE001 - best effort
+                continue
+            if cost is None:
+                continue
+            with session_scope() as s:
+                run = s.get(Run, run_id)
+                run.cost_usd, run.cost_known = round(cost, 6), True
+                notify(run.workspace_id, "outcome", run.outcome_id)
+            priced += 1
+        if priced:
+            log.info("priced %d run(s) from provider usage", priced)
 
     def _maybe_analyze(self) -> None:
         """Refresh improvement proposals from delivery history (every 30 minutes by default)."""
