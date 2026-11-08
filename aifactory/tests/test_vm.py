@@ -19,6 +19,7 @@ class FakeBridge:
     def __init__(self, root):
         self.root = root
         self.calls = []
+        self.spawned = []
         self.procs = {}
         self.exits = {}
 
@@ -77,6 +78,8 @@ class FakeBridge:
                     "truncated": False}
         if op == "spawn":
             import os
+
+            self.spawned.append({"command": self._map(args["command"]), "cwd": self._map(args.get("cwd") or "/work")})
 
             proc = await asyncio.create_subprocess_shell(self._map(args["command"]), cwd=self._map(args.get("cwd") or "/work"),
                                                          start_new_session=True, env={**os.environ, **(args.get("env") or {}), "HOME": str(self.root), "PLAYWRIGHT_BROWSERS_PATH": BROWSERS})
@@ -152,7 +155,9 @@ def test_runtime_qa_runs_inside_the_vm_sandbox(tmp_path, monkeypatch):
         images = await run.collect_images()
         run.stop()
         await asyncio.sleep(0.2)
-        assert pages[0].get("status") == 200 and pages[0].get("title") == "VM app", pages
+        diagnostics = {"pages": pages, "probe_body": probes[0].get("body", "")[:800], "log": await run.log_tail(),
+                       "calls": bridge.calls[-12:], "spawned": bridge.spawned[-2:]}
+        assert pages[0].get("status") == 200 and pages[0].get("title") == "VM app", diagnostics
         assert probes[0]["ok"] and images and images[0][1].startswith("iVBOR")
         assert run.evidence["isolation"].startswith("railway-vm sbx_test")
 
