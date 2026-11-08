@@ -185,8 +185,8 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
 def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) -> None:
     """Resolve open decisions as an operator acting under a person's explicit delegation.
 
-    Each item: {"outcome": N, "kind": "approve_merge"|"question"|..., "resolution": "...", "comment": "...",
-    "reusable": bool, "nonce": "..."}. The decision records the operator identity and who delegated it.
+    Each item: {"outcome": N, "task": "T1" (optional), "kind": "approve_merge"|"question"|..., "resolution": "...",
+    "comment": "...", "reusable": bool, "nonce": "..."}. The decision records the operator identity and who delegated it.
     """
     if not items:
         return
@@ -215,8 +215,16 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
             if any((e.data or {}).get("nonce") == nonce for e in db.query(Event).filter(
                     Event.outcome_id == outcome.id, Event.kind == "operator_decision")):
                 continue
-            decision = (db.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open",
-                                                  Decision.kind == item.get("kind")).order_by(Decision.created_at.desc()).first())
+            query = db.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open",
+                                              Decision.kind == item.get("kind"))
+            if item.get("task"):  # one task's decision when several tasks of an outcome wait at once
+                from .models import Task
+
+                task = db.query(Task).filter(Task.outcome_id == outcome.id, Task.key == str(item["task"])).first()
+                if task is None:
+                    continue
+                query = query.filter(Decision.task_id == task.id)
+            decision = query.order_by(Decision.created_at.desc()).first()
             if decision is None:
                 continue
             try:
