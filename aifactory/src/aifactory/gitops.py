@@ -109,7 +109,9 @@ async def apply_in_sandbox(sandbox: LocalSandbox, patch: "Patch") -> None:
         return
     sandbox.write_bytes(f"{SCRATCH}/candidate.patch", patch.diff)
     # --index stages the candidate so new files are tracked: reviewers see them in `git diff <base>`.
-    result = await sandbox.exec(f"git apply --index --binary --whitespace=nowarn {SCRATCH}/candidate.patch", timeout=120)
+    # Re-owning the checkout to the job identity invalidates git's cached stat data; refresh it first.
+    result = await sandbox.exec(f"git update-index -q --refresh >/dev/null 2>&1; "
+                                f"git apply --index --binary --whitespace=nowarn {SCRATCH}/candidate.patch", timeout=120)
     if not result.ok:
         raise SandboxError(f"Candidate patch does not apply: {result.output[-600:]}")
 

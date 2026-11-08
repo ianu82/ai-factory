@@ -86,7 +86,11 @@ def test_candidate_patch_with_new_files_is_visible_to_the_verifier(tmp_path):
     run("git", "add", ".")
     run("git", "commit", "-qm", "base")
     base = run("git", "rev-parse", "HEAD").strip()
-    diff = (b"diff --git a/new.py b/new.py\nnew file mode 100644\nindex 0000000..3e75765\n--- /dev/null\n"
+    diff = (b"diff --git a/a.txt b/a.txt\nindex 7898192..422c2b7 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n a\n+b\n"
+            b"diff --git a/new.py b/new.py\nnew file mode 100644\nindex 0000000..3e75765\n--- /dev/null\n"
             b"+++ b/new.py\n@@ -0,0 +1 @@\n+new\n")
-    asyncio.run(apply_in_sandbox(sb, Patch(diff=diff, files=["new.py"], additions=1, deletions=0)))
-    assert "new.py" in run("git", "diff", "--stat", base)
+    # Stale index stat data (as after re-owning the checkout to the job identity).
+    os.utime(sb.work / "a.txt", (1, 1))
+    asyncio.run(apply_in_sandbox(sb, Patch(diff=diff, files=["a.txt", "new.py"], additions=2, deletions=0)))
+    stat = run("git", "diff", "--stat", base)
+    assert "new.py" in stat and "a.txt" in stat
