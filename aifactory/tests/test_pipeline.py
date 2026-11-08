@@ -626,3 +626,36 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
         assert len(rebuilt) == 1 and rebuilt[0].attempt == 2
     tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
     assert "A.txt" in tree and "B.txt" in tree
+
+
+def test_abandoning_a_task_closes_its_pull_request_with_a_note(factory, client, monkeypatch):
+    from aifactory.models import Plan
+    from aifactory.pipeline import handover
+
+    monkeypatch.setattr(handover, "GitHub", FakeGitHub)
+    monkeypatch.setattr(handover, "resolve_token", lambda ws: "token")
+    FakeGitHub.comments = []
+    git("push", "-q", str(factory["remotes"] / "acme/demo.git"), "main:refs/heads/factory/1-t1",
+        cwd=factory["remotes"] / "seed" / "acme" / "demo")
+    pr = asyncio.run(FakeGitHub("t").create_pull("acme/demo", head="factory/1-t1", base="main", title="t", body="b"))
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="failed", pr_number=pr["number"], branch="factory/1-t1")
+        s.add(task)
+        s.flush()
+        decision = Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="unblock",
+                            title="T1 did not pass", options=[{"value": "abandon", "label": "Abandon"}])
+        s.add(decision)
+        s.flush()
+        task_id, decision_id, email = task.id, decision.id, s.get(User, factory["user"]).email
+    assert client.post("/auth/dev", json={"email": email, "name": "Dev"}).status_code == 200
+    r = client.post(f"/api/workspaces/{factory['ws']}/decisions/{decision_id}/resolve", json={"resolution": "abandon"})
+    assert r.status_code == 200 and r.json()["pr_closed"] is True
+    assert FakeGitHub.pulls[pr["number"]]["state"] == "closed"
+    assert FakeGitHub.comments and "Abandoned in AI Factory by Dev" in FakeGitHub.comments[-1][1]
+    with session_scope() as s:
+        assert s.get(Task, task_id).status == "abandoned" and s.get(Task, task_id).evidence["pr_closed"]

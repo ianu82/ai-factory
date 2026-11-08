@@ -86,3 +86,30 @@ async def publish_candidate(task_id: str, info: dict[str, Any]) -> dict[str, Any
            outcome_id=info["outcome_id"], task_id=task_id, data={"pr_url": pr.get("html_url", "")})
     notify(ws, "task", task_id, outcome_id=info["outcome_id"])
     return {"published": True, "pr_url": pr.get("html_url", ""), "branch": branch}
+
+
+async def close_dropped_pull(task_id: str, who: str, why: str) -> bool:
+    """Close the open pull request of a task people abandoned or cancelled (reopening it is always possible)."""
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        if task is None or not task.pr_number or (task.evidence or {}).get("pr_closed"):
+            return False
+        repo = s.get(Repository, task.repo_id)
+        ws, outcome_id, number, full_name = task.workspace_id, task.outcome_id, task.pr_number, repo.full_name
+    gh = GitHub(resolve_token(ws))
+    try:
+        pr = await gh.pull(full_name, number)
+        if pr.get("state") != "open":
+            return False
+        await gh.comment(full_name, number, f"{why} in AI Factory by {who}, so the Factory closed this pull request. "
+                                            "Reopen it to continue the work yourself.\n\n🤖 AI Factory")
+        await gh.request("PATCH", f"/repos/{full_name}/pulls/{number}", json={"state": "closed"})
+    except GitHubError as exc:
+        record(ws, "pr_close_failed", f"Could not close PR #{number}: {str(exc)[:200]}", outcome_id=outcome_id,
+               task_id=task_id, level="warn")
+        return False
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.evidence = {**(task.evidence or {}), "pr_closed": True}
+    record(ws, "pr_closed", f"Closed PR #{number} ({why.lower()} by {who})", outcome_id=outcome_id, task_id=task_id)
+    return True

@@ -35,6 +35,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     outcome = db.get(Outcome, decision.outcome_id) if decision.outcome_id else None
     task = db.get(Task, decision.task_id) if decision.task_id else None
     take_over: str | None = None
+    dropped: str | None = None
 
     def guidance(text: str) -> None:
         if text.strip() and outcome:
@@ -76,6 +77,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             task.status, task.blocked_reason = "queued", ""
         elif resolution == "abandon":
             task.status = "abandoned"
+            dropped = task.id
     elif kind == "approve_merge" and task:
         if resolution == "approve":
             task.status, task.stage = "queued", "merge"
@@ -101,6 +103,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                 task.status, task.blocked_reason = "queued", ""
             elif resolution == "abandon":
                 task.status = "abandoned"
+                dropped = task.id
             elif resolution == "take_over":
                 take_over = task.id  # finished after this decision is recorded
             elif resolution == "revert":
@@ -128,6 +131,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     if outcome:
         notify(decision.workspace_id, "outcome", outcome.id)
     result: dict[str, Any] = {"ok": True}
+    if dropped and task and task.pr_number:
+        result["dropped"] = dropped
     if take_over:
         from .pipeline.handover import HandoverError, mark_handed_over
 
