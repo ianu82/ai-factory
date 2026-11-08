@@ -480,7 +480,9 @@ class TaskRunner:
             lines.append(f"- {mark} {criterion}" + (f"  \n  <sub>{c.get('evidence', '')[:400]}</sub>" if c else ""))
         if self.app_summary:
             a = self.app_summary
-            lines += ["", "### Runtime QA (app booted in a fresh sandbox)"]
+            where = a.get("isolation") or "a fresh sandbox"
+            where = f"an isolated VM ({where.removeprefix('railway-vm ')})" if where.startswith("railway-vm") else where
+            lines += ["", f"### Runtime QA (app booted in {where})"]
             if a.get("started"):
                 lines.append(f"- App started and became ready in {a.get('ready_seconds')}s")
                 lines += [f"- {'✅' if (p.get('status') or 500) < 400 else '❌'} page `{p.get('path')}` → "
@@ -491,7 +493,8 @@ class TaskRunner:
                 lines.append(f"- {a.get('screenshots', 0)} screenshot(s) attached in AI Factory "
                              f"({a.get('verifier_screenshots', 0)} taken by the verifier)")
             else:
-                lines.append("- ❌ The app did not start")
+                lines.append("- ❌ The app did not become ready, so there is no runtime evidence; the boot log is in"
+                             " AI Factory")
         if self.checks:
             lines += ["", "### Checks run by the Factory"]
             lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s)" for c in self.checks]
