@@ -132,6 +132,12 @@ def test_runtime_qa_runs_inside_the_vm_sandbox(tmp_path, monkeypatch):
     # In the fake "VM" the QA interpreter is this test's Python (which has Playwright).
     monkeypatch.setattr(qa, "shot_command", lambda sandbox=None: f"{sys.executable} .factory/qa/shot.py")
 
+    class Unreachable:  # the app lives on the VM's loopback; the control plane must never call it directly
+        def __init__(self, *a, **k):
+            raise AssertionError("control plane tried to reach the VM app over its own network")
+
+    monkeypatch.setattr(qa.httpx, "AsyncClient", Unreachable)
+
     async def go():
         vm = await RailwayVMSandbox.create()
         (tmp_path / "vm" / "work" / "index.html").write_text("<title>VM app</title><h1>ok</h1>")

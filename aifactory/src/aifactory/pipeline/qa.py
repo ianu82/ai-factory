@@ -76,6 +76,33 @@ asyncio.run(main())
 '''
 
 
+# Requests from inside the sandbox: in a VM the app is only reachable on the VM's own loopback.
+HTTP_SCRIPT = r'''
+import json, sys, urllib.error, urllib.request
+
+req = json.loads(sys.argv[1])
+data = json.dumps(req["json"]).encode() if req.get("json") is not None else None
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+request = urllib.request.Request(req["url"], data=data, method=req.get("method", "GET"),
+                                 headers={"Content-Type": "application/json"} if data else {})
+try:
+    response = urllib.request.build_opener(NoRedirect).open(request, timeout=req.get("timeout", 10))
+    status, body = response.status, response.read(2000)
+except urllib.error.HTTPError as exc:
+    status, body = exc.code, exc.read(2000)
+except Exception as exc:
+    print(json.dumps({"error": type(exc).__name__ + ": " + str(exc)[:200]}))
+    sys.exit(0)
+print(json.dumps({"status": status, "body": body.decode("utf-8", "replace")}))
+'''
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -100,6 +127,7 @@ class AppRun:
         env = {k: str(v) for k, v in (self.cfg.get("env") or {}).items()}
         env.update({"PORT": str(self.port), "HOST": "127.0.0.1", "NODE_ENV": env.get("NODE_ENV", "production")})
         await write_text(self.sandbox, f"{SCRATCH}/qa/shot.py", SHOT_SCRIPT)
+        await write_text(self.sandbox, f"{SCRATCH}/qa/qa_request.py", HTTP_SCRIPT)
         await write_text(self.sandbox, f"{SCRATCH}/qa/config.json", json.dumps({
             "base": self.base, "login": self.cfg.get("login"),
             "pages": [{"path": p, "name": _name(p)} for p in self.cfg.get("pages") or []]}))
@@ -117,20 +145,36 @@ class AppRun:
             self.evidence["log_tail"] = await self.log_tail()
         return ready
 
+    @property
+    def _remote(self) -> bool:
+        return getattr(self.sandbox, "kind", "local") == "vm"
+
+    async def request(self, method: str, path: str, json_body: Any = None, timeout: float = 10.0) -> dict[str, Any]:
+        """One HTTP request to the app, from wherever the app is reachable. Returns {status, body} or {error}."""
+        if self._remote:
+            payload = {"url": self.base + path, "method": method, "json": json_body, "timeout": timeout}
+            result = await self.sandbox.exec(f"python3 {SCRATCH}/qa/qa_request.py {_shell_json(payload)}", timeout=timeout + 20)
+            try:
+                return json.loads(result.output.strip().splitlines()[-1])
+            except (json.JSONDecodeError, IndexError):
+                return {"error": f"request helper failed: {result.output[-200:]}"}
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                response = await client.request(method, self.base + path, json=json_body)
+                return {"status": response.status_code, "body": response.text[:2000]}
+        except httpx.HTTPError as exc:
+            return {"error": type(exc).__name__}
+
     async def _wait_ready(self) -> bool:
         deadline = time.monotonic() + float(self.cfg.get("ready_timeout", 300))
         path = self.cfg.get("ready_path", "/")
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-            while time.monotonic() < deadline:
-                if self.proc.returncode is not None:
-                    return False
-                try:
-                    response = await client.get(self.base + path)
-                    if response.status_code < 500:
-                        return True
-                except httpx.HTTPError:
-                    pass
-                await asyncio.sleep(2)
+        while time.monotonic() < deadline:
+            if self.proc.returncode is not None:
+                return False
+            status = (await self.request("GET", path)).get("status")
+            if status is not None and status < 500:
+                return True
+            await asyncio.sleep(2)
         return False
 
     async def log_tail(self, limit: int = 4000) -> str:
@@ -141,17 +185,16 @@ class AppRun:
 
     async def probes(self) -> list[dict[str, Any]]:
         results = []
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
-            for probe in self.cfg.get("probes") or []:
-                row = {"method": probe.get("method", "GET"), "path": probe["path"]}
-                try:
-                    response = await client.request(row["method"], self.base + probe["path"], json=probe.get("json"))
-                    row.update(status=response.status_code, body=response.text[:500])
-                    expected = probe.get("expect_status")
-                    row["ok"] = response.status_code == expected if expected else response.status_code < 500
-                except httpx.HTTPError as exc:
-                    row.update(ok=False, error=type(exc).__name__)
-                results.append(row)
+        for probe in self.cfg.get("probes") or []:
+            row = {"method": probe.get("method", "GET"), "path": probe["path"]}
+            answer = await self.request(row["method"], probe["path"], probe.get("json"), timeout=20.0)
+            if "status" in answer:
+                row.update(status=answer["status"], body=answer.get("body", "")[:500])
+                expected = probe.get("expect_status")
+                row["ok"] = answer["status"] == expected if expected else answer["status"] < 500
+            else:
+                row.update(ok=False, error=answer.get("error", "no response"))
+            results.append(row)
         return results
 
     async def screenshots(self, pages: list[str] | None = None) -> list[dict[str, Any]]:
