@@ -333,7 +333,20 @@ class TaskRunner:
         url = self._task_url()
         if url:
             lines.append(f"[View in AI Factory]({url})")
+        import re
+
+        issues = set(re.findall(rf"github\.com/{re.escape(self.repo.full_name)}/issues/(\d+)", self.outcome.brief or ""))
+        if issues and self._closes_issue():
+            lines.append("")
+            lines += [f"Closes #{n}" for n in sorted(issues, key=int)]
         return "\n".join(lines)
+
+    def _closes_issue(self) -> bool:
+        """Only the last task of an outcome closes its source issue."""
+        with session_scope() as s:
+            others = s.query(Task).filter(Task.outcome_id == self.task.outcome_id, Task.id != self.task_id,
+                                          Task.status != "completed").count()
+        return others == 0
 
     def _task_url(self) -> str:
         base = get_settings().public_url

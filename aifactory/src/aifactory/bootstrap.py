@@ -77,10 +77,46 @@ def apply_bootstrap() -> str | None:
             elif name:
                 pending.append((name, overrides))
         workspace_id = ws.id
-    if pending:
-        asyncio.get_running_loop().create_task(_connect(workspace_id, pending))
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(_connect(workspace_id, pending)) if pending else None
+    declared = cfg.get("outcomes") or []
+    if declared:
+        loop.create_task(_declare_outcomes(workspace_id, declared, task))
     log.info("Bootstrap workspace ready: %s", workspace_id)
     return workspace_id
+
+
+async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) -> None:
+    """Operator-declared work (idempotent by key): visible in the app with source "operator"."""
+    if connecting is not None:
+        await connecting
+    from .db import SessionLocal
+    from .events import record
+    from .models import Outcome
+    from .signals import outcome_from_text
+
+    db = SessionLocal()
+    try:
+        for item in items:
+            key = str(item.get("key") or item.get("title") or "")[:200]
+            if not key or not item.get("title"):
+                continue
+            marker = f"operator:{key}"
+            if db.query(Outcome).filter(Outcome.workspace_id == workspace_id, Outcome.signal_id == marker).first():
+                continue
+            repos = db.query(Repository).filter(Repository.workspace_id == workspace_id,
+                                                Repository.full_name.in_(item.get("repositories") or [])).all()
+            if not repos:
+                log.error("Declared outcome %s names no connected repository", key)
+                continue
+            outcome = outcome_from_text(db, workspace_id, None, item["title"], item.get("brief", ""), [r.id for r in repos],
+                                        acceptance=item.get("acceptance") or [], harness=item.get("harness"),
+                                        source="operator", signal_id=marker)
+            record(workspace_id, "outcome_declared", f"Operator-declared outcome #{outcome.number} admitted",
+                   outcome_id=outcome.id, session=db, data={"key": key})
+        db.commit()
+    finally:
+        db.close()
 
 
 async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
