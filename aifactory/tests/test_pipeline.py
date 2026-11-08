@@ -406,6 +406,43 @@ def test_rebasing_a_published_branch_replays_only_its_own_commits(factory):
     assert "task.txt" in tree and "other.txt" in tree and "dropme.txt" not in tree
 
 
+def test_a_branch_someone_else_pushed_to_is_never_rebased_into_the_candidate(factory):
+    states = iter(["none"])
+    original = FakeGitHub.checks
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    bare = factory["remotes"] / "acme/demo.git"
+
+    async def checks(self, full_name, sha):
+        state = next(states, "none")
+        if state == "none" and not getattr(checks, "moved", False):
+            checks.moved = True
+            _land_on_main(factory, "other.txt", "landed meanwhile\n")
+            branch = git("for-each-ref", "--format=%(refname:short)", "refs/heads/factory/", cwd=bare).split()[0]
+            git("fetch", "-q", str(bare), f"{branch}:pushed", cwd=seed)
+            git("checkout", "-q", "pushed", cwd=seed)
+            (seed / "sneaky.txt").write_text("unverified\n")
+            git("add", "-A", cwd=seed)
+            git("commit", "-qm", "unverified push", cwd=seed)
+            git("push", "-q", str(bare), f"pushed:{branch}", cwd=seed)
+            git("checkout", "-q", "main", cwd=seed)
+        FakeGitHub.check_state = state
+        return await original(self, full_name, sha)
+
+    FakeGitHub.checks = checks
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "require_ci": True}
+    try:
+        outcome_id = new_outcome(factory)
+        assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "needs_input"))
+    finally:
+        FakeGitHub.checks = original
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "needs_input" and "no longer matches the verified candidate" in task.blocked_reason
+    assert "sneaky.txt" not in git("ls-tree", "--name-only", "main", cwd=bare).split()
+
+
 def test_a_fix_that_gets_no_ci_because_main_moved_is_revalidated_not_blocked(factory):
     states = iter(["failure", "none"])
     original = FakeGitHub.checks

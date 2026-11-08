@@ -18,7 +18,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import GitHub, GitHubError, resolve_token
-from ..gitops import (AUTHOR, DEFAULT_PROTECTED, GitError, Patch, apply_in_sandbox, checkout, extract_patch, protected_violations,
+from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, apply_in_sandbox, checkout, extract_patch, protected_violations,
                       publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
@@ -842,9 +842,14 @@ class TaskRunner:
     async def _refresh_onto_main(self, token: str, gh: GitHub, main_sha: str) -> None:
         """Main moved: rebase the verified change, then re-run checks and CI before merging."""
         self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
-        clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
-                                            onto=self.repo.default_branch, task_id=self.task_id,
-                                            base=self.task.base_sha or "")
+        try:
+            clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
+                                                onto=self.repo.default_branch, task_id=self.task_id,
+                                                base=self.task.base_sha or "", head=self.task.head_sha or "")
+        except BranchMoved as exc:
+            self.block("unblock", f"{self.task.key}: PR head changed",
+                       f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
+                       "rebased or merged.", status="needs_input")
         if not clean:
             self._fresh_budget_after_base_moved("conflicts with newer commits")
             self.feedback.append(f"- Your change conflicts with newer commits on {self.repo.default_branch}. "

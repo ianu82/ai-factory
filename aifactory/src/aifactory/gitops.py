@@ -216,12 +216,17 @@ async def publish(full_name: str, token: str, *, base_sha: str, branch: str, pat
         shutil.rmtree(staging, ignore_errors=True)
 
 
+class BranchMoved(GitError):
+    """The published branch no longer points at the commit the Factory verified."""
+
+
 async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, task_id: str,
-                        base: str = "") -> tuple[bool, str]:
+                        base: str = "", head: str = "") -> tuple[bool, str]:
     """Rebase a published branch onto the latest base. Returns (clean, new_head_or_conflict_detail).
 
     With ``base`` (the commit the branch was built on) only the branch's own commits are replayed, so commits
-    removed from a rewritten base branch cannot come back."""
+    removed from a rewritten base branch cannot come back. With ``head`` (the verified commit) the rebase refuses
+    a branch someone else has pushed to (BranchMoved), and the push only replaces that exact commit."""
     mirror_path = await mirror(full_name, token)
     staging = get_settings().data_dir / "staging" / (task_id + "-rebase")
     shutil.rmtree(staging, ignore_errors=True)
@@ -229,6 +234,10 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
     await clone_mirror(mirror_path, staging, env)
     try:
         await git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=staging, env=env)
+        if head:
+            current = (await git("rev-parse", f"origin/{branch}", cwd=staging)).strip()
+            if current != head:
+                raise BranchMoved(f"{branch} is at {current[:10]}, not the verified {head[:10]}")
         await git("checkout", "-q", "-B", branch, f"origin/{branch}", cwd=staging)
         try:
             await git("rebase", "-q", *(["--onto", f"origin/{onto}", base] if base else [f"origin/{onto}"]),
@@ -236,10 +245,11 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
         except GitError as exc:
             await git("rebase", "--abort", cwd=staging)
             return False, str(exc)
-        head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
         await git("remote", "set-url", "origin", remote_url(full_name), cwd=staging)
-        await git("push", "--force-with-lease", "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=env)
-        return True, head
+        lease = f"--force-with-lease=refs/heads/{branch}:{head}" if head else "--force-with-lease"
+        new_head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
+        await git("push", lease, "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=env)
+        return True, new_head
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
