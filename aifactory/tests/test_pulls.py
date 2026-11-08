@@ -106,6 +106,12 @@ def test_pull_requests_are_grouped_and_linked_to_factory_work(client, signed_in,
     assert sorted(r["number"] for r in ready) == [1, 6]
 
 
+def test_a_pr_with_more_review_threads_than_can_be_read_is_never_ready():
+    assert pulls.classify({"detail": {"threads_unchecked": True, "mergeable_state": "clean"},
+                           "ci": {"state": "success"}}) == (
+        "attention", "Too many review threads to check; review them on GitHub")
+
+
 def test_pull_requests_need_workspace_membership(client, signed_in):
     from fastapi.testclient import TestClient
 

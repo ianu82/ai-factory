@@ -100,8 +100,8 @@ async def _open_threads(gh: GitHub, repo: str, number: int) -> dict[str, Any]:
             if not page.get("hasNextPage"):
                 break
             after = page.get("endCursor")
-        else:
-            return {}  # too many threads to read: say nothing rather than call it clean
+        else:  # too many threads to read them all: never call that clean
+            return {"threads_unchecked": True}
     except (GitHubError, KeyError, TypeError):
         return {}
     open_ = [n for n in nodes if not n.get("isResolved") and not n.get("isOutdated")]
@@ -140,6 +140,8 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
         return "attention", "Merge conflict with the base branch"
     if detail.get("changes_requested_by"):
         return "attention", f"Changes requested by {', '.join(detail['changes_requested_by'])}"
+    if detail.get("threads_unchecked"):
+        return "attention", "Too many review threads to check; review them on GitHub"
     if detail.get("open_threads"):
         n, who = detail["open_threads"], ", ".join(detail.get("open_thread_authors") or [])
         return "attention", f"{n} unresolved review comment{'s' if n != 1 else ''}" + (f" from {who}" if who else "")
