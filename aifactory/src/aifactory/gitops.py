@@ -63,12 +63,16 @@ def _mirror_path(full_name: str) -> Path:
     return get_settings().data_dir / "repos" / (full_name.replace("/", "__") + ".git")
 
 
-_mirror_locks: dict[str, asyncio.Lock] = {}
+_mirror_locks: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
 
 
 async def mirror(full_name: str, token: str) -> Path:
     path = _mirror_path(full_name)
-    lock = _mirror_locks.setdefault(full_name, asyncio.Lock())
+    loop = asyncio.get_running_loop()
+    entry = _mirror_locks.get(full_name)
+    if entry is None or entry[0] is not loop:  # a lock belongs to one event loop
+        entry = _mirror_locks[full_name] = (loop, asyncio.Lock())
+    lock = entry[1]
     async with lock:
         url = remote_url(full_name)
         env = git_auth_env(token)

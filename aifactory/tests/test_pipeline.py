@@ -577,3 +577,52 @@ def test_builder_can_work_in_an_isolated_vm(factory, monkeypatch, tmp_path):
     assert "create" in bridge.calls and "destroy" in bridge.calls
     # The builder's edit happened inside the VM and still reached main through the normal publish path.
     assert git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git").strip() == "echo 'Hello, Factory!'"
+
+
+def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        return {"content": "", "tool_calls": [call("finish", {"summary": "Two edits", "questions": [], "tasks": [
+            {"key": "T1", "title": "Write A", "repo": "acme/demo", "spec": "a", "acceptance": ["A written"], "depends_on": []},
+            {"key": "T2", "title": "Write B", "repo": "acme/demo", "spec": "b", "acceptance": ["B written"], "depends_on": []}]})]}
+
+    def builder(messages):
+        name = "A" if "Write A" in messages[1]["content"] else "B"
+        if step(messages) == 0:  # both tasks rewrite the same line: whichever merges second conflicts
+            return {"content": "", "tool_calls": [call("write_file", {"path": "shared.txt", "content": f"{name}\n"}),
+                                                  call("write_file", {"path": f"{name}.txt", "content": name}, 1)]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": f"wrote {name}"})]}
+
+    def verifier(messages):
+        criterion = "A written" if "A written" in messages[1]["content"] else "B written"
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
+        return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+
+    ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": [], "smoke": ["true"]}
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    with session_scope() as s:  # seed the shared file so both edits touch the same line
+        pass
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    (seed / "shared.txt").write_text("base\n")
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", "shared", cwd=seed)
+    git("push", "-q", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        tasks = s.query(Task).filter(Task.outcome_id == outcome_id).all()
+        assert outcome_status(outcome_id) == "completed", [(t.key, t.status, t.blocked_reason) for t in tasks]
+        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+        assert "rebuild_after_base_moved" in kinds
+        rebuilt = [t for t in tasks if (t.evidence or {}).get("rebase_rebuilds")]
+        assert len(rebuilt) == 1 and rebuilt[0].attempt == 2
+    tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
+    assert "A.txt" in tree and "B.txt" in tree
