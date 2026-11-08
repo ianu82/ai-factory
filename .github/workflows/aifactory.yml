@@ -1,0 +1,45 @@
+name: AI Factory v2
+
+on:
+  pull_request:
+    paths: ["aifactory/**", ".github/workflows/aifactory.yml"]
+  push:
+    branches: [main, factory-v2]
+    paths: ["aifactory/**", ".github/workflows/aifactory.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aifactory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: aifactory
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: |
+          python -m pip install --quiet uv
+          uv venv .venv
+          uv pip install --python .venv/bin/python --no-deps --require-hashes --only-binary=:all: -r anton-requirements.txt
+          uv pip install --python .venv/bin/python --no-deps --no-build-isolation "anton-agent @ git+https://github.com/mindsdb/anton@537cc1fb11849e9d152870738af22ca55c1d59d8"
+          uv pip install --python .venv/bin/python -e '.[dev]'
+          npm install -g @openai/codex@0.167.0 --no-audit --no-fund
+      - name: Web type-check and build
+        run: cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npx vite build
+      - name: Tests (pipeline end-to-end, gateway, Native/Anton/Codex harnesses)
+        run: .venv/bin/python -m pytest -q
