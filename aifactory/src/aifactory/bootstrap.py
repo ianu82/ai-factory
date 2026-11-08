@@ -119,16 +119,29 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
             key, nonce = str(item.get("key", "")), str(item.get("nonce", ""))
             outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
                                               Outcome.signal_id == f"operator:{key}").first()
-            if outcome is None or outcome.status != "blocked":
+            if outcome is None:
                 continue
             done = any((e.data or {}).get("nonce") == nonce for e in s.query(Event).filter(
                 Event.outcome_id == outcome.id, Event.kind == "operator_retry"))
             if done:
                 continue
-            outcome.status, outcome.blocked_reason = "planning", ""
-            for d in s.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open"):
+            from .models import Task
+
+            blocked_tasks = s.query(Task).filter(Task.outcome_id == outcome.id, Task.status == "blocked").all()
+            if outcome.status == "blocked" and not blocked_tasks:
+                outcome.status, outcome.blocked_reason = "planning", ""
+                what = "planning"
+            elif blocked_tasks:
+                for t in blocked_tasks:
+                    t.status, t.blocked_reason = "queued", ""  # resumes at its durable stage
+                outcome.status = "running"
+                what = ", ".join(t.key for t in blocked_tasks)
+            else:
+                continue
+            for d in s.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open",
+                                              Decision.kind == "unblock"):
                 d.status, d.resolution, d.comment, d.resolved_at = "resolved", "retry", "Operator retried", utcnow()
-            record(workspace_id, "operator_retry", f"Operator retried planning for #{outcome.number}",
+            record(workspace_id, "operator_retry", f"Operator retried {what} for #{outcome.number}",
                    outcome_id=outcome.id, actor="operator", session=s, data={"key": key, "nonce": nonce})
 
 
