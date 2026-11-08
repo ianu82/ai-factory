@@ -586,20 +586,70 @@ class TaskRunner:
         url = self._task_url()
         if url:
             lines.append(f"[View in AI Factory]({url})")
-        import re
-
-        issues = set(re.findall(rf"github\.com/{re.escape(self.repo.full_name)}/issues/(\d+)", self.outcome.brief or ""))
-        if issues and self._closes_issue():
+        issues = self._source_issues()
+        if issues:
             lines.append("")
-            lines += [f"Closes #{n}" for n in sorted(issues, key=int)]
+            if self._closes_issue():
+                lines += [f"Closes #{n}" for n in issues]
+            else:
+                lines += [f"Part of #{n} (closed when the outcome's last task merges)" for n in issues]
         return "\n".join(lines)
 
-    def _closes_issue(self) -> bool:
-        """Only the last task of an outcome closes its source issue."""
+    def _source_issues(self) -> list[str]:
+        """Issues in this repository that the outcome came from."""
+        import re
+
+        found = set(re.findall(rf"github\.com/{re.escape(self.repo.full_name)}/issues/(\d+)", self.outcome.brief or ""))
+        return sorted(found, key=int)
+
+    async def _claim_issues_before_merge(self, gh: GitHub, pr: dict[str, Any]) -> None:
+        """Whichever task merges last closes the source issue: other tasks may have finished since this PR opened."""
+        issues = self._source_issues()
+        if not issues or not self._closes_issue(merged_counts=True):
+            return
+        body = pr.get("body") or ""
+        missing = [n for n in issues if f"Closes #{n}" not in body]
+        if not missing:
+            return
+        import re
+
+        body = re.sub(r"\nPart of #\d+ \(closed when the outcome's last task merges\)", "", body).rstrip()
+        body += "\n\n" + "\n".join(f"Closes #{n}" for n in missing)
+        try:
+            await gh.request("PATCH", f"/repos/{self.repo.full_name}/pulls/{self.task.pr_number}", json={"body": body})
+        except GitHubError as exc:
+            self.event("issue_link_failed", f"Could not mark PR #{self.task.pr_number} as closing "
+                       f"{', '.join('#' + n for n in missing)}: {str(exc)[:200]}", level="warn")
+
+    async def _settle_issues(self) -> None:
+        """After the outcome's last task: make sure its source issues closed, and say so plainly if they did not."""
+        issues = self._source_issues()
+        if not issues or not self._closes_issue():
+            return
+        gh = GitHub(resolve_token(self.ws))
+        for n in issues:
+            try:
+                issue = await gh.request("GET", f"/repos/{self.repo.full_name}/issues/{n}")
+                if issue.get("state") != "closed":
+                    await asyncio.sleep(3)  # GitHub closes linked issues shortly after the merge
+                    issue = await gh.request("GET", f"/repos/{self.repo.full_name}/issues/{n}")
+                if issue.get("state") == "closed":
+                    self.event("issue_closed", f"Issue #{n} is closed", level="success")
+                    continue
+                await gh.request("PATCH", f"/repos/{self.repo.full_name}/issues/{n}", json={"state": "closed"})
+                self.event("issue_closed", f"Closed issue #{n}", level="success")
+            except GitHubError as exc:
+                reason = ("the GitHub token cannot write issues" if exc.status in (403, 404) else str(exc)[:160])
+                self.event("issue_close_failed", f"Delivered, but issue #{n} is still open: {reason}. Close it on "
+                           f"GitHub (it was delivered by PR #{self.task.pr_number}).", level="warn")
+
+    def _closes_issue(self, merged_counts: bool = False) -> bool:
+        """Only the last task of an outcome closes its source issue (when merging, siblings already merged and
+        still smoke-testing count as done)."""
         with session_scope() as s:
-            others = s.query(Task).filter(Task.outcome_id == self.task.outcome_id, Task.id != self.task_id,
-                                          Task.status != "completed").count()
-        return others == 0
+            others = [t for t in s.query(Task).filter(Task.outcome_id == self.task.outcome_id, Task.id != self.task_id)
+                      if t.status not in ("completed", "abandoned", "cancelled")]
+            return not [t for t in others if not (merged_counts and t.merge_sha)]
 
     def _task_url(self) -> str:
         base = get_settings().public_url
@@ -719,6 +769,7 @@ class TaskRunner:
                     refresh_onto = main_sha
                 else:
                     try:
+                        await self._claim_issues_before_merge(gh, pr)
                         method = (self.cfg.get("merge") or {}).get("method", "squash")
                         result = await gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
                                                 method=method, title=f"{self.task.title} (#{self.task.pr_number})")
@@ -861,7 +912,7 @@ class TaskRunner:
     async def release(self) -> None:
         release_cfg = self.cfg.get("release") or {}
         if not release_cfg.get("health_url") and release_cfg.get("mode") != "on_merge":
-            self._complete("Merged and smoke-tested")
+            await self._complete("Merged and smoke-tested")
             return
         self.stage("release", "Watching the release")
         url = release_cfg.get("health_url")
@@ -880,7 +931,7 @@ class TaskRunner:
                     if response.status_code < 400 and (not expect or expect in response.text):
                         self.evidence("release", {"state": "healthy", "url": url, "status": response.status_code})
                         self.event("released", f"Release healthy at {url}", level="success")
-                        self._complete("Merged, smoke-tested and released")
+                        await self._complete("Merged, smoke-tested and released")
                         return
                     last = f"HTTP {response.status_code}"
                 except httpx.HTTPError as exc:
@@ -893,9 +944,13 @@ class TaskRunner:
                        f"{url} did not report healthy within the window ({last}).", status="smoke_failed",
                        options=[{"value": "acknowledge", "label": "Acknowledge"}])
         self.evidence("release", {"state": "on_merge", "note": "Released by the repository's deploy-on-merge pipeline"})
-        self._complete("Merged, smoke-tested; released by deploy-on-merge")
+        await self._complete("Merged, smoke-tested; released by deploy-on-merge")
 
-    def _complete(self, summary: str) -> None:
+    async def _complete(self, summary: str) -> None:
+        try:
+            await self._settle_issues()
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must never undo a delivery
+            log.warning("issue settlement failed for %s: %s", self.task_id, exc)
         self.update(status="completed", stage="done", finished_at=utcnow(), summary=summary, blocked_reason="")
         self.event("task_completed", f"{self.task.key} complete: {summary}", level="success")
 

@@ -659,3 +659,71 @@ def test_abandoning_a_task_closes_its_pull_request_with_a_note(factory, client, 
     assert FakeGitHub.comments and "Abandoned in AI Factory by Dev" in FakeGitHub.comments[-1][1]
     with session_scope() as s:
         assert s.get(Task, task_id).status == "abandoned" and s.get(Task, task_id).evidence["pr_closed"]
+
+
+def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        return {"content": "", "tool_calls": [call("finish", {"summary": "Two files", "questions": [], "tasks": [
+            {"key": "T1", "title": "Add a.txt", "repo": "acme/demo", "spec": "a", "acceptance": ["a.txt exists"], "depends_on": []},
+            {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "b", "acceptance": ["b.txt exists"], "depends_on": []}]})]}
+
+    def builder(messages):
+        name = "a.txt" if "Add a.txt" in messages[1]["content"] else "b.txt"
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("write_file", {"path": name, "content": name})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": f"added {name}"})]}
+
+    def verifier(messages):
+        criterion = "a.txt exists" if "a.txt exists" in messages[1]["content"] else "b.txt exists"
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
+        return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+
+    ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
+    FakeGitHub.issues_state = {}
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": [], "smoke": ["true"]}
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        s.get(Outcome, outcome_id).brief = "Two files.\n\nSource: https://github.com/acme/demo/issues/7"
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    assert outcome_status(outcome_id) == "completed"
+    bodies = [pr["body"] for pr in FakeGitHub.pulls.values()]
+    assert sum("Closes #7" in b for b in bodies) == 1, bodies
+    assert FakeGitHub.issues_state.get(7) == "closed"
+    with session_scope() as s:
+        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+    assert "issue_closed" in kinds and "issue_close_failed" not in kinds
+
+
+def test_an_issue_the_factory_cannot_close_is_reported_plainly(factory, monkeypatch):
+    from aifactory.github import GitHubError
+
+    original_merge, original_request = FakeGitHub.merge, FakeGitHub.request
+
+    async def merge_without_keywords(self, full_name, number, **kwargs):  # e.g. the base is not the default branch
+        state = dict(FakeGitHub.issues_state)
+        result = await original_merge(self, full_name, number, **kwargs)
+        FakeGitHub.issues_state = state
+        return result
+
+    async def read_only_issues(self, method, path, **kwargs):
+        if "/issues/" in path and method == "PATCH":
+            raise GitHubError("Resource not accessible by personal access token", 403)
+        return await original_request(self, method, path, **kwargs)
+
+    monkeypatch.setattr(FakeGitHub, "merge", merge_without_keywords)
+    monkeypatch.setattr(FakeGitHub, "request", read_only_issues)
+    FakeGitHub.issues_state = {}
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        s.get(Outcome, outcome_id).brief = "Greeting.\n\nSource: https://github.com/acme/demo/issues/9"
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    assert outcome_status(outcome_id) == "completed"  # still delivered
+    with session_scope() as s:
+        failed = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "issue_close_failed").one()
+    assert "issue #9 is still open" in failed.message and "cannot write issues" in failed.message
