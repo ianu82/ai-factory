@@ -18,6 +18,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Outcome, Task, Workspace
+from ..sandbox import host_capacity
 from .delivery import TaskRunner
 from .planning import plan_outcome
 from .runtime import open_decision, workspace_settings
@@ -44,6 +45,7 @@ class Orchestrator:
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
         if self._loop_task is None:
+            log.info("capacity %s", host_capacity())
             self._recover()
             self._loop_task = asyncio.create_task(self._run(), name="orchestrator")
 

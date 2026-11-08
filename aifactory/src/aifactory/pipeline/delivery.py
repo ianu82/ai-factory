@@ -217,7 +217,9 @@ class TaskRunner:
                 self.evidence("attempts", {"n": attempt, "result": "checks_failed", "checks": _brief(self.checks)})
                 continue
 
-            # independent verification
+            # independent verification; nothing the builder left running (databases, dev servers) may compete
+            # with the verifier for processes or ports.
+            await self.builder.kill_all()
             self.stage("verify", f"Independent verification by a fresh {self.task.verifier_harness} session")
             verdict = await self._verify(token, patch, attempt)
             if verdict is None:

@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .config import get_settings
 
@@ -401,3 +401,35 @@ async def list_files(sandbox, relative: str, pattern: str = "*") -> list[str]:
         return sorted(p.name for p in sandbox.resolve(relative).glob(pattern))
     except OSError:
         return []
+
+
+def host_capacity() -> dict[str, Any]:
+    """What a job can use on this host: CPUs, process and memory ceilings (cgroup v2 / v1 or rlimit)."""
+
+    def first(*paths: str) -> str | None:
+        for path in paths:
+            try:
+                return Path(path).read_text().strip()
+            except OSError:
+                continue
+        return None
+
+    info: dict[str, Any] = {"cpus": os.cpu_count()}
+    try:
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        info["nproc_rlimit"] = None if soft == resource.RLIM_INFINITY else soft
+    except (ImportError, AttributeError, ValueError):
+        pass
+    info["pids_max"] = first("/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max")
+    info["pids_current"] = first("/sys/fs/cgroup/pids.current", "/sys/fs/cgroup/pids/pids.current")
+    memory = first("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if memory and memory.isdigit():
+        memory = f"{int(memory) / 2**30:.1f}GiB"
+    info["memory_max"] = memory
+    cpu = first("/sys/fs/cgroup/cpu.max")
+    if cpu and cpu.split()[0].isdigit():
+        quota, period = cpu.split()[:2]
+        info["cpu_quota"] = round(int(quota) / int(period), 1)
+    return info
