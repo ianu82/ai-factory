@@ -36,7 +36,8 @@ export function DecisionsPage() {
             <div className="list-section">Precedents the Factory follows · {precedents.length}</div>
             {precedents.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>None yet.</div>}
             <ul className="rows">{precedents.map((d) => <Row key={d.id} d={d} admin={admin} toggle={toggle} open={() => d.outcome_id && navigate(`/w/${ws.id}/outcomes/${d.outcome_id}`)} />)}</ul>
-            <div className="list-section">History</div>
+            <div className="list-section">History · {history.length}</div>
+            {history.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>Other resolved decisions will appear here, with who made them.</div>}
             <ul className="rows">{history.map((d) => <Row key={d.id} d={d} admin={admin} toggle={toggle} open={() => d.outcome_id && navigate(`/w/${ws.id}/outcomes/${d.outcome_id}`)} />)}</ul>
           </>
         )}
