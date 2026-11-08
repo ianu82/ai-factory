@@ -24,12 +24,15 @@ class FakeGitHub:
     async def request(self, method, path, params=None, json=None):
         FakeGitHub.calls.append(path)
         if path == "/graphql":
-            number = json["variables"]["number"]
-            threads = {10: [(False, False, "chatgpt-codex-connector[bot]"), (True, False, "lead"), (False, True, "lead")],
-                       11: [(False, False, "lead")]}.get(number, [])
-            return {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
-                {"isResolved": r, "isOutdated": o, "comments": {"nodes": [{"author": {"login": a}}]}}
-                for r, o, a in threads]}}}}}
+            number, after = json["variables"]["number"], json["variables"].get("after")
+            # PR 10: page 1 holds only resolved/outdated threads; the open bot finding is on page 2.
+            pages = {10: [[(True, False, "lead"), (False, True, "lead")], [(False, False, "chatgpt-codex-connector[bot]")]],
+                     11: [[(False, False, "lead")]]}.get(number, [[]])
+            index = int(after or 0)
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "nodes": [{"isResolved": r, "isOutdated": o, "comments": {"nodes": [{"author": {"login": a}}]}}
+                          for r, o, a in pages[index]],
+                "pageInfo": {"hasNextPage": index + 1 < len(pages), "endCursor": str(index + 1)}}}}}}
         if path.endswith("/pulls") and (params or {}).get("state") == "open":
             return [_pr(1, "Ready one"), _pr(2, "Failing CI"), _pr(3, "Conflicted"), _pr(4, "Still checking"),
                     _pr(5, "Work in progress", draft=True), _pr(6, "Factory awaiting approval"), _pr(7, "Reviewed"),

@@ -29,9 +29,13 @@ SETTLED_TTL_SECONDS = 300  # finished CI and known mergeability can change too (
 MAX_PAGES = 10  # GitHub pages of 100 per repository and state
 HUMAN_TASK = {"needs_input", "failed", "blocked", "smoke_failed"}
 SHIPPING_STAGES = {"ci", "merge", "publish", "smoke", "release"}  # Factory stages that ship the PR as it is
-THREADS = """query($owner: String!, $name: String!, $number: Int!) {
+THREAD_PAGES = 10  # 100 review threads per page
+THREADS = """query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    reviewThreads(first: 100) { nodes { isResolved isOutdated comments(first: 1) { nodes { author { login } } } } }
+    reviewThreads(first: 100, after: $after) {
+      nodes { isResolved isOutdated comments(first: 1) { nodes { author { login } } } }
+      pageInfo { hasNextPage endCursor }
+    }
   } }
 }"""
 _cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
@@ -84,10 +88,20 @@ async def _detail(gh: GitHub, repo: str, pr: dict[str, Any], refresh: bool = Fal
 async def _open_threads(gh: GitHub, repo: str, number: int) -> dict[str, Any]:
     """Review comments nobody has resolved and the code has not moved past (bots such as Codex review this way)."""
     owner, _, name = repo.partition("/")
+    nodes: list[dict[str, Any]] = []
+    after = None
     try:
-        data = await gh.request("POST", "/graphql", json={"query": THREADS, "variables": {
-            "owner": owner, "name": name, "number": number}})
-        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        for _ in range(THREAD_PAGES):
+            data = await gh.request("POST", "/graphql", json={"query": THREADS, "variables": {
+                "owner": owner, "name": name, "number": number, "after": after}})
+            threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            nodes += threads["nodes"]
+            page = threads.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            after = page.get("endCursor")
+        else:
+            return {}  # too many threads to read: say nothing rather than call it clean
     except (GitHubError, KeyError, TypeError):
         return {}
     open_ = [n for n in nodes if not n.get("isResolved") and not n.get("isOutdated")]
