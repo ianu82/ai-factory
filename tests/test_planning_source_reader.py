@@ -44,6 +44,33 @@ def test_literal_match_and_line_windows_report_the_actual_selection(tmp_path):
     assert result[1] == {"index": 1, "status": "no_match"}
 
 
+def test_literal_miss_remains_a_miss_with_labelled_nearby_source(tmp_path):
+    (tmp_path / "schema.txt").write_text("preamble\nCREATE TABLE IF NOT EXISTS entries (\ndate DATE\n);\n")
+    result = read(tmp_path, [section("schema.txt", lines=3, match="CREATE TABLE entries")])["sections"][0]
+    assert result == {"index": 0, "status": "no_match", "nearby": {
+        "match_kind": "ordered_tokens", "start_line": 2, "total_lines": 4, "line_count": 3,
+        "text": "CREATE TABLE IF NOT EXISTS entries (\ndate DATE\n);"}}
+
+
+def test_nearby_source_obeys_start_line_token_order_case_and_repetition(tmp_path):
+    (tmp_path / "functions.txt").write_text("async function lookup() {}\nlookup function\nFunction lookup\nfunction once\n")
+    selections = [section("functions.txt", start=2, match="function lookup"),
+                  section("functions.txt", match="function function"),
+                  section("functions.txt", match="absent token")]
+    assert read(tmp_path, selections)["sections"] == [
+        {"index": i, "status": "no_match"} for i in range(3)]
+    result = read(tmp_path, [section("functions.txt", lines=1, match="async lookup")])["sections"][0]
+    assert result["status"] == "no_match" and result["nearby"]["text"] == "async function lookup() {}"
+
+
+def test_oversized_nearby_context_preserves_the_miss_and_other_sections(tmp_path):
+    (tmp_path / "large.txt").write_text("async function lookup() {" + "x" * 13000 + "}\n")
+    (tmp_path / "small.txt").write_text("Other useful evidence\n")
+    result = read(tmp_path, [section("large.txt", match="async lookup"), section("small.txt")])["sections"]
+    assert result[0] == {"index": 0, "status": "no_match", "nearby_omitted_budget": True}
+    assert result[1]["status"] == "ok" and result[1]["text"] == "Other useful evidence"
+
+
 def test_unicode_and_json_escaping_fit_the_real_utf8_capture_limit(tmp_path):
     text = '\u6f22\U0001f680"\\\t' * 400
     (tmp_path / "unicode.txt").write_text(text)

@@ -100,3 +100,5 @@ The planner selects relative paths, one-based line windows and optional literal 
 
 Serialized UTF-8 output stays below the existing capture limit. A section that does not fit is marked `omitted_budget` while other readable selections remain available. Missing essential source still requires an unverified or blocked plan. The helper adds no request, token, time, network, source-write or publication authority.
 
+A literal miss remains `no_match`. When two or more query words all occur in order on a line at or after the requested start, the result can also include one `nearby` window labelled `ordered_tokens`. This is actual source context from the requested file, not a successful literal match or a claim of semantic relevance. If it cannot fit, `nearby_omitted_budget` records that omission while preserving the miss and other sections. The planner must still establish every essential fact from returned source; nearby context does not grant readiness.
+

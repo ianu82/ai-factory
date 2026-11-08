@@ -41,15 +41,31 @@ function read(q,index){
     const raw=buffer.subarray(0,size),text=raw.toString('utf8');
     if(!Buffer.from(text,'utf8').equals(raw))return {index,status:'invalid_utf8'};
     const lines=text.split(/\r?\n/);if(lines.at(-1)==='')lines.pop();
+    function excerpt(start){
+      const selected=lines.slice(start,start+q.line_count);
+      return {start_line:start+1,total_lines:lines.length,
+              text:selected.join('\n'),line_count:selected.length};
+    }
     let start=q.start_line-1;
     if(q.match!==null){
-      start=lines.findIndex((line,i)=>i>=start&&line.includes(q.match));
-      if(start<0)return {index,status:'no_match'};
+      const from=start;
+      start=lines.findIndex((line,i)=>i>=from&&line.includes(q.match));
+      if(start<0){
+        const words=q.match.match(/[\p{L}\p{N}_]+/gu)||[];
+        const nearby=words.length<2?-1:lines.findIndex((line,i)=>{
+          if(i<from)return false;
+          let at=0;
+          for(const word of line.match(/[\p{L}\p{N}_]+/gu)||[]){
+            if(word===words[at]&&++at===words.length)return true;
+          }
+          return false;
+        });
+        return nearby<0?{index,status:'no_match'}:
+          {index,status:'no_match',nearby:{match_kind:'ordered_tokens',...excerpt(nearby)}};
+      }
     }
     if(start>=lines.length&&!(start===0&&lines.length===0))return {index,status:'out_of_range'};
-    const selected=lines.slice(start,start+q.line_count);
-    return {index,status:'ok',start_line:start+1,total_lines:lines.length,
-            text:selected.join('\n'),line_count:selected.length};
+    return {index,status:'ok',...excerpt(start)};
   }catch{return {index,status:'unreadable'}}
   finally{if(fd!==undefined)fs.closeSync(fd)}
 }
@@ -59,6 +75,9 @@ const output={sections};
 if(Buffer.byteLength(JSON.stringify(output))>input.limit)throw Error('Unavailable output budget');
 for(let i=0;i<sections.length;i++){
   const previous=sections[i];sections[i]=read(input.sections[i],i);
+  if(Buffer.byteLength(JSON.stringify(output))>input.limit&&sections[i].nearby){
+    delete sections[i].nearby;sections[i].nearby_omitted_budget=true;
+  }
   if(Buffer.byteLength(JSON.stringify(output))>input.limit)sections[i]=previous;
 }
 process.stdout.write(JSON.stringify(output));

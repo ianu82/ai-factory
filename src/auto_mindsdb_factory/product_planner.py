@@ -21,7 +21,7 @@ class ProductPlanner(ProductAgent):
     tools = [TOOLS[0], {**TOOLS[1], "parameters": PLAN_SCHEMA,
                       "description": "Finish with bounded planning guidance; unresolved questions block implementation."},
              {"type": "function", "name": "inspect_source", "strict": True,
-              "description": "Read source sections in the read-only job. Lines are one-based; match is a literal first match at or after start_line, or null. Results use request index. Only selected lines are evidence; explicit omissions remain unread.",
+              "description": "Read source sections in the read-only job. Lines are one-based; match is a literal first match at or after start_line, or null. A literal miss stays no_match; optional nearby source is labelled ordered_tokens, never an exact match. Results use request index. Only returned lines are evidence; explicit omissions remain unread.",
               "parameters": SOURCE_READ_SCHEMA}]
 
     def __init__(self, connector, journal, *, task, base_sha, profile, deadline, cancelled=lambda: False):
