@@ -62,8 +62,8 @@ export function startLive(url: string, deps: LiveDeps): () => void {
     };
     current.onerror = () => {
       if (source !== current) return;
+      missed = true;  // the server keeps no replay: anything sent while we were away is gone, so resync on open
       if (current.readyState === CLOSED) {
-        missed = true;
         deps.onState("offline");
         schedule();
       } else {
@@ -78,7 +78,7 @@ export function startLive(url: string, deps: LiveDeps): () => void {
     };
   };
   const now = () => {
-    if (stopped || !(missed || source?.readyState === CLOSED)) return;
+    if (stopped || source?.readyState !== CLOSED) return;
     if (retry) { deps.clearTimeout(retry); retry = null; }
     attempts = 0;
     connect();

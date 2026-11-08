@@ -71,15 +71,19 @@ test("a stream the browser gave up on is reconnected with backoff and then resyn
   stop();
 });
 
-test("a blip the browser retries by itself is left to the browser", () => {
+test("a blip the browser retries by itself is left to the browser, then resynced", () => {
   const h = harness();
   startLive("/stream", h.deps);
   h.sources[0].open();
+  assert.equal(h.resyncs(), 0);
   h.sources[0].dropAndRetry();
   assert.equal(h.states.at(-1), "connecting");
+  h.fire("focus");
   h.advance(60_000);
-  assert.equal(h.sources.length, 1);
-  assert.equal(h.resyncs(), 0);
+  assert.equal(h.sources.length, 1);                // no extra connection: the browser handles it
+  h.sources[0].open();                              // browser reconnected by itself
+  assert.equal(h.states.at(-1), "live");
+  assert.equal(h.resyncs(), 1);                     // events sent during the blip are caught up
 });
 
 test("focus or the network coming back reconnects at once", () => {
@@ -93,11 +97,11 @@ test("focus or the network coming back reconnects at once", () => {
   h.sources[1].failForGood();
   h.fire("online");
   assert.equal(h.sources.length, 3);
-  h.fire("focus");                                  // still not open: focus tries again straight away
-  assert.equal(h.sources.length, 4);
-  h.sources[3].open();
+  h.fire("focus");                                  // the new attempt is still connecting: leave it be
+  assert.equal(h.sources.length, 3);
+  h.sources[2].open();
   h.fire("focus");
-  assert.equal(h.sources.length, 4);                // healthy: focus is a no-op
+  assert.equal(h.sources.length, 3);                // healthy: focus is a no-op
 });
 
 test("backoff is capped and stopping clears timers and listeners", () => {

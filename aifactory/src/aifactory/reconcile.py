@@ -39,11 +39,9 @@ async def reconcile_pull_requests() -> int:
             log.debug("reconcile skipped %s#%s: %s", full_name, number, exc)
             continue
         if pr.get("merged"):
-            _handle_merged(task_id, pr)
-            changed += 1
+            changed += _handle_merged(task_id, pr)
         elif pr.get("state") == "closed":
-            _handle_closed(task_id, pr)
-            changed += 1
+            changed += _handle_closed(task_id, pr)
     if changed:
         from .pipeline.orchestrator import orchestrator
 
@@ -56,10 +54,17 @@ def _supersede(s, task_id: str, why: str) -> None:
         d.status, d.comment = "superseded", why
 
 
-def _handle_merged(task_id: str, pr: dict) -> None:
+def _still_waiting(task: Task | None, number: int) -> bool:
+    """People may have resolved the decision while GitHub was being asked: only act on an unchanged wait."""
+    return bool(task and task.status in WAITING and task.pr_number == number and not task.merge_sha)
+
+
+def _handle_merged(task_id: str, pr: dict) -> bool:
     who = (pr.get("merged_by") or {}).get("login") or "someone"
     with session_scope() as s:
         task = s.get(Task, task_id)
+        if not _still_waiting(task, pr.get("number")):
+            return False
         _supersede(s, task_id, f"PR #{task.pr_number} was merged on GitHub by {who}")
         task.status, task.stage, task.blocked_reason = "queued", "merge", ""
         record(task.workspace_id, "merged_outside", f"PR #{task.pr_number} was merged on GitHub by {who}; "
@@ -67,13 +72,16 @@ def _handle_merged(task_id: str, pr: dict) -> None:
         ws, outcome_id = task.workspace_id, task.outcome_id
     notify(ws, "decision", task_id)
     notify(ws, "outcome", outcome_id)
+    return True
 
 
-def _handle_closed(task_id: str, pr: dict) -> None:
+def _handle_closed(task_id: str, pr: dict) -> bool:
     from .pipeline.runtime import open_decision
 
     with session_scope() as s:
         task = s.get(Task, task_id)
+        if not _still_waiting(task, pr.get("number")):
+            return False
         number = task.pr_number
         _supersede(s, task_id, f"PR #{number} was closed on GitHub without merging")
         # Forget the closed PR so a rebuild starts fresh and opens a new one (retrying a "failed" task resets attempts).
@@ -88,3 +96,4 @@ def _handle_closed(task_id: str, pr: dict) -> None:
                   outcome_id=outcome_id, task_id=task_id,
                   options=[{"value": "retry", "label": "Rebuild and open a new PR"},
                            {"value": "abandon", "label": "Abandon task"}])
+    return True

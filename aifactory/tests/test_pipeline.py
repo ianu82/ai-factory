@@ -807,3 +807,18 @@ def test_a_pr_closed_on_github_becomes_a_rebuild_decision(factory, monkeypatch):
     with session_scope() as s:
         task = s.get(Task, task_id)
         assert task.status == "completed" and task.pr_number != number  # rebuilt with a new pull request
+
+
+def test_reconciliation_leaves_a_task_people_resolved_meanwhile_alone(factory, monkeypatch):
+    from aifactory import reconcile
+
+    outcome_id, task_id, number = _waiting_task_with_pr(factory)
+    with session_scope() as s:  # someone abandons the task while GitHub is being asked
+        s.get(Task, task_id).status = "abandoned"
+    pr = {"number": number, "merged": True, "merged_by": {"login": "lead"}, "state": "closed"}
+    assert reconcile._handle_merged(task_id, pr) is False
+    assert reconcile._handle_closed(task_id, {**pr, "merged": False}) is False
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "abandoned" and task.pr_number == number
+        assert s.query(Decision).filter(Decision.task_id == task_id).one().status == "open"
