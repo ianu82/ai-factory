@@ -41,7 +41,7 @@ jobs:
           npm install -g @openai/codex@0.167.0 --no-audit --no-fund
           .venv/bin/python -m playwright install --with-deps chromium
       - name: Web type-check and build
-        run: cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npx vite build
+        run: cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npm test && npx vite build
       - name: Tests (pipeline end-to-end, gateway, Native/Anton/Codex harnesses)
         run: .venv/bin/python -m pytest -q
 

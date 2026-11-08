@@ -216,6 +216,7 @@ export interface Decision {
   outcome_title?: string;
   task_key?: string | null;
   pr_url?: string;
+  pr_number?: number | null;
   priority?: number;
 }
 
