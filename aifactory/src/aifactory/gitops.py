@@ -107,7 +107,9 @@ async def apply_in_sandbox(sandbox: LocalSandbox, patch: "Patch") -> None:
     """Apply a candidate patch inside a sandbox checkout (as the sandbox identity)."""
     if patch.empty:
         return
-    sandbox.write_bytes(f"{SCRATCH}/candidate.patch", patch.diff)
+    from .sandbox import write_bytes
+
+    await write_bytes(sandbox, f"{SCRATCH}/candidate.patch", patch.diff)
     # --index stages the candidate so new files are tracked: reviewers see them in `git diff <base>`.
     # Re-owning the checkout to the job identity invalidates git's cached stat data; refresh it first.
     result = await sandbox.exec(f"git update-index -q --refresh >/dev/null 2>&1; "
@@ -144,7 +146,9 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     result = await sandbox.exec(script, timeout=180)
     if not result.ok:
         raise SandboxError(f"Could not read the candidate changes: {result.output[-800:]}")
-    diff = sandbox.resolve(out_file).read_bytes()
+    from .sandbox import read_bytes
+
+    diff = await read_bytes(sandbox, out_file)
     files, adds, dels = [], 0, 0
     for line in result.output.splitlines():
         parts = line.split("\t")

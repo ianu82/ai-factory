@@ -554,3 +554,26 @@ def test_a_stuck_task_can_be_taken_over_from_its_decision(factory, client, monke
     with session_scope() as s:
         assert s.get(Task, task_id).status == "handed_over"
         assert s.get(Decision, decision_id).status == "resolved"
+
+
+def test_builder_can_work_in_an_isolated_vm(factory, monkeypatch, tmp_path):
+    from aifactory import vm as vm_module
+
+    from .test_vm import FakeBridge
+
+    bridge = FakeBridge(tmp_path / "buildvm")
+    monkeypatch.setattr(vm_module.VMBridge, "get", classmethod(lambda cls: bridge))
+    monkeypatch.setattr(vm_module, "vm_available", lambda: (True, ""))
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "build": {"isolation": "vm"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        kinds = [e.kind for e in s.query(Event).filter(Event.task_id == task.id)]
+        assert "build_vm_ready" in kinds
+    assert "create" in bridge.calls and "destroy" in bridge.calls
+    # The builder's edit happened inside the VM and still reached main through the normal publish path.
+    assert git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git").strip() == "echo 'Hello, Factory!'"
