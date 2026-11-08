@@ -199,3 +199,46 @@ def test_bootstrap_applies_declared_values_once_and_keeps_later_app_changes(monk
         repo = s.query(Repository).filter(Repository.full_name == "acme/app").one()
         assert repo.config["checks"] == ["npm test", "npm run lint"] and repo.config["merge"] == {"mode": "auto"}
         assert s.get(Workspace, ws_id).settings["budgets"]["run_usd"] == 6
+
+
+def test_delegated_resolve_can_target_one_task_of_an_outcome(monkeypatch):
+    from aifactory.models import Decision, Plan, Task
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={})
+        s.add(ws)
+        s.flush()
+        repo = Repository(workspace_id=ws.id, full_name="acme/app", default_branch="main", config={})
+        s.add(repo)
+        s.flush()
+        o = Outcome(workspace_id=ws.id, number=13, title="Two PRs", repo_ids=[repo.id], status="attention")
+        s.add(o)
+        s.flush()
+        plan = Plan(outcome_id=o.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        ids = {}
+        for key, pr in (("T1", 212), ("T3", 213)):  # T3's decision is the newer one
+            t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key=key, title=key, repo_id=repo.id,
+                     status="awaiting_approval", stage="merge", pr_number=pr)
+            s.add(t)
+            s.flush()
+            s.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="approve_merge", title=f"Merge {key}",
+                           options=[{"value": "approve", "label": "Merge"}]))
+            s.flush()
+            ids[key] = t.id
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "Acme", "workspace": "Acme", "delegated_by": "ian@mindsdb.com",
+        "resolve": [{"outcome": 13, "task": "T1", "kind": "approve_merge", "resolution": "approve", "nonce": "t1"}]}))
+
+    async def run():
+        return apply_bootstrap()
+
+    asyncio.run(run())
+    with session_scope() as s:
+        assert s.get(Task, ids["T1"]).status == "queued"
+        assert s.get(Task, ids["T3"]).status == "awaiting_approval"
+        assert s.query(Decision).filter(Decision.task_id == ids["T3"]).one().status == "open"
