@@ -18,6 +18,8 @@ ian@mindsdb.com)".
 | calorie-tracker Ticket 40 (#6), T1 → PR #22 | Native on MindsHub | First three attempts ended unverified: the production build hit `EAGAIN` in the shared container (48 visible CPUs, 1000-pid cgroup) while the builder's throwaway Postgres was still running. After platform fixes (per-job CPU sets, builder processes stopped before verification, boot logs in QA events) an operator retry built it in one attempt; verification ran in a Railway VM (the verifier started Postgres with Docker inside the VM to run the integration test), CI passed, the Factory merged it and post-merge smoke passed; outcome #6 delivered | Assisted (operator retry after platform fixes) |
 | calorie-tracker #21 → PR #23 (#8) | Anton on MindsHub (planner, builder and verifier) | Planned, built, checked; verified by a fresh Anton session with **runtime QA inside a Railway VM** (app ready in 21 s, 3/3 pages screenshotted, probe passed, the verifier added its own screenshot); first live prepared environment saved; CI → merge → smoke; issue closed. A Factory redeploy interrupted the first build attempt, which resumed on its own | Unattended |
 | calorie-tracker #24 → PRs #25, #26 (#9) | Native on MindsHub | The planner split the fix into two parallel tasks (route handlers, middleware). Each was verified in its own Railway VM booted from the prepared environment (setup skipped, app ready in 35 s / 53 s, pages and probe passed, the verifier added screenshots). #25 merged first; #26 was rebased and revalidated because the base moved, then merged; smoke passed for both | Unattended |
+| calorie-tracker #27 (#10) | Native on MindsHub, **builder in a Railway VM** | First run with builder VMs: setup ran in the build VM and saved the prepared environment the verifier VM then booted from. Runtime QA ran the builder's change-specific checks in the VM (2/2, then 3/3). The verifier, exercising the running app, rejected attempt 1 (`/api/health/` redirected) and attempt 2 (a global trailing-slash change altered unrelated routes); the builder escalated the conflict, answered as a delegated operator decision (keep Next.js's default redirect, saved as a repository precedent). Attempt 3 was verified and passed CI (PR #29), but #11 merged first, the rebase conflicted, and the rebuild tripped the attempt limit — a Factory bug, fixed in ai-factory #202 (fresh attempt budget after the base moves). Ian abandoned the task in the app at 18:32 before the fix shipped, so it was not retried; PR #29 is still open | Not delivered (abandoned by Ian) |
+| calorie-tracker #28 → PR #30 (#11) | **Codex on MindsHub, building and verifying inside Railway VMs** | Codex CLI ran in its build VM and in a separate verification VM through the Factory's public gateway with run-scoped tokens; the verifier checked the real 404 with Supabase unset, the protected-route redirects and the API 401s; CI → merge → smoke; ran in parallel with #10 | Unattended |
 | ai-factory #195 (Factory improving itself) | Codex on MindsHub | Fresh verifiers rejected several candidates for real races; the approved candidate then conflicted on rebase and was abandoned (delegated). PR #196 closed, issue #195 open | Assisted, not delivered |
 
 MindsHub Inference is the workspace provider (`gpt-terra`, failover disabled); per-run cost is read
@@ -42,6 +44,15 @@ VM, and the VM test fails if the control plane ever calls the app directly). The
 evidence. Since then builders also propose change-specific runtime checks (for example the status a
 fixed endpoint must now return), which the Factory runs in the same environment and attaches.
 
+## Release path
+
+v2 was merged to `main` (ianu82/ai-factory#194). The `factory` Railway service now deploys from `main`
+only after GitHub checks pass (tests on SQLite and Postgres, the Codex/Anton/sandbox jobs and the
+contract validation). Changes since go through pull requests (#198 builder VMs, #199 recovery guide,
+#200 cost reconciliation, #201 Codex in VMs, #202 rebuild budget), each merged once green, and each deploy waits for its checks. The v1
+service has no deploy trigger and is untouched. Declared bootstrap values apply when the operator
+changes them, so settings changed in the app survive redeploys.
+
 ## Roadmap
 
 | Item | Status in v2 | Evidence / remaining |
@@ -56,11 +67,11 @@ fixed endpoint must now return), which the Factory runs in the same environment 
 | F19 MindsHub sign-in & onboarding | API-key sign-in live; orgs/workspaces from MindsHub Auth; invited admins; setup checklist | OIDC coded; needs the domain on MindsHub's redirect allowlist (deliberately not blocking) |
 | F07 Workspaces | Isolated repos, credentials, policies, budgets, history | Two-workspace live test not yet run |
 | F08 Internal app | Inbox, Outcomes, Runs, Signals, Decisions, Settings; responsive | Rendered with fixtures and live data |
-| F09 Acceptance & recovery | Durable stages; restarts resume without cancelling; operator retry/resolve; revert on smoke failure | Recovery runbook not yet in-app |
+| F09 Acceptance & recovery | Durable stages; restarts resume without cancelling (an interrupted attempt is redone, not counted); operator retry/resolve; revert on smoke failure; in-app recovery guide (Inbox → How recovery works); costs reconciled from MindsHub usage when it lags | — |
 | F10 Visual & risk review | Runtime QA screenshots/probes as verifier evidence and in PRs; protected paths and change-size limits | Visual diffing against the base not built |
-| F11 Watch & intervene | Live activity, guidance delivered to the active agent, cancel, **take over** (candidate pushed as an unverified draft PR, task ends `handed_over`) | — |
+| F11 Watch & intervene | Live activity, guidance delivered to the active agent, cancel, **take over** from a task or from a stuck task's decision (candidate pushed as an unverified draft PR, task ends `handed_over`) | — |
 | F12 Product signals | GitHub issues, failing main CI, smoke/release failures, **product feedback API** (workspace key) and hand-logged feedback | Analytics/error-tracker connectors not built |
 | F13 Reuse human decisions | Attributed decisions; "remember" → precedents; **improvement proposals** from decisions and run history (policy, team notes, budgets, workers), applied by admins with attribution | — |
 | F14 Bounded remediation | Smoke failure → revert PR (policy or decision); signals → proposed outcomes | Auto-remediation of failing main CI is opt-in via `factory:auto` only |
-| F15 Customer onboarding | Sign-in restricted to `@mindsdb.com`; **Postgres supported** (CI runs the suite on Postgres 17) | Builders still run per-UID in the control-plane container; GitHub App onboarding not built (PAT per workspace) |
+| F15 Customer onboarding | Sign-in restricted to `@mindsdb.com`; cross-tenant isolation tested over every workspace route; **Postgres supported** (CI runs the suite on Postgres 17); **builders can run in their own Railway VM** (`build.isolation: "vm"`, enabled for calorie-tracker) | GitHub App onboarding not built (a PAT per workspace). Codex runs in VMs through the public HTTPS gateway (#201; live in #11) |
 | F16/F17 | Deferred | — |
