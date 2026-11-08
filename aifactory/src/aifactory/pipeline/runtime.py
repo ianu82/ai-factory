@@ -178,8 +178,10 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             s.flush()
             run_snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
         level = "success" if status == "succeeded" else ("warn" if status == "cancelled" else "error")
+        tokens = ledger.input_tokens + ledger.output_tokens
+        spend = (f"${run_snapshot.cost_usd:.2f}" if run_snapshot.cost_known else "cost unknown")
         record(spec.workspace_id, "run_finished",
-               f"{harness.label} {spec.role} {status}" + (f": {error[:300]}" if error else ""),
+               f"{harness.label} {spec.role} {status} · {tokens:,} tokens · {spend}" + (f": {error[:300]}" if error else ""),
                outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id, level=level,
                data={"status": status, "tokens": ledger.input_tokens + ledger.output_tokens,
                      "cost_usd": run_snapshot.cost_usd, "cost_known": run_snapshot.cost_known})
