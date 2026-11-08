@@ -149,10 +149,31 @@ class GitHub:
     async def comment(self, full_name: str, number: int, body: str) -> None:
         await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body})
 
-    async def checks(self, full_name: str, sha: str) -> CheckSummary:
-        runs = await self.request("GET", f"/repos/{full_name}/commits/{sha}/check-runs", params={"per_page": 100})
-        statuses = await self.request("GET", f"/repos/{full_name}/commits/{sha}/status")
+    async def _actions_checks(self, full_name: str, sha: str) -> list[dict[str, Any]]:
+        """Fine-grained tokens often lack the Checks permission; Actions read covers workflow jobs."""
+        runs = await self.request("GET", f"/repos/{full_name}/actions/runs", params={"head_sha": sha, "per_page": 50})
         checks: list[dict[str, Any]] = []
+        for run in runs.get("workflow_runs", []):
+            jobs = await self.request("GET", f"/repos/{full_name}/actions/runs/{run['id']}/jobs", params={"per_page": 100})
+            for job in jobs.get("jobs", []):
+                checks.append({"name": job["name"], "status": job["status"], "conclusion": job.get("conclusion") or "",
+                               "url": job.get("html_url") or "", "id": job["id"], "summary": "", "kind": "check_run"})
+            if not jobs.get("jobs"):
+                checks.append({"name": run.get("name", "workflow"), "status": run["status"],
+                               "conclusion": run.get("conclusion") or "", "url": run.get("html_url") or "",
+                               "id": run["id"], "summary": "", "kind": "workflow"})
+        return checks
+
+    async def checks(self, full_name: str, sha: str) -> CheckSummary:
+        checks: list[dict[str, Any]] = []
+        try:
+            runs = await self.request("GET", f"/repos/{full_name}/commits/{sha}/check-runs", params={"per_page": 100})
+        except GitHubError as exc:
+            if exc.status not in (403, 404):
+                raise
+            runs = {"check_runs": []}
+            checks.extend(await self._actions_checks(full_name, sha))
+        statuses = await self.request("GET", f"/repos/{full_name}/commits/{sha}/status")
         for run in runs.get("check_runs", []):
             checks.append({
                 "name": run["name"],

@@ -155,3 +155,23 @@ def test_gateway_pins_model_enforces_budget_and_records_usage(client, signed_in,
     gateway.revoke(run_id)
     assert client.post("/gateway/v1/responses", json={"input": "x"}, headers=headers).status_code == 401
     assert client.post("/gateway/v1/responses", json={"input": "x"}, headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_ci_checks_fall_back_to_actions_when_checks_api_is_forbidden(monkeypatch):
+    from aifactory.github import GitHub, GitHubError
+
+    async def fake_request(self, method, path, **kwargs):
+        if path.endswith("/check-runs"):
+            raise GitHubError("Resource not accessible by personal access token", 403)
+        if path.endswith("/status"):
+            return {"statuses": [{"context": "ai-factory/verification", "state": "success"}]}
+        if path.endswith("/actions/runs"):
+            return {"workflow_runs": [{"id": 9, "name": "Validate", "status": "completed", "conclusion": "success"}]}
+        if path.endswith("/jobs"):
+            return {"jobs": [{"id": 1, "name": "validate", "status": "completed", "conclusion": "success", "html_url": "u"},
+                             {"id": 2, "name": "sandbox", "status": "in_progress", "conclusion": None, "html_url": "u"}]}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(GitHub, "request", fake_request)
+    summary = asyncio.run(GitHub("t").checks("o/r", "abc"))
+    assert summary.state == "pending" and [c["name"] for c in summary.checks] == ["validate", "sandbox"]
