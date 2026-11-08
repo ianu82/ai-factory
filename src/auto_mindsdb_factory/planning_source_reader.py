@@ -72,13 +72,18 @@ function read(q,index){
 // Reserve every request's omission marker first; a large section cannot erase others.
 const sections=input.sections.map((_,index)=>({index,status:'omitted_budget'}));
 const output={sections};
-if(Buffer.byteLength(JSON.stringify(output))>input.limit)throw Error('Unavailable output budget');
+// Earlier excerpts cannot consume space needed to report a later literal miss.
+const reserves=sections.map((s,index)=>Buffer.byteLength(JSON.stringify({index,status:'no_match',nearby_omitted_budget:true}))-Buffer.byteLength(JSON.stringify(s)));
+let pendingReserve=reserves.reduce((a,b)=>a+b,0);
+const fits=()=>Buffer.byteLength(JSON.stringify(output))+pendingReserve<=input.limit;
+if(!fits())throw Error('Unavailable output budget');
 for(let i=0;i<sections.length;i++){
+  pendingReserve-=reserves[i];
   const previous=sections[i];sections[i]=read(input.sections[i],i);
-  if(Buffer.byteLength(JSON.stringify(output))>input.limit&&sections[i].nearby){
+  if(!fits()&&sections[i].nearby){
     delete sections[i].nearby;sections[i].nearby_omitted_budget=true;
   }
-  if(Buffer.byteLength(JSON.stringify(output))>input.limit)sections[i]=previous;
+  if(!fits())sections[i]=previous;
 }
 process.stdout.write(JSON.stringify(output));
 """

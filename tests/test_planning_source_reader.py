@@ -71,6 +71,13 @@ def test_oversized_nearby_context_preserves_the_miss_and_other_sections(tmp_path
     assert result[1]["status"] == "ok" and result[1]["text"] == "Other useful evidence"
 
 
+def test_earlier_excerpt_cannot_consume_a_later_miss_omission_marker(tmp_path):
+    (tmp_path / "filler").write_text("x" * 11600)
+    (tmp_path / "nearby").write_text("async function lookup() {" + "y" * 13000 + "}\n")
+    result = read(tmp_path, [section("filler"), section("nearby", match="async lookup")])["sections"]
+    assert result[1] == {"index": 1, "status": "no_match", "nearby_omitted_budget": True}
+
+
 def test_unicode_and_json_escaping_fit_the_real_utf8_capture_limit(tmp_path):
     text = '\u6f22\U0001f680"\\\t' * 400
     (tmp_path / "unicode.txt").write_text(text)
