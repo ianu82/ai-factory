@@ -727,3 +727,98 @@ def test_an_issue_the_factory_cannot_close_is_reported_plainly(factory, monkeypa
     with session_scope() as s:
         failed = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "issue_close_failed").one()
     assert "issue #9 is still open" in failed.message and "cannot write issues" in failed.message
+
+
+def _waiting_task_with_pr(factory, title="Greeting"):
+    from aifactory.models import Plan
+
+    base = git("rev-parse", "refs/heads/main", cwd=factory["remotes"] / "acme/demo.git")
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    git("checkout", "-q", "-B", "factory/1-t1", cwd=seed)
+    (seed / "greet.sh").write_text("echo 'Hello, Factory!'\n")
+    git("commit", "-qam", "greeting", cwd=seed)
+    git("push", "-q", "-f", str(factory["remotes"] / "acme/demo.git"), "factory/1-t1", cwd=seed)
+    head = git("rev-parse", "HEAD", cwd=seed)
+    git("checkout", "-q", "main", cwd=seed)
+    pr = asyncio.run(FakeGitHub("t").create_pull("acme/demo", head="factory/1-t1", base="main", title=title, body="b"))
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        s.get(Outcome, outcome_id).status = "attention"  # already planned: the task below waits on a person
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title=title,
+                    repo_id=factory["repo"], status="awaiting_approval", stage="merge", base_sha=base, head_sha=head,
+                    branch="factory/1-t1", pr_number=pr["number"], pr_url=pr["html_url"])
+        s.add(task)
+        s.flush()
+        s.add(Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="approve_merge",
+                       title="Approve merge", options=[{"value": "approve", "label": "Merge"}]))
+        return outcome_id, task.id, pr["number"]
+
+
+def test_a_pr_merged_on_github_finishes_its_task_without_asking_again(factory, monkeypatch):
+    from aifactory import reconcile
+
+    monkeypatch.setattr(reconcile, "GitHub", FakeGitHub)
+    monkeypatch.setattr(reconcile, "resolve_token", lambda ws: "token")
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {**ws.settings["autonomy"], "merge": "approval"}}
+    outcome_id, task_id, number = _waiting_task_with_pr(factory)
+    asyncio.run(FakeGitHub("t").merge("acme/demo", number, sha="", method="squash", title="merged by a person"))
+    assert asyncio.run(reconcile.reconcile_pull_requests()) == 1
+
+    def task_settled():
+        with session_scope() as s:
+            return s.get(Task, task_id).status in ("completed", "failed", "needs_input", "awaiting_approval")
+
+    assert drive(task_settled, timeout=60)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "completed", (task.status, task.blocked_reason)
+        assert task.merge_sha and task.evidence["merge"]["outside"]
+        decisions = s.query(Decision).filter(Decision.task_id == task_id).all()
+        assert [(d.kind, d.status) for d in decisions] == [("approve_merge", "superseded")]  # no new approval card
+
+
+def test_a_pr_closed_on_github_becomes_a_rebuild_decision(factory, monkeypatch):
+    from aifactory import reconcile
+    from aifactory.decisions import resolve
+
+    monkeypatch.setattr(reconcile, "GitHub", FakeGitHub)
+    monkeypatch.setattr(reconcile, "resolve_token", lambda ws: "token")
+    outcome_id, task_id, number = _waiting_task_with_pr(factory)
+    FakeGitHub.pulls[number]["state"] = "closed"
+    assert asyncio.run(reconcile.reconcile_pull_requests()) == 1
+    assert asyncio.run(reconcile.reconcile_pull_requests()) == 0  # handled once
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "failed" and task.pr_number is None and task.evidence["closed_prs"] == [number]
+        open_ = s.query(Decision).filter(Decision.task_id == task_id, Decision.status == "open").one()
+        assert open_.kind == "unblock" and f"#{number} was closed" in open_.title
+        resolve(s, open_, s.get(User, factory["user"]), "retry")
+
+    def task_settled():
+        with session_scope() as s:
+            return s.get(Task, task_id).status in ("completed", "failed", "needs_input", "awaiting_approval")
+
+    assert drive(task_settled, timeout=90)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "completed" and task.pr_number != number  # rebuilt with a new pull request
+
+
+def test_reconciliation_leaves_a_task_people_resolved_meanwhile_alone(factory, monkeypatch):
+    from aifactory import reconcile
+
+    outcome_id, task_id, number = _waiting_task_with_pr(factory)
+    with session_scope() as s:  # someone abandons the task while GitHub is being asked
+        s.get(Task, task_id).status = "abandoned"
+    pr = {"number": number, "merged": True, "merged_by": {"login": "lead"}, "state": "closed"}
+    assert reconcile._handle_merged(task_id, pr) is False
+    assert reconcile._handle_closed(task_id, {**pr, "merged": False}) is False
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "abandoned" and task.pr_number == number
+        assert s.query(Decision).filter(Decision.task_id == task_id).one().status == "open"

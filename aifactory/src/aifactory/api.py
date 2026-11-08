@@ -600,6 +600,7 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
             "outcome_title": outcomes[d.outcome_id].title if d.outcome_id in outcomes else "",
             "task_key": tasks[d.task_id].key if d.task_id in tasks else None,
             "pr_url": tasks[d.task_id].pr_url if d.task_id in tasks else "",
+            "pr_number": tasks[d.task_id].pr_number if d.task_id in tasks else None,
             "priority": outcomes[d.outcome_id].priority if d.outcome_id in outcomes else 2,
         }) for d in decisions],
         "since": S.ts(since),

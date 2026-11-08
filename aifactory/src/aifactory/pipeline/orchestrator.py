@@ -88,6 +88,7 @@ class Orchestrator:
                 await self._maybe_sync_signals()
                 await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_reconcile_costs()
+                await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
@@ -119,6 +120,20 @@ class Orchestrator:
                 roles = [m.role for m in s.query(Membership).filter(Membership.workspace_id == ws.id)]
                 log.info("inventory workspace %s '%s' members=%s credentials: %s", ws.id[:6], ws.name, roles, creds)
         log.info("inventory orchestrator %s", self.status())
+
+    async def _maybe_reconcile_pulls(self) -> None:
+        """PRs merged or closed on GitHub while their task waits on a decision (every 2 minutes)."""
+        import time
+
+        if time.monotonic() - getattr(self, "_last_pull_reconcile", float("-inf")) < 120:
+            return
+        self._last_pull_reconcile = time.monotonic()
+        from ..reconcile import reconcile_pull_requests
+
+        try:
+            await reconcile_pull_requests()
+        except Exception:
+            log.exception("pull request reconciliation failed")
 
     async def _maybe_reconcile_costs(self) -> None:
         """Price finished runs whose cost was not known yet (MindsHub usage can lag behind the run)."""

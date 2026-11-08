@@ -51,7 +51,7 @@ export function DecisionCard({ d, showContext = false, onOpen }: { d: Decision; 
         </div>
       )}
       {d.body && <Prose text={d.body} />}
-      {d.pr_url && <a className="linkish" href={d.pr_url} target="_blank" rel="noreferrer" style={{ marginTop: 6 }}>Review the pull request <ExternalLink /></a>}
+      {d.pr_url && <a className="linkish" href={d.pr_url} target="_blank" rel="noreferrer" style={{ marginTop: 6 }}>Review pull request #{d.pr_number ?? d.pr_url.split("/").pop()} on GitHub <ExternalLink /></a>}
       {canAct && (
         <>
           {noting && (

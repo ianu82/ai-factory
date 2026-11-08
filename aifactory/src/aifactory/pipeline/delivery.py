@@ -741,6 +741,17 @@ class TaskRunner:
     async def merge(self) -> None:
         token = resolve_token(self.ws)
         gh = GitHub(token)
+        if self.task.pr_number:
+            current = await gh.pull(self.repo.full_name, self.task.pr_number)
+            if current.get("merged"):  # a person merged it on GitHub: that is the approval
+                who = (current.get("merged_by") or {}).get("login") or "someone"
+                self.update(merge_sha=current.get("merge_commit_sha") or "", status="running", blocked_reason="")
+                self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "by": who,
+                                        "outside": True, "at": utcnow().isoformat()})
+                self.event("merged", f"PR #{self.task.pr_number} was merged on GitHub by {who} "
+                           f"({self.task.merge_sha[:8]})", level="success")
+                await self.smoke()
+                return
         if self._merge_needs_approval() and not self._approved("approve_merge"):
             self.update(stage="merge")
             self.block("approve_merge", f"Approve merge: {self.task.title}",
