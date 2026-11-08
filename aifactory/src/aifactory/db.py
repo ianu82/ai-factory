@@ -17,6 +17,21 @@ class Base(DeclarativeBase):
     pass
 
 
+@event.listens_for(Session, "before_flush")
+def _fit_strings(session: Session, _context, _instances) -> None:
+    """Clip text to its column's declared length. SQLite ignores VARCHAR limits; Postgres rejects the row,
+    and a long command or title must never fail a delivery step."""
+    from sqlalchemy import String, inspect as sa_inspect
+
+    for obj in list(session.new) + list(session.dirty):
+        mapper = sa_inspect(obj).mapper
+        for column in mapper.columns:
+            if isinstance(column.type, String) and column.type.length:
+                value = getattr(obj, column.key, None)
+                if isinstance(value, str) and len(value) > column.type.length:
+                    setattr(obj, column.key, value[: column.type.length - 1] + "…")
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
@@ -36,10 +51,18 @@ def _configure_sqlite(engine: Engine) -> None:
         cursor.close()
 
 
+def normalize_url(url: str) -> str:
+    """Accept the URLs hosting providers hand out (postgres://, postgresql://) and use the psycopg 3 driver."""
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
+    return url
+
+
 def init_engine(url: str | None = None) -> Engine:
     global _engine, _session_factory
     settings = get_settings()
-    url = url or settings.database_url
+    url = normalize_url(url or settings.database_url)
     if url.startswith("sqlite:///"):
         path = url.removeprefix("sqlite:///")
         if path and path != ":memory:":
@@ -50,7 +73,7 @@ def init_engine(url: str | None = None) -> Engine:
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
     else:
-        kwargs["pool_pre_ping"] = True
+        kwargs.update(pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=1800)
     _engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
         _configure_sqlite(_engine)

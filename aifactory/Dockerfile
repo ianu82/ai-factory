@@ -40,7 +40,7 @@ COPY vmbridge/sidecar.mjs ./vmbridge/
 COPY pyproject.toml ./
 COPY src ./src
 COPY --from=web /web-dist ./src/aifactory/web
-RUN uv pip install --system . && uv pip check --system || true
+RUN uv pip install --system ".[postgres]" && uv pip check --system || true
 ENV AIFACTORY_DATA_DIR=/data/aifactory \
     AIFACTORY_ENV=production \
     PYTHONUNBUFFERED=1 \

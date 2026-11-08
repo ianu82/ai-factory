@@ -184,3 +184,13 @@ def test_existing_databases_gain_new_nullable_columns(tmp_path):
     assert "data" in {c["name"] for c in inspect(engine).get_columns("signals")}
     with db.session_scope() as s:
         assert s.get(Signal, "s1").data is None
+
+
+def test_long_strings_are_clipped_to_column_length(client, signed_in):
+    from aifactory.models import Artifact
+
+    with session_scope() as s:
+        s.add(Artifact(workspace_id="w", kind="check", name="x" * 900, content="ok"))
+    with session_scope() as s:
+        name = s.query(Artifact).one().name
+        assert len(name) == 300 and name.endswith("…")

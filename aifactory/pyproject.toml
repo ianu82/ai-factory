@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=9.2", "pytest-asyncio>=1.4", "playwright>=1.64"]
+postgres = ["psycopg[binary]>=3.2"]
 
 [project.scripts]
 aifactory = "aifactory.cli:main"

@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 def isolated_env(tmp_path, monkeypatch):
     data = tmp_path / "data"
     monkeypatch.setenv("AIFACTORY_DATA_DIR", str(data))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{data / 'factory.db'}")
+    shared = os.environ.get("AIFACTORY_TEST_DATABASE_URL")  # e.g. a throwaway Postgres; reset per test
+    monkeypatch.setenv("DATABASE_URL", shared or f"sqlite:///{data / 'factory.db'}")
     monkeypatch.setenv("AIFACTORY_SECRET_KEY", "test-secret-key-for-unit-tests-only")
     monkeypatch.setenv("AIFACTORY_ALLOW_DEV_SIGN_IN", "1")
     monkeypatch.setenv("AIFACTORY_ORCHESTRATOR", "0")
@@ -25,7 +26,14 @@ def isolated_env(tmp_path, monkeypatch):
 
     config.reset_settings_cache()
     security.reset_crypto_cache()
-    db.init_engine()
+    if shared:
+        from aifactory.models import Base
+
+        engine = db.init_engine()
+        Base.metadata.drop_all(engine)
+        Base.metadata.create_all(engine)
+    else:
+        db.init_engine()
     yield data
     config.reset_settings_cache()
     security.reset_crypto_cache()
