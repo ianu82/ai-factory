@@ -60,6 +60,7 @@ class Workspace(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     mindshub_workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    onboarding: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     outcome_seq: Mapped[int] = mapped_column(Integer, default=0)
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
