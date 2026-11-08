@@ -50,15 +50,26 @@ def workspace_settings(workspace_id: str) -> dict[str, Any]:
         return merged_settings(ws.settings if ws else {})
 
 
-def take_guidance(outcome_id: str, task_id: str | None = None):
-    """Return a function that yields undelivered team guidance for an outcome/task once."""
+def guidance_history(outcome_id: str, task_id: str | None = None) -> list[str]:
+    """All team guidance so far for an outcome (and this task), for inclusion in new prompts."""
+    with session_scope() as s:
+        rows = (s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user")
+                .order_by(Message.created_at).all())
+        return [m.body for m in rows if m.task_id in (None, task_id)]
+
+
+def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
+    """Yield guidance posted while a session runs, once per session (every task's agent hears it)."""
+    started = since or utcnow()
+    seen: set[str] = set()
 
     def take() -> list[str]:
         with session_scope() as s:
-            query = s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user",
-                                            Message.delivered.is_(False))
-            rows = [m for m in query.order_by(Message.created_at) if m.task_id in (None, task_id)]
+            rows = [m for m in s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user",
+                                                        Message.created_at >= started).order_by(Message.created_at)
+                    if m.task_id in (None, task_id) and m.id not in seen]
             for m in rows:
+                seen.add(m.id)
                 m.delivered = True
             return [m.body for m in rows]
 

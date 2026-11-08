@@ -12,7 +12,8 @@ from ..gitops import checkout
 from ..models import Outcome, Plan, Repository, Task
 from ..prompts import PLANNER, plan_prompt
 from ..sandbox import LocalSandbox
-from .runtime import SessionSpec, open_decision, precedents, run_agent, set_outcome, workspace_settings
+from .runtime import (SessionSpec, guidance_history, open_decision, precedents, run_agent, set_outcome,
+                      workspace_settings)
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                            subdir=repo.full_name.replace("/", "__"), adopt=False)
         sandbox.adopt_work()
         decisions = precedents(workspace_id)
-        prompt = plan_prompt(snapshot, repos, decisions, [])
+        prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id))
         run, result, error = await run_agent(SessionSpec(
             workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
             prompt=prompt, system=PLANNER, sandbox=sandbox), cancelled)
@@ -86,8 +87,13 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         body = "\n\n".join(f"**{q['question']}**\n{q.get('why', '')}" +
                            (("\nOptions: " + ", ".join(q["options"])) if q.get("options") else "") for q in questions)
         set_outcome(outcome_id, status="needs_input")
+        options = [{"value": "answer", "label": "Answer and re-plan"}]
+        if report.get("tasks"):
+            body += "\n\nThe planner also proposed a plan with its own assumptions:\n" + report.get("summary", "")
+            options.insert(0, {"value": "approve", "label": "Approve plan as proposed"})
+        options.append({"value": "cancel", "label": "Cancel"})
         open_decision(workspace_id, "question", f"Planner needs a decision for #{snapshot.number}", body,
-                      outcome_id=outcome_id, options=[{"value": "answer", "label": "Answer and re-plan"}])
+                      outcome_id=outcome_id, options=options)
         return
     if settings["autonomy"].get("plan") == "auto":
         approve_plan(plan_id, approved_by=None)

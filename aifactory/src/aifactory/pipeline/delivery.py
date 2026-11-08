@@ -22,7 +22,8 @@ from ..gitops import (DEFAULT_PROTECTED, GitError, Patch, apply_in_sandbox, chec
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
-from .runtime import SessionSpec, open_decision, outcome_cost, precedents, run_agent, workspace_settings
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, run_agent,
+                      workspace_settings)
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,8 @@ class TaskRunner:
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
                 prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
-                                    precedents(self.ws, self.repo.id))), self.cancelled)
+                                    precedents(self.ws, self.repo.id),
+                                    guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
             if result is None:
                 if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
                     self.block("unblock", f"{self.task.key}: model provider problem", error,

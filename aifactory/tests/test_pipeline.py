@@ -314,3 +314,26 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     with session_scope() as s:
         kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
     assert "revalidate" in kinds, "second merge should have rebased onto the first"
+
+
+def test_planner_question_with_a_plan_can_be_approved_as_proposed(factory):
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        report = json.loads(planner_script(messages)["tool_calls"][0]["function"]["arguments"])
+        report["questions"] = [{"question": "Exclamation mark or full stop?", "why": "Brand voice"}]
+        return {"content": "", "tool_calls": [call("finish", report)]}
+
+    ScriptedModel.scripts["planner"] = planner
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "needs_input")
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.status == "open").one()
+        assert [o["value"] for o in decision.options][:2] == ["approve", "answer"]
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision.id), db.get(User, factory["user"]), "approve", comment="Exclamation mark.")
+    db.close()
+    assert drive(lambda: outcome_status(outcome_id) == "completed")

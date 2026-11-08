@@ -59,6 +59,16 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         if resolution == "answer":
             guidance(comment)
             outcome.status = "planning"
+        elif resolution == "approve":
+            guidance(comment)
+            plan = (db.query(Plan).filter(Plan.outcome_id == outcome.id, Plan.status == "proposed")
+                    .order_by(Plan.version.desc()).first())
+            if plan:
+                db.commit()
+                approve_plan(plan.id, approved_by=user.id)
+        elif resolution == "cancel":
+            outcome.status = "cancelled"
+            orchestrator.cancel_outcome(outcome.id)
     elif kind == "question" and task:
         if resolution == "answer":
             guidance(comment)

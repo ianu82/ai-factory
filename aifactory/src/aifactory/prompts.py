@@ -83,7 +83,8 @@ def plan_prompt(outcome: Any, repos: list[Any], decisions: list[Any], guidance: 
     return "\n".join(lines)
 
 
-def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisions: list[Any]) -> str:
+def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisions: list[Any],
+                 guidance: list[str] | None = None) -> str:
     cfg = repo.config or {}
     lines = [
         f"# Task {task.key}: {task.title}",
@@ -109,6 +110,8 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
     if decisions:
         lines += ["", "## Prior human decisions that apply"]
         lines += [f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}" for d in decisions]
+    if guidance:
+        lines += ["", "## Guidance from the team (follow it)", *[f"- {g}" for g in guidance[-12:]]]
     if feedback:
         lines += ["", "## Feedback from the previous attempt — address every point", *feedback]
     return "\n".join(lines)
