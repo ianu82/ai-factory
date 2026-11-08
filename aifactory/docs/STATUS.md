@@ -13,7 +13,13 @@ admitted (a GitHub issue labelled `factory:auto`). Anything else is marked assis
 | calorie-tracker #15 → PR #17 | Codex (via gateway, OpenAI fallback) | Same flow end to end, about 3 minutes after pickup | Unattended |
 | calorie-tracker #16 → PR #18 | Anton (OpenAI fallback) | Fresh Anton verifier rejected attempt 1 for a real defect (empty body → 500); attempt 2 fixed it; rebased onto #17's merge, rechecked and re-ran CI before merging | Unattended |
 
-Runs after 14:00 UTC use MindsHub Inference (`gpt-terra`, workspace key saved through sign-in).
+Runs after 14:00 UTC use MindsHub Inference (`gpt-terra`, workspace key saved when Ian signed in with
+his MindsHub API key). Per-run cost is read back from MindsHub usage (sessions cost about $0.06–0.16).
+
+| Outcome | Worker | What happened | Classification |
+| --- | --- | --- | --- |
+| calorie-tracker #19 (Ticket 40) | Native on MindsHub | Planner proposed 2 tasks but escalated a genuine product decision: the requested ranges conflict with DB precision (0.01 kg rounds to 0.0 under `CHECK (weight_kg > 0)`) | Waiting on Ian (correct stop, not a delivery) |
+| ai-factory #195 (Factory improving itself) | Codex on MindsHub | Fresh Codex verifiers rejected several candidates for real races and a semantic change in CI-signal persistence. Two rejections were caused by platform bugs (an unstaged patch hid new files; stale git stat data), both fixed with regression tests | Assisted (operator retries after platform fixes); merge needs human approval by policy |
 
 ## Roadmap
 
