@@ -97,3 +97,80 @@ def test_pull_requests_need_workspace_membership(client, signed_in):
     other = TestClient(client.app)
     other.post("/auth/dev", json={"email": "x@other.test", "organization": "Other"})
     assert other.get(f"/api/workspaces/{ws_id}/pulls").status_code == 404
+
+
+class ChangingGitHub(FakeGitHub):
+    """One PR whose CI and mergeability change without the PR itself changing."""
+    ci_state = "success"
+    mergeable = "clean"
+    open_count = 1
+
+    async def request(self, method, path, params=None, json=None):
+        if path.endswith("/pulls"):
+            page = (params or {}).get("page", 1)
+            if (params or {}).get("state") != "open":
+                return []
+            total = ChangingGitHub.open_count
+            start = (page - 1) * 100
+            return [_pr(n, f"PR {n}") for n in range(start + 1, min(total, start + 100) + 1)]
+        if path.endswith("/reviews"):
+            return []
+        return {"additions": 1, "deletions": 1, "changed_files": 1, "mergeable_state": ChangingGitHub.mergeable}
+
+    async def checks(self, repo, sha):
+        state = ChangingGitHub.ci_state
+        return CheckSummary(state=state, checks=[{"name": "test", "status": "completed",
+                                                  "conclusion": "failure" if state == "failure" else "success"}])
+
+
+def _setup(ws_id, monkeypatch, cls):
+    monkeypatch.setattr(pulls, "GitHub", cls)
+    monkeypatch.setattr(pulls, "resolve_token", lambda ws: "token")
+    for cache in (pulls._cache, pulls._details, pulls._checks):
+        cache.clear()
+    with session_scope() as s:
+        s.add(Repository(workspace_id=ws_id, full_name="acme/app"))
+
+
+def test_a_rerun_or_a_moved_base_shows_up_on_refresh(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    _setup(ws_id, monkeypatch, ChangingGitHub)
+    ChangingGitHub.ci_state, ChangingGitHub.mergeable, ChangingGitHub.open_count = "success", "clean", 1
+    assert client.get(f"/api/workspaces/{ws_id}/pulls").json()["items"][0]["group"] == "ready"
+
+    ChangingGitHub.ci_state = "failure"  # checks re-run on the same commit and now fail
+    row = client.get(f"/api/workspaces/{ws_id}/pulls?refresh=true").json()["items"][0]
+    assert row["group"] == "attention" and row["reason"] == "Checks failed: test"
+
+    ChangingGitHub.ci_state, ChangingGitHub.mergeable = "success", "dirty"  # the base branch moved under it
+    row = client.get(f"/api/workspaces/{ws_id}/pulls?refresh=true").json()["items"][0]
+    assert row["group"] == "attention" and row["reason"].startswith("Merge conflict")
+
+
+def test_settled_ci_results_expire(monkeypatch):
+    import asyncio
+
+    ChangingGitHub.ci_state = "success"
+    pulls._checks.clear()
+    asyncio.run(pulls._ci(ChangingGitHub("t"), "acme/app", "abc"))
+    ChangingGitHub.ci_state = "failure"
+    assert asyncio.run(pulls._ci(ChangingGitHub("t"), "acme/app", "abc"))["state"] == "success"  # within the TTL
+    monkeypatch.setattr(pulls, "SETTLED_TTL_SECONDS", 0)
+    assert asyncio.run(pulls._ci(ChangingGitHub("t"), "acme/app", "abc"))["state"] == "failure"
+
+
+def test_github_blocking_wins_over_a_pending_factory_approval():
+    row = {"factory": {"status": "awaiting_approval"}, "ci": {"state": "success"},
+           "detail": {"mergeable_state": "blocked"}}
+    assert pulls.classify(row)[0] == "attention"
+
+
+def test_open_pull_requests_are_paginated_and_truncation_is_said(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    _setup(ws_id, monkeypatch, ChangingGitHub)
+    ChangingGitHub.ci_state, ChangingGitHub.mergeable, ChangingGitHub.open_count = "success", "clean", 150
+    body = client.get(f"/api/workspaces/{ws_id}/pulls").json()
+    assert len(body["items"]) == 150 and body["notes"] == []
+    monkeypatch.setattr(pulls, "MAX_PAGES", 1)
+    body = client.get(f"/api/workspaces/{ws_id}/pulls?refresh=true").json()
+    assert len(body["items"]) == 100 and "acme/app" in body["notes"][0]

@@ -329,6 +329,7 @@ export interface PullsResponse {
   items: PullRow[];
   counts: Partial<Record<PullRow["group"], number>>;
   errors: string[];
+  notes?: string[];
   fetched_at: number;
   repositories?: string[];
 }

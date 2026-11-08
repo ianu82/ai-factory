@@ -76,6 +76,7 @@ export function PullRequestsPage() {
                 : `GitHub didn't answer for everything: ${q.data.errors.slice(0, 3).join(" · ")}`}
           </div>
         )}
+        {!!q.data?.notes?.length && <p className="pr-note">{q.data.notes.join(" ")}</p>}
         {q.isLoading ? <Skeleton rows={5} /> : q.isError ? (
           <Empty title="Couldn't load pull requests">{(q.error as Error).message}</Empty>
         ) : !repos.length ? (

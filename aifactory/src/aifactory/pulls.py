@@ -24,10 +24,12 @@ from .models import Decision, Outcome, Repository, Task, User
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
-TTL_SECONDS = 45
+TTL_SECONDS = 45  # the page's own cache, and how long pending CI is trusted
+SETTLED_TTL_SECONDS = 300  # finished CI and known mergeability can change too (reruns, a moving base branch)
+MAX_PAGES = 10  # GitHub pages of 100 per repository and state
 HUMAN_TASK = {"needs_input", "failed", "blocked", "smoke_failed"}
 _cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
-_details: dict[tuple[str, int, str], dict[str, Any]] = {}
+_details: dict[tuple[str, int, str, str], tuple[float, dict[str, Any]]] = {}
 _checks: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 
@@ -47,10 +49,11 @@ def _factory_links(workspace_id: str) -> dict[tuple[str, int], dict[str, Any]]:
         return links
 
 
-async def _detail(gh: GitHub, repo: str, pr: dict[str, Any]) -> dict[str, Any]:
-    key = (repo, pr["number"], pr.get("updated_at") or "")
-    if key in _details:
-        return _details[key]
+async def _detail(gh: GitHub, repo: str, pr: dict[str, Any], refresh: bool = False) -> dict[str, Any]:
+    key = (repo, pr["number"], pr.get("updated_at") or "", (pr.get("base") or {}).get("sha") or "")
+    cached = _details.get(key)
+    if cached and not refresh and time.monotonic() - cached[0] < SETTLED_TTL_SECONDS:
+        return cached[1]
     full = await gh.request("GET", f"/repos/{repo}/pulls/{pr['number']}")
     detail = {"additions": full.get("additions", 0), "deletions": full.get("deletions", 0),
               "changed_files": full.get("changed_files", 0), "mergeable_state": full.get("mergeable_state") or "unknown",
@@ -67,14 +70,16 @@ async def _detail(gh: GitHub, repo: str, pr: dict[str, Any]) -> dict[str, Any]:
         except GitHubError:
             pass
     if detail["mergeable_state"] != "unknown":  # GitHub computes mergeability lazily; don't cache "unknown"
-        _details[key] = detail
+        _details[key] = (time.monotonic(), detail)
     return detail
 
 
-async def _ci(gh: GitHub, repo: str, sha: str) -> dict[str, Any]:
+async def _ci(gh: GitHub, repo: str, sha: str, refresh: bool = False) -> dict[str, Any]:
     cached = _checks.get((repo, sha))
-    if cached and (cached[1]["state"] in ("success", "failure") or time.monotonic() - cached[0] < TTL_SECONDS):
-        return cached[1]
+    if cached and not refresh:
+        settled = cached[1]["state"] in ("success", "failure")
+        if time.monotonic() - cached[0] < (SETTLED_TTL_SECONDS if settled else TTL_SECONDS):
+            return cached[1]
     summary = await gh.checks(repo, sha)
     failing = [c["name"] for c in summary.checks if c.get("conclusion") in ("failure", "error", "timed_out", "cancelled")]
     pending = [c["name"] for c in summary.checks if c.get("status") != "completed"]
@@ -100,10 +105,10 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
     if ci.get("state") == "pending":
         waiting = len(ci.get("pending") or []) or ci.get("total") or 0
         return "checks", f"Waiting on {waiting} check{'s' if waiting != 1 else ''}"
-    if factory.get("status") == "awaiting_approval":
-        return "ready", "Checks passed; merge needs approval in AI Factory"
     if detail.get("mergeable_state") == "blocked":
         return "attention", "GitHub is blocking the merge (branch protection or required review)"
+    if factory.get("status") == "awaiting_approval":
+        return "ready", "Checks passed; merge needs approval in AI Factory"
     if factory.get("status") in ("running", "queued") and factory.get("stage") in ("ci", "merge", "publish"):
         return "checks", "The Factory is merging this" if factory.get("stage") == "merge" else "The Factory is watching CI"
     return "ready", "Checks passed" if ci.get("state") == "success" else "No checks reported"
@@ -135,9 +140,9 @@ async def workspace_pulls(workspace_id: str, state: str = "open", refresh: bool 
                    "merged_at": pr.get("merged_at"), "base": (pr.get("base") or {}).get("ref", ""),
                    "factory": links.get((repo, pr["number"]))}
             try:
-                row["detail"] = await _detail(gh, repo, pr)
+                row["detail"] = await _detail(gh, repo, pr, refresh)
                 if pr.get("state") == "open":
-                    row["ci"] = await _ci(gh, repo, (pr.get("head") or {}).get("sha", ""))
+                    row["ci"] = await _ci(gh, repo, (pr.get("head") or {}).get("sha", ""), refresh)
             except GitHubError as exc:
                 row["detail"], row["ci"] = row.get("detail") or {}, {"state": "unknown"}
                 errors.append(f"{repo}#{pr['number']}: {str(exc)[:120]}")
@@ -147,16 +152,28 @@ async def workspace_pulls(workspace_id: str, state: str = "open", refresh: bool 
                 row["group"], row["reason"] = classify(row)
             rows.append(row)
 
+    async def listing(repo: str, which: str, pages: int) -> list[dict[str, Any]]:
+        """Follow GitHub's pagination (100 per page) up to ``pages`` pages; note when a repository has more."""
+        out: list[dict[str, Any]] = []
+        for page in range(1, pages + 1):
+            batch = await gh.request("GET", f"/repos/{repo}/pulls", params={
+                "state": which, "per_page": 100, "page": page, "sort": "updated", "direction": "desc"})
+            out.extend(batch)
+            if len(batch) < 100:
+                return out
+        if which == "open":
+            truncated.append(repo)
+        return out
+
     jobs = []
+    truncated: list[str] = []
     for repo in repos:
         try:
             if state in ("open", "ready", "all"):
-                for pr in await gh.request("GET", f"/repos/{repo}/pulls",
-                                           params={"state": "open", "per_page": 50, "sort": "updated", "direction": "desc"}):
+                for pr in await listing(repo, "open", MAX_PAGES):
                     jobs.append(build(repo, pr))
             if state in ("merged", "all"):
-                for pr in await gh.request("GET", f"/repos/{repo}/pulls",
-                                           params={"state": "closed", "per_page": 30, "sort": "updated", "direction": "desc"}):
+                for pr in await listing(repo, "closed", 1):  # the most recently updated hundred is enough history
                     if pr.get("merged_at"):
                         jobs.append(build(repo, pr))
         except GitHubError as exc:
@@ -169,7 +186,9 @@ async def workspace_pulls(workspace_id: str, state: str = "open", refresh: bool 
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["group"]] = counts.get(r["group"], 0) + 1
-    result = {"items": rows, "counts": counts, "errors": errors, "fetched_at": time.time(),
+    notes = [f"Showing the {MAX_PAGES * 100} most recently updated open pull requests in {', '.join(truncated)}; "
+             "older ones are not listed."] if truncated else []
+    result = {"items": rows, "counts": counts, "errors": errors, "notes": notes, "fetched_at": time.time(),
               "repositories": repos}
     _cache[key] = (time.monotonic(), result)
     return result
