@@ -113,10 +113,22 @@ class FakeGitHub:
         FakeGitHub.comments.append((number, body))
         return None
 
+    issues_state: dict[int, str] = {}
+
     async def request(self, method, path, *, json=None, params=None, **kwargs):
-        if method == "PATCH" and "/pulls/" in path and (json or {}).get("state") == "closed":
-            self.pulls[int(path.rsplit("/", 1)[1])]["state"] = "closed"
+        number = int(path.rsplit("/", 1)[1]) if path.rsplit("/", 1)[1].isdigit() else None
+        if method == "PATCH" and "/pulls/" in path:
+            if "state" in (json or {}):
+                self.pulls[number]["state"] = json["state"]
+            if "body" in (json or {}):
+                self.pulls[number]["body"] = json["body"]
             return {}
+        if "/issues/" in path and number is not None:
+            if method == "GET":
+                return {"number": number, "state": FakeGitHub.issues_state.get(number, "open")}
+            if method == "PATCH":
+                FakeGitHub.issues_state[number] = json.get("state", "open")
+                return {}
         raise AssertionError(f"unexpected request {method} {path}")
 
     async def checks(self, full_name, sha):
@@ -127,6 +139,10 @@ class FakeGitHub:
         return "Error: test failed in CI"
 
     async def merge(self, full_name, number, *, sha, method, title):
+        import re as _re
+
+        for n in _re.findall(r"Closes #(\d+)", self.pulls[number].get("body") or ""):  # GitHub's closing keywords
+            FakeGitHub.issues_state[int(n)] = "closed"
         pr = self.pulls[number]
         bare = self._bare(full_name)
         with tempfile.TemporaryDirectory() as tmp:

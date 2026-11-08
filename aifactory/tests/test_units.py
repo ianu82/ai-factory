@@ -146,3 +146,33 @@ def test_unpriced_runs_are_priced_later_from_provider_usage(monkeypatch):
         late, never = s.get(Run, "run-late"), s.get(Run, "run-never")
         assert late.cost_known and late.cost_usd == 0.0731
         assert not never.cost_known
+
+
+def test_mirror_fetches_and_job_clones_never_overlap(tmp_path, monkeypatch):
+    import asyncio
+
+    from aifactory import gitops
+
+    active, overlaps = set(), []
+
+    async def fake_git(*args, **kwargs):
+        op = "fetch" if "fetch" in args else "clone" if "clone" in args else None
+        if op:
+            if active:
+                overlaps.append((op, set(active)))
+            active.add(op + str(id(args)))
+            await asyncio.sleep(0.05)
+            active.discard(op + str(id(args)))
+        return ""
+
+    monkeypatch.setattr(gitops, "git", fake_git)
+    monkeypatch.setattr(gitops, "_mirror_path", lambda name: tmp_path / "m.git")
+    (tmp_path / "m.git").mkdir()
+    (tmp_path / "m.git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    async def go():
+        await asyncio.gather(gitops.mirror("acme/app", "t"), gitops.clone_mirror(tmp_path / "m.git", tmp_path / "a", {}),
+                             gitops.mirror("acme/app", "t"), gitops.clone_mirror(tmp_path / "m.git", tmp_path / "b", {}))
+
+    asyncio.run(go())
+    assert overlaps == []

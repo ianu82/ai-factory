@@ -66,14 +66,18 @@ def _mirror_path(full_name: str) -> Path:
 _mirror_locks: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
 
 
+def _mirror_lock(path: Path) -> asyncio.Lock:
+    """One lock per mirror: fetches into it and job clones out of it never overlap."""
+    loop = asyncio.get_running_loop()
+    entry = _mirror_locks.get(str(path))
+    if entry is None or entry[0] is not loop:  # a lock belongs to one event loop
+        entry = _mirror_locks[str(path)] = (loop, asyncio.Lock())
+    return entry[1]
+
+
 async def mirror(full_name: str, token: str) -> Path:
     path = _mirror_path(full_name)
-    loop = asyncio.get_running_loop()
-    entry = _mirror_locks.get(full_name)
-    if entry is None or entry[0] is not loop:  # a lock belongs to one event loop
-        entry = _mirror_locks[full_name] = (loop, asyncio.Lock())
-    lock = entry[1]
-    async with lock:
+    async with _mirror_lock(path):
         url = remote_url(full_name)
         env = git_auth_env(token)
         if not (path / "HEAD").exists():
@@ -91,10 +95,11 @@ async def mirror(full_name: str, token: str) -> Path:
 
 
 async def clone_mirror(mirror_path: Path, dest: Path, env: dict[str, str]) -> None:
-    """Copy the mirror into a job directory, retrying once if a concurrent fetch was mid-write."""
+    """Copy the mirror into a job directory while no fetch is writing to it (retry once as a last resort)."""
     for tries in range(2):
         try:
-            await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(dest), env=env, timeout=900)
+            async with _mirror_lock(mirror_path):
+                await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(dest), env=env, timeout=900)
             return
         except GitError:
             if tries:
