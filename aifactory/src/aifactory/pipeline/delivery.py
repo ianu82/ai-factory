@@ -284,7 +284,7 @@ class TaskRunner:
             app: AppRun | None = None
             try:
                 sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
-                await self._run_commands(sandbox, self.cfg.get("setup") or [], "verify_setup", timeout=1200)
+                await self._prepare(sandbox)
                 brief = ""
                 if qa_cfg.get("start"):
                     app = await self._start_app(sandbox, qa_cfg)
@@ -358,18 +358,44 @@ class TaskRunner:
             self.event("qa_vm_unavailable", f"VM isolation requested but unavailable ({why}); verifying in a local sandbox",
                        level="warn")
             return local
+        from ..vm import environment_key
+
+        key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
+            if qa_cfg.get("prepared", True) and self.cfg.get("setup") else None
         try:
             self.event("qa_vm_starting", "Starting an isolated VM for verification and runtime QA")
-            vm = await RailwayVMSandbox.from_local(local, cpu=float(qa_cfg.get("cpu", 4)),
+            vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(qa_cfg.get("cpu", 4)),
                                                    memory_gb=float(qa_cfg.get("memory_gb", 8)))
         except Exception as exc:
             self.event("qa_vm_unavailable", f"Could not start a QA VM ({str(exc)[:300]}); verifying in a local sandbox",
                        level="warn")
             return local
         await local.close()
-        self.event("qa_vm_ready", f"Verification VM {vm.vm_id} ready" + (f" in {vm.region}" if vm.region else ""),
-                   level="success", vm=vm.vm_id)
+        vm.environment_key = key
+        self.event("qa_vm_ready", f"Verification VM {vm.vm_id} ready" + (f" in {vm.region}" if vm.region else "")
+                   + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
+                   prepared=vm.prepared)
         return vm
+
+    async def _prepare(self, sandbox) -> None:
+        """Install dependencies, unless the VM booted from a prepared environment for these exact lockfiles.
+        After a clean install in a VM, save it so the next verification starts ready."""
+        setup = self.cfg.get("setup") or []
+        if getattr(sandbox, "prepared", None):
+            self.event("verify_setup_skipped", "Dependencies unchanged since the prepared environment was saved; "
+                       "setup skipped", level="success", environment=sandbox.prepared)
+            return
+        results = await self._run_commands(sandbox, setup, "verify_setup", timeout=1200)
+        key = getattr(sandbox, "environment_key", None)
+        if key and results and all(r["ok"] for r in results):
+            started = time.monotonic()
+            try:
+                await sandbox.checkpoint(key)
+                self.event("environment_prepared", f"Saved a prepared environment for these dependencies "
+                           f"({time.monotonic() - started:.0f}s)", environment=key)
+            except Exception as exc:  # an optimisation only
+                self.event("environment_prepare_failed", f"Could not save a prepared environment: {str(exc)[:200]}",
+                           level="warn")
 
     async def _start_app(self, sandbox, qa_cfg: dict[str, Any]) -> AppRun:
         """Boot the candidate in the verifier's sandbox, then let the Factory capture its own evidence first."""

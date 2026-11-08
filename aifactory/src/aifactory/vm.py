@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
 import os
 import posixpath
+import shlex
 import shutil
 import tarfile
 import time
@@ -48,6 +50,25 @@ def sidecar_path() -> Path | None:
         if path.is_file() and (path.parent / "node_modules" / "railway").is_dir():
             return path
     return None
+
+
+DEPENDENCY_DIRS = ("node_modules", ".venv")
+LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "uv.lock",
+             "poetry.lock", "Pipfile.lock", "requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.py",
+             "setup.cfg", "Gemfile.lock", "go.sum", "Cargo.lock", ".nvmrc", ".python-version")
+
+
+def environment_key(work: Path, repo: str, setup: list[str]) -> str:
+    """Name of the prepared environment for this repository's dependencies: same lockfiles + setup → same VM."""
+    digest = hashlib.sha256()
+    digest.update(json.dumps({"repo": repo, "setup": setup, "template": QA_TEMPLATE}, sort_keys=True).encode())
+    for root, dirs, files in os.walk(work):
+        rel_root = Path(root).relative_to(work)
+        dirs[:] = sorted(d for d in dirs if d not in DEPENDENCY_DIRS and d != ".git" and len(rel_root.parts) < 4)
+        for name in sorted(files):
+            if name in LOCKFILES:
+                digest.update(str(rel_root / name).encode() + b"\0" + (Path(root) / name).read_bytes() + b"\0")
+    return "aif-env-" + digest.hexdigest()[:24]
 
 
 def vm_available() -> tuple[bool, str]:
@@ -163,29 +184,63 @@ class RailwayVMSandbox:
         self.work = PurePosixPath("/work")
         self.home = PurePosixPath("/root")
         self.uid = None
+        self.prepared: str | None = None  # checkpoint this VM booted from, when it did
+        self.environment_key: str | None = None  # checkpoint to save after a clean setup
         self._closed = False
         self._procs: list[str] = []
 
     @classmethod
     async def create(cls, *, cpu: float = 4, memory_gb: float = 8, template: dict[str, Any] | None = None,
-                     timeout: float = 900) -> "RailwayVMSandbox":
+                     checkpoint: str | None = None, timeout: float = 900) -> "RailwayVMSandbox":
         bridge = VMBridge.get()
-        info = await bridge.call("create", {"resources": {"cpu": cpu, "memoryGB": memory_gb},
-                                            "template": template or QA_TEMPLATE}, timeout=timeout)
+        args: dict[str, Any] = {"resources": {"cpu": cpu, "memoryGB": memory_gb}}
+        if checkpoint:
+            args["checkpoint"] = checkpoint
+        else:
+            args["template"] = template or QA_TEMPLATE
+        info = await bridge.call("create", args, timeout=timeout)
         return cls(info["id"], bridge, info.get("region"))
 
+    async def checkpoint(self, name: str, timeout: float = 600) -> None:
+        """Save this VM's filesystem as a named checkpoint (replacing one with the same name)."""
+        await self.bridge.call("checkpoint", {"id": self.vm_id, "name": name}, timeout=timeout)
+
     @classmethod
-    async def from_local(cls, local: LocalSandbox, **kwargs: Any) -> "RailwayVMSandbox":
-        """Create a VM and upload a prepared local checkout (including .git) to /work."""
+    async def from_local(cls, local: LocalSandbox, *, prepared: str | None = None,
+                         keep: tuple[str, ...] = DEPENDENCY_DIRS, **kwargs: Any) -> "RailwayVMSandbox":
+        """Create a VM and upload a prepared local checkout (including .git) to /work.
+
+        With ``prepared`` (a checkpoint name), boot from that checkpoint when it exists: its dependency
+        directories are kept, everything else in /work is replaced by this checkout, and ``vm.prepared``
+        is set so callers can skip setup.
+        """
         started = time.monotonic()
-        vm = await cls.create(**kwargs)
+        vm = None
+        if prepared:
+            try:
+                vm = await cls.create(checkpoint=prepared, **kwargs)
+                prune = " -o ".join(f"-name {shlex.quote(name)}" for name in keep)
+                result = await vm.exec(
+                    f"mkdir -p /work && cd /work && find . -mindepth 1 \\( {prune} \\) -prune -o \\( -type f -o -type l \\)"
+                    " -print0 | xargs -0 -r rm -f", timeout=300, cwd="/")
+                if not result.ok:
+                    raise SandboxError(f"Could not reset the prepared checkout: {result.output[-300:]}")
+                vm.prepared = prepared
+            except Exception as exc:  # no checkpoint yet (or it expired): build from the template
+                log.info("prepared environment %s unavailable: %s", prepared, str(exc)[:200])
+                if vm is not None:
+                    await vm.close()
+                vm = None
+        if vm is None:
+            vm = await cls.create(**kwargs)
         try:
             buffer = io.BytesIO()
             with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+                skip = set(keep)
                 for entry in sorted(local.work.iterdir()):
-                    if entry.name in ("node_modules", ".venv"):
+                    if entry.name in skip:
                         continue
-                    tar.add(entry, arcname=entry.name)
+                    tar.add(entry, arcname=entry.name, filter=lambda info: None if PurePosixPath(info.name).name in skip else info)
             data = buffer.getvalue()
             if len(data) > 200_000_000:
                 raise SandboxError("Checkout is too large to upload to a VM")

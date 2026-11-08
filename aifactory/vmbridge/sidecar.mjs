@@ -42,9 +42,19 @@ const ops = {
   async create(a) {
     const options = {...client, resources: a.resources, idleTimeoutMinutes: a.idleTimeoutMinutes ?? 20,
       networkIsolation: a.networkIsolation || 'ISOLATED', env: {}, domains: []};
-    const sandbox = a.template ? await Sandbox.create(template(a.template), options) : await Sandbox.create(options);
+    const sandbox = a.checkpoint ? await Sandbox.create(a.checkpoint, options)
+      : a.template ? await Sandbox.create(template(a.template), options) : await Sandbox.create(options);
     boxes.set(sandbox.id, sandbox);
     return {id: sandbox.id, region: sandbox.region ?? null};
+  },
+  async checkpoint(a) {
+    const sandbox = await box(a.id);
+    const info = await sandbox.checkpoint(a.name);
+    return {name: info?.name ?? a.name};
+  },
+  async checkpoints() {
+    const items = await Sandbox.checkpoints(client);
+    return {names: items.map((c) => c.name)};
   },
   async exec(a) {
     const sandbox = await box(a.id);

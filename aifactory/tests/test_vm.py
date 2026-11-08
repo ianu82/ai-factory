@@ -33,9 +33,24 @@ class FakeBridge:
         args = args or {}
         self.calls.append(op)
         if op == "create":
+            import shutil
+
+            if args.get("checkpoint"):
+                saved = self.root.parent / "checkpoints" / args["checkpoint"]
+                if not saved.exists():
+                    raise RuntimeError("checkpoint not found")
+                shutil.rmtree(self.root / "work", ignore_errors=True)
+                shutil.copytree(saved, self.root / "work", symlinks=True)
             (self.root / "work").mkdir(parents=True, exist_ok=True)
             (self.root / "tmp").mkdir(exist_ok=True)
             return {"id": "sbx_test", "region": "test"}
+        if op == "checkpoint":
+            import shutil
+
+            target = self.root.parent / "checkpoints" / args["name"]
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(self.root / "work", target, symlinks=True)
+            return {"name": args["name"]}
         if op == "write":
             path = self.root.joinpath(self._map(args["path"]).lstrip("/")) if not self._map(args["path"]).startswith(str(self.root)) else None
             target = path or __import__("pathlib").Path(self._map(args["path"]))
@@ -132,5 +147,42 @@ def test_runtime_qa_runs_inside_the_vm_sandbox(tmp_path, monkeypatch):
         assert pages[0].get("status") == 200 and pages[0].get("title") == "VM app", pages
         assert probes[0]["ok"] and images and images[0][1].startswith("iVBOR")
         assert run.evidence["isolation"].startswith("railway-vm sbx_test")
+
+    asyncio.run(go())
+
+
+def test_prepared_environment_keeps_dependencies_and_replaces_the_checkout(tmp_path, monkeypatch):
+    from aifactory.vm import environment_key
+
+    bridge = FakeBridge(tmp_path / "vm")
+    monkeypatch.setattr("aifactory.vm.VMBridge.get", classmethod(lambda cls: bridge))
+
+    def checkout(name, files):
+        local = LocalSandbox(name, root=tmp_path / "local").create()
+        local.work.mkdir()
+        for rel, text in files.items():
+            (local.work / rel).parent.mkdir(parents=True, exist_ok=True)
+            (local.work / rel).write_text(text)
+        return local
+
+    async def go():
+        first = checkout("a", {"package-lock.json": "{lock-1}", "old.txt": "old", "src/app.js": "v1"})
+        key = environment_key(first.work, "acme/app", ["npm ci"])
+        vm = await RailwayVMSandbox.from_local(first, prepared=key)
+        assert vm.prepared is None  # nothing saved yet: built from the template
+        await vm.exec("mkdir -p node_modules/dep && echo installed > node_modules/dep/index.js")
+        await vm.checkpoint(key)
+        await vm.close()
+
+        second = checkout("b", {"package-lock.json": "{lock-1}", "src/app.js": "v2", "new.txt": "new"})
+        assert environment_key(second.work, "acme/app", ["npm ci"]) == key
+        third = checkout("c", {"package-lock.json": "{lock-2}"})
+        assert environment_key(third.work, "acme/app", ["npm ci"]) != key  # lockfile changed
+
+        vm = await RailwayVMSandbox.from_local(second, prepared=key)
+        assert vm.prepared == key
+        assert (await vm.exec("cat node_modules/dep/index.js; cat src/app.js; echo; cat new.txt")).output.split() == ["installed", "v2", "new"]
+        assert not (await vm.exec("test -e old.txt")).ok  # files from the earlier checkout are gone
+        await vm.close()
 
     asyncio.run(go())
