@@ -53,7 +53,9 @@ export function RunsPage() {
                   <td className="mono hide-sm">{r.model}</td>
                   <td className="r num">{r.turns}</td>
                   <td className="r num">{tokens(r.input_tokens + r.output_tokens)}</td>
-                  <td className="r num">{money(r.cost_usd, r.cost_known)}</td>
+                  <td className="r num">{r.status === "running" && !r.cost_usd
+                    ? <span className="muted" title="Cost is recorded when the session ends">—</span>
+                    : money(r.cost_usd, r.cost_known)}</td>
                   <td className="r num hide-sm">{duration(r.started_at, r.finished_at)}</td>
                   <td className="r num muted">{ago(r.started_at)}</td>
                 </tr>

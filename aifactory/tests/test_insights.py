@@ -95,10 +95,37 @@ def test_recurring_review_findings_become_an_editable_team_note(client, signed_i
         assert s.get(Repository, repo_id).config["context"] == "Use pnpm.\n\n" + edited
 
 
+def test_check_failures_count_only_checks_the_repository_still_runs(client, signed_in):
+    ws_id = signed_in["workspaces"][0]["id"]
+    repo_id, outcome_id, rest = _world(ws_id, merge_mode="auto")
+    plan_id, _ = rest.split(":")
+    old, current = "pytest -q", "pytest -q --deselect tests/test_vm.py::test_env"
+    with session_scope() as s:
+        s.get(Repository, repo_id).config = {"checks": [old]}
+        for i in range(3):
+            t = _task(s, ws_id, repo_id, outcome_id, plan_id, f"T{i}", status="completed")
+            s.add(Event(workspace_id=ws_id, outcome_id=outcome_id, task_id=t.id, kind="check_result", level="warn",
+                        message=f"✗ {old}", data={"command": old}))
+
+    def proposals():
+        client.post(f"/api/workspaces/{ws_id}/signals/analyze")
+        return [x for x in client.get(f"/api/workspaces/{ws_id}/signals").json()
+                if x["source"] == "improvement" and x["data"]["rule"] == "check_failures" and x["status"] == "new"]
+
+    assert len(proposals()) == 1
+    with session_scope() as s:  # the check was replaced: the old failures no longer justify a note
+        s.get(Repository, repo_id).config = {"checks": [current]}
+    assert proposals() == []
+
+
 def test_ignored_proposal_stays_quiet_until_the_evidence_grows(client, signed_in):
     ws_id = signed_in["workspaces"][0]["id"]
     repo_id, outcome_id, rest = _world(ws_id, merge_mode="auto")
     plan_id, _ = rest.split(":")
+
+    with session_scope() as s:
+        repo = s.get(Repository, repo_id)
+        repo.config = {**repo.config, "checks": ["npm run lint"]}
 
     def fail_check(n):
         with session_scope() as s:
