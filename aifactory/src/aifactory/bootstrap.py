@@ -81,6 +81,7 @@ def apply_bootstrap() -> str | None:
     task = loop.create_task(_connect(workspace_id, pending)) if pending else None
     declared = cfg.get("outcomes") or []
     _cancel_declared(workspace_id, cfg.get("cancel") or [])
+    _retry_declared(workspace_id, cfg.get("retry") or [])
     if declared:
         loop.create_task(_declare_outcomes(workspace_id, declared, task))
     log.info("Bootstrap workspace ready: %s", workspace_id)
@@ -105,6 +106,30 @@ def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
                 t.status = "cancelled"
             record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number} (declared key {key})",
                    outcome_id=outcome.id, actor="operator", level="warn", session=s)
+
+
+def _retry_declared(workspace_id: str, items: list[dict]) -> None:
+    """One-shot operator retry of a blocked declared outcome; each nonce applies once."""
+    from .db import utcnow
+    from .events import record
+    from .models import Decision, Event, Outcome
+
+    with session_scope() as s:
+        for item in items:
+            key, nonce = str(item.get("key", "")), str(item.get("nonce", ""))
+            outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                              Outcome.signal_id == f"operator:{key}").first()
+            if outcome is None or outcome.status != "blocked":
+                continue
+            done = any((e.data or {}).get("nonce") == nonce for e in s.query(Event).filter(
+                Event.outcome_id == outcome.id, Event.kind == "operator_retry"))
+            if done:
+                continue
+            outcome.status, outcome.blocked_reason = "planning", ""
+            for d in s.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open"):
+                d.status, d.resolution, d.comment, d.resolved_at = "resolved", "retry", "Operator retried", utcnow()
+            record(workspace_id, "operator_retry", f"Operator retried planning for #{outcome.number}",
+                   outcome_id=outcome.id, actor="operator", session=s, data={"key": key, "nonce": nonce})
 
 
 async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) -> None:
