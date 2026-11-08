@@ -450,3 +450,43 @@ def test_smoke_failure_is_reverted_under_recovery_policy(factory):
     assert FakeGitHub.merged == [1, 2]
     main_greet = git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
     assert main_greet.strip() == "echo 'Hello'"
+
+
+def test_take_over_pushes_the_latest_candidate_as_a_draft_pr_and_stops_the_factory(factory, monkeypatch):
+    from aifactory.models import Artifact, Plan
+    from aifactory.pipeline import handover
+
+    monkeypatch.setattr(handover, "GitHub", FakeGitHub)
+    monkeypatch.setattr(handover, "resolve_token", lambda ws: "token")
+    base = git("rev-parse", "refs/heads/main", cwd=factory["remotes"] / "acme/demo.git")
+    diff = ("diff --git a/greet.sh b/greet.sh\n--- a/greet.sh\n+++ b/greet.sh\n@@ -1 +1 @@\n"
+            "-echo 'Hello'\n+echo 'Hello, Factory!'\n")
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="Greeting",
+                    repo_id=factory["repo"], status="failed", base_sha=base, attempt=3)
+        s.add(task)
+        s.flush()
+        s.add(Artifact(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="diff",
+                       name="Attempt 3 diff", content=diff, data={"files": ["greet.sh"]}))
+        s.add(Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="unblock",
+                       title="T1 did not pass after 3 attempts"))
+        task_id = task.id
+        user = s.get(User, factory["user"])
+
+    info = handover.mark_handed_over(task_id, user)
+    result = asyncio.run(handover.publish_candidate(task_id, info))
+    assert result["published"] and result["pr_url"]
+    pr = next(iter(FakeGitHub.pulls.values()))
+    assert pr["title"].startswith("[handed over]") and "not** passed independent verification" in pr["body"]
+    content = git("show", f"{result['branch']}:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+    assert content.strip() == "echo 'Hello, Factory!'"
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "handed_over" and task.pr_url == result["pr_url"] and "Dev" in task.blocked_reason
+        assert s.query(Decision).filter(Decision.task_id == task_id).one().status == "superseded"
+    with pytest.raises(handover.HandoverError):
+        handover.mark_handed_over(task_id, user)

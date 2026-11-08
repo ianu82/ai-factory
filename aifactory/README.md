@@ -16,12 +16,15 @@ Outcome ──► Plan ──► Tasks (parallel, dependency-ordered)
                        │
                        ├─ Build      fresh sandbox, setup, builder session (Native | Codex | Anton)
                        ├─ Checks     repository checks run by the Factory, failures → next attempt
-                       ├─ Verify     a *fresh* session of the verifier harness checks every criterion
+                       ├─ Verify     a *fresh* session of the verifier harness checks every criterion;
+                       │             runtime QA boots the app (in its own Railway VM when configured),
+                       │             screenshots pages and probes endpoints as evidence
                        ├─ PR         patch applied to a pristine clone, pushed, PR opened with evidence
                        ├─ CI         waits for GitHub checks; failures + logs → next attempt
                        ├─ Merge      policy (auto/approval); same-repo merges serialized and revalidated
                        ├─ Smoke      fresh checkout of the merge commit runs smoke commands
-                       └─ Release    optional deploy-on-merge health check
+                       ├─ Release    optional deploy-on-merge health check
+                       └─ Recover    smoke failure → revert PR (policy `recovery.smoke_failure: revert`)
 ```
 
 Every stage is durable (`task.stage`), so approvals and restarts resume without repeating
@@ -39,7 +42,13 @@ logs) into the next attempt instead of starting over blind. Completion is honest
   recorded and delivered to the active agent).
 - **Runs** — every agent session with model, tokens, cost and outcome; throughput stats.
 - **Signals** — GitHub issues labelled `factory` (proposed) or `factory:auto` (pre-authorized),
-  failing CI on the default branch, post-merge smoke and release failures.
+  failing CI on the default branch, post-merge smoke and release failures, and product feedback
+  (sent by your app with the workspace feedback key, or logged by hand).
+  **Proposed improvements** come from the Factory's own history: consistent approvals suggest
+  a lighter policy, recurring reviewer findings and failed checks become editable team notes,
+  runtime QA that cannot boot, budget stops and better-performing workers are flagged — each
+  with its evidence and one change an admin can apply (attributed, and quiet until the evidence
+  changes if set aside).
 - **Decisions** — attributed history; decisions marked "remember" become precedents that later
   planning and building follow.
 - **Settings** — autonomy policies, concurrency (1–50), attempts, budgets, models per role,
@@ -74,8 +83,16 @@ logs) into the next attempt instead of starting over blind. Completion is honest
   control-plane clone (job-written hooks/config never execute there), enforces protected
   paths and size limits, and pushes with environment-scoped auth.
 
-Isolation today is per-UID inside one container. Stronger isolation (gVisor/microVM per
-job, as MindsHub Cowork uses, or Railway sandboxes) is the next step for untrusted tenants.
+- Each job is pinned to a small CPU set (`AIFACTORY_SANDBOX_CPUS`, default 4) so toolchains
+  size their worker pools for the job rather than the host.
+- Verification and runtime QA can run in an isolated Railway sandbox VM (`qa.isolation: "vm"`,
+  needs `RAILWAY_API_TOKEN`): the checkout is uploaded, no Factory credential enters the VM, and
+  the VM is destroyed afterwards. VMs boot from a *prepared environment* (a checkpoint keyed by
+  the repository's lockfiles and setup commands) when one exists, so unchanged dependencies are
+  not reinstalled; a clean setup saves one for next time.
+
+Builders still run per-UID inside the control-plane container. Moving builders into VMs too is
+the next step for untrusted tenants.
 
 ## Running locally
 
@@ -87,7 +104,8 @@ AIFACTORY_ALLOW_DEV_SIGN_IN=1 .venv/bin/python -m aifactory.cli serve --port 800
 ```
 
 Tests: `.venv/bin/python -m pytest` (includes end-to-end pipeline tests against a local git
-remote with a scripted model). UI fixture for rendering checks: `scripts/seed_local_fixture.py`.
+remote with a scripted model). Set `AIFACTORY_TEST_DATABASE_URL=postgresql://…` to run the
+suite against a throwaway Postgres (CI does both). UI fixture for rendering checks: `scripts/seed_local_fixture.py`.
 
 ## Server configuration
 
@@ -96,6 +114,9 @@ remote with a scripted model). UI fixture for rendering checks: `scripts/seed_lo
 | `AIFACTORY_PUBLIC_URL` | Public base URL (links, cookies, OIDC redirect) |
 | `AIFACTORY_SECRET_KEY` | Encryption key for stored credentials |
 | `AIFACTORY_DATA_DIR` | SQLite database, mirrors, job sandboxes (`/data/aifactory` on Railway) |
+| `DATABASE_URL` | Optional Postgres (`postgres://…`; install the `postgres` extra). Defaults to SQLite in the data dir |
+| `RAILWAY_API_TOKEN` | Project token for verification VMs (`qa.isolation: "vm"`) |
+| `AIFACTORY_SANDBOX_CPUS` | CPUs per job (default 4; 0 disables pinning) |
 | `AIFACTORY_ALLOWED_EMAILS` | Comma list of emails or `@domain` allowed to sign in |
 | `AIFACTORY_BOOTSTRAP` | JSON: organization, workspace, invited admins, repositories (+config), settings, declared outcomes |
 | `AIFACTORY_BOOTSTRAP_GITHUB_TOKEN` / `..._OPENAI_API_KEY` / `..._MINDSHUB_API_KEY` | Server fallback credentials until a workspace stores its own |

@@ -1,0 +1,88 @@
+"""Take over: a person stops the Factory on a task and continues from its latest candidate.
+
+The task ends as ``handed_over`` (honestly not delivered by the Factory). If the candidate was
+never published, the latest attempt's diff is pushed to the task branch and a draft pull request
+is opened, so the person starts from the Factory's work instead of from nothing.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from ..db import session_scope, utcnow
+from ..events import notify, record
+from ..github import GitHub, GitHubError, resolve_token
+from ..gitops import Patch, publish
+from ..models import Artifact, Decision, Outcome, Repository, Task, User
+
+log = logging.getLogger(__name__)
+
+NOT_TAKEABLE = {"completed", "abandoned", "cancelled", "reverted", "handed_over"}
+
+
+class HandoverError(RuntimeError):
+    pass
+
+
+def mark_handed_over(task_id: str, user: User) -> dict[str, Any]:
+    """Stop the Factory's work on the task (status, open decisions). Returns what publishing needs."""
+    who = user.name or user.email
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        if task is None:
+            raise HandoverError("Task not found")
+        if task.status in NOT_TAKEABLE:
+            raise HandoverError(f"{task.key} is already {task.status.replace('_', ' ')}")
+        task.status, task.stage = "handed_over", ""
+        task.blocked_reason = f"Handed over to {who}"
+        task.finished_at = utcnow()
+        for d in s.query(Decision).filter(Decision.task_id == task_id, Decision.status == "open"):
+            d.status = "superseded"
+        diff = (s.query(Artifact).filter(Artifact.task_id == task_id, Artifact.kind == "diff")
+                .order_by(Artifact.created_at.desc()).first())
+        outcome = s.get(Outcome, task.outcome_id)
+        repo = s.get(Repository, task.repo_id)
+        record(task.workspace_id, "task_handed_over", f"{who} took over {task.key}; the Factory stopped working on it",
+               outcome_id=task.outcome_id, task_id=task.id, actor=user.id, level="warn", session=s)
+        return {"workspace_id": task.workspace_id, "outcome_id": task.outcome_id, "key": task.key, "title": task.title,
+                "number": outcome.number if outcome else 0, "pr_url": task.pr_url, "branch": task.branch,
+                "base_sha": task.base_sha, "repo": repo.full_name if repo else "",
+                "default_branch": repo.default_branch if repo else "main",
+                "diff": diff.content if diff else "", "files": (diff.data or {}).get("files", []) if diff else [],
+                "who": who}
+
+
+async def publish_candidate(task_id: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Push the latest unpublished candidate and open a draft PR. Best effort; returns what happened."""
+    ws = info["workspace_id"]
+    if info["pr_url"]:
+        return {"pr_url": info["pr_url"], "published": False}
+    if not info["diff"].strip() or not info["base_sha"] or not info["repo"]:
+        record(ws, "handover_no_candidate", f"{info['key']} had no candidate change yet; nothing was pushed",
+               outcome_id=info["outcome_id"], task_id=task_id)
+        return {"published": False}
+    branch = info["branch"] or f"factory/{info['number']}-{info['key'].lower()}-{task_id[:6]}"
+    token = resolve_token(ws)
+    try:
+        head = await publish(info["repo"], token, base_sha=info["base_sha"], branch=branch,
+                             patch=Patch(diff=info["diff"].encode(), files=info["files"], additions=0, deletions=0),
+                             message=f"{info['title']} (Factory candidate, handed over)", task_id=task_id + "-handover")
+        body = (f"Work in progress handed over to {info['who']} from AI Factory outcome #{info['number']} "
+                f"({info['key']}). This is the Factory's latest candidate; it has **not** passed independent "
+                "verification. The Factory will not touch this branch again.\n\n🤖 AI Factory")
+        pr = await GitHub(token).create_pull(info["repo"], head=branch, base=info["default_branch"],
+                                             title=f"[handed over] {info['title']}", body=body, draft=True)
+    except (GitHubError, Exception) as exc:  # noqa: BLE001 - the hand-over itself already happened
+        log.warning("handover publish failed for %s: %s", task_id, exc)
+        record(ws, "handover_publish_failed", f"Could not push the candidate for {info['key']}: {str(exc)[:300]}",
+               outcome_id=info["outcome_id"], task_id=task_id, level="warn")
+        return {"published": False, "error": str(exc)[:300]}
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.branch, task.head_sha = branch, head
+        task.pr_number, task.pr_url = pr.get("number"), pr.get("html_url", "")
+    record(ws, "handover_published", f"Pushed the candidate to {branch} and opened draft PR #{pr.get('number')}",
+           outcome_id=info["outcome_id"], task_id=task_id, data={"pr_url": pr.get("html_url", "")})
+    notify(ws, "task", task_id, outcome_id=info["outcome_id"])
+    return {"published": True, "pr_url": pr.get("html_url", ""), "branch": branch}

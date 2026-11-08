@@ -1,10 +1,10 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, ExternalLink, GitPullRequest } from "lucide-react";
 import { api, type Artifact, type Run, type Task } from "../api";
 import { useWs } from "../App";
 import { duration, HARNESS_LABEL, money, tokens } from "../format";
-import { DiffView, GateTrack, Mark, Prose, Status } from "../ui";
+import { DiffView, GateTrack, Mark, Prose, Status, useToast } from "../ui";
 
 const STAGE_TEXT: Record<string, string> = {
   prepare: "Preparing a fresh checkout", build: "Building", revise: "Revising", checks: "Running checks",
@@ -191,6 +191,49 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
             </div>
           )}
         </div>
+      )}
+      <TakeOver task={task} />
+    </div>
+  );
+}
+
+const FINISHED = new Set(["completed", "abandoned", "cancelled", "reverted", "handed_over"]);
+
+function TakeOver({ task }: { task: Task }) {
+  const { ws } = useWs();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (FINISHED.has(task.status) || ws.role === "viewer") return null;
+  const go = async () => {
+    setBusy(true);
+    try {
+      const r = await api<{ published?: boolean; pr_url?: string; error?: string }>(`/api/workspaces/${ws.id}/tasks/${task.id}/take-over`, { method: "POST" });
+      toast(r.pr_url ? "Handed over. The pull request is yours." : r.error ? `Handed over, but the candidate could not be pushed: ${r.error}` : "Handed over. There was no candidate to push yet.", Boolean(r.error));
+      qc.invalidateQueries({ queryKey: ["outcome", ws.id] });
+      qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(false);
+      setAsking(false);
+    }
+  };
+  return (
+    <div className="takeover">
+      {asking ? (
+        <>
+          <span>The Factory stops working on {task.key} for good. {task.pr_url ? "Its pull request stays open for you." : "Its latest candidate is pushed to a branch with a draft pull request, unverified."}</span>
+          <span className="spacer" />
+          <button className="btn sm ghost" onClick={() => setAsking(false)} disabled={busy}>Keep the Factory on it</button>
+          <button className="btn sm danger" onClick={go} disabled={busy}>{busy ? "Handing over…" : "Take over"}</button>
+        </>
+      ) : (
+        <>
+          <span className="muted">Rather finish this yourself?</span>
+          <button className="btn sm ghost" onClick={() => setAsking(true)}>Take over {task.key}</button>
+        </>
       )}
     </div>
   );

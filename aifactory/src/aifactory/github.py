@@ -136,12 +136,16 @@ class GitHub:
         pulls = await self.request("GET", f"/repos/{full_name}/pulls", params={"head": f"{owner}:{head_branch}", "state": "all"})
         return pulls[0] if pulls else None
 
-    async def create_pull(self, full_name: str, *, head: str, base: str, title: str, body: str) -> dict[str, Any]:
+    async def create_pull(self, full_name: str, *, head: str, base: str, title: str, body: str,
+                          draft: bool = False) -> dict[str, Any]:
         existing = await self.find_pull(full_name, head)
         if existing and existing["state"] == "open":
             await self.request("PATCH", f"/repos/{full_name}/pulls/{existing['number']}", json={"title": title, "body": body})
             return await self.pull(full_name, existing["number"])
-        return await self.request("POST", f"/repos/{full_name}/pulls", json={"head": head, "base": base, "title": title, "body": body})
+        payload = {"head": head, "base": base, "title": title, "body": body}
+        if draft:
+            payload["draft"] = True
+        return await self.request("POST", f"/repos/{full_name}/pulls", json=payload)
 
     async def pull(self, full_name: str, number: int) -> dict[str, Any]:
         return await self.request("GET", f"/repos/{full_name}/pulls/{number}")

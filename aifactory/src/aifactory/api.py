@@ -502,6 +502,27 @@ def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_us
     return {"ok": True}
 
 
+@router.post("/workspaces/{workspace_id}/tasks/{task_id}/take-over")
+async def take_over_task(workspace_id: str, task_id: str, user: User = Depends(current_user),
+                         db: Session = Depends(get_db)):
+    """Stop the Factory on this task and hand its latest candidate to the person asking."""
+    from .pipeline.handover import HandoverError, mark_handed_over, publish_candidate
+
+    _ws(db, user, workspace_id, "member")
+    t = db.get(Task, task_id)
+    if t is None or t.workspace_id != workspace_id:
+        raise HTTPException(404, "Task not found")
+    try:
+        info = mark_handed_over(task_id, user)
+    except HandoverError as exc:
+        raise HTTPException(409, str(exc))
+    orchestrator.cancel_task(task_id)
+    notify(workspace_id, "task", task_id, outcome_id=t.outcome_id)
+    result = await publish_candidate(task_id, info)
+    orchestrator.wake()
+    return result
+
+
 class MessageBody(BaseModel):
     body: str = Field(min_length=1, max_length=8000)
     task_id: str | None = None

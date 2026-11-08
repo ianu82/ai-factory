@@ -85,7 +85,7 @@ class FakeGitHub:
     async def branch_sha(self, full_name: str, branch: str) -> str:
         return git("rev-parse", f"refs/heads/{branch}", cwd=self._bare(full_name))
 
-    async def create_pull(self, full_name, *, head, base, title, body):
+    async def create_pull(self, full_name, *, head, base, title, body, draft=False):
         for pr in self.pulls.values():
             if pr["head"]["ref"] == head and pr["state"] == "open":
                 pr["body"] = body

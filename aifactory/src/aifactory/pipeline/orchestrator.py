@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 ACTIVE_TASK = {"queued", "running"}
 DONE_TASK = {"completed"}
-TERMINAL_TASK = {"completed", "abandoned", "cancelled", "reverted"}
+TERMINAL_TASK = {"completed", "abandoned", "cancelled", "reverted", "handed_over"}
 HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_failed"}
 
 
@@ -234,7 +234,9 @@ class Orchestrator:
         if statuses <= TERMINAL_TASK:
             outcome.status = "partially_completed"
             outcome.completed_at = utcnow()
-            outcome.summary = f"{sum(t.status == 'completed' for t in tasks)} of {len(tasks)} task(s) delivered."
+            handed = sum(t.status == "handed_over" for t in tasks)
+            outcome.summary = (f"{sum(t.status == 'completed' for t in tasks)} of {len(tasks)} task(s) delivered"
+                               + (f"; {handed} handed over to people." if handed else "."))
             notify(outcome.workspace_id, "outcome", outcome.id)
             return
         # A pending task is stalled when something it depends on is waiting on a person or was dropped.
