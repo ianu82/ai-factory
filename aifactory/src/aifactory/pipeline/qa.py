@@ -183,10 +183,14 @@ class AppRun:
         except Exception:
             return ""
 
-    async def probes(self) -> list[dict[str, Any]]:
+    async def probes(self, items: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         results = []
-        for probe in self.cfg.get("probes") or []:
+        for probe in (self.cfg.get("probes") or []) if items is None else items:
             row = {"method": probe.get("method", "GET"), "path": probe["path"]}
+            if probe.get("why"):
+                row["why"] = probe["why"]
+            if probe.get("expect_status"):
+                row["expect_status"] = probe["expect_status"]
             answer = await self.request(row["method"], probe["path"], probe.get("json"), timeout=20.0)
             if "status" in answer:
                 row.update(status=answer["status"], body=answer.get("body", "")[:500])
@@ -229,6 +233,32 @@ def shot_command(sandbox=None) -> str:
     return f"{shlex.quote(sys.executable)} {SCRATCH}/qa/shot.py"
 
 
+def change_checks(report: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """The builder's proposed runtime checks and pages, made safe to run: same-app paths only, a few of each."""
+    checks = []
+    for item in (report or {}).get("runtime_checks") or []:
+        if not isinstance(item, dict):
+            continue
+        method, path = str(item.get("method", "GET")).upper(), str(item.get("path", ""))
+        try:
+            expect = int(item.get("expect_status"))
+        except (TypeError, ValueError):
+            continue
+        if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD") or not path.startswith("/") \
+                or path.startswith("//") or not 100 <= expect <= 599:
+            continue
+        body = item.get("body") or ""
+        try:
+            parsed = json.loads(body) if isinstance(body, str) and body.strip() else (body if isinstance(body, dict) else None)
+        except json.JSONDecodeError:
+            parsed = None
+        checks.append({"method": method, "path": path[:300], "json": parsed, "expect_status": expect,
+                       "why": str(item.get("why", ""))[:300]})
+    pages = [p[:300] for p in (report or {}).get("runtime_pages") or []
+             if isinstance(p, str) and p.startswith("/") and not p.startswith("//")]
+    return checks[:5], pages[:4]
+
+
 def _name(path: str) -> str:
     cleaned = "".join(c if c.isalnum() else "-" for c in path.strip("/")) or "home"
     return cleaned[:60]
@@ -248,4 +278,17 @@ def verifier_brief(run: AppRun) -> str:
             f"`{run.cfg['start']}`, ready after {run.evidence['ready_seconds']}s). Exercise the changed behaviour "
             f"against the running app: use `curl` for HTTP/API calls, and `{shot_command(run.sandbox)} <path> <name>` "
             f"to save a screenshot of a page as evidence. Cite what you observed in your criterion evidence. The app "
-            f"log is at {SCRATCH}/app.log.")
+            f"log is at {SCRATCH}/app.log.") + _change_brief(run)
+
+
+def _change_brief(run: AppRun) -> str:
+    rows = run.evidence.get("change_checks") or []
+    if not rows:
+        return ""
+    lines = ["", "", "The builder proposed these runtime checks for this change; the Factory ran them against the app "
+             "(results are facts, but judge whether they actually prove the criteria):"]
+    for r in rows:
+        got = r.get("status", r.get("error", "no response"))
+        lines.append(f"- {'PASS' if r.get('ok') else 'FAIL'} {r['method']} {r['path']} → {got} "
+                     f"(expected {r.get('expect_status')}) — {r.get('why', '')}")
+    return "\n".join(lines)

@@ -22,7 +22,7 @@ from ..gitops import (DEFAULT_PROTECTED, GitError, Patch, apply_in_sandbox, chec
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
-from .qa import AppRun, verifier_brief
+from .qa import AppRun, change_checks, verifier_brief
 from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, run_agent,
                       workspace_settings)
 
@@ -409,13 +409,20 @@ class TaskRunner:
         self.event("qa_app_starting", f"Starting the app for runtime QA: {qa_cfg['start'][:200]}")
         ready = await app.start()
         if ready:
-            app.evidence["pages"] = await app.screenshots() if qa_cfg.get("pages") else []
+            checks, extra_pages = change_checks(self.builder_report)
+            pages = list(dict.fromkeys(list(qa_cfg.get("pages") or []) + extra_pages))
+            app.evidence["pages"] = await app.screenshots(pages) if pages else []
             app.evidence["probes"] = await app.probes()
+            app.evidence["change_checks"] = await app.probes(checks) if checks else []
             ok_pages = sum(1 for p in app.evidence["pages"] if p.get("status") and p["status"] < 400)
             ok_probes = sum(1 for p in app.evidence["probes"] if p.get("ok"))
+            ok_change = sum(1 for p in app.evidence["change_checks"] if p.get("ok"))
+            all_ok = (ok_pages == len(app.evidence["pages"]) and ok_probes == len(app.evidence["probes"])
+                      and ok_change == len(app.evidence["change_checks"]))
             self.event("qa_app_ready", f"App ready in {app.evidence['ready_seconds']}s · pages {ok_pages}/"
-                       f"{len(app.evidence['pages'])} · probes {ok_probes}/{len(app.evidence['probes'])}",
-                       level="success" if ok_pages == len(app.evidence["pages"]) and ok_probes == len(app.evidence["probes"]) else "warn")
+                       f"{len(app.evidence['pages'])} · probes {ok_probes}/{len(app.evidence['probes'])}"
+                       + (f" · change checks {ok_change}/{len(checks)}" if checks else ""),
+                       level="success" if all_ok else "warn")
         else:
             tail = " ".join((app.evidence.get("log_tail") or "").strip().splitlines()[-4:])[-400:]
             self.event("qa_app_failed", f"The app did not become ready for runtime QA: {tail or 'no output'}",
@@ -436,6 +443,8 @@ class TaskRunner:
             "isolation": app.evidence.get("isolation"),
             "pages": [{k: p.get(k) for k in ("path", "status", "title", "error")} for p in app.evidence.get("pages", [])],
             "probes": [{k: p.get(k) for k in ("method", "path", "status", "ok")} for p in app.evidence.get("probes", [])],
+            "change_checks": [{k: p.get(k) for k in ("method", "path", "status", "ok", "expect_status", "why", "error")}
+                              for p in app.evidence.get("change_checks", [])],
             "screenshots": len(images), "verifier_screenshots": sum(1 for n, _ in images if n not in rows)}
 
     def _runtime_problem(self, app: AppRun | None, qa_cfg: dict[str, Any]) -> str:
@@ -487,7 +496,9 @@ class TaskRunner:
         if self.app_summary:
             a = self.app_summary
             where = a.get("isolation") or "a fresh sandbox"
-            where = f"an isolated VM ({where.removeprefix('railway-vm ')})" if where.startswith("railway-vm") else where
+            if where.startswith("railway-vm"):
+                vm_id, _, region = where.removeprefix("railway-vm ").partition(" ")
+                where = f"an isolated Railway VM `{vm_id[:8]}`" + (f" in {region.strip('()')}" if region else "")
             lines += ["", f"### Runtime QA (app booted in {where})"]
             if a.get("started"):
                 lines.append(f"- App started and became ready in {a.get('ready_seconds')}s")
@@ -496,6 +507,11 @@ class TaskRunner:
                           for p in a.get("pages", [])]
                 lines += [f"- {'✅' if p.get('ok') else '❌'} `{p.get('method')} {p.get('path')}` → {p.get('status')}"
                           for p in a.get("probes", [])]
+                if a.get("change_checks"):
+                    lines.append("- Checks for this change (proposed by the builder, run by the Factory):")
+                    lines += [f"  - {'✅' if p.get('ok') else '❌'} `{p.get('method')} {p.get('path')}` → "
+                              f"{p.get('status') or p.get('error')} (expected {p.get('expect_status')})"
+                              + (f" — {p['why']}" if p.get("why") else "") for p in a["change_checks"]]
                 lines.append(f"- {a.get('screenshots', 0)} screenshot(s) attached in AI Factory "
                              f"({a.get('verifier_screenshots', 0)} taken by the verifier)")
             else:

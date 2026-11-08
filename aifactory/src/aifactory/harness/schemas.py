@@ -51,6 +51,20 @@ BUILDER_REPORT: dict[str, Any] = {
                       "required": ["criterion", "how"]},
         },
         "blocked_reason": {"type": "string"},
+        "runtime_checks": {
+            "type": "array",
+            "description": "When the app is booted for runtime QA: up to 5 HTTP requests against the running app "
+                           "that demonstrate this change works, with the status each should return.",
+            "items": {"type": "object", "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]},
+                "path": {"type": "string", "description": "Path on the app, starting with /"},
+                "body": {"type": "string", "description": "JSON request body as text, or empty"},
+                "expect_status": {"type": "integer"},
+                "why": {"type": "string", "description": "What this request proves about the change"}},
+                "required": ["method", "path", "expect_status", "why"]},
+        },
+        "runtime_pages": {"type": "array", "items": {"type": "string"},
+                          "description": "Up to 4 page paths worth a screenshot because this change affects them."},
     },
     "required": ["status", "summary"],
 }

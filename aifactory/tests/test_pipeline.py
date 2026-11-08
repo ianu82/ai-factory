@@ -374,6 +374,21 @@ def test_runtime_qa_boots_the_app_and_attaches_screenshots(factory):
                      " && exec python3 -m http.server $PORT --bind 127.0.0.1",
             "ready_path": "/", "ready_timeout": 30, "pages": ["/"], "required": True,
             "probes": [{"method": "GET", "path": "/", "expect_status": 200}]}}
+
+    def builder_with_checks(messages):
+        reply = good_builder(messages)
+        for tool_call in reply.get("tool_calls", []):
+            if tool_call["function"]["name"] == "finish":
+                args = json.loads(tool_call["function"]["arguments"])
+                args["runtime_checks"] = [
+                    {"method": "GET", "path": "/index.html", "expect_status": 200, "why": "the greeting page is served"},
+                    {"method": "GET", "path": "/missing", "expect_status": 404, "why": "unknown paths are not served"},
+                    {"method": "GET", "path": "//evil.example/x", "expect_status": 200, "why": "must be dropped"}]
+                args["runtime_pages"] = ["/index.html"]
+                tool_call["function"]["arguments"] = json.dumps(args)
+        return reply
+
+    ScriptedModel.scripts["builder"] = builder_with_checks
     outcome_id = new_outcome(factory)
     assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
     with session_scope() as s:
@@ -384,8 +399,11 @@ def test_runtime_qa_boots_the_app_and_attaches_screenshots(factory):
         assert app["pages"][0]["status"] == 200 and app["pages"][0]["title"] == "Greeting", app
         shots = s.query(Artifact).filter(Artifact.task_id == task.id, Artifact.kind == "screenshot").all()
         assert shots and shots[0].content.startswith("iVBOR")  # base64 PNG
+        assert [(c["path"], c["ok"]) for c in app["change_checks"]] == [("/index.html", True), ("/missing", True)]
+        assert [p["path"] for p in app["pages"]] == ["/", "/index.html"]
     pr = FakeGitHub.pulls[1]
     assert "Runtime QA" in pr["body"] and "page `/` → 200" in pr["body"]
+    assert "`GET /missing` → 404 (expected 404) — unknown paths are not served" in pr["body"]
 
 
 def test_merge_approval_does_not_cover_a_later_candidate(factory):
