@@ -328,3 +328,20 @@ class SessionRecord(Base):
 
 
 Index("ix_events_ws_id", Event.workspace_id, Event.id)
+
+
+class MemoryEntry(Base):
+    """Factory-owned long-term memory. A null repository denotes workspace scope."""
+
+    __tablename__ = "memory_entries"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repo_id: Mapped[str | None] = mapped_column(ForeignKey("repositories.id"), nullable=True, index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    text: Mapped[str] = mapped_column(Text)
+    topic: Mapped[str] = mapped_column(String(200), default="")
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
