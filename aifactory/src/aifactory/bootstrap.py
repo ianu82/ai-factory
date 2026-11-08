@@ -136,12 +136,14 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
                 continue
             from .models import Task
 
+            retry_statuses = ["blocked", "failed"] + (["cancelled"] if item.get("include_cancelled") else [])
             blocked_tasks = s.query(Task).filter(Task.outcome_id == outcome.id,
-                                                 Task.status.in_(["blocked", "failed"])).all()
+                                                 Task.status.in_(retry_statuses)).all()
             if outcome.status == "blocked" and not blocked_tasks:
                 outcome.status, outcome.blocked_reason = "planning", ""
                 what = "planning"
             elif blocked_tasks:
+                outcome.completed_at = None
                 for t in blocked_tasks:
                     if t.status == "failed":  # attempts exhausted: start fresh attempts
                         t.attempt = 0

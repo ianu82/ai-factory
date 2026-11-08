@@ -48,9 +48,9 @@ class Orchestrator:
             self._loop_task = asyncio.create_task(self._run(), name="orchestrator")
 
     async def stop(self) -> None:
+        """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
         self._stopping = True
-        for job, cancel in list(self._planning.values()) + list(self._tasks.values()):
-            cancel.set()
+        for job, _cancel in list(self._planning.values()) + list(self._tasks.values()):
             job.cancel()
         if self._loop_task:
             self._loop_task.cancel()

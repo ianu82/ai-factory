@@ -414,3 +414,23 @@ def test_merge_approval_does_not_cover_a_later_candidate(factory):
     with session_scope() as s:
         s.get(Task, task_id).evidence = {"published": {"head": "old", "at": (approved_at - timedelta(minutes=5)).isoformat()}}
     assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge") is True
+
+
+def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
+    def slow_builder(messages):
+        import time as _t
+
+        _t.sleep(0.05)
+        return {"content": "", "tool_calls": [call("run", {"command": "sleep 30"}, step(messages))]}
+
+    ScriptedModel.scripts["builder"] = slow_builder
+    outcome_id = new_outcome(factory)
+
+    def building():
+        with session_scope() as s:
+            return s.query(Task).filter(Task.outcome_id == outcome_id, Task.stage == "build").count() == 1
+
+    assert drive(building, timeout=60)  # drive() stops the orchestrator once the task is building
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "queued", task.status
