@@ -291,8 +291,9 @@ def _event_kinds(outcome_id):
         return [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
 
 
-def _request_changes_after_main_moves(factory, path, content):
-    """Merge needs approval; while it waits, main moves; the reviewer requests changes. Returns (outcome, main sha)."""
+def _request_changes_after_main_moves(factory, move):
+    """Merge needs approval; while it waits, ``move()`` moves main; the reviewer requests changes.
+    Returns (outcome, main sha)."""
     from aifactory.db import SessionLocal
     from aifactory.decisions import resolve
 
@@ -308,7 +309,7 @@ def _request_changes_after_main_moves(factory, path, content):
             return d.id if d else None
 
     assert drive(lambda: merge_decision() is not None)
-    main = _land_on_main(factory, path, content)
+    main = move()
     db = SessionLocal()
     resolve(db, db.get(Decision, merge_decision()), db.get(User, factory["user"]), "reject",
             comment="Please also keep the script POSIX-only.")
@@ -334,7 +335,8 @@ def _approve_and_finish(factory, outcome_id):
 
 
 def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
-    outcome_id, main = _request_changes_after_main_moves(factory, "other.txt", "landed meanwhile\n")
+    outcome_id, main = _request_changes_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"))
     kinds = _event_kinds(outcome_id)
     assert "rebased" in kinds and "rebuild_on_main" not in kinds, " ".join(kinds)
     with session_scope() as s:
@@ -354,7 +356,8 @@ def test_a_requested_revision_that_conflicts_with_main_restarts_from_main(factor
         return good_builder(messages)
 
     ScriptedModel.scripts["builder"] = builder
-    outcome_id, main = _request_changes_after_main_moves(factory, "greet.sh", "echo 'Hi'\n")
+    outcome_id, main = _request_changes_after_main_moves(
+        factory, lambda: _land_on_main(factory, "greet.sh", "echo 'Hi'\n"))
     assert told
     kinds = _event_kinds(outcome_id)
     assert "rebuild_on_main" in kinds and "rebased" not in kinds, " ".join(kinds)
@@ -364,6 +367,22 @@ def test_a_requested_revision_that_conflicts_with_main_restarts_from_main(factor
     bare = factory["remotes"] / "acme/demo.git"
     assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
     assert "land greet.sh" in git("log", "--format=%s", "main", cwd=bare)
+
+
+def test_a_revision_replays_only_its_own_commits_when_main_was_rewritten(factory):
+    _land_on_main(factory, "dropme.txt", "reverted by force-push later\n")
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+
+    def rewrite_main():  # drop the dropme.txt commit from history, then land something new
+        git("reset", "-q", "--hard", "HEAD~1", cwd=seed)
+        git("push", "-q", "-f", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+        return _land_on_main(factory, "other.txt", "landed meanwhile\n")
+
+    outcome_id, main = _request_changes_after_main_moves(factory, rewrite_main)
+    assert "rebased" in _event_kinds(outcome_id)
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
+    assert "other.txt" in tree and "dropme.txt" not in tree
 
 
 def test_a_fix_that_gets_no_ci_because_main_moved_is_revalidated_not_blocked(factory):

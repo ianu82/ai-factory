@@ -271,11 +271,12 @@ class TaskRunner:
         sb, default = self.builder, self.repo.default_branch
         found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
         main = found.output.strip() if found.ok else ""
-        if not main or main == self.task.base_sha:
+        if not main or not self.task.base_sha or main == self.task.base_sha:
             return
         author = " ".join(f"-c user.{k}={shlex.quote(v)}" for k, v in
                           (("name", AUTHOR["GIT_AUTHOR_NAME"]), ("email", AUTHOR["GIT_AUTHOR_EMAIL"])))
-        rebased = await sb.exec(f"git {author} rebase -q {main}", timeout=300)
+        # --onto: replay only this task's commits, even if the default branch was rewritten since.
+        rebased = await sb.exec(f"git {author} rebase -q --onto {main} {shlex.quote(self.task.base_sha)}", timeout=300)
         if rebased.ok:
             self.update(base_sha=main)
             self.event("rebased", f"Brought {branch} up to date with {default} ({main[:8]}) before revising")
