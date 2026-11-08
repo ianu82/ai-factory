@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import { Activity, Inbox as InboxIcon, Library, LogOut, Menu, Plus, Radio, Settings as SettingsIcon, Target } from "lucide-react";
+import { Activity, GitPullRequest, Inbox as InboxIcon, Library, LogOut, Menu, Plus, Radio, Settings as SettingsIcon, Target } from "lucide-react";
 import { api, ApiError, type Me, type Meta, type Workspace } from "./api";
 import { useLive } from "./live";
 import { Avatar } from "./ui";
@@ -10,6 +10,7 @@ import { InboxPage } from "./pages/Inbox";
 import { OutcomesPage } from "./pages/Outcomes";
 import { RunsPage } from "./pages/Runs";
 import { SignalsPage } from "./pages/Signals";
+import { PullRequestsPage, usePulls } from "./pages/PullRequests";
 import { DecisionsPage } from "./pages/Decisions";
 import { SettingsPage } from "./pages/Settings";
 import { NewOutcome } from "./pages/NewOutcome";
@@ -56,7 +57,7 @@ function Loading({ error }: { error?: unknown }) {
 /** Stable deep links (used by runtime QA and docs): /go/outcomes → the first workspace's Outcomes. */
 function GoTo({ workspaceId }: { workspaceId: string }) {
   const { section = "inbox" } = useParams();
-  const allowed = ["inbox", "outcomes", "runs", "signals", "decisions", "settings"];
+  const allowed = ["inbox", "outcomes", "pulls", "runs", "signals", "decisions", "settings"];
   return <Navigate to={`/w/${workspaceId}/${allowed.includes(section) ? section : "inbox"}`} replace />;
 }
 
@@ -99,6 +100,7 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
             <Route path="inbox" element={<InboxPage />} />
             <Route path="outcomes" element={<OutcomesPage />} />
             <Route path="outcomes/:outcomeId" element={<OutcomesPage />} />
+            <Route path="pulls" element={<PullRequestsPage />} />
             <Route path="runs" element={<RunsPage />} />
             <Route path="signals" element={<SignalsPage />} />
             <Route path="decisions" element={<DecisionsPage />} />
@@ -123,6 +125,8 @@ function Sidebar() {
     queryFn: () => api<{ decisions: unknown[] }>(`/api/workspaces/${ws.id}/inbox`),
     refetchInterval: 30_000,
   });
+  const pulls = usePulls("open");
+  const pullsNeedingYou = (pulls.data?.counts.ready || 0) + (pulls.data?.counts.attention || 0);
   const [switching, setSwitching] = useState(false);
   const base = `/w/${ws.id}`;
   const signOut = async () => {
@@ -162,6 +166,9 @@ function Sidebar() {
         {!!inbox.data?.decisions.length && <span className="count" aria-label={`${inbox.data.decisions.length} need you`}>{inbox.data.decisions.length}</span>}
       </NavLink>
       <NavLink to={`${base}/outcomes`} className="nav-item"><Target /> Outcomes</NavLink>
+      <NavLink to={`${base}/pulls`} className="nav-item"><GitPullRequest /> Pull requests
+        {!!pullsNeedingYou && <span className="count" aria-label={`${pullsNeedingYou} pull requests ready or needing attention`}>{pullsNeedingYou}</span>}
+      </NavLink>
       <NavLink to={`${base}/runs`} className="nav-item"><Activity /> Runs</NavLink>
       <NavLink to={`${base}/signals`} className="nav-item"><Radio /> Signals</NavLink>
       <NavLink to={`${base}/decisions`} className="nav-item"><Library /> Decisions</NavLink>

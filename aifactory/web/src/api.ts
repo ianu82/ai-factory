@@ -306,3 +306,29 @@ export interface Artifact {
   created_at: string;
   content?: string;
 }
+
+export interface PullRow {
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  author: { login: string; avatar: string };
+  draft: boolean;
+  created_at: string;
+  updated_at: string;
+  merged_at: string | null;
+  base: string;
+  group: "ready" | "attention" | "checks" | "draft" | "merged";
+  reason: string;
+  detail: { additions?: number; deletions?: number; changed_files?: number; mergeable_state?: string };
+  ci?: { state: string; total?: number; failing?: string[]; pending?: string[] };
+  factory: { outcome_id: string; outcome_number: number | null; task_key: string; status: string; decision_id: string | null } | null;
+}
+
+export interface PullsResponse {
+  items: PullRow[];
+  counts: Partial<Record<PullRow["group"], number>>;
+  errors: string[];
+  fetched_at: number;
+  repositories?: string[];
+}
