@@ -112,11 +112,13 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
     if qa.get("start"):
         lines += ["", "## Runtime QA",
                   f"After you finish, the factory boots the app (`{qa['start']}`) in a fresh, isolated environment "
-                  "with no credentials or external services, and an independent verifier exercises it. In your report, "
-                  "propose `runtime_checks`: up to 5 HTTP requests against the running app that demonstrate this change "
-                  "works (for an API fix: the request and the status it must now return), and `runtime_pages` worth a "
-                  "screenshot if the change is visible. The factory runs them itself and attaches the results to the "
-                  "pull request, so only propose requests that work without signing in to external services."]
+                  "with no credentials or external services, and an independent verifier exercises it. Your finish "
+                  "report MUST include `runtime_checks` whenever the change is observable over HTTP: up to 5 requests "
+                  "against the running app that demonstrate it works (for an API fix: the request and the status it "
+                  "must now return; for a page: the path and 200), plus `runtime_pages` worth a screenshot if the change "
+                  "is visible. The factory runs them itself and attaches the results to the pull request as evidence, "
+                  "so only propose requests that work without signing in to external services. If nothing is "
+                  "observable over HTTP (pure refactor, tests only), send an empty list and say why in your summary."]
     if decisions:
         lines += ["", "## Prior human decisions that apply"]
         lines += [f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}" for d in decisions]

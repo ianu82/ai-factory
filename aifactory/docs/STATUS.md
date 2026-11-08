@@ -50,7 +50,7 @@ fixed endpoint must now return), which the Factory runs in the same environment 
 | F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 (native), #8 (Anton, unattended); Codex ran on MindsHub in #195 |
 | F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected) | First self-change verified then lost to a rebase conflict (#195) |
 | F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18 |
-| F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by lockfiles + setup; setup skipped on a hit, saved after a clean miss | First live checkpoint saved in #8 (11 s); first live boot from it pending |
+| F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by repository, lockfiles and setup; setup skipped on a hit, saved after a clean miss, older ones pruned | Live: checkpoint saved in #8 (11 s); both parallel tasks of #9 booted their own VM from it in 6–9 s with setup skipped |
 | F04 Coding model choice | Models per role from the provider's live list | — |
 | F19 MindsHub sign-in & onboarding | API-key sign-in live; orgs/workspaces from MindsHub Auth; invited admins; setup checklist | OIDC coded; needs the domain on MindsHub's redirect allowlist (deliberately not blocking) |
 | F07 Workspaces | Isolated repos, credentials, policies, budgets, history | Two-workspace live test not yet run |
