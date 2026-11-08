@@ -44,6 +44,18 @@ def invited_role(email: str | None, workspace: Workspace) -> str | None:
     return invites.get(email.lower())
 
 
+def _changed(applied: dict[str, str], key: str, value) -> bool:
+    """Bootstrap values are operator intent at the time they change: apply a key when its declared value
+    differs from the one last applied, and leave later edits made in the app alone otherwise."""
+    import hashlib
+
+    digest = hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    if applied.get(key) == digest:
+        return False
+    applied[key] = digest
+    return True
+
+
 def apply_bootstrap() -> str | None:
     cfg = bootstrap_config()
     if not cfg:
@@ -62,8 +74,11 @@ def apply_bootstrap() -> str | None:
             s.flush()
         settings = merged_settings(ws.settings)
         overrides = cfg.get("settings") or {}
+        applied = dict(settings.get("_bootstrap") or {})
         for key, value in overrides.items():
-            settings[key] = {**settings.get(key, {}), **value} if isinstance(value, dict) else value
+            if _changed(applied, key, value):  # otherwise keep what people set in the app since
+                settings[key] = {**settings.get(key, {}), **value} if isinstance(value, dict) else value
+        settings["_bootstrap"] = applied
         settings["invites"] = {**(settings.get("invites") or {}),
                                **{e.lower(): "owner" for e in cfg.get("admins", [])}}
         ws.settings = settings
@@ -74,7 +89,13 @@ def apply_bootstrap() -> str | None:
             branch = None if isinstance(entry, str) else entry.get("default_branch")
             if name in existing:
                 if overrides:
-                    existing[name].config = {**(existing[name].config or {}), **overrides}
+                    current = dict(existing[name].config or {})
+                    applied = dict(current.get("_bootstrap") or {})
+                    for key, value in overrides.items():
+                        if _changed(applied, key, value):
+                            current[key] = value
+                    current["_bootstrap"] = applied
+                    existing[name].config = current
                 if branch:
                     existing[name].default_branch = branch
             elif name:
@@ -252,7 +273,10 @@ async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
             gh = GitHub(resolve_token(workspace_id))
             info = await gh.repo(name)
             branch = overrides.pop("_base_branch", None) or info.get("default_branch") or "main"
-            config = {**await detect(gh, name, branch), **overrides}
+            applied: dict[str, str] = {}
+            for key, value in overrides.items():
+                _changed(applied, key, value)
+            config = {**await detect(gh, name, branch), **overrides, "_bootstrap": applied}
         except GitHubError as exc:
             log.error("Bootstrap could not connect %s: %s", name, exc)
             continue

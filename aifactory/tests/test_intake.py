@@ -160,3 +160,42 @@ def test_delegated_operator_resolves_a_merge_approval_once(monkeypatch):
         operator = s.get(User, decision.resolved_by)
         assert decision.resolution == "approve" and operator.is_system and "ian@mindsdb.com" in operator.name
         assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
+
+
+def test_bootstrap_applies_declared_values_once_and_keeps_later_app_changes(monkeypatch):
+    def boot(config):
+        monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
+
+        async def run():
+            return apply_bootstrap()
+
+        return asyncio.run(run())
+
+    base = {"organization": "Acme", "workspace": "Delivery", "settings": {"budgets": {"run_usd": 5}},
+            "repositories": [{"full_name": "acme/app", "config": {"merge": {"mode": "approval"}, "checks": ["npm test"]}}]}
+    ws_id = boot(base)
+    with session_scope() as s:
+        s.add(Repository(workspace_id=ws_id, full_name="acme/app", config={}))
+    boot(base)  # connects the declared config to the existing repository
+    with session_scope() as s:
+        repo = s.query(Repository).filter(Repository.full_name == "acme/app").one()
+        assert repo.config["merge"] == {"mode": "approval"}
+        # People change things in the app (for example by applying an improvement proposal).
+        repo.config = {**repo.config, "merge": {"mode": "auto"}, "context": "Use pnpm."}
+        ws = s.get(Workspace, ws_id)
+        ws.settings = {**ws.settings, "budgets": {**ws.settings["budgets"], "run_usd": 12}}
+
+    boot(base)  # a restart with the same bootstrap keeps those changes
+    with session_scope() as s:
+        repo = s.query(Repository).filter(Repository.full_name == "acme/app").one()
+        assert repo.config["merge"] == {"mode": "auto"} and repo.config["context"] == "Use pnpm."
+        assert s.get(Workspace, ws_id).settings["budgets"]["run_usd"] == 12
+
+    changed = json.loads(json.dumps(base))
+    changed["repositories"][0]["config"]["checks"] = ["npm test", "npm run lint"]
+    changed["settings"]["budgets"]["run_usd"] = 6
+    boot(changed)  # the operator changed the bootstrap: those keys apply, untouched ones stay
+    with session_scope() as s:
+        repo = s.query(Repository).filter(Repository.full_name == "acme/app").one()
+        assert repo.config["checks"] == ["npm test", "npm run lint"] and repo.config["merge"] == {"mode": "auto"}
+        assert s.get(Workspace, ws_id).settings["budgets"]["run_usd"] == 6
