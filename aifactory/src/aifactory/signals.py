@@ -99,10 +99,12 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                         db.commit()
                         continue
                     author = (issue.get("user") or {}).get("login", "")
+                    names = {(lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in issue.get("labels") or []}
+                    worker = next((n.split(":", 1)[1] for n in names if n in ("worker:native", "worker:codex", "worker:anton")), None)
                     outcome = outcome_from_text(
                         db, workspace_id, None, issue["title"],
                         f"{issue.get('body') or ''}\n\nSource: {issue['html_url']} (opened by {author}, labelled {auto_label})",
-                        [repo.id], source="signal", signal_id=sig.id)
+                        [repo.id], source="signal", signal_id=sig.id, harness=worker)
                     sig.status, sig.outcome_id = "accepted", outcome.id
                     accepted += 1
                     record(workspace_id, "signal_accepted",
