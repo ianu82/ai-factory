@@ -110,3 +110,39 @@ def test_job_cpu_sets_are_small_and_spread_by_uid(monkeypatch):
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1}, raising=False)
     monkeypatch.setenv("AIFACTORY_SANDBOX_CPUS", "4")
     assert sandbox.job_cpus(20000) is None  # a small host is left alone
+
+
+def test_unpriced_runs_are_priced_later_from_provider_usage(monkeypatch):
+    import asyncio
+
+    from aifactory import inference
+    from aifactory.db import session_scope, utcnow
+    from aifactory.models import Run
+    from aifactory.pipeline.orchestrator import Orchestrator
+
+    async def session_cost(self, session_id):
+        return 0.0731 if session_id == "run-late" else None
+
+    monkeypatch.setattr(inference.ModelClient, "session_cost", session_cost)
+    monkeypatch.setattr(inference, "resolve_provider",
+                        lambda ws: inference.ProviderConfig("mindshub", "http://model.test/v1", "k", "MindsHub"))
+    from aifactory.models import Organization, Outcome, Workspace
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={})
+        s.add(ws)
+        s.flush()
+        outcome = Outcome(workspace_id=ws.id, number=1, title="t", brief="", repo_ids=[], status="running")
+        s.add(outcome)
+        s.flush()
+        for rid in ("run-late", "run-never"):
+            s.add(Run(id=rid, workspace_id=ws.id, outcome_id=outcome.id, role="builder", harness="native",
+                      provider="mindshub", status="cancelled", cost_known=False, finished_at=utcnow()))
+    asyncio.run(Orchestrator()._maybe_reconcile_costs())
+    with session_scope() as s:
+        late, never = s.get(Run, "run-late"), s.get(Run, "run-never")
+        assert late.cost_known and late.cost_usd == 0.0731
+        assert not never.cost_known
