@@ -3,43 +3,53 @@
 Updated 8 November 2026. Evidence links point to real runs on the live service
 (https://factory-production-f28b.up.railway.app) against `ianu82/calorie-tracker` and
 `ianu82/ai-factory`. "Unattended" means no human or operator action after the work was
-admitted (a GitHub issue labelled `factory:auto`). Anything else is marked assisted.
+admitted (a GitHub issue labelled `factory:auto`). Anything else is marked assisted, and an
+operator action taken on Ian's behalf is recorded in the Factory as "Operator (delegated by
+ian@mindsdb.com)".
 
 ## Live delivery evidence
 
 | Outcome | Worker | What happened | Classification |
 | --- | --- | --- | --- |
-| calorie-tracker #13 → PR #14 | Native (OpenAI fallback, `gpt-6.1-terra`) | Plan → build → checks → fresh-native verification → PR → CI → merge → smoke; issue closed | Assisted: two platform fixes during the run (Responses API, Checks-API fallback), each followed by an operator retry |
-| calorie-tracker #15 → PR #17 | Codex (via gateway, OpenAI fallback) | Same flow end to end, about 3 minutes after pickup | Unattended |
-| calorie-tracker #16 → PR #18 | Anton (OpenAI fallback) | Fresh Anton verifier rejected attempt 1 for a real defect (empty body → 500); attempt 2 fixed it; rebased onto #17's merge, rechecked and re-ran CI before merging | Unattended |
+| calorie-tracker #13 → PR #14 | Native (OpenAI fallback) | Plan → build → checks → fresh-native verification → PR → CI → merge → smoke; issue closed | Assisted: two platform fixes during the run, each followed by an operator retry |
+| calorie-tracker #15 → PR #17 | Codex (via gateway) | Same flow end to end, about 3 minutes after pickup | Unattended |
+| calorie-tracker #16 → PR #18 | Anton | Fresh Anton verifier rejected attempt 1 for a real defect (empty body → 500); attempt 2 fixed it; rebased onto #17's merge, rechecked and re-ran CI before merging | Unattended |
+| calorie-tracker Ticket 40 (#6), T2 → PR #20 | Native on MindsHub (`gpt-terra`) | The planner stopped on a genuine product conflict (requested ranges vs DB precision); the answer was given as a delegated operator decision; T2 merged and smoke passed | Assisted (one human product decision, by design) |
+| calorie-tracker Ticket 40 (#6), T1 | Native on MindsHub | Three attempts ended unverified because the production build hit `EAGAIN` in the shared container (48 visible CPUs, 1000-pid cgroup) while the builder's throwaway Postgres was still running. Fixed in the platform (per-job CPU sets, builder processes stopped before verification, boot logs in QA events) and retried with runtime QA in a Railway VM | See "Runtime QA in a VM" below |
+| ai-factory #195 (Factory improving itself) | Codex on MindsHub | Fresh verifiers rejected several candidates for real races; the approved candidate then conflicted on rebase and was abandoned (delegated). PR #196 closed, issue #195 open | Assisted, not delivered |
 
-Runs after 14:00 UTC use MindsHub Inference (`gpt-terra`, workspace key saved when Ian signed in with
-his MindsHub API key). Per-run cost is read back from MindsHub usage (sessions cost about $0.06–0.16).
+MindsHub Inference is the workspace provider (`gpt-terra`, failover disabled); per-run cost is read
+back from MindsHub usage (sessions cost about $0.06–0.16).
 
-| Outcome | Worker | What happened | Classification |
-| --- | --- | --- | --- |
-| calorie-tracker #19 (Ticket 40) | Native on MindsHub | Planner proposed 2 tasks but escalated a genuine product decision: the requested ranges conflict with DB precision (0.01 kg rounds to 0.0 under `CHECK (weight_kg > 0)`) | Waiting on Ian (correct stop, not a delivery) |
-| ai-factory #195 (Factory improving itself) | Codex on MindsHub | Fresh Codex verifiers rejected several candidates for real races and a semantic change in CI-signal persistence. Two rejections were caused by platform bugs (an unstaged patch hid new files; stale git stat data), both fixed with regression tests | Assisted (operator retries after platform fixes); merge needs human approval by policy |
+### Runtime QA in a VM
+
+Verification now boots the candidate app and captures evidence before the verifier session
+starts: Playwright screenshots of configured pages, HTTP probes, and the boot log, attached to the
+task and summarised in the pull request. With `qa.isolation: "vm"` this happens in an isolated
+Railway sandbox VM (no Factory credentials inside, destroyed afterwards).
+
+Live: #6 T1 retry, 16:34 UTC — VM `f97dfb4f…` (us-west2) ready with the checkout in 157 s (first
+template build), `npm ci` inside the VM passed, app boot started. RESULT_PENDING
 
 ## Roadmap
 
 | Item | Status in v2 | Evidence / remaining |
 | --- | --- | --- |
-| F01 Codex qualification | Useful unattended delivery done; semantic rejection and cancel/cleanup for Codex not yet separately shown | PR #17 |
+| F01 Codex qualification | Unattended delivery done | PR #17 |
 | F18 Anton unattended delivery | Done, including independent rejection of a defective candidate | PR #18 |
-| F02 MindsHub Inference | Workspace key saved via MindsHub sign-in; provider readiness verified (70 models); per-run cost readback via `/v1/usage/sessions` implemented | Live MindsHub deliveries in progress; Anton/Codex each still need a MindsHub run |
-| F03 Factory builds Factory | `ai-factory` connected (base `factory-v2`, merge needs human approval, deploy config protected) | First self-change: ai-factory #195 |
-| F05 Parallel execution | Concurrency per workspace (1–50) plus a server cap; dependency ordering; serialized, revalidated same-repo merges | PRs #17/#18 ran in parallel; #18 revalidated after #17 merged |
-| F06 Prepared environments | Not built (setup reruns per sandbox; npm ci ≈ 8 s here) | Cache setup by lockfile hash |
-| F04 Coding model choice | Models per role selectable in Settings from the provider's live list | — |
-| F19 MindsHub sign-in & onboarding | API-key sign-in live; org/workspace from MindsHub Auth; invited admins; setup checklist | OIDC coded but needs the domain on MindsHub's Keycloak allowlist (deliberately not blocking) |
-| F07 Workspaces | Isolated repos, credentials, policies, budgets and history per workspace; multi-repo outcomes | Two-workspace live test not yet run |
-| F08 Internal app | Inbox, Outcomes, Runs, Signals, Decisions, Settings; masked key save/test; responsive | Rendered with fixtures; real-data walkthrough pending |
-| F09 Acceptance & recovery | Durable stages; restart resumes; failures explicit; this document | Recovery runbook not yet in-app |
-| F10 Visual & risk review | Not built | Browser screenshot QA for UI changes |
-| F11 Watch & intervene | Live activity, guidance channel delivered to the active agent, cancel; interventions recorded | Pause/take-over not built |
-| F12 Product signals | GitHub issues (`factory`, `factory:auto`), failing main CI, post-merge smoke/release failures → deduplicated signals | Error/analytics sources not connected |
-| F13 Reuse human decisions | Attributed decisions; "remember" turns them into precedents used by planning and building | — |
-| F14 Bounded remediation | Not built beyond signals → proposed outcomes | — |
-| F15 Customer onboarding | Sign-in restricted to `@mindsdb.com` | Stronger sandbox isolation (gVisor/microVM) and Postgres first |
+| F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 T2 (native), #195 runs (Codex) |
+| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected) | First self-change verified then lost to a rebase conflict (#195) |
+| F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18 |
+| F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by lockfiles + setup; setup skipped on a hit, saved after a clean miss | Unit-tested against a fake bridge; first live checkpoint pending |
+| F04 Coding model choice | Models per role from the provider's live list | — |
+| F19 MindsHub sign-in & onboarding | API-key sign-in live; orgs/workspaces from MindsHub Auth; invited admins; setup checklist | OIDC coded; needs the domain on MindsHub's redirect allowlist (deliberately not blocking) |
+| F07 Workspaces | Isolated repos, credentials, policies, budgets, history | Two-workspace live test not yet run |
+| F08 Internal app | Inbox, Outcomes, Runs, Signals, Decisions, Settings; responsive | Rendered with fixtures and live data |
+| F09 Acceptance & recovery | Durable stages; restarts resume without cancelling; operator retry/resolve; revert on smoke failure | Recovery runbook not yet in-app |
+| F10 Visual & risk review | Runtime QA screenshots/probes as verifier evidence and in PRs; protected paths and change-size limits | Visual diffing against the base not built |
+| F11 Watch & intervene | Live activity, guidance delivered to the active agent, cancel, **take over** (candidate pushed as an unverified draft PR, task ends `handed_over`) | — |
+| F12 Product signals | GitHub issues, failing main CI, smoke/release failures, **product feedback API** (workspace key) and hand-logged feedback | Analytics/error-tracker connectors not built |
+| F13 Reuse human decisions | Attributed decisions; "remember" → precedents; **improvement proposals** from decisions and run history (policy, team notes, budgets, workers), applied by admins with attribution | — |
+| F14 Bounded remediation | Smoke failure → revert PR (policy or decision); signals → proposed outcomes | Auto-remediation of failing main CI is opt-in via `factory:auto` only |
+| F15 Customer onboarding | Sign-in restricted to `@mindsdb.com`; **Postgres supported** (CI runs the suite on Postgres 17) | Builders still run per-UID in the control-plane container; GitHub App onboarding not built (PAT per workspace) |
 | F16/F17 | Deferred | — |

@@ -377,11 +377,12 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
 def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
     repo = db.get(Repository, repo_id)
-    if repo and repo.workspace_id == workspace_id:
-        if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running"])).first():
-            raise HTTPException(409, "Work is running on this repository")
-        db.delete(repo)
-        db.commit()
+    if repo is None or repo.workspace_id != workspace_id:
+        raise HTTPException(404, "Repository not found")
+    if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running"])).first():
+        raise HTTPException(409, "Work is running on this repository")
+    db.delete(repo)
+    db.commit()
     return {"ok": True}
 
 
@@ -547,6 +548,9 @@ def post_message(workspace_id: str, outcome_id: str, body: MessageBody, user: Us
 @router.get("/workspaces/{workspace_id}/tasks/{task_id}/artifacts")
 def task_artifacts(workspace_id: str, task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
+    task = db.get(Task, task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise HTTPException(404, "Task not found")
     rows = db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.task_id == task_id).order_by(
         Artifact.created_at).all()
     return [S.artifact(a) for a in rows]
