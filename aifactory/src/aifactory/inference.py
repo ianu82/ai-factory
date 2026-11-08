@@ -260,8 +260,9 @@ class ModelClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.session_id = session_id
-        # OpenAI's newest models are Responses-only; MindsHub serves both shapes for every model family.
-        self.wire = wire or ("responses" if provider.provider == "openai" else "chat")
+        # The Responses API is the common denominator: OpenAI's newest models only support function tools
+        # with reasoning there, and MindsHub serves it for every model family (Anton and Codex use it too).
+        self.wire = wire or "responses"
 
     async def chat(
         self,

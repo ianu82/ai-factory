@@ -107,6 +107,13 @@ class Orchestrator:
                              t.pr_number or "-", (t.blocked_reason or "")[:300].replace("\n", " "))
                 for d in s.query(Decision).filter(Decision.outcome_id == o.id, Decision.status == "open"):
                     log.info("inventory   decision %s: %s — %s", d.kind, d.title[:100], (d.body or "")[:400].replace("\n", " "))
+        from ..models import Membership, Secret
+
+        with session_scope() as s:
+            for ws in s.query(Workspace).all():
+                creds = ", ".join(f"{c.kind}={c.status}" for c in s.query(Secret).filter(Secret.workspace_id == ws.id)) or "none"
+                roles = [m.role for m in s.query(Membership).filter(Membership.workspace_id == ws.id)]
+                log.info("inventory workspace %s '%s' members=%s credentials: %s", ws.id[:6], ws.name, roles, creds)
         log.info("inventory orchestrator %s", self.status())
 
     async def _maybe_sync_signals(self) -> None:
@@ -147,6 +154,27 @@ class Orchestrator:
             return
         self._last_inventory = time.monotonic()
         await asyncio.to_thread(self.log_inventory)
+        await self._provider_readiness()
+
+    async def _provider_readiness(self) -> None:
+        """Log whether each workspace's model provider answers and serves the configured models."""
+        from ..inference import InferenceError, ModelClient, resolve_provider, workspace_models
+
+        with session_scope() as s:
+            workspace_ids = [w.id for w in s.query(Workspace).all()]
+        for workspace_id in workspace_ids:
+            try:
+                provider = resolve_provider(workspace_id)
+                names = await ModelClient(provider).list_models()
+                models = workspace_models(workspace_settings(workspace_id))
+                wanted = {provider.model_override} if provider.model_override else {models.planner, models.builder, models.verifier}
+                missing = sorted(m for m in wanted if m and m not in names)
+                log.info("readiness %s provider=%s models=%d configured=%s missing=%s", workspace_id[:6],
+                         provider.provider, len(names), sorted(wanted), missing or "none")
+            except InferenceError as exc:
+                log.warning("readiness %s provider unavailable: %s", workspace_id[:6], exc)
+            except Exception as exc:  # readiness must never break scheduling
+                log.warning("readiness %s check failed: %s", workspace_id[:6], type(exc).__name__)
 
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""
