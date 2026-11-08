@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from typing import Any
 
@@ -59,6 +60,7 @@ class EventBus:
 
 
 bus = EventBus()
+log = logging.getLogger("aifactory.events")
 
 
 def event_dict(event: Event) -> dict[str, Any]:
@@ -112,6 +114,9 @@ def record(
             s.flush()
             payload = event_dict(event)
     bus.publish({"type": "event", **payload})
+    if kind not in ("agent_thought", "agent_tool"):
+        log.info("[%s %s%s] %s: %s", workspace_id[:6], (outcome_id or "-")[:6], f"/{task_id[:6]}" if task_id else "",
+                 kind, payload["message"][:300])
     return payload
 
 
