@@ -385,6 +385,27 @@ def test_a_revision_replays_only_its_own_commits_when_main_was_rewritten(factory
     assert "other.txt" in tree and "dropme.txt" not in tree
 
 
+def test_rebasing_a_published_branch_replays_only_its_own_commits(factory):
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    bare = factory["remotes"] / "acme/demo.git"
+    base = _land_on_main(factory, "dropme.txt", "removed by a force-push later\n")
+    git("checkout", "-q", "-b", "factory/9-t1", cwd=seed)
+    (seed / "task.txt").write_text("task\n")
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", "task", cwd=seed)
+    git("push", "-q", str(bare), "factory/9-t1", cwd=seed)
+    git("checkout", "-q", "main", cwd=seed)
+    git("reset", "-q", "--hard", "HEAD~1", cwd=seed)
+    git("push", "-q", "-f", str(bare), "main", cwd=seed)
+    _land_on_main(factory, "other.txt", "landed\n")
+
+    clean, head = asyncio.run(gitops.rebase_branch("acme/demo", "token", branch="factory/9-t1", onto="main",
+                                                   task_id="t-rebase", base=base))
+    assert clean
+    tree = git("ls-tree", "--name-only", head, cwd=bare).split()
+    assert "task.txt" in tree and "other.txt" in tree and "dropme.txt" not in tree
+
+
 def test_a_fix_that_gets_no_ci_because_main_moved_is_revalidated_not_blocked(factory):
     states = iter(["failure", "none"])
     original = FakeGitHub.checks

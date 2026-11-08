@@ -216,8 +216,12 @@ async def publish(full_name: str, token: str, *, base_sha: str, branch: str, pat
         shutil.rmtree(staging, ignore_errors=True)
 
 
-async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, task_id: str) -> tuple[bool, str]:
-    """Rebase a published branch onto the latest base. Returns (clean, new_head_or_conflict_detail)."""
+async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, task_id: str,
+                        base: str = "") -> tuple[bool, str]:
+    """Rebase a published branch onto the latest base. Returns (clean, new_head_or_conflict_detail).
+
+    With ``base`` (the commit the branch was built on) only the branch's own commits are replayed, so commits
+    removed from a rewritten base branch cannot come back."""
     mirror_path = await mirror(full_name, token)
     staging = get_settings().data_dir / "staging" / (task_id + "-rebase")
     shutil.rmtree(staging, ignore_errors=True)
@@ -227,7 +231,8 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
         await git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=staging, env=env)
         await git("checkout", "-q", "-B", branch, f"origin/{branch}", cwd=staging)
         try:
-            await git("rebase", "-q", f"origin/{onto}", cwd=staging, env=AUTHOR)
+            await git("rebase", "-q", *(["--onto", f"origin/{onto}", base] if base else [f"origin/{onto}"]),
+                      cwd=staging, env=AUTHOR)
         except GitError as exc:
             await git("rebase", "--abort", cwd=staging)
             return False, str(exc)

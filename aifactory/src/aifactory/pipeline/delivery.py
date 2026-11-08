@@ -843,7 +843,8 @@ class TaskRunner:
         """Main moved: rebase the verified change, then re-run checks and CI before merging."""
         self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
         clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
-                                            onto=self.repo.default_branch, task_id=self.task_id)
+                                            onto=self.repo.default_branch, task_id=self.task_id,
+                                            base=self.task.base_sha or "")
         if not clean:
             self._fresh_budget_after_base_moved("conflicts with newer commits")
             self.feedback.append(f"- Your change conflicts with newer commits on {self.repo.default_branch}. "
