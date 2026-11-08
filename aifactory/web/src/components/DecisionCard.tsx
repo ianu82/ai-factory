@@ -8,7 +8,7 @@ import { Prose, useToast } from "../ui";
 
 const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
 
-export function DecisionCard({ d, showContext = false, onOpen }: { d: Decision; showContext?: boolean; onOpen?: () => void }) {
+export function DecisionCard({ d, showContext = false, onOpen, focused = false }: { d: Decision; showContext?: boolean; onOpen?: () => void; focused?: boolean }) {
   const { ws } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
@@ -42,7 +42,7 @@ export function DecisionCard({ d, showContext = false, onOpen }: { d: Decision; 
   };
 
   return (
-    <article className="decide" aria-label={d.title}>
+    <article className={`decide ${focused ? "focused" : ""}`} aria-label={d.title}>
       <span className="kind-tag">{DECISION_KIND[d.kind] || d.kind} · {ago(d.created_at)}</span>
       <h4>{d.title}</h4>
       {showContext && d.outcome_number != null && (

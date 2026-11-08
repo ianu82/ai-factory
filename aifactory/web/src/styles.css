@@ -299,6 +299,13 @@ a { color: inherit; text-decoration: none; }
 .guide dd { margin: 0; color: var(--body); line-height: 1.5; }
 @media (max-width: 760px) { .guide dl { grid-template-columns: 1fr; gap: 2px; } .guide dd { margin-bottom: 8px; } }
 
+/* inbox rows — one line of why, the main action in reach */
+.ib-row .title { display: flex; align-items: baseline; gap: 8px; }
+.ib-kind { flex: none; font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--human); }
+.ib-why { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ib-act { height: 24px; }
+.decide.focused { border-color: var(--human); box-shadow: 0 0 0 3px var(--human-soft); }
+
 /* tasks inside an outcome */
 .task { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); }
 .task + .task { margin-top: 8px; }

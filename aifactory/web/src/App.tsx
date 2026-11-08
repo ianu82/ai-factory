@@ -97,6 +97,7 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
           {live === "offline" && <div className="banner">Live updates disconnected. Reconnecting…</div>}
           <Routes>
             <Route path="inbox" element={<InboxPage />} />
+            <Route path="inbox/:decisionId" element={<InboxPage />} />
             <Route path="outcomes" element={<OutcomesPage />} />
             <Route path="outcomes/:outcomeId" element={<OutcomesPage />} />
             <Route path="runs" element={<RunsPage />} />
