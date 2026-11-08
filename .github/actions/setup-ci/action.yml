@@ -1,0 +1,17 @@
+name: Set up pinned CI tooling
+description: Install uv from its official PyPI wheel and retain Python 3.13 selection.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m venv "$RUNNER_TEMP/factory-ci-tools"
+        "$RUNNER_TEMP/factory-ci-tools/bin/python" -m pip install \
+          --index-url https://pypi.org/simple --only-binary=:all: --no-deps \
+          --disable-pip-version-check --no-cache-dir --retries 0 --timeout 20 uv==0.13.7
+        version_line="$("$RUNNER_TEMP/factory-ci-tools/bin/uv" --version)"
+        printf '%s\n' "$version_line"
+        [[ "$version_line" =~ ^uv[[:space:]]0\.13\.7([[:space:]]|$) ]]
+        printf '%s\n' "$RUNNER_TEMP/factory-ci-tools/bin" >> "$GITHUB_PATH"
+        printf '%s\n' 'UV_PYTHON=3.13' >> "$GITHUB_ENV"
