@@ -152,6 +152,12 @@ class TaskRunner:
     async def deliver(self, continue_from_branch: bool = False) -> None:
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
+        finished = {a.get("n") for a in (self.task.evidence or {}).get("attempts", []) if isinstance(a, dict)}
+        if self.task.attempt and self.task.attempt not in finished:
+            # Every attempt that ends records its result; one without a record was interrupted (a restart or
+            # redeploy), so it is redone rather than counted against the limit.
+            self.event("attempt_resumed", f"Attempt {self.task.attempt} was interrupted; running it again")
+            self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
             if attempt > max_attempts:

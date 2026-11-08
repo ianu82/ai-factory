@@ -434,6 +434,15 @@ def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         assert task.status == "queued", task.status
+        assert task.attempt == 1
+
+    # After the restart the interrupted attempt is redone, not counted against the limit.
+    ScriptedModel.scripts["builder"] = good_builder
+    assert drive(lambda: outcome_status(outcome_id) == "completed", timeout=90)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.attempt == 1 and [a["n"] for a in task.evidence["attempts"]] == [1]
+        assert s.query(Event).filter(Event.task_id == task.id, Event.kind == "attempt_resumed").count() == 1
 
 
 def test_smoke_failure_is_reverted_under_recovery_policy(factory):
