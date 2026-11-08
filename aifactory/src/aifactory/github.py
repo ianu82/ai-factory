@@ -17,7 +17,7 @@ import httpx
 
 from .config import get_settings
 from .db import session_scope
-from .models import Secret
+from .models import IssueAcknowledgementState, Secret, Workspace
 from .security import decrypt
 
 API = "https://api.github.com"
@@ -29,15 +29,29 @@ class GitHubError(RuntimeError):
         self.status = status
 
 
-def resolve_token(workspace_id: str) -> str:
+def resolve_token_with_state(workspace_id: str) -> tuple[str, int, bool]:
     with session_scope() as s:
-        sec = s.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == "github_token").one_or_none()
+        row = (s.query(Secret, IssueAcknowledgementState.generation, IssueAcknowledgementState.disabled)
+               .select_from(Workspace)
+               .outerjoin(Secret, (Secret.workspace_id == Workspace.id) & (Secret.kind == "github_token"))
+               .outerjoin(IssueAcknowledgementState, IssueAcknowledgementState.workspace_id == Workspace.id)
+               .filter(Workspace.id == workspace_id).one_or_none())
+        sec, generation, disabled = row if row else (None, None, None)
         if sec is not None and sec.status != "invalid":
-            return decrypt(sec.ciphertext)
+            return decrypt(sec.ciphertext), generation or 0, bool(disabled)
     token = get_settings().bootstrap_github_token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
     if not token:
         raise GitHubError("No GitHub access is configured for this workspace. Add a GitHub token in Settings.")
-    return token
+    return token, generation or 0, bool(disabled)
+
+
+def resolve_token_with_generation(workspace_id: str) -> tuple[str, int]:
+    token, generation, _ = resolve_token_with_state(workspace_id)
+    return token, generation
+
+
+def resolve_token(workspace_id: str) -> str:
+    return resolve_token_with_generation(workspace_id)[0]
 
 
 def git_auth_env(token: str) -> dict[str, str]:

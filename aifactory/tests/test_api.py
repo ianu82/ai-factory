@@ -9,9 +9,11 @@ import pytest
 from aifactory import api as api_module
 from aifactory import auth as auth_module
 from aifactory import gateway
-from aifactory.db import session_scope
+from aifactory import signals as signals_module
+from aifactory.db import SessionLocal, session_scope
+from aifactory.github import GitHubError, resolve_token_with_generation
 from aifactory.inference import ProviderConfig, UsageLedger
-from aifactory.models import Run, Secret, Workspace
+from aifactory.models import Event, IssueAcknowledgementState, Repository, Run, Secret, Workspace
 
 
 def test_sign_in_creates_org_workspace_and_owner(client, signed_in):
@@ -175,3 +177,173 @@ def test_ci_checks_fall_back_to_actions_when_checks_api_is_forbidden(monkeypatch
     monkeypatch.setattr(GitHub, "request", fake_request)
     summary = asyncio.run(GitHub("t").checks("o/r", "abc"))
     assert summary.state == "pending" and [c["name"] for c in summary.checks] == ["validate", "sandbox"]
+
+
+def test_github_credential_save_reenables_acknowledgements_and_rejects_stale_failure(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    endpoint = f"/api/workspaces/{ws_id}/credentials"
+
+    async def fake_test(kind, value):
+        return ("untested" if value.endswith("new") else "valid"), "", {}
+
+    monkeypatch.setattr(api_module, "_test_secret", fake_test)
+    assert client.put(f"{endpoint}/github_token", json={"value": "old-token"}).status_code == 200
+    with session_scope() as s:
+        s.add(Repository(workspace_id=ws_id, full_name="acme/app", default_branch="main", config={}))
+    issue = {"number": 1}
+    attempts = []
+
+    class FakeGH:
+        def __init__(self, token):
+            self.token = token
+
+        async def issues(self, full_name, labels="", since=None):
+            number = issue["number"]
+            return [{"number": number, "title": str(number), "html_url": f"https://gh/{number}"}] if labels == "factory:auto" else []
+
+        async def comment(self, full_name, number, body):
+            attempts.append((self.token, number))
+            if number == 1:
+                raise GitHubError("forbidden", 403)
+
+        async def request(self, *args, **kwargs):
+            return {}
+
+    monkeypatch.setattr(signals_module, "GitHub", FakeGH)
+    assert client.post(f"/api/workspaces/{ws_id}/signals/sync").json()["accepted"] == 1
+    assert client.put(f"{endpoint}/openai_api_key", json={"value": "other-key"}).status_code == 200
+    issue["number"] = 2
+    assert client.post(f"/api/workspaces/{ws_id}/signals/sync").json()["accepted"] == 1
+    assert attempts == [("old-token", 1)]
+    _, old_generation = resolve_token_with_generation(ws_id)
+    response = client.put(f"{endpoint}/github_token", json={"value": "token-new"})
+    assert response.status_code == 200 and response.json()["status"] == "untested"
+    with SessionLocal() as db:
+        signals_module._disable_acknowledgements(db, ws_id, old_generation)
+        signals_module._disable_acknowledgements(db, ws_id, old_generation)
+    issue["number"] = 3
+    assert client.post(f"/api/workspaces/{ws_id}/signals/sync").json()["accepted"] == 1
+    assert attempts == [("old-token", 1), ("token-new", 3)]
+    with session_scope() as s:
+        state = s.get(IssueAcknowledgementState, ws_id)
+        assert not state.disabled and state.generation == old_generation + 1
+        assert s.query(Event).filter_by(workspace_id=ws_id, kind="issue_acknowledgements_disabled").count() == 1
+
+
+def test_concurrent_failures_only_emit_one_warning(client, signed_in):
+    ws_id = signed_in["workspaces"][0]["id"]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fail():
+        with SessionLocal() as db:
+            signals_module._disable_acknowledgements(db, ws_id, 0)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: fail(), range(8)))
+    with session_scope() as s:
+        assert s.get(IssueAcknowledgementState, ws_id).disabled
+        assert s.query(Event).filter_by(workspace_id=ws_id, kind="issue_acknowledgements_disabled").count() == 1
+
+
+def test_inflight_old_credential_403_does_not_disable_replacement(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    endpoint = f"/api/workspaces/{ws_id}/credentials/github_token"
+
+    async def fake_test(kind, value):
+        return "valid", "", {}
+
+    monkeypatch.setattr(api_module, "_test_secret", fake_test)
+    assert client.put(endpoint, json={"value": "old-token"}).status_code == 200
+    with session_scope() as s:
+        s.add(Repository(workspace_id=ws_id, full_name="acme/app", default_branch="main", config={}))
+    old_token, old_generation = resolve_token_with_generation(ws_id)
+    attempts = []
+
+    class FakeGH:
+        def __init__(self, token):
+            self.token = token
+
+        async def issues(self, full_name, labels="", since=None):
+            return [{"number": 1, "title": "First", "html_url": "https://gh/1"},
+                    {"number": 2, "title": "Second", "html_url": "https://gh/2"}] if labels == "factory:auto" else []
+
+        async def comment(self, full_name, number, body):
+            attempts.append((self.token, number))
+            if self.token == "old-token":
+                assert client.put(endpoint, json={"value": "new-token"}).status_code == 200
+                raise GitHubError("forbidden", 403)
+
+        async def request(self, *args, **kwargs):
+            return {}
+
+    monkeypatch.setattr(signals_module, "GitHub", FakeGH)
+    with SessionLocal() as db:
+        result = asyncio.run(signals_module.sync_github(db, ws_id, old_token, generation=old_generation))
+    assert result["accepted"] == 2 and attempts == [("old-token", 1), ("new-token", 1), ("new-token", 2)]
+    with session_scope() as s:
+        assert not s.get(IssueAcknowledgementState, ws_id).disabled
+        assert s.query(Event).filter_by(workspace_id=ws_id, kind="issue_acknowledgements_disabled").count() == 0
+
+
+def test_credential_replacement_after_sync_snapshot_uses_new_token(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    endpoint = f"/api/workspaces/{ws_id}/credentials/github_token"
+
+    async def fake_test(kind, value):
+        return "valid", "", {}
+
+    monkeypatch.setattr(api_module, "_test_secret", fake_test)
+    assert client.put(endpoint, json={"value": "old-token"}).status_code == 200
+    with session_scope() as s:
+        s.add(Repository(workspace_id=ws_id, full_name="acme/app", default_branch="main", config={}))
+    attempts = []
+
+    class FakeGH:
+        def __init__(self, token):
+            self.token = token
+
+        async def issues(self, full_name, labels="", since=None):
+            return [{"number": 1, "title": "First", "html_url": "https://gh/1"}] if labels == "factory:auto" else []
+
+        async def comment(self, full_name, number, body):
+            attempts.append((self.token, number))
+
+        async def request(self, *args, **kwargs):
+            return {}
+
+    def replace_after_snapshot(workspace_id):
+        from fastapi.testclient import TestClient
+
+        snapshot = resolve_token_with_generation(workspace_id)
+        with TestClient(client.app, cookies=client.cookies) as replacement_client:
+            assert replacement_client.put(endpoint, json={"value": "new-token"}).status_code == 200
+        return snapshot
+
+    monkeypatch.setattr(signals_module, "GitHub", FakeGH)
+    monkeypatch.setattr(api_module, "resolve_token_with_generation", replace_after_snapshot)
+    assert client.post(f"/api/workspaces/{ws_id}/signals/sync").json()["accepted"] == 1
+    assert attempts == [("new-token", 1)]
+
+
+def test_invalid_github_save_reenables_but_test_and_delete_do_not(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    endpoint = f"/api/workspaces/{ws_id}/credentials/github_token"
+
+    async def fake_test(kind, value):
+        return "invalid", "invalid token", {}
+
+    monkeypatch.setattr(api_module, "_test_secret", fake_test)
+    assert client.put(endpoint, json={"value": "bad-token"}).status_code == 200
+    with SessionLocal() as db:
+        signals_module._disable_acknowledgements(db, ws_id, 1)
+    assert client.post(f"{endpoint}/test").status_code == 200
+    with session_scope() as s:
+        assert s.get(IssueAcknowledgementState, ws_id).disabled
+    assert client.put(endpoint, json={"value": "bad-token-again"}).json()["status"] == "invalid"
+    with session_scope() as s:
+        assert not s.get(IssueAcknowledgementState, ws_id).disabled
+    with SessionLocal() as db:
+        signals_module._disable_acknowledgements(db, ws_id, 2)
+    assert client.delete(endpoint).status_code == 200
+    with session_scope() as s:
+        assert s.get(IssueAcknowledgementState, ws_id).disabled

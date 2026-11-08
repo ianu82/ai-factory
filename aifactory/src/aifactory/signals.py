@@ -16,8 +16,8 @@ from sqlalchemy.orm import Session
 
 from .db import utcnow
 from .events import notify, record
-from .github import GitHub
-from .models import Outcome, Repository, Signal, User, Workspace
+from .github import GitHub, GitHubError, resolve_token_with_state
+from .models import IssueAcknowledgementState, Outcome, Repository, Signal, User, Workspace
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +59,46 @@ def upsert_signal(db: Session, workspace_id: str, *, source: str, title: str, bo
     return row, True
 
 
-async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, Any]:
+def _state_insert(db: Session):
+    if db.get_bind().dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    elif db.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        raise RuntimeError("Unsupported database for issue acknowledgement state")
+    return insert(IssueAcknowledgementState)
+
+
+def reset_issue_acknowledgements(db: Session, workspace_id: str) -> None:
+    statement = _state_insert(db).values(workspace_id=workspace_id, generation=1, disabled=False)
+    db.execute(statement.on_conflict_do_update(
+        index_elements=[IssueAcknowledgementState.workspace_id],
+        set_={"generation": IssueAcknowledgementState.generation + 1, "disabled": False}))
+
+
+def _disable_acknowledgements(db: Session, workspace_id: str, generation: int) -> bool:
+    statement = _state_insert(db).values(workspace_id=workspace_id, generation=0, disabled=True)
+    statement = statement.on_conflict_do_update(
+        index_elements=[IssueAcknowledgementState.workspace_id], set_={"disabled": True},
+        where=(IssueAcknowledgementState.generation == generation) & (~IssueAcknowledgementState.disabled))
+    # A missing row represents generation zero, not an arbitrary stale generation.
+    if generation != 0:
+        from sqlalchemy import update
+        statement = (update(IssueAcknowledgementState)
+                     .where(IssueAcknowledgementState.workspace_id == workspace_id,
+                            IssueAcknowledgementState.generation == generation,
+                            IssueAcknowledgementState.disabled.is_(False))
+                     .values(disabled=True))
+    result = db.execute(statement)
+    if result.rowcount:
+        record(workspace_id, "issue_acknowledgements_disabled",
+               "Issue comments are disabled because the GitHub token cannot write issues.",
+               level="warn", session=db)
+    db.commit()
+    return bool(result.rowcount)
+
+
+async def sync_github(db: Session, workspace_id: str, token: str, *, generation: int | None = None) -> dict[str, Any]:
     """Pull GitHub issues and failing default-branch CI runs as signals.
 
     Issues labelled ``factory`` become proposed signals. Issues labelled ``factory:auto``
@@ -67,8 +106,21 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
     """
     from .config import get_settings
 
+    direct_token = generation is None
+    if direct_token:
+        generation = (db.query(IssueAcknowledgementState.generation).filter_by(workspace_id=workspace_id).scalar() or 0)
     gh = GitHub(token)
     created = updated = accepted = 0
+    pending_ci: list[dict[str, Any]] = []
+
+    def flush_ci() -> None:
+        nonlocal created, updated
+        for signal in pending_ci:
+            _, new = upsert_signal(db, workspace_id, **signal)
+            created += new
+            updated += not new
+        pending_ci.clear()
+
     for repo in db.query(Repository).filter(Repository.workspace_id == workspace_id):
         cfg = repo.config or {}
         label = cfg.get("signal_label", "factory")
@@ -83,6 +135,7 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                 if issue["number"] in seen:
                     continue
                 seen.add(issue["number"])
+                flush_ci()
                 sig, new = upsert_signal(db, workspace_id, source="github_issue", title=issue["title"],
                                          body=issue.get("body") or "", url=issue["html_url"],
                                          external_id=f"{repo.full_name}#{issue['number']}", repo_id=repo.id)
@@ -113,12 +166,41 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                     db.commit()
                     base = get_settings().public_url
                     link = f"{base}/w/{workspace_id}/outcomes/{outcome.id}" if base.startswith("https") else ""
-                    try:
-                        await gh.comment(repo.full_name, issue["number"],
-                                         f"AI Factory picked this up as outcome #{outcome.number}."
-                                         + (f" Follow progress: {link}" if link else ""))
-                    except Exception:
-                        pass
+                    while True:
+                        if direct_token:
+                            state = (db.query(IssueAcknowledgementState.generation, IssueAcknowledgementState.disabled)
+                                     .filter_by(workspace_id=workspace_id).one_or_none())
+                            current_generation, disabled = state if state else (0, False)
+                            if current_generation == generation:
+                                comment_token = token
+                            else:
+                                try:
+                                    comment_token, current_generation, disabled = resolve_token_with_state(workspace_id)
+                                except GitHubError:
+                                    break
+                        else:
+                            try:
+                                comment_token, current_generation, disabled = resolve_token_with_state(workspace_id)
+                            except GitHubError:
+                                break
+                        if disabled:
+                            break
+                        try:
+                            await GitHub(comment_token).comment(
+                                repo.full_name, issue["number"],
+                                f"AI Factory picked this up as outcome #{outcome.number}."
+                                + (f" Follow progress: {link}" if link else ""))
+                            break
+                        except GitHubError as exc:
+                            if exc.status != 403 or _disable_acknowledgements(db, workspace_id, current_generation):
+                                break
+                            state = (db.query(IssueAcknowledgementState.generation, IssueAcknowledgementState.disabled)
+                                     .filter_by(workspace_id=workspace_id).one_or_none())
+                            latest_generation, disabled = state if state else (0, False)
+                            if disabled or latest_generation == current_generation:
+                                break
+                        except Exception:
+                            break
         try:
             runs = await gh.request("GET", f"/repos/{repo.full_name}/actions/runs",
                                     params={"branch": repo.default_branch, "status": "failure", "per_page": 5})
@@ -134,13 +216,12 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
         for run in (runs or {}).get("workflow_runs", [])[:3]:
             if latest_ok and run.get("created_at", "") < latest_ok:
                 continue  # already fixed by a later green run
-            _, new = upsert_signal(db, workspace_id, source="ci_failure",
+            pending_ci.append(dict(source="ci_failure",
                                    title=f"{run.get('name', 'CI')} failing on {repo.default_branch} in {repo.full_name}",
                                    body=f"Run {run.get('html_url')} failed at {run.get('head_sha', '')[:8]}.",
                                    url=run.get("html_url", ""), external_id=f"{repo.full_name}:ci:{run.get('name')}",
-                                   repo_id=repo.id)
-            created += new
-            updated += not new
+                                   repo_id=repo.id))
+    flush_ci()
     db.commit()
     notify(workspace_id, "signal", "sync")
     return {"created": created, "updated": updated, "accepted": accepted}

@@ -18,7 +18,7 @@ from .config import get_settings
 from .db import get_db, utcnow
 from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
-from .github import GitHub, GitHubError, resolve_token
+from .github import GitHub, GitHubError, resolve_token, resolve_token_with_generation
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, ProviderConfig, resolve_provider
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
@@ -28,7 +28,7 @@ from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
 from .repo_detect import detect
 from .sandbox import isolation_available
 from .security import encrypt, mask
-from .signals import outcome_from_text, sync_github
+from .signals import outcome_from_text, reset_issue_acknowledgements, sync_github
 
 router = APIRouter(prefix="/api")
 SECRET_KINDS = {"mindshub_api_key", "openai_api_key", "github_token"}
@@ -250,6 +250,8 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
     sec.status, sec.status_detail, sec.metadata_json = status, detail, metadata
     sec.tested_at = utcnow()
     sec.updated_by = user.id
+    if kind == "github_token":
+        reset_issue_acknowledgements(db, workspace_id)
     db.commit()
     record(workspace_id, "credential_saved", f"{user.name or user.email} saved the {kind.replace('_', ' ')} ({status})",
            actor=user.id, level="success" if status == "valid" else "warn", data={"kind": kind, "status": status})
@@ -681,7 +683,8 @@ def list_signals(workspace_id: str, user: User = Depends(current_user), db: Sess
 async def sync_signals(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "member")
     try:
-        return await sync_github(db, workspace_id, resolve_token(workspace_id))
+        token, generation = resolve_token_with_generation(workspace_id)
+        return await sync_github(db, workspace_id, token, generation=generation)
     except GitHubError as exc:
         raise HTTPException(400, str(exc))
 

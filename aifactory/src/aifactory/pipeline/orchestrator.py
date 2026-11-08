@@ -125,7 +125,7 @@ class Orchestrator:
             return
         self._last_signal_sync = time.monotonic()
         from ..db import SessionLocal
-        from ..github import GitHubError, resolve_token
+        from ..github import GitHubError, resolve_token_with_generation
         from ..models import Repository
         from ..signals import sync_github
 
@@ -137,7 +137,8 @@ class Orchestrator:
                 continue
             db = SessionLocal()
             try:
-                result = await sync_github(db, workspace_id, resolve_token(workspace_id))
+                token, generation = resolve_token_with_generation(workspace_id)
+                result = await sync_github(db, workspace_id, token, generation=generation)
                 if result.get("accepted"):
                     self.wake()
             except GitHubError as exc:

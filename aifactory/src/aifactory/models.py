@@ -98,6 +98,13 @@ class Secret(Base):
     __table_args__ = (UniqueConstraint("workspace_id", "kind"),)
 
 
+class IssueAcknowledgementState(Base):
+    __tablename__ = "issue_acknowledgement_states"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Repository(Base):
     __tablename__ = "repositories"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
