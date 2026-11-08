@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import socket
 import threading
@@ -13,6 +14,11 @@ import pytest
 
 if not shutil.which("codex"):
     pytest.skip("Codex CLI not installed", allow_module_level=True)
+if os.environ.get("GITHUB_ACTIONS") != "true" and os.environ.get("AIFACTORY_CODEX_TESTS") != "1":
+    # These drive the real CLI end to end. CI installs the pinned version deliberately and runs them; elsewhere
+    # (including Factory sandboxes, where the CLI is present for workers but the environment differs) they are opt-in.
+    pytest.skip("Codex CLI harness tests run in CI; set AIFACTORY_CODEX_TESTS=1 to run them here",
+                allow_module_level=True)
 
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
