@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
 import time
 from typing import Any, Callable
 
@@ -17,7 +18,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import GitHub, GitHubError, resolve_token
-from ..gitops import (DEFAULT_PROTECTED, GitError, Patch, apply_in_sandbox, checkout, extract_patch, protected_violations,
+from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, apply_in_sandbox, checkout, extract_patch, protected_violations,
                       publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
@@ -244,6 +245,7 @@ class TaskRunner:
         self.stage("prepare", f"Preparing a fresh checkout of {self.repo.full_name}")
         if from_branch:
             await checkout(self.builder, self.repo.full_name, token, f"refs/heads/{branch}", branch)
+            await self._bring_branch_up_to_date(branch)
         else:
             base_sha = await checkout(self.builder, self.repo.full_name, token, self.repo.default_branch, branch)
             self.update(base_sha=base_sha, branch=branch)
@@ -261,6 +263,34 @@ class TaskRunner:
         if broken:
             self.feedback.append("- Note: repository setup failed before you started:\n" + "\n".join(
                 f"`{c['command']}` → exit {c['exit_code']}\n```\n{c['tail'][-1500:]}\n```" for c in broken))
+
+    async def _bring_branch_up_to_date(self, branch: str) -> None:
+        """Revise on top of today's base branch. GitHub runs no pull-request checks while a branch conflicts, so a
+        revision pushed from a stale base would wait for CI forever. A clean rebase keeps the earlier work; a
+        conflicting one restarts the work tree from the latest base and tells the builder why."""
+        sb, default = self.builder, self.repo.default_branch
+        found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
+        main = found.output.strip() if found.ok else ""
+        if not main or not self.task.base_sha or main == self.task.base_sha:
+            return
+        author = " ".join(f"-c user.{k}={shlex.quote(v)}" for k, v in
+                          (("name", AUTHOR["GIT_AUTHOR_NAME"]), ("email", AUTHOR["GIT_AUTHOR_EMAIL"])))
+        # --onto: replay only this task's commits, even if the default branch was rewritten since.
+        rebased = await sb.exec(f"git {author} rebase -q --onto {main} {shlex.quote(self.task.base_sha)}", timeout=300)
+        if rebased.ok:
+            self.update(base_sha=main)
+            self.event("rebased", f"Brought {branch} up to date with {default} ({main[:8]}) before revising")
+            return
+        await sb.exec("git rebase --abort", timeout=60)
+        reset = await sb.exec(f"git reset -q --hard {main}", timeout=120)
+        if not reset.ok:
+            raise SandboxError(f"Could not restart {branch} from {default}: {reset.output[-400:]}")
+        self.update(base_sha=main)
+        self.feedback.append(f"- Your previous branch conflicts with newer commits on {default}, so this revision starts "
+                             f"from the latest {default}. Re-implement the change on top of it; all earlier feedback "
+                             "still applies.")
+        self.event("rebuild_on_main", f"{branch} conflicts with {default}; the revision restarts from the latest code",
+                   level="warn")
 
     def _policy_problem(self, patch: Patch) -> str:
         if patch.empty:
@@ -663,6 +693,9 @@ class TaskRunner:
         if outcome == "failure":
             await self._fix_ci(gh)
             return
+        if outcome == "stale":
+            await self._refresh_onto_main(token, gh, self._stale_main)
+            return
         await self.merge()
 
     async def _wait_ci(self, gh: GitHub) -> str:
@@ -694,6 +727,11 @@ class TaskRunner:
                 required = self.cfg.get("require_ci", False)
                 self.evidence("ci", {"state": "none", "head": self.task.head_sha})
                 if required:
+                    # GitHub runs no pull-request checks while a branch conflicts with its base: rebase first.
+                    main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                    if main_sha and main_sha != self.task.base_sha:
+                        self._stale_main = main_sha
+                        return "stale"
                     self.block("unblock", f"{self.task.key}: no CI checks reported",
                                f"PR #{self.task.pr_number} received no CI checks within {grace}s, and this repository "
                                "requires CI before merging.")
@@ -804,8 +842,14 @@ class TaskRunner:
     async def _refresh_onto_main(self, token: str, gh: GitHub, main_sha: str) -> None:
         """Main moved: rebase the verified change, then re-run checks and CI before merging."""
         self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
-        clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
-                                            onto=self.repo.default_branch, task_id=self.task_id)
+        try:
+            clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
+                                                onto=self.repo.default_branch, task_id=self.task_id,
+                                                base=self.task.base_sha or "", head=self.task.head_sha or "")
+        except BranchMoved as exc:
+            self.block("unblock", f"{self.task.key}: PR head changed",
+                       f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
+                       "rebased or merged.", status="needs_input")
         if not clean:
             self._fresh_budget_after_base_moved("conflicts with newer commits")
             self.feedback.append(f"- Your change conflicts with newer commits on {self.repo.default_branch}. "
