@@ -557,7 +557,7 @@ class TaskRunner:
             import httpx
 
             deadline = time.monotonic() + int(release_cfg.get("timeout_minutes", 15)) * 60
-            expect = release_cfg.get("expect_text")
+            expect = (release_cfg.get("expect_text") or "").replace("{merge_sha}", self.task.merge_sha or "") or None
             delay = int(release_cfg.get("initial_delay_seconds", 90))
             await asyncio.sleep(delay)
             last = ""

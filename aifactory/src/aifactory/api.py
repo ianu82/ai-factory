@@ -45,7 +45,12 @@ def _ws(db: Session, user: User, workspace_id: str, minimum: str = "viewer") -> 
 # --- identity ---------------------------------------------------------------
 @router.get("/health")
 def health():
-    return {"ok": True, "orchestrator": orchestrator.status()}
+    import os
+
+    from . import __version__
+
+    return {"ok": True, "version": __version__, "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA", ""),
+            "orchestrator": orchestrator.status()}
 
 
 @router.get("/meta")
