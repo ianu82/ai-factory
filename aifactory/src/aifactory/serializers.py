@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from .models import Artifact, Decision, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace
+from .models import Artifact, Decision, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace
 
 
 def ts(value: datetime | None) -> str | None:
@@ -99,3 +99,10 @@ def signal(s: Signal) -> dict[str, Any]:
     return {"id": s.id, "source": s.source, "title": s.title, "body": s.body, "url": s.url, "count": s.count,
             "status": s.status, "outcome_id": s.outcome_id, "repo_id": s.repo_id, "data": s.data or {},
             "first_seen_at": ts(s.first_seen_at), "last_seen_at": ts(s.last_seen_at)}
+
+
+def memory(entry: MemoryEntry) -> dict[str, Any]:
+    return {"id": entry.id, "workspace_id": entry.workspace_id, "repo_id": entry.repo_id,
+            "scope": "workspace" if entry.repo_id is None else "repository", "run_id": entry.run_id,
+            "kind": entry.kind, "text": entry.text, "topic": entry.topic, "confidence": entry.confidence,
+            "source": entry.source, "created_at": ts(entry.created_at), "updated_at": ts(entry.updated_at)}

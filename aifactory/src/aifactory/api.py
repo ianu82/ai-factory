@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -22,6 +22,7 @@ from .events import bus, event_dict, notify, record
 from .github import GitHub, GitHubError, resolve_token
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, ProviderConfig, resolve_provider
+from .memory import MemoryScopeError, MemoryService
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace)
 from .pipeline.orchestrator import orchestrator
@@ -296,6 +297,31 @@ async def models(workspace_id: str, user: User = Depends(current_user), db: Sess
         return {"provider": None, "models": [], "error": str(exc)}
 
 
+# --- memory -----------------------------------------------------------------------
+@router.get("/workspaces/{workspace_id}/memory")
+def memories(workspace_id: str, repo_id: str | None = None, run_id: str | None = None,
+             limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=1_000_000),
+             user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id)
+    try:
+        return [S.memory(entry) for entry in MemoryService(workspace_id, repo_id, run_id).list(limit=limit, offset=offset)]
+    except MemoryScopeError:
+        raise HTTPException(404, "Memory scope not found") from None
+
+
+@router.delete("/workspaces/{workspace_id}/memory/{entry_id}")
+def delete_memory(workspace_id: str, entry_id: str, user: User = Depends(current_user),
+                  db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    try:
+        deleted = MemoryService(workspace_id).delete(entry_id, actor=user.id)
+    except MemoryScopeError:
+        deleted = False
+    if not deleted:
+        raise HTTPException(404, "Memory entry not found")
+    return {"ok": True}
+
+
 # --- repositories -----------------------------------------------------------------
 @router.get("/workspaces/{workspace_id}/repositories")
 def repositories(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -381,6 +407,7 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
         raise HTTPException(404, "Repository not found")
     if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running"])).first():
         raise HTTPException(409, "Work is running on this repository")
+    MemoryService(workspace_id, repo_id).delete_repository_entries(session=db, actor=user.id)
     db.delete(repo)
     db.commit()
     return {"ok": True}
