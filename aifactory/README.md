@@ -91,8 +91,10 @@ logs) into the next attempt instead of starting over blind. Completion is honest
   the repository's lockfiles and setup commands) when one exists, so unchanged dependencies are
   not reinstalled; a clean setup saves one for next time.
 
-Builders still run per-UID inside the control-plane container. Moving builders into VMs too is
-the next step for untrusted tenants.
+Builders can work in their own VM as well (`build.isolation: "vm"`): the checkout is uploaded,
+setup runs there (or is skipped from the prepared environment) and the patch is extracted for the
+normal publish path. Codex runs in VMs too; it reaches models through the Factory's public HTTPS
+gateway with its run-scoped token, which is revoked when the run ends.
 
 ## Running locally
 
