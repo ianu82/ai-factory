@@ -372,7 +372,7 @@ def test_runtime_qa_boots_the_app_and_attaches_screenshots(factory):
         repo.config = {**repo.config, "qa": {
             "start": "printf '<html><head><title>Greeting</title></head><body><h1>Hello</h1></body></html>' > index.html"
                      " && exec python3 -m http.server $PORT --bind 127.0.0.1",
-            "ready_path": "/", "ready_timeout": 30, "pages": ["/"],
+            "ready_path": "/", "ready_timeout": 30, "pages": ["/"], "required": True,
             "probes": [{"method": "GET", "path": "/", "expect_status": 200}]}}
     outcome_id = new_outcome(factory)
     assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)

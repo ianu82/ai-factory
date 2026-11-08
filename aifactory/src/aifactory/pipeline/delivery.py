@@ -383,7 +383,9 @@ class TaskRunner:
                        f"{len(app.evidence['pages'])} · probes {ok_probes}/{len(app.evidence['probes'])}",
                        level="success" if ok_pages == len(app.evidence["pages"]) and ok_probes == len(app.evidence["probes"]) else "warn")
         else:
-            self.event("qa_app_failed", "The app did not become ready for runtime QA", level="warn")
+            tail = " ".join((app.evidence.get("log_tail") or "").strip().splitlines()[-4:])[-400:]
+            self.event("qa_app_failed", f"The app did not become ready for runtime QA: {tail or 'no output'}",
+                       level="warn")
         return app
 
     async def _store_app_evidence(self, app: AppRun, attempt: int, run_id: str) -> None:
@@ -403,7 +405,9 @@ class TaskRunner:
             "screenshots": len(images), "verifier_screenshots": sum(1 for n, _ in images if n not in rows)}
 
     def _runtime_problem(self, app: AppRun | None, qa_cfg: dict[str, Any]) -> str:
-        if app is None or qa_cfg.get("required") is False:
+        # Runtime QA is evidence for the verifier; it only fails a candidate on its own when marked required
+        # (a broken QA environment must not sink a good change).
+        if app is None or not qa_cfg.get("required"):
             return ""
         if not app.evidence.get("started"):
             return "the app did not start"
