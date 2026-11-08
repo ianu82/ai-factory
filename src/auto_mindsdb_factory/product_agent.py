@@ -85,6 +85,14 @@ class ProductAgent:
     def _turn_policy(self, turn: int, investigated: bool) -> tuple[list, dict | None]:
         return self.tools, None
 
+    def _tool_schema(self, name: str) -> dict:
+        return self.report_schema if name == "finish" else COMMAND_SCHEMA
+
+    def _execute_tool(self, name: str, arguments: dict, command: Callable) -> dict:
+        if name != "run":
+            raise AgentSessionError("Unknown agent tool")
+        return command(arguments["command"])
+
     def _accept_report(self, arguments: dict, context: dict, ran_command: bool) -> None:
         expected = {criterion["id"] for criterion in context["acceptance_criteria"]}
         actual = [criterion["id"] for criterion in arguments["criteria"]]
@@ -182,16 +190,14 @@ class ProductAgent:
                 raise AgentSessionError("Agent requested a tool unavailable for this turn")
             try:
                 arguments = json.loads(call["arguments"])
-                validate(arguments, self.report_schema if call["name"] == "finish" else COMMAND_SCHEMA)
+                validate(arguments, self._tool_schema(call["name"]))
             except (KeyError, ValueError, ValidationError) as exc:
                 raise AgentSessionError("Invalid tool arguments") from exc
             if call["name"] == "finish":
                 self._accept_report(arguments, context, ran_command)
                 self.journal.append(self.report_event, role=role, report=arguments)
                 return arguments
-            if call["name"] != "run":
-                raise AgentSessionError("Unknown agent tool")
-            result = command(arguments["command"])
+            result = self._execute_tool(call["name"], arguments, command)
             ran_command = True
             self.journal.append("agent_command", role=role, **result)
             items.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result)})

@@ -165,6 +165,22 @@ _DEFINITIONS[("planner", "8")] = _definition(
 )
 
 
+_previous_planner = _DEFINITIONS[("planner", "8")]
+_DEFINITIONS[("planner", "9")] = _definition(
+    "planner", "9", _previous_planner["instructions"] + (
+        " When inspect_source is offered, use it for the first source investigation. "
+        "Select small line windows or literal matches for applicable instructions, relevant control flow, "
+        "test patterns and requirements. It executes a fixed read-only command in the same isolated job "
+        "and accounts for serialized UTF-8 output within the existing capture limit. "
+        "Results identify requests by index; ok covers only the returned line window, not necessarily the whole file. "
+        "Omitted, missing or unreadable sections are not investigated evidence and still block readiness when essential. "
+        "No request, report reserve, phase deadline, source permission or later delivery gate is extended."
+    ),
+    supported_tools=["run", "finish", "inspect_source"],
+    **{key: _previous_planner[key] for key in ("purpose", "required_evidence", "constraints")},
+)
+
+
 # Keep historical definitions in _DEFINITIONS when changing an active version.
 _DEFAULT_VERSIONS = {"builder": "1", "verifier": "1", "planner": "1"}
 _DEFAULT = object()
@@ -178,6 +194,9 @@ def select_role(role: str, version: str = _DEFAULT) -> dict:
         raise RoleDefinitionError("Unknown product role or version")
     definition = deepcopy(_DEFINITIONS[(role, version)])
     keys = {"role", "version", "instructions", "purpose", "required_evidence", "supported_tools", "constraints", "digest"}
+    allowed_tools = {"run", "finish"}
+    if (role, version) == ("planner", "9"):
+        allowed_tools.add("inspect_source")
     if not isinstance(definition, dict) or set(definition) != keys:
         raise RoleDefinitionError("Malformed product role definition")
     if (definition["role"] != role or definition["version"] != version
@@ -186,7 +205,7 @@ def select_role(role: str, version: str = _DEFAULT) -> dict:
                    or any(not isinstance(item, str) or not item.strip() for item in definition[k])
                    or len(set(definition[k])) != len(definition[k])
                    for k in ("required_evidence", "supported_tools", "constraints"))
-            or not set(definition["supported_tools"]) <= {"run", "finish"}):
+            or not set(definition["supported_tools"]) <= allowed_tools):
         raise RoleDefinitionError("Malformed product role definition")
     content = {k: v for k, v in definition.items() if k != "digest"}
     if not isinstance(definition["digest"], str) or definition["digest"] != _digest(content):

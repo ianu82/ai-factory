@@ -38,6 +38,7 @@ def test_unknown_role_or_version(role, version):
 @pytest.mark.parametrize("change", [
     {"instructions": ""}, {"required_evidence": []}, {"constraints": [None]},
     {"supported_tools": ["shell", "finish"]}, {"role": "verifier"}, {"version": "2"},
+    {"supported_tools": ["run", "finish", "inspect_source"]},
     {"digest": "wrong"}, {"extra": "value"},
 ])
 def test_malformed_definitions_rejected_even_with_matching_digest(monkeypatch, change):
@@ -96,6 +97,17 @@ def test_inventory_guidance_preserves_historical_capture_role_and_capabilities()
     assert current["instructions"].startswith(previous["instructions"])
     assert {k: v for k, v in current.items() if k not in {"version", "digest", "instructions"}} == {
         k: v for k, v in previous.items() if k not in {"version", "digest", "instructions"}}
+
+
+def test_typed_inspection_role_retains_historical_inventory_and_delivery_roles():
+    previous = select_role("planner", "8")
+    assert previous["digest"] == "60bc43c255b6c9b06f60cdce018f0675d29bc10d3e7e803dbdbc58358cd7218b"
+    current = select_role("planner", "9")
+    assert current["instructions"].startswith(previous["instructions"])
+    assert current["supported_tools"] == ["run", "finish", "inspect_source"]
+    assert all(select_role(role)["supported_tools"] == ["run", "finish"] for role in ("builder", "verifier"))
+    assert {k: v for k, v in current.items() if k not in {"version", "digest", "instructions", "supported_tools"}} == {
+        k: v for k, v in previous.items() if k not in {"version", "digest", "instructions", "supported_tools"}}
 
 
 def test_candidate_files_and_cwd_cannot_replace_trusted_registry(tmp_path):

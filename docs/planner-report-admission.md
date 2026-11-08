@@ -92,3 +92,11 @@ These operation observations describe activity; they do not establish liveness.
 
 Builder and verifier prompts, tools and budgets are unchanged. Existing failed
 runs stay terminal; a new planning policy requires a fresh intake and fresh proof.
+# Bounded source inspection
+
+Planner version 9 offers `inspect_source` on the existing approved Node image. Its first request selects that tool; later requests retain the existing investigation and report-reserve policy. Other images keep `run` and `finish`. Builder and verifier tools remain unchanged.
+
+The planner selects relative paths, one-based line windows and optional literal matches. The controller constructs a fixed Node command and passes it through the same read-only job command owner, deadlines and cancellation. It reads no controller files. Results identify selections by request index and report returned line ranges, total line counts and explicit omissions. `ok` describes the requested window, not necessarily the whole file.
+
+Serialized UTF-8 output stays below the existing capture limit. A section that does not fit is marked `omitted_budget` while other readable selections remain available. Missing essential source still requires an unverified or blocked plan. The helper adds no request, token, time, network, source-write or publication authority.
+

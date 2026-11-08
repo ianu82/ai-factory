@@ -247,3 +247,71 @@ def test_consumer_still_rejects_duplicate_mapping_with_different_evidence(tmp_pa
         agent.run("planner", agent.task.public_context, lambda _: {"exit_code": 0})
     assert len(requests) == 2
     assert not any(e["kind"] == "planner_report" for e in journal.events())
+
+
+NODE_IMAGE = "node@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da"
+
+
+def test_node_planner_uses_typed_inspection_through_the_existing_command_owner(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for the source-reader contract")
+    (tmp_path / "parser.py").write_text("source evidence\n")
+    selection = {"sections": [{"path": "parser.py", "start_line": 1, "line_count": 10, "match": None}]}
+    agent, requests, journal = setup(tmp_path, [("inspect_source", selection), ("finish", plan())],
+                                     image=NODE_IMAGE, max_agent_turns=2)
+    deadline = agent.deadline
+    commands = []
+    def command(argv):
+        commands.append(argv)
+        result = subprocess.run([node, *argv[1:]], cwd=tmp_path, env={"PATH": os.environ["PATH"]},
+                                capture_output=True, text=True, timeout=5)
+        assert json.loads(result.stdout)["sections"][0]["text"] == "source evidence"
+        return {"command": argv, "exit_code": result.returncode, "stdout": result.stdout}
+    assert agent.run("planner", agent.task.public_context, command) == plan()
+    assert [t["name"] for t in requests[0]["tools"]] == ["inspect_source"]
+    assert [t["name"] for t in requests[1]["tools"]] == ["finish"]
+    assert len(commands) == 1 and commands[0][:2] == ["node", "-e"]
+    assert agent.deadline == deadline and agent.max_turns == 2
+    assert journal.summary()["total_tokens"] == 20 and (tmp_path / "parser.py").read_text() == "source evidence\n"
+
+
+@pytest.mark.parametrize("image", ["python@sha256:" + "a" * 64, "node@sha256:" + "a" * 64])
+def test_unproven_image_does_not_offer_or_execute_the_node_reader(tmp_path, image):
+    agent, requests, journal = setup(tmp_path, [("inspect_source", {"sections": []})], image=image)
+    with pytest.raises(AgentSessionError, match="unavailable for this turn"):
+        agent.run("planner", agent.task.public_context, lambda _: pytest.fail("command invoked"))
+    assert [t["name"] for t in requests[0]["tools"]] == ["run", "finish"]
+    assert journal.summary()["total_tokens"] == 10
+
+
+@pytest.mark.parametrize("mutation", ["extra", "traversal"])
+def test_invalid_source_selection_cannot_run_or_add_a_retry(tmp_path, mutation):
+    selection = {"sections": [{"path": "../private", "start_line": 1, "line_count": 10, "match": None}]}
+    if mutation == "extra":
+        selection["sections"][0]["path"] = "parser.py"
+        selection["limit"] = 999999
+    agent, requests, journal = setup(tmp_path, [("inspect_source", selection)], image=NODE_IMAGE)
+    with pytest.raises((AgentSessionError, ValueError)):
+        agent.run("planner", agent.task.public_context, lambda _: pytest.fail("command invoked"))
+    assert len(requests) == 1 and journal.summary()["total_tokens"] == 10
+    assert not any(e["kind"] == "planner_report" for e in journal.events())
+
+
+def test_typed_inspection_keeps_the_original_time_reserve(tmp_path, monkeypatch):
+    selection = {"sections": [{"path": "parser.py", "start_line": 1, "line_count": 10, "match": None}]}
+    agent, requests, _ = setup(tmp_path, [("inspect_source", selection), ("finish", plan())], image=NODE_IMAGE)
+    deadline = agent.deadline
+    clock = {"now": deadline - 100}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    def command(argv):
+        clock["now"] = deadline - 20
+        return {"command": argv, "exit_code": 0}
+    assert agent.run("planner", agent.task.public_context, command) == plan()
+    assert [t["name"] for t in requests[-1]["tools"]] == ["finish"]
+    assert json.loads(requests[-1]["input"][-1]["content"])["planning_budget"] == {
+        "requests_remaining": 7, "seconds_remaining": 20, "report_only": True}
+    assert agent.deadline == deadline and agent.max_turns == 8

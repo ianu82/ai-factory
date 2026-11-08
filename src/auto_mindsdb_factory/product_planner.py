@@ -8,16 +8,21 @@ from .product_agent import AgentSessionError, ProductAgent, RoleSnapshotError, T
 from .product_plan import PLAN_SCHEMA, ProductPlan
 from .product_roles import select_role
 from .docker_runner import DockerSandbox
+from .planning_source_reader import SOURCE_READ_SCHEMA, source_read_command
 
-PLANNER_VERSION = "8"
+PLANNER_VERSION = "9"
 REPORT_RESERVE_SECONDS = 60
+_NODE_READER_IMAGE = "node@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da"
 
 
 class ProductPlanner(ProductAgent):
     report_schema = PLAN_SCHEMA
     report_event = "planner_report"
     tools = [TOOLS[0], {**TOOLS[1], "parameters": PLAN_SCHEMA,
-                      "description": "Finish with bounded planning guidance; unresolved questions block implementation."}]
+                      "description": "Finish with bounded planning guidance; unresolved questions block implementation."},
+             {"type": "function", "name": "inspect_source", "strict": True,
+              "description": "Read source sections in the read-only job. Lines are one-based; match is a literal first match at or after start_line, or null. Results use request index. Only selected lines are evidence; explicit omissions remain unread.",
+              "parameters": SOURCE_READ_SCHEMA}]
 
     def __init__(self, connector, journal, *, task, base_sha, profile, deadline, cancelled=lambda: False):
         settings = profile.document
@@ -41,6 +46,17 @@ class ProductPlanner(ProductAgent):
         validation["minItems"] = validation["maxItems"] = len(criterion_ids)
         properties = validation["items"]["properties"]
         properties["criterion_id"] = {**properties["criterion_id"], "enum": criterion_ids}
+        # Offer the Node command only on the already approved, pinned Node image.
+        if settings["image"] != _NODE_READER_IMAGE:
+            self.tools = self.tools[:2]
+
+    def _tool_schema(self, name):
+        return SOURCE_READ_SCHEMA if name == "inspect_source" else super()._tool_schema(name)
+
+    def _execute_tool(self, name, arguments, command):
+        if name == "inspect_source":
+            return command(source_read_command(arguments))
+        return super()._execute_tool(name, arguments, command)
 
     def _instructions(self, role):
         if role != "planner":
@@ -57,7 +73,10 @@ class ProductPlanner(ProductAgent):
     def _turn_policy(self, turn, investigated):
         remaining = max(0, self.deadline - time.monotonic())
         report_only = investigated and (turn == self.max_turns - 1 or remaining <= REPORT_RESERVE_SECONDS)
-        return (self.tools[1:] if report_only else self.tools), {"planning_budget": {
+        tools = self.tools[1:2] if report_only else self.tools
+        if not investigated and len(self.tools) == 3:
+            tools = self.tools[2:]
+        return tools, {"planning_budget": {
             "requests_remaining": self.max_turns - turn, "seconds_remaining": round(remaining, 3),
             "report_only": report_only}, "command_output": {
                 "max_bytes_per_stream": DockerSandbox.MAX_CAPTURED_OUTPUT_BYTES,
