@@ -107,8 +107,17 @@ class FakeGitHub:
     async def set_status(self, *args, **kwargs):
         return None
 
-    async def comment(self, *args, **kwargs):
+    comments: list[tuple[int, str]] = []
+
+    async def comment(self, full_name=None, number=None, body="", *args, **kwargs):
+        FakeGitHub.comments.append((number, body))
         return None
+
+    async def request(self, method, path, *, json=None, params=None, **kwargs):
+        if method == "PATCH" and "/pulls/" in path and (json or {}).get("state") == "closed":
+            self.pulls[int(path.rsplit("/", 1)[1])]["state"] = "closed"
+            return {}
+        raise AssertionError(f"unexpected request {method} {path}")
 
     async def checks(self, full_name, sha):
         return CheckSummary(self.check_state, [{"name": "ci", "status": "completed", "conclusion": self.check_state,

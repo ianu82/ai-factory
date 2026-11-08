@@ -468,14 +468,18 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
 
 
 @router.post("/workspaces/{workspace_id}/outcomes/{outcome_id}/cancel")
-def cancel_outcome(workspace_id: str, outcome_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def cancel_outcome(workspace_id: str, outcome_id: str, user: User = Depends(current_user),
+                         db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "member")
     o = db.get(Outcome, outcome_id)
     if o is None or o.workspace_id != workspace_id:
         raise HTTPException(404, "Outcome not found")
     o.status = "cancelled"
+    with_prs = []
     for t in db.query(Task).filter(Task.outcome_id == o.id, Task.status.notin_(["completed", "abandoned"])):
         t.status = "cancelled"
+        if t.pr_number:
+            with_prs.append(t.id)
     for d in db.query(Decision).filter(Decision.outcome_id == o.id, Decision.status == "open"):
         d.status = "superseded"
     db.commit()
@@ -483,11 +487,16 @@ def cancel_outcome(workspace_id: str, outcome_id: str, user: User = Depends(curr
     record(workspace_id, "outcome_cancelled", f"{user.name or user.email} cancelled #{o.number}", outcome_id=o.id,
            actor=user.id, level="warn")
     notify(workspace_id, "outcome", o.id)
+    if with_prs:
+        from .pipeline.handover import close_dropped_pull
+
+        for task_id in with_prs:
+            await close_dropped_pull(task_id, user.name or user.email, "Cancelled")
     return {"ok": True}
 
 
 @router.post("/workspaces/{workspace_id}/tasks/{task_id}/cancel")
-def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "member")
     t = db.get(Task, task_id)
     if t is None or t.workspace_id != workspace_id:
@@ -500,6 +509,10 @@ def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_us
            task_id=t.id, actor=user.id, level="warn")
     notify(workspace_id, "task", t.id, outcome_id=t.outcome_id)
     orchestrator.wake()
+    if t.status == "cancelled" and t.pr_number:
+        from .pipeline.handover import close_dropped_pull
+
+        await close_dropped_pull(t.id, user.name or user.email, "Cancelled")
     return {"ok": True}
 
 
@@ -619,6 +632,11 @@ async def resolve_decision(workspace_id: str, decision_id: str, body: Resolution
         from .pipeline.handover import publish_candidate
 
         result["handover"] = await publish_candidate(d.task_id, info)
+    dropped = result.pop("dropped", None)
+    if dropped:
+        from .pipeline.handover import close_dropped_pull
+
+        result["pr_closed"] = await close_dropped_pull(dropped, user.name or user.email, "Abandoned")
     return result
 
 
