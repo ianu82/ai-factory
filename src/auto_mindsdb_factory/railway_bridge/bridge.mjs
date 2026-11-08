@@ -8,17 +8,21 @@ import {bridgeProgress} from './progress.mjs';
 
 const MAX_MESSAGE_BYTES = 100 * 1024 * 1024;
 let progress = () => {};
+let createStage = null;
+function creationStage(stage) { createStage = stage; progress(stage); }
 const observations = execObservations(() => progress());
 const options = {...clientOptions(), webSocketImpl: observations.WebSocketImpl};
 
 async function dispatch(request) {
   const remainingBudget = execBudget(request.budget_ms);
   if (request.action === 'create') {
+    creationStage('create_allocating');
     const sandbox = await Sandbox.create({
       ...options, resources: {cpu: 4, memoryGB: 8}, idleTimeoutMinutes: 5,
       networkIsolation: 'ISOLATED', region: 'us-west2', env: {}, domains: [],
     });
     try {
+      creationStage('create_files');
       const directory = '/opt/ai-factory/auto_mindsdb_factory';
       await sandbox.files.mkdir(directory);
       await sandbox.files.write(`${directory}/__init__.py`, '');
@@ -26,6 +30,7 @@ async function dispatch(request) {
         const code = await readFile(new URL(`../${name}.py`, import.meta.url));
         await sandbox.files.write(`${directory}/${name}.py`, code, {mode: 0o644});
       }
+      creationStage('create_bootstrap');
       await checkedExec(sandbox,
         'set -eu; if ! test -x /usr/bin/python3; then apt-get update -qq && ' +
         'DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends python3 >/dev/null; fi; ' +
@@ -35,9 +40,15 @@ async function dispatch(request) {
         'usermod -aG docker factory && install -d -o factory -g factory /work && ' +
         'runuser -u factory -- docker info >/dev/null && runuser -u factory -- /usr/bin/python3 --version',
         undefined, 180);
+      creationStage('create_ready');
       return {id: sandbox.id};
     } catch (error) {
-      await sandbox.destroy();
+      const failedStage = createStage;
+      creationStage(`${failedStage}_destroying`);
+      try {
+        await sandbox.destroy();
+        creationStage(`${failedStage}_destroy_returned`);
+      } catch { /* Keep the primary failure; retirement is unconfirmed. */ }
       throw error;
     }
   }
@@ -82,7 +93,7 @@ try {
   const response = await dispatch(request);
   process.stdout.write(JSON.stringify(response));
 } catch (error) {
-  progress('failed');
+  progress(createStage ?? 'failed');
   process.stdout.write(JSON.stringify({error: error.constructor.name, ...execFailureObservations(error, observations)}));
   process.exitCode = 1;
 }

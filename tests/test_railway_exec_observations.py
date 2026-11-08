@@ -15,6 +15,51 @@ def observations():
         "counters_saturated": False, "observation_failed": False}
 
 
+@pytest.mark.parametrize('stage', ['create_allocating', 'create_files_destroying',
+                                  'create_files_destroy_returned', 'create_bootstrap_destroy_returned'])
+def test_public_create_bridge_binds_phase_progress_without_changing_budget(monkeypatch, stage):
+    monkeypatch.setenv('RAILWAY_API_TOKEN', 'test-only')
+    monkeypatch.setenv('RAILWAY_ENVIRONMENT_ID', 'test-only')
+    def stopped(command, *, input, timeout, **options):
+        request = json.loads(input)
+        assert request['action'] == 'create' and request['timeout'] == 300 and timeout == 360
+        nonce = request.get('progress_nonce')
+        assert type(nonce) is str and len(nonce) == 32
+        frame = {'nonce': nonce, 'sequence': 2, 'stage': stage, 'exec_observations': observations()}
+        return SimpleNamespace(returncode=1, stdout=json.dumps({'error': 'RailwayConnectionError'}),
+            stderr='private-provider-text\nFACTORY_BRIDGE_PROGRESS ' + json.dumps(frame) + '\n')
+    monkeypatch.setattr(runner.subprocess, 'run', stopped)
+    with pytest.raises(runner.RailwayOperationError) as raised:
+        runner.bridge({'action': 'create', 'timeout': 300})
+    assert runner.railway_failure_facts(raised.value) == ('create', 'RailwayConnectionError')
+    facts = runner.railway_bridge_progress(raised.value)
+    assert facts['stage'] == stage and facts['partial'] is True
+    assert runner.railway_exec_observations(raised.value) is None
+    assert 'private-provider' not in str(raised.value) + repr(vars(raised.value))
+
+
+def test_create_timeout_retains_real_subprocess_byte_progress(monkeypatch):
+    import subprocess
+    import sys
+    monkeypatch.setenv('RAILWAY_API_TOKEN', 'test-only')
+    monkeypatch.setenv('RAILWAY_ENVIRONMENT_ID', 'test-only')
+    actual_run = subprocess.run
+    def timed_out(command, *, input, **options):
+        request = json.loads(input)
+        frame = {'nonce': request['progress_nonce'], 'sequence': 1, 'stage': 'create_files',
+                 'exec_observations': observations()}
+        program = 'import sys,time;sys.stderr.write(' + repr(
+            'FACTORY_BRIDGE_PROGRESS ' + json.dumps(frame) + '\n') + ');sys.stderr.flush();time.sleep(10)'
+        return actual_run([sys.executable, '-c', program], capture_output=True, text=True, timeout=.2)
+    monkeypatch.setattr(runner.subprocess, 'run', timed_out)
+    with pytest.raises(runner.RailwayOperationError) as raised:
+        runner.bridge({'action': 'create', 'timeout': 300})
+    assert runner.railway_failure_facts(raised.value) == ('create', 'TimeoutExpired')
+    facts = runner.railway_bridge_progress(raised.value)
+    assert facts['stage'] == 'create_files' and facts['partial'] is True
+    assert runner.railway_exec_observations(raised.value) is None
+
+
 @pytest.mark.parametrize("category", ["ExecNotStartedError", "ExecInterruptedError", "ExecControlUnsupportedError"])
 def test_bridge_preserves_bounded_exec_observations_and_original_error(monkeypatch, category):
     facts = observations()

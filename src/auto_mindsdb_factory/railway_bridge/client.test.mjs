@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
+import {spawnSync} from 'node:child_process';
 import test from 'node:test';
 import {Sandbox, ExecInterruptedError, ExecNotStartedError, ExecControlUnsupportedError} from 'railway';
 import {WebSocketServer} from 'ws';
@@ -7,6 +8,47 @@ import {clientOptions} from './client.mjs';
 import {execObservations, execFailureObservations} from './exec-observations.mjs';
 import {checkedExec, execBudget} from './exec.mjs';
 import {bridgeProgress} from './progress.mjs';
+
+for (const phase of ['allocation', 'files', 'bootstrap', 'success']) {
+  for (const cleanupFails of phase === 'files' ? [false, true] : [false]) {
+    test(`public create bridge retains ${phase} stage and cleanup=${!cleanupFails}`, () => {
+      const program = `
+        import assert from 'node:assert/strict';
+        import {Sandbox, RailwayConnectionError} from 'railway';
+        const phase = ${JSON.stringify(phase)}, cleanupFails = ${cleanupFails};
+        const fail = () => {throw new RailwayConnectionError({message: 'private-provider-text'});};
+        Sandbox.create = async options => {
+          assert.deepEqual(options.resources, {cpu: 4, memoryGB: 8});
+          assert.equal(options.idleTimeoutMinutes, 5);
+          assert.equal(options.networkIsolation, 'ISOLATED');
+          assert.deepEqual(options.env, {}); assert.deepEqual(options.domains, []);
+          if (phase === 'allocation') fail();
+          return {id: 'test-worker', files: {
+            mkdir: async () => {if (phase === 'files') fail();}, write: async () => {},
+          }, exec: () => {
+            if (phase === 'bootstrap') fail();
+            return Promise.resolve({exitCode: 0, stdout: 'ready', truncated: false, timedOut: false});
+          }, destroy: async () => {if (cleanupFails) throw new Error('private-cleanup-text');}};
+        };
+        await import('./bridge.mjs');`;
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e', program], {
+        cwd: new URL('.', import.meta.url), input: JSON.stringify({action: 'create', progress_nonce: 'c'.repeat(32)}),
+        encoding: 'utf8', timeout: 3000, env: {PATH: process.env.PATH},
+      });
+      assert.equal(result.status, phase === 'success' ? 0 : 1);
+      const response = JSON.parse(result.stdout);
+      if (phase === 'success') assert.equal(response.id, 'test-worker');
+      else assert.equal(response.error, 'RailwayConnectionError');
+      const frames = result.stderr.split('\n').filter(line => line.startsWith('FACTORY_BRIDGE_PROGRESS '))
+        .map(line => JSON.parse(line.slice('FACTORY_BRIDGE_PROGRESS '.length)));
+      const stage = phase === 'allocation' ? 'create_allocating' : phase === 'success' ? 'create_ready'
+        : `create_${phase}_${cleanupFails ? 'destroying' : 'destroy_returned'}`;
+      assert.equal(frames.at(-1).stage, stage);
+      assert.ok(frames.every(frame => frame.nonce === 'c'.repeat(32)));
+      assert.doesNotMatch(result.stdout + result.stderr, /private-provider|private-cleanup/);
+    });
+  }
+}
 
 async function fixture(t, mode, observations) {
   const server = createServer();

@@ -32,6 +32,10 @@ _exec_counters = ("connections", "opened", "errors", "closed", "http_rejections"
     "capabilities_frames", "typed_error_frames", "hello_send_attempts", "init_send_attempts",
     "init_send_returned", "unclassified_control_sends")
 _exec_fields = _exec_counters + ("last_http_status", "last_close_code", "counters_saturated", "observation_failed")
+_progress_stages = {"dispatch", "connect", "connected", "exec", "returned", "failed",
+    "create_allocating", "create_files", "create_bootstrap", "create_ready",
+    *(f"create_{phase}_{state}" for phase in ("files", "bootstrap", "ready")
+      for state in ("destroying", "destroy_returned"))}
 
 
 def _freeze_exec_observations(value):
@@ -50,6 +54,11 @@ def _freeze_exec_observations(value):
 
 def _bridge_progress(stderr, nonce):
     # Never retain raw stderr, the nonce, or an incomplete/foreign frame.
+    if type(stderr) is bytes and len(stderr) <= 65536:
+        try:
+            stderr = stderr.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
     if type(stderr) is not str or len(stderr) > 65536 or type(nonce) is not str:
         return None
     latest = None
@@ -62,7 +71,7 @@ def _bridge_progress(stderr, nonce):
                     or frame['nonce'] != nonce or type(frame['sequence']) is not int
                     or not 1 <= frame['sequence'] <= 64 or (latest and frame['sequence'] <= latest[0])
                     or type(frame['stage']) is not str
-                    or frame['stage'] not in {'dispatch', 'connect', 'connected', 'exec', 'returned', 'failed'}):
+                    or frame['stage'] not in _progress_stages):
                 return None
             observations = _freeze_exec_observations(frame['exec_observations'])
             if observations is None:
@@ -76,7 +85,7 @@ def _bridge_progress(stderr, nonce):
 def _freeze_bridge_progress(value):
     if (type(value) is not tuple or len(value) != 3 or type(value[0]) is not int
             or not 1 <= value[0] <= 64 or type(value[1]) is not str
-            or value[1] not in {'dispatch', 'connect', 'connected', 'exec', 'returned', 'failed'}
+            or value[1] not in _progress_stages
             or type(value[2]) is not tuple or len(value[2]) != len(_exec_fields)):
         return None
     observations = _freeze_exec_observations(dict(zip(_exec_fields, value[2])))
@@ -191,13 +200,13 @@ def bridge(request):
     deadline = request.pop("deadline", None)
     nonce = None
     try:
+        nonce = request['progress_nonce'] = secrets.token_hex(16)
         command = ["node", str(Path(__file__).with_name("railway_bridge") / "bridge.mjs")]
         if deadline is None:
             result = subprocess.run(command, input=json.dumps(request), capture_output=True,
                 text=True, env=environment, timeout=timeout)
         else:
             _execution_budget(deadline, timeout)  # Validate before allocating a bridge process.
-            nonce = request['progress_nonce'] = secrets.token_hex(16)
             result = _bounded_bridge(command, input=json.dumps(request), env=environment,
                 timeout=timeout, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as error:
