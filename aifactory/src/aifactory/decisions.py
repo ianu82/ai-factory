@@ -99,6 +99,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                 task.status, task.blocked_reason = "queued", ""
             elif resolution == "abandon":
                 task.status = "abandoned"
+            elif resolution == "revert":
+                task.status, task.stage, task.blocked_reason = "queued", "revert", ""
             elif resolution in ("acknowledge", "fix"):
                 task.blocked_reason = ""
                 if resolution == "fix":

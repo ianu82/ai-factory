@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 ACTIVE_TASK = {"queued", "running"}
 DONE_TASK = {"completed"}
-TERMINAL_TASK = {"completed", "abandoned", "cancelled"}
+TERMINAL_TASK = {"completed", "abandoned", "cancelled", "reverted"}
 HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_failed"}
 
 

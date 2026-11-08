@@ -56,6 +56,7 @@ export const TASK_STATUS: Record<string, { label: string; tone: Tone }> = {
   failed: { label: "Did not pass", tone: "bad" },
   blocked: { label: "Blocked", tone: "bad" },
   smoke_failed: { label: "Merged · smoke failed", tone: "bad" },
+  reverted: { label: "Reverted after smoke failed", tone: "warn" },
   completed: { label: "Delivered", tone: "good" },
   abandoned: { label: "Abandoned", tone: "idle" },
   cancelled: { label: "Cancelled", tone: "idle" },

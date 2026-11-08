@@ -18,7 +18,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import GitHub, GitHubError, resolve_token
 from ..gitops import (DEFAULT_PROTECTED, GitError, Patch, apply_in_sandbox, checkout, extract_patch, protected_violations,
-                      publish, rebase_branch)
+                      publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
@@ -137,6 +137,8 @@ class TaskRunner:
                 await self.release()
             elif stage == "revise":
                 await self.deliver(continue_from_branch=True)
+            elif stage == "revert":
+                await self.revert()
             else:
                 await self.deliver()
         except Stop:
@@ -681,13 +683,63 @@ class TaskRunner:
             failed = [r for r in results if not r["ok"]]
             _signal(self.ws, self.repo.id, "smoke_failure", f"Smoke failed after merging {self.task.title}",
                     "\n\n".join(f"`{r['command']}`\n{r['tail'][-1500:]}" for r in failed), self.task.pr_url)
+            if (self.cfg.get("recovery") or {}).get("smoke_failure") == "revert":
+                self.event("recovery", "Smoke failed; the repository's recovery policy reverts the merge", level="warn")
+                await self.revert()
+                return
             self.block("unblock", f"Smoke checks failed after merging {self.task.key}",
-                       "The change is merged but post-merge smoke checks failed. Review the failure; a revert or "
-                       "follow-up fix may be needed.", status="smoke_failed",
-                       options=[{"value": "acknowledge", "label": "Acknowledge"},
-                                {"value": "fix", "label": "Create a fix outcome"}])
+                       "The change is merged but post-merge smoke checks failed. Revert it, create a follow-up fix, "
+                       "or acknowledge.", status="smoke_failed",
+                       options=[{"value": "revert", "label": "Revert the merge"},
+                                {"value": "fix", "label": "Create a fix outcome"},
+                                {"value": "acknowledge", "label": "Acknowledge"}])
         self.event("smoke_passed", "Post-merge smoke checks passed", level="success")
         await self.release()
+
+    async def revert(self) -> None:
+        """Bounded recovery: open a revert PR for the merged change, wait for CI, merge it and re-run smoke."""
+        if not self.task.merge_sha:
+            self.block("unblock", f"{self.task.key}: nothing to revert", "No merge commit is recorded for this task.")
+        self.stage("revert", f"Reverting {self.task.merge_sha[:8]} from {self.repo.default_branch}")
+        token = resolve_token(self.ws)
+        gh = GitHub(token)
+        branch = f"factory/revert-{self.outcome.number}-{self.task.key.lower()}-{self.task_id[:6]}"
+        try:
+            head = await revert_commit(self.repo.full_name, token, base=self.repo.default_branch,
+                                       sha=self.task.merge_sha, branch=branch, task_id=self.task_id)
+            pr = await gh.create_pull(self.repo.full_name, head=branch, base=self.repo.default_branch,
+                                      title=f"Revert: {self.task.title}",
+                                      body=(f"Post-merge smoke checks failed after #{self.task.pr_number} "
+                                            f"({self.task.merge_sha[:10]}). The Factory is reverting it under the "
+                                            "repository's recovery policy or a recorded decision."
+                                            + (f"\n\n[View in AI Factory]({self._task_url()})" if self._task_url() else "")))
+        except (GitError, GitHubError) as exc:
+            self.block("unblock", f"{self.task.key}: could not open a revert", str(exc), status="smoke_failed",
+                       options=[{"value": "acknowledge", "label": "Acknowledge"}])
+        self.event("revert_opened", f"Opened revert PR #{pr['number']}", level="warn", url=pr["html_url"])
+        deadline = time.monotonic() + self.settings["limits"].get("ci_minutes", 45) * 60
+        state = "pending"
+        while time.monotonic() < deadline:
+            summary = await gh.checks(self.repo.full_name, head)
+            state = summary.state
+            if state in ("success", "failure") or (state == "none" and time.monotonic() > deadline - 2400):
+                break
+            await asyncio.sleep(20)
+        if state == "failure":
+            self.block("unblock", f"{self.task.key}: the revert failed CI",
+                       f"Revert PR #{pr['number']} did not pass CI; the original change is still merged.",
+                       status="smoke_failed", options=[{"value": "acknowledge", "label": "Acknowledge"}])
+        try:
+            result = await gh.merge(self.repo.full_name, pr["number"], sha=head, method="squash",
+                                    title=f"Revert: {self.task.title} (#{pr['number']})")
+        except GitHubError as exc:
+            self.block("unblock", f"{self.task.key}: could not merge the revert", str(exc), status="smoke_failed",
+                       options=[{"value": "acknowledge", "label": "Acknowledge"}])
+        self.evidence("revert", {"pr": pr["number"], "sha": result.get("sha", ""), "ci": state, "at": utcnow().isoformat()})
+        self.update(status="reverted", stage="done", finished_at=utcnow(),
+                    summary=f"Reverted after post-merge smoke failed (revert PR #{pr['number']})")
+        self.event("reverted", f"Reverted via PR #{pr['number']}; {self.repo.default_branch} is back to its previous behaviour",
+                   level="warn", url=pr["html_url"])
 
     async def release(self) -> None:
         release_cfg = self.cfg.get("release") or {}

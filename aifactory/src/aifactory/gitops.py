@@ -207,3 +207,23 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
         return True, head
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+async def revert_commit(full_name: str, token: str, *, base: str, sha: str, branch: str, task_id: str) -> str:
+    """Create ``branch`` from the latest ``base`` with ``sha`` reverted, push it, return the new head."""
+    mirror_path = await mirror(full_name, token)
+    staging = get_settings().data_dir / "staging" / (task_id + "-revert")
+    shutil.rmtree(staging, ignore_errors=True)
+    env = git_auth_env(token)
+    await git("clone", "--no-hardlinks", "--quiet", str(mirror_path), str(staging), env=env, timeout=900)
+    try:
+        await git("checkout", "-q", "-B", branch, f"origin/{base}", cwd=staging)
+        parents = (await git("rev-list", "--parents", "-n", "1", sha, cwd=staging)).split()
+        mainline = ["-m", "1"] if len(parents) > 2 else []
+        await git("revert", "--no-edit", *mainline, sha, cwd=staging, env=AUTHOR)
+        head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
+        await git("remote", "set-url", "origin", remote_url(full_name), cwd=staging)
+        await git("push", "--force", "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=env)
+        return head
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)

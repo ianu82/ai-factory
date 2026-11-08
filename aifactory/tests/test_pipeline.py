@@ -434,3 +434,19 @@ def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         assert task.status == "queued", task.status
+
+
+def test_smoke_failure_is_reverted_under_recovery_policy(factory):
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        # Checks pass before merge; the post-merge smoke check fails for the new greeting.
+        repo.config = {**repo.config, "smoke": ["! grep -q Factory greet.sh"], "recovery": {"smoke_failure": "revert"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("partially_completed", "completed", "attention"), timeout=90)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "reverted", (task.status, task.blocked_reason)
+        assert task.evidence["revert"]["pr"] == 2 and task.evidence["smoke"]["state"] == "failed"
+    assert FakeGitHub.merged == [1, 2]
+    main_greet = git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+    assert main_greet.strip() == "echo 'Hello'"
