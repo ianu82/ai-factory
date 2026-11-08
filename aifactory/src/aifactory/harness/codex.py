@@ -49,6 +49,8 @@ class CodexHarness:
             raise HarnessUnavailable(why)
         if not session.gateway_url or not session.gateway_token:
             raise HarnessUnavailable("Codex requires the Factory inference gateway")
+        if getattr(session.sandbox, "kind", "local") == "vm":
+            raise HarnessUnavailable("Codex sessions run in a local sandbox, not a VM")
         sandbox = session.sandbox
         scratch = f"{SCRATCH}/codex"
         sandbox.write_text(f"{scratch}/schema.json", json.dumps(_strict(session.report_schema)))

@@ -28,15 +28,19 @@ RUN uv pip install --system --no-deps --require-hashes --only-binary=:all: -r /t
  && uv pip install --system --no-deps --no-build-isolation \
       "anton-agent @ git+https://github.com/mindsdb/anton@537cc1fb11849e9d152870738af22ca55c1d59d8" \
  && python -c "import anton.core.session"
-COPY pyproject.toml ./
-COPY src ./src
-COPY --from=web /web-dist ./src/aifactory/web
-RUN uv pip install --system . && uv pip check --system || true
 # Runtime QA: headless Chromium for screenshots, shared read-only with job sandboxes.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN uv pip install --system "playwright==1.64.1" \
  && python -m playwright install --with-deps chromium \
  && chmod -R a+rX /ms-playwright
+# VM bridge: Railway sandbox SDK, used for verification and runtime QA in isolated VMs.
+COPY vmbridge/package.json vmbridge/package-lock.json ./vmbridge/
+RUN npm ci --prefix vmbridge --no-audit --no-fund --ignore-scripts
+COPY vmbridge/sidecar.mjs ./vmbridge/
+COPY pyproject.toml ./
+COPY src ./src
+COPY --from=web /web-dist ./src/aifactory/web
+RUN uv pip install --system . && uv pip check --system || true
 ENV AIFACTORY_DATA_DIR=/data/aifactory \
     AIFACTORY_ENV=production \
     PYTHONUNBUFFERED=1 \

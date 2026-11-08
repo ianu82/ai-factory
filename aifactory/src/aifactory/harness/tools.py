@@ -10,6 +10,8 @@ import time
 from typing import Any
 
 from ..sandbox import SandboxError
+from ..sandbox import read_text as sb_read_text
+from ..sandbox import write_text as sb_write_text
 from .base import HarnessSession
 
 MAX_TOOL_OUTPUT = 30_000
@@ -88,7 +90,7 @@ class ToolBox:
                 session.on_progress("tool", f"Listed files in {path}", {"tool": name})
                 return clip(result.output or "(no files)")
             if name == "read_file":
-                text = sandbox.read_text(args["path"])
+                text = await sb_read_text(sandbox, args["path"])
                 lines = text.splitlines()
                 start = max(1, int(args.get("start_line") or 1))
                 end = int(args.get("end_line") or min(len(lines), start + 1499))
@@ -118,11 +120,11 @@ class ToolBox:
                                     {"command": command[:300], "exit_code": result.exit_code, "timed_out": result.timed_out})
                 return clip(result.for_model())
             if name == "write_file" and session.writable:
-                sandbox.write_text(args["path"], args.get("content", ""))
+                await sb_write_text(sandbox, args["path"], args.get("content", ""))
                 session.on_progress("edit", f"Wrote {args['path']}", {"tool": name, "path": args["path"]})
                 return f"Wrote {args['path']} ({len(args.get('content', ''))} characters)."
             if name == "edit_file" and session.writable:
-                text = sandbox.read_text(args["path"], limit=5_000_000)
+                text = await sb_read_text(sandbox, args["path"], limit=5_000_000)
                 old, new = args.get("old_text", ""), args.get("new_text", "")
                 count = text.count(old) if old else 0
                 if count == 0:
@@ -130,7 +132,7 @@ class ToolBox:
                 if count > 1 and not args.get("replace_all"):
                     return f"Error: old_text matches {count} places. Add surrounding context or set replace_all."
                 updated = text.replace(old, new) if args.get("replace_all") else text.replace(old, new, 1)
-                sandbox.write_text(args["path"], updated)
+                await sb_write_text(sandbox, args["path"], updated)
                 session.on_progress("edit", f"Edited {args['path']}", {"tool": name, "path": args["path"]})
                 return f"Edited {args['path']} ({count if args.get('replace_all') else 1} replacement)."
             return f"Error: unknown or unavailable tool '{name}'."

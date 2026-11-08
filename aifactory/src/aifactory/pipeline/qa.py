@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from ..sandbox import SCRATCH, LocalSandbox
+from ..sandbox import SCRATCH, LocalSandbox, list_files, read_bytes, write_text
 
 SHOT_SCRIPT = r'''
 import asyncio, json, sys
@@ -99,8 +99,8 @@ class AppRun:
         self.port = _free_port()
         env = {k: str(v) for k, v in (self.cfg.get("env") or {}).items()}
         env.update({"PORT": str(self.port), "HOST": "127.0.0.1", "NODE_ENV": env.get("NODE_ENV", "production")})
-        self.sandbox.write_text(f"{SCRATCH}/qa/shot.py", SHOT_SCRIPT)
-        self.sandbox.write_text(f"{SCRATCH}/qa/config.json", json.dumps({
+        await write_text(self.sandbox, f"{SCRATCH}/qa/shot.py", SHOT_SCRIPT)
+        await write_text(self.sandbox, f"{SCRATCH}/qa/config.json", json.dumps({
             "base": self.base, "login": self.cfg.get("login"),
             "pages": [{"path": p, "name": _name(p)} for p in self.cfg.get("pages") or []]}))
         await self.sandbox.exec(f"mkdir -p {SCRATCH}/shots", timeout=30)
@@ -109,8 +109,12 @@ class AppRun:
         ready = await self._wait_ready()
         self.evidence = {"started": ready, "port": self.port, "start": self.cfg["start"],
                          "ready_seconds": round(time.monotonic() - self.started_at, 1)}
+        if getattr(self.sandbox, "kind", "local") == "vm":
+            self.evidence["isolation"] = f"railway-vm {self.sandbox.vm_id}" + (f" ({self.sandbox.region})" if self.sandbox.region else "")
+        else:
+            self.evidence["isolation"] = "sandbox (separate identity in the Factory container)"
         if not ready:
-            self.evidence["log_tail"] = self.log_tail()
+            self.evidence["log_tail"] = await self.log_tail()
         return ready
 
     async def _wait_ready(self) -> bool:
@@ -129,10 +133,10 @@ class AppRun:
                 await asyncio.sleep(2)
         return False
 
-    def log_tail(self, limit: int = 4000) -> str:
+    async def log_tail(self, limit: int = 4000) -> str:
         try:
-            return self.sandbox.resolve(f"{SCRATCH}/app.log").read_bytes()[-limit:].decode("utf-8", "replace")
-        except OSError:
+            return (await read_bytes(self.sandbox, f"{SCRATCH}/app.log", limit, True)).decode("utf-8", "replace")
+        except Exception:
             return ""
 
     async def probes(self) -> list[dict[str, Any]]:
@@ -152,23 +156,22 @@ class AppRun:
 
     async def screenshots(self, pages: list[str] | None = None) -> list[dict[str, Any]]:
         arg = "" if pages is None else " " + _shell_json([{"path": p, "name": _name(p)} for p in pages])
-        result = await self.sandbox.exec(f"{shot_command()}{arg}", timeout=240)
+        result = await self.sandbox.exec(f"{shot_command(self.sandbox)}{arg}", timeout=240)
         try:
             return json.loads(result.output.strip().splitlines()[-1])
         except (json.JSONDecodeError, IndexError):
             return [{"path": "(screenshot helper)", "error": f"screenshot helper failed: {result.output[-600:]}"}]
 
-    def collect_images(self) -> list[tuple[str, str]]:
+    async def collect_images(self) -> list[tuple[str, str]]:
         """All PNGs saved under .factory/shots (Factory's and the verifier's), base64-encoded."""
         images = []
-        try:
-            folder = self.sandbox.resolve(f"{SCRATCH}/shots")
-            for path in sorted(folder.glob("*.png"))[:24]:
-                data = path.read_bytes()
-                if len(data) <= 3_000_000:
-                    images.append((path.stem, base64.b64encode(data).decode()))
-        except OSError:
-            pass
+        for name in (await list_files(self.sandbox, f"{SCRATCH}/shots", "*.png"))[:24]:
+            try:
+                data = await read_bytes(self.sandbox, f"{SCRATCH}/shots/{name}")
+            except Exception:
+                continue
+            if len(data) <= 3_000_000:
+                images.append((name.removesuffix(".png"), base64.b64encode(data).decode()))
         return images
 
     def stop(self) -> None:
@@ -176,8 +179,10 @@ class AppRun:
             self.sandbox.stop(self.proc)
 
 
-def shot_command() -> str:
-    """The helper runs with the Factory's interpreter (which has Playwright), as the sandbox identity."""
+def shot_command(sandbox=None) -> str:
+    """The helper runs as the sandbox identity with an interpreter that has Playwright."""
+    if getattr(sandbox, "kind", "local") == "vm":
+        return f"python3 {SCRATCH}/qa/shot.py"
     return f"{shlex.quote(sys.executable)} {SCRATCH}/qa/shot.py"
 
 
@@ -195,8 +200,9 @@ def verifier_brief(run: AppRun) -> str:
         return ("\n\n## Runtime QA\nThe Factory tried to start the app (`" + run.cfg["start"] + "`) but it did not become "
                 "ready. Last log lines:\n```\n" + run.evidence.get("log_tail", "")[-2000:] + "\n```\nTreat this as "
                 "evidence about the candidate.")
-    return (f"\n\n## The app is running for you\nThe candidate is running at {run.base} (started with "
+    where = "an isolated VM" if getattr(run.sandbox, "kind", "local") == "vm" else "your sandbox"
+    return (f"\n\n## The app is running for you\nThe candidate is running in {where} at {run.base} (started with "
             f"`{run.cfg['start']}`, ready after {run.evidence['ready_seconds']}s). Exercise the changed behaviour "
-            f"against the running app: use `curl` for HTTP/API calls, and `{shot_command()} <path> <name>` "
+            f"against the running app: use `curl` for HTTP/API calls, and `{shot_command(run.sandbox)} <path> <name>` "
             f"to save a screenshot of a page as evidence. Cite what you observed in your criterion evidence. The app "
             f"log is at {SCRATCH}/app.log.")

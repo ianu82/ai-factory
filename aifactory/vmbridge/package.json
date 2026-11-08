@@ -1,0 +1,7 @@
+{
+  "name": "aifactory-vmbridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "dependencies": { "railway": "3.16.0", "ws": "8.22.1" }
+}

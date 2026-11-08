@@ -358,3 +358,46 @@ class LocalSandbox:
                     os.lchown(item, self.uid, self.uid)
                 except FileNotFoundError:
                     pass
+
+
+# Backend-neutral file helpers: local sandboxes are synchronous, VM sandboxes asynchronous.
+def _is_vm(sandbox) -> bool:
+    return getattr(sandbox, "kind", "local") == "vm"
+
+
+async def read_text(sandbox, relative: str, limit: int = 400_000) -> str:
+    if _is_vm(sandbox):
+        return await sandbox.read_text_async(relative, limit)
+    return sandbox.read_text(relative, limit)
+
+
+async def write_text(sandbox, relative: str, content: str) -> None:
+    if _is_vm(sandbox):
+        await sandbox.write_bytes_async(relative, content.encode("utf-8"))
+    else:
+        sandbox.write_text(relative, content)
+
+
+async def write_bytes(sandbox, relative: str, content: bytes) -> None:
+    if _is_vm(sandbox):
+        await sandbox.write_bytes_async(relative, content)
+    else:
+        sandbox.write_bytes(relative, content)
+
+
+async def read_bytes(sandbox, relative: str, limit: int | None = None, from_end: bool = False) -> bytes:
+    if _is_vm(sandbox):
+        return await sandbox.read_bytes_async(relative, limit, from_end)
+    data = sandbox.resolve(relative).read_bytes()
+    if limit:
+        return data[-limit:] if from_end else data[:limit]
+    return data
+
+
+async def list_files(sandbox, relative: str, pattern: str = "*") -> list[str]:
+    if _is_vm(sandbox):
+        return await sandbox.list_files(relative, pattern)
+    try:
+        return sorted(p.name for p in sandbox.resolve(relative).glob(pattern))
+    except OSError:
+        return []

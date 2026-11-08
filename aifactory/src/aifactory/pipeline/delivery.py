@@ -276,11 +276,10 @@ class TaskRunner:
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
         qa_cfg = self.cfg.get("qa") or {}
         for tries in range(2):
-            sandbox = LocalSandbox(f"task-{self.task_id[:12]}-v{attempt}-{tries}").create()
+            sandbox = None
             app: AppRun | None = None
             try:
-                await checkout(sandbox, self.repo.full_name, token, self.task.base_sha, f"verify-{self.task_id[:8]}")
-                await apply_in_sandbox(sandbox, patch)
+                sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
                 await self._run_commands(sandbox, self.cfg.get("setup") or [], "verify_setup", timeout=1200)
                 brief = ""
                 if qa_cfg.get("start"):
@@ -293,11 +292,12 @@ class TaskRunner:
                     prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks)
                     + brief), self.cancelled)
                 if app is not None:
-                    self._store_app_evidence(app, attempt, run.id)
+                    await self._store_app_evidence(app, attempt, run.id)
             finally:
                 if app is not None:
                     app.stop()
-                await sandbox.close()
+                if sandbox is not None:
+                    await sandbox.close()
             if result is None:
                 if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
                     self.block("unblock", f"{self.task.key}: model provider problem during verification", error)
@@ -331,7 +331,43 @@ class TaskRunner:
                    "published.")
         return None
 
-    async def _start_app(self, sandbox: LocalSandbox, qa_cfg: dict[str, Any]) -> AppRun:
+    async def _verifier_sandbox(self, token: str, patch: Patch, attempt: int, tries: int, qa_cfg: dict[str, Any]):
+        """A fresh checkout with the candidate applied: in a Railway VM when QA asks for VM isolation."""
+        local = LocalSandbox(f"task-{self.task_id[:12]}-v{attempt}-{tries}").create()
+        try:
+            await checkout(local, self.repo.full_name, token, self.task.base_sha, f"verify-{self.task_id[:8]}")
+            await apply_in_sandbox(local, patch)
+        except BaseException:
+            await local.close()
+            raise
+        wants_vm = (qa_cfg.get("isolation") or (self.settings.get("qa") or {}).get("isolation")) == "vm"
+        if not wants_vm:
+            return local
+        if self.task.verifier_harness == "codex":
+            self.event("qa_vm_skipped", "Codex verifiers run in a local sandbox; runtime QA stays local for this task",
+                       level="warn")
+            return local
+        from ..vm import RailwayVMSandbox, vm_available
+
+        ok, why = vm_available()
+        if not ok:
+            self.event("qa_vm_unavailable", f"VM isolation requested but unavailable ({why}); verifying in a local sandbox",
+                       level="warn")
+            return local
+        try:
+            self.event("qa_vm_starting", "Starting an isolated VM for verification and runtime QA")
+            vm = await RailwayVMSandbox.from_local(local, cpu=float(qa_cfg.get("cpu", 4)),
+                                                   memory_gb=float(qa_cfg.get("memory_gb", 8)))
+        except Exception as exc:
+            self.event("qa_vm_unavailable", f"Could not start a QA VM ({str(exc)[:300]}); verifying in a local sandbox",
+                       level="warn")
+            return local
+        await local.close()
+        self.event("qa_vm_ready", f"Verification VM {vm.vm_id} ready" + (f" in {vm.region}" if vm.region else ""),
+                   level="success", vm=vm.vm_id)
+        return vm
+
+    async def _start_app(self, sandbox, qa_cfg: dict[str, Any]) -> AppRun:
         """Boot the candidate in the verifier's sandbox, then let the Factory capture its own evidence first."""
         app = AppRun(sandbox, qa_cfg)
         self.event("qa_app_starting", f"Starting the app for runtime QA: {qa_cfg['start'][:200]}")
@@ -348,17 +384,18 @@ class TaskRunner:
             self.event("qa_app_failed", "The app did not become ready for runtime QA", level="warn")
         return app
 
-    def _store_app_evidence(self, app: AppRun, attempt: int, run_id: str) -> None:
+    async def _store_app_evidence(self, app: AppRun, attempt: int, run_id: str) -> None:
         rows = {p.get("name"): p for p in app.evidence.get("pages", []) if isinstance(p, dict)}
-        for name, image in app.collect_images():
+        images = await app.collect_images()
+        for name, image in images:
             meta = rows.get(name, {"name": name, "by": "verifier"})
             self.artifact("screenshot", f"{'Factory' if meta.get('by') == 'factory' else 'Verifier'}: {meta.get('path', name)}",
                           image, run_id=run_id, attempt=attempt, **{k: meta.get(k) for k in
                                                                     ("path", "status", "title", "console_errors", "by")})
-        self.artifact("log", f"App log (attempt {attempt})", app.log_tail(20000), run_id=run_id)
-        images = app.collect_images()
+        self.artifact("log", f"App log (attempt {attempt})", await app.log_tail(20000), run_id=run_id)
         self.app_summary = {
             "started": app.evidence.get("started"), "ready_seconds": app.evidence.get("ready_seconds"),
+            "isolation": app.evidence.get("isolation"),
             "pages": [{k: p.get(k) for k in ("path", "status", "title", "error")} for p in app.evidence.get("pages", [])],
             "probes": [{k: p.get(k) for k in ("method", "path", "status", "ok")} for p in app.evidence.get("probes", [])],
             "screenshots": len(images), "verifier_screenshots": sum(1 for n, _ in images if n not in rows)}

@@ -5,3 +5,4 @@ web/dist
 src/aifactory/web
 **/__pycache__
 tests
+vmbridge/node_modules
