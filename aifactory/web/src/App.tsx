@@ -30,6 +30,12 @@ export function App() {
         element={unauth ? <Navigate to="/signin" replace /> : me.data && meta.data ? <Shell me={me.data} meta={meta.data} /> : <Loading error={me.error} />}
       />
       <Route
+        path="/go/:section"
+        element={unauth ? <Navigate to="/signin" replace /> : me.data
+          ? me.data.workspaces[0] ? <GoTo workspaceId={me.data.workspaces[0].id} /> : <NoWorkspace />
+          : <Loading error={me.error} />}
+      />
+      <Route
         path="*"
         element={unauth ? <Navigate to="/signin" replace /> : me.data
           ? me.data.workspaces[0] ? <Navigate to={`/w/${me.data.workspaces[0].id}/inbox`} replace /> : <NoWorkspace />
@@ -45,6 +51,13 @@ function Loading({ error }: { error?: unknown }) {
       {error ? `Could not reach the Factory: ${(error as Error).message}` : "Loading…"}
     </div>
   );
+}
+
+/** Stable deep links (used by runtime QA and docs): /go/outcomes → the first workspace's Outcomes. */
+function GoTo({ workspaceId }: { workspaceId: string }) {
+  const { section = "inbox" } = useParams();
+  const allowed = ["inbox", "outcomes", "runs", "signals", "decisions", "settings"];
+  return <Navigate to={`/w/${workspaceId}/${allowed.includes(section) ? section : "inbox"}`} replace />;
 }
 
 function NoWorkspace() {

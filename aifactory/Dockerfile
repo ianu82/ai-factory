@@ -32,6 +32,11 @@ COPY pyproject.toml ./
 COPY src ./src
 COPY --from=web /web-dist ./src/aifactory/web
 RUN uv pip install --system . && uv pip check --system || true
+# Runtime QA: headless Chromium for screenshots, shared read-only with job sandboxes.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN uv pip install --system "playwright==1.64.1" \
+ && python -m playwright install --with-deps chromium \
+ && chmod -R a+rX /ms-playwright
 ENV AIFACTORY_DATA_DIR=/data/aifactory \
     AIFACTORY_ENV=production \
     PYTHONUNBUFFERED=1 \

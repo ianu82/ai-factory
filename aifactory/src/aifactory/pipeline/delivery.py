@@ -22,6 +22,7 @@ from ..gitops import (DEFAULT_PROTECTED, GitError, Patch, apply_in_sandbox, chec
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
+from .qa import AppRun, verifier_brief
 from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, run_agent,
                       workspace_settings)
 
@@ -46,6 +47,7 @@ class TaskRunner:
         self.builder_report: dict[str, Any] = {}
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
+        self.app_summary: dict[str, Any] | None = None
         self._load()
         self.feedback = self._prior_feedback()
 
@@ -219,7 +221,7 @@ class TaskRunner:
             if verdict is None:
                 continue
             self.evidence("attempts", {"n": attempt, "result": "verified", "checks": _brief(self.checks),
-                                       "verdict": verdict})
+                                       "verdict": verdict, "app_run": self.app_summary})
             break
 
         await self._publish(token)
@@ -272,19 +274,29 @@ class TaskRunner:
         return results
 
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
+        qa_cfg = self.cfg.get("qa") or {}
         for tries in range(2):
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-v{attempt}-{tries}").create()
+            app: AppRun | None = None
             try:
                 await checkout(sandbox, self.repo.full_name, token, self.task.base_sha, f"verify-{self.task_id[:8]}")
                 await apply_in_sandbox(sandbox, patch)
                 await self._run_commands(sandbox, self.cfg.get("setup") or [], "verify_setup", timeout=1200)
+                brief = ""
+                if qa_cfg.get("start"):
+                    app = await self._start_app(sandbox, qa_cfg)
+                    brief = verifier_brief(app)
                 run, result, error = await run_agent(SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
                     attempt=attempt, writable=False,
-                    prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks)),
-                    self.cancelled)
+                    prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks)
+                    + brief), self.cancelled)
+                if app is not None:
+                    self._store_app_evidence(app, attempt, run.id)
             finally:
+                if app is not None:
+                    app.stop()
                 await sandbox.close()
             if result is None:
                 if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
@@ -292,6 +304,10 @@ class TaskRunner:
                 self.event("verification_unavailable", f"Verifier session failed: {error[:300]}", level="warn")
                 continue
             report = result.report
+            runtime_problem = self._runtime_problem(app, qa_cfg)
+            if runtime_problem and report["verdict"] == "pass":
+                report = {**report, "verdict": "fail",
+                          "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
             self.verifier_report = report
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))
@@ -304,14 +320,62 @@ class TaskRunner:
             self.feedback.append("- Independent review FAILED. " + report.get("summary", "")[:1500])
             self.feedback += [f"  - Criterion not met: {c['criterion']} — {c.get('evidence', '')[:600]}" for c in failing]
             self.feedback += [f"  - {f['severity']}: {f['description'][:600]} {f.get('location', '')}" for f in findings]
+            if runtime_problem and app is not None and app.evidence.get("log_tail"):
+                self.feedback.append(f"  - App log when it failed:\n```\n{app.evidence['log_tail'][-1500:]}\n```")
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
-                                       "checks": _brief(self.checks)})
+                                       "checks": _brief(self.checks), "app_run": self.app_summary})
             self.event("verification_failed", report.get("summary", "")[:400], level="warn")
             return None
         self.block("unblock", f"{self.task.key}: independent verification could not run",
                    "Two verifier sessions failed to produce a verdict. The candidate remains unverified and was not "
                    "published.")
         return None
+
+    async def _start_app(self, sandbox: LocalSandbox, qa_cfg: dict[str, Any]) -> AppRun:
+        """Boot the candidate in the verifier's sandbox, then let the Factory capture its own evidence first."""
+        app = AppRun(sandbox, qa_cfg)
+        self.event("qa_app_starting", f"Starting the app for runtime QA: {qa_cfg['start'][:200]}")
+        ready = await app.start()
+        if ready:
+            app.evidence["pages"] = await app.screenshots() if qa_cfg.get("pages") else []
+            app.evidence["probes"] = await app.probes()
+            ok_pages = sum(1 for p in app.evidence["pages"] if p.get("status") and p["status"] < 400)
+            ok_probes = sum(1 for p in app.evidence["probes"] if p.get("ok"))
+            self.event("qa_app_ready", f"App ready in {app.evidence['ready_seconds']}s · pages {ok_pages}/"
+                       f"{len(app.evidence['pages'])} · probes {ok_probes}/{len(app.evidence['probes'])}",
+                       level="success" if ok_pages == len(app.evidence["pages"]) and ok_probes == len(app.evidence["probes"]) else "warn")
+        else:
+            self.event("qa_app_failed", "The app did not become ready for runtime QA", level="warn")
+        return app
+
+    def _store_app_evidence(self, app: AppRun, attempt: int, run_id: str) -> None:
+        rows = {p.get("name"): p for p in app.evidence.get("pages", []) if isinstance(p, dict)}
+        for name, image in app.collect_images():
+            meta = rows.get(name, {"name": name, "by": "verifier"})
+            self.artifact("screenshot", f"{'Factory' if meta.get('by') == 'factory' else 'Verifier'}: {meta.get('path', name)}",
+                          image, run_id=run_id, attempt=attempt, **{k: meta.get(k) for k in
+                                                                    ("path", "status", "title", "console_errors", "by")})
+        self.artifact("log", f"App log (attempt {attempt})", app.log_tail(20000), run_id=run_id)
+        images = app.collect_images()
+        self.app_summary = {
+            "started": app.evidence.get("started"), "ready_seconds": app.evidence.get("ready_seconds"),
+            "pages": [{k: p.get(k) for k in ("path", "status", "title", "error")} for p in app.evidence.get("pages", [])],
+            "probes": [{k: p.get(k) for k in ("method", "path", "status", "ok")} for p in app.evidence.get("probes", [])],
+            "screenshots": len(images), "verifier_screenshots": sum(1 for n, _ in images if n not in rows)}
+
+    def _runtime_problem(self, app: AppRun | None, qa_cfg: dict[str, Any]) -> str:
+        if app is None or qa_cfg.get("required") is False:
+            return ""
+        if not app.evidence.get("started"):
+            return "the app did not start"
+        bad_pages = [f"{p.get('path')} ({p.get('error') or p.get('status')})"[:300] for p in app.evidence.get("pages", [])
+                     if p.get("error") or (p.get("status") or 500) >= 500]
+        bad_probes = [p.get("path") for p in app.evidence.get("probes", []) if not p.get("ok")]
+        if bad_pages:
+            return f"pages failed to render: {bad_pages}"
+        if bad_probes:
+            return f"probes failed: {bad_probes}"
+        return ""
 
     # publication ---------------------------------------------------------------
     async def _publish(self, token: str) -> None:
@@ -333,6 +397,7 @@ class TaskRunner:
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
+        self.evidence("published", {"head": head, "at": utcnow().isoformat(), "pr": pr["number"]})
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:
@@ -342,6 +407,20 @@ class TaskRunner:
             c = by.get(criterion) or next((v for k, v in by.items() if k and criterion[:40] in k), {})
             mark = {"pass": "✅", "fail": "❌"}.get(c.get("status", ""), "◻️")
             lines.append(f"- {mark} {criterion}" + (f"  \n  <sub>{c.get('evidence', '')[:400]}</sub>" if c else ""))
+        if self.app_summary:
+            a = self.app_summary
+            lines += ["", "### Runtime QA (app booted in a fresh sandbox)"]
+            if a.get("started"):
+                lines.append(f"- App started and became ready in {a.get('ready_seconds')}s")
+                lines += [f"- {'✅' if (p.get('status') or 500) < 400 else '❌'} page `{p.get('path')}` → "
+                          f"{p.get('status') or p.get('error', 'error')} {('· ' + p['title']) if p.get('title') else ''}"
+                          for p in a.get("pages", [])]
+                lines += [f"- {'✅' if p.get('ok') else '❌'} `{p.get('method')} {p.get('path')}` → {p.get('status')}"
+                          for p in a.get("probes", [])]
+                lines.append(f"- {a.get('screenshots', 0)} screenshot(s) attached in AI Factory "
+                             f"({a.get('verifier_screenshots', 0)} taken by the verifier)")
+            else:
+                lines.append("- ❌ The app did not start")
         if self.checks:
             lines += ["", "### Checks run by the Factory"]
             lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s)" for c in self.checks]
@@ -444,10 +523,16 @@ class TaskRunner:
         return merge_policy != "auto"
 
     def _approved(self, kind: str) -> bool:
+        """An approval covers only the candidate that was published before it was given."""
+        from datetime import datetime
+
         with session_scope() as s:
             row = (s.query(Decision).filter(Decision.task_id == self.task_id, Decision.kind == kind,
                                             Decision.status == "resolved").order_by(Decision.resolved_at.desc()).first())
-            return bool(row and row.resolution == "approve")
+            if not (row and row.resolution == "approve" and row.resolved_at):
+                return False
+            published = (self.task.evidence or {}).get("published", {}).get("at")
+            return not published or row.resolved_at >= datetime.fromisoformat(published)
 
     async def merge(self) -> None:
         token = resolve_token(self.ws)
@@ -455,7 +540,8 @@ class TaskRunner:
         if self._merge_needs_approval() and not self._approved("approve_merge"):
             self.update(stage="merge")
             self.block("approve_merge", f"Approve merge: {self.task.title}",
-                       f"PR #{self.task.pr_number} passed independent verification and CI. {self.task.pr_url}",
+                       f"PR #{self.task.pr_number} passed independent verification and CI at "
+                       f"{self.task.head_sha[:10]}. {self.task.pr_url}",
                        status="awaiting_approval",
                        options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
         self.stage("merge", f"Merging PR #{self.task.pr_number}")

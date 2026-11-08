@@ -115,6 +115,14 @@ export interface Attempt {
   result: string;
   checks?: { command: string; ok: boolean; exit_code: number; duration: number }[];
   verdict?: VerifierReport;
+  app_run?: {
+    started: boolean;
+    ready_seconds: number;
+    pages: { path: string; status?: number; title?: string; error?: string }[];
+    probes: { method: string; path: string; status?: number; ok?: boolean }[];
+    screenshots: number;
+    verifier_screenshots: number;
+  } | null;
   detail?: string;
   error?: string;
   reason?: string;

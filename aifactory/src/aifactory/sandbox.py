@@ -73,6 +73,17 @@ class _UidPool:
 _uid_pool = _UidPool(int(os.environ.get("AIFACTORY_SANDBOX_UID_BASE", "20000")))
 
 
+def playwright_browsers_path() -> str:
+    explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if explicit:
+        return explicit
+    home = Path(os.environ.get("HOME", "~")).expanduser()
+    for candidate in (home / "Library/Caches/ms-playwright", home / ".cache/ms-playwright"):
+        if candidate.is_dir():
+            return str(candidate)
+    return ""
+
+
 def isolation_available() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0 and os.environ.get("AIFACTORY_SANDBOX_ISOLATION", "1") != "0"
 
@@ -171,6 +182,9 @@ class LocalSandbox:
             "npm_config_update_notifier": "false",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         }
+        browsers = playwright_browsers_path()
+        if browsers:
+            env["PLAYWRIGHT_BROWSERS_PATH"] = browsers  # shared, read-only browser install for runtime QA
         if extra:
             env.update(extra)
         return env
@@ -258,6 +272,32 @@ class LocalSandbox:
             truncated=truncated or total > len(data),
             total_bytes=total,
         )
+
+    async def spawn(self, command: str, *, env: dict[str, str] | None = None, log: str = ".factory/app.log",
+                    cwd: str | None = None) -> asyncio.subprocess.Process:
+        """Start a long-running process (e.g. the app under test); it is stopped with the sandbox."""
+        if self._closed:
+            raise SandboxError("Sandbox is closed")
+        log_path = self.resolve(log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.uid is not None:
+            os.chown(log_path.parent, self.uid, self.uid)
+        handle = open(log_path, "ab")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash", "-lc", command, cwd=str(self.resolve(cwd) if cwd else self.work), env=self.env(env),
+                stdin=asyncio.subprocess.DEVNULL, stdout=handle, stderr=asyncio.subprocess.STDOUT,
+                preexec_fn=self._preexec())
+        finally:
+            handle.close()
+        if self.uid is not None:
+            os.chown(log_path, self.uid, self.uid)
+        self._groups.add(proc.pid)
+        return proc
+
+    def stop(self, proc: asyncio.subprocess.Process) -> None:
+        self._kill_group(proc.pid)
+        self._groups.discard(proc.pid)
 
     def _kill_group(self, pgid: int) -> None:
         try:

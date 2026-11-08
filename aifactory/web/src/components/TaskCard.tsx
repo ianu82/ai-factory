@@ -59,7 +59,10 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
   const lastVerdict = [...attempts].reverse().find((a) => a.verdict)?.verdict;
   const byCriterion = new Map((lastVerdict?.criteria || []).map((c) => [c.criterion, c]));
   const diffs = (artifacts.data || []).filter((a) => a.kind === "diff");
-  const reports = (artifacts.data || []).filter((a) => ["check", "smoke", "report", "setup"].includes(a.kind));
+  const reports = (artifacts.data || []).filter((a) => ["check", "smoke", "report", "setup", "log"].includes(a.kind));
+  const shots = (artifacts.data || []).filter((a) => a.kind === "screenshot");
+  const lastShots = shots.filter((a) => a.data.attempt === shots[shots.length - 1]?.data.attempt).slice(-8);
+  const appRun = [...attempts].reverse().find((a) => a.app_run)?.app_run;
 
   const open = async (a: Artifact) => {
     if (view?.id === a.id) return setView(null);
@@ -148,6 +151,25 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
         </details>
       )}
 
+      {appRun && (
+        <div>
+          <div className="muted" style={{ fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+            Runtime QA {appRun.started ? `· app ready in ${appRun.ready_seconds}s` : "· app did not start"}
+          </div>
+          <div className="checks">
+            {(appRun.pages || []).map((p) => (
+              <div key={p.path} className="checkline"><Mark status={(p.status || 500) < 400 ? "pass" : "fail"} />
+                <code>{p.path}</code><span className="muted">{p.status || p.error} {p.title ? `· ${p.title}` : ""}</span></div>
+            ))}
+            {(appRun.probes || []).map((p) => (
+              <div key={`${p.method}${p.path}`} className="checkline"><Mark status={p.ok ? "pass" : "fail"} />
+                <code>{p.method} {p.path}</code><span className="muted">{p.status}</span></div>
+            ))}
+          </div>
+          {lastShots.length > 0 && <div className="shots">{lastShots.map((a) => <Shot key={a.id} artifact={a} />)}</div>}
+        </div>
+      )}
+
       {(diffs.length > 0 || reports.length > 0) && (
         <div>
           <div className="muted" style={{ fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>Evidence</div>
@@ -171,6 +193,25 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
         </div>
       )}
     </div>
+  );
+}
+
+function Shot({ artifact }: { artifact: Artifact }) {
+  const { ws } = useWs();
+  const [open, setOpen] = useState(false);
+  const q = useQuery({
+    queryKey: ["outcome", ws.id, "artifact", artifact.id],
+    queryFn: () => api<Artifact>(`/api/workspaces/${ws.id}/artifacts/${artifact.id}`),
+    staleTime: Infinity,
+  });
+  const src = q.data?.content ? `data:image/png;base64,${q.data.content}` : "";
+  return (
+    <figure className="shot">
+      <button onClick={() => setOpen(!open)} aria-label={`Screenshot ${artifact.name}`} className={open ? "open" : ""}>
+        {src ? <img src={src} alt={artifact.name} /> : <div className="skeleton" style={{ height: 90 }} />}
+      </button>
+      <figcaption>{artifact.name}{artifact.data.status ? ` · ${artifact.data.status}` : ""}</figcaption>
+    </figure>
   );
 }
 

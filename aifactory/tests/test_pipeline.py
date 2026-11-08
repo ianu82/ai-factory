@@ -361,3 +361,56 @@ def test_reviewer_findings_survive_a_retry(factory):
     runner = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
     joined = "\n".join(runner.feedback)
     assert "Race on credential save" in joined and "stale token" in joined and "events published before commit" in joined
+
+
+def test_runtime_qa_boots_the_app_and_attaches_screenshots(factory):
+    pytest.importorskip("playwright")
+    from aifactory.models import Artifact
+
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "qa": {
+            "start": "printf '<html><head><title>Greeting</title></head><body><h1>Hello</h1></body></html>' > index.html"
+                     " && exec python3 -m http.server $PORT --bind 127.0.0.1",
+            "ready_path": "/", "ready_timeout": 30, "pages": ["/"],
+            "probes": [{"method": "GET", "path": "/", "expect_status": 200}]}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        app = task.evidence["attempts"][-1]["app_run"]
+        assert app["started"] and app["probes"][0]["ok"], app
+        assert app["pages"][0]["status"] == 200 and app["pages"][0]["title"] == "Greeting", app
+        shots = s.query(Artifact).filter(Artifact.task_id == task.id, Artifact.kind == "screenshot").all()
+        assert shots and shots[0].content.startswith("iVBOR")  # base64 PNG
+    pr = FakeGitHub.pulls[1]
+    assert "Runtime QA" in pr["body"] and "page `/` → 200" in pr["body"]
+
+
+def test_merge_approval_does_not_cover_a_later_candidate(factory):
+    from datetime import timedelta
+
+    from aifactory.db import utcnow
+    from aifactory.models import Plan
+    from aifactory.pipeline.delivery import TaskRunner
+
+    outcome_id = new_outcome(factory)
+    approved_at = utcnow()
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="queued", stage="merge",
+                    evidence={"published": {"head": "new", "at": (approved_at + timedelta(minutes=5)).isoformat()}})
+        s.add(task)
+        s.flush()
+        s.add(Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="approve_merge",
+                       title="Approve", status="resolved", resolution="approve", resolved_at=approved_at))
+        task_id = task.id
+    runner = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    assert runner._approved("approve_merge") is False
+    with session_scope() as s:
+        s.get(Task, task_id).evidence = {"published": {"head": "old", "at": (approved_at - timedelta(minutes=5)).isoformat()}}
+    assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge") is True
