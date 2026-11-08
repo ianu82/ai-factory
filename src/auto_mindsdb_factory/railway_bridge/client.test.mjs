@@ -53,9 +53,15 @@ for (const phase of ['allocation', 'files', 'bootstrap', 'success']) {
 async function fixture(t, mode, observations) {
   const server = createServer();
   const sockets = new WebSocketServer({noServer: true});
+  const pending = new Set();
+  server.on('connection', socket => {
+    pending.add(socket);
+    socket.on('close', () => pending.delete(socket));
+  });
   const observed = {attempts: 0, commands: 0};
   server.on('upgrade', (request, socket, head) => {
     observed.attempts++;
+    if (mode === 'pending-recover' && observed.attempts === 1) return;
     if (mode === 'reject' || (mode === 'recover' && observed.attempts === 1)) {
       socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       return;
@@ -77,7 +83,7 @@ async function fixture(t, mode, observations) {
           observed.commands++;
           if (mode === 'interrupt') connection.terminate();
         }
-        if (frame.type === 'stdin_close' && mode === 'recover') {
+        if (frame.type === 'stdin_close' && ['recover', 'pending-recover'].includes(mode)) {
           connection.send(Buffer.concat([Buffer.from([1]), Buffer.from('confirmed result\n')]));
           connection.send(JSON.stringify({type: 'exit', data: {exit_code: 0}}));
         }
@@ -86,7 +92,10 @@ async function fixture(t, mode, observations) {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
+    const drained = [...pending].map(socket => new Promise(resolve => socket.once('close', resolve)));
     for (const connection of sockets.clients) connection.terminate();
+    for (const socket of pending) socket.destroy();
+    await Promise.all(drained);
     server.closeAllConnections();
     await new Promise(resolve => sockets.close(resolve));
     await new Promise(resolve => server.close(resolve));
@@ -193,6 +202,17 @@ test('a transient rejected handshake recovers and executes exactly once', async 
   assert.equal(result.truncated, false);
   assert.equal(result.timedOut, false);
   assert.deepEqual(observed, {attempts: 2, commands: 1});
+});
+
+test('a pending HTTP upgrade leaves time for the existing prestart retry', {timeout: 35000}, async t => {
+  const observations = execObservations();
+  const {sandbox, observed} = await fixture(t, 'pending-recover', observations);
+  const result = await checkedExec(sandbox, 'one-command', 'request data', 2, 65536, 35000);
+  assert.equal(result, 'confirmed result\n');
+  assert.deepEqual(observed, {attempts: 2, commands: 1});
+  assert.equal(observations.snapshot().opened, 1);
+  assert.equal(observations.snapshot().hello_send_attempts, 1);
+  assert.equal(observations.snapshot().init_send_attempts, 1);
 });
 
 test('a disconnect after command dispatch is not retried', async t => {
