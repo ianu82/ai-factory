@@ -10,7 +10,7 @@ import { TaskCard } from "./TaskCard";
 
 const QUIET = new Set(["agent_thought", "agent_tool"]);
 
-export function OutcomeDetail({ outcomeId, onClose }: { outcomeId: string; onClose: () => void }) {
+export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcomeId: string; onClose: () => void; focusDecisionId?: string }) {
   const { ws } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
@@ -23,7 +23,8 @@ export function OutcomeDetail({ outcomeId, onClose }: { outcomeId: string; onClo
   if (q.isLoading) return <Skeleton rows={8} />;
   if (q.error || !q.data) return <div className="empty"><h3>Could not load this outcome</h3><p>{(q.error as Error)?.message}</p></div>;
   const { outcome, tasks, runs, decisions, plans, messages, events, repositories } = q.data;
-  const open = decisions.filter((d) => d.status === "open");
+  const open = decisions.filter((d) => d.status === "open")
+    .sort((a, b) => Number(b.id === focusDecisionId) - Number(a.id === focusDecisionId));  // the one you came for first
   const plan = [...plans].reverse().find((p) => p.status !== "superseded") || plans[plans.length - 1];
   const active = !["completed", "cancelled", "partially_completed"].includes(outcome.status);
   const timeline = (showAll ? events : events.filter((e) => !QUIET.has(e.kind))).slice(-160);
@@ -64,7 +65,7 @@ export function OutcomeDetail({ outcomeId, onClose }: { outcomeId: string; onClo
 
       {open.length > 0 && (
         <section className="p-sec" aria-label="Needs you">
-          {open.map((d) => <DecisionCard key={d.id} d={d} />)}
+          {open.map((d) => <DecisionCard key={d.id} d={d} focused={d.id === focusDecisionId} />)}
         </section>
       )}
 
