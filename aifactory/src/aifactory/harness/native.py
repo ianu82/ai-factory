@@ -67,6 +67,8 @@ class NativeHarness:
             assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
             if calls:
                 assistant["tool_calls"] = calls
+            if message.get("_raw"):
+                assistant["_raw"] = message["_raw"]  # Responses API: replay reasoning items verbatim
             messages.append(assistant)
             if message.get("content"):
                 session.on_progress("thought", clip(message["content"], 600), {})

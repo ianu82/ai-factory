@@ -88,3 +88,39 @@ def test_native_forces_a_final_report_when_out_of_turns(tmp_path, monkeypatch):
     session, client, _ = make_session(tmp_path, wrapped, max_turns=3)
     result = asyncio.run(NativeHarness().run(session))
     assert result.report["status"] == "blocked"
+
+
+def test_model_client_speaks_responses_api_and_round_trips_reasoning(monkeypatch):
+    import httpx
+
+    from aifactory import inference
+    from aifactory.inference import ModelClient
+
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        assert request.url.path.endswith("/responses")
+        if len(seen) == 1:
+            return httpx.Response(200, json={"status": "completed", "usage": {"input_tokens": 50, "output_tokens": 5}, "output": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc", "summary": []},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "run", "arguments": "{\"command\": \"ls\"}"}]})
+        return httpx.Response(200, json={"status": "completed", "usage": {"input_tokens": 60, "output_tokens": 7}, "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(inference.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(upstream), **kw))
+    client = ModelClient(ProviderConfig("openai", "https://api.test/v1", "sk-x", "OpenAI"))
+    tools = [{"type": "function", "function": {"name": "run", "description": "d", "parameters": {"type": "object"}}}]
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    first = asyncio.run(client.chat(model="m", messages=msgs, tools=tools, reasoning_effort="high"))
+    assert first["tool_calls"][0]["id"] == "call_1" and first["tool_calls"][0]["function"]["name"] == "run"
+    assert seen[0]["tools"][0]["name"] == "run" and seen[0]["reasoning"] == {"effort": "high"}
+    assert seen[0]["input"][0] == {"role": "developer", "content": "sys"}
+    msgs += [first, {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"}]
+    second = asyncio.run(client.chat(model="m", messages=msgs, tools=tools))
+    assert second["content"] == "done"
+    replay = seen[1]["input"]
+    assert {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc", "summary": []} in replay
+    assert replay[-1] == {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}

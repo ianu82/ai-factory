@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,8 @@ from .config import get_settings
 from .db import session_scope
 from .models import Run, Secret, Workspace
 from .security import decrypt
+
+log = logging.getLogger(__name__)
 
 PROVIDERS = {
     "mindshub": {"secret": "mindshub_api_key", "label": "MindsHub Inference"},
@@ -199,15 +202,66 @@ class UsageLedger:
                 run.turns = self.calls
 
 
+def to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate a chat-style transcript into stateless Responses API input items."""
+    items: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("_raw"):
+            items.extend(m["_raw"])  # reasoning, messages and calls exactly as returned
+        elif role == "assistant":
+            if m.get("content"):
+                items.append({"role": "assistant", "content": m["content"]})
+            for call in m.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                items.append({"type": "function_call", "call_id": call.get("id", ""), "name": fn.get("name", ""),
+                              "arguments": fn.get("arguments") or "{}"})
+        elif role == "tool":
+            items.append({"type": "function_call_output", "call_id": m.get("tool_call_id", ""),
+                          "output": str(m.get("content") or "")})
+        elif role == "system":
+            items.append({"role": "developer", "content": m.get("content") or ""})
+        else:
+            items.append({"role": role or "user", "content": m.get("content") or ""})
+    return items
+
+
+def from_responses_output(data: dict[str, Any]) -> dict[str, Any]:
+    output = data.get("output") or []
+    text: list[str] = []
+    calls: list[dict[str, Any]] = []
+    raw: list[dict[str, Any]] = []
+    for item in output:
+        kind = item.get("type")
+        if kind == "message":
+            for part in item.get("content") or []:
+                if part.get("type") in ("output_text", "text") and part.get("text"):
+                    text.append(part["text"])
+            raw.append({k: v for k, v in item.items() if k in ("type", "role", "content", "id", "status")})
+        elif kind == "function_call":
+            calls.append({"id": item.get("call_id") or item.get("id", ""), "type": "function",
+                          "function": {"name": item.get("name", ""), "arguments": item.get("arguments") or "{}"}})
+            raw.append({k: v for k, v in item.items() if k in ("type", "call_id", "name", "arguments", "id", "status")})
+        elif kind == "reasoning":
+            raw.append({k: v for k, v in item.items() if k in ("type", "id", "summary", "encrypted_content")})
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(text)}
+    if calls:
+        message["tool_calls"] = calls
+    message["_raw"] = raw
+    return message
+
+
 class ModelClient:
-    """OpenAI-compatible Chat Completions client with bounded, honest retries."""
+    """OpenAI-compatible model client (Chat Completions or Responses) with bounded, honest retries."""
 
     def __init__(self, provider: ProviderConfig, *, timeout: float = 300.0, max_retries: int = 4,
-                 session_id: str | None = None):
+                 session_id: str | None = None, wire: str | None = None):
         self.provider = provider
         self.timeout = timeout
         self.max_retries = max_retries
         self.session_id = session_id
+        # OpenAI's newest models are Responses-only; MindsHub serves both shapes for every model family.
+        self.wire = wire or ("responses" if provider.provider == "openai" else "chat")
 
     async def chat(
         self,
@@ -215,12 +269,31 @@ class ModelClient:
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 8000,
+        max_tokens: int = 16000,
         ledger: UsageLedger | None = None,
         tool_choice: str | None = None,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"model": model, "messages": messages, "max_completion_tokens": max_tokens}
+        if ledger:
+            ledger.check()
+        if self.wire == "responses":
+            body: dict[str, Any] = {"model": model, "input": to_responses_input(messages), "store": False,
+                                    "max_output_tokens": max_tokens, "include": ["reasoning.encrypted_content"]}
+            if tools:
+                body["tools"] = [{"type": "function", **t["function"]} for t in tools]
+                body["parallel_tool_calls"] = True
+                if tool_choice:
+                    body["tool_choice"] = tool_choice
+            if reasoning_effort:
+                body["reasoning"] = {"effort": reasoning_effort}
+            data = await self._post("/responses", body)
+            if ledger:
+                ledger.add(model, extract_usage(data))
+            if data.get("status") == "incomplete" and not (data.get("output") or []):
+                raise InferenceError(f"Model response incomplete: {data.get('incomplete_details')}")
+            return from_responses_output(data)
+        clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+        body = {"model": model, "messages": clean, "max_completion_tokens": max_tokens}
         if tools:
             body["tools"] = tools
             body["parallel_tool_calls"] = True
@@ -228,9 +301,14 @@ class ModelClient:
                 body["tool_choice"] = tool_choice
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
-        if ledger:
-            ledger.check()
-        data = await self._post("/chat/completions", body)
+        try:
+            data = await self._post("/chat/completions", body)
+        except InferenceError as exc:
+            if exc.status in (400, 404) and "responses" in str(exc).lower():
+                self.wire = "responses"
+                return await self.chat(model=model, messages=messages, tools=tools, max_tokens=max_tokens,
+                                       ledger=ledger, tool_choice=tool_choice, reasoning_effort=reasoning_effort)
+            raise
         if ledger:
             ledger.add(model, extract_usage(data))
         choices = data.get("choices") or []
@@ -258,6 +336,7 @@ class ModelClient:
                 if response.status_code in (401, 403):
                     raise InferenceError(f"{self.provider.label} refused the credential ({response.status_code}): {detail}", status=response.status_code)
                 if response.status_code in (400, 404, 422):
+                    log.warning("%s %s rejected (%s): %s", self.provider.label, path, response.status_code, detail[:400])
                     if "max_completion_tokens" in detail and "max_completion_tokens" in body:
                         body = {**body, "max_tokens": body.pop("max_completion_tokens")}
                         continue
@@ -266,6 +345,12 @@ class ModelClient:
                         continue
                     if "reasoning_effort" in detail and "reasoning_effort" in body:
                         body = {k: v for k, v in body.items() if k != "reasoning_effort"}
+                        continue
+                    if "reasoning" in detail and "reasoning" in body:
+                        body = {k: v for k, v in body.items() if k != "reasoning"}
+                        continue
+                    if "include" in detail and "include" in body:
+                        body = {k: v for k, v in body.items() if k != "include"}
                         continue
                     raise InferenceError(f"{self.provider.label} rejected the request ({response.status_code}): {detail}", status=response.status_code)
                 last = InferenceError(f"{self.provider.label} error {response.status_code}: {detail}", retryable=True, status=response.status_code)
