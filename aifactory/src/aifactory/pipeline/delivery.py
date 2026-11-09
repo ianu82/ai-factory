@@ -20,7 +20,7 @@ from ..events import notify, record
 from ..github import GitHub, GitHubError, resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, apply_in_sandbox, checkout,
                       conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
-from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
+from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
 from .qa import AppRun, change_checks, verifier_brief
@@ -91,7 +91,8 @@ class TaskRunner:
         notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
 
     def event(self, kind: str, message: str, level: str = "info", **data: Any) -> None:
-        record(self.ws, kind, message, outcome_id=self.task.outcome_id, task_id=self.task_id, level=level, data=data)
+        record(self.ws, kind, message, outcome_id=self.task.outcome_id, task_id=self.task_id, level=level,
+               data={"attempt": self.task.attempt, "head": self.task.head_sha, **data})
 
     def evidence(self, key: str, value: Any) -> None:
         with session_scope() as s:
@@ -101,14 +102,22 @@ class TaskRunner:
             if key == "attempts":
                 ev.setdefault("attempts", []).append(value)
             else:
+                if key in ("ci", "smoke"):
+                    value = {**value, "at": utcnow().isoformat()}
+                if key in ("ci", "smoke") and value.get("state") in ("failure", "failed"):
+                    ev.setdefault("failure_facts", []).append({"kind": key, **value,
+                                                              "attempt": task.attempt, "at": utcnow().isoformat()})
                 ev[key] = value
             task.evidence = ev
             self.task.evidence = ev
 
-    def artifact(self, kind: str, name: str, content: str = "", run_id: str | None = None, **data: Any) -> None:
+    def artifact(self, kind: str, name: str, content: str = "", run_id: str | None = None, **data: Any) -> str:
+        artifact_id = new_id()
         with session_scope() as s:
-            s.add(Artifact(workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, run_id=run_id,
-                           kind=kind, name=name, content=content[:400_000], data=data))
+            s.add(Artifact(id=artifact_id, workspace_id=self.ws, outcome_id=self.task.outcome_id,
+                           task_id=self.task_id, run_id=run_id, kind=kind, name=name,
+                           content=content[:400_000], data=data))
+        return artifact_id
 
     def stage(self, stage: str, message: str | None = None) -> None:
         self.update(stage=stage, status="running")
@@ -215,7 +224,7 @@ class TaskRunner:
                 self.event("candidate_rejected", problem, level="warn")
                 continue
             self.patch = patch
-            self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
+            diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
                           files=patch.files, additions=patch.additions, deletions=patch.deletions)
             self.checks = await self._run_commands(self.builder, self.cfg.get("checks") or [], "check")
             failed = [c for c in self.checks if not c["ok"]]
@@ -233,7 +242,9 @@ class TaskRunner:
             if verdict is None:
                 continue
             self.evidence("attempts", {"n": attempt, "result": "verified", "checks": _brief(self.checks),
-                                       "verdict": verdict, "app_run": self.app_summary})
+                                       "verdict": verdict, "app_run": self.app_summary,
+                                       "configured_checks": list(self.cfg.get("checks") or []),
+                                       "diff_artifact_id": diff_id})
             break
 
         await self._publish(token)
@@ -743,7 +754,7 @@ class TaskRunner:
             summary = await gh.checks(self.repo.full_name, self.task.head_sha)
             if summary.state != last_state:
                 self.event("ci_status", f"CI {summary.state}", level={"success": "success", "failure": "warn"}.get(
-                    summary.state, "info"), checks=[{k: c[k] for k in ("name", "status", "conclusion", "url")}
+                    summary.state, "info"), state=summary.state, checks=[{k: c[k] for k in ("name", "status", "conclusion", "url")}
                                                     for c in summary.checks])
                 last_state = summary.state
             elapsed = time.monotonic() - started
