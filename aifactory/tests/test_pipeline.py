@@ -662,6 +662,16 @@ def test_only_actionable_failures_earn_an_automatic_retry():
 
 
 def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(factory):
+    def verifier_with_null_findings(messages):  # findings is optional and may be null in a valid report
+        reply = passing_verifier(messages)
+        for tool_call in reply.get("tool_calls", []):
+            if tool_call["function"]["name"] == "finish":
+                args = json.loads(tool_call["function"]["arguments"])
+                args["findings"] = None
+                tool_call["function"]["arguments"] = json.dumps(args)
+        return reply
+
+    ScriptedModel.scripts["verifier"] = verifier_with_null_findings
     with session_scope() as s:
         repo = s.get(Repository, factory["repo"])
         repo.config = {**repo.config, "qa": {"start": "exec sleep 30", "ready_path": "/", "ready_timeout": 2,

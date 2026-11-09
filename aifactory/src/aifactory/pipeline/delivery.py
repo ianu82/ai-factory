@@ -407,7 +407,7 @@ class TaskRunner:
                 # Recorded as a finding too, so later attempts (and the automatic retry) see a concrete failure.
                 report = {**report, "verdict": "fail",
                           "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", ""),
-                          "findings": [*report.get("findings", []), {
+                          "findings": [*(report.get("findings") or []), {
                               "severity": "major", "description": f"Required runtime QA failed: {runtime_problem}",
                               "location": "runtime QA"}]}
             self.verifier_report = report
