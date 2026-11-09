@@ -109,6 +109,17 @@ Tests: `.venv/bin/python -m pytest` (includes end-to-end pipeline tests against 
 remote with a scripted model). Set `AIFACTORY_TEST_DATABASE_URL=postgresql://…` to run the
 suite against a throwaway Postgres (CI does both). UI fixture for rendering checks: `scripts/seed_local_fixture.py`.
 
+## Releases
+
+Pull requests merge into `main` as soon as they are ready. Staging (its own Railway environment) deploys
+`main`, and production deploys the `release` branch. `aifactory release-check` runs every 15 minutes:
+- it confirms production is live on the current release;
+- at most every 2 hours, it moves `release` forward to the commit staging runs, once that commit has soaked,
+  passed its checks and smoke tests, and changed Factory code;
+- a release that fails in production puts releases on hold.
+
+See [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Server configuration
 
 | Variable | Purpose |
