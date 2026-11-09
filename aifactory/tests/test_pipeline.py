@@ -661,6 +661,23 @@ def test_only_actionable_failures_earn_an_automatic_retry():
     assert not delivery._actionable({"result": "builder_failed"}) and not delivery._actionable({})
 
 
+def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(factory):
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "qa": {"start": "exec sleep 30", "ready_path": "/", "ready_timeout": 2,
+                                             "pages": [], "required": True}}
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"), timeout=120)
+    task_id, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed", "verification_failed"]
+    assert title == "T1 did not pass after 1 attempts and an automatic retry"
+    with session_scope() as s:
+        verdict = s.get(Task, task_id).evidence["attempts"][-1]["verdict"]
+        assert any("Required runtime QA failed: the app did not start" in f["description"] for f in verdict["findings"])
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:

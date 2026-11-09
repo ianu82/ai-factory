@@ -404,8 +404,12 @@ class TaskRunner:
             report = result.report
             runtime_problem = self._runtime_problem(app, qa_cfg)
             if runtime_problem and report["verdict"] == "pass":
+                # Recorded as a finding too, so later attempts (and the automatic retry) see a concrete failure.
                 report = {**report, "verdict": "fail",
-                          "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
+                          "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", ""),
+                          "findings": [*report.get("findings", []), {
+                              "severity": "major", "description": f"Required runtime QA failed: {runtime_problem}",
+                              "location": "runtime QA"}]}
             self.verifier_report = report
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))
