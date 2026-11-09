@@ -3,6 +3,7 @@ import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-quer
 import { api, type Credential, type Repo } from "../api";
 import { previewRepository, repositoryDiscoveryUrl, type RepositoryPreview, type ReviewedCommands } from "../repositoryConnect";
 import { commandsFromRepository, repositoryStack, saveRepositoryReview } from "../repositoryConnect";
+import { GitHubPermissions } from "./GitHubPermissions";
 import { getOnboarding, onboardingQueryKey, type OnboardingStepProps } from "./api";
 
 type Discovery = { items: { full_name: string; private: boolean; can_push: boolean; description: string }[]; next_page: number | null; error?: string };
@@ -59,7 +60,7 @@ export function RepositoryStep({ workspace, readOnly, onComplete, onNavigate }: 
     try {
       const diagnostic = await api<Credential>(`/api/workspaces/${id}/credentials/github_token/test?repository=${encodeURIComponent(name)}`, { method: "POST" });
       update(key, { diagnostic });
-      await qc.invalidateQueries({ queryKey: ["credentials", id] });
+      await Promise.all([["credentials", id], ["models", id], ["github-repos", id], onboardingQueryKey(id)].map((queryKey) => qc.invalidateQueries({ queryKey })));
     } catch (err) { update(key, { diagnosticError: (err as Error).message }); }
     finally { update(key, { diagnosticBusy: false }); }
   };
@@ -161,7 +162,8 @@ export function RepositoryStep({ workspace, readOnly, onComplete, onNavigate }: 
           <button className="btn" disabled={readOnly || review.diagnosticBusy || finishing} onClick={() => diagnose(key, review.preview?.full_name || key)}>{review.diagnosticBusy ? "Checking permissions…" : "Retest GitHub permissions"}</button>
           {review.diagnosticError && <p role="alert">{review.diagnosticError}</p>}
           {review.diagnostic && <div aria-live="polite"><p>{review.diagnostic.detail}</p><ul>{(review.diagnostic.metadata?.permissions || []).map((p: { permission: string; required: string; state: string; instruction: string }) => <li key={p.permission}>{p.permission}: {p.required} — <strong>{p.state}</strong>{p.state !== "present" && <p>{p.instruction}</p>}</li>)}</ul></div>}
-          <p className="hint">If missing or unverified: in GitHub, create a fine-grained token for the correct resource owner, select this repository, and allow Contents and Pull requests: write; Issues, Checks and Actions: read. Check organization approval. You can replace the token in the GitHub onboarding step without visiting Settings.</p>
+          <GitHubPermissions workspaceId={id} credential={review.diagnostic} />
+          <p className="hint">You can replace the token in the GitHub onboarding step without visiting Settings.</p>
         </div>
       </section>;
     })}

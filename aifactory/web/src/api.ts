@@ -87,7 +87,14 @@ export interface LinearDiscovery<T> {
   items: T[];
 }
 
+export interface GitHubPermission {
+  permission: string;
+  label: string;
+  required: "read" | "write";
+}
+
 export interface CredentialsResponse {
+  github_permissions: GitHubPermission[];
   items: Credential[];
   server_fallbacks: Record<string, boolean>;
 }
@@ -350,6 +357,7 @@ export interface Credential {
   hint?: string;
   detail?: string;
   tested_at?: string;
+  updated_at?: string;
   metadata?: Record<string, any>;
 }
 

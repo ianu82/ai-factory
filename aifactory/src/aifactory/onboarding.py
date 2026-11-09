@@ -89,9 +89,23 @@ def snapshot(db: Session, ws: Workspace) -> OnboardingState:
     usable = {"models": model_usable, "github": github_usable, "repositories": repo_connected}
     # Catalog evidence comes from credential validation (including seeded keys),
     # never from an identity-only sign-in or this local snapshot.
+    from .github import REQUIRED_PERMISSIONS
+
+    github_meta = (github.metadata_json or {}) if github else {}
+    permissions = {p.get("permission"): p.get("state") for p in github_meta.get("permissions", [])
+                   if isinstance(p, dict)}
+    # Read-only probes cannot prove every fine-grained grant, particularly on
+    # public repositories. Unknown is honest, not a known denial. The repository
+    # itself must have been fetched successfully before this rule applies.
+    github_validated = bool(
+        github and github.status == "valid" and github_meta.get("login") and github_meta.get("repository")
+        and github_meta.get("test_status") == "valid"
+        and github_meta.get("diagnostic_code") in ("github_verified", "github_permissions_unverified")
+        and all(permissions.get(name) in ("present", "unverified") for name in REQUIRED_PERMISSIONS)
+    )
     validated = {
         "models": bool(model and model.status == "valid" and (model.metadata_json or {}).get("models")),
-        "github": bool(github and github.status == "valid" and (github.metadata_json or {}).get("login")),
+        "github": github_validated,
         "repositories": repo_connected,
     }
     completed = {step for step, valid in validated.items() if valid}

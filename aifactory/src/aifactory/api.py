@@ -21,7 +21,7 @@ from .credential_diagnostics import MESSAGES, safe_metadata, test_models
 from .db import get_db, utcnow
 from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
-from .github import GitHub, GitHubError, resolve_token
+from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_token
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
@@ -246,7 +246,9 @@ def credentials(workspace_id: str, user: User = Depends(current_user), db: Sessi
     _ws(db, user, workspace_id)
     secrets = {s.kind: s for s in db.query(Secret).filter(Secret.workspace_id == workspace_id)}
     settings = get_settings()
-    return {"items": [_secret_view(k, secrets.get(k)) for k in ("mindshub_api_key", "github_token", "openai_api_key", "linear_api_key")],
+    return {"github_permissions": [{"permission": name, "label": PERMISSION_LABELS[name], "required": level}
+                                   for name, level in REQUIRED_PERMISSIONS.items()],
+            "items": [_secret_view(k, secrets.get(k)) for k in ("mindshub_api_key", "github_token", "openai_api_key", "linear_api_key")],
             "server_fallbacks": {"github_token": bool(settings.bootstrap_github_token),
                                  "openai_api_key": bool(settings.bootstrap_openai_key),
                                  "mindshub_api_key": bool(settings.bootstrap_mindshub_key)}}
@@ -310,7 +312,12 @@ async def test_credential(workspace_id: str, kind: str,
     if sec is None:
         raise HTTPException(404, "Not configured")
     value = decrypt(sec.ciphertext)
-    if kind == "github_token" and repository:
+    # Settings and automatic tests have no repository parameter. Reuse the last
+    # selected repository instead of downgrading its evidence to identity-only.
+    if kind == "github_token":
+        recorded = (sec.metadata_json or {}).get("repository")
+        if repository is None and isinstance(recorded, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", recorded):
+            repository = recorded
         status, detail, metadata = await GitHub(value).diagnose(repository)
     else:
         status, detail, metadata = await _test_secret(kind, value)

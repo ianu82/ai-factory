@@ -23,9 +23,16 @@ from .security import decrypt
 API = "https://api.github.com"
 
 
-REQUIRED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "read", "checks": "read", "actions": "read"}
-PERMISSION_INSTRUCTION = ("Create a fine-grained token for the selected repository with Contents and Pull requests: write; "
-                          "Issues, Checks and Actions: read. Check organization approval and repository access, then retest.")
+# Keep this contract in sync with delivery, signals, handover and pulls. Both web
+# token recipes consume this list through the credentials API.
+REQUIRED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "write",
+                        "statuses": "write", "checks": "read", "actions": "read", "metadata": "read"}
+PERMISSION_LABELS = {"contents": "Contents", "pull_requests": "Pull requests", "issues": "Issues",
+                     "statuses": "Commit statuses", "checks": "Checks", "actions": "Actions", "metadata": "Metadata"}
+PERMISSION_INSTRUCTION = ("Create a fine-grained token for the correct resource owner and selected repositories with "
+                          + "; ".join(f"{PERMISSION_LABELS[name]}: {'Read and write' if level == 'write' else 'Read-only'}"
+                                      for name, level in REQUIRED_PERMISSIONS.items())
+                          + ". Check organization approval and repository access, then retest.")
 PERMISSION_EVIDENCE = {"not_verified", "classic_repo_scope", "classic_scope_missing", "private_repository_probe"}
 
 
