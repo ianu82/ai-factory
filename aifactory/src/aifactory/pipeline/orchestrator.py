@@ -203,9 +203,11 @@ class Orchestrator:
         from ..github import GitHubError, resolve_token
         from ..models import Repository
         from ..signals import sync_github
+        from ..linear_intake import sync_linear
 
         with session_scope() as s:
             targets = {r.workspace_id for r in s.query(Repository)}
+            targets |= {w.id for w in s.query(Workspace) if (w.settings or {}).get("linear", {}).get("enabled")}
             paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
         for workspace_id in targets - paused:
             if (workspace_settings(workspace_id).get("signals") or {}).get("auto_sync") is False:
@@ -219,6 +221,15 @@ class Orchestrator:
                 log.warning("signal sync skipped for %s: %s", workspace_id, exc)
             except Exception:
                 log.exception("signal sync failed for %s", workspace_id)
+            finally:
+                db.close()
+            db = SessionLocal()
+            try:
+                result = await sync_linear(db, workspace_id)
+                if result.get("accepted"):
+                    self.wake()
+            except Exception:
+                log.exception("Linear intake failed for %s", workspace_id)
             finally:
                 db.close()
 

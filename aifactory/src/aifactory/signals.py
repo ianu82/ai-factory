@@ -12,6 +12,7 @@ import hashlib
 import logging
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from .db import utcnow
@@ -25,9 +26,9 @@ log = logging.getLogger(__name__)
 def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: str, brief: str, repo_ids: list[str],
                       *, acceptance: list[str] | None = None, harness: str | None = None, source: str = "user",
                       signal_id: str | None = None, priority: int = 2, status: str = "planning") -> Outcome:
-    ws = db.get(Workspace, workspace_id)
-    ws.outcome_seq = (ws.outcome_seq or 0) + 1
-    outcome = Outcome(workspace_id=workspace_id, number=ws.outcome_seq, title=title.strip()[:300], brief=brief.strip(),
+    number = db.execute(update(Workspace).where(Workspace.id == workspace_id).values(
+        outcome_seq=Workspace.outcome_seq + 1).returning(Workspace.outcome_seq)).scalar_one()
+    outcome = Outcome(workspace_id=workspace_id, number=number, title=title.strip()[:300], brief=brief.strip(),
                       acceptance=[a.strip() for a in (acceptance or []) if a.strip()], repo_ids=repo_ids,
                       harness=harness or None, source=source, signal_id=signal_id, priority=priority,
                       created_by=user.id if user else None, status=status)

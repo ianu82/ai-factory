@@ -80,7 +80,7 @@ def _sanitize_changes(value: Any, secrets: tuple[str, ...]) -> Any:
     return value
 
 
-def save_config(db: Session, workspace: Workspace, config: LinearConfig, actor: str) -> None:
+def save_config(db: Session, workspace: Workspace, config: LinearConfig, actor: str, *, commit: bool = True) -> None:
     value = config.model_dump()
     if (workspace.settings or {}).get("linear") == value:
         return
@@ -90,4 +90,5 @@ def save_config(db: Session, workspace: Workspace, config: LinearConfig, actor: 
     workspace.settings = {**merged_settings(workspace.settings), "linear": value}
     record(workspace.id, "settings_changed", "Updated workspace Linear configuration", actor=actor,
            data={"changes": changes}, session=db)
-    db.commit()
+    if commit:
+        db.commit()
