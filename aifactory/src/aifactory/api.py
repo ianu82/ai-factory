@@ -688,18 +688,10 @@ class OutcomeCreate(BaseModel):
     template: Literal["readme-contributing"] | None = None
 
 
-def _outcome_rows(db: Session, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
-    tasks: dict[str, list[Task]] = {}
-    runs: dict[str, list[Run]] = {}
-    decisions: dict[str, int] = {}
-    if outcome_ids:
-        for t in db.query(Task).filter(Task.outcome_id.in_(outcome_ids)):
-            tasks.setdefault(t.outcome_id, []).append(t)
-        for r in db.query(Run).filter(Run.outcome_id.in_(outcome_ids)):
-            runs.setdefault(r.outcome_id, []).append(r)
-        for d in db.query(Decision).filter(Decision.outcome_id.in_(outcome_ids), Decision.status == "open"):
-            decisions[d.outcome_id] = decisions.get(d.outcome_id, 0) + 1
-    return tasks, runs, decisions
+def _outcome_rows(db: Session, workspace_id: str, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
+    from .work_services import outcome_rows
+
+    return outcome_rows(db, workspace_id, outcome_ids)
 
 
 @router.get("/workspaces/{workspace_id}/outcomes")
@@ -710,7 +702,7 @@ def list_outcomes(workspace_id: str, status: str = "", limit: int = 200, user: U
     if status:
         query = query.filter(Outcome.status.in_(status.split(",")))
     rows = query.order_by(Outcome.updated_at.desc()).limit(max(1, min(limit, 500))).all()
-    tasks, runs, decisions = _outcome_rows(db, [o.id for o in rows])
+    tasks, runs, decisions = _outcome_rows(db, workspace_id, [o.id for o in rows])
     sources = S.outcome_sources(db, rows)
     return [S.outcome(o, tasks.get(o.id, []), runs.get(o.id, []), decisions.get(o.id, 0),
                       sources.get(o.signal_id)) for o in rows]
@@ -729,7 +721,7 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
         db.execute(update(Workspace).where(Workspace.id == workspace_id).values(outcome_seq=Workspace.outcome_seq))
         existing = db.query(Outcome).filter_by(workspace_id=workspace_id, created_by=user.id, signal_id=marker).first()
         if existing is not None:
-            tasks, runs, decisions = _outcome_rows(db, [existing.id])
+            tasks, runs, decisions = _outcome_rows(db, workspace_id, [existing.id])
             result = S.outcome(existing, tasks.get(existing.id, []), runs.get(existing.id, []), decisions.get(existing.id, 0))
             db.commit()
             return result
@@ -883,16 +875,11 @@ class MessageBody(BaseModel):
 @router.post("/workspaces/{workspace_id}/outcomes/{outcome_id}/messages")
 def post_message(workspace_id: str, outcome_id: str, body: MessageBody, user: User = Depends(current_user),
                  db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "member")
-    o = db.get(Outcome, outcome_id)
-    if o is None or o.workspace_id != workspace_id:
-        raise HTTPException(404, "Outcome not found")
-    m = Message(workspace_id=workspace_id, outcome_id=outcome_id, task_id=body.task_id, author_id=user.id,
-                author_kind="user", body=body.body.strip())
-    db.add(m)
+    from .work_services import publish_changes, send_guidance
+
+    m, payload = send_guidance(db, user, workspace_id, outcome_id, body.body, body.task_id)
     db.commit()
-    record(workspace_id, "guidance", f"{user.name or user.email}: {body.body[:200]}", outcome_id=outcome_id,
-           task_id=body.task_id, actor=user.id, data={"intervention": True})
+    publish_changes([payload])
     return S.message(m, user.name or user.email or "")
 
 
@@ -1391,3 +1378,8 @@ async def stream(workspace_id: str, request: Request, user: User = Depends(curre
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# Confirmation adapters are deliberately not model tools.
+from .mind.actions import router as mind_actions_router
+router.include_router(mind_actions_router)
