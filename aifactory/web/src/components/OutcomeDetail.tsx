@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Ban, X } from "lucide-react";
 import { api, type FactoryEvent, type OutcomeDetail as Detail } from "../api";
@@ -7,6 +8,7 @@ import { ago, clock, HARNESS_LABEL, money } from "../format";
 import { Prose, Skeleton, Status, useToast } from "../ui";
 import { DecisionCard } from "./DecisionCard";
 import { TaskCard } from "./TaskCard";
+import { LinearIssueLink } from "./LinearIssueLink";
 
 const QUIET = new Set(["agent_thought", "agent_tool"]);
 
@@ -20,11 +22,13 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
     refetchInterval: (query) => (["completed", "cancelled"].includes(query.state.data?.outcome.status || "") ? false : 15_000),
   });
   const [showAll, setShowAll] = useState(false);
+  const { hash } = useLocation();
+  const targetDecisionId = hash.startsWith("#decision-") ? hash.slice("#decision-".length) : focusDecisionId;
   if (q.isLoading) return <Skeleton rows={8} />;
   if (q.error || !q.data) return <div className="empty"><h3>Could not load this outcome</h3><p>{(q.error as Error)?.message}</p></div>;
   const { outcome, tasks, runs, decisions, plans, messages, events, repositories } = q.data;
-  const open = decisions.filter((d) => d.status === "open")
-    .sort((a, b) => Number(b.id === focusDecisionId) - Number(a.id === focusDecisionId));  // the one you came for first
+  const open = decisions.filter((d) => d.status === "open" || d.id === targetDecisionId)
+    .sort((a, b) => Number(b.id === targetDecisionId) - Number(a.id === targetDecisionId));
   const plan = [...plans].reverse().find((p) => p.status !== "superseded") || plans[plans.length - 1];
   const active = !["completed", "cancelled", "partially_completed"].includes(outcome.status);
   const timeline = (showAll ? events : events.filter((e) => !QUIET.has(e.kind))).slice(-160);
@@ -46,6 +50,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
       <header className="p-head">
         <div className="crumbs">
           <span className="ref">#{outcome.number}</span>
+          <LinearIssueLink issue={outcome.linear_issue} />
           <span>{repositories.map((r) => r.full_name).join(", ")}</span>
           <span style={{ flex: 1 }} />
           {active && ws.role !== "viewer" && (
@@ -65,7 +70,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
 
       {open.length > 0 && (
         <section className="p-sec" aria-label="Needs you">
-          {open.map((d) => <DecisionCard key={d.id} d={d} focused={d.id === focusDecisionId} />)}
+          {open.map((d) => <DecisionCard key={d.id} d={d} focused={d.id === targetDecisionId} />)}
         </section>
       )}
 

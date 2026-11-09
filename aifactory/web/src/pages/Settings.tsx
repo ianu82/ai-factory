@@ -8,11 +8,13 @@ import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, t
 import { ago } from "../format";
 import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
+import { LinearSettings } from "../components/LinearSettings";
 
 const SECTIONS = [
   ["policies", "Autonomy & limits"],
   ["models", "Models & workers"],
   ["credentials", "Credentials"],
+  ["linear", "Linear"],
   ["repositories", "Repositories"],
   ["members", "Members"],
   ["workspace", "Workspace"],
@@ -33,6 +35,7 @@ export function SettingsPage() {
             {section === "policies" && <Policies />}
             {section === "models" && <Models />}
             {section === "credentials" && <Credentials />}
+            {section === "linear" && <LinearSettings key={ws.id} />}
             {section === "repositories" && <Repositories />}
             {section === "members" && <Members />}
             {section === "workspace" && <WorkspaceSection />}
@@ -160,7 +163,7 @@ const CRED_HELP: Record<string, { what: string; placeholder: string }> = {
   mindshub_api_key: { what: "Powers every planner, builder and verifier session. Create a key in MindsHub console → API keys.", placeholder: "mdb_…" },
   github_token: { what: "Fine-grained token with Contents, Pull requests and Commit statuses (read & write) on the repositories this workspace may change.", placeholder: "github_pat_…" },
   openai_api_key: { what: "Optional alternative provider.", placeholder: "sk-…" },
-  linear_api_key: { what: "Personal Linear API key. Used only by the control plane, never sent to sandboxes.", placeholder: "lin_api_…" },
+  linear_api_key: { what: "Personal Linear API key. Used only by the control plane, never sent to sandboxes. After saving, choose your team and workflow states in Settings → Linear.", placeholder: "lin_api_…" },
 };
 
 function Credentials() {
@@ -170,7 +173,7 @@ function Credentials() {
     <section className="s-block">
       <h2>Credentials</h2>
       <p>Stored encrypted on the Factory server. Values are never shown again, never sent to sandboxes, and never appear in logs, PRs or evidence. Agents reach models through a run-scoped gateway token.</p>
-      {q.isLoading ? <Skeleton rows={3} /> : q.data?.items.map((c) => <CredentialRow key={c.kind} c={c} fallback={q.data!.server_fallbacks[c.kind]} />)}
+      {q.isLoading ? <Skeleton rows={3} /> : q.error ? <p role="alert">Could not load credentials: {q.error.message} <button className="btn sm" onClick={() => q.refetch()}>Retry</button></p> : q.data?.items.map((c) => <CredentialRow key={`${ws.id}-${c.kind}`} c={c} fallback={q.data!.server_fallbacks[c.kind]} />)}
     </section>
   );
 }
@@ -186,6 +189,8 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
   const refresh = () => Promise.all([
     qc.invalidateQueries({ queryKey: ["credentials", ws.id] }),
     qc.invalidateQueries({ queryKey: ["models", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["linear-teams", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["linear-states", ws.id] }),
     qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
   ]);
   const saveKey = async (e: React.FormEvent) => {
@@ -200,6 +205,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
     } catch (err) {
       toast((err as Error).message, true);
     } finally {
+      setValue("");
       setBusy(false);
     }
   };
@@ -209,14 +215,25 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
       const r = await api<Credential>(`/api/workspaces/${ws.id}/credentials/${c.kind}/test`, { method: "POST" });
       toast(r.status === "valid" ? r.detail || "Working" : r.detail || "Test failed", r.status !== "valid");
       await refresh();
+    } catch (err) {
+      toast((err as Error).message, true);
     } finally {
       setBusy(false);
     }
   };
   const remove = async () => {
     if (!confirm(`Remove the ${c.label} credential? Running work using it will fail.`)) return;
-    await api(`/api/workspaces/${ws.id}/credentials/${c.kind}`, { method: "DELETE" });
-    await refresh();
+    setBusy(true);
+    try {
+      await api(`/api/workspaces/${ws.id}/credentials/${c.kind}`, { method: "DELETE" });
+      setValue("");
+      setEditing(true);
+      await refresh();
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(false);
+    }
   };
   const tone = c.status === "valid" ? "good" : c.status === "invalid" ? "bad" : c.configured ? "warn" : "idle";
   return (
@@ -229,8 +246,8 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
         {c.configured && admin && !editing && (
           <>
             <button className="btn sm ghost" onClick={test} disabled={busy}>Test</button>
-            <button className="btn sm ghost" onClick={() => setEditing(true)}>Replace</button>
-            <button className="icon-btn" onClick={remove} aria-label={`Remove ${c.label}`}><Trash2 /></button>
+            <button className="btn sm ghost" onClick={() => setEditing(true)} disabled={busy}>Replace</button>
+            <button className="icon-btn" onClick={remove} disabled={busy} aria-label={`Remove ${c.label}`}><Trash2 /></button>
           </>
         )}
       </div>
@@ -241,7 +258,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
       </div>
       {editing && admin && (
         <form onSubmit={saveKey}>
-          <input className="input mono" type="password" autoComplete="off" spellCheck={false} placeholder={CRED_HELP[c.kind]?.placeholder}
+          <input className="input mono" type="password" autoComplete="off" spellCheck={false} disabled={busy} placeholder={CRED_HELP[c.kind]?.placeholder}
             value={value} onChange={(e) => setValue(e.target.value)} aria-label={`${c.label} value`} />
           <button className="btn primary" disabled={busy || value.trim().length < 8}>{busy ? "Testing…" : "Save & test"}</button>
           {c.configured && <button type="button" className="btn ghost" onClick={() => { setEditing(false); setValue(""); }}>Cancel</button>}

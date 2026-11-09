@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { LinearIssueLink } from "../components/LinearIssueLink";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { GitPullRequest, Search } from "lucide-react";
@@ -100,6 +101,7 @@ function OutcomeRow({ o, selected, onSelect, repos }: { o: Outcome; selected: bo
         <div className="title">{o.title}</div>
         <div className="sub">
           <span className="ref">#{o.number}</span>
+          <LinearIssueLink issue={o.linear_issue} />
           <span style={{ color: s.tone === "human" ? "var(--human)" : s.tone === "bad" ? "var(--bad)" : undefined, fontWeight: s.tone === "human" ? 550 : undefined }}>
             {o.open_decisions > 0 ? `${s.label} · ${o.open_decisions} decision${o.open_decisions > 1 ? "s" : ""}` : s.label}
           </span>

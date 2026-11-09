@@ -30,6 +30,37 @@ export async function api<T = any>(path: string, init: RequestInit & { json?: un
 
 export type Role = "owner" | "admin" | "member" | "viewer";
 
+export type LinearStage = "queued" | "building" | "verifying" | "merging" | "done" | "blocked";
+
+export interface LinearConfig {
+  enabled: boolean;
+  team_id: string | null;
+  intake_label: string;
+  repo_ids: string[];
+  states: Record<LinearStage, string | null>;
+}
+
+export interface LinearTeam {
+  id: string;
+  name: string;
+  key?: string;
+}
+
+export interface LinearState {
+  id: string;
+  name: string;
+  type: string;
+}
+
+export interface LinearDiscovery<T> {
+  items: T[];
+}
+
+export interface CredentialsResponse {
+  items: Credential[];
+  server_fallbacks: Record<string, boolean>;
+}
+
 export interface Settings {
   provider: "mindshub" | "openai";
   models: { default?: string; planner?: string; builder?: string; verifier?: string };
@@ -41,6 +72,7 @@ export interface Settings {
   budgets: { run_usd: number; outcome_usd: number; run_tokens: number };
   limits: Record<string, number>;
   reasoning_effort?: string;
+  linear?: LinearConfig;
 }
 
 export interface Workspace {
@@ -99,6 +131,7 @@ export interface Outcome {
   status: string;
   priority: number;
   source: string;
+  linear_issue: { id: string; identifier: string | null; url: string } | null;
   summary: string;
   blocked_reason: string;
   created_at: string;

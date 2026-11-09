@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ExternalLink } from "lucide-react";
 import { api, type Decision } from "../api";
@@ -17,7 +17,14 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
   const [busy, setBusy] = useState<string | null>(null);
   const textNeeded = d.options.some((o) => NEEDS_TEXT.has(o.value));
   const [noting, setNoting] = useState(d.kind === "question");
-  const canAct = ws.role !== "viewer";
+  const canAct = ws.role !== "viewer" && d.status === "open";
+  const card = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (focused) {
+      card.current?.scrollIntoView({ block: "center" });
+      card.current?.focus({ preventScroll: true });
+    }
+  }, [focused]);
 
   const resolve = async (value: string) => {
     if (NEEDS_TEXT.has(value) && !comment.trim()) {
@@ -42,7 +49,7 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
   };
 
   return (
-    <article className={`decide ${focused ? "focused" : ""}`} aria-label={d.title}>
+    <article ref={card} id={`decision-${d.id}`} tabIndex={-1} className={`decide ${focused ? "focused" : ""}`} aria-label={d.title}>
       <span className="kind-tag">{DECISION_KIND[d.kind] || d.kind} · {ago(d.created_at)}</span>
       <h4>{d.title}</h4>
       {showContext && d.outcome_number != null && (
