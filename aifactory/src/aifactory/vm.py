@@ -350,6 +350,36 @@ class RailwayVMSandbox:
             raise SandboxError(f"Path escapes the repository: {relative}")
         return path
 
+    async def read_image_bytes_async(self, relative: str, limit: int) -> bytes:
+        import inspect
+
+        from .safe_files import safe_read
+
+        if self._closed:
+            raise SandboxError("Sandbox is closed")
+        # Do not use resolve + bridge.read: resolve is lexical, and a separate
+        # filesystem check would race the open. Both happen inside this command.
+        script = ("from __future__ import annotations\n" + inspect.getsource(safe_read)
+                  + "\nimport base64\nprint(base64.b64encode(safe_read("
+                  + repr(str(self.work)) + ", " + repr(relative) + ", " + repr(limit)
+                  + ")).decode('ascii'))")
+        result = await self.bridge.call("exec", {
+            "id": self.vm_id, "command": "python3 -c " + _quote(script),
+            "cwd": "/", "timeoutSec": 30, "maxOutputBytes": 4 * ((limit + 2) // 3) + 4096,
+            "env": {"HOME": str(self.home)}}, timeout=60)
+        if result.get("exitCode") != 0 or result.get("truncated") or result.get("timedOut"):
+            raise SandboxError("Cannot read sandbox image: " + (result.get("stderr") or "read failed")[-600:])
+        try:
+            encoded = (result.get("stdout") or "").strip()
+            if len(encoded) > 4 * ((limit + 2) // 3):
+                raise ValueError("Image is too large")
+            data = base64.b64decode(encoded, validate=True)
+            if len(data) > limit:
+                raise ValueError("Image is too large")
+            return data
+        except ValueError as exc:
+            raise SandboxError("Invalid sandbox image response") from exc
+
     async def read_bytes_async(self, relative: str, limit: int | None = None, from_end: bool = False) -> bytes:
         args: dict[str, Any] = {"id": self.vm_id, "path": str(self.resolve(relative))}
         if limit:

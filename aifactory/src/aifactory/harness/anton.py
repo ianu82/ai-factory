@@ -1,8 +1,8 @@
 """Anton harness: MindsDB's Anton agent session driving the shared Factory tool set.
 
 Anton's ChatSession runs in the control plane; its provider is pointed at the workspace's
-model provider with per-run accounting, and its only tools are the Factory tools, which
-execute inside the job sandbox. Anton's own code-execution runtime, web tools, memory and
+model provider with per-run accounting. Factory tools and a protected image reader
+access the job sandbox. Anton's own code-execution runtime, web tools, memory and
 skills are disabled so results depend only on the repository and the task.
 """
 
@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..inference import BudgetExceeded
+from .anton_tools import replace_session_tools
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
 from .schemas import validate_report
 from .tools import ToolBox, finish_tool, tool_specs
@@ -122,6 +123,17 @@ class AntonHarness:
         tools = [ToolDef(t["function"]["name"], t["function"]["description"], t["function"]["parameters"],
                          finish_handler if t["function"]["name"] == "finish" else make_handler(t["function"]["name"]))
                  for t in specs]
+        tools = replace_session_tools(tools, session.sandbox)
+
+        class SandboxChatSession(ChatSession):
+            def _build_core_tools(chat):
+                super()._build_core_tools()
+                # The pinned SDK registers built-ins before config.tools and
+                # deduplicates by name. Override only this session's registry,
+                # including on lazy rebuilds; never patch SDK ToolDefs globally.
+                chat.tool_registry.unregister_tool("read_image")
+                chat.tool_registry.register_tool(next(t for t in tools if t.name == "read_image"))
+
         provider = Provider(api_key=provider_cfg.api_key, base_url=provider_cfg.base_url,
                             flavor=OpenAIProvider.FLAVOR_OPENAI, reasoning_effort=session.reasoning_effort)
         try:
@@ -141,7 +153,7 @@ class AntonHarness:
             settings = settings.model_copy(update={
                 "analytics_enabled": False, "skills_root": Path(temporary) / "skills", "skills_extra_roots": [],
                 "skills_artifact_roots": [], "skill_drafts_root": None})
-            chat = ChatSession(ChatSessionConfig(
+            chat = SandboxChatSession(ChatSessionConfig(
                 llm_client=client, settings=settings, runtime_factory=no_runtime, session_id=uuid4().hex,
                 harness="anton", tools=tools, tool_allowlist=frozenset(t.name for t in tools),
                 background_memory=False, web_search_enabled=False, web_fetch_enabled=False,

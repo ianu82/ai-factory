@@ -47,6 +47,9 @@ def _fake_server(port: int, requests: list):
         if not outputs:
             call = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "write_file", "status": "completed",
                     "arguments": json.dumps({"path": "hello.txt", "content": "hi from anton\n"})}
+        elif len(outputs) == 1:
+            call = {"type": "function_call", "id": "fc_image", "call_id": "call_image", "name": "read_image",
+                    "status": "completed", "arguments": json.dumps({"file_path": ".factory/screen.jpg"})}
         else:
             call = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": "finish", "status": "completed",
                     "arguments": json.dumps({"status": "done", "summary": "Wrote hello.txt"})}
@@ -70,6 +73,13 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     try:
         sb = LocalSandbox("anton", root=tmp_path).create()
         sb.work.mkdir()
+        import io
+        from PIL import Image
+
+        image = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+        (sb.work / ".factory").mkdir()
+        (sb.work / ".factory" / "screen.jpg").write_bytes(image.getvalue())
         provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
         ledger = UsageLedger(run_id="r", workspace_settings={})
         session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
@@ -82,5 +92,9 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     assert (sb.work / "hello.txt").read_text() == "hi from anton\n"
     assert ledger.input_tokens >= 200 and ledger.calls >= 2
     tool_names = {t.get("name") for t in requests[0].get("tools", [])}
-    assert {"write_file", "finish", "run"} <= tool_names
+    assert {"write_file", "finish", "run", "read_image"} <= tool_names
     assert not tool_names & {"scratchpad", "web_search", "web_fetch"}
+
+    # The actual ChatSession dispatch must use the replacement and pass vision
+    # content to the provider, not just advertise an otherwise unreachable tool.
+    assert any("data:image/png;base64," in json.dumps(body) for body in requests[2:])

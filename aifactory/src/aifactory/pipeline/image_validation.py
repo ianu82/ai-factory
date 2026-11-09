@@ -191,11 +191,18 @@ def _gif(raw: bytes) -> None:
     _require(False)
 
 
-def _webp(raw: bytes) -> None:
+def _webp(raw: bytes, depth: int = 0, budget: list[int] | None = None) -> None:
+    # ANMF may contain only image chunks, not arbitrarily nested animations.
+    # Bound both stack depth and cumulative work even for hostile containers.
+    _require(depth <= 1)
+    if budget is None:
+        budget = [10_000]
     _require(raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
              and int.from_bytes(raw[4:8], "little") + 8 == len(raw))
     pos, images = 12, 0
     while pos < len(raw):
+        budget[0] -= 1
+        _require(budget[0] >= 0)
         _require(pos + 8 <= len(raw))
         tag, size = raw[pos:pos + 4], int.from_bytes(raw[pos + 4:pos + 8], "little")
         data = raw[pos + 8:pos + 8 + size]
@@ -217,7 +224,7 @@ def _webp(raw: bytes) -> None:
             _require(size > 16)
             # Animation frames contain their own padded image chunks.
             body = data[16:]
-            _webp(b"RIFF" + (len(body) + 4).to_bytes(4, "little") + b"WEBP" + body)
+            _webp(b"RIFF" + (len(body) + 4).to_bytes(4, "little") + b"WEBP" + body, depth + 1, budget)
             images += 1
     _require(pos == len(raw) and images > 0)
 

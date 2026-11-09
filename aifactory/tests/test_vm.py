@@ -270,3 +270,65 @@ def test_vm_attachment_originals_and_safe_writes(tmp_path, monkeypatch):
         await vm.close()
 
     asyncio.run(go())
+
+
+def test_vm_protected_image_reads_check_and_open_on_vm_filesystem(tmp_path, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    from aifactory.sandbox import SandboxError, read_image_bytes
+
+    bridge = FakeBridge(tmp_path / "vm")
+    monkeypatch.setattr("aifactory.vm.VMBridge.get", classmethod(lambda cls: bridge))
+    stream = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(stream, format="PNG")
+    raw = stream.getvalue()
+
+    async def go():
+        vm = await RailwayVMSandbox.create()
+        work = bridge.root / "work"
+        (work / ".factory").mkdir()
+        (work / ".factory" / "screen.jpg").write_bytes(raw)
+        outside = bridge.root / "tmp" / "secret.png"
+        outside.write_bytes(raw)
+        (work / "outside.png").symlink_to(outside)
+        (work / "outside-dir").symlink_to(outside.parent, target_is_directory=True)
+        (work / "inside.png").symlink_to(work / ".factory" / "screen.jpg")
+        (work / "inside-dir").symlink_to(work / ".factory", target_is_directory=True)
+        # Lexical resolve accepts these: only a VM-side no-follow open protects them.
+        assert str(vm.resolve("outside-dir/secret.png")).endswith("outside-dir/secret.png")
+        for path in (".factory/screen.jpg", str(vm.work / ".factory/screen.jpg")):
+            before = len(bridge.calls)
+            assert await read_image_bytes(vm, path, 1000) == raw
+            assert bridge.calls[before:] == ["exec"]
+        for path in ("../tmp/secret.png", "/tmp/secret.png", "outside.png", "outside-dir/secret.png",
+                     "inside.png", "inside-dir/screen.jpg"):
+            with pytest.raises(SandboxError):
+                await read_image_bytes(vm, path, 1000)
+        with pytest.raises(SandboxError, match="too large"):
+            await read_image_bytes(vm, ".factory/screen.jpg", 10)
+        # Larger than exec's ordinary head/tail clipping: image transport must be lossless.
+        (work / "large.png").write_bytes(b"x" * 100_000)
+        assert await read_image_bytes(vm, "large.png", 100_000) == b"x" * 100_000
+        pytest.importorskip("anton.core.tools.tool_defs")
+        from aifactory.harness.anton_tools import sandbox_image_tool
+
+        tool = sandbox_image_tool(vm)
+        outcome = await tool.handler(None, {"file_path": ".factory/screen.jpg"})
+        assert outcome.ok is True
+        assert outcome.content[0]["source"]["media_type"] == "image/png"
+        assert base64.b64decode(outcome.content[0]["source"]["data"]) == raw
+        assert outcome.content[1]["type"] == "text"
+        (work / "invalid.png").write_bytes(b"not an image")
+        outcome = await tool.handler(None, {"file_path": "invalid.png"})
+        assert outcome.ok is False and isinstance(outcome.content, str)
+        from anton.utils.clipboard import MAX_IMAGE_BYTES
+
+        with (work / "oversized.png").open("wb") as handle:
+            handle.truncate(MAX_IMAGE_BYTES)
+        outcome = await tool.handler(None, {"file_path": "oversized.png"})
+        assert outcome.ok is False and isinstance(outcome.content, str) and "too large" in outcome.content
+        await vm.close()
+
+    asyncio.run(go())
