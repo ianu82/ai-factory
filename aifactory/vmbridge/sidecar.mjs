@@ -7,8 +7,11 @@ import {ExecNotStartedError, Sandbox} from 'railway';
 import WebSocket from 'ws';
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
-// A spawn is acknowledged as started without a session name only after any handshake would have failed.
-const SPAWN_START_WAIT_MS = HANDSHAKE_TIMEOUT_MS + 15_000;
+// The railway SDK retries a connection that failed before the command started once (connectWithRetry), so a
+// start can take two handshakes. A spawn is acknowledged without a session name only after both would have
+// failed, plus a margin for minting the second token.
+const SDK_CONNECT_ATTEMPTS = 2;
+const SPAWN_START_WAIT_MS = SDK_CONNECT_ATTEMPTS * HANDSHAKE_TIMEOUT_MS + 15_000;
 
 class ExecWebSocket extends WebSocket {
   constructor(address, protocols, options) {
