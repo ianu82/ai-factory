@@ -68,9 +68,9 @@ async def publish_candidate(task_id: str, info: dict[str, Any]) -> dict[str, Any
         head = await publish(info["repo"], token, base_sha=info["base_sha"], branch=branch,
                              patch=Patch(diff=info["diff"].encode(), files=info["files"], additions=0, deletions=0),
                              message=f"{info['title']} (Factory candidate, handed over)", task_id=task_id + "-handover")
-        body = (f"Work in progress handed over to {info['who']} from AI Factory outcome #{info['number']} "
+        body = (f"Work in progress handed over to {info['who']} from MindsHub AI Factory outcome #{info['number']} "
                 f"({info['key']}). This is the Factory's latest candidate; it has **not** passed independent "
-                "verification. The Factory will not touch this branch again.\n\n🤖 AI Factory")
+                "verification. The Factory will not touch this branch again.\n\n🤖 MindsHub AI Factory")
         pr = await GitHub(token).create_pull(info["repo"], head=branch, base=info["default_branch"],
                                              title=f"[handed over] {info['title']}", body=body, draft=True)
     except (GitHubError, Exception) as exc:  # noqa: BLE001 - the hand-over itself already happened
@@ -101,8 +101,8 @@ async def close_dropped_pull(task_id: str, who: str, why: str) -> bool:
         pr = await gh.pull(full_name, number)
         if pr.get("state") != "open":
             return False
-        await gh.comment(full_name, number, f"{why} in AI Factory by {who}, so the Factory closed this pull request. "
-                                            "Reopen it to continue the work yourself.\n\n🤖 AI Factory")
+        await gh.comment(full_name, number, f"{why} in MindsHub AI Factory by {who}, so the Factory closed this pull request. "
+                                            "Reopen it to continue the work yourself.\n\n🤖 MindsHub AI Factory")
         await gh.request("PATCH", f"/repos/{full_name}/pulls/{number}", json={"state": "closed"})
     except GitHubError as exc:
         record(ws, "pr_close_failed", f"Could not close PR #{number}: {str(exc)[:200]}", outcome_id=outcome_id,

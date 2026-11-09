@@ -658,7 +658,7 @@ class TaskRunner:
         try:
             pr = await gh.create_pull(self.repo.full_name, head=self.task.branch, base=self.repo.default_branch,
                                       title=f"{self.task.title}", body=body)
-            await gh.set_status(self.repo.full_name, head, "success", "Independently verified by AI Factory",
+            await gh.set_status(self.repo.full_name, head, "success", "Independently verified by MindsHub AI Factory",
                                 self._task_url())
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
@@ -692,11 +692,11 @@ class TaskRunner:
                     lines += [f"  - {'✅' if p.get('ok') else '❌'} `{p.get('method')} {p.get('path')}` → "
                               f"{p.get('status') or p.get('error')} (expected {p.get('expect_status')})"
                               + (f" — {p['why']}" if p.get("why") else "") for p in a["change_checks"]]
-                lines.append(f"- {a.get('screenshots', 0)} screenshot(s) attached in AI Factory "
+                lines.append(f"- {a.get('screenshots', 0)} screenshot(s) attached in MindsHub AI Factory "
                              f"({a.get('verifier_screenshots', 0)} taken by the verifier)")
             else:
                 lines.append("- ❌ The app did not become ready, so there is no runtime evidence; the boot log is in"
-                             " AI Factory")
+                             " MindsHub AI Factory")
         if self.checks:
             lines += ["", "### Checks run by the Factory"]
             lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s)" for c in self.checks]
@@ -707,7 +707,7 @@ class TaskRunner:
                   f"Cost so far: {('$%.2f' % spent) if known else ('at least $%.2f (some runs not priced yet)' % spent) if spent else 'not priced yet'}."]
         url = self._task_url()
         if url:
-            lines.append(f"[View in AI Factory]({url})")
+            lines.append(f"[View in MindsHub AI Factory]({url})")
         issues = self._source_issues()
         if issues:
             lines.append("")
@@ -967,7 +967,7 @@ class TaskRunner:
             await self.deliver(continue_from_branch=True)
             return
         try:
-            await gh.set_status(self.repo.full_name, detail, "success", "Revalidated after rebase by AI Factory",
+            await gh.set_status(self.repo.full_name, detail, "success", "Revalidated after rebase by MindsHub AI Factory",
                                 self._task_url())
         except GitHubError:
             pass
@@ -1027,7 +1027,7 @@ class TaskRunner:
                                       body=(f"Post-merge smoke checks failed after #{self.task.pr_number} "
                                             f"({self.task.merge_sha[:10]}). The Factory is reverting it under the "
                                             "repository's recovery policy or a recorded decision."
-                                            + (f"\n\n[View in AI Factory]({self._task_url()})" if self._task_url() else "")))
+                                            + (f"\n\n[View in MindsHub AI Factory]({self._task_url()})" if self._task_url() else "")))
         except (GitError, GitHubError) as exc:
             self.block("unblock", f"{self.task.key}: could not open a revert", str(exc), status="smoke_failed",
                        options=[{"value": "acknowledge", "label": "Acknowledge"}])

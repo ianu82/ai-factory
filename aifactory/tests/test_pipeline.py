@@ -138,9 +138,13 @@ def test_outcome_is_planned_built_verified_merged_and_smoke_tested(factory):
         assert task.evidence["ci"]["state"] == "success"
         assert {r.role for r in runs} == {"planner", "builder", "verifier"}
         assert all(r.input_tokens > 0 for r in runs)
+        branch = task.branch
     assert FakeGitHub.merged == [1]
     main_greet = git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
     assert "Hello, Factory!" in main_greet
+    # Commits are signed "MindsHub AI Factory": a bare "AI Factory" / ai-factory identity is a real GitHub user.
+    signed = git("log", "-1", "--format=%an <%ae>|%cn <%ce>", branch, cwd=factory["remotes"] / "acme/demo.git")
+    assert signed == "MindsHub AI Factory <factory@mindshub.ai>|MindsHub AI Factory <factory@mindshub.ai>"
     for kind in ("plan_proposed", "plan_approved", "verified", "published", "merged", "smoke_passed", "outcome_completed"):
         assert kind in kinds, kinds
 
@@ -1159,7 +1163,7 @@ def test_abandoning_a_task_closes_its_pull_request_with_a_note(factory, client, 
     r = client.post(f"/api/workspaces/{factory['ws']}/decisions/{decision_id}/resolve", json={"resolution": "abandon"})
     assert r.status_code == 200 and r.json()["pr_closed"] is True
     assert FakeGitHub.pulls[pr["number"]]["state"] == "closed"
-    assert FakeGitHub.comments and "Abandoned in AI Factory by Dev" in FakeGitHub.comments[-1][1]
+    assert FakeGitHub.comments and "Abandoned in MindsHub AI Factory by Dev" in FakeGitHub.comments[-1][1]
     with session_scope() as s:
         assert s.get(Task, task_id).status == "abandoned" and s.get(Task, task_id).evidence["pr_closed"]
 

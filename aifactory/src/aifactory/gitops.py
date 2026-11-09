@@ -24,8 +24,8 @@ from .sandbox import SCRATCH, LocalSandbox, SandboxError
 
 SAFE_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=always",
             "-c", "advice.detachedHead=false", "-c", "init.defaultBranch=main"]
-AUTHOR = {"GIT_AUTHOR_NAME": "AI Factory", "GIT_AUTHOR_EMAIL": "factory@mindshub.ai",
-          "GIT_COMMITTER_NAME": "AI Factory", "GIT_COMMITTER_EMAIL": "factory@mindshub.ai"}
+AUTHOR = {"GIT_AUTHOR_NAME": "MindsHub AI Factory", "GIT_AUTHOR_EMAIL": "factory@mindshub.ai",
+          "GIT_COMMITTER_NAME": "MindsHub AI Factory", "GIT_COMMITTER_EMAIL": "factory@mindshub.ai"}
 DEFAULT_PROTECTED = [".github/workflows/**", ".env", ".env.*", "**/*.pem", "**/*.key"]
 # Overridable for tests and GitHub Enterprise; credentials are never embedded in it.
 GIT_BASE = os.environ.get("AIFACTORY_GIT_BASE", "https://github.com").rstrip("/")
