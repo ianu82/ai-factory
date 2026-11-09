@@ -127,6 +127,7 @@ def apply_bootstrap() -> str | None:
     _cancel_declared(workspace_id, cfg.get("cancel") or [])
     _retry_declared(workspace_id, cfg.get("retry") or [])
     _resolve_delegated(workspace_id, cfg.get("resolve") or [], cfg.get("delegated_by", ""))
+    _guidance_delegated(workspace_id, cfg.get("guidance") or [], cfg.get("delegated_by", ""))
     if declared:
         loop.create_task(_declare_outcomes(workspace_id, declared, task))
     log.info("Bootstrap workspace ready: %s", workspace_id)
@@ -230,6 +231,66 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
                    outcome_id=outcome.id, actor="operator", session=s, data={"key": key, "nonce": nonce})
 
 
+def _operator_user(db, delegated_by: str):
+    """The system identity operator actions are recorded under: one per delegator, never renamed, so what was
+    delegated earlier keeps naming who delegated it. (Records before this used one shared identity, which
+    keeps the name it last had.)"""
+    import hashlib
+
+    from .models import User
+
+    key = hashlib.sha256(delegated_by.strip().lower().encode()).hexdigest()[:12] if delegated_by else "self"
+    email = f"operator+{key}@factory.local"
+    operator = db.query(User).filter(User.is_system.is_(True), User.email == email).first()
+    if operator is None:
+        name = f"Operator (delegated by {delegated_by})" if delegated_by else "Operator"
+        operator = User(email=email, name=name, is_system=True)
+        db.add(operator)
+        db.commit()
+    return operator
+
+
+def _guidance_delegated(workspace_id: str, items: list[dict], delegated_by: str) -> None:
+    """Post guidance to an outcome (or one task) as the operator under a person's delegation, like the app's
+    guidance box: outcome-level guidance reaches every task of the outcome, including tasks not started yet.
+
+    Each item: {"outcome": N, "task": "T2" (optional), "body": "...", "nonce": "..."}; each nonce posts once.
+    """
+    if not items:
+        return
+    from .db import SessionLocal
+    from .events import record
+    from .models import Event, Message, Outcome, Task
+
+    db = SessionLocal()
+    try:
+        operator = _operator_user(db, delegated_by)
+        for item in items:
+            body, nonce = str(item.get("body") or "").strip(), str(item.get("nonce") or "")
+            outcome = db.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                               Outcome.number == int(item.get("outcome", 0))).first()
+            if outcome is None or not body or not nonce:
+                continue
+            if any((e.data or {}).get("nonce") == nonce for e in db.query(Event).filter(  # once per workspace
+                    Event.workspace_id == workspace_id, Event.kind == "guidance")):
+                continue
+            task_id = None
+            if item.get("task"):
+                task = db.query(Task).filter(Task.outcome_id == outcome.id, Task.key == str(item["task"])).first()
+                if task is None:
+                    continue
+                task_id = task.id
+            # The message and its nonce-bearing event commit together, so a crash can never post it twice.
+            db.add(Message(workspace_id=workspace_id, outcome_id=outcome.id, task_id=task_id, author_id=operator.id,
+                           author_kind="user", body=body))
+            record(workspace_id, "guidance", f"{operator.name}: {body[:200]}", outcome_id=outcome.id, task_id=task_id,
+                   actor="operator", data={"intervention": True, "nonce": nonce, "delegated_by": delegated_by},
+                   session=db)
+            db.commit()
+    finally:
+        db.close()
+
+
 def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) -> None:
     """Resolve open decisions as an operator acting under a person's explicit delegation.
 
@@ -241,19 +302,12 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
     from .db import SessionLocal
     from .decisions import DecisionError, resolve
     from .events import record
-    from .models import Decision, Event, Outcome, User
+    from .models import Decision, Event, Outcome
 
     db = SessionLocal()
     try:
-        name = f"Operator (delegated by {delegated_by})" if delegated_by else "Operator"
-        operator = db.query(User).filter(User.is_system.is_(True), User.email == "operator@factory.local").first()
-        if operator is None:
-            operator = User(email="operator@factory.local", name=name, is_system=True)
-            db.add(operator)
-            db.commit()
-        elif operator.name != name:
-            operator.name = name
-            db.commit()
+        operator = _operator_user(db, delegated_by)
+        name = operator.name
         for item in items:
             outcome = db.query(Outcome).filter(Outcome.workspace_id == workspace_id,
                                                Outcome.number == int(item.get("outcome", 0))).first()

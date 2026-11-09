@@ -345,3 +345,66 @@ def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkey
                 "T1": first, "T2": "pending"}
         declared = {o.title: o.priority for o in s.query(Outcome).filter(Outcome.source == "operator")}
         assert declared == {"Mind v1": 0, "Other": 2}
+
+
+def test_bootstrap_guidance_reaches_tasks_once_and_is_attributed_to_the_operator(monkeypatch):
+    from aifactory.models import Event, Message, Plan, Task, User
+    from aifactory.pipeline.runtime import guidance_history
+
+    def boot(config):
+        monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
+
+        async def run():
+            return apply_bootstrap()
+
+        return asyncio.run(run())
+
+    base = {"organization": "Acme", "workspace": "Delivery", "delegated_by": "ian@example.com"}
+    ws_id = boot(base)
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app", config={})
+        s.add(repo)
+        s.flush()
+        o = Outcome(workspace_id=ws_id, number=5, title="Review loop", repo_ids=[repo.id], status="running")
+        s.add(o)
+        s.flush()
+        plan = Plan(outcome_id=o.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        s.add_all([Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key=k, title=k, repo_id=repo.id,
+                        status="pending") for k in ("T1", "T2")])
+        outcome_id = o.id
+    cfg = {**base, "guidance": [{"outcome": 5, "body": "Answer question-only comments in the thread.", "nonce": "g1"},
+                                {"outcome": 5, "task": "T2", "body": "Ignore commenters without write access.",
+                                 "nonce": "g2"},
+                                {"outcome": 5, "task": "T9", "body": "No such task.", "nonce": "g3"},
+                                {"outcome": 99, "body": "No such outcome.", "nonce": "g4"}]}
+    boot(cfg)
+    boot(cfg)  # a restart never posts the same guidance twice
+    with session_scope() as s:
+        t1, t2 = (s.query(Task).filter(Task.outcome_id == outcome_id, Task.key == k).one().id for k in ("T1", "T2"))
+        messages = s.query(Message).filter(Message.outcome_id == outcome_id).all()
+        assert len(messages) == 2
+        author = s.get(User, messages[0].author_id)
+        assert author.is_system and author.name == "Operator (delegated by ian@example.com)"
+        events = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "guidance").all()
+        assert sorted(e.data["nonce"] for e in events) == ["g1", "g2"]
+        assert all(e.data["delegated_by"] == "ian@example.com" for e in events)
+    assert guidance_history(outcome_id, t1) == ["Answer question-only comments in the thread."]
+    assert guidance_history(outcome_id, t2) == ["Answer question-only comments in the thread.",
+                                                "Ignore commenters without write access."]
+
+    # A nonce reused for another outcome never posts again, and a later delegator gets their own identity:
+    # earlier guidance keeps naming who delegated it.
+    with session_scope() as s:
+        o2 = Outcome(workspace_id=ws_id, number=6, title="Other", repo_ids=[], status="running")
+        s.add(o2)
+        s.flush()
+        other_id = o2.id
+    boot({**base, "delegated_by": "ceo@example.com",
+          "guidance": [{"outcome": 6, "body": "Reused nonce.", "nonce": "g1"},
+                       {"outcome": 6, "body": "New guidance.", "nonce": "g5"}]})
+    with session_scope() as s:
+        assert [m.body for m in s.query(Message).filter(Message.outcome_id == other_id)] == ["New guidance."]
+        names = {s.get(User, m.author_id).name for m in s.query(Message).filter(Message.workspace_id == ws_id)}
+        assert names == {"Operator (delegated by ian@example.com)", "Operator (delegated by ceo@example.com)"}
