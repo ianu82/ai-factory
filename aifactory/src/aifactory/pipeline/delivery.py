@@ -464,8 +464,10 @@ class TaskRunner:
         rounds = int(self.settings.get("auto_retry_rounds", 1))
         used = int(ev.get("auto_retries", 0))
         attempts = [a for a in ev.get("attempts", []) if isinstance(a, dict)]
-        last = attempts[-1].get("result") if attempts else None
-        if used >= rounds or last not in ("verification_failed", "checks_failed", "policy"):
+        # Only the attempt that just ran out counts: some failures (an unreadable sandbox) record nothing, and an
+        # older record must not turn an infrastructure failure into an automatic retry.
+        last = attempts[-1] if attempts and attempts[-1].get("n") == self.task.attempt else {}
+        if used >= rounds or last.get("result") not in ("verification_failed", "checks_failed", "policy"):
             return False
         self.evidence("auto_retries", used + 1)
         self.evidence("attempt_base", self.task.attempt)

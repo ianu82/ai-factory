@@ -559,6 +559,30 @@ def test_attempts_exhausted_on_concrete_findings_get_one_automatic_retry(factory
         assert "auto_retries" not in (s.get(Task, task_id).evidence or {})
 
 
+def test_an_attempt_that_ended_in_an_infrastructure_failure_is_not_retried_automatically(factory, monkeypatch):
+    from aifactory.sandbox import SandboxError
+
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    original = delivery.extract_patch
+    calls = []
+
+    async def flaky_extract(sandbox, base_sha):
+        calls.append(1)
+        if len(calls) >= 2:  # the last attempt cannot even read the sandbox: nothing is recorded for it
+            raise SandboxError("sandbox went away")
+        return await original(sandbox, base_sha)
+
+    monkeypatch.setattr(delivery, "extract_patch", flaky_extract)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 2}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    _, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed"] and title == "T1 did not pass after 2 attempts"
+    assert "auto_retry" not in _event_kinds(outcome_id)
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:

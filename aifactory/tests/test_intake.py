@@ -162,6 +162,43 @@ def test_delegated_operator_resolves_a_merge_approval_once(monkeypatch):
         assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
 
 
+def test_operator_retry_gives_a_failed_task_a_fresh_budget_and_its_automatic_round(monkeypatch):
+    from aifactory.models import Plan, Task
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={})
+        s.add(ws)
+        s.flush()
+        repo = Repository(workspace_id=ws.id, full_name="acme/app", default_branch="main", config={})
+        s.add(repo)
+        s.flush()
+        o = Outcome(workspace_id=ws.id, number=9, title="Stuck", repo_ids=[repo.id], status="attention")
+        s.add(o)
+        s.flush()
+        plan = Plan(outcome_id=o.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key="T1", title="t", repo_id=repo.id,
+                 status="failed", attempt=6, evidence={"attempt_base": 3, "auto_retries": 1, "attempts": []})
+        s.add(t)
+        s.flush()
+        task_id = t.id
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "Acme", "workspace": "Acme", "retry": [{"outcome": 9, "nonce": "r1"}]}))
+
+    async def run():
+        return apply_bootstrap()
+
+    asyncio.run(run())
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "queued" and task.attempt == 0
+        assert "attempt_base" not in task.evidence and "auto_retries" not in task.evidence
+
+
 def test_bootstrap_applies_declared_values_once_and_keeps_later_app_changes(monkeypatch):
     def boot(config):
         monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
