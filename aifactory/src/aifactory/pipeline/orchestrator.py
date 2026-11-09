@@ -21,7 +21,8 @@ from ..models import Outcome, Task, Workspace
 from ..sandbox import host_capacity
 from .delivery import TaskRunner
 from .planning import plan_outcome
-from .runtime import open_decision, workspace_settings
+from .runtime import merged_settings, open_decision, workspace_settings
+from .scheduling import Candidate, RequesterTurns
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ class Orchestrator:
         self._loop_task: asyncio.Task | None = None
         self._planning: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
+        self._planning_turns = RequesterTurns()
+        self._delivery_turns = RequesterTurns()
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._stopping = False
         self._last_signal_sync = float("-inf")
@@ -368,31 +371,38 @@ class Orchestrator:
     def _schedule(self) -> None:
         settings = get_settings()
         with session_scope() as s:
-            paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
-            planning = [o.id for o in s.query(Outcome).filter(Outcome.status == "planning")
-                        if o.workspace_id not in paused]
-            queued = [(t.id, t.workspace_id) for t in
-                      s.query(Task).filter(Task.status == "queued").order_by(Task.created_at)
-                      if t.workspace_id not in paused]
-        for outcome_id in planning:
-            if outcome_id not in self._planning:
-                self._spawn_plan(outcome_id)
-        running_by_ws: dict[str, int] = {}
-        with session_scope() as s:
-            for task_id in self._tasks:
-                task = s.get(Task, task_id)
-                if task:
-                    running_by_ws[task.workspace_id] = running_by_ws.get(task.workspace_id, 0) + 1
-        for task_id, workspace_id in queued:
-            if task_id in self._tasks:
-                continue
-            if len(self._tasks) >= settings.global_concurrency:
-                break
-            limit = int(workspace_settings(workspace_id).get("concurrency", 3))
-            if running_by_ws.get(workspace_id, 0) >= limit:
-                continue
-            running_by_ws[workspace_id] = running_by_ws.get(workspace_id, 0) + 1
-            self._spawn_task(task_id)
+            workspaces = {w.id: w for w in s.query(Workspace)}
+            limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
+            planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
+                        for o in s.query(Outcome).filter(Outcome.status == "planning")]
+            queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
+                                0 if t.started_at is not None or t.stage or t.attempt > 0 else 1)
+                      for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
+                      .filter(Task.status == "queued")]
+            planning_by_ws: dict[str, int] = {}
+            for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
+                planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1
+            running_by_ws: dict[str, int] = {}
+            for task in s.query(Task).filter(Task.id.in_(list(self._tasks))):
+                running_by_ws[task.workspace_id] = running_by_ws.get(task.workspace_id, 0) + 1
+
+        def dispatch(candidates, active, counts, global_limit, limit_key, turns, spawn):
+            while len(active) < global_limit:
+                eligible = [c for c in candidates if c.id not in active
+                            and c.workspace_id in workspaces and not workspaces[c.workspace_id].paused
+                            and counts.get(c.workspace_id, 0) < limits[c.workspace_id][limit_key]]
+                if not eligible:
+                    break
+                candidate = turns.choose(eligible)
+                spawn(candidate.id)
+                turns.dispatched(candidate)
+                counts[candidate.workspace_id] = counts.get(candidate.workspace_id, 0) + 1
+                candidates.remove(candidate)
+
+        dispatch(planning, self._planning, planning_by_ws, settings.global_planning_concurrency,
+                 "planning_concurrency", self._planning_turns, self._spawn_plan)
+        dispatch(queued, self._tasks, running_by_ws, settings.global_concurrency,
+                 "concurrency", self._delivery_turns, self._spawn_task)
 
     def _spawn_plan(self, outcome_id: str) -> None:
         cancel = asyncio.Event()
