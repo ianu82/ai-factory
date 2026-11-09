@@ -521,6 +521,56 @@ def test_a_fix_that_gets_no_ci_because_main_moved_is_revalidated_not_blocked(fac
     assert kinds.index("revalidate") < kinds.index("merged"), " ".join(kinds)
 
 
+def _always_failing_verifier(messages):
+    if step(messages) == 0:
+        return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh"})]}
+    return {"content": "", "tool_calls": [call("finish", {
+        "verdict": "fail", "summary": "Greeting still wrong.",
+        "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "prints Hello"}], "findings": []})]}
+
+
+def _attempts_and_block(outcome_id):
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        decision = s.query(Decision).filter(Decision.task_id == task.id, Decision.status == "open").one()
+        return task.id, [a["result"] for a in task.evidence["attempts"]], decision.title, decision.id
+
+
+def test_attempts_exhausted_on_concrete_findings_get_one_automatic_retry(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    task_id, results, title, decision_id = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed", "verification_failed"]
+    assert title == "T1 did not pass after 1 attempts and an automatic retry"
+    assert "auto_retry" in _event_kinds(outcome_id)
+
+    # A person's retry restores the automatic round for the next budget.
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "retry", comment="Try harder.")
+    db.close()
+    with session_scope() as s:
+        assert "auto_retries" not in (s.get(Task, task_id).evidence or {})
+
+
+def test_automatic_retries_can_be_turned_off(factory):
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 0}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    _, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed"] and title == "T1 did not pass after 1 attempts"
+    assert "auto_retry" not in _event_kinds(outcome_id)
+
+
 def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     def planner(messages):
         if step(messages) == 0:

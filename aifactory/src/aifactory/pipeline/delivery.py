@@ -161,9 +161,14 @@ class TaskRunner:
             self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
+            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
+                attempt = self.task.attempt + 1
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
                 summary = "\n".join(self.feedback[-6:])[:3000]
-                self.block("unblock", f"{self.task.key} did not pass after {max_attempts} attempts",
+                retried = int((self.task.evidence or {}).get("auto_retries", 0))
+                tried = f"{max_attempts} attempts" + (" and an automatic retry" if retried == 1 else
+                                                      f" and {retried} automatic retries" if retried else "")
+                self.block("unblock", f"{self.task.key} did not pass after {tried}",
                            f"The task could not be completed within the attempt limit. Latest feedback:\n\n{summary}",
                            status="failed",
                            options=[{"value": "retry", "label": "Try again (fresh attempts)"},
@@ -451,6 +456,22 @@ class TaskRunner:
                    + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
                    prepared=vm.prepared)
         return vm
+
+    def _auto_retry(self) -> bool:
+        """Attempts ran out. When the last one failed on concrete, actionable feedback, start a fresh budget with that
+        feedback instead of asking a person, up to ``auto_retry_rounds`` times between human decisions."""
+        ev = self.task.evidence or {}
+        rounds = int(self.settings.get("auto_retry_rounds", 1))
+        used = int(ev.get("auto_retries", 0))
+        attempts = [a for a in ev.get("attempts", []) if isinstance(a, dict)]
+        last = attempts[-1].get("result") if attempts else None
+        if used >= rounds or last not in ("verification_failed", "checks_failed", "policy"):
+            return False
+        self.evidence("auto_retries", used + 1)
+        self.evidence("attempt_base", self.task.attempt)
+        self.event("auto_retry", f"{self.task.key} used its attempts on concrete findings; retrying with a fresh budget "
+                   f"before asking a person ({used + 1} of {rounds})", level="warn")
+        return True
 
     def _fresh_budget_after_base_moved(self, why: str) -> None:
         """A verified change that other work overtook is not the builder's failure: rebuilding it gets a fresh

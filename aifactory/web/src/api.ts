@@ -36,6 +36,7 @@ export interface Settings {
   harness: { builder: string; verifier: string; planner: string };
   concurrency: number;
   max_attempts: number;
+  auto_retry_rounds?: number;
   autonomy: { plan: "auto" | "approval"; merge: "auto" | "approval"; release: "auto" | "approval" };
   budgets: { run_usd: number; outcome_usd: number; run_tokens: number };
   limits: Record<string, number>;

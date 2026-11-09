@@ -71,8 +71,8 @@ function Policies() {
   const save = useSaveSettings();
   const s = ws.settings;
   const admin = ws.role === "owner" || ws.role === "admin";
-  const [nums, setNums] = useState({ concurrency: s.concurrency, max_attempts: s.max_attempts, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd });
-  useEffect(() => setNums({ concurrency: s.concurrency, max_attempts: s.max_attempts, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd }), [s]);
+  const [nums, setNums] = useState({ concurrency: s.concurrency, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd });
+  useEffect(() => setNums({ concurrency: s.concurrency, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd }), [s]);
   const autonomy = (key: keyof Settings["autonomy"], v: "auto" | "approval") => save({ autonomy: { ...s.autonomy, [key]: v } });
   return (
     <>
@@ -92,10 +92,11 @@ function Policies() {
         <div className="s-grid">
           <label className="field"><span>Tasks in parallel</span><input className="input num" type="number" min={1} max={50} value={nums.concurrency} disabled={!admin} onChange={(e) => setNums({ ...nums, concurrency: Number(e.target.value) })} /><span className="hint">1–50</span></label>
           <label className="field"><span>Attempts per task</span><input className="input num" type="number" min={1} max={8} value={nums.max_attempts} disabled={!admin} onChange={(e) => setNums({ ...nums, max_attempts: Number(e.target.value) })} /><span className="hint">Failed checks or verification feed the next attempt</span></label>
+          <label className="field"><span>Automatic retry rounds</span><input className="input num" type="number" min={0} max={3} value={nums.auto_retry_rounds} disabled={!admin} onChange={(e) => setNums({ ...nums, auto_retry_rounds: Number(e.target.value) })} /><span className="hint">When attempts run out on concrete findings, start a fresh set before asking you (0–3)</span></label>
           <label className="field"><span>Budget per agent session (USD)</span><input className="input num" type="number" min={0.5} step={0.5} value={nums.run_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, run_usd: Number(e.target.value) })} /></label>
           <label className="field"><span>Budget per outcome (USD)</span><input className="input num" type="number" min={1} step={1} value={nums.outcome_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, outcome_usd: Number(e.target.value) })} /><span className="hint">Work pauses for a decision when reached</span></label>
         </div>
-        {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, max_attempts: nums.max_attempts, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
+        {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, max_attempts: nums.max_attempts, auto_retry_rounds: nums.auto_retry_rounds, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
       </section>
     </>
   );
