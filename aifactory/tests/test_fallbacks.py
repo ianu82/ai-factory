@@ -104,3 +104,34 @@ def test_a_new_workspace_shows_its_own_credentials_as_missing(client, signed_in,
                                                 "mindshub_api_key": False}
     for secret in OPERATOR.values():
         assert secret not in setup.text and secret not in creds.text
+
+
+def test_renaming_the_bootstrap_workspace_keeps_it_and_the_marker_cannot_be_set(client, signed_in, monkeypatch,
+                                                                                 operator_keys):
+    me = signed_in["workspaces"][0]
+    boot_id = boot(monkeypatch, {"organization": me["org_name"], "workspace": "Factory",
+                                 "admins": ["ian@example.com"]})
+    with db.session_scope() as s:  # the signed-in person administers both workspaces
+        from aifactory.models import Membership, User
+
+        user = s.query(User).filter(User.email == "ian@example.com").one()
+        if not s.query(Membership).filter(Membership.workspace_id == boot_id, Membership.user_id == user.id).first():
+            s.add(Membership(workspace_id=boot_id, user_id=user.id, role="owner"))
+
+    renamed = client.patch(f"/api/workspaces/{boot_id}", json={"name": "Operator delivery"})
+    assert renamed.status_code == 200
+    assert boot(monkeypatch, {"organization": me["org_name"], "workspace": "Factory"}) == boot_id
+    assert resolve_token(boot_id) == "operator-github-secret"
+    with db.session_scope() as s:
+        assert s.query(Workspace).filter(Workspace.name == "Factory").count() == 0  # no empty replacement
+
+    # An admin of another workspace cannot claim, and the bootstrap's admin cannot clear, the marker.
+    other = me["id"]
+    client.patch(f"/api/workspaces/{other}", json={"settings": {"_bootstrap_workspace": True, "concurrency": 3}})
+    client.patch(f"/api/workspaces/{boot_id}", json={"settings": {"_bootstrap_workspace": False}})
+    assert boot(monkeypatch, {"organization": me["org_name"], "workspace": "Factory"}) == boot_id
+    with db.session_scope() as s:
+        assert "_bootstrap_workspace" not in (s.get(Workspace, other).settings or {})
+        assert s.get(Workspace, other).settings["concurrency"] == 3
+    with pytest.raises(GitHubError):
+        resolve_token(other)

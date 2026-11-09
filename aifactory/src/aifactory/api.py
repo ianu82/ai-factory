@@ -141,9 +141,12 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
     if body.description is not None:
         ws.description = body.description
     if body.settings is not None:
+        # Keys starting with "_" are the operator bootstrap's own bookkeeping (including the marker that
+        # earns server fallback credentials); people can never set or clear them through the API.
+        patch = {k: v for k, v in body.settings.items() if not str(k).startswith("_")}
         before = merged_settings(ws.settings)
-        ws.settings = _clean_settings({**before, **body.settings})
-        changes = {k: ws.settings[k] for k in body.settings if before.get(k) != ws.settings.get(k)}
+        ws.settings = _clean_settings({**before, **patch})
+        changes = {k: ws.settings[k] for k in patch if before.get(k) != ws.settings.get(k)}
     if body.paused is not None:
         ws.paused = body.paused
         changes["paused"] = body.paused
