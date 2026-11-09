@@ -571,3 +571,22 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
   .onboarding-content { min-height: 440px; }
   .onboarding-content h1 { font-size: 23px; }
 }
+
+.repository-step { display: grid; gap: 16px; min-width: 0; }
+.repository-step > p { margin: 0; }
+.repository-step .field { min-width: 0; }
+.repository-step .input, .repository-step .textarea { width: 100%; min-width: 0; box-sizing: border-box; }
+.repository-step .btn { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.repository-step .check { align-items: flex-start; min-width: 0; }
+.repository-step .check input { flex: none; margin-top: 3px; }
+.repository-options { list-style: none; margin: 0; padding: 0; }
+.repository-options li { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.repository-options small { display: block; color: var(--muted); }
+.repository-options p { margin: 4px 0 0 24px; }
+.repository-review { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); }
+.repository-review form { display: grid; gap: 16px; }
+.repository-review pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.repository-review h3 { font-size: 14px; }
+.repository-diagnostics { margin-top: 20px; border-top: 1px solid var(--line); }
+.repository-diagnostics ul { padding-left: 20px; }
+.repository-step :is(button, input, textarea):focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
