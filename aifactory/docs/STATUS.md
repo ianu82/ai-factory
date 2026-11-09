@@ -104,6 +104,26 @@ Every merge followed the same rule: the Factory was waiting on a person, CI and 
 were green, and the reviewer bot found nothing on the final commit. Leftover threads were answered with where
 the fix is before being resolved.
 
+### Factory-built PRs merged during the day (9 November, times UTC)
+
+Same rule and classification as overnight. Twenty-four Factory-built PRs are merged in all, every one assisted.
+
+| PR | Factory task | What the operator did | Classification |
+| --- | --- | --- | --- |
+| #238 (07:01) | #17 T2 protected sandbox image reads | Two review rounds | Assisted |
+| #274 (07:53) | #17 T5 sandbox-executed Anton web tools | Merge approval only (clean first review, checked for credential isolation) | Assisted (merge approval only) |
+| #215 (09:09) | #12 T4 configurable AI scorers | Nine review rounds | Assisted |
+| #275 (09:18) | #18 T3 bounded planners, priority and round-robin scheduling | Merge approval only | Assisted (merge approval only) |
+| #264 (09:22) | #13 T5 guided model and GitHub steps | Five review rounds, including operator decisions on the completion rule and the permission list | Assisted |
+| #276 (09:22) | #18 T4 shared credential-scoped rate and concurrency limits | Merge approval only | Assisted (merge approval only) |
+| #267 (11:09) | #14 T4 durable, idempotent outbound Linear operations | Three review rounds and two retries | Assisted |
+| #278 (11:16) | #18 T5 planning and reverify settings, parked CI in the UI | One review round, with an operator scope decision (the UI shows only what main backs) | Assisted |
+
+Operator PRs the same day: #282 and #290 (main fixes, below); #287 (Ian's UI feedback: setup link above
+Settings, PR filters in the toolbar, Inbox sorted by priority or newest, "Queued" outcomes); #291 (cancel an
+idle outcome by number, priority on declared outcomes); #292 (server credentials serve only the bootstrap
+workspace); #293 (delegated guidance).
+
 ### Platform changes made because of what the night showed
 
 - **Revisions start from today's main** (#250). A revision built on a stale base got no CI and stalled. It now
@@ -136,8 +156,38 @@ revision with change requests or retries applied. Outcomes #18–#38 (about 130 
 not delivered yet: they wait behind the concurrency limit while review rounds occupy slots. Concurrency was raised
 from 5 to 7 overnight and to 9 in the morning.
 
+Midday, 9 November:
+- **Mind:** Ian asked for Mind (issue #232) urgently. Its 16-task outcome #27 had barely started, so it was
+  cancelled. A thin first slice was declared at priority 0 as outcome #39, "Mind v1": the dock on every
+  screen, Opus 5.5 with an explicit unavailable state, read tools, three confirmed actions, and saved,
+  streamed threads with a budget. Memory, watches, briefings and triage follow as later outcomes.
+- **Review comments:** Ian added a review-comments criterion to #223 after it was planned (outcome #22).
+  Most of it is outcome #19's scope. The rest (question-only answers, ignoring commenters without write
+  access, and the loop for PRs people merge on GitHub) goes to #19 and #22 as delegated guidance (#293).
+
+### New-user rehearsal ("MindsHub products" workspace, mindsdb/cowork and cowork-server)
+
+Findings before any repository was connected:
+1. There is no UI to create a workspace; it was created through the API.
+2. New workspaces default to merging automatically, which is risky for product repositories. The rehearsal
+   workspace was set to Approve first by hand.
+3. The operator's server credentials made every new workspace look set up and would have served its runs.
+   Fixed in #292, and verified live: the rehearsal workspace has no fallbacks and its own valid keys.
+4. `/api/me` lists workspaces in insertion order, so other organization members land in AI Factory. Sign-in
+   also adds every member of the linked MindsHub organization to every workspace in it, with their MindsHub
+   role.
+
+Merge rule: ianu82/ai-factory merges when green and every comment is addressed. For mindsdb/* repositories,
+people merge on GitHub and the Factory never merges. The rehearsal workspace stays on Approve first with
+nobody approving until #22 (People merge on GitHub) ships.
+
 ### Operator mistakes, owned
 
+- Merged two individually green PRs back to back (#275 removed a helper that #276 used), so main was red
+  from 09:22 to 09:51 (fixed in #282). Later my own #287 and the Factory's #278 broke main again from 11:16
+  to 11:30 (fixed in #290): #278's new test expected the progress shape from before #287. Each PR was green
+  on its own base, and they share no files. Merges now go one at a time behind a green main, and the operator
+  first tests the merge result against current main when a PR is behind it.
 - Reused a nonce (`o16t5-retry1`) from earlier in the night, so the bootstrap correctly skipped that retry
   twice as already applied. Nonces must be unique across the workspace's history.
 - Told #13 T2 that a failed retest must never downgrade a valid token. That is right only for transient
@@ -153,12 +203,12 @@ from 5 to 7 overnight and to 9 in the morning.
 | F01 Codex qualification | Unattended delivery done | PR #17 |
 | F18 Anton unattended delivery | Done, including independent rejection of a defective candidate | PR #18 |
 | F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 (native), #8 (Anton, unattended); Codex ran on MindsHub in #195 |
-| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | Overnight 8–9 Nov: sixteen Factory-built PRs merged into `ai-factory` (#212, #237, #218, #214, #213, #251, #259, #231, #261, #263, #255, #265, #268, #220, #256, #221), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
+| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | 8–9 Nov: twenty-four Factory-built PRs merged into `ai-factory` (sixteen overnight, eight during the day), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
 | F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18, #25/#26 |
 | F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by repository, lockfiles and setup; setup skipped on a hit, saved after a clean miss, older ones pruned | Live: checkpoint saved in #8 (11 s); both parallel tasks of #9 booted their own VM from it in 6–9 s with setup skipped |
 | F04 Coding model choice | Models per role from the provider's live list | — |
 | F19 MindsHub sign-in & onboarding | API-key sign-in live; orgs/workspaces from MindsHub Auth; invited admins; setup checklist | OIDC coded; needs the domain on MindsHub's redirect allowlist (deliberately not blocking) |
-| F07 Workspaces | Isolated repos, credentials, policies, budgets, history | Two-workspace live test not yet run |
+| F07 Workspaces | Isolated repos, credentials, policies, budgets, history; server credentials only for the bootstrap workspace (#292) | Second live workspace ("MindsHub products") created for the rehearsal; no workspace-creation UI yet |
 | F08 Internal app | Inbox (grouped compact rows, inline actions, detail pane), Outcomes, Pull requests (GitHub, grouped by what each needs), Runs, Signals, Decisions, Settings; responsive; live updates that recover after deploys | Rendered with fixtures and live data |
 | F09 Acceptance & recovery | Durable stages; restarts resume without cancelling (an interrupted attempt is redone, not counted); operator retry/resolve; one automatic retry round when attempts run out on concrete findings (#258); revert on smoke failure; in-app recovery guide (Inbox → How recovery works); costs reconciled from MindsHub usage when it lags | — |
 | F10 Visual & risk review | Runtime QA screenshots/probes as verifier evidence and in PRs; protected paths and change-size limits | Visual diffing against the base not built |
