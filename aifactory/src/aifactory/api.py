@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from . import insights
+from . import insights, linear_config
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .config import get_settings
@@ -125,6 +125,8 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
 def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depends(current_user),
                      db: Session = Depends(get_db)):
     ws, _ = _ws(db, user, workspace_id, "admin")
+    if body.settings is not None and "linear" in body.settings:
+        raise HTTPException(422, "Use PUT /api/workspaces/{workspace_id}/linear to configure Linear")
     changes = {}
     if body.name is not None:
         ws.name = body.name.strip()[:120] or ws.name
@@ -142,6 +144,45 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
            data={"changes": changes})
     orchestrator.wake()
     return S.workspace(ws, require_member(db, user, workspace_id).role)
+
+
+@router.get("/workspaces/{workspace_id}/linear")
+def get_linear_config(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id)
+    return linear_config.saved_config(ws)
+
+
+@router.put("/workspaces/{workspace_id}/linear")
+async def put_linear_config(workspace_id: str, body: linear_config.LinearConfig,
+                            user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id, "admin")
+    try:
+        await linear_config.validate_config(db, workspace_id, body)
+    except linear_config.LinearConfigError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except LinearError as exc:
+        raise HTTPException(503, str(exc)) from None
+    linear_config.save_config(db, ws, body, user.id)
+    return body
+
+
+@router.get("/workspaces/{workspace_id}/linear/teams")
+async def linear_teams(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    try:
+        return {"items": await linear_config.provider(workspace_id).teams()}
+    except LinearError as exc:
+        raise HTTPException(503, str(exc)) from None
+
+
+@router.get("/workspaces/{workspace_id}/linear/teams/{team_id}/states")
+async def linear_team_states(workspace_id: str, team_id: str, user: User = Depends(current_user),
+                             db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    try:
+        return {"items": await linear_config.provider(workspace_id).team_states(team_id)}
+    except LinearError as exc:
+        raise HTTPException(503, str(exc)) from None
 
 
 @router.get("/workspaces/{workspace_id}/members")
