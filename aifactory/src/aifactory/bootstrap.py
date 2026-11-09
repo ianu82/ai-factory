@@ -438,7 +438,7 @@ async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) ->
 
 
 async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
-    from .github import GitHub, GitHubError, resolve_token
+    from .github import GitHub, GitHubError, resolve_credential as resolve_token
     from .repo_detect import detect
 
     for name, overrides in names:

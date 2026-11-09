@@ -11,6 +11,7 @@ Flow for a task:
 from __future__ import annotations
 
 import asyncio
+import base64
 import fnmatch
 import os
 import re
@@ -19,7 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import get_settings
-from .github import git_auth_env
+from .github import fresh_git_auth_env
+from .github_app import InstallationCredential
 from .sandbox import SCRATCH, LocalSandbox, SandboxError
 
 SAFE_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=always",
@@ -56,7 +58,13 @@ async def git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = 
     if proc.returncode != 0:
         from .security import redact
 
-        raise GitError(f"git {' '.join(a for a in args[:3])} failed: {redact(err.decode(errors='replace'))[-1500:]}")
+        # Git/remote diagnostics must not echo an ephemeral header or its token.
+        auth = (env or {}).get("GIT_CONFIG_VALUE_0", "")
+        sensitive = [auth]
+        if auth.startswith("AUTHORIZATION: basic "):
+            decoded = base64.b64decode(auth.split()[-1]).decode()
+            sensitive.extend((auth.split()[-1], decoded, decoded.removeprefix("x-access-token:")))
+        raise GitError(f"git {' '.join(a for a in args[:3])} failed: {redact(err.decode(errors='replace'), extra=tuple(sensitive))[-1500:]}")
     return out.decode(errors="replace")
 
 
@@ -76,22 +84,21 @@ def _mirror_lock(path: Path) -> asyncio.Lock:
     return entry[1]
 
 
-async def mirror(full_name: str, token: str) -> Path:
+async def mirror(full_name: str, token: str | InstallationCredential) -> Path:
     path = _mirror_path(full_name)
     async with _mirror_lock(path):
         url = remote_url(full_name)
-        env = git_auth_env(token)
         if not (path / "HEAD").exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             shutil.rmtree(tmp, ignore_errors=True)
-            await git("clone", "--bare", url, str(tmp), env=env, timeout=900)
+            await git("clone", "--bare", url, str(tmp), env=await fresh_git_auth_env(token), timeout=900)
             tmp.rename(path)
         # Jobs copy the mirror while other jobs fetch into it: no background maintenance may touch its files.
         for key, value in (("gc.auto", "0"), ("maintenance.auto", "false"), ("fetch.writeCommitGraph", "false")):
             await git("config", key, value, cwd=path)
         await git("-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "--prune", "origin",
-                  "+refs/heads/*:refs/heads/*", cwd=path, env=env, timeout=900)
+                  "+refs/heads/*:refs/heads/*", cwd=path, env=await fresh_git_auth_env(token), timeout=900)
     return path
 
 
@@ -109,7 +116,7 @@ async def clone_mirror(mirror_path: Path, dest: Path, env: dict[str, str]) -> No
             await asyncio.sleep(2)
 
 
-async def checkout(sandbox: LocalSandbox, full_name: str, token: str, base_ref: str, branch: str,
+async def checkout(sandbox: LocalSandbox, full_name: str, token: str | InstallationCredential, base_ref: str, branch: str,
                    subdir: str | None = None, adopt: bool = True) -> str:
     """Clone ``base_ref`` into the sandbox work tree (or a subdirectory); returns the exact base commit."""
     mirror_path = await mirror(full_name, token)
@@ -118,7 +125,7 @@ async def checkout(sandbox: LocalSandbox, full_name: str, token: str, base_ref: 
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    await clone_mirror(mirror_path, dest, git_auth_env(token))
+    await clone_mirror(mirror_path, dest, {})
     await git("checkout", "-q", "-B", branch, base_sha, cwd=dest)
     await git("remote", "set-url", "origin", remote_url(full_name), cwd=dest)
     exclude = dest / ".git" / "info" / "exclude"
@@ -224,22 +231,21 @@ def protected_violations(files: list[str], patterns: list[str]) -> list[str]:
     return bad
 
 
-async def publish(full_name: str, token: str, *, base_sha: str, branch: str, patch: Patch, message: str,
+async def publish(full_name: str, token: str | InstallationCredential, *, base_sha: str, branch: str, patch: Patch, message: str,
                   task_id: str) -> str:
     """Apply the patch onto a pristine clone at ``base_sha``, commit and force-push ``branch``."""
     mirror_path = await mirror(full_name, token)
     staging = get_settings().data_dir / "staging" / task_id
     shutil.rmtree(staging, ignore_errors=True)
     staging.parent.mkdir(parents=True, exist_ok=True)
-    env = git_auth_env(token)
-    await clone_mirror(mirror_path, staging, env)
+    await clone_mirror(mirror_path, staging, {})
     try:
         await git("checkout", "-q", "-B", branch, base_sha, cwd=staging)
         await git("apply", "--index", "--binary", "--whitespace=nowarn", "-", cwd=staging, input_bytes=patch.diff)
         await git("commit", "-q", "-m", message, cwd=staging, env=AUTHOR)
         head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
         await git("remote", "set-url", "origin", remote_url(full_name), cwd=staging)
-        await git("push", "--force", "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=env, timeout=600)
+        await git("push", "--force", "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=await fresh_git_auth_env(token), timeout=600)
         return head
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -249,7 +255,7 @@ class BranchMoved(GitError):
     """The published branch no longer points at the commit the Factory verified."""
 
 
-async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, task_id: str,
+async def rebase_branch(full_name: str, token: str | InstallationCredential, *, branch: str, onto: str, task_id: str,
                         base: str = "", head: str = "") -> tuple[bool, str]:
     """Rebase a published branch onto the latest base. Returns (clean, new_head_or_conflict_detail).
 
@@ -259,10 +265,9 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
     mirror_path = await mirror(full_name, token)
     staging = get_settings().data_dir / "staging" / (task_id + "-rebase")
     shutil.rmtree(staging, ignore_errors=True)
-    env = git_auth_env(token)
-    await clone_mirror(mirror_path, staging, env)
+    await clone_mirror(mirror_path, staging, {})
     try:
-        await git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=staging, env=env)
+        await git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=staging, env=await fresh_git_auth_env(token))
         if head:
             current = (await git("rev-parse", f"origin/{branch}", cwd=staging)).strip()
             if current != head:
@@ -277,19 +282,18 @@ async def rebase_branch(full_name: str, token: str, *, branch: str, onto: str, t
         await git("remote", "set-url", "origin", remote_url(full_name), cwd=staging)
         lease = f"--force-with-lease=refs/heads/{branch}:{head}" if head else "--force-with-lease"
         new_head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
-        await git("push", lease, "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=env)
+        await git("push", lease, "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=await fresh_git_auth_env(token))
         return True, new_head
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-async def revert_commit(full_name: str, token: str, *, base: str, sha: str, branch: str, task_id: str) -> str:
+async def revert_commit(full_name: str, token: str | InstallationCredential, *, base: str, sha: str, branch: str, task_id: str) -> str:
     """Create ``branch`` from the latest ``base`` with ``sha`` reverted, push it, return the new head."""
     mirror_path = await mirror(full_name, token)
     staging = get_settings().data_dir / "staging" / (task_id + "-revert")
     shutil.rmtree(staging, ignore_errors=True)
-    env = git_auth_env(token)
-    await clone_mirror(mirror_path, staging, env)
+    await clone_mirror(mirror_path, staging, {})
     try:
         await git("checkout", "-q", "-B", branch, f"origin/{base}", cwd=staging)
         parents = (await git("rev-list", "--parents", "-n", "1", sha, cwd=staging)).split()
@@ -297,7 +301,7 @@ async def revert_commit(full_name: str, token: str, *, base: str, sha: str, bran
         await git("revert", "--no-edit", *mainline, sha, cwd=staging, env=AUTHOR)
         head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
         await git("remote", "set-url", "origin", remote_url(full_name), cwd=staging)
-        await git("push", "--force", "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=env)
+        await git("push", "--force", "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=await fresh_git_auth_env(token))
         return head
     finally:
         shutil.rmtree(staging, ignore_errors=True)

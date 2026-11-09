@@ -65,6 +65,17 @@ class Settings:
     mindshub_requests_per_minute: int = 50
     openai_requests_per_minute: int = 50
 
+    github_app_id: str = field(default="", repr=False)
+    github_app_private_key: str = field(default="", repr=False)
+    github_app_client_id: str = field(default="", repr=False)
+    github_app_client_secret: str = field(default="", repr=False)
+    github_app_webhook_secret: str = field(default="", repr=False)
+
+    @property
+    def github_app_available(self) -> bool:
+        return all((self.github_app_id, self.github_app_private_key, self.github_app_client_id,
+                    self.github_app_client_secret, self.github_app_webhook_secret))
+
     @property
     def secure_cookies(self) -> bool:
         return self.public_url.startswith("https://")
@@ -91,6 +102,11 @@ def get_settings() -> Settings:
         bootstrap_openai_key=os.environ.get("AIFACTORY_BOOTSTRAP_OPENAI_API_KEY", ""),
         bootstrap_mindshub_key=os.environ.get("AIFACTORY_BOOTSTRAP_MINDSHUB_API_KEY", ""),
         bootstrap_github_token=os.environ.get("AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", ""),
+        github_app_id=os.environ.get("AIFACTORY_GITHUB_APP_ID", "").strip(),
+        github_app_private_key=os.environ.get("AIFACTORY_GITHUB_APP_PRIVATE_KEY", "").strip(),
+        github_app_client_id=os.environ.get("AIFACTORY_GITHUB_APP_CLIENT_ID", "").strip(),
+        github_app_client_secret=os.environ.get("AIFACTORY_GITHUB_APP_CLIENT_SECRET", "").strip(),
+        github_app_webhook_secret=os.environ.get("AIFACTORY_GITHUB_APP_WEBHOOK_SECRET", "").strip(),
         jobs_dir=Path(os.environ.get("AIFACTORY_JOBS_DIR", str(data_dir / "jobs"))).resolve(),
         sandbox_user=os.environ.get("AIFACTORY_SANDBOX_USER", ""),
         global_concurrency=concurrency_limit(os.environ.get("AIFACTORY_GLOBAL_CONCURRENCY"), 8),

@@ -24,7 +24,7 @@ from .db import get_db, utcnow
 from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
 from .fallbacks import available as fallback_credentials
-from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_token
+from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_credential as resolve_token
 from .guided import README_TEMPLATE, README_TITLE, README_BRIEF, README_ACCEPTANCE, outcome_guidance
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
@@ -178,6 +178,9 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
 def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depends(current_user),
                      db: Session = Depends(get_db)):
     ws, _ = _ws(db, user, workspace_id, "admin")
+    if body.settings is not None and "github_app_installation_id" in body.settings:
+        # Only T4's verified installation callback may bind/unbind an installation.
+        raise HTTPException(422, "Use the GitHub App connection flow to manage GitHub access")
     if body.settings is not None and "linear" in body.settings:
         raise HTTPException(422, "Use PUT /api/workspaces/{workspace_id}/linear to configure Linear")
     changes = {}

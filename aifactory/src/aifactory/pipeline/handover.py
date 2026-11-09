@@ -12,7 +12,7 @@ from typing import Any
 
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..github import GitHub, GitHubError, resolve_token
+from ..github import GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import Patch, publish
 from ..models import Artifact, Decision, Outcome, Repository, Task, User
 

@@ -7,7 +7,7 @@ import logging
 
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..github import resolve_token
+from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
 from ..models import Outcome, Plan, Repository, Task
 from ..prompts import PLANNER, plan_prompt

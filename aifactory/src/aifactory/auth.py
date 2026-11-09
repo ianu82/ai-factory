@@ -182,6 +182,7 @@ def auth_methods() -> dict[str, Any]:
     settings = get_settings()
     return {
         "oidc": bool(settings.oidc_client_id),
+        "github_app": settings.github_app_available,
         "api_key": settings.allow_api_key_sign_in,
         "dev": settings.allow_dev_sign_in,
     }

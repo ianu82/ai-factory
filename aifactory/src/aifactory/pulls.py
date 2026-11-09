@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from .auth import current_user, require_member
 from .db import get_db, session_scope
-from .github import GitHub, GitHubError, resolve_token
+from .github import GitHub, GitHubError, resolve_credential as resolve_token
 from .models import Decision, Outcome, Repository, Task, User
 
 log = logging.getLogger(__name__)
