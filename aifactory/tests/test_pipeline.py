@@ -532,6 +532,214 @@ def test_a_fix_that_gets_no_ci_because_main_moved_is_revalidated_not_blocked(fac
     assert kinds.index("revalidate") < kinds.index("merged"), " ".join(kinds)
 
 
+def _always_failing_verifier(messages):
+    if step(messages) == 0:
+        return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh"})]}
+    return {"content": "", "tool_calls": [call("finish", {
+        "verdict": "fail", "summary": "Greeting still wrong.",
+        "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "prints Hello"}], "findings": []})]}
+
+
+def _attempts_and_block(outcome_id):
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        decision = s.query(Decision).filter(Decision.task_id == task.id, Decision.status == "open").one()
+        return task.id, [a["result"] for a in task.evidence["attempts"]], decision.title, decision.id
+
+
+def test_attempts_exhausted_on_concrete_findings_get_one_automatic_retry(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    task_id, results, title, decision_id = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed", "verification_failed"]
+    assert title == "T1 did not pass after 1 attempts and an automatic retry"
+    assert "auto_retry" in _event_kinds(outcome_id)
+
+    # A person's retry restores the automatic round for the next budget.
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "retry", comment="Try harder.")
+    db.close()
+    with session_scope() as s:
+        assert "auto_retries" not in (s.get(Task, task_id).evidence or {})
+
+
+def test_an_attempt_that_ended_in_an_infrastructure_failure_is_not_retried_automatically(factory, monkeypatch):
+    from aifactory.sandbox import SandboxError
+
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    original = delivery.extract_patch
+    calls = []
+
+    async def flaky_extract(sandbox, base_sha):
+        calls.append(1)
+        if len(calls) >= 2:  # the last attempt cannot even read the sandbox: nothing is recorded for it
+            raise SandboxError("sandbox went away")
+        return await original(sandbox, base_sha)
+
+    monkeypatch.setattr(delivery, "extract_patch", flaky_extract)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 2}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    _, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed"] and title == "T1 did not pass after 2 attempts"
+    assert "auto_retry" not in _event_kinds(outcome_id)
+
+
+def test_automatic_retry_rounds_from_bootstrap_are_clamped(factory):
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    with session_scope() as s:  # bootstrap writes settings directly, without the API's clamp
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 50}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"), timeout=120)
+    _, results, title, _ = _attempts_and_block(outcome_id)
+    assert len(results) == 4 and title == "T1 did not pass after 1 attempts and 3 automatic retries"
+
+
+def test_failed_check_output_survives_a_restart_into_the_next_attempt(factory):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        from aifactory.models import Plan
+
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t", spec="s",
+                    acceptance=["c"], repo_id=factory["repo"], status="queued",
+                    evidence={"attempts": [{"n": 1, "result": "checks_failed", "checks": delivery._brief([
+                        {"command": "sh test.sh", "ok": False, "exit_code": 1, "duration": 0.1,
+                         "tail": "expected greeting, got: Hello"},
+                        {"command": "true", "ok": True, "exit_code": 0, "duration": 0.0, "tail": ""}])}]})
+        s.add(task)
+        s.flush()
+        task_id = task.id
+    notes = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._prior_feedback()
+    assert len(notes) == 1 and "`sh test.sh` failed (exit 1)" in notes[0] and "expected greeting, got: Hello" in notes[0]
+
+
+def test_a_requested_revision_starts_with_a_fresh_budget_and_automatic_round(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="awaiting_approval", stage="merge", attempt=5, pr_number=3,
+                    evidence={"attempt_base": 3, "auto_retries": 1, "attempts": []})
+        s.add(task)
+        s.flush()
+        decision = Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="approve_merge",
+                            title="Approve merge", options=[{"value": "approve", "label": "Merge"},
+                                                            {"value": "reject", "label": "Request changes"}])
+        s.add(decision)
+        s.flush()
+        task_id, decision_id = task.id, decision.id
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "reject", comment="Rename the flag.")
+    db.close()
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.stage == "revise" and task.attempt == 0
+        assert "attempt_base" not in task.evidence and "auto_retries" not in task.evidence
+
+
+def test_only_actionable_failures_earn_an_automatic_retry():
+    assert delivery._actionable({"result": "verification_failed", "verdict": {
+        "criteria": [{"criterion": "c", "status": "fail"}], "findings": []}})
+    assert delivery._actionable({"result": "verification_failed", "verdict": {
+        "criteria": [{"criterion": "c", "status": "pass"}], "findings": [{"severity": "major", "description": "x"}]}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {  # minor findings are not relayed
+        "criteria": [{"criterion": "c", "status": "pass"}], "findings": [{"severity": "minor", "description": "x"}]}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {
+        "verdict": "fail", "criteria": [{"criterion": "c", "status": "pass"}], "findings": []}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {"verdict": "fail"}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {"criteria": None, "findings": None}})
+    assert delivery._actionable({"result": "verification_failed", "verdict": {
+        "criteria": None, "findings": [{"severity": "major", "description": "x"}]}})
+    assert delivery._actionable({"result": "checks_failed", "checks": [{"command": "t", "ok": False}]})
+    assert not delivery._actionable({"result": "checks_failed", "checks": []})
+    assert delivery._actionable({"result": "policy", "detail": "- Too big"})
+    assert not delivery._actionable({"result": "builder_failed"}) and not delivery._actionable({})
+
+
+def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(factory):
+    def verifier_with_null_findings(messages):  # findings is optional and may be null in a valid report
+        reply = passing_verifier(messages)
+        for tool_call in reply.get("tool_calls", []):
+            if tool_call["function"]["name"] == "finish":
+                args = json.loads(tool_call["function"]["arguments"])
+                args["findings"] = None
+                tool_call["function"]["arguments"] = json.dumps(args)
+        return reply
+
+    ScriptedModel.scripts["verifier"] = verifier_with_null_findings
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "qa": {"start": "exec sleep 30", "ready_path": "/", "ready_timeout": 2,
+                                             "pages": [], "required": True}}
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"), timeout=120)
+    task_id, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed", "verification_failed"]
+    assert title == "T1 did not pass after 1 attempts and an automatic retry"
+    with session_scope() as s:
+        verdict = s.get(Task, task_id).evidence["attempts"][-1]["verdict"]
+        assert any("Required runtime QA failed: the app did not start" in f["description"] for f in verdict["findings"])
+
+
+def test_a_runtime_qa_failure_is_recorded_even_when_the_verifier_already_failed(factory):
+    def bare_failing_verifier(messages):  # fails with all criteria passing and no findings
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "true"})]}
+        return {"content": "", "tool_calls": [call("finish", {
+            "verdict": "fail", "summary": "Not convinced.",
+            "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "ok"}], "findings": []})]}
+
+    ScriptedModel.scripts["verifier"] = bare_failing_verifier
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "qa": {"start": "exec sleep 30", "ready_path": "/", "ready_timeout": 2,
+                                             "pages": [], "required": True}}
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"), timeout=120)
+    task_id, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed", "verification_failed"] and "automatic retry" in title
+    with session_scope() as s:
+        verdict = s.get(Task, task_id).evidence["attempts"][0]["verdict"]
+        assert verdict["summary"] == "Not convinced." and verdict["findings"][-1]["location"] == "runtime QA"
+
+
+def test_automatic_retries_can_be_turned_off(factory):
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 0}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    _, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed"] and title == "T1 did not pass after 1 attempts"
+    assert "auto_retry" not in _event_kinds(outcome_id)
+
+
 def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     def planner(messages):
         if step(messages) == 0:

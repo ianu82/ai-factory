@@ -59,12 +59,17 @@ class TaskRunner:
             verdict = attempt.get("verdict") or {}
             if attempt.get("result") == "verification_failed" and verdict:
                 notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
-                for c in verdict.get("criteria", []):
+                for c in verdict.get("criteria") or []:
                     if c.get("status") != "pass":
                         notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
-                for f in verdict.get("findings", []):
+                for f in verdict.get("findings") or []:
                     if f.get("severity") in ("blocker", "major"):
                         notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
+            elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks") or []):
+                for c in attempt["checks"]:
+                    if not c.get("ok"):
+                        notes.append(f"- In an earlier attempt, check `{c.get('command')}` failed (exit {c.get('exit_code')})"
+                                     + (f":\n```\n{c['tail']}\n```" if c.get("tail") else ""))
             elif attempt.get("result") in ("checks_failed", "policy"):
                 notes.append(f"- An earlier attempt failed: {attempt.get('detail') or attempt.get('result')}")
         return notes
@@ -95,13 +100,18 @@ class TaskRunner:
                data={"attempt": self.task.attempt, "head": self.task.head_sha, **data})
 
     def evidence(self, key: str, value: Any) -> None:
+        self._set_evidence({key: value})
+
+    def _set_evidence(self, values: dict[str, Any]) -> None:
+        """Record evidence keys in one transaction ("attempts" appends)."""
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
             ev = json.loads(json.dumps(task.evidence or {}))
-            if key == "attempts":
-                ev.setdefault("attempts", []).append(value)
-            else:
+            for key, value in values.items():
+                if key == "attempts":
+                    ev.setdefault("attempts", []).append(value)
+                    continue
                 if key in ("ci", "smoke"):
                     value = {**value, "at": utcnow().isoformat()}
                 if key in ("ci", "smoke") and value.get("state") in ("failure", "failed"):
@@ -170,9 +180,14 @@ class TaskRunner:
             self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
+            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
+                attempt = self.task.attempt + 1
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
                 summary = "\n".join(self.feedback[-6:])[:3000]
-                self.block("unblock", f"{self.task.key} did not pass after {max_attempts} attempts",
+                retried = int((self.task.evidence or {}).get("auto_retries", 0))
+                tried = f"{max_attempts} attempts" + (" and an automatic retry" if retried == 1 else
+                                                      f" and {retried} automatic retries" if retried else "")
+                self.block("unblock", f"{self.task.key} did not pass after {tried}",
                            f"The task could not be completed within the attempt limit. Latest feedback:\n\n{summary}",
                            status="failed",
                            options=[{"value": "retry", "label": "Try again (fresh attempts)"},
@@ -401,9 +416,15 @@ class TaskRunner:
                 continue
             report = result.report
             runtime_problem = self._runtime_problem(app, qa_cfg)
-            if runtime_problem and report["verdict"] == "pass":
-                report = {**report, "verdict": "fail",
-                          "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
+            if runtime_problem:
+                # Recorded as a finding whatever the verifier said, so later attempts (and the automatic retry) see
+                # the concrete failure; a passing verdict is overridden.
+                report = {**report, "findings": [*(report.get("findings") or []), {
+                    "severity": "major", "description": f"Required runtime QA failed: {runtime_problem}",
+                    "location": "runtime QA"}]}
+                if report["verdict"] == "pass":
+                    report = {**report, "verdict": "fail",
+                              "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
             self.verifier_report = report
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))
@@ -464,6 +485,24 @@ class TaskRunner:
                    + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
                    prepared=vm.prepared)
         return vm
+
+    def _auto_retry(self) -> bool:
+        """Attempts ran out. When the last one failed on concrete, actionable feedback, start a fresh budget with that
+        feedback instead of asking a person, up to ``auto_retry_rounds`` times between human decisions."""
+        ev = self.task.evidence or {}
+        rounds = max(0, min(int(self.settings.get("auto_retry_rounds", 1) or 0), 3))  # bootstrap values skip the API clamp
+        used = int(ev.get("auto_retries", 0))
+        attempts = [a for a in ev.get("attempts", []) if isinstance(a, dict)]
+        # Only the attempt that just ran out counts: some failures (an unreadable sandbox) record nothing, and an
+        # older record must not turn an infrastructure failure into an automatic retry.
+        last = attempts[-1] if attempts and attempts[-1].get("n") == self.task.attempt else {}
+        if used >= rounds or not _actionable(last):
+            return False
+        # Counter and fresh budget together: a crash in between must not spend the round without granting it.
+        self._set_evidence({"auto_retries": used + 1, "attempt_base": self.task.attempt})
+        self.event("auto_retry", f"{self.task.key} used its attempts on concrete findings; retrying with a fresh budget "
+                   f"before asking a person ({used + 1} of {rounds})", level="warn")
+        return True
 
     def _fresh_budget_after_base_moved(self, why: str) -> None:
         """A verified change that other work overtook is not the builder's failure: rebuilding it gets a fresh
@@ -1056,8 +1095,26 @@ class TaskRunner:
         self.event("task_completed", f"{self.task.key} complete: {summary}", level="success")
 
 
+def _actionable(attempt: dict[str, Any]) -> bool:
+    """Whether an attempt's record gives the next attempt something concrete to fix."""
+    result = attempt.get("result")
+    if result == "checks_failed":
+        return any(not c.get("ok") for c in attempt.get("checks") or [])
+    if result == "policy":
+        return bool(attempt.get("detail"))
+    if result == "verification_failed":
+        verdict = attempt.get("verdict") or {}  # optional report fields may be null
+        # Exactly what the feedback relays to the next attempt: unmet criteria and blocker/major findings.
+        return (any(c.get("status") != "pass" for c in verdict.get("criteria") or [])
+                or any(f.get("severity") in ("blocker", "major") for f in verdict.get("findings") or []))
+    return False
+
+
 def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")} for c in checks]
+    """Check results for the evidence record; failed checks keep their output tail so the failure can be fed back
+    to a later attempt even after a restart."""
+    return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")}
+            | ({} if c["ok"] else {"tail": str(c.get("tail") or "")[-1500:]}) for c in checks]
 
 
 def _signal(workspace_id: str, repo_id: str | None, source: str, title: str, body: str, url: str) -> None:

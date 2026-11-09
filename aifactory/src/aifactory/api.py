@@ -111,6 +111,7 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     merged = merged_settings(raw)
     merged["concurrency"] = max(1, min(int(merged.get("concurrency", 3)), 50))
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
+    merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
         if merged["harness"].get(role) not in ("native", "codex", "anton"):
             merged["harness"][role] = "native"

@@ -24,6 +24,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
     "max_attempts": 3,
+    # When attempts run out on concrete feedback (verifier findings, failed checks, policy), try once more with a
+    # fresh budget before asking a person: relaying findings into a retry is not a decision.
+    "auto_retry_rounds": 1,
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "run_minutes": 60,
