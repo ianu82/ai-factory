@@ -207,6 +207,7 @@ class TaskRunner:
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
+                effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
                 prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
                                     precedents(self.ws, self.repo.id),
@@ -418,7 +419,8 @@ class TaskRunner:
                 run, result, error = await run_agent(SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
-                    attempt=attempt, writable=False,
+                    attempt=attempt, writable=False, effective_settings=self.settings,
+                    repositories={self.repo.full_name: self.cfg},
                     prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
                                          precedents(self.ws, self.repo.id),
                                          guidance_history(self.task.outcome_id, self.task_id))

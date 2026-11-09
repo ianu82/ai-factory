@@ -1117,9 +1117,12 @@ def reconcile_scorer_cost(workspace_id: str, run_id: str, score_id: str, attempt
 
 # --- runs, activity, signals -----------------------------------------------------------
 @router.get("/workspaces/{workspace_id}/runs")
-def list_runs(workspace_id: str, limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    rows = db.query(Run).filter(Run.workspace_id == workspace_id).order_by(Run.started_at.desc()).limit(max(1, min(limit, 500))).all()
+    query = db.query(Run).filter(Run.workspace_id == workspace_id)
+    if config_version is not None:
+        query = query.filter(Run.config_version == config_version)
+    rows = query.order_by(Run.started_at.desc()).limit(max(1, min(limit, 500))).all()
     outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({r.outcome_id for r in rows}))}
     tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_({r.task_id for r in rows if r.task_id}))}
     from .scorers import run_summaries

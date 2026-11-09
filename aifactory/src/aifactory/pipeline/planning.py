@@ -43,7 +43,8 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id))
         run, result, error = await run_agent(SessionSpec(
             workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
-            prompt=prompt, system=PLANNER, sandbox=sandbox), cancelled)
+            prompt=prompt, system=PLANNER, sandbox=sandbox, effective_settings=settings,
+            repositories={r.full_name: r.config or {} for r in repos}), cancelled)
     except asyncio.CancelledError:
         raise
     except Exception as exc:

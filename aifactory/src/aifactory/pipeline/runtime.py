@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from ..config import concurrency_limit, get_settings
+from ..config_versions import canonical_json, configuration_version
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..gateway import GatewayGrant, issue, revoke
@@ -122,7 +126,7 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
         return found[:limit]
 
 
-@dataclass
+@dataclass(frozen=True)
 class SessionSpec:
     workspace_id: str
     outcome_id: str
@@ -134,20 +138,44 @@ class SessionSpec:
     sandbox: LocalSandbox
     attempt: int = 1
     writable: bool = False
+    effective_settings: Mapping[str, Any] | None = None
+    model_override: str | None = None
+    repositories: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        # Own a recursively immutable snapshot, not a reference to mutable workspace/repo JSON.
+        def freeze(value):
+            if isinstance(value, Mapping):
+                return MappingProxyType({k: freeze(v) for k, v in value.items()})
+            if isinstance(value, (list, tuple)):
+                return tuple(freeze(v) for v in value)
+            return value
+        for key in ("effective_settings", "repositories"):
+            value = getattr(self, key)
+            if value is not None:
+                object.__setattr__(self, key, freeze(value))
 
 
 async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, HarnessResult | None, str]:
     """Run one harness session as a recorded Run. Returns (run, result_or_None, error)."""
-    settings = workspace_settings(spec.workspace_id)
+    settings = (merged_settings(json.loads(canonical_json(spec.effective_settings)))
+                if spec.effective_settings is not None else workspace_settings(spec.workspace_id))
     models = workspace_models(settings)
     model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier}[spec.role]
-    provider = resolve_provider(spec.workspace_id)
-    model = provider.model_override or model
+    provider = (resolve_provider(spec.workspace_id, required_provider=settings["provider"])
+                if spec.effective_settings is not None
+                and settings["provider"] != workspace_settings(spec.workspace_id)["provider"]
+                else resolve_provider(spec.workspace_id))
+    model = spec.model_override or provider.model_override or model
+    version, snapshot = configuration_version(
+        role=spec.role, system=spec.system, harness=spec.harness, provider=provider, model=model,
+        settings=settings, repositories=spec.repositories, sandbox_kind=getattr(spec.sandbox, "kind", "local"))
     limits = settings["limits"]
     budgets = settings["budgets"]
     with session_scope() as s:
         run = Run(workspace_id=spec.workspace_id, outcome_id=spec.outcome_id, task_id=spec.task_id, role=spec.role,
-                  harness=spec.harness, provider=provider.provider, model=model, attempt=spec.attempt)
+                  harness=spec.harness, provider=provider.provider, model=model, attempt=spec.attempt,
+                  config_version=version, config_snapshot=snapshot)
         s.add(run)
         s.flush()
         run_id = run.id

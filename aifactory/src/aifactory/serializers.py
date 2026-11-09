@@ -44,7 +44,7 @@ def repository(r: Repository) -> dict[str, Any]:
 
 def run(r: Run) -> dict[str, Any]:
     return {"id": r.id, "task_id": r.task_id, "outcome_id": r.outcome_id, "role": r.role, "harness": r.harness,
-            "provider": r.provider, "model": r.model, "attempt": r.attempt, "status": r.status, "turns": r.turns,
+            "config_version": r.config_version, "provider": r.provider, "model": r.model, "attempt": r.attempt, "status": r.status, "turns": r.turns,
             "input_tokens": r.input_tokens, "output_tokens": r.output_tokens, "cost_usd": r.cost_usd,
             "cost_known": r.cost_known, "error": r.error, "result": r.result, "started_at": ts(r.started_at),
             "finished_at": ts(r.finished_at)}
