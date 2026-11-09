@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
@@ -54,6 +55,10 @@ def _ws(db: Session, user: User, workspace_id: str, minimum: str = "viewer") -> 
 
 
 # --- identity ---------------------------------------------------------------
+# When this process started: the release checker uses it to tell a soak from a restart.
+STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 @router.get("/health")
 def health():
     import os
@@ -61,7 +66,7 @@ def health():
     from . import __version__
 
     return {"ok": True, "version": __version__, "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA", ""),
-            "orchestrator": orchestrator.status()}
+            "started_at": STARTED_AT, "orchestrator": orchestrator.status()}
 
 
 @router.get("/meta")

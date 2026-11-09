@@ -1,4 +1,4 @@
-"""Command line: `aifactory serve`."""
+"""Command line: `aifactory serve`, `aifactory release-check` and benchmark tools."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ def main(argv: list[str] | None = None) -> None:
     history.add_argument("--suite", required=True, metavar="NAME")
     history.add_argument("--output-root", metavar="PATH",
                          help="Export root (default: aifactory/benchmarks in the current source checkout; required outside a checkout)")
+    release = sub.add_parser("release-check", help="Promote the commit staging runs to the release branch when it is ready")
+    release.add_argument("--dry-run", action="store_true", help="Check everything but do not move the release branch")
     args = parser.parse_args(argv)
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if args.command == "benchmarks":
@@ -38,6 +40,18 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"Exported {destination}")
         except (SuiteError, OSError) as exc:
             parser.error(str(exc))
+    if args.command == "release-check":
+        import json
+        import sys
+
+        from .release import ReleaseError, release_check
+
+        try:
+            result = release_check(dry_run=args.dry_run)
+        except ReleaseError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result.as_dict()))
+        sys.exit(1 if result.failed else 0)
     if args.command == "serve":
         import uvicorn
 
