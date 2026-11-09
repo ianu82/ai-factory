@@ -492,7 +492,8 @@ def test_waiting_ci_is_serialized_in_task_cards_and_outcome_tracks(client, signe
     listing = client.get(path)
     assert listing.status_code == 200
     outcome = listing.json()[0]
-    assert outcome["progress"] == {"done": 0, "total": 1}
+    # A parked CI wait has started but is not running (it holds no slot).
+    assert outcome["progress"] == {"done": 0, "total": 1, "started": 1, "active": 0}
     assert outcome["track"][0] == {
         "key": "T1", "status": "waiting_ci", "stage": "ci", "evidence": {"ci": {"state": "pending"}},
     }
