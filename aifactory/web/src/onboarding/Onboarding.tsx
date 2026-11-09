@@ -5,6 +5,8 @@ import { useWs } from "../App";
 import { api } from "../api";
 import { ONBOARDING_STEPS, onboardingQueryKey, patchOnboarding, type OnboardingAction } from "./api";
 import { deferMember, STEP_LABELS, useOnboarding } from "./state";
+import { ModelStep } from "./ModelStep";
+import { GitHubStep } from "./GitHubStep";
 import { RepositoryStep } from "./RepositoryStep";
 
 export function Onboarding() {
@@ -80,7 +82,11 @@ export function Onboarding() {
               <p className="mono muted">STEP {index + 1} OF {ONBOARDING_STEPS.length} · {progress.data.completed_steps.length} SAVED</p>
               <h1 ref={heading} tabIndex={-1}>{STEP_LABELS[progress.data.current_step]}</h1>
               <p>{progress.data.completed_steps.includes(progress.data.current_step) ? "This step is saved. You can revisit it without losing progress." : "Set up your workspace one step at a time."}</p>
-              {step === "repositories" ? <RepositoryStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
+              {step === "models" ? <ModelStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
+                onNavigate={(next) => save({ action: "navigate", step: next })}
+                onComplete={save} onDefer={leave} /> : step === "github" ? <GitHubStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
+                onNavigate={(next) => save({ action: "navigate", step: next })}
+                onComplete={save} onDefer={leave} /> : step === "repositories" ? <RepositoryStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
                 onNavigate={(next) => save({ action: "navigate", step: next })}
                 onComplete={save} onDefer={leave} /> : <section className="onboarding-unavailable" aria-label="Step availability">
                 <h2>This step is not available yet</h2>
@@ -102,7 +108,7 @@ export function Onboarding() {
           <footer className="onboarding-actions">
             {admin && progress.data ? <>
               <button className="btn" disabled={busy || index === 0} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index - 1] }))}>Back</button>
-              {step !== "repositories" && <button className="btn primary" disabled={busy || index === ONBOARDING_STEPS.length - 1} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index + 1] }))}>Continue</button>}
+              {step !== "models" && step !== "github" && step !== "repositories" && <button className="btn primary" disabled={busy || index === ONBOARDING_STEPS.length - 1} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index + 1] }))}>Continue</button>}
             </> : <span className="muted">Workspace setup · read-only</span>}
           </footer>
         </main>

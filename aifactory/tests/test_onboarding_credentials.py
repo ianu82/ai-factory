@@ -162,7 +162,7 @@ def test_retest_status_and_metadata_replacement(client, signed_in, monkeypatch, 
     body = client.post(path + "/test").json()
     assert body["status"] == expected
     assert body["metadata"]["test_status"] == ("invalid" if failure == 401 else "untested")
-    assert "login" not in body["metadata"] and "repository" not in body["metadata"]
+    assert "login" not in body["metadata"] and body["metadata"]["repository"] == "acme/app"
     assert all(p["state"] == "unverified" for p in body["metadata"]["permissions"])
     assert TOKEN not in json.dumps(body) + client.get(path.rsplit("/", 1)[0]).text
 
@@ -341,3 +341,86 @@ def test_long_upstream_echo_is_not_partially_disclosed(client, signed_in, monkey
     onboarding = client.get(f"/api/workspaces/{ws}/onboarding")
     assert onboarding.status_code == 200
     assert secret[:190] not in onboarding.text
+
+
+@pytest.mark.parametrize("private", [True, False])
+def test_fine_grained_completion_and_settings_retest_keep_repository(client, signed_in, monkeypatch, private):
+    ws = signed_in["workspaces"][0]["id"]
+    path = f"/api/workspaces/{ws}/credentials/github_token"
+    calls = []
+
+    def handle(r):
+        calls.append(r.url.path)
+        return github_handler(r, private=private)
+
+    transport(monkeypatch, handle)
+    assert client.put(path, json={"value": TOKEN}).status_code == 200
+    progress = f"/api/workspaces/{ws}/onboarding"
+    assert "github" not in client.get(progress).json()["completed_steps"]
+    checked = client.post(path + "/test?repository=acme/app").json()
+    assert any(p["state"] == "unverified" for p in checked["metadata"]["permissions"])
+    assert "github" in client.get(progress).json()["completed_steps"]
+    calls.clear()
+    retest = client.post(path + "/test")
+    assert retest.status_code == 200
+    assert "/repos/acme/app" in calls
+    assert retest.json()["metadata"]["repository"] == "acme/app"
+    assert "github" in client.get(progress).json()["completed_steps"]
+    assert client.patch(progress, json={"action": "complete", "step": "github"}).status_code == 200
+
+
+@pytest.mark.parametrize("failure", [403, 404])
+def test_inaccessible_repository_retest_removes_completion(client, signed_in, monkeypatch, failure):
+    ws = signed_in["workspaces"][0]["id"]
+    path = f"/api/workspaces/{ws}/credentials/github_token"
+    transport(monkeypatch, github_handler)
+    client.put(path, json={"value": TOKEN})
+    client.post(path + "/test?repository=acme/app")
+    progress = f"/api/workspaces/{ws}/onboarding"
+    assert "github" in client.get(progress).json()["completed_steps"]
+    transport(monkeypatch, lambda r: response(failure) if r.url.path == "/repos/acme/app" else github_handler(r))
+    assert client.post(path + "/test").json()["metadata"]["diagnostic_code"] == "github_repository_unverified"
+    state = client.get(progress).json()
+    assert "github" not in state["completed_steps"]
+    assert "github" in state["validation_uncertain_steps"]
+    assert client.patch(progress, json={"action": "complete", "step": "github"}).status_code == 409
+
+
+def test_permission_contract_and_both_web_recipes(client, signed_in):
+    from pathlib import Path
+
+    expected = {"contents": "write", "pull_requests": "write", "issues": "write", "statuses": "write",
+                "checks": "read", "actions": "read", "metadata": "read"}
+    assert REQUIRED_PERMISSIONS == expected
+    ws = signed_in["workspaces"][0]["id"]
+    recipe = client.get(f"/api/workspaces/{ws}/credentials").json()["github_permissions"]
+    assert {p["permission"]: p["required"] for p in recipe} == expected
+    assert next(p["label"] for p in recipe if p["permission"] == "statuses") == "Commit statuses"
+    web = Path(__file__).resolve().parents[1] / "web" / "src" / "onboarding"
+    for step in ("GitHubStep.tsx", "RepositoryStep.tsx"):
+        source = (web / step).read_text()
+        assert "<GitHubPermissions " in source
+        assert "Issues, Checks and Actions: read" not in source
+        assert "Contents and Pull requests: write" not in source
+    settings = (web.parent / "pages" / "Settings.tsx").read_text()
+    assert '<GitHubPermissions workspaceId={ws.id} credential={c}' in settings
+    assert "Contents, Pull requests and Commit statuses (read & write)" not in settings
+    source = (web / "GitHubPermissions.tsx").read_text()
+    assert "github_permissions?.map" in source
+    assert 'p.required === "write" ? "Read and write" : "Read-only"' in source
+
+
+def test_model_choices_persist_without_changing_other_settings(client, signed_in, monkeypatch):
+    ws = signed_in["workspaces"][0]["id"]
+    transport(monkeypatch, lambda r: response(data={"data": [{"id": "planner"}, {"id": "builder"}]})
+              if r.url.path.endswith("/models") else response(data={"user_id": "u"}))
+    path = f"/api/workspaces/{ws}"
+    client.put(path + "/credentials/mindshub_api_key", json={"value": KEY})
+    before = client.get("/api/me").json()["workspaces"][0]["settings"]
+    models = {"default": "planner", "planner": "planner", "builder": "builder", "verifier": "planner"}
+    assert client.patch(path, json={"settings": {"provider": "mindshub", "models": models}}).status_code == 200
+    after = client.get("/api/me").json()["workspaces"][0]["settings"]
+    assert after["models"] == models
+    assert {k: v for k, v in after.items() if k not in ("provider", "models")} == {
+        k: v for k, v in before.items() if k not in ("provider", "models")}
+    assert set(client.get(path + "/models").json()["models"]) == {"planner", "builder"}

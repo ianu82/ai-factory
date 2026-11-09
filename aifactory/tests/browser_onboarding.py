@@ -72,6 +72,10 @@ def check(base_url: str) -> None:
                             elif action["action"] == "defer":
                                 states[wid]["deferred"] = action["deferred"]
                         return route.fulfill(json=states[wid])
+                    if path.endswith("/credentials"):
+                        return route.fulfill(json={"items": [], "server_fallbacks": {}, "github_permissions": []})
+                    if path.endswith("/models"):
+                        return route.fulfill(json={"provider": None, "models": []})
                     if path.endswith("/inbox"):
                         return route.fulfill(json={"decisions": [], "since": None, "changes": []})
                     if path.endswith("/pulls"):
@@ -104,12 +108,13 @@ def check(base_url: str) -> None:
                 if role in ("owner", "admin"):
                     for width in (375, 1440):
                         page.set_viewport_size({"width": width, "height": 900})
-                        bounds = page.locator(".onboarding-actions").evaluate("el => el.getBoundingClientRect().top + scrollY")
-                        page.get_by_role("button", name="Continue", exact=True).focus()
+                        # Connection steps now own guarded continuation. The
+                        # shell still permits keyboard revisits via navigation.
+                        expect(page.get_by_role("button", name="Save models and continue")).to_be_disabled()
+                        page.get_by_role("button", name="2 GitHub").focus()
                         page.keyboard.press("Enter")
                         expect(page.get_by_role("heading", name="GitHub", exact=True)).to_be_focused()
                         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-                        assert page.locator(".onboarding-actions").evaluate("el => el.getBoundingClientRect().top + scrollY") == bounds
                         page.get_by_role("button", name="Back", exact=True).click()
                         expect(page.get_by_role("heading", name="AI models", exact=True)).to_be_focused()
                     page.get_by_role("button", name="5 Team").click()
@@ -151,7 +156,11 @@ def check(base_url: str) -> None:
                 assert states["two"]["current_step"] == "models"
                 if role not in ("owner", "admin"):
                     assert not mutations
-                assert not any("/test" in path or "/credentials" in path for _, path in requests)
+                    assert not any("/test" in path or "/credentials" in path for _, path in requests)
+                else:
+                    # Admin connection views read the shared credential API, but
+                    # no test is made when no credential has been configured.
+                    assert not any("/test" in path for _, path in requests)
 
                 page.get_by_role("button", name="Sign out", exact=True).click()
                 expect(page).to_have_url(base_url + "/signin")

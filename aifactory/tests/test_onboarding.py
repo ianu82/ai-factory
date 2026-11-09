@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
 
 from aifactory import config, db
+from aifactory.github import REQUIRED_PERMISSIONS
 from aifactory.models import Membership, Outcome, Repository, Secret, Workspace
 from aifactory.onboarding import STEPS
 
@@ -24,7 +25,9 @@ def seed_ready(ws_id, *, provider="mindshub", status="valid", metadata=True):
                    hint="secret-hint", status=status, status_detail="private error detail",
                    metadata_json={"models": ["model"], "secret": "private metadata"} if metadata else {}),
             Secret(workspace_id=ws_id, kind="github_token", ciphertext="encrypted-github-secret", status=status,
-                   metadata_json={"login": "octocat"} if metadata else {}),
+                   metadata_json={"login": "octocat", "repository": "acme/app", "test_status": "valid",
+                                  "diagnostic_code": "github_verified",
+                                  "permissions": [{"permission": name, "state": "present"} for name in REQUIRED_PERMISSIONS]} if metadata else {}),
             Repository(workspace_id=ws_id, full_name="acme/app", config={"checks": ["pytest"]}),
         ])
 

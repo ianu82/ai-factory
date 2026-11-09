@@ -6,6 +6,7 @@ import { api, type Credential, type ModelCheckResult, type Repo, type Settings, 
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { ago } from "../format";
+import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
 import { LinearSettings } from "../components/LinearSettings";
@@ -199,7 +200,7 @@ function Models() {
 
 const CRED_HELP: Record<string, { what: string; placeholder: string }> = {
   mindshub_api_key: { what: "Powers every planner, builder and verifier session. Create a key in MindsHub console → API keys.", placeholder: "mdb_…" },
-  github_token: { what: "Fine-grained token with Contents, Pull requests and Commit statuses (read & write) on the repositories this workspace may change.", placeholder: "github_pat_…" },
+  github_token: { what: "Fine-grained token for this workspace’s repositories. Use the required permissions listed below.", placeholder: "github_pat_…" },
   openai_api_key: { what: "Optional alternative provider.", placeholder: "sk-…" },
   linear_api_key: { what: "Personal Linear API key. Used only by the control plane, never sent to sandboxes. After saving, choose your team and workflow states in Settings → Linear.", placeholder: "lin_api_…" },
 };
@@ -227,6 +228,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
   const refresh = () => Promise.all([
     qc.invalidateQueries({ queryKey: ["credentials", ws.id] }),
     qc.invalidateQueries({ queryKey: ["models", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["github-repos", ws.id] }),
     qc.invalidateQueries({ queryKey: ["linear-teams", ws.id] }),
     qc.invalidateQueries({ queryKey: ["linear-states", ws.id] }),
     qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
@@ -294,6 +296,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
           <span style={{ color: c.status === "invalid" ? "var(--bad)" : undefined }}>{c.detail || c.status}{c.tested_at ? ` · checked ${ago(c.tested_at)}` : ""}</span>
         ) : fallback ? "Using the server's bootstrap credential until you add one for this workspace." : CRED_HELP[c.kind]?.what}
       </div>
+      {c.kind === "github_token" && <GitHubPermissions workspaceId={ws.id} credential={c} />}
       {editing && admin && (
         <form onSubmit={saveKey}>
           <input className="input mono" type="password" autoComplete="off" spellCheck={false} disabled={busy} placeholder={CRED_HELP[c.kind]?.placeholder}
