@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Outcome, type Repo } from "../api";
+import { useOutcomeRequestId } from "../outcomeDraft";
 import { useWs } from "../App";
 import { Modal, useToast } from "../ui";
 import { AttachmentPicker, pasteImages, useAttachmentQueue } from "../components/Attachments";
@@ -22,6 +23,9 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const submitting = useRef(false);
   const attachments = useAttachmentQueue(ws.id);
+  const draft = { title, brief, attachment_ids: attachments.ids, repo_ids: picked, harness: harness || null, priority,
+    acceptance: criteria.split("\n").map((c) => c.replace(/^\s*[-*\d.]+\s*/, "").trim()).filter(Boolean) };
+  const requestId = useOutcomeRequestId(draft);
   const titleRef = useRef<HTMLInputElement>(null);
   useEffect(() => titleRef.current?.focus(), []);
   useEffect(() => {
@@ -36,8 +40,7 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
     try {
       const o = await api<Outcome>(`/api/workspaces/${ws.id}/outcomes`, {
         method: "POST",
-        json: { title, brief, attachment_ids: attachments.ids, repo_ids: picked, harness: harness || null, priority,
-                acceptance: criteria.split("\n").map((c) => c.replace(/^\s*[-*\d.]+\s*/, "").trim()).filter(Boolean) },
+        json: { ...draft, request_id: requestId },
       });
       attachments.finishSubmission(true);
       qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });

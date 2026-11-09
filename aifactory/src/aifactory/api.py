@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from . import attachments as A
@@ -668,6 +671,7 @@ class OutcomeCreate(BaseModel):
     harness: str | None = None
     priority: int = 2
     attachment_ids: list[str] = Field(default_factory=list)
+    request_id: UUID | None = None
 
 
 def _outcome_rows(db: Session, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
@@ -702,6 +706,19 @@ def list_outcomes(workspace_id: str, status: str = "", limit: int = 200, user: U
 def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(current_user),
                    db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "member")
+    marker = None
+    if body.request_id is not None:
+        # UUID bytes encoded without padding fit the existing VARCHAR(32) signal_id.
+        marker = "request:" + base64.urlsafe_b64encode(body.request_id.bytes).decode().rstrip("=")
+        # Serialize requests for this workspace on SQLite and Postgres. A row lock
+        # alone would be ignored by SQLite. This write precedes the replay lookup.
+        db.execute(update(Workspace).where(Workspace.id == workspace_id).values(outcome_seq=Workspace.outcome_seq))
+        existing = db.query(Outcome).filter_by(workspace_id=workspace_id, created_by=user.id, signal_id=marker).first()
+        if existing is not None:
+            tasks, runs, decisions = _outcome_rows(db, [existing.id])
+            result = S.outcome(existing, tasks.get(existing.id, []), runs.get(existing.id, []), decisions.get(existing.id, 0))
+            db.commit()
+            return result
     repos = db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.id.in_(body.repo_ids)).all()
     if len(repos) != len(set(body.repo_ids)):
         raise HTTPException(400, "Unknown repository")
@@ -722,7 +739,8 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
         db.rollback()
         raise HTTPException(409, "Attachment is no longer available")
     outcome = outcome_from_text(db, workspace_id, user, body.title, body.brief, [r.id for r in repos],
-                                acceptance=body.acceptance, harness=body.harness, priority=max(0, min(body.priority, 3)))
+                                acceptance=body.acceptance, harness=body.harness, priority=max(0, min(body.priority, 3)),
+                                signal_id=marker)
     if uploads:
         db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.outcome_id == claim_id).update(
             {Artifact.outcome_id: outcome.id}, synchronize_session=False)
