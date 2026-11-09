@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .models import Artifact, Decision, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace
+from .models import Artifact, Decision, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace, Workstream
 
 
 def ts(value: datetime | None) -> str | None:
@@ -26,6 +26,15 @@ def workspace(w: Workspace, role: str | None = None, org_name: str = "") -> dict
     return {"id": w.id, "name": w.name, "slug": w.slug, "description": w.description, "org_id": w.org_id,
             "org_name": org_name, "role": role, "paused": w.paused, "settings": merged_settings(w.settings),
             "mindshub_workspace_id": w.mindshub_workspace_id, "created_at": ts(w.created_at)}
+
+
+def workstream(w: Workstream) -> dict[str, Any]:
+    return {"id": w.id, "workspace_id": w.workspace_id, "slug": w.slug, "name": w.name,
+            "goal": w.goal, "owner_id": w.owner_id, "default_repo_ids": w.default_repo_ids,
+            "state": w.state, "worker_override": w.worker_override,
+            "plan_approval_override": w.plan_approval_override, "merge_approval_override": w.merge_approval_override,
+            "priority_override": w.priority_override, "outcome_budget_override": w.outcome_budget_override,
+            "created_at": ts(w.created_at), "updated_at": ts(w.updated_at)}
 
 
 def repository(r: Repository) -> dict[str, Any]:
@@ -78,7 +87,7 @@ def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None 
     started = sum(1 for t in tasks if t.status not in ("pending", "queued") or t.attempt or t.pr_number)
     active = sum(1 for t in tasks if t.status == "running")
     return {"id": o.id, "number": o.number, "title": o.title, "brief": o.brief, "acceptance": o.acceptance,
-            "repo_ids": o.repo_ids, "harness": o.harness, "status": o.status, "priority": o.priority,
+            "workstream_id": o.workstream_id, "repo_ids": o.repo_ids, "harness": o.harness, "status": o.status, "priority": o.priority,
             "source": o.source, "summary": o.summary, "blocked_reason": o.blocked_reason,
             "linear_issue": {"id": source_signal.external_id,
                              "identifier": (source_signal.data or {}).get("identifier"),

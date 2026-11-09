@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from . import attachments as A
-from . import insights, linear_config
+from . import insights, linear_config, workstreams
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
@@ -74,6 +74,41 @@ def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return {"user": S.user(user),
             "workspaces": [S.workspace(w, m.role, o.name) for m, w, o in rows],
             "organizations": [{"id": o.id, "name": o.name} for o in {o.id: o for _, _, o in rows}.values()]}
+
+
+# --- workstreams -------------------------------------------------------------
+@router.get("/workspaces/{workspace_id}/workstreams")
+def list_workstreams(workspace_id: str, state: Literal["active", "archived", "all"] = "active",
+                     user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id)
+    from .models import Workstream
+
+    query = db.query(Workstream).filter_by(workspace_id=workspace_id)
+    if state != "all":
+        query = query.filter_by(state=state)
+    return [S.workstream(w) for w in query.order_by(Workstream.created_at, Workstream.id)]
+
+
+@router.get("/workspaces/{workspace_id}/workstreams/{workstream_id}")
+def get_workstream(workspace_id: str, workstream_id: str, user: User = Depends(current_user),
+                   db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id)
+    return S.workstream(workstreams.get(db, workspace_id, workstream_id))
+
+
+@router.post("/workspaces/{workspace_id}/workstreams")
+def create_workstream(workspace_id: str, body: workstreams.WorkstreamCreate,
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _, member = _ws(db, user, workspace_id, "member")
+    return workstreams.create(db, workspace_id, member, user, body)
+
+
+@router.patch("/workspaces/{workspace_id}/workstreams/{workstream_id}")
+def update_workstream(workspace_id: str, workstream_id: str, body: workstreams.WorkstreamUpdate,
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _, member = _ws(db, user, workspace_id, "member")
+    stream = workstreams.get(db, workspace_id, workstream_id)
+    return workstreams.update(db, stream, member, user, body)
 
 
 # --- workspaces ---------------------------------------------------------------
@@ -577,8 +612,10 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
             config["enabled"] = False
         linear_config.save_config(db, workspace, linear_config.LinearConfig.model_validate(config), user.id,
                                   commit=False)
+    workstream_events = workstreams.remove_repository_defaults(db, workspace_id, repo_id, user)
     db.delete(repo)
     db.commit()
+    workstreams.publish_changes(workstream_events)
     return {"ok": True}
 
 
