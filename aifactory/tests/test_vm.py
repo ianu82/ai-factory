@@ -247,7 +247,7 @@ def test_vm_attachment_originals_and_safe_writes(tmp_path, monkeypatch):
         for aid, name, raw, mime in rows:
             path = f".factory/attachments/{aid}-{name}"
             assert await vm.read_bytes_async(path) == raw
-            assert (await vm.exec(f"base64 -w0 {path}")).output.strip() == base64.b64encode(raw).decode()
+            assert (await vm.exec(f"base64 < {path} | tr -d '\\n'")).output.strip() == base64.b64encode(raw).decode()
             assert f"MIME: {mime}; decoded size: {len(raw)} bytes; path: {path}" in context
             await write_bytes(vm, path, b"changed")
         assert (await prepare_attachments(vm, "ws", "out"))[0] == context

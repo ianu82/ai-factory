@@ -90,7 +90,7 @@ def test_originals_isolation_and_deterministic_truncation(tmp_path):
         for aid, name, raw, mime in rows:
             path = f".factory/attachments/{aid}-{name}"
             assert f"MIME: {mime}; decoded size: {len(raw)} bytes; path: {path}" in prompt
-            assert (await sb.exec(f"base64 -w0 {path}")).output.strip() == base64.b64encode(raw).decode()
+            assert (await sb.exec(f"base64 < {path} | tr -d '\\n'")).output.strip() == base64.b64encode(raw).decode()
             sb.write_bytes(path, b"builder modified")
         assert (await prepare_attachments(sb, "ws", "out"))[0] == prompt
         for aid, name, raw, _ in rows:
@@ -295,7 +295,8 @@ def test_vm_ordinary_edit_preserves_executable_mode(tmp_path, monkeypatch):
                               "git init -q; git add run.sh; "
                               "git -c user.name=test -c user.email=test@example.com commit -qm base")).ok
         await write_text(vm, "run.sh", "#!/bin/sh\necho new\n")
-        result = await vm.exec("stat -c %a run.sh; ./run.sh; git diff HEAD")
+        result = await vm.exec("python3 -c \"import os; print(format(os.stat('run.sh').st_mode & 0o777, 'o'))\"; "
+                               "./run.sh; git diff HEAD")
         assert result.ok and result.output.startswith("755\nnew\n")
         assert "mode change" not in result.output
         await vm.close()

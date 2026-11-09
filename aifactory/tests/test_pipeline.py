@@ -1087,7 +1087,7 @@ def test_all_agent_roles_receive_attachments_and_publish_only_code(factory):
                 assert f"MIME: {mime}; decoded size: {len(raw)} bytes; path: {path}" in prompt
             if step(messages) == 0:
                 seen.add(role)
-                checks = [f'test "$(base64 -w0 {shlex.quote(f".factory/attachments/{aid}-{name}")})" = '
+                checks = [f'test "$(base64 < {shlex.quote(f".factory/attachments/{aid}-{name}")} | tr -d \'\\n\')" = '
                           + shlex.quote(base64.b64encode(raw).decode()) for aid, name, raw, _ in rows]
                 if role == "builder":
                     # Simulate the accidental force-add that gitignore cannot prevent.
