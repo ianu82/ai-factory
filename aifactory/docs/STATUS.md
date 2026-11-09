@@ -1,6 +1,6 @@
 # AI Factory v2 — status against the roadmap
 
-Updated 8 November 2026. Evidence links point to real runs on the live service
+Updated 9 November 2026. Evidence links point to real runs on the live service
 (https://factory-production-f28b.up.railway.app) against `ianu82/calorie-tracker` and
 `ianu82/ai-factory`. "Unattended" means no human or operator action after the work was
 admitted (a GitHub issue labelled `factory:auto`). Anything else is marked assisted, and an
