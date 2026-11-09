@@ -47,6 +47,7 @@ class World:
         self.marks: dict[str, str] = {OLD: "success"}
         self.mark_posts: list[tuple[str, str]] = []
         self.production = {"ok": True, "commit": OLD, "started_at": iso(NOW - timedelta(hours=3))}
+        self.production_down_for = 0
         self.staging = {"ok": True, "commit": NEW, "started_at": iso(NOW - timedelta(minutes=45))}
         self.staging_down_for = 0
         self.files = ["aifactory/src/aifactory/api.py"]
@@ -56,10 +57,10 @@ class World:
                        {"name": "postgres", "status": "completed", "conclusion": "success"}]
         self.asset_status = 200
         self.me_status = 401
-        self.holds: list[dict] = []
-        self.open_issues: list[dict] = []
+        self.store: list[dict] = []  # every issue: number, title, labels, created_at, state
         self.labels: set[str] = set()
-        self.issues: list[dict] = []
+        self.issues: list[dict] = []  # bodies of issues the checker opened
+        self.comments: list[tuple[int, str]] = []
         self.patches: list[dict] = []
         self.github_calls = 0
 
@@ -82,15 +83,28 @@ class World:
             self.mark_posts.append((sha, body["state"]))
             return httpx.Response(201, json={})
         if path == f"{base}/issues" and method == "GET":
-            if params.get("labels") == HOLD:
-                return httpx.Response(200, json=self.holds)
-            return httpx.Response(200, json=self.open_issues + self.holds)
+            wanted = params.get("labels")
+            return httpx.Response(200, json=[
+                {"number": i["number"], "title": i["title"], "created_at": iso(i["created_at"]),
+                 "labels": [{"name": n} for n in i["labels"]]}
+                for i in self.store if i["state"] == "open" and (not wanted or wanted in i["labels"])])
         if path == f"{base}/issues" and method == "POST":
             body = json.loads(request.content)
             self.issues.append(body)
-            issue = {"number": 100 + len(self.issues), "title": body["title"]}
-            (self.holds if HOLD in body.get("labels", []) else self.open_issues).append(issue)
-            return httpx.Response(201, json=issue)
+            issue = self.add_issue(body["title"], body.get("labels", []))
+            return httpx.Response(201, json={"number": issue["number"]})
+        if path.startswith(f"{base}/issues/"):
+            number = int(path.split("/")[5])
+            issue = next(i for i in self.store if i["number"] == number)
+            if path.endswith("/labels") and method == "POST":
+                issue["labels"] += json.loads(request.content)["labels"]
+                return httpx.Response(200, json=[])
+            if path.endswith("/comments") and method == "POST":
+                self.comments.append((number, json.loads(request.content)["body"]))
+                return httpx.Response(201, json={})
+            if method == "PATCH":
+                issue.update(json.loads(request.content))
+                return httpx.Response(200, json={})
         if path == f"{base}/labels/{HOLD}":
             return httpx.Response(200 if HOLD in self.labels else 404, json={})
         if path == f"{base}/labels" and method == "POST":
@@ -110,6 +124,12 @@ class World:
             return httpx.Response(200, json={"object": {"sha": body["sha"]}})
         return httpx.Response(404, json={"message": f"unexpected {method} {path}"})
 
+    def add_issue(self, title: str, labels: list[str] | None = None, created_at: datetime | None = None) -> dict:
+        issue = {"number": 100 + len(self.store), "title": title, "labels": list(labels or []),
+                 "created_at": created_at or self.clock.now(), "state": "open"}
+        self.store.append(issue)
+        return issue
+
     def web(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == f"{STAGING}/api/health":
@@ -118,6 +138,9 @@ class World:
                 return httpx.Response(502)
             return httpx.Response(200, json=self.staging)
         if url == f"{PROD}/api/health":
+            if self.production_down_for > 0:
+                self.production_down_for -= 1
+                raise httpx.ConnectError("connection refused")
             return httpx.Response(200, json=self.production)
         if url == f"{STAGING}/":
             return httpx.Response(200, text=APP)
@@ -213,7 +236,7 @@ def test_waits_while_production_deploys_the_release(world):
     world.production["commit"] = OTHER
     result = world.run()
     assert result.status == "held" and "Waiting for production" in result.detail
-    assert world.holds == [] and world.patches == []
+    assert world.store == [] and world.patches == []
 
 
 def test_a_release_that_never_goes_live_holds_releases_and_marks_the_commit(world):
@@ -230,9 +253,9 @@ def test_a_release_that_never_goes_live_holds_releases_and_marks_the_commit(worl
 
 
 def test_an_open_hold_stops_everything(world):
-    world.holds = [{"number": 7, "title": "Release hold: rollback in progress"}]
+    hold = world.add_issue("Release hold: rollback in progress", [HOLD])
     result = world.run()
-    assert result.status == "held" and "#7" in result.detail
+    assert result.status == "held" and f"#{hold['number']}" in result.detail
     assert world.patches == [] and world.mark_posts == []
 
 
@@ -248,6 +271,49 @@ def test_a_commit_marked_do_not_release_is_never_promoted(world):
     result = world.run()
     assert result.status == "held" and "do-not-release" in result.detail
     assert world.patches == []
+
+
+# --- a confirmed release stays good through blips and outages ---------------------------------------------------
+def test_a_blip_on_a_confirmed_release_changes_nothing(world):
+    world.production_down_for = 3
+    result = world.run()
+    assert result.status == "promoted"
+    assert world.mark_posts == [] and world.issues == []
+
+
+def test_an_outage_on_a_confirmed_release_skips_the_run_without_marking_it(world):
+    world.production_down_for = 1000
+    result = world.run()
+    assert result.status == "held" and "does not answer" in result.detail
+    assert world.mark_posts == [] and world.patches == []
+    assert [i["title"] for i in world.issues] == [f"Production unhealthy on {OLD[:7]}"]
+    assert "labels" not in world.issues[0]  # not a hold yet
+    world.clock.sleep(15 * 60)
+    assert world.run().status == "held" and len(world.issues) == 1  # still the same outage
+
+
+def test_an_outage_that_lasts_puts_releases_on_hold_without_marking_the_release(world):
+    outage = world.add_issue(f"Production unhealthy on {OLD[:7]}", created_at=NOW - timedelta(minutes=50))
+    world.production_down_for = 1000
+    result = world.run()
+    assert result.status == "failed" and "on hold" in result.detail
+    assert outage["labels"] == [HOLD] and world.mark_posts == []
+    assert world.issues == []  # the outage issue itself became the hold
+    assert "on hold" in world.run().detail
+
+
+def test_production_recovering_closes_the_outage_issue(world):
+    outage = world.add_issue(f"Production unhealthy on {OLD[:7]}", created_at=NOW - timedelta(minutes=20))
+    result = world.run()
+    assert outage["state"] == "closed" and world.comments and world.comments[0][0] == outage["number"]
+    assert result.status == "promoted"
+
+
+def test_production_on_another_commit_after_confirmation_is_an_outage_not_a_bad_release(world):
+    world.production["commit"] = OTHER
+    result = world.run()
+    assert result.status == "held" and "reports ccccccc instead" in result.detail
+    assert world.mark_posts == []
 
 
 # --- gates before a promotion ------------------------------------------------------------------------------------

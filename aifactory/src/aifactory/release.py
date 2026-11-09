@@ -12,7 +12,8 @@ A run, in order:
 2. Confirms the current release. Production must report the `release` commit and have run it for a few minutes;
    the commit then gets a green `factory/release` status. If production has not gone live on it in time, the run
    marks that commit "do not release", opens a `release-hold` issue and stops. A person rolls back or fixes, then
-   closes the hold.
+   closes the hold. A release confirmed earlier is never marked bad: a production blip is retried, and a longer
+   outage opens one issue that becomes a hold only if it lasts.
 3. Waits until the last release is at least the release interval old (2 hours by default).
 4. Promotes the commit staging runs when all of these hold:
    - staging has run it without restarting for the soak period;
@@ -44,6 +45,7 @@ log = logging.getLogger(__name__)
 OK_CONCLUSIONS = {"success", "neutral", "skipped"}
 COMPARE_FILE_LIMIT = 300  # GitHub's compare API lists at most this many files
 STAGING_RETRIES = 6  # health retries, one poll interval apart, before staging counts as down
+PRODUCTION_RETRIES = 10  # likewise for production: a restart or a slow answer is not an outage
 ASSET = re.compile(r'src="(/assets/[^"]+\.js)"')
 
 
@@ -64,6 +66,7 @@ class ReleaseConfig:
     interval_minutes: int = 120
     live_timeout_minutes: int = 40
     stable_minutes: int = 5
+    outage_hold_minutes: int = 45
     poll_seconds: int = 30
     hold_label: str = "release-hold"
     status_context: str = "factory/release"
@@ -94,6 +97,7 @@ class ReleaseConfig:
                    interval_minutes=number("AIFACTORY_RELEASE_INTERVAL_MINUTES", 120),
                    live_timeout_minutes=number("AIFACTORY_RELEASE_LIVE_TIMEOUT_MINUTES", 40),
                    stable_minutes=number("AIFACTORY_RELEASE_STABLE_MINUTES", 5),
+                   outage_hold_minutes=number("AIFACTORY_RELEASE_OUTAGE_HOLD_MINUTES", 45),
                    poll_seconds=max(1, number("AIFACTORY_RELEASE_POLL_SECONDS", 30)),
                    paused=env("AIFACTORY_RELEASE_PAUSED", "").strip().lower() in ("1", "true", "yes", "on"))
 
@@ -249,16 +253,17 @@ class Releaser:
         try:
             if any(i.get("title") == title for i in self._open_issues()):
                 return
-            if labels:
-                for label in labels:
-                    if self._gh("GET", f"/repos/{self.cfg.repo}/labels/{label}").status_code == 404:
-                        self._gh("POST", f"/repos/{self.cfg.repo}/labels",
-                                 json={"name": label, "color": "b60205",
-                                       "description": "Stops the release checker until closed"})
+            for label in labels or []:
+                self._ensure_label(label)
             self._gh("POST", f"/repos/{self.cfg.repo}/issues",
                      json={"title": title, "body": body, **({"labels": labels} if labels else {})})
         except (ReleaseError, httpx.HTTPError) as exc:  # reporting must never hide the result itself
             log.error("Could not open the release issue on GitHub: %s", exc)
+
+    def _ensure_label(self, label: str) -> None:
+        if self._gh("GET", f"/repos/{self.cfg.repo}/labels/{label}").status_code == 404:
+            self._gh("POST", f"/repos/{self.cfg.repo}/labels",
+                     json={"name": label, "color": "b60205", "description": "Stops the release checker until closed"})
 
     def _body(self, result: Result, extra: str = "") -> str:
         return (f"{result.detail}\n\nCommit: `{result.commit or 'unknown'}`\nRelease branch was at: "
@@ -307,6 +312,17 @@ class Releaser:
                                   f"{cfg.interval_minutes}.", previous=current)
         return self._promote(current)
 
+    def _production(self) -> dict[str, Any]:
+        """Production's health, asked again over a few minutes while it does not answer: a restart or a slow
+        response is not an outage. A healthy answer, on whichever commit, ends the wait."""
+        live = _health(self.web, self.cfg.production_url)
+        for _ in range(PRODUCTION_RETRIES):
+            if live.get("ok"):
+                break
+            self.sleep(self.cfg.poll_seconds)
+            live = _health(self.web, self.cfg.production_url)
+        return live
+
     def _confirm_production(self, current: str, since_move: float | None) -> Result | None:
         """None when production runs the current release, confirmed; otherwise the reason to stop this run."""
         cfg = self.cfg
@@ -314,23 +330,23 @@ class Releaser:
         if mark == "failure":
             return Result("held", f"{cfg.branch} is at {current[:7]}, which is marked do-not-release. "
                                   f"Roll {cfg.branch} back or ship a fix.", current, current)
-        live = _health(self.web, cfg.production_url)
-        if live.get("ok") and live.get("commit") == current:
+        live = self._production()
+        on_release = bool(live.get("ok")) and live.get("commit") == current
+        if mark == "success":
+            return self._watch_confirmed(current, live, on_release)
+        if on_release:
             up = self._minutes_since(_time(live.get("started_at")))
-            if mark == "success":
-                self.step(f"Production runs {current[:7]}, confirmed earlier")
-                return None
             if up is not None and up < cfg.stable_minutes:
                 return Result("held", f"Production has run {current[:7]} for {up:.0f} minutes; confirming after "
                                       f"{cfg.stable_minutes}.", current, current)
             self._set_mark(current, "success", "Live in production")
             self.step(f"Production confirmed on {current[:7]}")
             return None
+        seen = str(live.get("commit") or "")[:7] or live.get("error", "no answer")
         if since_move is not None and since_move < cfg.live_timeout_minutes:
-            seen = str(live.get("commit") or "")[:7] or live.get("error", "no answer")
             return Result("held", f"Waiting for production to go live on {current[:7]} (moved {since_move:.0f} minutes "
                                   f"ago; production reports {seen}).", current, current)
-        seen = str(live.get("commit") or "")[:7] or live.get("error", "no answer")
+        # Only a release never confirmed live is marked bad: it did not go live, or not for long enough.
         waited = "an unknown time" if since_move is None else f"{since_move:.0f} minutes"
         result = Result("failed", f"Production reports {seen}, but {cfg.branch} has been at {current[:7]} for {waited}.",
                         current, current)
@@ -339,6 +355,44 @@ class Releaser:
             f"Releases are on hold while this issue is open, and {current[:7]} is marked do-not-release. Check the "
             f"Railway deployment. To roll back, move `{cfg.branch}` to the last good release. Close this issue once "
             "production is healthy; the checker then releases the next commit staging runs.")), [cfg.hold_label])
+        result.reported = True
+        return result
+
+    def _watch_confirmed(self, current: str, live: dict[str, Any], on_release: bool) -> Result | None:
+        """A confirmed release stays good. If production stops answering, or answers on another commit, the run
+        skips and records the outage in one issue; only an outage that lasts puts releases on hold."""
+        cfg = self.cfg
+        title = f"Production unhealthy on {current[:7]}"
+        outage = next((i for i in self._open_issues() if i.get("title") == title), None)
+        if on_release:
+            self.step(f"Production runs {current[:7]}, confirmed earlier")
+            if outage and not self.dry_run and not any(l.get("name") == cfg.hold_label for l in outage.get("labels", [])):
+                self._gh("POST", f"/repos/{cfg.repo}/issues/{outage['number']}/comments",
+                         json={"body": "Production answers healthy on the release again; closing."})
+                self._gh("PATCH", f"/repos/{cfg.repo}/issues/{outage['number']}", json={"state": "closed"})
+                self.step(f"Closed #{outage['number']}: production recovered")
+            return None
+        seen = (f"reports {str(live.get('commit'))[:7]} instead" if live.get("ok")
+                else f"does not answer ({live.get('error', 'no answer')})")
+        if outage is None:
+            result = Result("held", f"Production {seen} of {current[:7]}; skipping this run.", current, current)
+            self._open_issue(title, self._body(result, (
+                f"{current[:7]} was confirmed live earlier, so it is not marked bad. The checker skips releases while "
+                f"production is unhealthy and puts them on hold if this lasts {cfg.outage_hold_minutes} minutes. It "
+                "closes this issue itself when production answers again.")))
+            return result
+        lasted = self._minutes_since(_time(outage.get("created_at"))) or 0.0
+        if lasted < cfg.outage_hold_minutes:
+            return Result("held", f"Production still {seen} of {current[:7]}, for {lasted:.0f} minutes; skipping "
+                                  "this run.", current, current)
+        if not self.dry_run:
+            self._ensure_label(cfg.hold_label)
+            self._gh("POST", f"/repos/{cfg.repo}/issues/{outage['number']}/labels", json={"labels": [cfg.hold_label]})
+            self._gh("POST", f"/repos/{cfg.repo}/issues/{outage['number']}/comments", json={"body": (
+                f"Production has been unhealthy for {lasted:.0f} minutes, so releases are now on hold until this issue "
+                f"is closed. {current[:7]} is not marked bad: it ran healthily before the outage.")})
+        result = Result("failed", f"Production has been unhealthy for {lasted:.0f} minutes; releases are on hold "
+                                  f"(#{outage['number']}).", current, current)
         result.reported = True
         return result
 

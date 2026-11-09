@@ -26,6 +26,11 @@ A run, in order:
    on the release within 40 minutes of `release` moving:
    - the commit is marked **do-not-release** (a failed `factory/release` status);
    - the checker opens a `release-hold` issue, which stops all releases until a person closes it.
+
+   A release that was already confirmed is never marked bad afterwards. If production stops answering (after
+   retries over 5 minutes) or answers on another commit, the run skips and opens one "Production unhealthy" issue.
+   The checker closes that issue itself when production recovers. If the outage lasts 45 minutes, the issue
+   becomes a `release-hold`.
 3. **Keeps releases at least 2 hours apart**, counted from when `release` last moved.
 4. **Promotes the commit staging runs** when all of these hold:
    - staging has run it without restarting for 30 minutes. Staging's data comes from earlier versions, so this
@@ -73,6 +78,7 @@ steps, and exits non-zero on a failure.
 | `AIFACTORY_RELEASE_INTERVAL_MINUTES` | Minimum time between releases (default 120) |
 | `AIFACTORY_RELEASE_SOAK_MINUTES` | How long staging must run the candidate (default 30) |
 | `AIFACTORY_RELEASE_LIVE_TIMEOUT_MINUTES` / `AIFACTORY_RELEASE_STABLE_MINUTES` | Go-live deadline (40) and minimum uptime before confirming (5) |
+| `AIFACTORY_RELEASE_OUTAGE_HOLD_MINUTES` | How long a confirmed release's production outage lasts before releases go on hold (default 45) |
 | `AIFACTORY_RELEASE_PAUSED` | `true` stops releases, for example during a demo |
 
 ## Operating it
