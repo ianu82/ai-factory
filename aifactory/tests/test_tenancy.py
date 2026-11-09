@@ -96,3 +96,84 @@ def test_other_organizations_cannot_reach_a_workspace_or_its_objects(client):
     r = TestClient(client.app).post(f"/api/feedback/{b_ws}", json={"title": "cross-tenant"},
                                     headers={"Authorization": f"Bearer {key}"})
     assert r.status_code == 401
+
+
+def test_attachment_workspace_uploader_and_viewer_boundaries(client, signed_in):
+    import base64
+    from aifactory.models import Membership, Workspace
+
+    ws = signed_in["workspaces"][0]["id"]
+    root = f"/api/workspaces/{ws}"
+    ids = _seed(ws)
+    with session_scope() as s:
+        s.get(Workspace, ws).outcome_seq = 1
+    body = {"name": "example.txt", "content": base64.b64encode(b"example").decode()}
+    staged = client.post(root + "/attachments", json=body).json()["id"]
+    linked = client.post(root + "/attachments", json=body).json()["id"]
+    outcome_body = {"title": "Attachments outcome", "repo_ids": [ids["repo"]], "attachment_ids": [linked]}
+    outcome = client.post(root + "/outcomes", json=outcome_body).json()["id"]
+
+    other = TestClient(client.app)
+    assert other.post("/auth/dev", json={"email": "other@example.test", "organization": "Other"}).status_code == 200
+    me = other.get("/api/me").json()
+    foreign_root = f'/api/workspaces/{me["workspaces"][0]["id"]}'
+    for aid in [staged, linked]:
+        assert other.get(root + "/artifacts/" + aid).status_code == 404
+        assert other.delete(root + "/attachments/" + aid).status_code == 404
+        assert other.get(foreign_root + "/artifacts/" + aid).status_code == 404
+        assert other.delete(foreign_root + "/attachments/" + aid).status_code == 404
+    assert other.post(root + "/attachments", json=body).status_code == 404
+    foreign_ids = _seed(me["workspaces"][0]["id"])
+    foreign_repo = foreign_ids["repo"]
+    assert other.post(foreign_root + "/outcomes", json={**outcome_body, "repo_ids": [foreign_repo],
+                                                       "attachment_ids": [staged]}).status_code == 404
+    assert other.get(foreign_root + "/outcomes/" + outcome).status_code == 404
+
+    with session_scope() as s:
+        member = Membership(workspace_id=ws, user_id=me["user"]["id"], role="viewer")
+        s.add(member)
+    assert other.post(root + "/attachments", json=body).status_code == 403
+    assert other.delete(root + "/attachments/" + staged).status_code == 403
+    assert other.get(root + "/artifacts/" + linked).status_code == 200
+    assert other.get(root + "/artifacts/" + staged).status_code == 404
+    detail = other.get(root + "/outcomes/" + outcome).json()
+    assert detail["attachments"][0]["id"] == linked and "content" not in detail["attachments"][0]
+
+    with session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws, user_id=me["user"]["id"]).one().role = "member"
+    assert other.post(root + "/attachments", json=body).status_code == 200
+    assert other.delete(root + "/attachments/" + staged).status_code == 404
+    assert other.post(root + "/outcomes", json={**outcome_body, "attachment_ids": [staged]}).status_code == 404
+    assert other.post(root + "/outcomes", json={**outcome_body, "attachment_ids": [linked]}).status_code == 404
+    # A corrupted reference to a foreign outcome must not resolve via its owning workspace.
+    with session_scope() as s:
+        corrupt = Artifact(workspace_id=ws, outcome_id=foreign_ids["outcome"],
+                           kind="attachment", name="bad.txt", content=body["content"], data={})
+        s.add(corrupt)
+        s.flush()
+        corrupt_id = corrupt.id
+    assert client.get(root + "/artifacts/" + corrupt_id).status_code == 404
+
+
+def test_staged_attachment_quota_is_per_uploader_and_workspace(client, signed_in):
+    from aifactory.models import Membership
+
+    ws = signed_in["workspaces"][0]["id"]
+    root = f"/api/workspaces/{ws}"
+    body = {"name": "reference.txt", "content": "cmVmZXJlbmNl"}
+    for _ in range(10):
+        assert client.post(root + "/attachments", json=body).status_code == 200
+    assert client.post(root + "/attachments", json=body).status_code == 413
+
+    other = TestClient(client.app)
+    assert other.post("/auth/dev", json={"email": "quota@example.test", "organization": "Other"}).status_code == 200
+    me = other.get("/api/me").json()
+    other_ws = me["workspaces"][0]["id"]
+    with session_scope() as s:
+        s.add(Membership(workspace_id=ws, user_id=me["user"]["id"], role="member"))
+        s.add(Membership(workspace_id=other_ws, user_id=signed_in["user"]["id"], role="member"))
+    # Another uploader in the full workspace still has their own quota.
+    assert other.post(root + "/attachments", json=body).status_code == 200
+    # The original uploader also has independent capacity in another workspace.
+    assert client.post(f"/api/workspaces/{other_ws}/attachments", json=body).status_code == 200
+    assert client.post(root + "/attachments", json=body).status_code == 413

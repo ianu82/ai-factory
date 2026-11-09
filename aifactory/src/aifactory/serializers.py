@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 from datetime import datetime
 from typing import Any
 
@@ -105,7 +107,7 @@ def message(m: Message, author: str = "") -> dict[str, Any]:
 
 def artifact(a: Artifact, content: bool = False) -> dict[str, Any]:
     row = {"id": a.id, "kind": a.kind, "name": a.name, "task_id": a.task_id, "run_id": a.run_id, "data": a.data,
-           "size": len(a.content or ""), "created_at": ts(a.created_at)}
+           "size": len(base64.b64decode(a.content or "")) if a.kind == "attachment" else len(a.content or ""), "created_at": ts(a.created_at)}
     if content:
         row["content"] = a.content
     return row

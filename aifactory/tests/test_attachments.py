@@ -319,3 +319,383 @@ def test_safe_replacement_preserves_existing_permissions(tmp_path, mode):
     safe_write(str(tmp_path), "new", b"new")
     assert stat.S_IMODE((tmp_path / "new").stat().st_mode) == 0o644
     assert sorted(p.name for p in tmp_path.iterdir()) == ["file", "new"]
+
+
+# Staged upload API and atomic outcome linking.
+@pytest.fixture
+def attachment_api(client, signed_in):
+    from aifactory.models import Repository
+
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="acme/app")
+        s.add(repo)
+        s.flush()
+        repo_id = repo.id
+    return f"/api/workspaces/{ws}", repo_id
+
+
+def upload(client, root, name="reference.txt", raw=b"reference"):
+    return client.post(root + "/attachments", json={"name": name, "content": base64.b64encode(raw).decode()})
+
+
+def submit(client, root, repo, ids):
+    return client.post(root + "/outcomes", json={"title": "An outcome", "repo_ids": [repo], "attachment_ids": ids})
+
+
+PDF = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\nstartxref\n9\n%%EOF\n"
+SUPPORTED_UPLOADS = [("a.png", PNG, "image/png"),
+                     ("a.jpg", VALID_IMAGES["image/jpeg"], "image/jpeg"),
+                     ("a.gif", VALID_IMAGES["image/gif"], "image/gif"),
+                     ("a.webp", VALID_IMAGES["image/webp"], "image/webp"),
+                     ("a.pdf", PDF, "application/pdf"), ("a.txt", b"hello\n", "text/plain"),
+                     ("a.md", b"# A heading", "text/markdown"),
+                     ("a.csv", b'key,value\na,"one,two"\n', "text/csv"),
+                     ("a.json", b'{"value":1}', "application/json")]
+
+
+@pytest.mark.parametrize("name,raw,mime", SUPPORTED_UPLOADS)
+def test_api_accepts_formats_and_roundtrips_metadata(client, signed_in, attachment_api, name, raw, mime):
+    root, _ = attachment_api
+    result = upload(client, root, name, raw)
+    assert result.status_code == 200, result.text
+    view = result.json()
+    assert "content" not in view and view["size"] == len(raw)
+    assert view["data"] == {"mime_type": mime, "size_bytes": len(raw), "uploaded_by": signed_in["user"]["id"]}
+    stored = client.get(root + "/artifacts/" + view["id"]).json()
+    assert base64.b64decode(stored["content"]) == raw
+    assert client.delete(root + "/attachments/" + view["id"]).status_code == 200
+    assert client.get(root + "/artifacts/" + view["id"]).status_code == 404
+
+
+@pytest.mark.parametrize("extension", ["txt", "md", "csv", "json"])
+@pytest.mark.parametrize("markup", ["<svg/onload=alert(1)>", "<HtMl/lang=en><BoDy/onload=alert(1)>",
+                                    "<SVG", "<svg >", "<svg/>", "<!DOCTYPE html>"])
+def test_disguised_markup_rejected_anywhere(client, attachment_api, extension, markup):
+    root, _ = attachment_api
+    text = json.dumps({"example": markup}) if extension == "json" else "some text\n" + markup
+    assert upload(client, root, "disguised." + extension, text.encode()).status_code == 400
+
+
+@pytest.mark.parametrize("name,raw", [("bad.json", b'{"value":}'), ("bad.json", b'NaN'),
+                                      ("bad.txt", b"binary\x00data"), ("bad.txt", b"binary\x01data"),
+                                      ("bad.txt", b"\xff\xfe\x80"), ("bad.png", b"plain text"),
+                                      ("bad.jpg", PNG), ("bad.txt", PNG), ("bad.html", b"hello"),
+                                      ("bad.svg", PNG), ("bad.csv", b'a,"unterminated'),
+                                      ("bad.json", b'{"x":"\\u003csvg/onload=x>"}')])
+def test_api_rejects_spoofing_binary_and_invalid_documents(client, attachment_api, name, raw):
+    root, _ = attachment_api
+    assert upload(client, root, name, raw).status_code == 400
+
+
+@pytest.mark.parametrize("content", ["data:text/plain;base64,aGk=", "a Gk=", "!!!!", "aGk", "", "é"])
+def test_strict_base64(client, attachment_api, content):
+    root, _ = attachment_api
+    assert client.post(root + "/attachments", json={"name": "a.txt", "content": content}).status_code == 400
+
+
+def test_bom_json_is_usable_by_runtime_without_changing_original(client, attachment_api, tmp_path):
+    root, repo = attachment_api
+    raw = b'\xef\xbb\xbf{"value":1}'
+    view = upload(client, root, "bom.json", raw).json()
+    outcome = submit(client, root, repo, [view["id"]]).json()
+    with session_scope() as s:
+        assert _decode(s.get(Artifact, view["id"])) == (raw, "application/json")
+    sb = LocalSandbox("bom", root=tmp_path / "sb").create()
+    sb.work.mkdir()
+    context, _ = asyncio.run(prepare_attachments(sb, root.rsplit("/", 1)[-1], outcome["id"]))
+    assert '\\ufeff' not in context and '{\\"value\\":1}' in context
+    assert (sb.work / f'.factory/attachments/{view["id"]}-bom.json').read_bytes() == raw
+
+
+def test_sanitised_metadata_and_attribution_committed_before_wake(client, signed_in, attachment_api, monkeypatch):
+    from aifactory.models import Event, Outcome
+    from aifactory.pipeline.orchestrator import orchestrator
+
+    root, repo = attachment_api
+    views = [upload(client, root, "../folder\\..\\unsafe\n<>name.txt").json(),
+             upload(client, root, "x" * 250 + ".txt").json()]
+    assert views[0]["name"] == "unsafe___name.txt"
+    assert len(views[1]["name"]) == 180 and views[1]["name"].endswith(".txt")
+    ids = [v["id"] for v in views]
+    observed = []
+
+    def wake():
+        with session_scope() as s:
+            rows = s.query(Artifact).filter(Artifact.id.in_(ids)).all()
+            assert len({a.outcome_id for a in rows}) == 1 and rows[0].outcome_id
+            assert s.get(Outcome, rows[0].outcome_id) is not None
+            event = s.query(Event).filter_by(kind="attachments_added").one()
+            assert event.actor == signed_in["user"]["id"]
+            assert event.data == {"ids": ids, "names": [v["name"] for v in views], "count": 2}
+            assert "content" not in json.dumps(event.data)
+            observed.append(True)
+
+    monkeypatch.setattr(orchestrator, "wake", wake)
+    response = submit(client, root, repo, ids)
+    assert response.status_code == 200, response.text
+    assert observed == [True]
+    detail = client.get(root + "/outcomes/" + response.json()["id"]).json()
+    assert [a["id"] for a in detail["attachments"]] == ids
+    assert all("content" not in a for a in detail["attachments"])
+    assert client.delete(root + "/attachments/" + ids[0]).status_code == 404
+    assert client.get(root + "/artifacts/" + ids[0]).status_code == 200
+    assert submit(client, root, repo, ids).status_code == 404
+
+
+def test_decoded_size_boundaries(client, attachment_api):
+    from aifactory.attachments import MAX_FILE_BYTES, MAX_TOTAL_BYTES
+
+    root, repo = attachment_api
+    ids = []
+    for size in [MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_TOTAL_BYTES - 2 * MAX_FILE_BYTES]:
+        response = upload(client, root, raw=b"a" * size)
+        assert response.status_code == 200, response.text
+        assert response.json()["size"] == size
+        ids.append(response.json()["id"])
+    assert submit(client, root, repo, ids).status_code == 200
+    assert upload(client, root, raw=b"a" * (MAX_FILE_BYTES + 1)).status_code == 400
+    # The encoded bound alone is insufficient: these lengths share a base64 size.
+    assert upload(client, root, raw=b"a" * (MAX_FILE_BYTES + 2)).status_code == 400
+    ids = [upload(client, root, raw=b"a" * size).json()["id"] for size in
+           [MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_TOTAL_BYTES - 2 * MAX_FILE_BYTES]]
+    assert upload(client, root, raw=b"a").status_code == 413
+    # Legacy/corrupt storage cannot bypass the outcome's independent total limit.
+    with session_scope() as s:
+        row = s.get(Artifact, ids[-1])
+        row.content = base64.b64encode(b"a" * (MAX_TOTAL_BYTES - 2 * MAX_FILE_BYTES + 1)).decode()
+    assert submit(client, root, repo, ids).status_code == 400
+
+
+def test_count_duplicate_and_invalid_ids_leave_no_outcome_or_events(client, attachment_api):
+    from aifactory.models import Event, Outcome
+
+    root, repo = attachment_api
+    ids = [upload(client, root).json()["id"] for _ in range(10)]
+    assert upload(client, root).status_code == 413
+    for bad in [ids + ["extra"], [ids[0], ids[0]], [ids[0], "missing"]]:
+        assert submit(client, root, repo, bad).status_code in (400, 404)
+        with session_scope() as s:
+            assert s.query(Outcome).count() == 0
+            assert s.query(Event).filter(Event.kind.in_(["outcome_created", "attachments_added"])).count() == 0
+            assert all(a.outcome_id is None for a in s.query(Artifact))
+    assert submit(client, root, repo, ids[:10]).status_code == 200
+    assert submit(client, root, repo, []).status_code == 200
+
+
+def test_expired_staging_and_cleanup_preserve_linked(client, attachment_api):
+    from datetime import timedelta
+    from aifactory.db import utcnow
+
+    root, repo = attachment_api
+    linked = upload(client, root).json()["id"]
+    assert submit(client, root, repo, [linked]).status_code == 200
+    expired = upload(client, root).json()["id"]
+    with session_scope() as s:
+        for aid in [linked, expired]:
+            s.get(Artifact, aid).created_at = utcnow() - timedelta(hours=25)
+    assert submit(client, root, repo, [expired]).status_code == 404
+    assert client.get(root + "/artifacts/" + expired).status_code == 404
+    assert upload(client, root).status_code == 200
+    with session_scope() as s:
+        assert s.get(Artifact, expired) is None
+        assert s.get(Artifact, linked) is not None
+    assert client.get(root + "/artifacts/" + linked).status_code == 200
+
+
+def test_concurrent_submissions_cannot_reuse_upload(client, attachment_api, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aifactory import attachments
+    from aifactory.models import Event, Outcome
+
+    root, repo = attachment_api
+    aid = upload(client, root).json()["id"]
+    barrier = Barrier(2)
+    original = attachments.validate_staged
+
+    def validate(*args):
+        result = original(*args)
+        barrier.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(attachments, "validate_staged", validate)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: submit(client, root, repo, [aid]), range(2)))
+    assert sorted(r.status_code for r in results) == [200, 409]
+    with session_scope() as s:
+        outcome = s.query(Outcome).one()
+        assert s.get(Artifact, aid).outcome_id == outcome.id
+        assert s.query(Event).filter_by(kind="outcome_created").count() == 1
+        assert s.query(Event).filter_by(kind="attachments_added").count() == 1
+
+
+def _riff(tag, data):
+    chunk = tag + len(data).to_bytes(4, "little") + data + (b"\0" if len(data) % 2 else b"")
+    return b"RIFF" + (len(chunk) + 4).to_bytes(4, "little") + b"WEBP" + chunk
+
+
+def _bomb_png():
+    import struct
+    import zlib
+
+    def chunk(tag, body):
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 100000, 100000, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\0" * 1024)) + chunk(b"IEND", b""))
+
+
+BAD_RASTERS = [
+    ("bomb.png", _bomb_png()),
+    ("bad.gif", bytes.fromhex("47494638396101000100800000000000ffffff2c0000000001000100000201ff003b")),
+    ("bad.webp", _riff(b"VP8L", b"\x2f\0\0\0\xe0")),
+    ("bad.webp", _riff(b"VP8L", b"\x2f\0\0\0\0")),
+    ("bad.webp", _riff(b"VP8L", b"\x2f\0\0\0\0\0\0\0")),
+    ("bad.webp", _riff(b"VP8 ", b"\x20\0\0\x9d\x01\x2a\x01\0\x01\0\0")),
+    ("bad.webp", _riff(b"VP8 ", b"\x20\0\0\x9d\x01\x2a\0\0\0\0\0")),
+    ("bad.webp", _riff(b"VP8X", b"\xc1" + b"\0" * 9)),
+    ("bad.webp", _riff(b"JUNK", b"arbitrary bytes")),
+    ("bad.webp", VALID_IMAGES["image/webp"] + b"trailing"),
+    ("bad.jpg", b"\xff\xd8\xff\xc0\x00\x08\x08\x00\x01\x00\x01\x00\xff\xd9"),
+]
+
+
+def _jpeg_without_quantization():
+    raw = VALID_IMAGES["image/jpeg"]
+    while b"\xff\xdb" in raw:
+        pos = raw.index(b"\xff\xdb")
+        size = int.from_bytes(raw[pos + 2:pos + 4], "big")
+        raw = raw[:pos] + raw[pos + 2 + size:]
+    return raw
+
+
+@pytest.mark.parametrize("name,raw", BAD_RASTERS + [("bad.jpg", _jpeg_without_quantization())])
+def test_verifier_malformed_rasters_are_rejected(client, attachment_api, name, raw):
+    root, _ = attachment_api
+    assert upload(client, root, name, raw).status_code == 400
+
+
+def test_screenshot_serialization_unchanged():
+    from aifactory.serializers import artifact as view
+
+    screenshot = Artifact(kind="runtime_qa_screenshot", name="screenshot.png", content=base64.b64encode(PNG).decode())
+    assert view(screenshot)["size"] == len(screenshot.content)
+    assert "content" not in view(screenshot)
+    assert view(screenshot, content=True)["content"] == screenshot.content
+
+
+def test_png_bomb_rejected_before_decompression(monkeypatch):
+    from aifactory.pipeline import image_validation
+
+    def forbidden():
+        pytest.fail("Oversized PNG must be rejected before decompression")
+
+    monkeypatch.setattr(image_validation.zlib, "decompressobj", forbidden)
+    with pytest.raises(ValueError):
+        image_validation.validate_image(_bomb_png(), "image/png")
+
+
+def test_failure_after_outcome_creation_rolls_back_claims_and_events(client, attachment_api, monkeypatch):
+    from aifactory import api
+    from aifactory.models import Event, Outcome
+
+    root, repo = attachment_api
+    aid = upload(client, root).json()["id"]
+    original = api.record
+
+    def fail(*args, **kwargs):
+        if args[1] == "attachments_added":
+            raise RuntimeError("transaction interrupted")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api, "record", fail)
+    with pytest.raises(RuntimeError, match="transaction interrupted"):
+        submit(client, root, repo, [aid])
+    with session_scope() as s:
+        assert s.get(Artifact, aid).outcome_id is None
+        assert s.query(Outcome).count() == 0
+        assert s.query(Event).filter(Event.kind.in_(["outcome_created", "attachments_added"])).count() == 0
+    monkeypatch.setattr(api, "record", original)
+    assert submit(client, root, repo, [aid]).status_code == 200
+
+
+@pytest.mark.parametrize("modification", ["reserved", "canvas", "start_code", "riff_size"])
+def test_webp_container_mutations(client, attachment_api, modification):
+    root, _ = attachment_api
+    raw = bytearray(VALID_IMAGES["image/webp"])
+    if modification == "reserved":
+        raw[20] |= 0x40
+    elif modification == "canvas":
+        raw[24:30] = b"\xff" * 6
+    elif modification == "start_code":
+        offset = raw.index(b"VP8 ") + 8
+        raw[offset + 3] = 0
+    else:
+        raw[4:8] = (len(raw) - 9).to_bytes(4, "little")
+    assert upload(client, root, "invalid.webp", raw).status_code == 400
+
+
+@pytest.mark.parametrize("size", [131074, 10 * 1024 * 1024])
+def test_csv_large_fields_use_advertised_file_limit(client, attachment_api, size):
+    root, _ = attachment_api
+    raw = b"a" * (size - 1) + b"\n"
+    response = upload(client, root, "large.csv", raw)
+    assert response.status_code == 200, response.text
+    assert response.json()["size"] == size
+    stored = client.get(root + "/artifacts/" + response.json()["id"]).json()
+    assert base64.b64decode(stored["content"]) == raw
+
+
+def test_staged_quota_delete_link_and_expiry_free_capacity(client, attachment_api):
+    from datetime import timedelta
+    from aifactory.db import utcnow
+
+    root, repo = attachment_api
+    ids = [upload(client, root).json()["id"] for _ in range(10)]
+    rejected = upload(client, root)
+    assert rejected.status_code == 413 and "quota" in rejected.json()["detail"]
+    assert client.delete(root + "/attachments/" + ids.pop()).status_code == 200
+    replacement = upload(client, root).json()["id"]
+    ids.append(replacement)
+    assert upload(client, root).status_code == 413
+    assert submit(client, root, repo, ids).status_code == 200
+    staged = [upload(client, root).json()["id"] for _ in range(10)]
+    with session_scope() as s:
+        s.get(Artifact, staged[0]).created_at = utcnow() - timedelta(hours=25)
+    assert upload(client, root).status_code == 200
+    with session_scope() as s:
+        assert s.get(Artifact, staged[0]) is None
+        assert all(s.get(Artifact, aid).outcome_id for aid in ids)
+
+
+@pytest.mark.parametrize("quota", ["count", "bytes"])
+def test_concurrent_uploads_cannot_exceed_staged_quota(client, attachment_api, monkeypatch, quota):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aifactory import attachments
+
+    root, _ = attachment_api
+    if quota == "count":
+        for _ in range(9):
+            assert upload(client, root).status_code == 200
+        raw = b"a"
+    else:
+        for _ in range(2):
+            assert upload(client, root, raw=b"a" * attachments.MAX_FILE_BYTES).status_code == 200
+        raw = b"a" * (5 * 1024 * 1024)
+    barrier = Barrier(2)
+    original = attachments.validate_upload
+
+    def validate(*args):
+        result = original(*args)
+        barrier.wait(timeout=30)
+        return result
+
+    monkeypatch.setattr(attachments, "validate_upload", validate)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: upload(client, root, raw=raw), range(2)))
+    assert sorted(r.status_code for r in responses) == [200, 413]
+    with session_scope() as s:
+        rows = s.query(Artifact).filter_by(kind="attachment", outcome_id=None).all()
+        assert len(rows) <= attachments.MAX_FILES
+        assert sum(len(base64.b64decode(row.content)) for row in rows) <= attachments.MAX_TOTAL_BYTES
