@@ -5,6 +5,7 @@ import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import { api, type Credential, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
+import { validMindBudget } from "../mind";
 import { ago } from "../format";
 import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
@@ -79,6 +80,9 @@ function Policies() {
   const admin = ws.role === "owner" || ws.role === "admin";
   const [nums, setNums] = useState({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd });
   useEffect(() => setNums({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd }), [s]);
+  const [mindBudget, setMindBudget] = useState(String(s.mind?.daily_budget_usd ?? 10));
+  const [mindSaving, setMindSaving] = useState(false);
+  useEffect(() => setMindBudget(String(s.mind?.daily_budget_usd ?? 10)), [ws.id, s.mind?.daily_budget_usd]);
   const autonomy = (key: keyof Settings["autonomy"], v: "auto" | "approval") => save({ autonomy: { ...s.autonomy, [key]: v } });
   return (
     <>
@@ -91,6 +95,20 @@ function Policies() {
           <Seg value={s.autonomy.merge} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin} /></div>
         <div className="s-line"><div className="l"><b>Releases</b><span>For repositories that deploy when main changes, require approval before merging.</span></div>
           <Seg value={s.autonomy.release} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("release", v)} disabled={!admin} /></div>
+      </section>
+      <section className="s-block">
+        <h2>Mind daily budget</h2>
+        <p>Resets at 00:00 UTC. Spending is per person across workspaces, not a separate allowance in each workspace. The lowest daily limit among your accessible workspaces applies conservatively; pending accounting can pause new messages. A zero limit stops new Mind spending.</p>
+        <form onSubmit={async (e) => {
+          e.preventDefault();
+          if (!admin || mindSaving || !validMindBudget(mindBudget)) return;
+          setMindSaving(true);
+          try { await save({ mind: { daily_budget_usd: Number(mindBudget) } }); }
+          finally { setMindSaving(false); }
+        }}>
+          <label className="field"><span>Mind daily budget (USD)</span><input className="input num" type="number" min={0} step="any" value={mindBudget} readOnly={!admin} disabled={mindSaving} aria-describedby="mind-budget-help" onChange={(e) => setMindBudget(e.target.value)} /><span className="hint" id="mind-budget-help">Default $10. Enter a finite, nonnegative amount. Only workspace admins and owners can change this limit.</span></label>
+          {admin && <button className="btn primary" disabled={mindSaving || !validMindBudget(mindBudget)}>{mindSaving ? "Saving…" : "Save Mind budget"}</button>}
+        </form>
       </section>
       <section className="s-block">
         <h2>Throughput and limits</h2>

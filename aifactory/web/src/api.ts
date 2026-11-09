@@ -6,7 +6,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T = any>(path: string, init: RequestInit & { json?: unknown } = {}): Promise<T> {
+export async function apiResponse(path: string, init: RequestInit & { json?: unknown } = {}): Promise<Response> {
   const { json, ...rest } = init;
   const res = await fetch(path, {
     credentials: "same-origin",
@@ -24,6 +24,11 @@ export async function api<T = any>(path: string, init: RequestInit & { json?: un
     }
     throw new ApiError(res.status, message || `Request failed (${res.status})`);
   }
+  return res;
+}
+
+export async function api<T = any>(path: string, init: RequestInit & { json?: unknown } = {}): Promise<T> {
+  const res = await apiResponse(path, init);
   if (res.status === 204) return undefined as T;
   return res.json();
 }
@@ -112,6 +117,7 @@ export interface Settings {
   limits: Record<string, number>;
   reasoning_effort?: string;
   linear?: LinearConfig;
+  mind?: { daily_budget_usd: number };
 }
 
 export interface ModelCheckResult {
@@ -431,4 +437,61 @@ export interface PullsResponse {
   notes?: string[];
   fetched_at: number;
   repositories?: string[];
+}
+
+// Mind wire projection. No SDK history, tool transcripts or credentials belong here.
+export interface MindContext {
+  workspace_id: string; kind: string; id: string; outcome_id?: string; label: string;
+}
+export interface MindCitation { label: string; url: string }
+export interface MindCard {
+  id: string; revision: number; kind: string; workspace_id: string; title: string;
+  fields: Record<string, string>;
+  status: "proposed" | "dismissed" | "confirmed" | "stale" | "executing";
+  effect?: string;
+  result?: { text: string; citations?: MindCitation[] };
+}
+export interface MindMessage {
+  id: string; role: "user" | "assistant"; content: string;
+  citations?: MindCitation[]; cards?: MindCard[];
+}
+export interface MindThread {
+  id: string; title: string; workspace_id: string;
+  cost_usd: number | null; cost_known: boolean;
+}
+export interface MindStatus {
+  model: string | null; available: boolean; reason?: string;
+  budget_state: "ok" | "budget_exceeded" | "pending_accounting";
+}
+export interface MindHistory { thread: MindThread; messages: MindMessage[]; status: MindStatus }
+export type MindEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "tool_start" | "tool_result"; name: string }
+  | { type: "action_card"; card: MindCard }
+  | { type: "status"; status: MindStatus }
+  | { type: "done"; message: MindMessage; thread: MindThread; status: MindStatus }
+  | { type: "error"; message: string; reason?: string };
+
+/** T1/T3 HTTP shapes; the dock uses a small presentation projection above. */
+export interface MindWireCitation { label: string; href: string }
+export interface MindWireCard {
+  id: string; revision: number; kind: string;
+  workspace: { id: string; name: string };
+  object: MindWireCitation; fields: Record<string, string>; effect: string;
+  status: "pending" | "dismissed" | "executing" | "succeeded" | "stale";
+  result?: { ok: boolean; reason?: string; [key: string]: unknown };
+}
+export interface MindWireThread {
+  id: string; title: string; billing_workspace_id: string; model_id: string | null;
+  status: string; cost: { usd: number | null; known: boolean };
+}
+export interface MindWireMessage {
+  id: string; role: "user" | "assistant"; text: string;
+  citations: MindWireCitation[]; action_cards: MindWireCard[]; status: string;
+}
+export interface MindWireHistory { thread: MindWireThread; messages: MindWireMessage[] }
+export interface MindWireStatus { status: "ready" | "unavailable"; model_id: string | null; reason?: string }
+export interface MindWireUsage {
+  thread_cost: { usd: number | null; known: boolean };
+  daily_spend: number | null; daily_limit: number;
 }
