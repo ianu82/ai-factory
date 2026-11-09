@@ -27,7 +27,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _fake_server(port: int, requests: list):
+def _fake_server(port: int, requests: list, web_enabled=False):
     import uvicorn
 
     app = FastAPI()
@@ -50,10 +50,18 @@ def _fake_server(port: int, requests: list):
         elif len(outputs) == 1:
             call = {"type": "function_call", "id": "fc_image", "call_id": "call_image", "name": "read_image",
                     "status": "completed", "arguments": json.dumps({"file_path": ".factory/screen.jpg"})}
+        elif web_enabled and len(outputs) == 2:
+            call = {"type": "function_call", "id": "fc_web", "call_id": "call_web", "name": "web_fetch",
+                    "status": "completed", "arguments": json.dumps({"url": f"http://127.0.0.1:{port}/page"})}
         else:
             call = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": "finish", "status": "completed",
                     "arguments": json.dumps({"status": "done", "summary": "Wrote hello.txt"})}
         return response([call], n)
+
+    @app.get("/page")
+    async def page():
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("Sandbox web integration fixture")
 
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
@@ -65,11 +73,13 @@ def _fake_server(port: int, requests: list):
     return server
 
 
-def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path, monkeypatch):
+@pytest.mark.parametrize("web_enabled", [False, True])
+def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path, monkeypatch, web_enabled):
     monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
     port = _free_port()
     requests: list = []
-    server = _fake_server(port, requests)
+    server = _fake_server(port, requests, web_enabled)
+    progress = []
     try:
         sb = LocalSandbox("anton", root=tmp_path).create()
         sb.work.mkdir()
@@ -84,7 +94,9 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
         ledger = UsageLedger(run_id="r", workspace_settings={})
         session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
                                  sandbox=sb, model="fake-model", client=ModelClient(provider), ledger=ledger,
-                                 report_schema=BUILDER_REPORT, writable=True, max_turns=10)
+                                 report_schema=BUILDER_REPORT, writable=True, max_turns=10,
+                                 tool_policy={"web": web_enabled},
+                                 on_progress=lambda *event: progress.append(event))
         result = asyncio.run(AntonHarness().run(session))
     finally:
         server.should_exit = True
@@ -93,7 +105,15 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     assert ledger.input_tokens >= 200 and ledger.calls >= 2
     tool_names = {t.get("name") for t in requests[0].get("tools", [])}
     assert {"write_file", "finish", "run", "read_image"} <= tool_names
-    assert not tool_names & {"scratchpad", "web_search", "web_fetch"}
+    assert "scratchpad" not in tool_names
+    if web_enabled:
+        assert {"web_search", "web_fetch"} <= tool_names
+        assert any(event[0] == "web_request" and event[2]["outcome"] == "success" for event in progress)
+        assert any("Sandbox web integration fixture" in json.dumps(body) for body in requests[3:])
+    else:
+        assert not tool_names & {"web_search", "web_fetch"}
+    # All advertised tools are function tools, never provider-native web tools.
+    assert all(tool.get("type") == "function" for body in requests for tool in body.get("tools", []))
 
     # The actual ChatSession dispatch must use the replacement and pass vision
     # content to the provider, not just advertise an otherwise unreachable tool.

@@ -48,6 +48,8 @@ class HarnessSession:
     # Stored originals: {name: filename, mime_type: detected media type, content: base64 bytes}.
     # Harnesses own provider-specific image delivery/fallback.
     image_inputs: list[dict[str, str]] = field(default_factory=list)
+    # Host-supplied, workspace-scoped opt-ins. Tools fail closed when absent.
+    tool_policy: dict[str, Any] = field(default_factory=dict)
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()
