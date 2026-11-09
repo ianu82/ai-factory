@@ -33,7 +33,8 @@ How to work:
 - Read the relevant code first; follow the repository's conventions, style and architecture.
 - Make focused changes. Do not reformat unrelated code or change CI/deployment configuration.
 - Add or update tests that prove the acceptance criteria when the repository has tests.
-- Run the relevant checks yourself (tests, type-check, lint, build) and fix failures you caused.
+- Run the relevant checks yourself (tests, type-check, lint, build) and fix failures you caused. If a failure
+  also happens without your change, it is pre-existing: leave unrelated tests alone and say so in your report.
   The project's configured checks will be run again after you finish, and an independent reviewer
   will verify every criterion, so be thorough.
 - If you receive review feedback or failing checks from a previous attempt, address each point.
@@ -57,6 +58,12 @@ How to work:
   (commands and their results, file:line references).
 - Also look for regressions, broken behaviour, security problems, missing tests, and changes
   outside the task's scope. Report them as findings with a severity.
+- Separate the change from its environment. When a test or command fails, check whether it fails the same way
+  without the change (for example in a clean checkout of {base} in a temporary directory). A failure that is
+  identical on the base commit is pre-existing: mention it as evidence, but do not fail a criterion or raise a
+  blocker or major finding for it. A criterion such as "the full test suite passes" is met when everything the
+  change could affect passes and the only failures are pre-existing ones. Opt-in test suites that are skipped by
+  default stay skipped; do not enable them.
 - verdict "pass" only if every criterion passes with evidence and there are no blocker findings.
 
 When done, call finish with your verdict."""

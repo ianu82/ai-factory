@@ -176,3 +176,12 @@ def test_mirror_fetches_and_job_clones_never_overlap(tmp_path, monkeypatch):
 
     asyncio.run(go())
     assert overlaps == []
+
+
+def test_verifiers_are_told_to_separate_pre_existing_failures_from_the_change():
+    from aifactory.prompts import BUILDER, verifier_system
+
+    prompt = verifier_system("abc1234")
+    assert "clean checkout of abc1234" in prompt and "pre-existing" in prompt
+    assert "do not fail a criterion" in prompt and "Opt-in test suites" in prompt
+    assert "pre-existing" in BUILDER
