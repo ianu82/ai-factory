@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
-import { api, type Credential, type Repo, type Settings, type Workspace } from "../api";
+import { api, type Credential, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { ago } from "../format";
@@ -33,7 +33,7 @@ export function SettingsPage() {
           </nav>
           <div>
             {section === "policies" && <Policies />}
-            {section === "models" && <Models />}
+            {section === "models" && <Models key={ws.id} />}
             {section === "credentials" && <Credentials />}
             {section === "linear" && <LinearSettings key={ws.id} />}
             {section === "repositories" && <Repositories />}
@@ -115,6 +115,34 @@ function Models() {
   const models = useQuery({ queryKey: ["models", ws.id], queryFn: () => api<{ provider: string | null; label?: string; models: string[]; error?: string }>(`/api/workspaces/${ws.id}/models`) });
   const [m, setM] = useState(s.models);
   useEffect(() => setM(s.models), [s.models]);
+  const fingerprint = JSON.stringify([ws.id, s.provider, s.models]);
+  const dirty = JSON.stringify(m) !== JSON.stringify(s.models);
+  const generation = useRef(0);
+  const [check, setCheck] = useState<{ fingerprint: string; result: ModelCheckResult }>();
+  const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState("");
+  const invalidateCheck = () => {
+    generation.current += 1;
+    setCheck(undefined);
+    setChecking(false);
+    setCheckError("");
+  };
+  useEffect(() => { invalidateCheck(); }, [fingerprint]);
+  const checkModels = async () => {
+    const request = ++generation.current;
+    setChecking(true);
+    setCheck(undefined);
+    setCheckError("");
+    try {
+      const result = await api<ModelCheckResult>(`/api/workspaces/${ws.id}/models/check`, { method: "POST" });
+      if (request === generation.current) setCheck({ fingerprint, result });
+    } catch (err) {
+      if (request === generation.current) setCheckError((err as Error).message);
+    } finally {
+      if (request === generation.current) setChecking(false);
+    }
+  };
+  const currentCheck = !dirty && check?.fingerprint === fingerprint ? check.result : undefined;
   const options = useMemo(() => Array.from(new Set([...(models.data?.models || []), m.default || "", m.planner || "", m.builder || "", m.verifier || ""].filter(Boolean))), [models.data, m]);
   const harness = (role: keyof Settings["harness"], value: string) => save({ harness: { ...s.harness, [role]: value } });
   return (
@@ -127,16 +155,26 @@ function Models() {
           {(["default", "planner", "builder", "verifier"] as const).map((role) => (
             <label key={role} className="field">
               <span>{role === "default" ? "Default model" : `${role[0].toUpperCase()}${role.slice(1)}`}</span>
-              <select className="select" value={m[role] || ""} disabled={!admin} onChange={(e) => setM({ ...m, [role]: e.target.value || undefined })}>
+              <select className="select" value={m[role] || ""} disabled={!admin} onChange={(e) => { invalidateCheck(); setM({ ...m, [role]: e.target.value || undefined }); }}>
                 {role !== "default" && <option value="">Use default</option>}
                 {options.map((o) => <option key={o} value={o}>{o}</option>)}
               </select>
+              {role !== "default" && <span className="hint" role="status">
+                <Dot tone={currentCheck?.roles[role].status === "supported" ? "good" : currentCheck?.roles[role].status === "unsupported" ? "bad" : currentCheck ? "warn" : "idle"} />{" "}
+                {checking && !dirty ? "Checking image input…" : currentCheck ? <>
+                  {currentCheck.roles[role].model} · Images: {currentCheck.roles[role].status === "unknown" ? "unknown (check failed)" : currentCheck.roles[role].status}
+                  <br />{currentCheck.roles[role].explanation}
+                </> : dirty ? "Images: not checked — save models first" : "Images: not checked"}
+              </span>}
             </label>
           ))}
         </div>
+        <p>Checks send one tiny image per distinct saved model and may incur a small provider charge.</p>
+        {checkError && <div className="err" role="alert">{checkError}</div>}
         {admin && <div style={{ marginTop: 14, display: "flex", gap: 8 }}>
-          <button className="btn primary" onClick={() => save({ models: m })}>Save models</button>
-          <Seg value={s.provider} options={[["mindshub", "MindsHub Inference"], ["openai", "OpenAI"]]} onChange={(v) => save({ provider: v })} />
+          <button className="btn primary" onClick={() => { invalidateCheck(); void save({ models: m }); }}>Save models</button>
+          <button className="btn" disabled={checking || dirty} onClick={checkModels}>{checking ? "Checking…" : "Check models"}</button>
+          <Seg value={s.provider} options={[["mindshub", "MindsHub Inference"], ["openai", "OpenAI"]]} onChange={(v) => { invalidateCheck(); void save({ provider: v }); }} />
         </div>}
       </section>
       <section className="s-block">

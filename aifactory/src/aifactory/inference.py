@@ -255,11 +255,12 @@ class ModelClient:
     """OpenAI-compatible model client (Chat Completions or Responses) with bounded, honest retries."""
 
     def __init__(self, provider: ProviderConfig, *, timeout: float = 300.0, max_retries: int = 4,
-                 session_id: str | None = None, wire: str | None = None):
+                 session_id: str | None = None, wire: str | None = None, log_errors: bool = True):
         self.provider = provider
         self.timeout = timeout
         self.max_retries = max_retries
         self.session_id = session_id
+        self.log_errors = log_errors
         # The Responses API is the common denominator: OpenAI's newest models only support function tools
         # with reasoning there, and MindsHub serves it for every model family (Anton and Codex use it too).
         self.wire = wire or "responses"
@@ -337,7 +338,13 @@ class ModelClient:
                 if response.status_code in (401, 403):
                     raise InferenceError(f"{self.provider.label} refused the credential ({response.status_code}): {detail}", status=response.status_code)
                 if response.status_code in (400, 404, 422):
-                    log.warning("%s %s rejected (%s): %s", self.provider.label, path, response.status_code, detail[:400])
+                    last = InferenceError(
+                        f"{self.provider.label} rejected the request ({response.status_code}): {detail}",
+                        status=response.status_code)
+                    if self.log_errors:
+                        log.warning("%s %s rejected (%s): %s", self.provider.label, path, response.status_code, detail[:400])
+                    if attempt == self.max_retries:
+                        raise last
                     if "max_completion_tokens" in detail and "max_completion_tokens" in body:
                         body = {**body, "max_tokens": body.pop("max_completion_tokens")}
                         continue

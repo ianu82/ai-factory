@@ -179,3 +179,237 @@ def test_ci_checks_fall_back_to_actions_when_checks_api_is_forbidden(monkeypatch
     monkeypatch.setattr(GitHub, "request", fake_request)
     summary = asyncio.run(GitHub("t").checks("o/r", "abc"))
     assert summary.state == "pending" and [c["name"] for c in summary.checks] == ["validate", "sandbox"]
+
+
+def _mock_image_provider(monkeypatch, handler):
+    from aifactory import model_checks
+
+    monkeypatch.setattr(model_checks, "resolve_provider", lambda _: ProviderConfig(
+        "mindshub", "https://provider.test/v1", "mdb_secret-never-expose", "MindsHub"))
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(handler), **kw))
+
+
+def test_model_check_sends_valid_png_and_deduplicates_inherited_roles(client, signed_in, monkeypatch):
+    import base64
+    import struct
+    import zlib
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"models": {
+        "default": "default-model", "builder": "other-model"}}})
+    seen = []
+
+    def upstream(request):
+        assert request.url.path == "/v1/responses"
+        body = json.loads(request.content)
+        seen.append(body["model"])
+        assert body["max_output_tokens"] == 32 and not body["store"]
+        image = body["input"][0]["content"][1]
+        assert image["type"] == "input_image"
+        prefix, encoded = image["image_url"].split(",")
+        assert prefix == "data:image/png;base64"
+        png = base64.b64decode(encoded, validate=True)
+        assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) < 100
+        offset = 8
+        chunks = {}
+        while offset < len(png):
+            size = struct.unpack("!I", png[offset:offset + 4])[0]
+            kind = png[offset + 4:offset + 8]
+            data = png[offset + 8:offset + 8 + size]
+            assert zlib.crc32(kind + data) == struct.unpack("!I", png[offset + 8 + size:offset + 12 + size])[0]
+            chunks[kind] = data
+            offset += 12 + size
+        assert struct.unpack("!2I5B", chunks[b"IHDR"]) == (1, 1, 8, 2, 0, 0, 0)
+        assert zlib.decompress(chunks[b"IDAT"]) == b"\0\0\0\0"
+        assert chunks[b"IEND"] == b""
+        return httpx.Response(200, json={"output": []})
+
+    _mock_image_provider(monkeypatch, upstream)
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200, r.text
+    assert sorted(seen) == ["default-model", "other-model"]
+    roles = r.json()["roles"]
+    assert roles["planner"]["model"] == roles["verifier"]["model"] == "default-model"
+    assert roles["builder"]["model"] == "other-model"
+    assert {role["status"] for role in roles.values()} == {"supported"}
+
+
+@pytest.mark.parametrize(("status", "message", "expected"), [
+    (400, "This model does not support image input", "unsupported"),
+    (400, "This model does not support images", "unsupported"),
+    (422, "Vision is not supported", "unsupported"),
+    (400, "This model does not support image input; use a supported image format", "unsupported"),
+    (400, "This model does not support image_url; use a supported image format", "unsupported"),
+    (400, "This model does not support image input format TIFF", "unknown"),
+    (400, "This model does not support image input encoding base64", "unknown"),
+    (400, "This model does not support image input MIME type image/tiff", "unknown"),
+    (400, "This model does not support image input size: too large", "unknown"),
+    (400, "Unsupported image format", "unknown"),
+    (400, "TIFF images are not supported", "unknown"),
+    (400, "Base64 image input is not supported", "unknown"),
+    (400, "Data URL images are not supported", "unknown"),
+    (400, "Data URI images are not supported", "unknown"),
+    (400, "data URIs are not allowed", "unknown"),
+    (400, "data URLs are not allowed", "unknown"),
+    (400, "Inline images are not supported", "unknown"),
+    (400, "Inline image input is not supported", "unknown"),
+    (400, "Base64 images are not supported", "unknown"),
+    (400, "Data-URL images are not supported", "unknown"),
+    (400, "Provision is not supported", "unknown"),
+    (400, "This model does not support image input. Please do not include images.", "unsupported"),
+    (401, "This model does not support image input", "unknown"),
+    (403, "Invalid credential", "unknown"),
+    (404, "Model unavailable", "unknown"),
+    (429, "Rate limited", "unknown"),
+    (500, "Provider error", "unknown"),
+])
+def test_model_check_classifies_provider_errors_safely(client, signed_in, monkeypatch, caplog,
+                                                       status, message, expected):
+    seen = []
+
+    def upstream(request):
+        seen.append(request)
+        return httpx.Response(status, json={"error": {"message": message + "; mdb_secret-never-expose"}})
+
+    _mock_image_provider(monkeypatch, upstream)
+    ws_id = signed_in["workspaces"][0]["id"]
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200
+    assert {role["status"] for role in r.json()["roles"].values()} == {expected}
+    assert len(seen) == 1  # no retries, including include-removal, or text-only fallback
+    assert "mdb_secret-never-expose" not in r.text + caplog.text
+    assert message not in r.text
+
+
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.ConnectError])
+def test_model_check_transport_failures_are_unknown(client, signed_in, monkeypatch, error):
+    def upstream(request):
+        raise error("private provider detail mdb_secret-never-expose", request=request)
+
+    _mock_image_provider(monkeypatch, upstream)
+    ws_id = signed_in["workspaces"][0]["id"]
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert {role["status"] for role in r.json()["roles"].values()} == {"unknown"}
+    assert "private" not in r.text and "mdb_secret" not in r.text
+
+
+def test_model_check_missing_credentials_and_builtin_default(client, signed_in, monkeypatch):
+    def no_network(*args, **kwargs):
+        raise AssertionError("No request should be made without credentials")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_network)
+    ws_id = signed_in["workspaces"][0]["id"]
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200
+    assert r.json()["provider"] is None
+    assert {role["model"] for role in r.json()["roles"].values()} == {"gpt-terra"}
+    assert {role["status"] for role in r.json()["roles"].values()} == {"unknown"}
+
+
+def test_model_check_bootstrap_override_matches_runtime(client, signed_in, monkeypatch):
+    from aifactory.config import reset_settings_cache
+
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP_OPENAI_API_KEY", "sk-bootstrap-secret")
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP_OPENAI_MODEL", "bootstrap-model")
+    reset_settings_cache()
+    ws_id = signed_in["workspaces"][0]["id"]
+    client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"models": {
+        "planner": "a", "builder": "b", "verifier": "c"}}})
+    seen = []
+
+    def upstream(request):
+        seen.append(json.loads(request.content)["model"])
+        assert request.headers["authorization"] == "Bearer sk-bootstrap-secret"
+        return httpx.Response(200, json={"output": []})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(upstream), **kw))
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200 and r.json()["provider"] == "openai"
+    assert seen == ["bootstrap-model"]
+    assert {role["model"] for role in r.json()["roles"].values()} == {"bootstrap-model"}
+
+
+def test_model_client_exhausted_include_retry_preserves_provider_error(monkeypatch):
+    from aifactory.inference import InferenceError, ModelClient
+
+    message = "This model does not support image input. Please do not include images."
+
+    def upstream(request):
+        return httpx.Response(400, json={"error": {"message": message}})
+
+    _mock_image_provider(monkeypatch, upstream)
+    client = ModelClient(ProviderConfig("openai", "https://provider.test/v1", "key", "OpenAI"), max_retries=0)
+    with pytest.raises(InferenceError, match=message) as error:
+        asyncio.run(client._post("/responses", {"include": ["reasoning.encrypted_content"]}))
+    assert error.value.status == 400
+
+
+def test_model_catalog_never_probes_selected_models(client, signed_in, monkeypatch):
+    from aifactory import model_checks
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("GET must not send paid image probes")
+
+    async def catalog(self):
+        return ["catalog-model"]
+
+    monkeypatch.setattr(model_checks.ModelClient, "_post", forbidden)
+    monkeypatch.setattr(api_module.ModelClient, "list_models", catalog)
+    monkeypatch.setattr(api_module, "resolve_provider", lambda _: ProviderConfig(
+        "openai", "https://provider.test/v1", "key", "OpenAI"))
+    ws_id = signed_in["workspaces"][0]["id"]
+    r = client.get(f"/api/workspaces/{ws_id}/models")
+    assert r.status_code == 200 and r.json()["models"] == ["catalog-model"]
+
+
+def test_model_checks_report_distinct_results_independently(client, signed_in, monkeypatch):
+    ws_id = signed_in["workspaces"][0]["id"]
+    client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"models": {
+        "planner": "accepts", "builder": "rejects", "verifier": "unavailable"}}})
+    seen = []
+
+    def upstream(request):
+        model = json.loads(request.content)["model"]
+        seen.append(model)
+        if model == "accepts":
+            return httpx.Response(200, json={"output": []})
+        return httpx.Response(400 if model == "rejects" else 503,
+                              json={"error": {"message": "This model does not support images"}})
+
+    _mock_image_provider(monkeypatch, upstream)
+    roles = client.post(f"/api/workspaces/{ws_id}/models/check").json()["roles"]
+    assert len(seen) == 3
+    assert [roles[role]["status"] for role in ("planner", "builder", "verifier")] == [
+        "supported", "unsupported", "unknown"]
+
+
+def test_model_check_overall_timeout_is_bounded(client, signed_in, monkeypatch):
+    from aifactory import model_checks
+
+    async def blocked(self, path, body):
+        assert self.timeout == 0.01 and self.max_retries == 0
+        assert self.log_errors is False
+        await asyncio.sleep(60)
+
+    _mock_image_provider(monkeypatch, lambda request: pytest.fail("No real network"))
+    monkeypatch.setattr(model_checks, "CHECK_TIMEOUT", 0.01)
+    monkeypatch.setattr(model_checks.ModelClient, "_post", blocked)
+    ws_id = signed_in["workspaces"][0]["id"]
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200
+    assert {role["status"] for role in r.json()["roles"].values()} == {"unknown"}
+
+
+def test_workspace_admin_can_explicitly_check_models(client, signed_in, monkeypatch):
+    from aifactory.models import Membership
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        s.query(Membership).filter(Membership.workspace_id == ws_id).one().role = "admin"
+    _mock_image_provider(monkeypatch, lambda request: httpx.Response(200, json={"output": []}))
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200
+    assert {role["status"] for role in r.json()["roles"].values()} == {"supported"}
