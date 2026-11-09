@@ -688,6 +688,30 @@ def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(fact
         assert any("Required runtime QA failed: the app did not start" in f["description"] for f in verdict["findings"])
 
 
+def test_a_runtime_qa_failure_is_recorded_even_when_the_verifier_already_failed(factory):
+    def bare_failing_verifier(messages):  # fails with all criteria passing and no findings
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "true"})]}
+        return {"content": "", "tool_calls": [call("finish", {
+            "verdict": "fail", "summary": "Not convinced.",
+            "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "ok"}], "findings": []})]}
+
+    ScriptedModel.scripts["verifier"] = bare_failing_verifier
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "qa": {"start": "exec sleep 30", "ready_path": "/", "ready_timeout": 2,
+                                             "pages": [], "required": True}}
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"), timeout=120)
+    task_id, results, title, _ = _attempts_and_block(outcome_id)
+    assert results == ["verification_failed", "verification_failed"] and "automatic retry" in title
+    with session_scope() as s:
+        verdict = s.get(Task, task_id).evidence["attempts"][0]["verdict"]
+        assert verdict["summary"] == "Not convinced." and verdict["findings"][-1]["location"] == "runtime QA"
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:
