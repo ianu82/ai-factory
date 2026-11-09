@@ -232,17 +232,20 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
 
 
 def _operator_user(db, delegated_by: str):
-    """The system identity that operator actions are recorded under, naming who delegated them."""
+    """The system identity operator actions are recorded under: one per delegator, never renamed, so what was
+    delegated earlier keeps naming who delegated it. (Records before this used one shared identity, which
+    keeps the name it last had.)"""
+    import hashlib
+
     from .models import User
 
-    name = f"Operator (delegated by {delegated_by})" if delegated_by else "Operator"
-    operator = db.query(User).filter(User.is_system.is_(True), User.email == "operator@factory.local").first()
+    key = hashlib.sha256(delegated_by.strip().lower().encode()).hexdigest()[:12] if delegated_by else "self"
+    email = f"operator+{key}@factory.local"
+    operator = db.query(User).filter(User.is_system.is_(True), User.email == email).first()
     if operator is None:
-        operator = User(email="operator@factory.local", name=name, is_system=True)
+        name = f"Operator (delegated by {delegated_by})" if delegated_by else "Operator"
+        operator = User(email=email, name=name, is_system=True)
         db.add(operator)
-        db.commit()
-    elif operator.name != name:
-        operator.name = name
         db.commit()
     return operator
 
@@ -268,8 +271,8 @@ def _guidance_delegated(workspace_id: str, items: list[dict], delegated_by: str)
                                                Outcome.number == int(item.get("outcome", 0))).first()
             if outcome is None or not body or not nonce:
                 continue
-            if any((e.data or {}).get("nonce") == nonce for e in db.query(Event).filter(
-                    Event.outcome_id == outcome.id, Event.kind == "guidance")):
+            if any((e.data or {}).get("nonce") == nonce for e in db.query(Event).filter(  # once per workspace
+                    Event.workspace_id == workspace_id, Event.kind == "guidance")):
                 continue
             task_id = None
             if item.get("task"):
@@ -277,11 +280,13 @@ def _guidance_delegated(workspace_id: str, items: list[dict], delegated_by: str)
                 if task is None:
                     continue
                 task_id = task.id
+            # The message and its nonce-bearing event commit together, so a crash can never post it twice.
             db.add(Message(workspace_id=workspace_id, outcome_id=outcome.id, task_id=task_id, author_id=operator.id,
                            author_kind="user", body=body))
-            db.commit()
             record(workspace_id, "guidance", f"{operator.name}: {body[:200]}", outcome_id=outcome.id, task_id=task_id,
-                   actor="operator", data={"intervention": True, "nonce": nonce, "delegated_by": delegated_by})
+                   actor="operator", data={"intervention": True, "nonce": nonce, "delegated_by": delegated_by},
+                   session=db)
+            db.commit()
     finally:
         db.close()
 

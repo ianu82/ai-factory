@@ -393,3 +393,18 @@ def test_bootstrap_guidance_reaches_tasks_once_and_is_attributed_to_the_operator
     assert guidance_history(outcome_id, t1) == ["Answer question-only comments in the thread."]
     assert guidance_history(outcome_id, t2) == ["Answer question-only comments in the thread.",
                                                 "Ignore commenters without write access."]
+
+    # A nonce reused for another outcome never posts again, and a later delegator gets their own identity:
+    # earlier guidance keeps naming who delegated it.
+    with session_scope() as s:
+        o2 = Outcome(workspace_id=ws_id, number=6, title="Other", repo_ids=[], status="running")
+        s.add(o2)
+        s.flush()
+        other_id = o2.id
+    boot({**base, "delegated_by": "ceo@example.com",
+          "guidance": [{"outcome": 6, "body": "Reused nonce.", "nonce": "g1"},
+                       {"outcome": 6, "body": "New guidance.", "nonce": "g5"}]})
+    with session_scope() as s:
+        assert [m.body for m in s.query(Message).filter(Message.outcome_id == other_id)] == ["New guidance."]
+        names = {s.get(User, m.author_id).name for m in s.query(Message).filter(Message.workspace_id == ws_id)}
+        assert names == {"Operator (delegated by ian@example.com)", "Operator (delegated by ceo@example.com)"}
