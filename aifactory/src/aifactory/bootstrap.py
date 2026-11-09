@@ -115,12 +115,13 @@ def apply_bootstrap() -> str | None:
 
 def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
     """Operator cancellation of outcomes: a declared key (e.g. an accidental duplicate), or "#N" for outcome
-    number N from any source (e.g. an intake outcome replaced by a re-scoped one). "#N" never stops work in
-    flight: an outcome with a running task is left alone and logged."""
+    number N from any source (e.g. an intake outcome replaced by a re-scoped one). "#N" applies only while no
+    task has ever started (no attempt, stage, start or PR; an interrupted task is persisted as queued with
+    those markers), so it never stops or strands work in flight; otherwise it is skipped and logged."""
     if not keys:
         return
     from .events import record
-    from .models import Outcome, Task
+    from .models import Decision, Outcome, Task
 
     with session_scope() as s:
         for key in keys:
@@ -131,12 +132,18 @@ def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
                        else query.filter(Outcome.signal_id == f"operator:{key}")).first()
             if outcome is None or outcome.status in ("completed", "cancelled", "partially_completed"):
                 continue
-            if by_number and s.query(Task).filter(Task.outcome_id == outcome.id, Task.status == "running").first():
-                log.error("Not cancelling #%s: it has a running task", outcome.number)
+            tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
+            started = [t.key for t in tasks if t.status not in ("pending", "queued", "cancelled")
+                       or t.attempt or t.stage or t.started_at is not None or t.pr_number]
+            if by_number and started:
+                log.error("Not cancelling #%s: work has started on %s", outcome.number, ", ".join(started))
                 continue
             outcome.status = "cancelled"
-            for t in s.query(Task).filter(Task.outcome_id == outcome.id, Task.status != "completed"):
-                t.status = "cancelled"
+            for t in tasks:
+                if t.status != "completed":
+                    t.status = "cancelled"
+            for d in s.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open"):
+                d.status = "superseded"  # as the app's own cancel does: a stale answer must not restart work
             how = "" if by_number else f" (declared key {key})"
             record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number}{how}",
                    outcome_id=outcome.id, actor="operator", level="warn", session=s)

@@ -282,7 +282,7 @@ def test_delegated_resolve_can_target_one_task_of_an_outcome(monkeypatch):
 
 
 def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkeypatch):
-    from aifactory.models import Plan, Task
+    from aifactory.models import Decision, Plan, Task
 
     def boot(config):
         monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
@@ -302,7 +302,7 @@ def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkey
         s.add(repo)
         s.flush()
         ids = {}
-        for number, status in ((7, "queued"), (8, "running")):
+        for number, status in ((7, "queued"), (8, "running"), (9, "interrupted")):
             o = Outcome(workspace_id=ws_id, number=number, title=f"Intake {number}", repo_ids=[repo.id],
                         status="running", source="signal")
             s.add(o)
@@ -310,22 +310,31 @@ def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkey
             plan = Plan(outcome_id=o.id, status="approved", content={})
             s.add(plan)
             s.flush()
-            s.add_all([Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T1", title="First",
-                            repo_id=repo.id, status=status),
+            # An interrupted task is persisted as queued but keeps its resumption markers.
+            first = Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T1", title="First",
+                         repo_id=repo.id, status="queued" if status == "interrupted" else status)
+            if status == "interrupted":
+                first.stage, first.attempt = "verify", 1
+            s.add_all([first,
                        Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T2", title="Second",
                             repo_id=repo.id, status="pending", depends_on=["T1"])])
             ids[number] = o.id
+        s.add(Decision(workspace_id=ws_id, outcome_id=ids[7], kind="question", title="Planner question", body=""))
 
-    boot({**base, "cancel": ["#7", "#8", "#99"],
+    boot({**base, "cancel": ["#7", "#8", "#9", "#99"],
           "outcomes": [{"key": "mind-v1", "title": "Mind v1", "brief": "Thin slice.", "priority": 0,
                         "repositories": ["acme/app"]},
                        {"key": "other", "title": "Other", "priority": 9, "repositories": ["acme/app"]}]})
     with session_scope() as s:
-        idle, busy = s.get(Outcome, ids[7]), s.get(Outcome, ids[8])
+        idle = s.get(Outcome, ids[7])
         assert idle.status == "cancelled"
         assert {t.status for t in s.query(Task).filter(Task.outcome_id == idle.id)} == {"cancelled"}
-        assert busy.status == "running"  # work in flight is never stopped by a number cancel
-        assert {t.key: t.status for t in s.query(Task).filter(Task.outcome_id == busy.id)} == {
-            "T1": "running", "T2": "pending"}
+        assert [d.status for d in s.query(Decision).filter(Decision.outcome_id == idle.id)] == ["superseded"]
+        # Work in flight (running, or interrupted by a restart and queued to resume) is never stopped.
+        for number, first in ((8, "running"), (9, "queued")):
+            busy = s.get(Outcome, ids[number])
+            assert busy.status == "running"
+            assert {t.key: t.status for t in s.query(Task).filter(Task.outcome_id == busy.id)} == {
+                "T1": first, "T2": "pending"}
         declared = {o.title: o.priority for o in s.query(Outcome).filter(Outcome.source == "operator")}
         assert declared == {"Mind v1": 0, "Other": 2}
