@@ -1,0 +1,213 @@
+# AI Factory v1 controller
+
+This is the original v1 controller (`src/auto_mindsdb_factory`). It is paused and kept for reference; the live product is v2 in [`aifactory/`](../aifactory/README.md). Paths below are relative to the repository root.
+
+AI Factory v1 implements scoped software tasks, independently verifies the resulting
+commit, and can publish and merge small changes under a trusted product profile.
+
+## Product delivery
+
+The short product workflow uses a target repository without factory schemas or
+policy files. Controller-owned profiles define pinned execution, required checks,
+per-role models, permitted paths and budgets. Implementation runs in a disposable
+container; verification gets a fresh read-only checkout and executable acceptance
+criteria. Automatic promotion requires current evidence, the tested base, GitHub
+merge confirmation and fresh post-merge smoke checks.
+
+- [Product workflow, commands and supported boundaries](product-delivery-plan.md)
+- [Opt-in Linear product delivery](linear-product-delivery.md)
+- [Verified end-to-end milestone](product-delivery-milestone.md)
+- [Architecture and staged-runtime compatibility](ai-factory-architecture.md)
+
+Frozen replays retain every repetition and score. Outcome metrics include failed
+delivery attempts in accepted-work cost. Repeated failures can generate bounded
+investigation proposals; proposals do not adopt or execute themselves.
+
+## Start Here
+
+- Strategy and operating model: `docs/software-factory-plan.md`
+- Control plane and MVP execution spec: `docs/factory-control-plane-spec.md`
+- Current architecture diagram: `docs/ai-factory-architecture.md`
+- Lightsail production runbook: `docs/lightsail-production-runbook.md`
+- Lane and eval policies: `factory/policies/`
+- Machine handoff schemas: `schemas/`
+
+## Staged workflow
+
+The first implementation target now includes executable Stage 1 through Stage 9 behavior for the `spec -> tickets -> PR -> integration -> eval -> security -> staging -> monitoring -> feedback` lane:
+
+1. Detect a relevant upstream change.
+2. Normalize Anthropic release notes into source items.
+3. Produce a deterministic Stage 1 spec packet.
+4. Assign a risk lane and policy decision.
+5. Generate scoped 1-2 day tickets plus a tiered eval manifest.
+6. Draft and review a structured PR packet up to `PR_REVIEWABLE`.
+7. Generate versioned prompt, tool, golden-dataset, and latency-baseline artifacts for model-touching work.
+8. Execute merge-gating eval tiers, emit an eval report, and finalize the PR packet up to `PR_MERGEABLE` or `PR_REVISION`.
+9. Run security threat analysis and sign-off, then advance to `SECURITY_APPROVED`, `SECURITY_REVIEWING`, or `PR_REVISION`.
+10. Run a merge orchestration pass that can auto-merge low-risk lanes, pause in `MERGE_REVIEWING` for human merge approval, or return to `PR_REVISION`.
+11. Run a staging-soak and promotion-decision pass, then advance to `PRODUCTION_MONITORING`, `STAGING_SOAK`, or `PR_REVISION`.
+12. Run production monitoring and incident handling, then emit healthy, auto-mitigated, or human-escalated monitoring records while the work item stays in `PRODUCTION_MONITORING`.
+13. Synthesize production learnings into a Stage 9 `feedback-report`, incident learning packets, and backlog candidates while keeping the work item in `PRODUCTION_MONITORING`.
+14. Persist Stage 1 through Stage 9 bundles plus merge bundles into a run store and execute recurring Stage 1 poll cycles plus weekly Stage 9 feedback cycles from that store.
+15. Advance persisted active-build runs through autonomous Stages 2 through 8 plus merge orchestration in one progression cycle, stopping only at real review or release gates.
+16. Trigger immediate per-work-item handoff from Stage 1 intake or manual bundle registration so new active-build runs can advance without waiting for the next scheduled progression pass.
+17. Trigger immediate Stage 9 incident follow-up synthesis when a Stage 8 monitoring result reports a live or still-open production incident instead of waiting for the weekly rollup.
+18. Protect recurring automation with renewable per-run leases so concurrent workers skip locked runs instead of double-advancing the same work item, even during longer stage executions.
+19. Protect `automation-state.json` with a state lease plus compare-and-swap checks so concurrent Stage 1 or weekly cycles do not clobber each other’s dedupe state.
+20. Run a unified supervisor cycle that can execute Stage 1 intake, progression, and optional weekly feedback in one safe control-plane pass.
+21. Run a first real vertical slice that keeps the deterministic stage contracts but creates real GitHub branch/PR evidence, gates Stage 5 on local eval commands, and drives Stage 7 through Stage 9 from file-backed ops signals.
+
+The recurring staged workflow uses a persisted run store. Its Linear worker stops
+at PR-ready: real code-worker branch/PR creation, command-backed local gates and
+Linear stage sync. The separate product workflow above supports automatic merge
+through an explicit profile. Staging, monitoring, rollback and feedback remain
+simulation-only until real deployment and observability integrations are connected.
+
+## Useful Commands
+
+- `uv run python scripts/validate_contracts.py`
+- `uv run pytest`
+- `uv run auto-mindsdb-factory scout-anthropic --html-file fixtures/intake/anthropic-release-notes-sample.html --limit 3`
+- `uv run auto-mindsdb-factory stage1-intake --html-file fixtures/intake/anthropic-release-notes-sample.html --entry-index 0`
+- `uv run auto-mindsdb-factory stage1-intake-manual --provider github --external-id github-issue-2 --title "Factory cockpit should surface GitHub check conclusions and eval status" --body "Update the factory cockpit JSON schema and dashboard output to include pull request check conclusions, local eval status, and a clear health summary for each run." --url https://github.com/ianu82/ai-factory/issues/2`
+- `uv run auto-mindsdb-factory stage2-ticketing --stage1-result-file stage1-result.json`
+- `uv run auto-mindsdb-factory stage3-build-review --stage2-result-file stage2-result.json`
+- `uv run auto-mindsdb-factory stage4-integration --stage3-result-file stage3-result.json`
+- `uv run auto-mindsdb-factory stage5-eval --stage4-result-file stage4-result.json`
+- `uv run auto-mindsdb-factory stage6-security-review --stage5-result-file stage5-result.json`
+- `uv run auto-mindsdb-factory stage-merge --stage6-result-file stage6-result.json`
+- `uv run auto-mindsdb-factory stage7-release-staging --merge-result-file merge-result.json`
+- `uv run auto-mindsdb-factory stage8-production-monitoring --stage7-result-file stage7-result.json`
+- `uv run auto-mindsdb-factory stage9-feedback-synthesis --stage8-result-file stage8-result.json`
+- `uv run auto-mindsdb-factory automation-register-bundle --stage stage1 --result-file stage1-result.json --store-dir .factory-automation --advance-immediately`
+- `uv run auto-mindsdb-factory automation-register-bundle --stage merge --result-file merge-result.json --store-dir .factory-automation --advance-immediately`
+- `uv run auto-mindsdb-factory automation-stage1-cycle --store-dir .factory-automation --html-file fixtures/intake/anthropic-release-notes-sample.html --advance-immediately`
+- `uv run auto-mindsdb-factory linear-webhook-server --store-dir .factory-automation --host 0.0.0.0 --port 8080`
+- `uv run auto-mindsdb-factory automation-linear-trigger-cycle --store-dir .factory-automation --repository ianu82/ai-factory`
+- `uv run auto-mindsdb-factory automation-advance-runs --store-dir .factory-automation`
+- `uv run auto-mindsdb-factory factory-doctor --store-dir .factory-automation --repository ianu82/ai-factory`
+- `uv run auto-mindsdb-factory factory-worker --store-dir .factory-automation --repository ianu82/ai-factory --once`
+- `uv run auto-mindsdb-factory automation-weekly-feedback --store-dir .factory-automation --window-label 2026-W17`
+- `uv run auto-mindsdb-factory automation-supervisor-cycle --store-dir .factory-automation --html-file fixtures/intake/anthropic-release-notes-sample.html --run-weekly-feedback --window-label 2026-W17`
+- `uv run auto-mindsdb-factory factory-vertical-slice --store-dir .factory-automation --repository ianu82/ai-factory`
+- `uv run auto-mindsdb-factory factory-cockpit --store-dir .factory-automation`
+- `uv run auto-mindsdb-factory demo-controller fixtures/scenarios/fast_lane_feature`
+
+## Live OpenAI Agent Mode
+
+The factory can now use a live OpenAI agent for the judgment-heavy drafting work in Stage 2 and Stage 3 while keeping the rest of the stage contracts deterministic and eval-gated.
+
+Edit the repo-local `.env` file or override values in `.env.local`:
+
+- `.env`
+- `.env.local`
+
+The CLI auto-loads `.env` first and `.env.local` second from the current working directory and optional `--repo-root`. Existing shell environment variables still win.
+
+Set the environment:
+
+- `export OPENAI_API_KEY=...`
+- `export AI_FACTORY_AGENT_PROVIDER=openai`
+- `export AI_FACTORY_OPENAI_MODEL=gpt-6.1-terra`
+- Optional: set `AI_FACTORY_OPENAI_FALLBACK_MODEL` to a model ID to retry failed primary requests; unset by default.
+- Optional: `export AI_FACTORY_OPENAI_REASONING_EFFORT=medium`
+- Optional: `export AI_FACTORY_OPENAI_MAX_OUTPUT_TOKENS=4000`
+- Optional: `export AI_FACTORY_OPENAI_TIMEOUT_SECONDS=120`
+- Optional: `export AI_FACTORY_CODE_WORKER_PROVIDER=codex_cli`
+- Optional: `export AI_FACTORY_CODE_WORKER_MODEL=gpt-6.1-terra`
+- Optional: `export AI_FACTORY_CODE_WORKER_TIMEOUT_SECONDS=1800`
+- Optional: `export AI_FACTORY_AUTONOMY_MODE=pr_ready`
+- Optional: `export AI_FACTORY_INTAKE_PAUSED=false`
+
+Run agent-assisted stages directly:
+
+- `uv run auto-mindsdb-factory stage2-ticketing --agent-provider openai --stage1-result-file stage1-result.json`
+- `uv run auto-mindsdb-factory stage3-build-review --agent-provider openai --stage2-result-file stage2-result.json`
+
+Run the full vertical slice with a live OpenAI agent:
+
+- `uv run auto-mindsdb-factory factory-vertical-slice --agent-provider openai --store-dir .factory-automation --repository ianu82/ai-factory`
+
+If `OPENAI_API_KEY` is missing, the CLI fails fast with a friendly initialization error before the run starts.
+
+## Linear Stage 1 Intake Trigger
+
+The factory can accept Linear issues through the dedicated `Stage 1 Intake` workflow state and hand them into Stage 1 manual intake.
+
+Set the Linear trigger environment in `.env` or `.env.local`:
+
+- `LINEAR_WEBHOOK_SECRET`
+- `LINEAR_API_KEY`
+- `LINEAR_TARGET_TEAM_ID`
+- `LINEAR_TARGET_STATE_ID`
+- Optional: `LINEAR_COMMENT_ON_ACCEPT=true`
+- Optional: `LINEAR_COMMENT_ON_REJECT=true`
+- Optional: `LINEAR_FACTORY_CREATE_STATES=true`
+- Optional: `LINEAR_MATERIALIZE_STAGE2_TICKETS=false`
+- Optional: `LINEAR_FACTORY_SYNC_DISABLED=false`
+- Optional: `FACTORY_TRIGGER_BASE_URL`
+
+Run the webhook receiver and the drain worker as separate processes:
+
+- `uv run auto-mindsdb-factory linear-webhook-server --store-dir .factory-automation --host 0.0.0.0 --port 8080`
+- `uv run auto-mindsdb-factory automation-linear-trigger-cycle --store-dir .factory-automation --repository ianu82/ai-factory`
+
+Set up the Linear stage workflow and backfill existing factory runs:
+
+- `uv run auto-mindsdb-factory linear-ensure-stage-states --store-dir .factory-automation`
+- `uv run auto-mindsdb-factory linear-stage-setup --store-dir .factory-automation --verify-only`
+- `uv run auto-mindsdb-factory automation-linear-sync-cycle --store-dir .factory-automation`
+
+Practical setup notes:
+
+- Configure the Linear webhook to send only `Issues` events. Extra event types are harmless because the receiver ignores them, but they create noise.
+- Point Linear at a public `https://.../hooks/linear` URL. The built-in server is the local receiver; in practice you usually place it behind a reverse proxy or HTTPS tunnel.
+- The receiver only verifies, filters, and persists the event. The worker is the process that actually turns the issue into a Stage 1 run and kicks off immediate handoff.
+- `automation-linear-trigger-cycle` is a one-shot drain pass, not a daemon. Run it from cron, systemd, or another heartbeat loop if you want near-real-time processing.
+- Keep `LINEAR_TARGET_STATE_ID` pointed at the `Stage 1 Intake` workflow state for the target team. `New Feature` can remain a human requirements-quality state before manually moving an issue into factory intake.
+- If a run starts from a Linear issue, the factory reuses that issue and moves it forward. If a run starts elsewhere, the factory creates a new Linear issue once the work becomes an active build candidate.
+- When the factory cannot advance automatically, it keeps the issue in the current stage and writes a short explanatory comment for a human reviewer.
+- In production `pr_ready` mode, Stage 6 is the stop line: the factory comments that the PR is ready for human merge/deploy and does not advance through simulated Stage 7-9 evidence.
+
+Incoming webhook envelopes are persisted under `.factory-automation/linear-trigger-inbox/`, and dedupe state lives in `.factory-automation/linear-trigger-state.json`.
+
+## Production PR-Ready Mode
+
+Production v1 uses `factory-worker` rather than cron-style one-shot commands. The worker drains Linear triggers, advances runs, calls `codex exec` in an isolated git worktree, lets the orchestrator inspect the diff, commits/pushes/opens the PR, runs command-backed gates, syncs Linear, and stops before merge/deploy.
+
+The production worker defaults to the OpenAI agent provider for Stage 2 ticket drafting and Stage 3 drafting/review. It uses the same model, fallback, reasoning and timeout settings as one-shot stage commands, and checks them before processing intake. An explicit `AI_FACTORY_AGENT_PROVIDER=none` is accepted only in deliberately enabled simulation mode. Drafting receives a bounded tracked-file inventory and project manifests. Delivered PR review receives the actual candidate diff; an empty or oversized diff blocks review instead of being silently omitted. The PR packet records the worker's actual changed files rather than proposed path hints.
+
+Run the preflight:
+
+- `uv run auto-mindsdb-factory factory-doctor --store-dir .factory-automation --repository ianu82/ai-factory`
+
+Run one production-style cycle:
+
+- `uv run auto-mindsdb-factory factory-worker --store-dir .factory-automation --repository ianu82/ai-factory --once`
+
+Default real gates are:
+
+- `uv run --locked --extra dev python -m pytest -q`
+- `uv run --locked --extra dev python scripts/validate_contracts.py`
+
+Configure additional gates with `AI_FACTORY_GATE_LINT_COMMAND`, `AI_FACTORY_GATE_TYPECHECK_COMMAND`, `AI_FACTORY_GATE_INTEGRATION_COMMAND`, and `AI_FACTORY_GATE_MIGRATION_SAFETY_COMMAND`. Checks without real commands are recorded as `not_configured`; later-stage checks are recorded as `deferred` rather than fake-passed.
+
+Production gates run in a fresh detached worktree at the full commit SHA recorded in the PR delivery evidence. The service checkout is never the fallback for a missing candidate. Eval reports record `execution.mode` and the tested `commit_sha`; simulation reports are explicitly labeled and cannot evaluate a delivered PR. Candidate source paths replace inherited Python import paths, and service credentials are removed from the gate environment. Gates still execute local code and require an appropriately restricted execution account.
+
+Every merge-gating check marked `required` must have a real passing command. `AI_FACTORY_REQUIRED_GATE_KINDS` adds mandatory kinds; it does not waive requirements in the manifest. Model and safety gates can use `AI_FACTORY_GATE_LATENCY_COMMAND`, `AI_FACTORY_GATE_COST_COMMAND`, `AI_FACTORY_GATE_LLM_QUALITY_COMMAND`, and `AI_FACTORY_GATE_ADVERSARIAL_COMMAND`. Install or configure each target project's dependencies for these commands before enabling intake.
+
+Production gates run as `AI_FACTORY_GATE_RUN_AS_USER`, falling back to the configured `AI_FACTORY_CODE_WORKER_RUN_AS_USER`; they refuse to start without an execution account. The account must be able to run the configured commands, read the target interpreter and dependencies, and write the temporary workspace. The orchestrator needs permission to change and restore ownership of its generated workspaces. A dedicated gate account without model, GitHub or Linear credentials is preferable. `factory-doctor` checks the gate account before intake is enabled.
+
+Default gates use the candidate's `uv.lock` and a workspace-local environment. A stale lockfile or failed dependency installation blocks the gate. Inherited virtual-environment/project overrides are removed; explicitly configured gate commands remain unchanged and must select the appropriate locked environment for their project.
+
+## Repository Layout
+
+```text
+docs/
+  software-factory-plan.md
+  factory-control-plane-spec.md
+factory/
+  policies/
+schemas/
+```
