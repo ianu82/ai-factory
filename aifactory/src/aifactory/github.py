@@ -23,6 +23,23 @@ from .security import decrypt
 API = "https://api.github.com"
 
 
+REQUIRED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "read", "checks": "read", "actions": "read"}
+PERMISSION_INSTRUCTION = ("Create a fine-grained token for the selected repository with Contents and Pull requests: write; "
+                          "Issues, Checks and Actions: read. Check organization approval and repository access, then retest.")
+PERMISSION_EVIDENCE = {"not_verified", "classic_repo_scope", "classic_scope_missing", "private_repository_probe"}
+
+
+def _rate_limited(response: httpx.Response) -> bool:
+    if response.status_code == 429:
+        return True
+    if response.status_code != 403:
+        return False
+    # Primary quota can remain positive during a secondary/abuse limit.
+    message = _message(response).lower()
+    return ("retry-after" in response.headers or response.headers.get("x-ratelimit-remaining") == "0"
+            or any(word in message for word in ("rate limit", "rate-limit", "secondary", "abuse")))
+
+
 class GitHubError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
@@ -97,6 +114,94 @@ class GitHub:
                 await asyncio.sleep(2 ** attempt)
         assert last is not None
         raise last
+
+    async def diagnose(self, repository: str | None = None) -> tuple[str, str, dict[str, Any]]:
+        """GET-only checks. Repository roles and accepted-permissions are not token grants."""
+        from .credential_diagnostics import result
+
+        permissions = [{"permission": name, "required": level, "state": "unverified", "evidence": "not_verified",
+                        "instruction": PERMISSION_INSTRUCTION} for name, level in REQUIRED_PERMISSIONS.items()]
+        metadata: dict[str, Any] = {"permissions": permissions}
+        if repository:
+            metadata["repository"] = repository
+
+        def transient(code: str) -> tuple[str, str, dict[str, Any]]:
+            # A failed check is not evidence, even if earlier probes succeeded.
+            for entry in permissions:
+                entry.update(state="unverified", evidence="not_verified", instruction=PERMISSION_INSTRUCTION)
+            return result(code, "untested", **metadata)
+
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            async def get(path: str) -> httpx.Response:
+                return await client.get(API + path, headers=self._headers(), params={"per_page": 1})
+
+            try:
+                me = await get("/user")
+                if _rate_limited(me):
+                    return transient("rate_limited")
+                if me.status_code in (401, 403):
+                    return result("github_invalid", "invalid", **metadata)
+                if me.status_code != 200:
+                    return transient("service_error")
+                account = me.json()
+                if not isinstance(account, dict) or not isinstance(account.get("login"), str):
+                    return transient("service_error")
+                metadata["login"] = account["login"]
+                if not repository:
+                    return result("github_permissions_unverified", "valid", **metadata)
+                repo = await get(f"/repos/{repository}")
+                if _rate_limited(repo):
+                    return transient("rate_limited")
+                if repo.status_code == 401:
+                    return result("github_invalid", "invalid", **metadata)
+                if repo.status_code in (403, 404):
+                    return result("github_repository_unverified", "valid", **metadata)
+                if repo.status_code != 200:
+                    return transient("service_error")
+                repo_data = repo.json()
+                if not isinstance(repo_data, dict):
+                    return transient("service_error")
+                private = repo_data.get("private") is True
+                # X-OAuth-Scopes describes actual classic token grants, unlike
+                # X-Accepted-GitHub-Permissions which describes endpoint requirements.
+                scope_header = me.headers.get("x-oauth-scopes")
+                scopes = {scope.strip() for scope in (scope_header or "").split(",")}
+                if "repo" in scopes:
+                    for entry in permissions:
+                        entry.update(state="present", evidence="classic_repo_scope", instruction="")
+                    return result("github_verified", "valid", **metadata)
+                if scope_header and private:
+                    for entry in permissions:
+                        entry.update(state="missing", evidence="classic_scope_missing")
+                    return result("github_permissions_missing", "invalid", **metadata)
+                # Public reads prove nothing about token grants. Neither contents
+                # nor pull-request write can be safely probed without mutation.
+                # /issues also accepts Pull requests:read, so never proves Issues.
+                branch = repo_data.get("default_branch")
+                probes = {"checks": f"commits/{branch}/check-runs" if isinstance(branch, str) and branch else None,
+                          "actions": "actions/runs"}
+                from urllib.parse import quote
+
+                for entry in permissions:
+                    suffix = probes.get(entry["permission"])
+                    if suffix is None:
+                        continue
+                    if entry["permission"] == "checks":
+                        suffix = "commits/" + quote(branch, safe="") + "/check-runs"
+                    response = await get(f"/repos/{repository}/{suffix}")
+                    if _rate_limited(response):
+                        return transient("rate_limited")
+                    if response.status_code == 401:
+                        return result("github_invalid", "invalid", **metadata)
+                    if response.status_code >= 500:
+                        return transient("service_error")
+                    if response.status_code == 200 and private:
+                        entry.update(state="present", evidence="private_repository_probe", instruction="")
+                return result("github_permissions_unverified", "valid", **metadata)
+            except httpx.HTTPError:
+                return transient("network_error")
+            except (ValueError, TypeError):
+                return transient("service_error")
 
     async def user(self) -> dict[str, Any]:
         return await self.request("GET", "/user")

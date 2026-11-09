@@ -34,7 +34,9 @@ ROLE_RANK = {"viewer": 0, "member": 1, "admin": 2, "owner": 3}
 
 
 class AuthError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 async def mindshub_identity(bearer: str) -> dict[str, Any]:
@@ -47,14 +49,20 @@ async def mindshub_identity(bearer: str) -> dict[str, Any]:
     except httpx.HTTPError:
         raise AuthError("MindsHub sign-in is unavailable right now. Try again shortly.")
     if response.status_code in (401, 403):
-        raise AuthError("MindsHub did not accept these credentials.")
+        raise AuthError("MindsHub did not accept these credentials.", response.status_code)
     if response.status_code == 429:
-        raise AuthError("MindsHub is rate limiting sign-in. Try again in a minute.")
+        raise AuthError("MindsHub is rate limiting sign-in. Try again in a minute.", 429)
     if response.status_code != 200:
-        raise AuthError(f"MindsHub sign-in failed ({response.status_code}).")
-    data = response.json()
-    if not isinstance(data, dict) or data.get("valid") is False or not data.get("user_id"):
-        raise AuthError("MindsHub returned an invalid identity.")
+        raise AuthError("MindsHub sign-in is unavailable right now. Try again shortly.", response.status_code)
+    try:
+        data = response.json()
+    except ValueError:
+        raise AuthError("MindsHub returned an invalid response.", 502) from None
+    # Explicit rejection takes precedence over absent/malformed identity fields.
+    if isinstance(data, dict) and data.get("valid") is False:
+        raise AuthError("MindsHub did not accept these credentials.", 401)
+    if not isinstance(data, dict) or not data.get("user_id"):
+        raise AuthError("MindsHub returned an invalid identity.", 502)
     return data
 
 
@@ -196,18 +204,22 @@ async def sign_in_with_api_key(body: ApiKeySignIn, response: Response, db: Sessi
         identity = await mindshub_identity(key)
         user = upsert_identity(db, identity)
     except AuthError as exc:
-        raise HTTPException(401, str(exc))
+        status = 401 if exc.status in (401, 403) else 429 if exc.status == 429 else 503
+        raise HTTPException(status, str(exc))
     if body.use_for_inference:
+        from .credential_diagnostics import safe_metadata, test_models
+
+        status, detail, metadata = await test_models("mindshub_api_key", key, identity)
+        metadata = safe_metadata(metadata, key)
         # Seed the inference credential for workspaces this user owns that have none yet.
         for member in db.query(Membership).filter(Membership.user_id == user.id, Membership.role.in_(["owner", "admin"])):
             existing = db.query(Secret).filter(Secret.workspace_id == member.workspace_id,
                                                Secret.kind == "mindshub_api_key").one_or_none()
             if existing is None:
                 db.add(Secret(workspace_id=member.workspace_id, kind="mindshub_api_key", ciphertext=encrypt(key),
-                              hint=mask(key), status="valid", status_detail="Verified by MindsHub Auth at sign-in",
+                              hint=mask(key), status=status, status_detail=detail,
                               tested_at=utcnow(), updated_by=user.id,
-                              metadata_json={"organization_id": identity.get("organization_id"),
-                                             "workspace_id": identity.get("workspace_id")}))
+                              metadata_json=metadata))
     start_session(db, response, user, "api_key")
     return {"ok": True}
 

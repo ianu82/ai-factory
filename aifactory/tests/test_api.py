@@ -41,6 +41,10 @@ def test_api_key_sign_in_uses_mindshub_identity_and_stores_masked_key(client, mo
         return {"valid": True, "user_id": "u-1", "email": "lead@mindsdb.com", "organization_id": "org-1",
                 "organization_name": "MindsDB", "workspace_id": "w-1", "roles": ["manage-organization"]}
 
+    async def catalog(self):
+        return ["test-model"]
+
+    monkeypatch.setattr(api_module.ModelClient, "list_models", catalog)
     monkeypatch.setattr(auth_module, "mindshub_identity", identity)
     r = client.post("/auth/api-key", json={"key": "mdb_test123.supersecretvalue", "use_for_inference": True})
     assert r.status_code == 200, r.text
