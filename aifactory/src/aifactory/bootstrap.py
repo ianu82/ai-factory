@@ -168,8 +168,9 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> None:
                 for t in blocked_tasks:
                     if t.status == "failed":  # attempts exhausted: start fresh attempts
                         t.attempt = 0
-                        t.evidence = {k: v for k, v in (t.evidence or {}).items()
-                                      if k not in ("attempt_base", "auto_retries")}
+                        from .decisions import fresh_budget
+
+                        t.evidence = fresh_budget(t.evidence)
                         t.stage = "revise" if t.pr_number else ""
                     t.status, t.blocked_reason = "queued", ""  # otherwise resumes at its durable stage
                 outcome.status = "running"

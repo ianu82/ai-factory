@@ -740,6 +740,46 @@ def test_automatic_retries_can_be_turned_off(factory):
     assert "auto_retry" not in _event_kinds(outcome_id)
 
 
+def test_an_attempt_interrupted_after_a_retry_is_redone_not_counted(factory):
+    """Attempt numbers restart after a person's retry; old records with the same numbers must not make an
+    interrupted attempt look finished (seen live: a restart skipped attempt 1 of a fresh budget)."""
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        old = [{"n": n, "result": "verification_failed", "verdict": {"verdict": "fail", "summary": "old"}} for n in (1, 2, 3)]
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="Update greeting",
+                    spec="Make greet.sh print Hello, Factory!", acceptance=[CRITERION], repo_id=factory["repo"],
+                    status="failed", attempt=3, evidence={"attempts": old})
+        s.add(task)
+        s.flush()
+        s.add(Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="unblock",
+                       title="T1 did not pass after 3 attempts", options=[{"value": "retry", "label": "Try again"}]))
+        s.get(Outcome, outcome_id).status = "running"
+        task_id = task.id
+    with session_scope() as s:
+        decision_id = s.query(Decision).filter(Decision.task_id == task_id).one().id
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "retry", comment="Try again.")
+    db.close()
+    with session_scope() as s:  # attempt 1 of the new budget started, then a restart interrupted it
+        task = s.get(Task, task_id)
+        task.attempt = 1
+        assert task.evidence["budget_epoch"] == 1
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "completed", task.blocked_reason
+        current = [a for a in task.evidence["attempts"] if a.get("epoch") == 1]
+        assert [a["n"] for a in current] == [1] and current[0]["result"] == "verified"
+    assert "attempt_resumed" in _event_kinds(outcome_id)
+
+
 def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     def planner(messages):
         if step(messages) == 0:

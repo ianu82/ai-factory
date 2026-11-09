@@ -109,8 +109,8 @@ class TaskRunner:
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
             ev = json.loads(json.dumps(task.evidence or {}))
             for key, value in values.items():
-                if key == "attempts":
-                    ev.setdefault("attempts", []).append(value)
+                if key == "attempts":  # tagged with the budget it belongs to (attempt numbers restart per budget)
+                    ev.setdefault("attempts", []).append({**value, "epoch": int(ev.get("budget_epoch", 0))})
                     continue
                 if key in ("ci", "smoke"):
                     value = {**value, "at": utcnow().isoformat()}
@@ -172,7 +172,7 @@ class TaskRunner:
     async def deliver(self, continue_from_branch: bool = False) -> None:
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
-        finished = {a.get("n") for a in (self.task.evidence or {}).get("attempts", []) if isinstance(a, dict)}
+        finished = {a.get("n") for a in self._budget_attempts()}
         if self.task.attempt and self.task.attempt not in finished:
             # Every attempt that ends records its result; one without a record was interrupted (a restart or
             # redeploy), so it is redone rather than counted against the limit.
@@ -486,13 +486,20 @@ class TaskRunner:
                    prepared=vm.prepared)
         return vm
 
+    def _budget_attempts(self) -> list[dict[str, Any]]:
+        """Attempt records of the current budget. Numbers restart at 1 when a person retries or requests changes;
+        records from earlier budgets are kept for their findings but are not this budget's attempts."""
+        ev = self.task.evidence or {}
+        epoch = int(ev.get("budget_epoch", 0))
+        return [a for a in ev.get("attempts", []) if isinstance(a, dict) and int(a.get("epoch", 0)) == epoch]
+
     def _auto_retry(self) -> bool:
         """Attempts ran out. When the last one failed on concrete, actionable feedback, start a fresh budget with that
         feedback instead of asking a person, up to ``auto_retry_rounds`` times between human decisions."""
         ev = self.task.evidence or {}
         rounds = max(0, min(int(self.settings.get("auto_retry_rounds", 1) or 0), 3))  # bootstrap values skip the API clamp
         used = int(ev.get("auto_retries", 0))
-        attempts = [a for a in ev.get("attempts", []) if isinstance(a, dict)]
+        attempts = self._budget_attempts()
         # Only the attempt that just ran out counts: some failures (an unreadable sandbox) record nothing, and an
         # older record must not turn an infrastructure failure into an automatic retry.
         last = attempts[-1] if attempts and attempts[-1].get("n") == self.task.attempt else {}
