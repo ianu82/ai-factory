@@ -203,6 +203,16 @@ class _VMProcess:
         return result.get("exitCode") if result.get("exitCode") is not None else -1
 
 
+# The bridge reports these when its exec connection failed before anything ran in the VM, so the call can be
+# repeated without side effects. Anything else (a command that started, a timeout) is never retried here.
+UNSTARTED_MARKERS = ("ExecNotStartedError", "no command was sent")
+UNSTARTED_DELAYS = (2.0, 5.0)
+
+
+def _never_started(exc: BaseException) -> bool:
+    return isinstance(exc, SandboxError) and any(m in str(exc) for m in UNSTARTED_MARKERS)
+
+
 class RailwayVMSandbox:
     kind = "vm"
 
@@ -285,6 +295,18 @@ class RailwayVMSandbox:
             await vm.close()
             raise
 
+    async def _call_started(self, op: str, args: dict[str, Any], timeout: float = 600) -> Any:
+        """A bridge call, repeated when its connection failed before the command was sent (a transient proxy
+        failure that otherwise blocks the whole task); every other error is raised as before."""
+        for delay in (*UNSTARTED_DELAYS, None):
+            try:
+                return await self.bridge.call(op, args, timeout=timeout)
+            except SandboxError as exc:
+                if delay is None or not _never_started(exc):
+                    raise
+                log.warning("VM %s %s did not start (%s); retrying in %.0fs", self.vm_id, op, exc, delay)
+                await asyncio.sleep(delay)
+
     async def exec(self, command: str, *, timeout: float = 600, cwd: str | None = None,
                    env: dict[str, str] | None = None, stdin: bytes | None = None,
                    on_output: Callable[[bytes], None] | None = None) -> ExecResult:
@@ -299,10 +321,10 @@ class RailwayVMSandbox:
         base_env = {"CI": "1", "TERM": "dumb", "NO_COLOR": "1", "HOME": str(self.home), "LANG": "C.UTF-8"}
         try:
             # Login shell for the image's PATH, then pin the directory: profiles may change it.
-            result = await self.bridge.call("exec", {"id": self.vm_id,
-                                                     "command": f"bash -lc {_quote(f'cd {_quote(workdir)} && {command}')}",
-                                                     "timeoutSec": int(max(5, timeout)), "cwd": workdir,
-                                                     "env": {**base_env, **(env or {})}}, timeout=timeout + 120)
+            result = await self._call_started("exec", {"id": self.vm_id,
+                                                       "command": f"bash -lc {_quote(f'cd {_quote(workdir)} && {command}')}",
+                                                       "timeoutSec": int(max(5, timeout)), "cwd": workdir,
+                                                       "env": {**base_env, **(env or {})}}, timeout=timeout + 120)
         except asyncio.TimeoutError:
             return ExecResult(command=command, exit_code=124, output="(VM command did not return)", duration=timeout,
                               timed_out=True)
@@ -325,7 +347,7 @@ class RailwayVMSandbox:
         workdir = str(self.resolve(cwd)) if cwd else str(self.work)
         wrapped = (f"cd {_quote(workdir)} && mkdir -p {_quote(str(log_path.parent))} && "
                    f"exec bash -c {_quote(command)} >> {_quote(str(log_path))} 2>&1")
-        info = await self.bridge.call("spawn", {"id": self.vm_id, "command": f"bash -lc {_quote(wrapped)}",
+        info = await self._call_started("spawn", {"id": self.vm_id, "command": f"bash -lc {_quote(wrapped)}",
                                                 "cwd": workdir, "env": {"HOME": str(self.home), **(env or {})}})
         exit_future = self.bridge.watch_exit(info["proc"])
         self._procs.append(info["proc"])
