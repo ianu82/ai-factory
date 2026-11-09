@@ -14,7 +14,7 @@ from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, Message, Outcome, Run, Task, Workspace
+from ..models import Decision, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from .attachments import prepare_attachments
 
@@ -211,6 +211,14 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                 row.cost_usd, row.cost_known = round(ledger.cost_usd, 6), ledger.cost_known and ledger.calls > 0
             if result:
                 row.result = result.report
+            # Reserve in the same transaction as completion: a restart cannot lose sampled work.
+            try:
+                from ..scorers import reserve_automatic
+                with s.begin_nested():
+                    reserve_automatic(s, row)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("could not reserve automatic scorers")
             s.flush()
             run_snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
         level = "success" if status == "succeeded" else ("warn" if status == "cancelled" else "error")
@@ -226,9 +234,20 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
 
 
 def outcome_cost(outcome_id: str) -> tuple[float, bool]:
+    from sqlalchemy import func, select
+
     with session_scope() as s:
-        runs = s.query(Run).filter(Run.outcome_id == outcome_id).all()
-        return sum(r.cost_usd for r in runs), all(r.cost_known for r in runs)
+        # Budget checks need only numeric totals, not the unbounded run/score
+        # history (including large result, definition and reasoning payloads).
+        run_cost, run_unknown = s.query(
+            func.coalesce(func.sum(Run.cost_usd), 0),
+            func.count(Run.id).filter(Run.cost_known.is_(False)),
+        ).filter(Run.outcome_id == outcome_id).one()
+        score_cost, score_unknown = s.query(
+            func.coalesce(func.sum(ScorerResult.cost_usd), 0),
+            func.count(ScorerResult.id).filter(ScorerResult.cost_known.is_(False)),
+        ).filter(ScorerResult.run_id.in_(select(Run.id).where(Run.outcome_id == outcome_id))).one()
+        return run_cost + score_cost, run_unknown == 0 and score_unknown == 0
 
 
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,

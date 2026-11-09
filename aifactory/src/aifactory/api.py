@@ -122,6 +122,11 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
             merged["autonomy"][key] = DEFAULT_SETTINGS["autonomy"][key]
     if merged.get("provider") not in PROVIDERS:
         merged["provider"] = "mindshub"
+    from .scorers import definitions
+    try:
+        definitions(merged)
+    except ValueError:
+        raise HTTPException(422, "Invalid scorer configuration") from None
     return merged
 
 
@@ -620,7 +625,7 @@ def list_outcomes(workspace_id: str, status: str = "", limit: int = 200, user: U
     query = db.query(Outcome).filter(Outcome.workspace_id == workspace_id)
     if status:
         query = query.filter(Outcome.status.in_(status.split(",")))
-    rows = query.order_by(Outcome.updated_at.desc()).limit(min(limit, 500)).all()
+    rows = query.order_by(Outcome.updated_at.desc()).limit(max(1, min(limit, 500))).all()
     tasks, runs, decisions = _outcome_rows(db, [o.id for o in rows])
     sources = S.outcome_sources(db, rows)
     return [S.outcome(o, tasks.get(o.id, []), runs.get(o.id, []), decisions.get(o.id, 0),
@@ -908,14 +913,125 @@ def update_precedent(workspace_id: str, decision_id: str, body: PrecedentUpdate,
     return {"ok": True}
 
 
+class ScoreRequest(BaseModel):
+    scorer_id: str = Field(min_length=1, max_length=80)
+
+
+@router.get("/workspaces/{workspace_id}/scorers")
+def scorer_definitions(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .scorers import definitions
+    ws, _ = _ws(db, user, workspace_id)
+    try:
+        return [d.model_dump() | {"version": d.version} for d in definitions(ws.settings or {})]
+    except ValueError:
+        raise HTTPException(422, "Invalid scorer configuration") from None
+
+
+def _score_run(db, user, workspace_id, run_id, minimum="viewer"):
+    ws, _ = _ws(db, user, workspace_id, minimum)
+    run = db.get(Run, run_id)
+    if not run or run.workspace_id != workspace_id:
+        raise HTTPException(404, "Run not found")
+    return ws, run
+
+
+@router.get("/workspaces/{workspace_id}/runs/{run_id}/scores")
+def run_scores(workspace_id: str, run_id: str, limit: int = Query(20, ge=1, le=50),
+               offset: int = Query(0, ge=0), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .models import ScorerResult
+    from .scorers import result_dict
+    _score_run(db, user, workspace_id, run_id)
+    return [result_dict(r) for r in db.query(ScorerResult).filter_by(workspace_id=workspace_id, run_id=run_id)
+            .order_by(ScorerResult.created_at.desc(), ScorerResult.id.desc()).offset(offset).limit(limit)]
+
+
+@router.post("/workspaces/{workspace_id}/runs/{run_id}/scores")
+async def score_run(workspace_id: str, run_id: str, body: ScoreRequest,
+                    user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .models import ScorerResult
+    from .scorers import definitions, execute, reserve, result_dict
+    ws, run = _score_run(db, user, workspace_id, run_id, "member")
+    try:
+        configured = definitions(ws.settings or {})
+    except ValueError:
+        raise HTTPException(422, "Invalid scorer configuration") from None
+    definition = next((d for d in configured if d.id == body.scorer_id), None)
+    if definition is None:
+        raise HTTPException(404, "Scorer not found")
+    try:
+        row = reserve(db, run, definition)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    result_id = row.id
+    db.commit()
+    await execute(result_id)
+    db.expire_all()
+    return result_dict(db.get(ScorerResult, result_id))
+
+
+class ScorerCostRequest(BaseModel):
+    cost_usd: float = Field(ge=0, allow_inf_nan=False)
+    evidence: str = Field(min_length=1, max_length=2000, pattern=r".*\S.*")
+
+
+def _score_attempt(db, workspace_id, run_id, score_id, attempt_id=None):
+    from .models import ScorerAttempt, ScorerResult
+    score = db.get(ScorerResult, score_id)
+    if not score or score.workspace_id != workspace_id or score.run_id != run_id:
+        raise HTTPException(404, "Score not found")
+    if attempt_id is None:
+        return score
+    attempt = db.get(ScorerAttempt, attempt_id)
+    if not attempt or attempt.workspace_id != workspace_id or attempt.result_id != score_id:
+        raise HTTPException(404, "Scorer attempt not found")
+    return attempt
+
+
+@router.get("/workspaces/{workspace_id}/runs/{run_id}/scores/{score_id}/attempts")
+def scorer_attempts(workspace_id: str, run_id: str, score_id: str,
+                    limit: int = Query(20, ge=1, le=50), offset: int = Query(0, ge=0),
+                    user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .models import ScorerAttempt
+    from .scorers import attempt_dict
+    _score_run(db, user, workspace_id, run_id)
+    _score_attempt(db, workspace_id, run_id, score_id)
+    return [attempt_dict(a) for a in db.query(ScorerAttempt).filter_by(
+        workspace_id=workspace_id, result_id=score_id).order_by(
+            ScorerAttempt.started_at.desc(), ScorerAttempt.id.desc()).offset(offset).limit(limit)]
+
+
+@router.post("/workspaces/{workspace_id}/runs/{run_id}/scores/{score_id}/attempts/{attempt_id}/cost")
+def reconcile_scorer_cost(workspace_id: str, run_id: str, score_id: str, attempt_id: str,
+                          body: ScorerCostRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Explicit, audited billing reconciliation, never guess zero for a possibly paid call."""
+    from .scorers import aggregate, attempt_dict
+    _score_run(db, user, workspace_id, run_id, "admin")
+    attempt = _score_attempt(db, workspace_id, run_id, score_id, attempt_id)
+    if attempt.finished_at is None or attempt.cost_known:
+        raise HTTPException(409, "Only finished attempts with unknown cost can be reconciled")
+    attempt.cost_usd, attempt.cost_known = round(body.cost_usd, 6), True
+    attempt.cost_reconciliation = {"actor": user.id, "at": utcnow().isoformat(), "evidence": body.evidence}
+    db.flush()
+    aggregate(db, score_id)
+    record(workspace_id, "scorer_cost_reconciled", "Scorer charge reconciled from provider billing",
+           actor=user.id, run_id=run_id, session=db,
+           data={"attempt_id": attempt_id, "provider": attempt.provider, "cost_usd": attempt.cost_usd})
+    db.commit()
+    return attempt_dict(attempt)
+
+
 # --- runs, activity, signals -----------------------------------------------------------
 @router.get("/workspaces/{workspace_id}/runs")
 def list_runs(workspace_id: str, limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    rows = db.query(Run).filter(Run.workspace_id == workspace_id).order_by(Run.started_at.desc()).limit(min(limit, 500)).all()
+    rows = db.query(Run).filter(Run.workspace_id == workspace_id).order_by(Run.started_at.desc()).limit(max(1, min(limit, 500))).all()
     outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({r.outcome_id for r in rows}))}
     tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_({r.task_id for r in rows if r.task_id}))}
-    return [S.run(r) | {"outcome_number": outcomes[r.outcome_id].number if r.outcome_id in outcomes else None,
+    from .scorers import run_summaries
+    scores, totals = run_summaries(db, workspace_id, [r.id for r in rows])
+    return [S.run(r) | {"scores": scores.get(r.id, []),
+                        "score_summary": totals.get(r.id, {"count": 0, "cost_usd": 0, "cost_known": True}),
+                        "outcome_number": outcomes[r.outcome_id].number if r.outcome_id in outcomes else None,
                         "outcome_title": outcomes[r.outcome_id].title if r.outcome_id in outcomes else "",
                         "task_key": tasks[r.task_id].key if r.task_id in tasks else None} for r in rows]
 
@@ -932,6 +1048,19 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
     task_ids = {t.id for t in tasks}
     runs = [r for r in db.query(Run).filter(Run.workspace_id == workspace_id)
             if r.outcome_id in outcome_ids and (not r.task_id or r.task_id in task_ids) and not benchmark(r)]
+    from .models import ScorerResult
+    from sqlalchemy import func
+
+    # Score history is unbounded; aggregate numeric usage without loading judge
+    # definitions or reasoning into this frequently refreshed endpoint.
+    score_cost, score_tokens, score_unknown = db.query(
+        func.coalesce(func.sum(ScorerResult.cost_usd), 0),
+        func.coalesce(func.sum(ScorerResult.input_tokens + ScorerResult.output_tokens), 0),
+        func.count(ScorerResult.id).filter(ScorerResult.cost_known.is_(False)),
+    ).filter(ScorerResult.workspace_id == workspace_id,
+             ScorerResult.run_id.in_([r.id for r in runs])).one()
+    total_cost = sum(r.cost_usd for r in runs) + score_cost
+    cost_known = all(r.cost_known for r in runs) and score_unknown == 0
     decisions = db.query(Decision).filter(Decision.workspace_id == workspace_id).all()
     merged = [t for t in tasks if t.merge_sha]
     by_status: dict[str, int] = {}
@@ -954,9 +1083,9 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
         "outcomes": by_status,
         "tasks": {"total": len(tasks), "completed": sum(t.status == "completed" for t in tasks), "merged": len(merged),
                   "first_attempt": first_pass, "smoke_failed": sum(t.status == "smoke_failed" for t in tasks)},
-        "cost": {"usd": round(sum(r.cost_usd for r in runs), 2), "known": all(r.cost_known for r in runs),
-                 "per_completed_task": round(sum(r.cost_usd for r in runs) / max(1, sum(t.status == "completed" for t in tasks)), 2)},
-        "tokens": sum(r.input_tokens + r.output_tokens for r in runs),
+        "cost": {"usd": round(total_cost, 2), "known": cost_known,
+                 "per_completed_task": round(total_cost / max(1, sum(t.status == "completed" for t in tasks)), 2)},
+        "tokens": sum(r.input_tokens + r.output_tokens for r in runs) + score_tokens,
         "human": {"decisions": len(decisions), "open": sum(d.status == "open" for d in decisions),
                   "interventions": db.query(Message).filter(Message.workspace_id == workspace_id,
                                                             Message.author_kind == "user").count()},

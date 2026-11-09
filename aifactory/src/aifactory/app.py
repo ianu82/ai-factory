@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -38,7 +39,12 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
         apply_bootstrap()
         if run:
             orchestrator.start()
+        from . import scorers
+        scorer_worker = asyncio.create_task(scorers.worker(), name="scorer-queue")
         yield
+        scorer_worker.cancel()
+        await asyncio.gather(scorer_worker, return_exceptions=True)
+        await scorers.stop()
         if run:
             await orchestrator.stop()
 

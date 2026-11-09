@@ -143,29 +143,77 @@ class Orchestrator:
         if time.monotonic() - getattr(self, "_last_cost_reconcile", float("-inf")) < 600:
             return
         self._last_cost_reconcile = time.monotonic()
-        from ..inference import InferenceError, ModelClient, resolve_provider
-        from ..models import Run
+        from ..inference import InferenceError, ModelClient, price_for, resolve_provider
+        from sqlalchemy import and_, func, or_
+
+        from ..models import Run, ScorerAttempt
+        from ..scorers import aggregate
 
         since = utcnow() - timedelta(days=7)
         with session_scope() as s:
-            pending = [(r.id, r.workspace_id) for r in s.query(Run).filter(
+            pending = [(Run, r.id, r.workspace_id) for r in s.query(Run).filter(
                 Run.cost_known.is_(False), Run.provider == "mindshub", Run.finished_at.isnot(None),
                 Run.finished_at >= since).limit(50)]
+            pending += [(ScorerAttempt, a.id, a.workspace_id) for a in s.query(ScorerAttempt).filter(
+                ScorerAttempt.cost_known.is_(False), ScorerAttempt.finished_at.isnot(None),
+                or_(ScorerAttempt.provider == "mindshub",
+                    and_(ScorerAttempt.provider == "openai", ScorerAttempt.usage_known.is_(True))),
+                or_(ScorerAttempt.cost_retry_at.is_(None), ScorerAttempt.cost_retry_at <= utcnow())
+            ).order_by(func.coalesce(ScorerAttempt.cost_retry_at, ScorerAttempt.finished_at),
+                       ScorerAttempt.id).limit(50)]
         priced = 0
-        clients: dict[str, Any] = {}
-        for run_id, workspace_id in pending:
+        clients: dict[tuple[str, str | None], Any] = {}
+        for kind, run_id, workspace_id in pending:
             try:
-                if workspace_id not in clients:
-                    clients[workspace_id] = ModelClient(resolve_provider(workspace_id))
-                cost = await clients[workspace_id].session_cost(run_id)
+                # A judge attempt may outlive a workspace's provider selection. Never
+                # query a different provider (or silently fall back to another key).
+                recorded_provider = None
+                if kind is ScorerAttempt:
+                    with session_scope() as s:
+                        attempt = s.get(ScorerAttempt, run_id)
+                        # Advance even on absent credentials, missing pricing or provider errors:
+                        # an unpriceable page must not starve later attempts. Keep retrying
+                        # (capped at one day); manual billing reconciliation is always available.
+                        attempt.cost_retry_count = (attempt.cost_retry_count or 0) + 1
+                        attempt.cost_retry_at = utcnow() + timedelta(
+                            seconds=min(86400, 600 * 2 ** min(attempt.cost_retry_count - 1, 8)))
+                        recorded_provider = attempt.provider
+                        if recorded_provider == "openai":
+                            # OpenAI exposes no session billing API. Reprice retained usage
+                            # after pricing is configured; otherwise retain honest unknown
+                            # cost for an admin to reconcile from provider billing.
+                            ws = s.get(Workspace, workspace_id)
+                            price = price_for(attempt.model, ws.settings or {})
+                            if attempt.usage_known and price is not None:
+                                attempt.cost_usd = round((attempt.input_tokens * price[0]
+                                                          + attempt.output_tokens * price[1]) / 1e6, 6)
+                                attempt.cost_known = True
+                                aggregate(s, attempt.result_id)
+                                priced += 1
+                            else:
+                                log.info("scorer %s requires manual OpenAI billing reconciliation", run_id)
+                            continue
+                key = (workspace_id, recorded_provider)
+                if key not in clients:
+                    if kind is ScorerAttempt:
+                        provider = resolve_provider(workspace_id, required_provider=recorded_provider)
+                    else:
+                        provider = resolve_provider(workspace_id)
+                    clients[key] = ModelClient(provider)
+                cost = await clients[key].session_cost(run_id)
             except (InferenceError, Exception):  # noqa: BLE001 - best effort
+                if kind is ScorerAttempt:
+                    log.info("scorer cost reconciliation deferred for %s: recorded provider unavailable", run_id)
                 continue
             if cost is None:
                 continue
             with session_scope() as s:
-                run = s.get(Run, run_id)
+                run = s.get(kind, run_id)
                 run.cost_usd, run.cost_known = round(cost, 6), True
-                notify(run.workspace_id, "outcome", run.outcome_id)
+                if kind is ScorerAttempt:
+                    aggregate(s, run.result_id)
+                else:
+                    notify(run.workspace_id, "outcome", run.outcome_id)
             priced += 1
         if priced:
             log.info("priced %d run(s) from provider usage", priced)
