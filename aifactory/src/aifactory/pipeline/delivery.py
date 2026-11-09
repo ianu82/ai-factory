@@ -65,6 +65,11 @@ class TaskRunner:
                 for f in verdict.get("findings", []):
                     if f.get("severity") in ("blocker", "major"):
                         notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
+            elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks", [])):
+                for c in attempt["checks"]:
+                    if not c.get("ok"):
+                        notes.append(f"- In an earlier attempt, check `{c.get('command')}` failed (exit {c.get('exit_code')})"
+                                     + (f":\n```\n{c['tail']}\n```" if c.get("tail") else ""))
             elif attempt.get("result") in ("checks_failed", "policy"):
                 notes.append(f"- An earlier attempt failed: {attempt.get('detail') or attempt.get('result')}")
         return notes
@@ -1072,7 +1077,10 @@ class TaskRunner:
 
 
 def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")} for c in checks]
+    """Check results for the evidence record; failed checks keep their output tail so the failure can be fed back
+    to a later attempt even after a restart."""
+    return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")}
+            | ({} if c["ok"] else {"tail": str(c.get("tail") or "")[-1500:]}) for c in checks]
 
 
 def _signal(workspace_id: str, repo_id: str | None, source: str, title: str, body: str, url: str) -> None:

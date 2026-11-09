@@ -594,6 +594,29 @@ def test_automatic_retry_rounds_from_bootstrap_are_clamped(factory):
     assert len(results) == 4 and title == "T1 did not pass after 1 attempts and 3 automatic retries"
 
 
+def test_failed_check_output_survives_a_restart_into_the_next_attempt(factory):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        from aifactory.models import Plan
+
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t", spec="s",
+                    acceptance=["c"], repo_id=factory["repo"], status="queued",
+                    evidence={"attempts": [{"n": 1, "result": "checks_failed", "checks": delivery._brief([
+                        {"command": "sh test.sh", "ok": False, "exit_code": 1, "duration": 0.1,
+                         "tail": "expected greeting, got: Hello"},
+                        {"command": "true", "ok": True, "exit_code": 0, "duration": 0.0, "tail": ""}])}]})
+        s.add(task)
+        s.flush()
+        task_id = task.id
+    notes = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._prior_feedback()
+    assert len(notes) == 1 and "`sh test.sh` failed (exit 1)" in notes[0] and "expected greeting, got: Hello" in notes[0]
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:
