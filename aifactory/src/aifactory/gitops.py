@@ -164,11 +164,11 @@ class Patch:
 async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     """Everything the job changed relative to the base commit (committed or not)."""
     out_file = f"{SCRATCH}/candidate.patch"
-    # Keep publication rename-free so excluded attachment paths cannot leak as
+    # Keep publication rename-free so excluded scratch paths cannot leak as
     # rename sources. Policy size statistics still recognize ordinary renames.
     stats_file = f"{SCRATCH}/candidate.numstat"
     # File data goes through backend-neutral reads (exec output is clipped).
-    paths = "-- . ':(top,exclude).factory/attachments' ':(top,exclude).factory/attachments/**'"
+    paths = "-- . ':(top,exclude).factory' ':(top,exclude).factory/**'"
     script = (
         f"set -e; mkdir -p {SCRATCH}; git add -A >/dev/null; "
         f"git -c core.quotepath=off diff --cached --binary --no-renames --no-color {base_sha} {paths} > {out_file}; "

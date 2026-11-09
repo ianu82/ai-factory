@@ -388,6 +388,18 @@ async def read_bytes(sandbox, relative: str, limit: int | None = None, from_end:
     return data
 
 
+async def read_image_bytes(sandbox, relative: str, limit: int) -> bytes:
+    """Read model-selected image paths with a hard byte cap on either backend."""
+    if _is_vm(sandbox):
+        return await sandbox.read_image_bytes_async(relative, limit)
+    from .safe_files import safe_read
+
+    try:
+        return safe_read(str(sandbox.work), relative, limit)
+    except (OSError, ValueError) as exc:
+        raise SandboxError(f"Cannot read sandbox image: {exc}") from exc
+
+
 async def list_files(sandbox, relative: str, pattern: str = "*") -> list[str]:
     if _is_vm(sandbox):
         return await sandbox.list_files(relative, pattern)

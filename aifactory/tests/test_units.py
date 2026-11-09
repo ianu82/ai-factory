@@ -230,3 +230,53 @@ def test_repository_precedents_apply_only_to_their_own_repository():
                            status="resolved", resolution="answer", reusable=True, scope="repository",
                            resolved_at=utcnow()))
     assert titles(b_id) == ["Use UK English"]
+
+
+@pytest.mark.parametrize("scratch_state", ["unignored", "force-staged", "committed"])
+def test_extract_patch_excludes_all_root_scratch_and_external_files(tmp_path, scratch_state):
+    import subprocess
+
+    from aifactory.gitops import extract_patch
+
+    sb = LocalSandbox("patch", root=tmp_path).create()
+    sb.work.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    def git(*args, cwd=sb.work, data=None):
+        return subprocess.run(["git", *args], cwd=cwd, env=env, input=data,
+                              check=True, capture_output=True).stdout
+    git("init", "-q")
+    (sb.work / "source.py").write_text("before\n")
+    if scratch_state == "force-staged":
+        (sb.work / ".gitignore").write_text("/.factory/\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD").decode().strip()
+    (sb.work / ".factory" / "deep").mkdir(parents=True)
+    (sb.work / ".factory" / "deep" / "private.bin").write_bytes(b"\0private screenshot")
+    (sb.work / ".factory" / "notes.txt").write_text("private note\n" * 20)
+    if scratch_state in {"force-staged", "committed"}:
+        git("add", "-f", ".factory")
+    if scratch_state == "committed":
+        git("commit", "-qm", "agent scratch commit")
+    # Simulate cells creating source in the checkout and scratch outside it.
+    async def go():
+        result = await sb.exec("printf 'after\\n' > source.py; printf 'new source\\n' > cell.py; "
+                               "mkdir -p nested/.factory; printf 'keep\\n' > nested/.factory/ordinary.txt; "
+                               'printf secret > "$HOME/home.txt"; printf secret > "$TMPDIR/tmp.txt"')
+        assert result.ok
+        return await extract_patch(sb, base)
+    patch = asyncio.run(go())
+    assert set(patch.files) == {"source.py", "cell.py", "nested/.factory/ordinary.txt"}
+    assert patch.additions == 3 and patch.deletions == 1
+    assert b"private" not in patch.diff and b"home.txt" not in patch.diff and b"tmp.txt" not in patch.diff
+    assert b"a/.factory" not in patch.diff and b"b/.factory" not in patch.diff
+    # Publication still applies the extracted binary patch to a pristine base.
+    clean = tmp_path / "clean"
+    git("clone", "-q", str(sb.work), str(clean))
+    git("checkout", "-q", base, cwd=clean)
+    git("apply", "--index", "--binary", "-", cwd=clean, data=patch.diff)
+    assert (clean / "cell.py").read_text() == "new source\n"
+    assert (clean / "source.py").read_text() == "after\n"
+    assert not (clean / ".factory").exists()
+    asyncio.run(sb.close())

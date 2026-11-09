@@ -46,3 +46,47 @@ def safe_write(root: str, relative: str, content: bytes, owner: int | None = Non
         if temporary:
             os.unlink(temporary, dir_fd=fd)
         os.close(fd)
+
+
+def safe_read(root: str, relative: str, limit: int) -> bytes:
+    """Bounded regular-file read without following any checkout symlink.
+
+    Self-contained so the exact same check-and-open runs inside a VM. Directory
+    descriptors keep path replacement races from redirecting subsequent opens.
+    """
+    import os
+    import stat
+
+    if limit <= 0:
+        raise ValueError("Invalid read limit")
+    if not isinstance(relative, str) or not relative or "\x00" in relative:
+        raise ValueError("Invalid sandbox read path")
+    root = os.path.abspath(root)
+    # Accept checkout-absolute paths, but reject traversal before normalization.
+    if ".." in relative.split("/"):
+        raise ValueError("Path escapes the repository")
+    if os.path.isabs(relative):
+        relative = os.path.relpath(relative, root)
+    parts = [p for p in relative.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        raise ValueError("Path escapes the repository")
+    directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, directory)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, directory, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        out = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(out, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("Not a regular file")
+            if info.st_size > limit:
+                raise ValueError("Image is too large; resize it and try again")
+            data = handle.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("Image is too large; resize it and try again")
+            return data
+    finally:
+        os.close(fd)
