@@ -57,6 +57,9 @@ def _changed(applied: dict[str, str], key: str, value) -> bool:
 
 
 def apply_bootstrap() -> str | None:
+    from .fallbacks import set_bootstrap_workspace
+
+    set_bootstrap_workspace(None)
     cfg = bootstrap_config()
     if not cfg:
         return None
@@ -66,12 +69,16 @@ def apply_bootstrap() -> str | None:
             org = Organization(name=cfg.get("organization", "Factory"))
             s.add(org)
             s.flush()
-        ws = s.query(Workspace).filter(Workspace.org_id == org.id, Workspace.name == cfg.get("workspace", "Factory")).first()
+        # The oldest workspace of that name is the bootstrap one: a later workspace given the same name
+        # must never take over its configuration or its server credentials.
+        ws = (s.query(Workspace).filter(Workspace.org_id == org.id, Workspace.name == cfg.get("workspace", "Factory"))
+              .order_by(Workspace.created_at, Workspace.id).first())
         if ws is None:
             ws = Workspace(org_id=org.id, name=cfg.get("workspace", "Factory"), slug="default",
                            settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
             s.add(ws)
             s.flush()
+        set_bootstrap_workspace(ws.id)
         settings = merged_settings(ws.settings)
         overrides = cfg.get("settings") or {}
         applied = dict(settings.get("_bootstrap") or {})

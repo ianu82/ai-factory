@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from .config import get_settings
 from .db import session_scope
 from .models import Secret
 from .security import decrypt
@@ -58,7 +56,9 @@ def resolve_token(workspace_id: str) -> str:
         sec = s.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == "github_token").one_or_none()
         if sec is not None and sec.status != "invalid":
             return decrypt(sec.ciphertext)
-    token = get_settings().bootstrap_github_token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+    from .fallbacks import github_token
+
+    token = github_token(workspace_id)  # the operator's server token serves only the bootstrap workspace
     if not token:
         raise GitHubError("No GitHub access is configured for this workspace. Add a GitHub token in Settings.")
     return token

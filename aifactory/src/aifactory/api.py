@@ -16,11 +16,11 @@ from . import attachments as A
 from . import insights, linear_config
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
-from .config import get_settings
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
 from .db import get_db, utcnow
 from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
+from .fallbacks import available as fallback_credentials
 from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_token
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
@@ -249,13 +249,10 @@ def _secret_view(kind: str, sec: Secret | None) -> dict[str, Any]:
 def credentials(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
     secrets = {s.kind: s for s in db.query(Secret).filter(Secret.workspace_id == workspace_id)}
-    settings = get_settings()
     return {"github_permissions": [{"permission": name, "label": PERMISSION_LABELS[name], "required": level}
                                    for name, level in REQUIRED_PERMISSIONS.items()],
             "items": [_secret_view(k, secrets.get(k)) for k in ("mindshub_api_key", "github_token", "openai_api_key", "linear_api_key")],
-            "server_fallbacks": {"github_token": bool(settings.bootstrap_github_token),
-                                 "openai_api_key": bool(settings.bootstrap_openai_key),
-                                 "mindshub_api_key": bool(settings.bootstrap_mindshub_key)}}
+            "server_fallbacks": fallback_credentials(workspace_id)}
 
 
 async def _test_secret(kind: str, value: str) -> tuple[str, str, dict[str, Any]]:

@@ -7,7 +7,6 @@ are not called validated. Neither acknowledgments nor an outcome gate readiness.
 
 from __future__ import annotations
 
-import os
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, Vali
 from sqlalchemy.orm import Session
 
 from .auth import current_user, require_member
-from .config import get_settings
 from .db import get_db
 from .models import Outcome, Repository, Secret, User, Workspace
 
@@ -74,7 +72,6 @@ def _workspace(db: Session, user: User, workspace_id: str, minimum: str = "viewe
 def snapshot(db: Session, ws: Workspace) -> OnboardingState:
     state = ws.onboarding if isinstance(ws.onboarding, dict) else {}
     secrets = {s.kind: s for s in db.query(Secret).filter(Secret.workspace_id == ws.id)}
-    settings = get_settings()
     preferred = (ws.settings or {}).get("provider") or "mindshub"
     providers = [preferred] + [p for p in ("mindshub", "openai") if p != preferred]
     # Match runtime's preference for workspace credentials over bootstrap keys.
@@ -82,8 +79,11 @@ def snapshot(db: Session, ws: Workspace) -> OnboardingState:
                   if secrets.get(f"{p}_api_key") is not None
                   and secrets[f"{p}_api_key"].status != "invalid"), None)
     github = secrets.get("github_token")
-    model_usable = model is not None or bool(settings.bootstrap_mindshub_key or settings.bootstrap_openai_key)
-    github_fallback = bool(settings.bootstrap_github_token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
+    from .fallbacks import available
+
+    fallback = available(ws.id)  # server credentials count only for the operator's bootstrap workspace
+    model_usable = model is not None or fallback["mindshub_api_key"] or fallback["openai_api_key"]
+    github_fallback = fallback["github_token"]
     github_usable = bool(github and github.status != "invalid") or github_fallback
     repo_connected = db.query(Repository.id).filter(Repository.workspace_id == ws.id).first() is not None
     usable = {"models": model_usable, "github": github_usable, "repositories": repo_connected}

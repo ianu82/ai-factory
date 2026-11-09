@@ -100,13 +100,17 @@ def resolve_provider(workspace_id: str, *, required_provider: str | None = None)
             key, provider = "", preferred
     override = None
     if not key:
-        # Server-level bootstrap keys (explicitly configured by the operator) are a fallback.
-        if preferred == "mindshub" and settings.bootstrap_mindshub_key:
-            key, provider = settings.bootstrap_mindshub_key, "mindshub"
-        elif settings.bootstrap_openai_key and required_provider in (None, "openai"):
-            key, provider = settings.bootstrap_openai_key, "openai"
-        elif settings.bootstrap_mindshub_key and required_provider in (None, "mindshub"):
-            key, provider = settings.bootstrap_mindshub_key, "mindshub"
+        # Server-level bootstrap keys (explicitly configured by the operator) are a fallback for the
+        # operator's bootstrap workspace only; any other workspace must add its own key.
+        from .fallbacks import model_keys
+
+        mindshub_key, openai_key = model_keys(workspace_id)
+        if preferred == "mindshub" and mindshub_key:
+            key, provider = mindshub_key, "mindshub"
+        elif openai_key and required_provider in (None, "openai"):
+            key, provider = openai_key, "openai"
+        elif mindshub_key and required_provider in (None, "mindshub"):
+            key, provider = mindshub_key, "mindshub"
         if key and provider != preferred:
             import os
 
