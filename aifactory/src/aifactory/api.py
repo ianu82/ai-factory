@@ -22,6 +22,7 @@ from .events import bus, event_dict, notify, record
 from .github import GitHub, GitHubError, resolve_token
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, ProviderConfig, resolve_provider
+from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace)
@@ -29,11 +30,11 @@ from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
 from .repo_detect import detect
 from .sandbox import isolation_available
-from .security import encrypt, mask
+from .security import encrypt, mask, redact
 from .signals import outcome_from_text, sync_github, upsert_signal
 
 router = APIRouter(prefix="/api")
-SECRET_KINDS = {"mindshub_api_key", "openai_api_key", "github_token"}
+SECRET_KINDS = {"mindshub_api_key", "openai_api_key", "github_token", "linear_api_key"}
 
 
 def _ws(db: Session, user: User, workspace_id: str, minimum: str = "viewer") -> tuple[Workspace, Membership]:
@@ -180,7 +181,8 @@ def mark_seen(workspace_id: str, user: User = Depends(current_user), db: Session
 
 # --- credentials ----------------------------------------------------------------
 def _secret_view(kind: str, sec: Secret | None) -> dict[str, Any]:
-    labels = {"mindshub_api_key": "MindsHub Inference", "openai_api_key": "OpenAI", "github_token": "GitHub"}
+    labels = {"mindshub_api_key": "MindsHub Inference", "openai_api_key": "OpenAI", "github_token": "GitHub",
+              "linear_api_key": "Linear"}
     if sec is None:
         return {"kind": kind, "label": labels[kind], "configured": False, "status": "missing"}
     return {"kind": kind, "label": labels[kind], "configured": True, "hint": sec.hint, "status": sec.status,
@@ -193,7 +195,7 @@ def credentials(workspace_id: str, user: User = Depends(current_user), db: Sessi
     _ws(db, user, workspace_id)
     secrets = {s.kind: s for s in db.query(Secret).filter(Secret.workspace_id == workspace_id)}
     settings = get_settings()
-    return {"items": [_secret_view(k, secrets.get(k)) for k in ("mindshub_api_key", "github_token", "openai_api_key")],
+    return {"items": [_secret_view(k, secrets.get(k)) for k in ("mindshub_api_key", "github_token", "openai_api_key", "linear_api_key")],
             "server_fallbacks": {"github_token": bool(settings.bootstrap_github_token),
                                  "openai_api_key": bool(settings.bootstrap_openai_key),
                                  "mindshub_api_key": bool(settings.bootstrap_mindshub_key)}}
@@ -202,6 +204,10 @@ def credentials(workspace_id: str, user: User = Depends(current_user), db: Sessi
 async def _test_secret(kind: str, value: str) -> tuple[str, str, dict[str, Any]]:
     settings = get_settings()
     try:
+        if kind == "linear_api_key":
+            viewer = await Linear(value).viewer()
+            name = redact(viewer["name"], (value,))
+            return "valid", redact(f"Connected as {name}", (value,)), {"name": name}
         if kind == "mindshub_api_key":
             from .auth import AuthError, mindshub_identity
 
@@ -222,10 +228,13 @@ async def _test_secret(kind: str, value: str) -> tuple[str, str, dict[str, Any]]
             gh = GitHub(value)
             me = await gh.user()
             return "valid", f"Connected as {me.get('login')}", {"login": me.get("login")}
+    except LinearError as exc:
+        return "invalid" if exc.category == "authentication" else "untested", redact(str(exc), (value,)), {}
     except (InferenceError, GitHubError) as exc:
         return "invalid", str(exc), {}
     except Exception as exc:
-        return "untested", f"Could not test right now: {type(exc).__name__}", {}
+        detail = f"Could not test right now: {type(exc).__name__}"
+        return "untested", redact(detail, (value,)) if kind == "linear_api_key" else detail, {}
     return "untested", "", {}
 
 
@@ -260,7 +269,7 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
 
 @router.post("/workspaces/{workspace_id}/credentials/{kind}/test")
 async def test_credential(workspace_id: str, kind: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "member")
+    _ws(db, user, workspace_id, "admin" if kind == "linear_api_key" else "member")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec is None:
         raise HTTPException(404, "Not configured")

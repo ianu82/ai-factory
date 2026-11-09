@@ -7,6 +7,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -41,6 +43,12 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
             await orchestrator.stop()
 
     app = FastAPI(title="AI Factory", version=__version__, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith("/api/workspaces/") and "/credentials/" in request.url.path:
+            return JSONResponse({"detail": "Invalid credential request"}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
     async def headers(request: Request, call_next):
