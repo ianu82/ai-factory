@@ -8,7 +8,7 @@ import { ago, DECISION_KIND } from "../format";
 import { Dot, Empty, Skeleton, useToast } from "../ui";
 import { DecisionCard } from "../components/DecisionCard";
 import { OutcomeDetail } from "../components/OutcomeDetail";
-import { SetupChecklist, useSetupState } from "../components/Setup";
+import { SetupNotice, useSetupState } from "../components/Setup";
 import { RecoveryGuide } from "../components/RecoveryGuide";
 
 type InboxData = { decisions: Decision[]; since: string | null; changes: (FactoryEvent & { outcome_number?: number; outcome_title?: string })[] };
@@ -101,7 +101,7 @@ export function InboxPage() {
         <div className="list-pane">
           {q.isLoading || setup.loading ? <Skeleton rows={4} /> : (
             <>
-              {!setup.ready && <SetupChecklist />}
+              {!setup.ready && <SetupNotice />}
               {groups.map((g) => (
                 <section key={g.key} aria-label={g.label}>
                   <div className="list-section">{g.label} · {g.rows.length}</div>

@@ -8,7 +8,7 @@ import { ago, money, OUTCOME_STATUS } from "../format";
 import { Dot, Empty, GateTrack, Skeleton } from "../ui";
 import type { Task } from "../api";
 import { OutcomeDetail } from "../components/OutcomeDetail";
-import { SetupChecklist, useSetupState } from "../components/Setup";
+import { SetupNotice, useSetupState } from "../components/Setup";
 
 const FILTERS: { key: string; label: string; match: (o: Outcome) => boolean }[] = [
   { key: "active", label: "Active", match: (o) => ["planning", "running", "awaiting_approval", "needs_input", "attention", "blocked"].includes(o.status) },
@@ -42,11 +42,11 @@ export function OutcomesPage() {
   const select = (id: string) => navigate(`/w/${ws.id}/outcomes/${id}`);
   const close = () => navigate(`/w/${ws.id}/outcomes`);
 
-  if (!outcomes.isLoading && all.length === 0 && !setup.ready) {
+  if (!outcomeId && !outcomes.isLoading && !setup.loading && all.length === 0 && !setup.ready) {
     return (
       <>
         <div className="page-head"><h1>Outcomes</h1></div>
-        <div className="page-body"><SetupChecklist /></div>
+        <div className="page-body"><SetupNotice /></div>
       </>
     );
   }

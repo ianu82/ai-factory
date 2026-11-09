@@ -6,6 +6,7 @@ import { api, type Credential, type Repo, type Settings, type Workspace } from "
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { ago } from "../format";
+import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
 
 const SECTIONS = [
@@ -181,7 +182,11 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
   const [editing, setEditing] = useState(!c.configured);
   const [busy, setBusy] = useState(false);
   const admin = ws.role === "owner" || ws.role === "admin";
-  const refresh = () => { qc.invalidateQueries({ queryKey: ["credentials", ws.id] }); qc.invalidateQueries({ queryKey: ["models", ws.id] }); };
+  const refresh = () => Promise.all([
+    qc.invalidateQueries({ queryKey: ["credentials", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["models", ws.id] }),
+    qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+  ]);
   const saveKey = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
@@ -190,7 +195,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
       setValue("");
       setEditing(false);
       toast(r.status === "valid" ? `${c.label} connected` : `${c.label} saved, but the test failed: ${r.detail}`, r.status !== "valid");
-      refresh();
+      await refresh();
     } catch (err) {
       toast((err as Error).message, true);
     } finally {
@@ -202,7 +207,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
     try {
       const r = await api<Credential>(`/api/workspaces/${ws.id}/credentials/${c.kind}/test`, { method: "POST" });
       toast(r.status === "valid" ? r.detail || "Working" : r.detail || "Test failed", r.status !== "valid");
-      refresh();
+      await refresh();
     } finally {
       setBusy(false);
     }
@@ -210,7 +215,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
   const remove = async () => {
     if (!confirm(`Remove the ${c.label} credential? Running work using it will fail.`)) return;
     await api(`/api/workspaces/${ws.id}/credentials/${c.kind}`, { method: "DELETE" });
-    refresh();
+    await refresh();
   };
   const tone = c.status === "valid" ? "good" : c.status === "invalid" ? "bad" : c.configured ? "warn" : "idle";
   return (
@@ -288,7 +293,10 @@ function Repositories() {
       setName("");
       setReview(null);
       setAdding(false);
-      qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
+        qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+      ]);
     } catch (err) {
       toast((err as Error).message, true);
     } finally {
@@ -371,7 +379,10 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
         release: { mode: form.release_mode || undefined, health_url: form.health_url || undefined },
       } } });
       toast("Repository saved");
-      qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
+        qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+      ]);
     } catch (err) {
       toast((err as Error).message, true);
     }
@@ -380,7 +391,10 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
     if (!confirm(`Disconnect ${repo.full_name}? Past outcomes keep their history.`)) return;
     try {
       await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "DELETE" });
-      qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
+        qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+      ]);
     } catch (err) {
       toast((err as Error).message, true);
     }
