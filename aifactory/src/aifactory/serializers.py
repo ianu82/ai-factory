@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from .models import Artifact, Decision, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace
 
 
@@ -56,14 +58,28 @@ def plan(p: Plan) -> dict[str, Any]:
             "approved_by": p.approved_by, "approved_at": ts(p.approved_at), "created_at": ts(p.created_at)}
 
 
+def outcome_sources(db: Session, outcomes: list[Outcome]) -> dict[str, Signal]:
+    signal_ids = {outcome.signal_id for outcome in outcomes if outcome.signal_id}
+    if not signal_ids:
+        return {}
+    return {signal.id: signal for signal in db.query(Signal).filter(
+        Signal.id.in_(signal_ids), Signal.source == "linear_issue")}
+
+
 def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None = None,
-            open_decisions: int = 0) -> dict[str, Any]:
+            open_decisions: int = 0, source_signal: Signal | None = None) -> dict[str, Any]:
     tasks = tasks if tasks is not None else []
     runs = runs or []
     done = sum(1 for t in tasks if t.status == "completed")
     return {"id": o.id, "number": o.number, "title": o.title, "brief": o.brief, "acceptance": o.acceptance,
             "repo_ids": o.repo_ids, "harness": o.harness, "status": o.status, "priority": o.priority,
             "source": o.source, "summary": o.summary, "blocked_reason": o.blocked_reason,
+            "linear_issue": {"id": source_signal.external_id,
+                             "identifier": (source_signal.data or {}).get("identifier"),
+                             "url": source_signal.url} if source_signal is not None
+                            and source_signal.source == "linear_issue"
+                            and source_signal.workspace_id == o.workspace_id
+                            and source_signal.id == o.signal_id else None,
             "created_by": o.created_by, "created_at": ts(o.created_at), "updated_at": ts(o.updated_at),
             "completed_at": ts(o.completed_at), "progress": {"done": done, "total": len(tasks)},
             "cost_usd": round(sum(r.cost_usd for r in runs), 4), "cost_known": all(r.cost_known for r in runs),

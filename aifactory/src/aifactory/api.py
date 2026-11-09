@@ -526,6 +526,14 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
     if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running"])).first():
         raise HTTPException(409, "Work is running on this repository")
     MemoryService(workspace_id, repo_id).delete_repository_entries(session=db, actor=user.id)
+    workspace = db.get(Workspace, workspace_id)
+    config = (workspace.settings or {}).get("linear")
+    if config and repo_id in config.get("repo_ids", []):
+        config = {**config, "repo_ids": [value for value in config["repo_ids"] if value != repo_id]}
+        if not config["repo_ids"]:
+            config["enabled"] = False
+        linear_config.save_config(db, workspace, linear_config.LinearConfig.model_validate(config), user.id,
+                                  commit=False)
     db.delete(repo)
     db.commit()
     return {"ok": True}
@@ -564,7 +572,9 @@ def list_outcomes(workspace_id: str, status: str = "", limit: int = 200, user: U
         query = query.filter(Outcome.status.in_(status.split(",")))
     rows = query.order_by(Outcome.updated_at.desc()).limit(min(limit, 500)).all()
     tasks, runs, decisions = _outcome_rows(db, [o.id for o in rows])
-    return [S.outcome(o, tasks.get(o.id, []), runs.get(o.id, []), decisions.get(o.id, 0)) for o in rows]
+    sources = S.outcome_sources(db, rows)
+    return [S.outcome(o, tasks.get(o.id, []), runs.get(o.id, []), decisions.get(o.id, 0),
+                      sources.get(o.signal_id)) for o in rows]
 
 
 @router.post("/workspaces/{workspace_id}/outcomes")
@@ -601,7 +611,8 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
     open_count = sum(1 for d in decisions if d.status == "open")
     return {
-        "outcome": S.outcome(o, tasks, runs, open_count) | {"created_by_name": users.get(o.created_by or "", "")},
+        "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
+                   | {"created_by_name": users.get(o.created_by or "", "")},
         "repositories": [{"id": rid, "full_name": repos.get(rid, "?")} for rid in o.repo_ids],
         "plans": [S.plan(p) for p in plans],
         "tasks": [S.task(t, [r for r in runs if r.task_id == t.id], repos.get(t.repo_id, "")) for t in tasks],
@@ -1001,6 +1012,10 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
     sig = db.get(Signal, signal_id)
     if sig is None or sig.workspace_id != workspace_id:
         raise HTTPException(404, "Signal not found")
+    if sig.source == "linear_issue":
+        if body.action == "accept" and sig.outcome_id:
+            return S.signal(sig)
+        raise HTTPException(409, "Linear signals are managed by configured Linear intake")
     if body.action == "ignore":
         sig.status = "ignored"
         db.commit()
