@@ -279,3 +279,69 @@ def test_delegated_resolve_can_target_one_task_of_an_outcome(monkeypatch):
         assert s.get(Task, ids["T1"]).status == "queued"
         assert s.get(Task, ids["T3"]).status == "awaiting_approval"
         assert s.query(Decision).filter(Decision.task_id == ids["T3"]).one().status == "open"
+
+
+def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkeypatch):
+    from aifactory.models import Decision, Plan, Task
+
+    def boot(config):
+        monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
+
+        async def run():
+            ws_id = apply_bootstrap()
+            for _ in range(20):  # declared outcomes are admitted by a background task
+                await asyncio.sleep(0)
+            return ws_id
+
+        return asyncio.run(run())
+
+    base = {"organization": "Acme", "workspace": "Delivery", "repositories": [{"full_name": "acme/app"}]}
+    ws_id = boot(base)
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app", config={})
+        s.add(repo)
+        s.flush()
+        ids = {}
+        for number, status in ((7, "queued"), (8, "running"), (9, "interrupted"), (10, "interrupted"),
+                               (11, "with_pr")):
+            o = Outcome(workspace_id=ws_id, number=number, title=f"Intake {number}", repo_ids=[repo.id],
+                        status="running", source="signal")
+            s.add(o)
+            s.flush()
+            plan = Plan(outcome_id=o.id, status="approved", content={})
+            s.add(plan)
+            s.flush()
+            # An interrupted task is persisted as queued but keeps its resumption markers.
+            first = Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T1", title="First",
+                         repo_id=repo.id, status=status if status in ("queued", "running") else "queued")
+            if status in ("interrupted", "with_pr"):
+                first.stage, first.attempt = "verify", 1
+            if status == "with_pr":
+                first.pr_number = 42
+            s.add_all([first,
+                       Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T2", title="Second",
+                            repo_id=repo.id, status="pending", depends_on=["T1"])])
+            ids[number] = o.id
+        s.add(Decision(workspace_id=ws_id, outcome_id=ids[7], kind="question", title="Planner question", body=""))
+
+    boot({**base, "cancel": ["#7", "#8", "#9", "#99", {"outcome": 10, "discard_started": True},
+                             {"outcome": 11, "discard_started": True}],
+          "outcomes": [{"key": "mind-v1", "title": "Mind v1", "brief": "Thin slice.", "priority": 0,
+                        "repositories": ["acme/app"]},
+                       {"key": "other", "title": "Other", "priority": 9, "repositories": ["acme/app"]}]})
+    with session_scope() as s:
+        idle = s.get(Outcome, ids[7])
+        assert idle.status == "cancelled"
+        assert {t.status for t in s.query(Task).filter(Task.outcome_id == idle.id)} == {"cancelled"}
+        assert [d.status for d in s.query(Decision).filter(Decision.outcome_id == idle.id)] == ["superseded"]
+        # Only the explicit form discards started work, and never where a pull request is open.
+        assert s.get(Outcome, ids[10]).status == "cancelled"
+        assert {t.status for t in s.query(Task).filter(Task.outcome_id == ids[10])} == {"cancelled"}
+        # Work in flight (running, or interrupted by a restart and queued to resume) is never stopped.
+        for number, first in ((8, "running"), (9, "queued"), (11, "queued")):
+            busy = s.get(Outcome, ids[number])
+            assert busy.status == "running"
+            assert {t.key: t.status for t in s.query(Task).filter(Task.outcome_id == busy.id)} == {
+                "T1": first, "T2": "pending"}
+        declared = {o.title: o.priority for o in s.query(Outcome).filter(Outcome.source == "operator")}
+        assert declared == {"Mind v1": 0, "Other": 2}

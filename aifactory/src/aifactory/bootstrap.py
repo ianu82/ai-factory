@@ -114,22 +114,48 @@ def apply_bootstrap() -> str | None:
 
 
 def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
-    """Operator cancellation of declared outcomes (e.g. an accidental duplicate)."""
+    """Operator cancellation of outcomes: a declared key (e.g. an accidental duplicate), or "#N" for outcome
+    number N from any source (e.g. an intake outcome replaced by a re-scoped one). "#N" applies only while no
+    task has ever started (no attempt, stage, start or PR; an interrupted task is persisted as queued with
+    those markers), so it never discards work in flight; otherwise it is skipped and logged.
+
+    {"outcome": N, "discard_started": true} is the explicit form that also discards started work. It runs
+    before the orchestrator starts, so no task is live in this process; outcomes with a pull request are
+    still refused (closing PRs belongs to the app's own cancel)."""
     if not keys:
         return
     from .events import record
-    from .models import Outcome, Task
+    from .models import Decision, Outcome, Task
 
     with session_scope() as s:
         for key in keys:
-            outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
-                                              Outcome.signal_id == f"operator:{key}").first()
+            discard = isinstance(key, dict) and key.get("discard_started") is True
+            if isinstance(key, dict):
+                key = f"#{key.get('outcome')}"
+            key = str(key)
+            by_number = key.startswith("#") and key[1:].isdigit()
+            query = s.query(Outcome).filter(Outcome.workspace_id == workspace_id)
+            outcome = (query.filter(Outcome.number == int(key[1:])) if by_number
+                       else query.filter(Outcome.signal_id == f"operator:{key}")).first()
             if outcome is None or outcome.status in ("completed", "cancelled", "partially_completed"):
                 continue
+            tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
+            started = [t.key for t in tasks if t.status not in ("pending", "queued", "cancelled")
+                       or t.attempt or t.stage or t.started_at is not None or t.pr_number]
+            with_prs = [t.key for t in tasks if t.pr_number and t.status != "completed"]
+            if by_number and (with_prs or (started and not discard)):
+                log.error("Not cancelling #%s: %s", outcome.number,
+                          f"open pull requests on {', '.join(with_prs)}" if with_prs
+                          else f"work has started on {', '.join(started)}")
+                continue
             outcome.status = "cancelled"
-            for t in s.query(Task).filter(Task.outcome_id == outcome.id, Task.status != "completed"):
-                t.status = "cancelled"
-            record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number} (declared key {key})",
+            for t in tasks:
+                if t.status != "completed":
+                    t.status = "cancelled"
+            for d in s.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open"):
+                d.status = "superseded"  # as the app's own cancel does: a stale answer must not restart work
+            how = "" if by_number else f" (declared key {key})"
+            record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number}{how}",
                    outcome_id=outcome.id, actor="operator", level="warn", session=s)
 
 
@@ -246,6 +272,11 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
         db.close()
 
 
+def _priority(value) -> int:
+    """0 urgent .. 3 low, as in the app; anything else is the default 2."""
+    return value if type(value) is int and 0 <= value <= 3 else 2
+
+
 async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) -> None:
     """Operator-declared work (idempotent by key): visible in the app with source "operator"."""
     if connecting is not None:
@@ -271,7 +302,7 @@ async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) ->
                 continue
             outcome = outcome_from_text(db, workspace_id, None, item["title"], item.get("brief", ""), [r.id for r in repos],
                                         acceptance=item.get("acceptance") or [], harness=item.get("harness"),
-                                        source="operator", signal_id=marker)
+                                        source="operator", signal_id=marker, priority=_priority(item.get("priority")))
             record(workspace_id, "outcome_declared", f"Operator-declared outcome #{outcome.number} admitted",
                    outcome_id=outcome.id, session=db, data={"key": key})
         db.commit()
