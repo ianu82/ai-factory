@@ -259,7 +259,7 @@ class Orchestrator:
             return
         self._last_signal_sync = time.monotonic()
         from ..db import SessionLocal
-        from ..github import GitHubError, resolve_token
+        from ..github import GitHubError, resolve_credential as resolve_token
         from ..models import Repository
         from ..signals import sync_github
         from ..linear_intake import sync_linear

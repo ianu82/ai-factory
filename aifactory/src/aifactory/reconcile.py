@@ -12,7 +12,7 @@ import logging
 
 from .db import session_scope
 from .events import notify, record
-from .github import GitHub, GitHubError, resolve_token
+from .github import GitHub, GitHubError, resolve_credential as resolve_token
 from .models import Decision, Repository, Task
 
 log = logging.getLogger(__name__)

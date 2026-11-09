@@ -16,6 +16,7 @@ import httpx
 
 from .db import session_scope
 from .models import Secret
+from .github_app import InstallationCredential, installation_id
 from .security import decrypt
 
 API = "https://api.github.com"
@@ -51,7 +52,22 @@ class GitHubError(RuntimeError):
         self.status = status
 
 
+def resolve_credential(workspace_id: str) -> str | InstallationCredential:
+    """Capture an installation binding, not an expiring token, for long-running work."""
+    installation = installation_id(workspace_id)
+    if installation is not None:
+        return InstallationCredential(workspace_id, installation)
+    return resolve_token(workspace_id)
+
+
+def workspace_client(workspace_id: str) -> GitHub:
+    return GitHub(resolve_credential(workspace_id))
+
+
 def resolve_token(workspace_id: str) -> str:
+    installation = installation_id(workspace_id)
+    if installation is not None:
+        return InstallationCredential(workspace_id, installation).resolve()
     with session_scope() as s:
         sec = s.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == "github_token").one_or_none()
         if sec is not None and sec.status != "invalid":
@@ -64,7 +80,9 @@ def resolve_token(workspace_id: str) -> str:
     return token
 
 
-def git_auth_env(token: str) -> dict[str, str]:
+def git_auth_env(token: str | InstallationCredential) -> dict[str, str]:
+    if isinstance(token, InstallationCredential):
+        token = token.resolve()
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     return {
         "GIT_CONFIG_COUNT": "1",
@@ -72,6 +90,12 @@ def git_auth_env(token: str) -> dict[str, str]:
         "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
         "GIT_TERMINAL_PROMPT": "0",
     }
+
+
+async def fresh_git_auth_env(token: str | InstallationCredential) -> dict[str, str]:
+    if isinstance(token, InstallationCredential):
+        return await asyncio.to_thread(git_auth_env, token)
+    return git_auth_env(token)
 
 
 @dataclass
@@ -85,16 +109,32 @@ class CheckSummary:
 
 
 class GitHub:
-    def __init__(self, token: str):
+    def __init__(self, token: str | InstallationCredential):
         self.token = token
 
-    def _headers(self) -> dict[str, str]:
+    @property
+    def installation_bound(self) -> bool:
+        return isinstance(self.token, InstallationCredential)
+
+    async def _fresh_headers(self) -> dict[str, str]:
+        if self.installation_bound:
+            token = await asyncio.to_thread(self.token.resolve)
+            return self._headers_for(token)
+        return self._headers()
+
+    @staticmethod
+    def _headers_for(token: str) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "ai-factory",
         }
+
+    def _headers(self) -> dict[str, str]:
+        if self.installation_bound:
+            raise GitHubError("Installation headers require refreshable authentication")
+        return self._headers_for(self.token)
 
     async def request(self, method: str, path: str, *, json: Any = None, params: dict | None = None,
                       ok: tuple[int, ...] = (200, 201, 204), retries: int = 3) -> Any:
@@ -103,11 +143,17 @@ class GitHub:
         for attempt in range(retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.request(method, url, headers=self._headers(), json=json, params=params)
+                    response = await client.request(method, url, headers=await self._fresh_headers(), json=json, params=params)
                 if response.status_code in ok:
                     if response.status_code == 204 or not response.content:
                         return {}
                     return response.json()
+                if self.installation_bound:
+                    if response.status_code in (401, 403, 404):
+                        self.token.invalidate()
+                    # Never echo provider messages for installation credentials.
+                    raise GitHubError(f"GitHub App {method} request failed ({response.status_code}). Manage GitHub access.",
+                                      response.status_code)
                 message = _message(response)
                 retryable = response.status_code >= 500 or (
                     response.status_code in (403, 429) and ("rate limit" in message.lower() or "secondary" in message.lower())
@@ -126,6 +172,13 @@ class GitHub:
         """GET-only checks. Repository roles and accepted-permissions are not token grants."""
         from .credential_diagnostics import result
 
+        if self.installation_bound:
+            if repository:
+                await self.repo(repository)
+            else:
+                await self.accessible_repos_page(per_page=1)
+            return result("github_verified", "valid")
+
         permissions = [{"permission": name, "required": level, "state": "unverified", "evidence": "not_verified",
                         "instruction": PERMISSION_INSTRUCTION} for name, level in REQUIRED_PERMISSIONS.items()]
         metadata: dict[str, Any] = {"permissions": permissions}
@@ -140,7 +193,7 @@ class GitHub:
 
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
             async def get(path: str) -> httpx.Response:
-                return await client.get(API + path, headers=self._headers(), params={"per_page": 1})
+                return await client.get(API + path, headers=await self._fresh_headers(), params={"per_page": 1})
 
             try:
                 me = await get("/user")
@@ -214,7 +267,21 @@ class GitHub:
         return await self.request("GET", "/user")
 
     async def repo(self, full_name: str) -> dict[str, Any]:
-        return await self.request("GET", f"/repos/{full_name}")
+        data = await self.request("GET", f"/repos/{full_name}")
+        if self.installation_bound:
+            # Public repository metadata can be readable even when a repository
+            # is outside the installation selection. Only listing membership
+            # proves access; PAT-style permissions.push is absent for Apps.
+            page = 1
+            while True:
+                accessible = await self.accessible_repos_page(page)
+                if any(r["full_name"].casefold() == data["full_name"].casefold() for r in accessible["items"]):
+                    break
+                if accessible["next_page"] is None:
+                    raise GitHubError("Repository is not available to this installation. Manage GitHub access.", 404)
+                page = accessible["next_page"]
+            data = {**data, "permissions": {**(data.get("permissions") or {}), "push": True}}
+        return data
 
     async def repository_author_permission(self, full_name: str, author: str) -> str | None:
         """Current repository access, never issue association or label ownership.
@@ -242,34 +309,26 @@ class GitHub:
         repos: list[dict[str, Any]] = []
         page = 1
         while len(repos) < limit:
-            batch = await self.request("GET", "/user/repos", params={"per_page": 100, "page": page, "sort": "pushed"})
-            if not batch:
+            result = await self.accessible_repos_page(page)
+            repos.extend(result["items"])
+            if result["next_page"] is None:
                 break
-            repos.extend(batch)
-            if len(batch) < 100:
-                break
-            page += 1
-        return [
-            {
-                "full_name": r["full_name"],
-                "default_branch": r.get("default_branch") or "main",
-                "private": r.get("private", False),
-                "description": r.get("description") or "",
-                "can_push": bool((r.get("permissions") or {}).get("push")),
-                "pushed_at": r.get("pushed_at"),
-            }
-            for r in repos[:limit]
-        ]
+            page = result["next_page"]
+        return repos[:limit]
 
     async def accessible_repos_page(self, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-        batch = await self.request("GET", "/user/repos", params={
-            "per_page": per_page, "page": page, "sort": "pushed",
-        })
+        path = "/installation/repositories" if self.installation_bound else "/user/repos"
+        params = {"per_page": per_page, "page": page}
+        if not self.installation_bound:
+            params["sort"] = "pushed"
+        data = await self.request("GET", path, params=params)
+        batch = data["repositories"] if self.installation_bound else data
         return {
             "items": [{
                 "full_name": r["full_name"], "default_branch": r.get("default_branch") or "main",
                 "private": r.get("private", False), "description": r.get("description") or "",
-                "can_push": bool((r.get("permissions") or {}).get("push")), "pushed_at": r.get("pushed_at"),
+                "can_push": self.installation_bound or bool((r.get("permissions") or {}).get("push")),
+                "pushed_at": r.get("pushed_at"),
             } for r in batch],
             "next_page": page + 1 if len(batch) == per_page else None,
         }
@@ -408,9 +467,11 @@ class GitHub:
         policy = review_policy({"review": policy})
         if policy["address"] == "off":
             return []
-        identity = await self.user()
+        # Installation tokens have no /user identity. The PR author is already
+        # excluded by normalization; bot comments are filtered independently.
+        identity = {"login": ""} if self.installation_bound else await self.user()
         pull = await self.pull(full_name, number)
-        if not identity.get("login") or not (pull.get("user") or {}).get("login"):
+        if (not self.installation_bound and not identity.get("login")) or not (pull.get("user") or {}).get("login"):
             raise GitHubError("GitHub review identity is unavailable")
         return normalize_feedback(reviews=await self.reviews(full_name, number),
                                   threads=await self.review_threads(full_name, number),
@@ -434,6 +495,7 @@ class GitHub:
 
     async def checks(self, full_name: str, sha: str) -> CheckSummary:
         checks: list[dict[str, Any]] = []
+        actions_loaded = False
         try:
             runs = await self.request("GET", f"/repos/{full_name}/commits/{sha}/check-runs", params={"per_page": 100})
         except GitHubError as exc:
@@ -441,7 +503,13 @@ class GitHub:
                 raise
             runs = {"check_runs": []}
             checks.extend(await self._actions_checks(full_name, sha))
-        statuses = await self.request("GET", f"/repos/{full_name}/commits/{sha}/status")
+            actions_loaded = True
+        if self.installation_bound:
+            statuses = {}
+            if not actions_loaded:
+                checks.extend(await self._actions_checks(full_name, sha))
+        else:
+            statuses = await self.request("GET", f"/repos/{full_name}/commits/{sha}/status")
         for run in runs.get("check_runs", []):
             checks.append({
                 "name": run["name"],
@@ -475,6 +543,8 @@ class GitHub:
         return CheckSummary(state, checks)
 
     async def set_status(self, full_name: str, sha: str, state: str, description: str, target_url: str = "") -> None:
+        if self.installation_bound:
+            return  # Verification evidence lives in Factory and the PR; no Commit statuses grant.
         body = {"state": state, "context": "ai-factory/verification", "description": description[:140]}
         if target_url.startswith("https://"):
             body["target_url"] = target_url
@@ -494,7 +564,7 @@ class GitHub:
             return check.get("summary", "")
         try:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(f"{API}/repos/{full_name}/actions/jobs/{check['id']}/logs", headers=self._headers())
+                response = await client.get(f"{API}/repos/{full_name}/actions/jobs/{check['id']}/logs", headers=await self._fresh_headers())
             if response.status_code == 200:
                 return response.text[-limit:]
         except httpx.TransportError:
