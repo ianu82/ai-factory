@@ -82,6 +82,7 @@ def init_engine(url: str | None = None) -> Engine:
 
     Base.metadata.create_all(_engine)
     _add_missing_columns(_engine)
+    _migrate_benchmark_trial_link(_engine)
     harden_data_dir()
     return _engine
 
@@ -101,6 +102,29 @@ def _add_missing_columns(engine: Engine) -> None:
                     continue
                 kind = column.type.compile(dialect=engine.dialect)
                 conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {kind}'))
+
+
+def _migrate_benchmark_trial_link(engine: Engine) -> None:
+    """create_all does not add indexes/constraints to an existing runs table.
+
+    SQLite cannot add a foreign key without rebuilding the table; PostgreSQL can.
+    New SQLite databases get the constraint from the model as usual.
+    """
+    from sqlalchemy import inspect, text
+
+    from .models import Run
+
+    with engine.begin() as conn:
+        for index in Run.__table__.indexes:
+            if index.name == "ix_runs_benchmark_trial_id":
+                index.create(conn, checkfirst=True)
+        if engine.dialect.name == "postgresql":
+            keys = inspect(conn).get_foreign_keys("runs")
+            if not any(k["constrained_columns"] == ["benchmark_trial_id"] for k in keys):
+                conn.execute(text(
+                    "ALTER TABLE runs ADD CONSTRAINT fk_runs_benchmark_trial_id "
+                    "FOREIGN KEY (benchmark_trial_id) REFERENCES benchmark_trials (id)"
+                ))
 
 
 def harden_data_dir() -> None:
