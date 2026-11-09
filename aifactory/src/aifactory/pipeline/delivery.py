@@ -59,13 +59,13 @@ class TaskRunner:
             verdict = attempt.get("verdict") or {}
             if attempt.get("result") == "verification_failed" and verdict:
                 notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
-                for c in verdict.get("criteria", []):
+                for c in verdict.get("criteria") or []:
                     if c.get("status") != "pass":
                         notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
-                for f in verdict.get("findings", []):
+                for f in verdict.get("findings") or []:
                     if f.get("severity") in ("blocker", "major"):
                         notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
-            elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks", [])):
+            elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks") or []):
                 for c in attempt["checks"]:
                     if not c.get("ok"):
                         notes.append(f"- In an earlier attempt, check `{c.get('command')}` failed (exit {c.get('exit_code')})"
@@ -1086,12 +1086,12 @@ def _actionable(attempt: dict[str, Any]) -> bool:
     """Whether an attempt's record gives the next attempt something concrete to fix."""
     result = attempt.get("result")
     if result == "checks_failed":
-        return any(not c.get("ok") for c in attempt.get("checks", []))
+        return any(not c.get("ok") for c in attempt.get("checks") or [])
     if result == "policy":
         return bool(attempt.get("detail"))
     if result == "verification_failed":
-        verdict = attempt.get("verdict") or {}
-        return (any(c.get("status") != "pass" for c in verdict.get("criteria", []))
+        verdict = attempt.get("verdict") or {}  # optional report fields may be null
+        return (any(c.get("status") != "pass" for c in verdict.get("criteria") or [])
                 or bool(verdict.get("findings")))
     return False
 
