@@ -372,7 +372,9 @@ class TaskRunner:
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
                     attempt=attempt, writable=False,
-                    prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks)
+                    prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
+                                         precedents(self.ws, self.repo.id),
+                                         guidance_history(self.task.outcome_id, self.task_id))
                     + brief), self.cancelled)
                 if app is not None:
                     await self._store_app_evidence(app, attempt, run.id)

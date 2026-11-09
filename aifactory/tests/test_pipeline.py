@@ -239,13 +239,24 @@ def test_builder_question_reaches_a_person_and_answer_resumes(factory):
             heard.append(True)
         return good_builder([m for m in messages if "Guidance from your team" not in str(m.get("content"))])
 
+    verifier_heard = []
+
+    def listening_verifier(messages):
+        if step(messages) == 0:
+            prompt = messages[1]["content"]
+            verifier_heard.append("## What people decided or asked for on this work" in prompt
+                                  and "Use 'Hello, Factory!'" in prompt)
+        return passing_verifier(messages)
+
     ScriptedModel.scripts["builder"] = listening_builder
+    ScriptedModel.scripts["verifier"] = listening_verifier
     db = SessionLocal()
     resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "answer",
             comment="Use 'Hello, Factory!'", reusable=True, scope="workspace")
     db.close()
     assert drive(lambda: outcome_status(outcome_id) == "completed")
     assert heard, "the answer was not delivered to the builder"
+    assert verifier_heard and all(verifier_heard), "the verifier must judge by the same decisions as the builder"
     with session_scope() as s:
         precedent = s.get(Decision, decision_id)
         assert precedent.reusable and precedent.scope == "workspace"
