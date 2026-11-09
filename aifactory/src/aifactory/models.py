@@ -496,3 +496,57 @@ class ScorerAttempt(Base):
     cost_known: Mapped[bool] = mapped_column(Boolean, default=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MergeRegret(Base):
+    """One immutable source fact; feedback and fix links are canonical here."""
+
+    __tablename__ = "merge_regrets"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"), index=True)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    source_key: Mapped[str] = mapped_column(String(500))
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    merge_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reporter: Mapped[str] = mapped_column(String(200))
+    url: Mapped[str] = mapped_column(String(2000), default="")
+    source_signal_id: Mapped[str | None] = mapped_column(ForeignKey("signals.id"), nullable=True)
+    signal_id: Mapped[str | None] = mapped_column(ForeignKey("signals.id"), nullable=True)
+    fix_outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
+    fix_url: Mapped[str] = mapped_column(String(2000), default="")
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "task_id", "kind", "source_key", name="uq_regret_source"),
+        Index("ix_regrets_scope_time", "workspace_id", "repo_id", "occurred_at"),
+    )
+
+
+class GateVerdict(Base):
+    """Session-level evidence. Metrics must collapse sessions by task and gate."""
+
+    __tablename__ = "gate_verdicts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"), index=True)
+    gate: Mapped[str] = mapped_column(String(100))
+    attempt: Mapped[int] = mapped_column(Integer)
+    candidate_key: Mapped[str] = mapped_column(String(64))
+    candidate_fingerprint: Mapped[str] = mapped_column(String(200), default="")
+    head_sha: Mapped[str] = mapped_column(String(64), default="")
+    session_key: Mapped[str] = mapped_column(String(200), default="")
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
+    verdict: Mapped[str] = mapped_column(String(10))
+    at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "task_id", "gate", "attempt", "candidate_key", "session_key",
+                         name="uq_gate_candidate_session"),
+        Index("ix_gate_scope", "workspace_id", "gate", "verdict"),
+    )
