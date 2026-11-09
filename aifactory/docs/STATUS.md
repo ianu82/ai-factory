@@ -95,6 +95,7 @@ repository's policy reserves for a person.
 | #263 (02:44) | #13 T6 searchable repository selection | Merge approval only | Assisted (merge approval only) |
 | #255 (02:48) | #12 T5 delivery metrics | Three review rounds | Assisted |
 | #265 (03:36) | #14 T3 restart-safe Linear intake | One review round | Assisted |
+| #268 (04:10) | #14 T6 Linear settings, source links and decision anchors in the web app | Merge approval only | Assisted (merge approval only) |
 
 Every merge followed the same rule: the Factory was waiting on a person, CI and the Factory's verification
 were green, and the reviewer bot found nothing on the final commit. Leftover threads were answered with where
@@ -136,7 +137,7 @@ the fix is before being resolved.
 | F01 Codex qualification | Unattended delivery done | PR #17 |
 | F18 Anton unattended delivery | Done, including independent rejection of a defective candidate | PR #18 |
 | F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 (native), #8 (Anton, unattended); Codex ran on MindsHub in #195 |
-| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | Overnight 8–9 Nov: twelve Factory-built PRs merged into `ai-factory` (#212, #237, #218, #214, #213, #251, #259, #231, #261, #263, #255, #265), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
+| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | Overnight 8–9 Nov: thirteen Factory-built PRs merged into `ai-factory` (#212, #237, #218, #214, #213, #251, #259, #231, #261, #263, #255, #265, #268), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
 | F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18, #25/#26 |
 | F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by repository, lockfiles and setup; setup skipped on a hit, saved after a clean miss, older ones pruned | Live: checkpoint saved in #8 (11 s); both parallel tasks of #9 booted their own VM from it in 6–9 s with setup skipped |
 | F04 Coding model choice | Models per role from the provider's live list | — |
