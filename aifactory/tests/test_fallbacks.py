@@ -135,3 +135,15 @@ def test_renaming_the_bootstrap_workspace_keeps_it_and_the_marker_cannot_be_set(
         assert s.get(Workspace, other).settings["concurrency"] == 3
     with pytest.raises(GitHubError):
         resolve_token(other)
+
+
+def test_renaming_the_organization_keeps_the_bootstrap_workspace(monkeypatch, operator_keys):
+    cfg = {"organization": "Factory Ops", "workspace": "Factory"}
+    boot_id = boot(monkeypatch, cfg)
+    with db.session_scope() as s:  # MindsHub sign-in renames the organization to its upstream name
+        s.get(Organization, s.get(Workspace, boot_id).org_id).name = "MindsDB Inc."
+    assert boot(monkeypatch, cfg) == boot_id
+    assert resolve_token(boot_id) == "operator-github-secret"
+    with db.session_scope() as s:  # no replacement organization or workspace was created
+        assert s.query(Organization).filter(Organization.name == "Factory Ops").count() == 0
+        assert s.query(Workspace).count() == 1
