@@ -164,11 +164,16 @@ class Patch:
 async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     """Everything the job changed relative to the base commit (committed or not)."""
     out_file = f"{SCRATCH}/candidate.patch"
-    # The patch goes to a file (exec output is clipped); numstat comes back on stdout.
+    # Keep publication rename-free so excluded attachment paths cannot leak as
+    # rename sources. Policy size statistics still recognize ordinary renames.
+    stats_file = f"{SCRATCH}/candidate.numstat"
+    # File data goes through backend-neutral reads (exec output is clipped).
+    paths = "-- . ':(top,exclude).factory/attachments' ':(top,exclude).factory/attachments/**'"
     script = (
         f"set -e; mkdir -p {SCRATCH}; git add -A >/dev/null; "
-        f"git -c core.quotepath=off diff --cached --binary --no-color {base_sha} > {out_file}; "
-        f"git -c core.quotepath=off diff --cached --numstat {base_sha}"
+        f"git -c core.quotepath=off diff --cached --binary --no-renames --no-color {base_sha} {paths} > {out_file}; "
+        f"git diff --cached --numstat -z --find-renames {base_sha} {paths} > {stats_file}; "
+        f"git -c core.quotepath=off diff --cached --numstat --no-renames {base_sha} {paths}"
     )
     result = await sandbox.exec(script, timeout=180)
     if not result.ok:
@@ -181,8 +186,16 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
         parts = line.split("\t")
         if len(parts) == 3:
             files.append(parts[2])
-            adds += int(parts[0]) if parts[0].isdigit() else 0
-            dels += int(parts[1]) if parts[1].isdigit() else 0
+    stats = iter((await read_bytes(sandbox, stats_file)).split(b"\0"))
+    for record in stats:
+        if not record:
+            continue
+        added, deleted, name = record.split(b"\t", 2)
+        if not name:  # -z rename records carry two additional NUL-delimited names.
+            next(stats)
+            next(stats)
+        adds += int(added) if added.isdigit() else 0
+        dels += int(deleted) if deleted.isdigit() else 0
     return Patch(diff=diff, files=files, additions=adds, deletions=dels)
 
 

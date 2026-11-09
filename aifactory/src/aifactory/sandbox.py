@@ -343,26 +343,15 @@ class LocalSandbox:
         self.write_bytes(relative, content.encode("utf-8"))
 
     def write_bytes(self, relative: str, content: bytes) -> None:
-        path = self.resolve(relative)
-        if path.is_dir():
-            raise SandboxError(f"Is a directory: {relative}")
-        parent = self.resolve(str(path.parent))
-        created: list[Path] = []
-        probe = parent
-        while not probe.exists():
-            created.append(probe)
-            probe = probe.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags, 0o644)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-        if self.uid is not None:
-            for item in [path, *created]:
-                try:
-                    os.lchown(item, self.uid, self.uid)
-                except FileNotFoundError:
-                    pass
+        from .safe_files import safe_write
+
+        # Keep support for absolute paths inside the checkout, but do not resolve symlinks.
+        path = Path(os.path.abspath(self.work / relative))
+        try:
+            rel = path.relative_to(self.work.absolute()).as_posix()
+            safe_write(str(self.work), rel, content, self.uid)
+        except (ValueError, OSError) as exc:
+            raise SandboxError(f"Unsafe sandbox write: {relative}: {exc}") from exc
 
 
 # Backend-neutral file helpers: local sandboxes are synchronous, VM sandboxes asynchronous.

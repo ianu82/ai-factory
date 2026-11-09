@@ -371,9 +371,28 @@ class RailwayVMSandbox:
         return text + (f"\n… [file truncated at {limit:,} bytes]" if len(data) > limit else "")
 
     async def write_bytes_async(self, relative: str, content: bytes) -> None:
+        import inspect
+        import uuid
+
+        from .safe_files import safe_write
+
         path = self.resolve(relative)
-        await self.exec(f"mkdir -p {_quote(str(path.parent))}", timeout=60, cwd="/")
-        await self.bridge.call("write", {"id": self.vm_id, "path": str(path), "base64": base64.b64encode(content).decode()})
+        rel = str(path.relative_to(self.work))
+        # Execute the same descriptor-relative writer in the VM. A bridge write follows
+        # symlinks; checking with a separate command before it would leave a race.
+        transfer = "/tmp/factory-write-" + uuid.uuid4().hex
+        await self.bridge.call("write", {"id": self.vm_id, "path": transfer,
+                                         "base64": base64.b64encode(content).decode()})
+        script = (inspect.getsource(safe_write) + "\nimport os\n"
+                  + "fd = os.open(" + repr(transfer) + ", os.O_RDONLY | os.O_NOFOLLOW)\n"
+                  + "with os.fdopen(fd, 'rb') as f: content = f.read()\n"
+                  + "safe_write(" + repr(str(self.work)) + ", " + repr(rel) + ", content)")
+        try:
+            result = await self.exec("python3 -c " + _quote(script), timeout=120, cwd="/")
+            if not result.ok:
+                raise SandboxError(f"Unsafe sandbox write: {relative}: {result.output[-600:]}")
+        finally:
+            await self.exec("rm -f -- " + _quote(transfer), timeout=60, cwd="/")
 
     async def list_files(self, relative: str, pattern: str = "*") -> list[str]:
         result = await self.exec(f"ls -1 {_quote(str(self.resolve(relative)))}/{pattern} 2>/dev/null || true", timeout=60)
