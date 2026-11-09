@@ -279,3 +279,53 @@ def test_delegated_resolve_can_target_one_task_of_an_outcome(monkeypatch):
         assert s.get(Task, ids["T1"]).status == "queued"
         assert s.get(Task, ids["T3"]).status == "awaiting_approval"
         assert s.query(Decision).filter(Decision.task_id == ids["T3"]).one().status == "open"
+
+
+def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkeypatch):
+    from aifactory.models import Plan, Task
+
+    def boot(config):
+        monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
+
+        async def run():
+            ws_id = apply_bootstrap()
+            for _ in range(20):  # declared outcomes are admitted by a background task
+                await asyncio.sleep(0)
+            return ws_id
+
+        return asyncio.run(run())
+
+    base = {"organization": "Acme", "workspace": "Delivery", "repositories": [{"full_name": "acme/app"}]}
+    ws_id = boot(base)
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app", config={})
+        s.add(repo)
+        s.flush()
+        ids = {}
+        for number, status in ((7, "queued"), (8, "running")):
+            o = Outcome(workspace_id=ws_id, number=number, title=f"Intake {number}", repo_ids=[repo.id],
+                        status="running", source="signal")
+            s.add(o)
+            s.flush()
+            plan = Plan(outcome_id=o.id, status="approved", content={})
+            s.add(plan)
+            s.flush()
+            s.add_all([Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T1", title="First",
+                            repo_id=repo.id, status=status),
+                       Task(workspace_id=ws_id, outcome_id=o.id, plan_id=plan.id, key="T2", title="Second",
+                            repo_id=repo.id, status="pending", depends_on=["T1"])])
+            ids[number] = o.id
+
+    boot({**base, "cancel": ["#7", "#8", "#99"],
+          "outcomes": [{"key": "mind-v1", "title": "Mind v1", "brief": "Thin slice.", "priority": 0,
+                        "repositories": ["acme/app"]},
+                       {"key": "other", "title": "Other", "priority": 9, "repositories": ["acme/app"]}]})
+    with session_scope() as s:
+        idle, busy = s.get(Outcome, ids[7]), s.get(Outcome, ids[8])
+        assert idle.status == "cancelled"
+        assert {t.status for t in s.query(Task).filter(Task.outcome_id == idle.id)} == {"cancelled"}
+        assert busy.status == "running"  # work in flight is never stopped by a number cancel
+        assert {t.key: t.status for t in s.query(Task).filter(Task.outcome_id == busy.id)} == {
+            "T1": "running", "T2": "pending"}
+        declared = {o.title: o.priority for o in s.query(Outcome).filter(Outcome.source == "operator")}
+        assert declared == {"Mind v1": 0, "Other": 2}

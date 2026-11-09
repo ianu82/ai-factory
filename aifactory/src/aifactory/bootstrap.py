@@ -114,7 +114,9 @@ def apply_bootstrap() -> str | None:
 
 
 def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
-    """Operator cancellation of declared outcomes (e.g. an accidental duplicate)."""
+    """Operator cancellation of outcomes: a declared key (e.g. an accidental duplicate), or "#N" for outcome
+    number N from any source (e.g. an intake outcome replaced by a re-scoped one). "#N" never stops work in
+    flight: an outcome with a running task is left alone and logged."""
     if not keys:
         return
     from .events import record
@@ -122,14 +124,21 @@ def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
 
     with session_scope() as s:
         for key in keys:
-            outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
-                                              Outcome.signal_id == f"operator:{key}").first()
+            key = str(key)
+            by_number = key.startswith("#") and key[1:].isdigit()
+            query = s.query(Outcome).filter(Outcome.workspace_id == workspace_id)
+            outcome = (query.filter(Outcome.number == int(key[1:])) if by_number
+                       else query.filter(Outcome.signal_id == f"operator:{key}")).first()
             if outcome is None or outcome.status in ("completed", "cancelled", "partially_completed"):
+                continue
+            if by_number and s.query(Task).filter(Task.outcome_id == outcome.id, Task.status == "running").first():
+                log.error("Not cancelling #%s: it has a running task", outcome.number)
                 continue
             outcome.status = "cancelled"
             for t in s.query(Task).filter(Task.outcome_id == outcome.id, Task.status != "completed"):
                 t.status = "cancelled"
-            record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number} (declared key {key})",
+            how = "" if by_number else f" (declared key {key})"
+            record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number}{how}",
                    outcome_id=outcome.id, actor="operator", level="warn", session=s)
 
 
@@ -246,6 +255,11 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
         db.close()
 
 
+def _priority(value) -> int:
+    """0 urgent .. 3 low, as in the app; anything else is the default 2."""
+    return value if type(value) is int and 0 <= value <= 3 else 2
+
+
 async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) -> None:
     """Operator-declared work (idempotent by key): visible in the app with source "operator"."""
     if connecting is not None:
@@ -271,7 +285,7 @@ async def _declare_outcomes(workspace_id: str, items: list[dict], connecting) ->
                 continue
             outcome = outcome_from_text(db, workspace_id, None, item["title"], item.get("brief", ""), [r.id for r in repos],
                                         acceptance=item.get("acceptance") or [], harness=item.get("harness"),
-                                        source="operator", signal_id=marker)
+                                        source="operator", signal_id=marker, priority=_priority(item.get("priority")))
             record(workspace_id, "outcome_declared", f"Operator-declared outcome #{outcome.number} admitted",
                    outcome_id=outcome.id, session=db, data={"key": key})
         db.commit()
