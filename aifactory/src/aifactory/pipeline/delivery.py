@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
 import time
 from typing import Any, Callable
@@ -17,8 +18,9 @@ from typing import Any, Callable
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
+from ..guided import README_TEMPLATE, outcome_guidance
 from ..github import GitHub, GitHubError, resolve_token
-from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, apply_in_sandbox, checkout,
+from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
@@ -232,7 +234,7 @@ class TaskRunner:
             except SandboxError as exc:
                 self.feedback.append(f"- Could not read your changes: {exc}")
                 continue
-            problem = self._policy_problem(patch)
+            problem = await self._policy_problem(patch)
             if problem:
                 self.feedback.append(problem)
                 self.evidence("attempts", {"n": attempt, "result": "policy", "detail": problem})
@@ -347,9 +349,28 @@ class TaskRunner:
         else:
             self.event("rebased", f"Carried {branch} onto {default} ({main[:8]}) before revising")
 
-    def _policy_problem(self, patch: Patch) -> str:
+    async def _policy_problem(self, patch: Patch) -> str:
         if patch.empty:
             return "- No changes were made to the repository. Implement the task (write the code), then finish."
+        with session_scope() as s:
+            guidance = outcome_guidance(s, self.outcome.workspace_id, self.outcome.id)
+        if guidance and guidance.get("template") == README_TEMPLATE:
+            # Fail closed: one root README only, never a nested README or another repository.
+            rejection = "- The guided README example may change only the existing root README in the selected repository (README.md if none exists)."
+            if self.task.repo_id != guidance.get("repo_id") or self.repo.id != guidance.get("repo_id"):
+                return rejection
+            try:
+                # Read the trusted mirror at the candidate's base, not the builder's
+                # working tree: deleting/renaming a README must not expand scope.
+                tree = await git("ls-tree", "--name-only", "-z", self.task.base_sha,
+                                 cwd=_mirror_path(self.repo.full_name))
+            except GitError:
+                return rejection + " Could not establish the base repository's README."
+            readmes = [name for name in tree.split("\0")
+                       if re.fullmatch(r"README(?:\.(?:md|markdown|mdown|rst|txt|adoc))?", name, re.IGNORECASE)]
+            allowed = readmes or ["README.md"]
+            if len(patch.files) != 1 or patch.files[0] not in allowed:
+                return rejection
         protected = list(self.cfg.get("protected_paths") or []) + DEFAULT_PROTECTED
         bad = protected_violations(patch.files, protected)
         if bad:

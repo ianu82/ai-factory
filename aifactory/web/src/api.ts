@@ -349,6 +349,7 @@ export interface Plan {
 }
 
 export interface OutcomeDetail {
+  guidance: { template: "readme-contributing"; repo_id: string } | null;
   attachments: Artifact[];
   outcome: Outcome;
   repositories: { id: string; full_name: string }[];

@@ -11,6 +11,7 @@ import { AutonomyStep } from "./AutonomyStep";
 import { TeamStep } from "./TeamStep";
 import { FirstOutcomeStep } from "./FirstOutcomeStep";
 import { RepositoryStep } from "./RepositoryStep";
+import { CopySetupPrompt } from "../components/Setup";
 
 export function Onboarding() {
   const { ws, me } = useWs();
@@ -56,6 +57,7 @@ export function Onboarding() {
       <header className="onboarding-header">
         <div><span className="mono">FACTORY / WORKSPACE SETUP</span><strong>{ws.name}</strong><span className="muted">{ws.org_name} · {ws.role}</span></div>
         <div className="onboarding-header-actions">
+          <CopySetupPrompt />
           <button className="btn" disabled={busy} onClick={leave}>Leave for now</button>
           <button className="btn ghost" disabled={busy} onClick={signOut}>Sign out</button>
         </div>
