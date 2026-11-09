@@ -36,16 +36,9 @@ only for the decisions that need a person.
 
 ```mermaid
 flowchart LR
-    A[Outcome] --> B[Plan]
-    B --> C[Build]
-    C --> D[Checks]
-    D --> E[Independent verification]
-    E --> F[Pull request + CI]
-    F --> G[Merge]
-    G --> H[Smoke test]
-    D -. failures feed the next attempt .-> C
-    E -. findings feed the next attempt .-> C
-    F -. CI logs feed the next attempt .-> C
+    A[Outcome] --> B[Plan] --> C[Build] --> D[Check & verify] --> E[PR + CI] --> F[Merge] --> G[Smoke test]
+    D -. findings .-> C
+    E -. CI failures .-> C
 ```
 
 1. **Plan.** You describe an outcome. The planner reads the connected repositories and
