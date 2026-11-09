@@ -299,7 +299,7 @@ def _land_on_main(factory, path, content):
 
 def _event_kinds(outcome_id):
     with session_scope() as s:
-        return [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+        return [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id).order_by(Event.id)]
 
 
 def _request_changes_after_main_moves(factory, move):
@@ -815,7 +815,7 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
     assert "a.txt" in tree and "b.txt" in tree
     with session_scope() as s:
-        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id).order_by(Event.id)]
     assert "revalidate" in kinds, "second merge should have rebased onto the first"
 
 
@@ -1123,7 +1123,7 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
     with session_scope() as s:
         tasks = s.query(Task).filter(Task.outcome_id == outcome_id).all()
         assert outcome_status(outcome_id) == "completed", [(t.key, t.status, t.blocked_reason) for t in tasks]
-        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id).order_by(Event.id)]
         assert "rebuild_after_base_moved" in kinds
         rebuilt = [t for t in tasks if (t.evidence or {}).get("rebase_rebuilds")]
         assert len(rebuilt) == 1 and rebuilt[0].attempt == 2
@@ -1199,7 +1199,7 @@ def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
     assert sum("Closes #7" in b for b in bodies) == 1, bodies
     assert FakeGitHub.issues_state.get(7) == "closed"
     with session_scope() as s:
-        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id)]
+        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id).order_by(Event.id)]
     assert "issue_closed" in kinds and "issue_close_failed" not in kinds
 
 
