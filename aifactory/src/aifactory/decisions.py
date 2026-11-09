@@ -18,6 +18,14 @@ class DecisionError(ValueError):
     pass
 
 
+
+def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """Evidence for a task whose attempt counter restarts at 0: attempt numbers are reused, so the epoch moves on
+    and earlier records (kept for their review findings) no longer count as this budget's attempts."""
+    ev = {k: v for k, v in (evidence or {}).items() if k not in ("attempt_base", "auto_retries")}
+    ev["budget_epoch"] = int(ev.get("budget_epoch", 0)) + 1
+    return ev
+
 def resolve(db: Session, decision: Decision, user: User, resolution: str, comment: str = "",
             reusable: bool = False, scope: str = "item") -> dict[str, Any]:
     if decision.status != "open":
@@ -85,8 +93,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             guidance(comment or "A reviewer requested changes before merging.")
             task.status, task.stage, task.attempt = "queued", "revise", 0
             # A requested revision is a fresh budget: earlier rounds' offsets and automatic retries do not carry over.
-            task.evidence = {k: v for k, v in (task.evidence or {}).items()
-                             if k not in ("attempt_base", "auto_retries")}
+            task.evidence = fresh_budget(task.evidence)
     elif kind == "budget" and task:
         if resolution == "retry":
             ev = dict(task.evidence or {})
@@ -100,8 +107,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             if resolution == "retry":
                 if task.status == "failed":
                     task.attempt = 0
-                    task.evidence = {k: v for k, v in (task.evidence or {}).items()
-                                     if k not in ("attempt_base", "auto_retries")}
+                    task.evidence = fresh_budget(task.evidence)
                     task.stage = "" if not task.pr_number else "revise"
                 guidance(comment)
                 task.status, task.blocked_reason = "queued", ""
