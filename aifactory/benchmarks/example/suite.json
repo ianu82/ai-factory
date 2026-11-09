@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "example",
+  "tasks": [
+    {
+      "key": "example-hello",
+      "repository": "example-not-production/illustrative-only",
+      "base_commit": "0000000000000000000000000000000000000000",
+      "title": "Illustration only: add a greeting",
+      "specification": "This is not an executable production benchmark. Replace the example repository and all-zero placeholder base commit with your own stored values before loading. Add a greeting function returning Hello, world!.",
+      "acceptance": ["The greeting function returns exactly Hello, world!."]
+    }
+  ]
+}

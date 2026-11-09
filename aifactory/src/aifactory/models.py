@@ -23,6 +23,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
 )
+from sqlalchemy import event, inspect
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base, utcnow
@@ -195,6 +196,60 @@ class Task(Base):
     __table_args__ = (UniqueConstraint("outcome_id", "key"),)
 
 
+class BenchmarkSuite(Base):
+    """An immutable, workspace-local snapshot. Changed content creates a new revision."""
+
+    __tablename__ = "benchmark_suites"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    revision: Mapped[int] = mapped_column(Integer)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    tasks: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", "revision"),
+        UniqueConstraint("workspace_id", "name", "content_hash"),
+    )
+
+
+@event.listens_for(BenchmarkSuite, "before_update")
+def _immutable_benchmark_suite(_mapper, _connection, suite: BenchmarkSuite) -> None:
+    if any(inspect(suite).attrs[key].history.has_changes() for key in (
+        "workspace_id", "name", "revision", "schema_version", "content_hash", "tasks",
+    )):
+        raise ValueError("Benchmark suite snapshots are immutable; load a new revision instead")
+
+
+class BenchmarkTrial(Base):
+    """Reserved execution record; loading/importing suites never executes a trial."""
+
+    __tablename__ = "benchmark_trials"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    suite_id: Mapped[str] = mapped_column(ForeignKey("benchmark_suites.id"), index=True)
+    suite_revision: Mapped[int] = mapped_column(Integer)
+    task_key: Mapped[str] = mapped_column(String(100))
+    trial_number: Mapped[int] = mapped_column(Integer)
+    harness: Mapped[str] = mapped_column(String(20), default="")
+    model: Mapped[str] = mapped_column(String(100), default="")
+    config_version: Mapped[str] = mapped_column(String(64), default="")
+    configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    checks: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    verifier: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Run(Base):
     """One agent session (planner, builder, verifier) and what it cost."""
 
@@ -203,6 +258,9 @@ class Run(Base):
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"), index=True)
     task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
+    benchmark_trial_id: Mapped[str | None] = mapped_column(
+        ForeignKey("benchmark_trials.id", name="fk_runs_benchmark_trial_id"), nullable=True, index=True,
+    )
     role: Mapped[str] = mapped_column(String(20))  # planner|builder|verifier
     harness: Mapped[str] = mapped_column(String(20))
     provider: Mapped[str] = mapped_column(String(20), default="")
