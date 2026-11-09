@@ -59,14 +59,14 @@ export function PullRequestsPage() {
         <span className="spacer" />
         <button className="btn sm" onClick={refresh} disabled={refreshing}><RefreshCw /> {refreshing ? "Checking…" : "Refresh"}</button>
       </div>
+      <div className="toolbar" role="tablist" aria-label="Filter pull requests">
+        {FILTERS.map(([key, label]) => (
+          <button key={key} role="tab" aria-selected={filter === key} className={`chip ${filter === key ? "on" : ""}`} onClick={() => setFilter(key)}>
+            {label}
+          </button>
+        ))}
+      </div>
       <div className="page-body">
-        <div className="pr-filters" role="tablist" aria-label="Filter pull requests">
-          {FILTERS.map(([key, label]) => (
-            <button key={key} role="tab" aria-selected={filter === key} className={`chip ${filter === key ? "on" : ""}`} onClick={() => setFilter(key)}>
-              {label}
-            </button>
-          ))}
-        </div>
         {!!q.data?.errors.length && (
           <div className="pr-error" role="status">
             {q.data.errors.every((e) => /\(401\)|Bad credentials/.test(e))

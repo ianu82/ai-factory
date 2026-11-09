@@ -184,7 +184,7 @@ export interface Outcome {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
-  progress: { done: number; total: number };
+  progress: { done: number; total: number; started?: number; active?: number };
   cost_usd: number;
   cost_known: boolean;
   open_decisions: number;

@@ -73,6 +73,10 @@ def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None 
     tasks = tasks if tasks is not None else []
     runs = runs or []
     done = sum(1 for t in tasks if t.status == "completed")
+    # "started": tasks that have left the queue (ran, are running, or wait on a person); with none started, the
+    # outcome is planned but every task is still waiting for a free slot or for its dependencies.
+    started = sum(1 for t in tasks if t.status not in ("pending", "queued") or t.attempt or t.pr_number)
+    active = sum(1 for t in tasks if t.status == "running")
     return {"id": o.id, "number": o.number, "title": o.title, "brief": o.brief, "acceptance": o.acceptance,
             "repo_ids": o.repo_ids, "harness": o.harness, "status": o.status, "priority": o.priority,
             "source": o.source, "summary": o.summary, "blocked_reason": o.blocked_reason,
@@ -83,7 +87,8 @@ def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None 
                             and source_signal.workspace_id == o.workspace_id
                             and source_signal.id == o.signal_id else None,
             "created_by": o.created_by, "created_at": ts(o.created_at), "updated_at": ts(o.updated_at),
-            "completed_at": ts(o.completed_at), "progress": {"done": done, "total": len(tasks)},
+            "completed_at": ts(o.completed_at), "progress": {"done": done, "total": len(tasks),
+                                                         "started": started, "active": active},
             "cost_usd": round(sum(r.cost_usd for r in runs), 4), "cost_known": all(r.cost_known for r in runs),
             "open_decisions": open_decisions,
             "prs": [{"number": t.pr_number, "url": t.pr_url, "task": t.key} for t in tasks if t.pr_url],
