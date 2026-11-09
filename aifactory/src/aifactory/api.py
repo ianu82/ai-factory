@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from . import attachments as A
 from . import insights, linear_config
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
@@ -26,7 +27,7 @@ from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
-                     Secret, Signal, Task, User, Workspace)
+                     Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
 from .repo_detect import detect
@@ -540,6 +541,46 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
     return {"ok": True}
 
 
+# --- staged attachments -----------------------------------------------------------
+class AttachmentUpload(BaseModel):
+    name: str = Field(min_length=1, max_length=1000)
+    content: str
+
+
+@router.post("/workspaces/{workspace_id}/attachments")
+def upload_attachment(workspace_id: str, body: AttachmentUpload, user: User = Depends(current_user),
+                      db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    try:
+        name, data = A.validate_upload(body.name, body.content)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        A.check_staged_quota(db, workspace_id, user.id, data["size_bytes"])
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(413, str(exc)) from exc
+    row = Artifact(workspace_id=workspace_id, kind="attachment", name=name, content=body.content,
+                   data={**data, "uploaded_by": user.id})
+    db.add(row)
+    db.commit()
+    return S.artifact(row)
+
+
+@router.delete("/workspaces/{workspace_id}/attachments/{attachment_id}")
+def delete_attachment(workspace_id: str, attachment_id: str, user: User = Depends(current_user),
+                      db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    # A conditional delete cannot race an outcome's conditional claim.
+    deleted = A.staged_query(db, workspace_id, user.id).filter(Artifact.id == attachment_id).delete(
+        synchronize_session=False)
+    A.cleanup_staged(db)
+    db.commit()
+    if not deleted:
+        raise HTTPException(404, "Attachment not found")
+    return {"ok": True}
+
+
 # --- outcomes ---------------------------------------------------------------------
 class OutcomeCreate(BaseModel):
     title: str = Field(min_length=3, max_length=300)
@@ -548,6 +589,7 @@ class OutcomeCreate(BaseModel):
     repo_ids: list[str] = Field(min_length=1)
     harness: str | None = None
     priority: int = 2
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 def _outcome_rows(db: Session, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
@@ -587,8 +629,29 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
         raise HTTPException(400, "Unknown repository")
     if body.harness and body.harness not in ("native", "codex", "anton"):
         raise HTTPException(400, "Unknown harness")
+    try:
+        uploads = A.validate_staged(db, workspace_id, user.id, body.attachment_ids)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # Claim before creating any outcome/events. The conditional UPDATE serializes
+    # competing submissions on both SQLite and Postgres; a loser rolls back all claims.
+    claim_id = new_id()
+    claimed = A.staged_query(db, workspace_id, user.id).filter(Artifact.id.in_(body.attachment_ids)).update(
+        {Artifact.outcome_id: claim_id}, synchronize_session=False)
+    if claimed != len(uploads):
+        db.rollback()
+        raise HTTPException(409, "Attachment is no longer available")
     outcome = outcome_from_text(db, workspace_id, user, body.title, body.brief, [r.id for r in repos],
                                 acceptance=body.acceptance, harness=body.harness, priority=max(0, min(body.priority, 3)))
+    if uploads:
+        db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.outcome_id == claim_id).update(
+            {Artifact.outcome_id: outcome.id}, synchronize_session=False)
+        record(workspace_id, "attachments_added", f"{user.name or user.email} added {len(uploads)} attachments",
+               outcome_id=outcome.id, actor=user.id,
+               data={"ids": [a.id for a in uploads], "names": [a.name for a in uploads], "count": len(uploads)}, session=db)
+    A.cleanup_staged(db)
     db.commit()
     orchestrator.wake()
     return S.outcome(outcome, [], [])
@@ -615,6 +678,9 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
                    | {"created_by_name": users.get(o.created_by or "", "")},
         "repositories": [{"id": rid, "full_name": repos.get(rid, "?")} for rid in o.repo_ids],
+        "attachments": [S.artifact(a) for a in db.query(Artifact).filter(
+            Artifact.workspace_id == workspace_id, Artifact.outcome_id == o.id, Artifact.kind == "attachment")
+            .order_by(Artifact.created_at, Artifact.id)],
         "plans": [S.plan(p) for p in plans],
         "tasks": [S.task(t, [r for r in runs if r.task_id == t.id], repos.get(t.repo_id, "")) for t in tasks],
         "runs": [S.run(r) for r in runs],
@@ -732,6 +798,14 @@ def artifact(workspace_id: str, artifact_id: str, user: User = Depends(current_u
     a = db.get(Artifact, artifact_id)
     if a is None or a.workspace_id != workspace_id:
         raise HTTPException(404, "Artifact not found")
+    if a.kind == "attachment":
+        if a.outcome_id is None:
+            if (a.data or {}).get("uploaded_by") != user.id or a.created_at <= utcnow() - A.STAGED_TTL:
+                raise HTTPException(404, "Artifact not found")
+        else:
+            outcome = db.get(Outcome, a.outcome_id)
+            if outcome is None or outcome.workspace_id != workspace_id:
+                raise HTTPException(404, "Artifact not found")
     return S.artifact(a, content=True)
 
 

@@ -1,13 +1,21 @@
-"""Dependency-free validation of stored image containers before model hand-off.
+"""Bounded image validation before storage and model hand-off.
 
 Do not treat magic bytes as validation: walk complete, bounded records and require
 image data and dimensions. PNG additionally checks CRCs and its compressed pixels.
-These checks are not a replacement for a viewer's hardened image decoder.
+Pillow verifies and fully decodes the stream after the container checks.
 """
 from __future__ import annotations
 
+import io
 import struct
+import warnings
 import zlib
+
+from PIL import Image
+
+# Fixed process-wide budget; warnings are promoted locally during validation.
+Image.MAX_IMAGE_PIXELS = 50_000_000
+MAX_DECODED_BYTES = 128 * 1024 * 1024
 
 
 def _require(condition: bool) -> None:
@@ -17,8 +25,10 @@ def _require(condition: bool) -> None:
 
 def validate_image(raw: bytes, mime: str) -> None:
     try:
+        _check_dimensions(raw, mime)
         {"image/png": _png, "image/jpeg": _jpeg, "image/gif": _gif,
          "image/webp": _webp}[mime](raw)
+        _fully_decode(raw, mime)
     except (IndexError, struct.error, zlib.error) as exc:
         raise ValueError("Invalid attachment image content") from exc
 
@@ -210,3 +220,42 @@ def _webp(raw: bytes) -> None:
             _webp(b"RIFF" + (len(body) + 4).to_bytes(4, "little") + b"WEBP" + body)
             images += 1
     _require(pos == len(raw) and images > 0)
+
+
+def _check_dimensions(raw: bytes, mime: str) -> None:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as image:
+                _require(image.get_format_mimetype() == mime)
+                width, height = image.size
+                _require(0 < width * height <= Image.MAX_IMAGE_PIXELS)
+                _require(width * height * max(4, len(image.getbands())) <= MAX_DECODED_BYTES)
+    except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombWarning,
+            Image.DecompressionBombError) as exc:
+        raise ValueError("Invalid attachment image content") from exc
+
+
+def _fully_decode(raw: bytes, mime: str) -> None:
+    """Container checks alone cannot prove an encoded raster stream is valid."""
+    formats = {"image/png": "PNG", "image/jpeg": "JPEG", "image/gif": "GIF", "image/webp": "WEBP"}
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as image:
+                _require(image.format == formats[mime])
+                width, height = image.size
+                _require(0 < width * height <= Image.MAX_IMAGE_PIXELS)
+                _require(width * height * max(4, len(image.getbands())) <= MAX_DECODED_BYTES)
+                image.verify()
+            with Image.open(io.BytesIO(raw)) as image:
+                total_pixels = 0
+                # Validate every animation frame and bound cumulative decode work.
+                for frame in range(getattr(image, "n_frames", 1)):
+                    image.seek(frame)
+                    total_pixels += image.width * image.height
+                    _require(total_pixels <= Image.MAX_IMAGE_PIXELS)
+                    image.load()
+    except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombWarning,
+            Image.DecompressionBombError) as exc:
+        raise ValueError("Invalid attachment image content") from exc

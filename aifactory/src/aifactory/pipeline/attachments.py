@@ -42,7 +42,7 @@ def _decode(artifact: Artifact) -> tuple[bytes, str]:
         mime = "application/pdf"
     else:
         try:
-            text = raw.decode("utf-8")
+            text = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
             text = None
         # Code examples inside references are data, not HTML documents.
@@ -88,7 +88,7 @@ async def prepare_attachments(sandbox, workspace_id: str, outcome_id: str) -> tu
         if mime in IMAGE_TYPES:
             images.append({"name": original_name, "mime_type": mime, "content": base64.b64encode(raw).decode("ascii")})
         if mime in TEXT_TYPES:
-            text = raw.decode("utf-8")
+            text = raw.decode("utf-8-sig")
             excerpt = text[:min(PER_FILE, remaining)]
             remaining -= len(excerpt)
             # JSON string quoting prevents reference text from forging delimiter lines.
