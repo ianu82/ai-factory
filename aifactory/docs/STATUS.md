@@ -113,8 +113,9 @@ the fix is before being resolved.
   precedents now apply only to their repository; before, they leaked to every repository.
 - **Pull requests page** (#253): unresolved review threads mean Needs attention, and Factory revisions show as
   In progress. **Signals** (#252): check notes are proposed only for checks the repository still runs.
-- **One automatic retry round** (#258, in review at the time of writing): when attempts run out on concrete,
-  relayed findings, the Factory retries once with a fresh budget before asking a person.
+- **One automatic retry round** (#258): when attempts run out on concrete findings that the feedback relays
+  (unmet criteria, blocker/major findings, failed checks, required runtime QA failures), the Factory retries once
+  with a fresh budget before asking a person. Settings → Throughput and limits sets the number of rounds (0–3).
 
 ### Operator mistakes, owned
 
