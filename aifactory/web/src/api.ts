@@ -75,6 +75,15 @@ export interface Settings {
   linear?: LinearConfig;
 }
 
+export interface ModelCheckResult {
+  provider: string | null;
+  roles: Record<"planner" | "builder" | "verifier", {
+    model: string;
+    status: "supported" | "unsupported" | "unknown";
+    explanation: string;
+  }>;
+}
+
 export interface Workspace {
   id: string;
   name: string;

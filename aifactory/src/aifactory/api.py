@@ -26,6 +26,7 @@ from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
+from .model_checks import check_workspace_models
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
@@ -345,6 +346,12 @@ async def models(workspace_id: str, user: User = Depends(current_user), db: Sess
         return {"provider": provider.provider, "label": provider.label, "models": names}
     except InferenceError as exc:
         return {"provider": None, "models": [], "error": str(exc)}
+
+
+@router.post("/workspaces/{workspace_id}/models/check")
+async def check_models(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id, "admin")
+    return await check_workspace_models(workspace_id, merged_settings(ws.settings or {}))
 
 
 # --- memory -----------------------------------------------------------------------

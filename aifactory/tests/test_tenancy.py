@@ -49,7 +49,7 @@ def test_other_organizations_cannot_reach_a_workspace_or_its_objects(client):
 
     routes = [
         ("patch", "", {"name": "x"}), ("get", "/members", None), ("get", "/credentials", None),
-        ("put", "/credentials/github_token", {"value": "ghp_xxxxxxxxxxxxxxxx"}), ("get", "/models", None),
+        ("put", "/credentials/github_token", {"value": "ghp_xxxxxxxxxxxxxxxx"}), ("get", "/models", None), ("post", "/models/check", None),
         ("get", "/repositories", None), ("patch", f"/repositories/{ids['repo']}", {"config": {"context": "x"}}),
         ("delete", f"/repositories/{ids['repo']}", None), ("get", "/outcomes", None),
         ("post", "/outcomes", {"title": "xyz", "brief": "y", "repo_ids": [ids["repo"]]}), ("get", f"/outcomes/{ids['outcome']}", None),
@@ -177,3 +177,23 @@ def test_staged_attachment_quota_is_per_uploader_and_workspace(client, signed_in
     # The original uploader also has independent capacity in another workspace.
     assert client.post(f"/api/workspaces/{other_ws}/attachments", json=body).status_code == 200
     assert client.post(root + "/attachments", json=body).status_code == 413
+
+
+def test_model_checks_require_workspace_admin(client, signed_in, monkeypatch):
+    from aifactory import model_checks
+    from aifactory.models import Membership
+
+    def forbidden(*args):
+        raise AssertionError("Authorization must happen before provider access")
+
+    monkeypatch.setattr(model_checks, "resolve_provider", forbidden)
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        member = s.query(Membership).filter(Membership.workspace_id == ws_id).one()
+        member.role = "member"
+    assert client.post(f"/api/workspaces/{ws_id}/models/check").status_code == 403
+    with session_scope() as s:
+        s.query(Membership).filter(Membership.workspace_id == ws_id).one().role = "viewer"
+    assert client.post(f"/api/workspaces/{ws_id}/models/check").status_code == 403
+    client.post("/auth/logout")
+    assert client.post(f"/api/workspaces/{ws_id}/models/check").status_code == 401
