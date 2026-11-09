@@ -16,12 +16,13 @@ from . import insights, linear_config
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .config import get_settings
+from .credential_diagnostics import MESSAGES, safe_metadata, test_models
 from .db import get_db, utcnow
 from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
 from .github import GitHub, GitHubError, resolve_token
 from .harness import capabilities
-from .inference import PROVIDERS, InferenceError, ModelClient, ProviderConfig, resolve_provider
+from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
@@ -30,7 +31,7 @@ from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
 from .repo_detect import detect
 from .sandbox import isolation_available
-from .security import encrypt, mask, redact
+from .security import decrypt, encrypt, mask, redact
 from .signals import outcome_from_text, sync_github, upsert_signal
 
 router = APIRouter(prefix="/api")
@@ -226,9 +227,15 @@ def _secret_view(kind: str, sec: Secret | None) -> dict[str, Any]:
               "linear_api_key": "Linear"}
     if sec is None:
         return {"kind": kind, "label": labels[kind], "configured": False, "status": "missing"}
-    return {"kind": kind, "label": labels[kind], "configured": True, "hint": sec.hint, "status": sec.status,
-            "detail": sec.status_detail, "tested_at": S.ts(sec.tested_at), "updated_at": S.ts(sec.updated_at),
-            "metadata": sec.metadata_json or {}}
+    value = decrypt(sec.ciphertext)
+    metadata = safe_metadata(sec.metadata_json or {}, value)
+    detail = MESSAGES.get(metadata.get("diagnostic_code"))
+    if detail is None:
+        detail = (redact(sec.status_detail or "", (value,)) if kind == "linear_api_key"
+                  else "Credential saved. Test it to verify current access.")
+    return {"kind": kind, "label": labels[kind], "configured": True, "hint": mask(value), "status": sec.status,
+            "detail": detail, "tested_at": S.ts(sec.tested_at), "updated_at": S.ts(sec.updated_at),
+            "metadata": metadata}
 
 
 @router.get("/workspaces/{workspace_id}/credentials")
@@ -243,39 +250,19 @@ def credentials(workspace_id: str, user: User = Depends(current_user), db: Sessi
 
 
 async def _test_secret(kind: str, value: str) -> tuple[str, str, dict[str, Any]]:
-    settings = get_settings()
     try:
         if kind == "linear_api_key":
             viewer = await Linear(value).viewer()
             name = redact(viewer["name"], (value,))
             return "valid", redact(f"Connected as {name}", (value,)), {"name": name}
-        if kind == "mindshub_api_key":
-            from .auth import AuthError, mindshub_identity
-
-            try:
-                identity = await mindshub_identity(value)
-            except AuthError as exc:
-                return "invalid", str(exc), {}
-            client = ModelClient(ProviderConfig("mindshub", settings.mindshub_api_base, value, "MindsHub Inference"))
-            models = await client.list_models()
-            return "valid", f"Connected to MindsHub · {len(models)} models available", {
-                "organization_id": identity.get("organization_id"), "organization_name": identity.get("organization_name"),
-                "workspace_id": identity.get("workspace_id"), "models": models[:80]}
-        if kind == "openai_api_key":
-            client = ModelClient(ProviderConfig("openai", settings.openai_api_base, value, "OpenAI"))
-            models = await client.list_models()
-            return "valid", f"Connected to OpenAI · {len(models)} models", {"models": models[:80]}
+        if kind in ("mindshub_api_key", "openai_api_key"):
+            return await test_models(kind, value)
         if kind == "github_token":
-            gh = GitHub(value)
-            me = await gh.user()
-            return "valid", f"Connected as {me.get('login')}", {"login": me.get("login")}
+            return await GitHub(value).diagnose()
     except LinearError as exc:
         return "invalid" if exc.category == "authentication" else "untested", redact(str(exc), (value,)), {}
-    except (InferenceError, GitHubError) as exc:
-        return "invalid", str(exc), {}
-    except Exception as exc:
-        detail = f"Could not test right now: {type(exc).__name__}"
-        return "untested", redact(detail, (value,)) if kind == "linear_api_key" else detail, {}
+    except Exception:
+        return "untested", MESSAGES["service_error"], {"diagnostic_code": "service_error", "test_status": "untested"}
     return "untested", "", {}
 
 
@@ -290,6 +277,8 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
     if kind not in SECRET_KINDS:
         raise HTTPException(404, "Unknown credential")
     value = body.value.strip()
+    if len(value) < 8:
+        raise HTTPException(422, "Invalid credential request")
     if kind == "mindshub_api_key" and not value.startswith("mdb_"):
         raise HTTPException(400, "MindsHub API keys start with mdb_")
     status, detail, metadata = await _test_secret(kind, value)
@@ -299,7 +288,7 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
         db.add(sec)
     sec.ciphertext = encrypt(value)
     sec.hint = mask(value)
-    sec.status, sec.status_detail, sec.metadata_json = status, detail, metadata
+    sec.status, sec.status_detail, sec.metadata_json = status, redact(detail, (value,)), safe_metadata(metadata, value)
     sec.tested_at = utcnow()
     sec.updated_by = user.id
     db.commit()
@@ -309,17 +298,26 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
 
 
 @router.post("/workspaces/{workspace_id}/credentials/{kind}/test")
-async def test_credential(workspace_id: str, kind: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "admin" if kind == "linear_api_key" else "member")
+async def test_credential(workspace_id: str, kind: str,
+                          repository: str | None = Query(default=None, max_length=200,
+                                                        pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"),
+                          user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec is None:
         raise HTTPException(404, "Not configured")
-    from .security import decrypt
-
-    status, detail, metadata = await _test_secret(kind, decrypt(sec.ciphertext))
-    sec.status, sec.status_detail, sec.tested_at = status, detail, utcnow()
-    if metadata:
-        sec.metadata_json = metadata
+    value = decrypt(sec.ciphertext)
+    if kind == "github_token" and repository:
+        status, detail, metadata = await GitHub(value).diagnose(repository)
+    else:
+        status, detail, metadata = await _test_secret(kind, value)
+    # Only transient diagnostic failures retain the last-known-good status.
+    # Definitive rejection must still turn Settings' status indicator red.
+    if not (status == "untested" and sec.status == "valid"
+            and metadata.get("diagnostic_code") in ("network_error", "rate_limited", "service_error")):
+        sec.status = status
+    sec.status_detail, sec.tested_at = redact(detail, (value,)), utcnow()
+    sec.metadata_json = safe_metadata(metadata, value)
     db.commit()
     return _secret_view(kind, sec)
 

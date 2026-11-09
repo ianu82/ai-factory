@@ -46,7 +46,8 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
-        if request.url.path.startswith("/api/workspaces/") and "/credentials/" in request.url.path:
+        if (request.url.path == "/auth/api-key" or
+                request.url.path.startswith("/api/workspaces/") and "/credentials/" in request.url.path):
             return JSONResponse({"detail": "Invalid credential request"}, status_code=422)
         if request.url.path.startswith("/api/workspaces/") and request.url.path.endswith("/linear"):
             return JSONResponse({"detail": "Invalid Linear configuration request"}, status_code=422)
