@@ -45,6 +45,9 @@ class HarnessSession:
     gateway_url: str = ""
     gateway_token: str = ""
     reasoning_effort: str | None = None
+    # Stored originals: {name: filename, mime_type: detected media type, content: base64 bytes}.
+    # Harnesses own provider-specific image delivery/fallback.
+    image_inputs: list[dict[str, str]] = field(default_factory=list)
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()

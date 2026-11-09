@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import { api, type Credential, type Repo, type Settings, type Workspace } from "../api";
 import { useWs } from "../App";
+import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { ago } from "../format";
+import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
 
 const SECTIONS = [
@@ -181,7 +183,11 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
   const [editing, setEditing] = useState(!c.configured);
   const [busy, setBusy] = useState(false);
   const admin = ws.role === "owner" || ws.role === "admin";
-  const refresh = () => { qc.invalidateQueries({ queryKey: ["credentials", ws.id] }); qc.invalidateQueries({ queryKey: ["models", ws.id] }); };
+  const refresh = () => Promise.all([
+    qc.invalidateQueries({ queryKey: ["credentials", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["models", ws.id] }),
+    qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+  ]);
   const saveKey = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
@@ -190,7 +196,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
       setValue("");
       setEditing(false);
       toast(r.status === "valid" ? `${c.label} connected` : `${c.label} saved, but the test failed: ${r.detail}`, r.status !== "valid");
-      refresh();
+      await refresh();
     } catch (err) {
       toast((err as Error).message, true);
     } finally {
@@ -202,7 +208,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
     try {
       const r = await api<Credential>(`/api/workspaces/${ws.id}/credentials/${c.kind}/test`, { method: "POST" });
       toast(r.status === "valid" ? r.detail || "Working" : r.detail || "Test failed", r.status !== "valid");
-      refresh();
+      await refresh();
     } finally {
       setBusy(false);
     }
@@ -210,7 +216,7 @@ function CredentialRow({ c, fallback }: { c: Credential; fallback: boolean }) {
   const remove = async () => {
     if (!confirm(`Remove the ${c.label} credential? Running work using it will fail.`)) return;
     await api(`/api/workspaces/${ws.id}/credentials/${c.kind}`, { method: "DELETE" });
-    refresh();
+    await refresh();
   };
   const tone = c.status === "valid" ? "good" : c.status === "invalid" ? "bad" : c.configured ? "warn" : "idle";
   return (
@@ -254,18 +260,44 @@ function Repositories() {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  const available = useQuery({
-    queryKey: ["github-repos", ws.id], enabled: adding,
-    queryFn: () => api<{ items: { full_name: string; private: boolean; can_push: boolean; description: string }[]; error?: string }>(`/api/workspaces/${ws.id}/github/repos`),
+  const [search, setSearch] = useState("");
+  const [review, setReview] = useState<RepositoryPreview | null>(null);
+  const [commands, setCommands] = useState({ setup: "", checks: "", start: "", deploys: false });
+  useEffect(() => {
+    const timer = setTimeout(() => setSearch(name), 300);
+    return () => clearTimeout(timer);
+  }, [name]);
+  const available = useInfiniteQuery({
+    queryKey: ["github-repos", ws.id, search], enabled: adding && !review && admin,
+    initialPageParam: 1,
+    queryFn: ({ pageParam }) => api<{ items: { full_name: string; private: boolean; can_push: boolean; description: string }[]; error?: string; next_page: number | null }>(repositoryDiscoveryUrl(ws.id, search, pageParam)),
+    getNextPageParam: (page) => page.next_page ?? undefined,
   });
-  const connect = async (full: string) => {
+  const preview = async (full: string) => {
     setBusy(true);
     try {
-      await api(`/api/workspaces/${ws.id}/repositories`, { method: "POST", json: { full_name: full } });
-      toast(`Connected ${full}`);
+      const result = await previewRepository(ws.id, full, api);
+      setReview(result);
+      setCommands({ setup: lines(result.config.setup), checks: lines(result.config.checks), start: result.config.qa?.start || "", deploys: false });
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const connect = async () => {
+    if (!review) return;
+    setBusy(true);
+    try {
+      await connectReviewedRepository(ws.id, review, commands, api);
+      toast(`Connected ${review.full_name}`);
       setName("");
+      setReview(null);
       setAdding(false);
-      qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
+        qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+      ]);
     } catch (err) {
       toast((err as Error).message, true);
     } finally {
@@ -273,7 +305,7 @@ function Repositories() {
     }
   };
   const connected = new Set((repos.data || []).map((r) => r.full_name));
-  const matches = (available.data?.items || []).filter((r) => !connected.has(r.full_name) && r.full_name.toLowerCase().includes(name.toLowerCase())).slice(0, 8);
+  const matches = [...new Map((available.data?.pages.flatMap((page) => page.items) || []).map((r) => [r.full_name, r])).values()].filter((r) => !connected.has(r.full_name));
   return (
     <section className="s-block">
       <div style={{ display: "flex", alignItems: "center" }}>
@@ -283,20 +315,40 @@ function Repositories() {
       <p>The Factory only changes repositories connected here. Setup and checks run in a fresh sandbox for every attempt; smoke runs on the merged result.</p>
       {adding && (
         <div className="cred" style={{ marginBottom: 12 }}>
-          <form onSubmit={(e) => { e.preventDefault(); if (name.includes("/")) connect(name); }} style={{ display: "flex", gap: 8, marginTop: 0 }}>
-            <input className="input" autoFocus placeholder="owner/name or search your repositories" value={name} onChange={(e) => setName(e.target.value)} />
-            <button className="btn primary" disabled={busy || !name.includes("/")}>{busy ? "Connecting…" : "Connect"}</button>
-            <button type="button" className="btn ghost" onClick={() => setAdding(false)}>Cancel</button>
-          </form>
-          {available.data?.error && <div className="err" style={{ marginTop: 8 }}>{available.data.error}</div>}
-          <ul className="rows" style={{ marginTop: 8 }}>
-            {matches.map((r) => (
-              <li key={r.full_name} className="row" style={{ padding: "7px 4px", background: "none", gridTemplateColumns: "minmax(0,1fr) auto" }} onClick={() => r.can_push && connect(r.full_name)}>
-                <div style={{ minWidth: 0 }}><div className="title" style={{ fontWeight: 500 }}>{r.full_name}</div>{r.description && <div className="sub">{r.description}</div>}</div>
-                <span className="meta">{r.can_push ? (r.private ? "private" : "public") : "read-only access"}</span>
-              </li>
-            ))}
-          </ul>
+          {review ? (
+            <form style={{ display: "grid" }} onSubmit={(e) => { e.preventDefault(); connect(); }}>
+              <h3 style={{ overflowWrap: "anywhere" }}>Review {review.full_name} · {review.default_branch}</h3>
+              <p>{(review.config.detected || []).join(", ") || "Stack unknown"}. Review commands before connecting.</p>
+              <div className="s-grid">
+                <label className="field"><span>Setup commands</span><textarea className="textarea mono" value={commands.setup} disabled={busy} onChange={(e) => setCommands({ ...commands, setup: e.target.value })} /></label>
+                <label className="field"><span>Check commands</span><textarea className="textarea mono" value={commands.checks} disabled={busy} onChange={(e) => setCommands({ ...commands, checks: e.target.value })} /></label>
+              </div>
+              <label className="field"><span>Runtime QA start command</span><textarea className="textarea mono" value={commands.start} disabled={busy} onChange={(e) => setCommands({ ...commands, start: e.target.value })} /><span className="hint">{review.config.start_detection?.reason || "Start command unknown."} Leave blank to disable runtime QA. Must listen on $PORT.</span></label>
+              <label className="check"><input type="checkbox" checked={commands.deploys} disabled={busy} onChange={(e) => setCommands({ ...commands, deploys: e.target.checked })} /> This repository deploys when main changes (not automatically detected)</label>
+              <button className="btn primary" disabled={busy}>{busy ? "Connecting…" : "Confirm & connect"}</button>
+              <button type="button" className="btn ghost" disabled={busy} onClick={() => setReview(null)}>Back</button>
+            </form>
+          ) : (
+            <>
+              <form onSubmit={(e) => { e.preventDefault(); if (name.includes("/")) preview(name); }} style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 0 }}>
+                <input className="input" aria-label="Repository name or search" autoFocus placeholder="owner/name or search your repositories" value={name} disabled={busy} onChange={(e) => setName(e.target.value)} />
+                <button className="btn primary" disabled={busy || !name.includes("/")}>{busy ? "Detecting…" : "Preview"}</button>
+                <button type="button" className="btn ghost" disabled={busy} onClick={() => setAdding(false)}>Cancel</button>
+              </form>
+              {(available.data?.pages.find((page) => page.error)?.error || available.error) && <div className="err" role="alert" style={{ marginTop: 8 }}>{available.data?.pages.find((page) => page.error)?.error || available.error?.message}</div>}
+              {available.isLoading && <div role="status">Finding repositories…</div>}
+              <ul className="rows" style={{ marginTop: 8 }}>
+                {matches.map((r) => (
+                  <li key={r.full_name}>
+                    <button type="button" className="btn ghost" style={{ width: "100%", textAlign: "left", whiteSpace: "normal", overflowWrap: "anywhere" }} disabled={busy || !r.can_push} onClick={() => preview(r.full_name)}>
+                      {r.full_name} · {r.can_push ? (r.private ? "private" : "public") : "read-only access"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {available.hasNextPage && <button className="btn ghost" disabled={available.isFetchingNextPage || busy} onClick={() => available.fetchNextPage()}>{available.isFetchingNextPage ? "Loading…" : "Load more repositories"}</button>}
+            </>
+          )}
         </div>
       )}
       {repos.isLoading ? <Skeleton rows={2} /> : (repos.data || []).length === 0 && !adding ? <div className="muted">No repositories yet.</div> :
@@ -328,7 +380,10 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
         release: { mode: form.release_mode || undefined, health_url: form.health_url || undefined },
       } } });
       toast("Repository saved");
-      qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
+        qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+      ]);
     } catch (err) {
       toast((err as Error).message, true);
     }
@@ -337,7 +392,10 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
     if (!confirm(`Disconnect ${repo.full_name}? Past outcomes keep their history.`)) return;
     try {
       await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "DELETE" });
-      qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
+        qc.invalidateQueries({ queryKey: onboardingQueryKey(ws.id) }),
+      ]);
     } catch (err) {
       toast((err as Error).message, true);
     }

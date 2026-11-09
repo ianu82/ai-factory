@@ -387,13 +387,21 @@ class ModelClient:
         return None
 
     async def list_models(self) -> list[str]:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(self.provider.base_url + "/models", headers=self.provider.headers())
-        if response.status_code in (401, 403):
-            raise InferenceError(f"{self.provider.label} refused the credential", status=response.status_code)
-        response.raise_for_status()
-        data = response.json()
-        rows = data.get("data", data if isinstance(data, list) else [])
+        try:
+            async with httpx.AsyncClient(timeout=min(self.timeout, 20.0)) as client:
+                response = await client.get(self.provider.base_url + "/models", headers=self.provider.headers())
+        except httpx.HTTPError:
+            raise InferenceError("Model catalog is unreachable", retryable=True) from None
+        if response.status_code != 200:
+            raise InferenceError("Model catalog request failed", status=response.status_code,
+                                 retryable=response.status_code == 429 or response.status_code >= 500)
+        try:
+            data = response.json()
+        except ValueError:
+            raise InferenceError("Invalid model catalog response", status=502, retryable=True) from None
+        rows = data if isinstance(data, list) else data.get("data") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise InferenceError("Invalid model catalog response", status=502, retryable=True)
         names = []
         for row in rows:
             if isinstance(row, dict) and row.get("id"):

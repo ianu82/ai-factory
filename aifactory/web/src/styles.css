@@ -536,3 +536,57 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
 .shot img { display: block; width: 100%; height: auto; }
 .shot figcaption { font-size: 11.5px; color: var(--muted); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shots:has(.open) { grid-template-columns: 1fr; }
+
+/* Full-page onboarding: reserved content/action regions, no app capture chrome. */
+.onboarding-frame { max-width: 1120px; min-height: 100%; margin: 0 auto; padding: 32px; overflow-wrap: anywhere; }
+.onboarding-header { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; min-height: 104px; border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+.onboarding-header > div:first-child { display: grid; gap: 4px; min-width: 0; flex: 1 1 200px; }
+.onboarding-header strong { font-size: 20px; }
+.onboarding-header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.onboarding-workspace { display: grid; gap: 4px; width: 100%; }
+.onboarding-workspace select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); }
+.onboarding-layout { display: grid; grid-template-columns: 224px minmax(0, 1fr); gap: 40px; padding-top: 32px; }
+.onboarding-nav { min-width: 0; }
+.onboarding-nav ol { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+.onboarding-nav button { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 64px; padding: 10px; text-align: left; border: 1px solid transparent; border-radius: var(--r); }
+.onboarding-nav button[aria-current="step"] { background: var(--teal-soft); border-color: var(--teal); }
+.onboarding-nav button:disabled { opacity: 1; color: var(--muted); }
+.onboarding-nav small { display: block; font-size: 11px; color: var(--muted); }
+.onboarding-main { min-width: 0; display: flex; flex-direction: column; min-height: 540px; }
+.onboarding-content { flex: 1; min-height: 420px; }
+.onboarding-content h1 { font-size: 26px; line-height: 1.25; margin: 16px 0; }
+.onboarding-content h1:focus { outline: 2px solid var(--teal); outline-offset: 4px; border-radius: var(--r); }
+.onboarding-content h2 { font-size: 16px; }
+.onboarding-unavailable { margin-top: 28px; padding: 20px; background: var(--sunken); border: 1px solid var(--line); border-radius: var(--r-lg); }
+.onboarding-message { min-height: 48px; color: var(--bad); padding: 8px 0; }
+.onboarding-message p { margin: 0; }
+.onboarding-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 64px; border-top: 1px solid var(--line); }
+@media (max-width: 700px) {
+  .onboarding-frame { padding: 20px 16px; }
+  .onboarding-layout { grid-template-columns: minmax(0, 1fr); gap: 24px; padding-top: 20px; }
+  .onboarding-nav ol { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+  .onboarding-nav button { min-height: 64px; padding: 8px; gap: 8px; }
+  .onboarding-nav > p { margin-bottom: 0; }
+  .onboarding-main { min-height: 560px; }
+  .onboarding-content { min-height: 440px; }
+  .onboarding-content h1 { font-size: 23px; }
+}
+
+.repository-step { display: grid; gap: 16px; min-width: 0; }
+.repository-step > p { margin: 0; }
+.repository-step .field { min-width: 0; }
+.repository-step .input, .repository-step .textarea { width: 100%; min-width: 0; box-sizing: border-box; }
+.repository-step .btn { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.repository-step .check { align-items: flex-start; min-width: 0; }
+.repository-step .check input { flex: none; margin-top: 3px; }
+.repository-options { list-style: none; margin: 0; padding: 0; }
+.repository-options li { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.repository-options small { display: block; color: var(--muted); }
+.repository-options p { margin: 4px 0 0 24px; }
+.repository-review { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); }
+.repository-review form { display: grid; gap: 16px; }
+.repository-review pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.repository-review h3 { font-size: 14px; }
+.repository-diagnostics { margin-top: 20px; border-top: 1px solid var(--line); }
+.repository-diagnostics ul { padding-left: 20px; }
+.repository-step :is(button, input, textarea):focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }

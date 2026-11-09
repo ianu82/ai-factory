@@ -80,6 +80,8 @@ export interface Repo {
     protected_paths?: string[];
     context?: string;
     detected?: string[];
+    qa?: { start?: string; [key: string]: unknown };
+    start_detection?: { available: boolean; reason: string };
     merge?: { mode?: string; method?: string; revalidate?: boolean };
     release?: { mode?: string; health_url?: string; expect_text?: string };
     require_ci?: boolean;

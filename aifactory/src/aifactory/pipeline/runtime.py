@@ -14,8 +14,9 @@ from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, Message, Outcome, Run, Workspace
+from ..models import Decision, Message, Outcome, Run, Task, Workspace
 from ..sandbox import LocalSandbox
+from .attachments import prepare_attachments
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "provider": "mindshub",
@@ -82,10 +83,38 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
 def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -> list[Decision]:
     """Reusable, attributed human decisions that apply to this workspace (and repository)."""
     with session_scope() as s:
-        rows = (s.query(Decision)
-                .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved", Decision.reusable.is_(True))
-                .order_by(Decision.resolved_at.desc()).limit(limit * 2).all())
-        return [d for d in rows if d.scope in ("workspace", "repository")][:limit]
+        query = (s.query(Decision)
+                 .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved",
+                         Decision.reusable.is_(True), Decision.scope.in_(("workspace", "repository")))
+                 .order_by(Decision.resolved_at.desc(), Decision.id))
+
+        def applicable(rows: list[Decision]) -> list[Decision]:
+            """A repository-scoped decision applies to the repository it was made about (its task's, else its
+            outcome's). Repositories are looked up once per page, not once per decision."""
+            if repo_id is None:
+                return rows
+            scoped = [d for d in rows if d.scope == "repository"]
+            task_ids = {d.task_id for d in scoped if d.task_id}
+            outcome_ids = {d.outcome_id for d in scoped if not d.task_id and d.outcome_id}
+            task_repo = dict(s.query(Task.id, Task.repo_id).filter(Task.id.in_(task_ids)).all()) if task_ids else {}
+            outcome_repos = ({oid: set(repos or []) for oid, repos in
+                              s.query(Outcome.id, Outcome.repo_ids).filter(Outcome.id.in_(outcome_ids)).all()}
+                             if outcome_ids else {})
+            return [d for d in rows if d.scope == "workspace"
+                    or (d.task_id and task_repo.get(d.task_id) == repo_id)
+                    or (not d.task_id and repo_id in outcome_repos.get(d.outcome_id, set()))]
+
+        # Without a repository (planning across an outcome's repositories) every decision applies. Page until
+        # enough apply: other repositories' decisions must not crowd out older applicable ones.
+        found: list[Decision] = []
+        offset, page = 0, max(limit * 4, 20)
+        while len(found) < limit:
+            rows = query.offset(offset).limit(page).all()
+            found += applicable(rows)
+            if len(rows) < page:
+                break
+            offset += page
+        return found[:limit]
 
 
 @dataclass
@@ -123,40 +152,42 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     turns = limits.get(f"{spec.role}_turns", 80)
     harness = get_harness(spec.harness)
     gateway_token = ""
-    if spec.harness == "codex":
-        gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
-                                           provider=provider, ledger=ledger))
-    record(spec.workspace_id, "run_started", f"{harness.label} {spec.role} started on {model}",
-           outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
-           data={"role": spec.role, "harness": spec.harness, "model": model, "provider": provider.provider,
-                 "attempt": spec.attempt})
-    notify(spec.workspace_id, "run", run_id)
-
-    last_progress = {"t": 0.0}
-
-    def on_progress(kind: str, message: str, data: dict[str, Any]) -> None:
-        # Commands, edits and guidance are always journaled; chatter is rate-limited.
-        now = time.monotonic()
-        if kind in ("thought", "tool") and now - last_progress["t"] < 4:
-            return
-        last_progress["t"] = now
-        record(spec.workspace_id, f"agent_{kind}", message, outcome_id=spec.outcome_id, task_id=spec.task_id,
-               run_id=run_id, data={"role": spec.role, **data})
-
-    session = HarnessSession(
-        run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
-        client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
-        deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
-        on_progress=on_progress, take_guidance=take_guidance(spec.outcome_id, spec.task_id),
-        # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.
-        gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
-        gateway_token=gateway_token,
-        reasoning_effort=settings.get("reasoning_effort"),
-    )
     result: HarnessResult | None = None
     error = ""
     status = "succeeded"
     try:
+        if spec.harness == "codex":
+            gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
+                                               provider=provider, ledger=ledger))
+        record(spec.workspace_id, "run_started", f"{harness.label} {spec.role} started on {model}",
+               outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
+               data={"role": spec.role, "harness": spec.harness, "model": model, "provider": provider.provider,
+                     "attempt": spec.attempt})
+        notify(spec.workspace_id, "run", run_id)
+
+        last_progress = {"t": 0.0}
+
+        def on_progress(kind: str, message: str, data: dict[str, Any]) -> None:
+            # Commands, edits and guidance are always journaled; chatter is rate-limited.
+            now = time.monotonic()
+            if kind in ("thought", "tool") and now - last_progress["t"] < 4:
+                return
+            last_progress["t"] = now
+            record(spec.workspace_id, f"agent_{kind}", message, outcome_id=spec.outcome_id, task_id=spec.task_id,
+                   run_id=run_id, data={"role": spec.role, **data})
+
+        session = HarnessSession(
+            run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
+            client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
+            deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
+            on_progress=on_progress, take_guidance=take_guidance(spec.outcome_id, spec.task_id),
+            # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.
+            gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
+            gateway_token=gateway_token,
+            reasoning_effort=settings.get("reasoning_effort"),
+        )
+        context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
+        session.prompt += context
         result = await harness.run(session)
     except asyncio.CancelledError:
         status, error = "cancelled", "Cancelled"

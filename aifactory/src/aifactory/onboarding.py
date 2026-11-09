@@ -87,8 +87,8 @@ def snapshot(db: Session, ws: Workspace) -> OnboardingState:
     github_usable = bool(github and github.status != "invalid") or github_fallback
     repo_connected = db.query(Repository.id).filter(Repository.workspace_id == ws.id).first() is not None
     usable = {"models": model_usable, "github": github_usable, "repositories": repo_connected}
-    # Sign-in's valid status proves identity only. The models metadata is written
-    # by the existing inference validation endpoint, never by this router.
+    # Catalog evidence comes from credential validation (including seeded keys),
+    # never from an identity-only sign-in or this local snapshot.
     validated = {
         "models": bool(model and model.status == "valid" and (model.metadata_json or {}).get("models")),
         "github": bool(github and github.status == "valid" and (github.metadata_json or {}).get("login")),

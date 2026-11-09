@@ -226,3 +226,47 @@ def test_prepared_environments_are_pruned_per_repository(tmp_path, monkeypatch):
     assert sorted(p.name for p in base.iterdir()) == ["aif-env-aaaaaaaa-0000000000000002",
                                                        "aif-env-aaaaaaaa-0000000000000003",
                                                        "aif-env-bbbbbbbb-0000000000000009", "unrelated"]
+
+
+def test_vm_attachment_originals_and_safe_writes(tmp_path, monkeypatch):
+    import stat
+
+    from aifactory.pipeline.attachments import prepare_attachments
+    from aifactory.sandbox import SandboxError, write_bytes
+
+    from .test_attachments import seed_references
+
+    rows = seed_references()
+    bridge = FakeBridge(tmp_path / "attachment-vm")
+    monkeypatch.setattr("aifactory.vm.VMBridge.get", classmethod(lambda cls: bridge))
+
+    async def go():
+        vm = await RailwayVMSandbox.create()
+        context, images = await prepare_attachments(vm, "ws", "out")
+        assert images and "Outcome attachments" in context
+        for aid, name, raw, mime in rows:
+            path = f".factory/attachments/{aid}-{name}"
+            assert await vm.read_bytes_async(path) == raw
+            assert (await vm.exec(f"base64 < {path} | tr -d '\\n'")).output.strip() == base64.b64encode(raw).decode()
+            assert f"MIME: {mime}; decoded size: {len(raw)} bytes; path: {path}" in context
+            await write_bytes(vm, path, b"changed")
+        assert (await prepare_attachments(vm, "ws", "out"))[0] == context
+        file = bridge.root / "work/run.sh"
+        file.write_text("#!/bin/sh\necho old\n")
+        file.chmod(0o755)
+        await write_text(vm, "run.sh", "#!/bin/sh\necho new\n")
+        assert stat.S_IMODE(file.stat().st_mode) == 0o755
+        assert (await vm.exec("./run.sh")).output.strip() == "new"
+        # Both intermediate and leaf symlinks are refused inside the VM.
+        outside = bridge.root / "outside"
+        outside.mkdir()
+        for target in ("escape", "escape-dir"):
+            (bridge.root / "work" / target).symlink_to(outside, target_is_directory=True)
+        for path in ("escape", "escape-dir/leak.txt", "../outside/leak.txt"):
+            with pytest.raises(SandboxError):
+                await write_bytes(vm, path, b"secret")
+        assert list(outside.iterdir()) == []
+        assert "write" in bridge.calls and "exec" in bridge.calls
+        await vm.close()
+
+    asyncio.run(go())

@@ -239,13 +239,24 @@ def test_builder_question_reaches_a_person_and_answer_resumes(factory):
             heard.append(True)
         return good_builder([m for m in messages if "Guidance from your team" not in str(m.get("content"))])
 
+    verifier_heard = []
+
+    def listening_verifier(messages):
+        if step(messages) == 0:
+            prompt = messages[1]["content"]
+            verifier_heard.append("## What people decided or asked for on this work" in prompt
+                                  and "Use 'Hello, Factory!'" in prompt)
+        return passing_verifier(messages)
+
     ScriptedModel.scripts["builder"] = listening_builder
+    ScriptedModel.scripts["verifier"] = listening_verifier
     db = SessionLocal()
     resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "answer",
             comment="Use 'Hello, Factory!'", reusable=True, scope="workspace")
     db.close()
     assert drive(lambda: outcome_status(outcome_id) == "completed")
     assert heard, "the answer was not delivered to the builder"
+    assert verifier_heard and all(verifier_heard), "the verifier must judge by the same decisions as the builder"
     with session_scope() as s:
         precedent = s.get(Decision, decision_id)
         assert precedent.reusable and precedent.scope == "workspace"
@@ -1274,3 +1285,183 @@ def test_reconciliation_leaves_a_task_people_resolved_meanwhile_alone(factory, m
         task = s.get(Task, task_id)
         assert task.status == "abandoned" and task.pr_number == number
         assert s.query(Decision).filter(Decision.task_id == task_id).one().status == "open"
+
+
+def test_all_agent_roles_receive_attachments_and_publish_only_code(factory):
+    import base64
+    import shlex
+
+    from .test_attachments import seed_references
+
+    outcome_id = new_outcome(factory)
+    rows = seed_references(factory["ws"], outcome_id)
+    seen = set()
+
+    def wrap(role, script):
+        def checked(messages):
+            prompt = messages[1]["content"]
+            for aid, name, raw, mime in rows:
+                path = f".factory/attachments/{aid}-{name}"
+                assert name in prompt
+                assert f"MIME: {mime}; decoded size: {len(raw)} bytes; path: {path}" in prompt
+            if step(messages) == 0:
+                seen.add(role)
+                checks = [f'test "$(base64 < {shlex.quote(f".factory/attachments/{aid}-{name}")} | tr -d \'\\n\')" = '
+                          + shlex.quote(base64.b64encode(raw).decode()) for aid, name, raw, _ in rows]
+                if role == "builder":
+                    # Simulate the accidental force-add that gitignore cannot prevent.
+                    checks += ["git add -f .factory/attachments", "printf \"echo 'Hello, Factory!'\\n\" > greet.sh"]
+                return {"content": "", "tool_calls": [call("run", {"command": " && ".join(checks)})]}
+            # The first command must actually have succeeded, not just been requested.
+            tool = next(m for m in messages if m["role"] == "tool")
+            assert "[exit code 0," in tool["content"], tool
+            return script(messages)
+        return checked
+
+    ScriptedModel.scripts = {"planner": wrap("planner", planner_script), "builder": wrap("builder", good_builder),
+                             "verifier": wrap("verifier", passing_verifier)}
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=90)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        branch = task.branch
+    assert seen == {"planner", "builder", "verifier"}
+    assert FakeGitHub.pulls
+    for ref in ("main", branch):
+        tree = git("ls-tree", "-r", "--name-only", ref, cwd=factory["remotes"] / "acme/demo.git")
+        assert ".factory/attachments" not in tree
+        assert "Factory!" in git("show", f"{ref}:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+
+
+@pytest.mark.parametrize("harness_name", ["native", "codex", "anton"])
+def test_shared_agent_hook_rehydrates_every_role_attempt_and_resume(factory, tmp_path, monkeypatch, harness_name):
+    from aifactory.harness import HarnessResult
+    from aifactory.pipeline.runtime import SessionSpec, run_agent
+    from aifactory.sandbox import LocalSandbox
+
+    from .test_attachments import seed_references
+
+    outcome_id = new_outcome(factory)
+    rows = seed_references(factory["ws"], outcome_id)
+    sb = LocalSandbox("retry-refs", root=tmp_path / "retry-refs").create()
+    sb.work.mkdir()
+    prompts = []
+
+    class FakeHarness:
+        label = "Fake non-native harness"
+
+        async def run(self, session):
+            assert len(session.image_inputs) == 1
+            for aid, name, raw, mime in rows:
+                path = f".factory/attachments/{aid}-{name}"
+                assert (sb.work / path).read_bytes() == raw
+                assert f"MIME: {mime}; decoded size: {len(raw)} bytes; path: {path}" in session.prompt
+                sb.write_bytes(path, b"builder-modified copy")
+            prompts.append(session.prompt)
+            return HarnessResult(report={}, turns=1)
+
+    monkeypatch.setattr(runtime, "get_harness", lambda _: FakeHarness())
+
+    async def go():
+        for role, attempt in [("planner", 1), ("builder", 1), ("builder", 1), ("builder", 2),
+                              ("verifier", 1), ("verifier", 2)]:
+            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, role, harness_name,
+                                                            "task", "system", sb, attempt=attempt), asyncio.Event())
+            assert run.status == "succeeded" and result and not error
+        assert len(prompts) == 6 and len(set(prompts)) == 1
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["base64", "symlink", "size", "html",
+                                      "image/png", "image/jpeg", "image/gif", "image/webp", "wrong-mime"])
+def test_attachment_setup_failure_finishes_run_and_revokes_gateway(factory, tmp_path, monkeypatch, failure):
+    from aifactory.models import Artifact
+    from aifactory.pipeline.runtime import SessionSpec, run_agent
+    from aifactory.sandbox import LocalSandbox
+
+    from .test_attachments import attachment
+
+    outcome_id = new_outcome(factory)
+    sb = LocalSandbox("failure", root=tmp_path / "failure").create()
+    sb.work.mkdir()
+    with session_scope() as s:
+        row = attachment(id="broken")
+        row.workspace_id, row.outcome_id = factory["ws"], outcome_id
+        if failure == "base64":
+            row.content = "broken!"
+        elif failure == "size":
+            row.data = {**row.data, "size_bytes": 999}
+        elif failure == "html":
+            import base64
+
+            raw = b"<!doctype html><html>not markdown</html>"
+            row.content = base64.b64encode(raw).decode()
+            row.data = {"mime_type": "text/markdown", "size_bytes": len(raw)}
+        elif failure.startswith("image/") or failure == "wrong-mime":
+            import base64
+
+            from .test_attachments import MALFORMED_IMAGES, PNG
+
+            raw = PNG if failure == "wrong-mime" else MALFORMED_IMAGES[failure]
+            row.content = base64.b64encode(raw).decode()
+            row.data = {"mime_type": "image/jpeg" if failure == "wrong-mime" else failure,
+                        "size_bytes": len(raw)}
+        else:
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            (sb.work / ".factory").symlink_to(outside, target_is_directory=True)
+        s.add(row)
+    granted, revoked = [], []
+    monkeypatch.setattr(runtime, "issue", lambda grant: granted.append(grant.run_id) or "grant")
+    monkeypatch.setattr(runtime, "revoke", revoked.append)
+
+    class NeverHarness:
+        label = "Never"
+
+        async def run(self, session):
+            pytest.fail("invalid attachment reached the harness")
+
+    monkeypatch.setattr(runtime, "get_harness", lambda _: NeverHarness())
+    run, result, error = asyncio.run(run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "codex",
+                                                          "task", "system", sb), asyncio.Event()))
+    assert error and result is None and run.status == "failed" and run.finished_at
+    assert granted == revoked == [run.id]
+    with session_scope() as s:
+        stored = s.get(Run, run.id)
+        assert stored.status == "failed" and stored.finished_at and stored.error == error
+        assert s.query(Event).filter(Event.run_id == run.id, Event.kind == "run_finished").count() == 1
+    if failure == "symlink":
+        assert list(outside.iterdir()) == []
+    else:
+        assert list(sb.work.iterdir()) == []
+
+
+def test_no_attachments_leave_shared_session_unchanged(factory, tmp_path, monkeypatch):
+    from aifactory.harness import HarnessResult
+    from aifactory.pipeline.runtime import SessionSpec, run_agent
+    from aifactory.sandbox import LocalSandbox
+
+    outcome_id = new_outcome(factory)
+    sb = LocalSandbox("no-refs", root=tmp_path / "no-refs").create()
+    sb.work.mkdir()
+
+    class NoAttachmentsHarness:
+        label = "No attachments"
+
+        async def run(self, session):
+            assert session.prompt == "original prompt"
+            assert session.image_inputs == []
+            assert not (sb.work / ".factory/attachments").exists()
+            session.image_inputs.append({"name": "private", "mime_type": "image/png", "content": ""})
+            return HarnessResult(report={}, turns=1)
+
+    monkeypatch.setattr(runtime, "get_harness", lambda _: NoAttachmentsHarness())
+
+    async def go():
+        for _ in range(2):
+            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "anton",
+                                                            "original prompt", "system", sb), asyncio.Event())
+            assert run.status == "succeeded" and result and not error
+
+    asyncio.run(go())

@@ -5,23 +5,24 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from . import insights
+from . import insights, linear_config
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .config import get_settings
+from .credential_diagnostics import MESSAGES, safe_metadata, test_models
 from .db import get_db, utcnow
 from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
 from .github import GitHub, GitHubError, resolve_token
 from .harness import capabilities
-from .inference import PROVIDERS, InferenceError, ModelClient, ProviderConfig, resolve_provider
+from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
@@ -30,7 +31,7 @@ from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
 from .repo_detect import detect
 from .sandbox import isolation_available
-from .security import encrypt, mask, redact
+from .security import decrypt, encrypt, mask, redact
 from .signals import outcome_from_text, sync_github, upsert_signal
 
 router = APIRouter(prefix="/api")
@@ -126,6 +127,8 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
 def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depends(current_user),
                      db: Session = Depends(get_db)):
     ws, _ = _ws(db, user, workspace_id, "admin")
+    if body.settings is not None and "linear" in body.settings:
+        raise HTTPException(422, "Use PUT /api/workspaces/{workspace_id}/linear to configure Linear")
     changes = {}
     if body.name is not None:
         ws.name = body.name.strip()[:120] or ws.name
@@ -143,6 +146,45 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
            data={"changes": changes})
     orchestrator.wake()
     return S.workspace(ws, require_member(db, user, workspace_id).role)
+
+
+@router.get("/workspaces/{workspace_id}/linear")
+def get_linear_config(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id)
+    return linear_config.saved_config(ws)
+
+
+@router.put("/workspaces/{workspace_id}/linear")
+async def put_linear_config(workspace_id: str, body: linear_config.LinearConfig,
+                            user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id, "admin")
+    try:
+        await linear_config.validate_config(db, workspace_id, body)
+    except linear_config.LinearConfigError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except LinearError as exc:
+        raise HTTPException(503, str(exc)) from None
+    linear_config.save_config(db, ws, body, user.id)
+    return body
+
+
+@router.get("/workspaces/{workspace_id}/linear/teams")
+async def linear_teams(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    try:
+        return {"items": await linear_config.provider(workspace_id).teams()}
+    except LinearError as exc:
+        raise HTTPException(503, str(exc)) from None
+
+
+@router.get("/workspaces/{workspace_id}/linear/teams/{team_id}/states")
+async def linear_team_states(workspace_id: str, team_id: str, user: User = Depends(current_user),
+                             db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    try:
+        return {"items": await linear_config.provider(workspace_id).team_states(team_id)}
+    except LinearError as exc:
+        raise HTTPException(503, str(exc)) from None
 
 
 @router.get("/workspaces/{workspace_id}/members")
@@ -186,9 +228,15 @@ def _secret_view(kind: str, sec: Secret | None) -> dict[str, Any]:
               "linear_api_key": "Linear"}
     if sec is None:
         return {"kind": kind, "label": labels[kind], "configured": False, "status": "missing"}
-    return {"kind": kind, "label": labels[kind], "configured": True, "hint": sec.hint, "status": sec.status,
-            "detail": sec.status_detail, "tested_at": S.ts(sec.tested_at), "updated_at": S.ts(sec.updated_at),
-            "metadata": sec.metadata_json or {}}
+    value = decrypt(sec.ciphertext)
+    metadata = safe_metadata(sec.metadata_json or {}, value)
+    detail = MESSAGES.get(metadata.get("diagnostic_code"))
+    if detail is None:
+        detail = (redact(sec.status_detail or "", (value,)) if kind == "linear_api_key"
+                  else "Credential saved. Test it to verify current access.")
+    return {"kind": kind, "label": labels[kind], "configured": True, "hint": mask(value), "status": sec.status,
+            "detail": detail, "tested_at": S.ts(sec.tested_at), "updated_at": S.ts(sec.updated_at),
+            "metadata": metadata}
 
 
 @router.get("/workspaces/{workspace_id}/credentials")
@@ -203,39 +251,19 @@ def credentials(workspace_id: str, user: User = Depends(current_user), db: Sessi
 
 
 async def _test_secret(kind: str, value: str) -> tuple[str, str, dict[str, Any]]:
-    settings = get_settings()
     try:
         if kind == "linear_api_key":
             viewer = await Linear(value).viewer()
             name = redact(viewer["name"], (value,))
             return "valid", redact(f"Connected as {name}", (value,)), {"name": name}
-        if kind == "mindshub_api_key":
-            from .auth import AuthError, mindshub_identity
-
-            try:
-                identity = await mindshub_identity(value)
-            except AuthError as exc:
-                return "invalid", str(exc), {}
-            client = ModelClient(ProviderConfig("mindshub", settings.mindshub_api_base, value, "MindsHub Inference"))
-            models = await client.list_models()
-            return "valid", f"Connected to MindsHub · {len(models)} models available", {
-                "organization_id": identity.get("organization_id"), "organization_name": identity.get("organization_name"),
-                "workspace_id": identity.get("workspace_id"), "models": models[:80]}
-        if kind == "openai_api_key":
-            client = ModelClient(ProviderConfig("openai", settings.openai_api_base, value, "OpenAI"))
-            models = await client.list_models()
-            return "valid", f"Connected to OpenAI · {len(models)} models", {"models": models[:80]}
+        if kind in ("mindshub_api_key", "openai_api_key"):
+            return await test_models(kind, value)
         if kind == "github_token":
-            gh = GitHub(value)
-            me = await gh.user()
-            return "valid", f"Connected as {me.get('login')}", {"login": me.get("login")}
+            return await GitHub(value).diagnose()
     except LinearError as exc:
         return "invalid" if exc.category == "authentication" else "untested", redact(str(exc), (value,)), {}
-    except (InferenceError, GitHubError) as exc:
-        return "invalid", str(exc), {}
-    except Exception as exc:
-        detail = f"Could not test right now: {type(exc).__name__}"
-        return "untested", redact(detail, (value,)) if kind == "linear_api_key" else detail, {}
+    except Exception:
+        return "untested", MESSAGES["service_error"], {"diagnostic_code": "service_error", "test_status": "untested"}
     return "untested", "", {}
 
 
@@ -250,6 +278,8 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
     if kind not in SECRET_KINDS:
         raise HTTPException(404, "Unknown credential")
     value = body.value.strip()
+    if len(value) < 8:
+        raise HTTPException(422, "Invalid credential request")
     if kind == "mindshub_api_key" and not value.startswith("mdb_"):
         raise HTTPException(400, "MindsHub API keys start with mdb_")
     status, detail, metadata = await _test_secret(kind, value)
@@ -259,7 +289,7 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
         db.add(sec)
     sec.ciphertext = encrypt(value)
     sec.hint = mask(value)
-    sec.status, sec.status_detail, sec.metadata_json = status, detail, metadata
+    sec.status, sec.status_detail, sec.metadata_json = status, redact(detail, (value,)), safe_metadata(metadata, value)
     sec.tested_at = utcnow()
     sec.updated_by = user.id
     db.commit()
@@ -269,17 +299,26 @@ async def set_credential(workspace_id: str, kind: str, body: SecretBody, user: U
 
 
 @router.post("/workspaces/{workspace_id}/credentials/{kind}/test")
-async def test_credential(workspace_id: str, kind: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "admin" if kind == "linear_api_key" else "member")
+async def test_credential(workspace_id: str, kind: str,
+                          repository: str | None = Query(default=None, max_length=200,
+                                                        pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"),
+                          user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec is None:
         raise HTTPException(404, "Not configured")
-    from .security import decrypt
-
-    status, detail, metadata = await _test_secret(kind, decrypt(sec.ciphertext))
-    sec.status, sec.status_detail, sec.tested_at = status, detail, utcnow()
-    if metadata:
-        sec.metadata_json = metadata
+    value = decrypt(sec.ciphertext)
+    if kind == "github_token" and repository:
+        status, detail, metadata = await GitHub(value).diagnose(repository)
+    else:
+        status, detail, metadata = await _test_secret(kind, value)
+    # Only transient diagnostic failures retain the last-known-good status.
+    # Definitive rejection must still turn Settings' status indicator red.
+    if not (status == "untested" and sec.status == "valid"
+            and metadata.get("diagnostic_code") in ("network_error", "rate_limited", "service_error")):
+        sec.status = status
+    sec.status_detail, sec.tested_at = redact(detail, (value,)), utcnow()
+    sec.metadata_json = safe_metadata(metadata, value)
     db.commit()
     return _secret_view(kind, sec)
 
@@ -341,35 +380,118 @@ def repositories(workspace_id: str, user: User = Depends(current_user), db: Sess
 
 
 @router.get("/workspaces/{workspace_id}/github/repos")
-async def github_repos(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def github_repos(workspace_id: str, page: int = Query(1, ge=1), q: str = Query("", max_length=200),
+                       per_page: int = Query(100, ge=1, le=100),
+                       user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
     try:
-        return {"items": await GitHub(resolve_token(workspace_id)).accessible_repos()}
+        gh = GitHub(resolve_token(workspace_id))
+        # Search only repositories reachable by this credential, not public GitHub
+        # search results. Continue past nonmatching pages, including the old cap.
+        while True:
+            result = await gh.accessible_repos_page(page, per_page)
+            result["items"] = [r for r in result["items"] if q.strip().casefold() in r["full_name"].casefold()]
+            if result["items"] or result["next_page"] is None:
+                return result
+            page = result["next_page"]
     except GitHubError as exc:
-        return {"items": [], "error": str(exc)}
+        return {"items": [], "error": str(exc), "next_page": None}
+
+
+class RepoQACommands(BaseModel):
+    start: str | None = None
+
+
+class RepoReleaseSelection(BaseModel):
+    mode: Literal["on_merge"] | None = None
+
+
+class RepoCommands(BaseModel):
+    setup: list[str] | None = None
+    checks: list[str] | None = None
+    qa: RepoQACommands | None = None
+    release: RepoReleaseSelection | None = None
 
 
 class RepoConnect(BaseModel):
     full_name: str
+    config: RepoCommands | None = None
+
+
+def _repo_name(full_name: str) -> str:
+    name = full_name.strip().removeprefix("https://github.com/").strip("/").removesuffix(".git")
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+        raise HTTPException(400, "Use owner/name")
+    return name
+
+
+async def _detect_repository(workspace_id: str, full_name: str):
+    name = _repo_name(full_name)
+    try:
+        gh = GitHub(resolve_token(workspace_id))
+        info = await gh.repo(name)
+        if not (info.get("permissions") or {}).get("push"):
+            raise HTTPException(400, "The workspace's GitHub access cannot push to this repository")
+        config = await detect(gh, info["full_name"], info.get("default_branch") or "main")
+    except GitHubError as exc:
+        raise HTTPException(400, str(exc))
+    return info, config
+
+
+@router.post("/workspaces/{workspace_id}/repositories/preview")
+async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depends(current_user),
+                       db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    info, config = await _detect_repository(workspace_id, body.full_name)
+    return {"full_name": info["full_name"], "default_branch": info.get("default_branch") or "main",
+            "description": info.get("description") or "", "detected": config.get("detected", []), "config": config,
+            "release_selection": {"mode": "on_merge", "confirmed": False,
+                                  "description": "Select only if this repository deploys when main changes; not automatically detected."}}
+
+
+def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(current)
+    for key in ("setup", "checks", "smoke", "protected_paths"):
+        if key in patch:
+            cfg[key] = [str(x).strip() for x in patch[key] or [] if str(x).strip()]
+    for key in ("context", "signal_label"):
+        if key in patch:
+            cfg[key] = str(patch[key] or "")[:8000]
+    for key in ("merge", "release", "qa", "recovery", "build"):
+        if key in patch and isinstance(patch[key], dict):
+            cfg[key] = patch[key]
+    for key in ("require_ci", "max_changed_lines"):
+        if key in patch:
+            cfg[key] = patch[key]
+    return cfg
 
 
 @router.post("/workspaces/{workspace_id}/repositories")
 async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depends(current_user),
                        db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    name = body.full_name.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
-        raise HTTPException(400, "Use owner/name")
+    name = _repo_name(body.full_name)
     if db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.full_name == name).first():
         raise HTTPException(409, "Already connected")
-    try:
-        gh = GitHub(resolve_token(workspace_id))
-        info = await gh.repo(name)
-        if not (info.get("permissions") or {}).get("push"):
-            raise HTTPException(400, "The workspace's GitHub access cannot push to this repository")
-        config = await detect(gh, name, info.get("default_branch") or "main")
-    except GitHubError as exc:
-        raise HTTPException(400, str(exc))
+    info, config = await _detect_repository(workspace_id, name)
+    if db.query(Repository).filter(Repository.workspace_id == workspace_id,
+                                   Repository.full_name == info["full_name"]).first():
+        raise HTTPException(409, "Already connected")
+    # Detection is a proposal, not consent to execute a long-running server.
+    qa = dict(config.get("qa") or {})
+    qa.pop("start", None)
+    config["qa"] = qa
+    if body.config is not None:
+        patch = body.config.model_dump(exclude_unset=True)
+        # Connection reviews only edit commands; retain all unrelated QA fields.
+        if isinstance(patch.get("qa"), dict):
+            reviewed_qa = patch["qa"]
+            patch["qa"] = dict(qa)
+            if "start" in reviewed_qa:
+                patch["qa"]["start"] = (reviewed_qa["start"] or "").strip()
+        if isinstance(patch.get("release"), dict):
+            patch["release"] = {**(config.get("release") or {}), **patch["release"]}
+        config = _clean_repo_config(config, patch)
     repo = Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=info.get("default_branch") or "main",
                       description=info.get("description") or "", config=config)
     db.add(repo)
@@ -390,20 +512,7 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     repo = db.get(Repository, repo_id)
     if repo is None or repo.workspace_id != workspace_id:
         raise HTTPException(404, "Repository not found")
-    cfg = dict(repo.config or {})
-    for key in ("setup", "checks", "smoke", "protected_paths"):
-        if key in body.config:
-            cfg[key] = [str(x).strip() for x in body.config[key] or [] if str(x).strip()]
-    for key in ("context", "signal_label"):
-        if key in body.config:
-            cfg[key] = str(body.config[key] or "")[:8000]
-    for key in ("merge", "release", "qa", "recovery", "build"):
-        if key in body.config and isinstance(body.config[key], dict):
-            cfg[key] = body.config[key]
-    for key in ("require_ci", "max_changed_lines"):
-        if key in body.config:
-            cfg[key] = body.config[key]
-    repo.config = cfg
+    repo.config = _clean_repo_config(repo.config or {}, body.config)
     db.commit()
     record(workspace_id, "repository_configured", f"Updated {repo.full_name} configuration", actor=user.id)
     return S.repository(repo)
@@ -722,16 +831,34 @@ def list_runs(workspace_id: str, limit: int = 100, user: User = Depends(current_
 @router.get("/workspaces/{workspace_id}/stats")
 def stats(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    outcomes = db.query(Outcome).filter(Outcome.workspace_id == workspace_id).all()
-    tasks = db.query(Task).filter(Task.workspace_id == workspace_id).all()
-    runs = db.query(Run).filter(Run.workspace_id == workspace_id).all()
+    from .metrics import benchmark, first_attempt_result, workspace_metrics
+
+    outcomes = [o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id) if not benchmark(o)]
+    outcome_ids = {o.id for o in outcomes}
+    tasks = [t for t in db.query(Task).filter(Task.workspace_id == workspace_id)
+             if t.outcome_id in outcome_ids and not benchmark(t)]
+    task_ids = {t.id for t in tasks}
+    runs = [r for r in db.query(Run).filter(Run.workspace_id == workspace_id)
+            if r.outcome_id in outcome_ids and (not r.task_id or r.task_id in task_ids) and not benchmark(r)]
     decisions = db.query(Decision).filter(Decision.workspace_id == workspace_id).all()
     merged = [t for t in tasks if t.merge_sha]
     by_status: dict[str, int] = {}
     for o in outcomes:
         by_status[o.status] = by_status.get(o.status, 0) + 1
-    first_pass = sum(1 for t in merged if len((t.evidence or {}).get("attempts", [])) <= 1)
+    metrics = workspace_metrics(db, workspace_id)
+    # The legacy Runs UI divides this counter by tasks.merged. Keep that
+    # population while using durable attempt/check history instead of list length.
+    merged_ids = {t.id for t in merged}
+    journals: dict[str, list[Event]] = {}
+    if merged_ids:
+        for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.task_id.in_(merged_ids)).order_by(Event.id):
+            journals.setdefault(e.task_id, []).append(e)
+    repos = {r.id: r for r in db.query(Repository).filter(Repository.workspace_id == workspace_id)}
+    first_pass = sum(first_attempt_result(t, journals.get(t.id, []),
+                                         (repos[t.repo_id].config or {}).get("checks", [])
+                                         if t.repo_id in repos else None) is True for t in merged)
     return {
+        "metrics": metrics,
         "outcomes": by_status,
         "tasks": {"total": len(tasks), "completed": sum(t.status == "completed" for t in tasks), "merged": len(merged),
                   "first_attempt": first_pass, "smoke_failed": sum(t.status == "smoke_failed" for t in tasks)},

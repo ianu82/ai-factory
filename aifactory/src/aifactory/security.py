@@ -81,10 +81,9 @@ def unsign(signed: str) -> str | None:
 
 def mask(value: str) -> str:
     value = value.strip()
-    if len(value) <= 10:
-        return "•" * len(value)
-    prefix = value.split(".", 1)[0] if value.startswith("mdb_") else value[:6]
-    prefix = prefix[:12]
+    if len(value) < 16:
+        return "••••…" + value[-2:] if len(value) > 2 else "••••"
+    prefix = value.split(".", 1)[0][:12] if value.startswith("mdb_") else value[:6]
     return f"{prefix}…{value[-4:]}"
 
 

@@ -176,3 +176,57 @@ def test_mirror_fetches_and_job_clones_never_overlap(tmp_path, monkeypatch):
 
     asyncio.run(go())
     assert overlaps == []
+
+
+def test_verifiers_are_told_to_separate_pre_existing_failures_from_the_change():
+    from aifactory.prompts import BUILDER, verifier_system
+
+    prompt = verifier_system("abc1234")
+    assert "clean checkout of abc1234" in prompt and "pre-existing" in prompt
+    assert "do not fail a criterion" in prompt and "Opt-in test suites" in prompt
+    assert "unrelated to the task" in prompt and "that failure still occurring is a real failure" in prompt
+    assert "unless the change touches the integration they" in prompt
+    assert "pre-existing" in BUILDER
+
+
+def test_repository_precedents_apply_only_to_their_own_repository():
+    from aifactory.db import session_scope, utcnow
+    from aifactory.models import Decision, Organization, Outcome, Plan, Repository, Task, Workspace
+    from aifactory.pipeline.runtime import precedents
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme-precedents", settings={})
+        s.add(ws)
+        s.flush()
+        a, b = Repository(workspace_id=ws.id, full_name="acme/a"), Repository(workspace_id=ws.id, full_name="acme/b")
+        s.add_all([a, b])
+        s.flush()
+        outcome = Outcome(workspace_id=ws.id, number=1, title="t", repo_ids=[a.id, b.id], status="running")
+        s.add(outcome)
+        s.flush()
+        plan = Plan(outcome_id=outcome.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=ws.id, outcome_id=outcome.id, plan_id=plan.id, key="T1", title="t", repo_id=a.id)
+        s.add(task)
+        s.flush()
+        for title, scope, task_id in (("Keep trailing slashes", "repository", task.id), ("Use UK English", "workspace", None)):
+            s.add(Decision(workspace_id=ws.id, outcome_id=outcome.id, task_id=task_id, kind="question", title=title,
+                           status="resolved", resolution="answer", reusable=True, scope=scope, resolved_at=utcnow()))
+        ws_id, a_id, b_id, outcome_id, task_id = ws.id, a.id, b.id, outcome.id, task.id
+
+    titles = lambda repo=None: sorted(d.title for d in precedents(ws_id, repo))  # noqa: E731
+    assert titles(a_id) == ["Keep trailing slashes", "Use UK English"]
+    assert titles(b_id) == ["Use UK English"]
+    assert titles() == ["Keep trailing slashes", "Use UK English"]
+
+    # Many newer decisions about repository A must not crowd out what applies to B.
+    with session_scope() as s:
+        for i in range(60):
+            s.add(Decision(workspace_id=ws_id, outcome_id=outcome_id, task_id=task_id, kind="question", title=f"A{i}",
+                           status="resolved", resolution="answer", reusable=True, scope="repository",
+                           resolved_at=utcnow()))
+    assert titles(b_id) == ["Use UK English"]

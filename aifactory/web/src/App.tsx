@@ -14,6 +14,8 @@ import { PullRequestsPage, usePulls } from "./pages/PullRequests";
 import { DecisionsPage } from "./pages/Decisions";
 import { SettingsPage } from "./pages/Settings";
 import { NewOutcome } from "./pages/NewOutcome";
+import { Onboarding } from "./onboarding/Onboarding";
+import { memberHasDeferred, useOnboarding } from "./onboarding/state";
 
 type Ctx = { me: Me; meta: Meta; ws: Workspace; live: string; openCapture: () => void };
 const WorkspaceCtx = createContext<Ctx | null>(null);
@@ -57,7 +59,7 @@ function Loading({ error }: { error?: unknown }) {
 /** Stable deep links (used by runtime QA and docs): /go/outcomes → the first workspace's Outcomes. */
 function GoTo({ workspaceId }: { workspaceId: string }) {
   const { section = "inbox" } = useParams();
-  const allowed = ["inbox", "outcomes", "pulls", "runs", "signals", "decisions", "settings"];
+  const allowed = ["inbox", "outcomes", "pulls", "runs", "signals", "decisions", "settings", "onboarding"];
   return <Navigate to={`/w/${workspaceId}/${allowed.includes(section) ? section : "inbox"}`} replace />;
 }
 
@@ -72,19 +74,31 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
   const [navOpen, setNavOpen] = useState(false);
   const live = useLive(ws?.id);
   const location = useLocation();
+  const onboarding = useOnboarding(ws?.id || "");
+  const base = `/w/${ws?.id}`;
+  const onOnboarding = location.pathname === `${base}/onboarding` || location.pathname === `${base}/onboarding/`;
+  // Only default Inbox entry is gated. Explicit decision, Settings and outcome
+  // deep links remain available even while readiness is loading or unresolved.
+  const inboxEntry = location.pathname === `${base}/inbox` || location.pathname === `${base}/inbox/`;
+  const awaitingEntry = inboxEntry && !onboarding.data;
+  const shouldOnboard = inboxEntry && onboarding.data && !onboarding.data.ready && !onboarding.data.deferred
+    && ((ws?.role === "owner" || ws?.role === "admin") || !memberHasDeferred(me.user.id, ws?.id || ""));
+  const blockCapture = onOnboarding || awaitingEntry || !!shouldOnboard;
   useEffect(() => setNavOpen(false), [location.pathname]);
+  useEffect(() => { setCapture(false); }, [location.pathname, ws?.id]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const typing = (e.target as HTMLElement)?.closest("input, textarea, select, [contenteditable]");
-      if (!typing && e.key === "c" && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); setCapture(true); }
+      if (!blockCapture && !typing && e.key === "c" && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); setCapture(true); }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, []);
+  }, [blockCapture]);
   if (!ws) return <Navigate to="/" replace />;
-  const ctx: Ctx = { me, meta, ws, live, openCapture: () => setCapture(true) };
+  const ctx: Ctx = { me, meta, ws, live, openCapture: () => { if (!blockCapture) setCapture(true); } };
   return (
     <WorkspaceCtx.Provider value={ctx}>
+      {onOnboarding ? <Routes><Route path="onboarding" element={<Onboarding key={ws.id} />} /></Routes> : awaitingEntry ? <Loading error={onboarding.error} /> : shouldOnboard ? <Navigate to={`${base}/onboarding`} replace /> : <>
       <div className={`shell ${navOpen ? "nav-open" : ""}`}>
         <Sidebar />
         <div className="main">
@@ -112,7 +126,8 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
         </div>
         {navOpen && <div className="scrim" style={{ zIndex: 30 }} onClick={() => setNavOpen(false)} />}
       </div>
-      {capture && <NewOutcome onClose={() => setCapture(false)} />}
+      {capture && !blockCapture && <NewOutcome onClose={() => setCapture(false)} />}
+      </>}
     </WorkspaceCtx.Provider>
   );
 }
@@ -121,6 +136,7 @@ function Sidebar() {
   const { me, ws, openCapture } = useWs();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const onboarding = useOnboarding(ws.id);
   const inbox = useQuery({
     queryKey: ["inbox", ws.id],
     queryFn: () => api<{ decisions: unknown[] }>(`/api/workspaces/${ws.id}/inbox`),
@@ -173,6 +189,7 @@ function Sidebar() {
       <NavLink to={`${base}/runs`} className="nav-item"><Activity /> Runs</NavLink>
       <NavLink to={`${base}/signals`} className="nav-item"><Radio /> Signals</NavLink>
       <NavLink to={`${base}/decisions`} className="nav-item"><Library /> Decisions</NavLink>
+      <NavLink to={`${base}/onboarding`} className="nav-item">{onboarding.data?.deferred ? "Resume onboarding" : "Finish workspace setup"}</NavLink>
       <div className="sidebar-foot">
         <NavLink to={`${base}/settings`} className="nav-item"><SettingsIcon /> Settings</NavLink>
         <div className="nav-sep" />
