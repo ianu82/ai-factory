@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -340,35 +340,118 @@ def repositories(workspace_id: str, user: User = Depends(current_user), db: Sess
 
 
 @router.get("/workspaces/{workspace_id}/github/repos")
-async def github_repos(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def github_repos(workspace_id: str, page: int = Query(1, ge=1), q: str = Query("", max_length=200),
+                       per_page: int = Query(100, ge=1, le=100),
+                       user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
     try:
-        return {"items": await GitHub(resolve_token(workspace_id)).accessible_repos()}
+        gh = GitHub(resolve_token(workspace_id))
+        # Search only repositories reachable by this credential, not public GitHub
+        # search results. Continue past nonmatching pages, including the old cap.
+        while True:
+            result = await gh.accessible_repos_page(page, per_page)
+            result["items"] = [r for r in result["items"] if q.strip().casefold() in r["full_name"].casefold()]
+            if result["items"] or result["next_page"] is None:
+                return result
+            page = result["next_page"]
     except GitHubError as exc:
-        return {"items": [], "error": str(exc)}
+        return {"items": [], "error": str(exc), "next_page": None}
+
+
+class RepoQACommands(BaseModel):
+    start: str | None = None
+
+
+class RepoReleaseSelection(BaseModel):
+    mode: Literal["on_merge"] | None = None
+
+
+class RepoCommands(BaseModel):
+    setup: list[str] | None = None
+    checks: list[str] | None = None
+    qa: RepoQACommands | None = None
+    release: RepoReleaseSelection | None = None
 
 
 class RepoConnect(BaseModel):
     full_name: str
+    config: RepoCommands | None = None
+
+
+def _repo_name(full_name: str) -> str:
+    name = full_name.strip().removeprefix("https://github.com/").strip("/").removesuffix(".git")
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+        raise HTTPException(400, "Use owner/name")
+    return name
+
+
+async def _detect_repository(workspace_id: str, full_name: str):
+    name = _repo_name(full_name)
+    try:
+        gh = GitHub(resolve_token(workspace_id))
+        info = await gh.repo(name)
+        if not (info.get("permissions") or {}).get("push"):
+            raise HTTPException(400, "The workspace's GitHub access cannot push to this repository")
+        config = await detect(gh, info["full_name"], info.get("default_branch") or "main")
+    except GitHubError as exc:
+        raise HTTPException(400, str(exc))
+    return info, config
+
+
+@router.post("/workspaces/{workspace_id}/repositories/preview")
+async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depends(current_user),
+                       db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    info, config = await _detect_repository(workspace_id, body.full_name)
+    return {"full_name": info["full_name"], "default_branch": info.get("default_branch") or "main",
+            "description": info.get("description") or "", "detected": config.get("detected", []), "config": config,
+            "release_selection": {"mode": "on_merge", "confirmed": False,
+                                  "description": "Select only if this repository deploys when main changes; not automatically detected."}}
+
+
+def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(current)
+    for key in ("setup", "checks", "smoke", "protected_paths"):
+        if key in patch:
+            cfg[key] = [str(x).strip() for x in patch[key] or [] if str(x).strip()]
+    for key in ("context", "signal_label"):
+        if key in patch:
+            cfg[key] = str(patch[key] or "")[:8000]
+    for key in ("merge", "release", "qa", "recovery", "build"):
+        if key in patch and isinstance(patch[key], dict):
+            cfg[key] = patch[key]
+    for key in ("require_ci", "max_changed_lines"):
+        if key in patch:
+            cfg[key] = patch[key]
+    return cfg
 
 
 @router.post("/workspaces/{workspace_id}/repositories")
 async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depends(current_user),
                        db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    name = body.full_name.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
-        raise HTTPException(400, "Use owner/name")
+    name = _repo_name(body.full_name)
     if db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.full_name == name).first():
         raise HTTPException(409, "Already connected")
-    try:
-        gh = GitHub(resolve_token(workspace_id))
-        info = await gh.repo(name)
-        if not (info.get("permissions") or {}).get("push"):
-            raise HTTPException(400, "The workspace's GitHub access cannot push to this repository")
-        config = await detect(gh, name, info.get("default_branch") or "main")
-    except GitHubError as exc:
-        raise HTTPException(400, str(exc))
+    info, config = await _detect_repository(workspace_id, name)
+    if db.query(Repository).filter(Repository.workspace_id == workspace_id,
+                                   Repository.full_name == info["full_name"]).first():
+        raise HTTPException(409, "Already connected")
+    # Detection is a proposal, not consent to execute a long-running server.
+    qa = dict(config.get("qa") or {})
+    qa.pop("start", None)
+    config["qa"] = qa
+    if body.config is not None:
+        patch = body.config.model_dump(exclude_unset=True)
+        # Connection reviews only edit commands; retain all unrelated QA fields.
+        if isinstance(patch.get("qa"), dict):
+            reviewed_qa = patch["qa"]
+            patch["qa"] = dict(qa)
+            if "start" in reviewed_qa:
+                patch["qa"]["start"] = (reviewed_qa["start"] or "").strip()
+        if isinstance(patch.get("release"), dict):
+            patch["release"] = {**(config.get("release") or {}), **patch["release"]}
+        config = _clean_repo_config(config, patch)
     repo = Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=info.get("default_branch") or "main",
                       description=info.get("description") or "", config=config)
     db.add(repo)
@@ -389,20 +472,7 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     repo = db.get(Repository, repo_id)
     if repo is None or repo.workspace_id != workspace_id:
         raise HTTPException(404, "Repository not found")
-    cfg = dict(repo.config or {})
-    for key in ("setup", "checks", "smoke", "protected_paths"):
-        if key in body.config:
-            cfg[key] = [str(x).strip() for x in body.config[key] or [] if str(x).strip()]
-    for key in ("context", "signal_label"):
-        if key in body.config:
-            cfg[key] = str(body.config[key] or "")[:8000]
-    for key in ("merge", "release", "qa", "recovery", "build"):
-        if key in body.config and isinstance(body.config[key], dict):
-            cfg[key] = body.config[key]
-    for key in ("require_ci", "max_changed_lines"):
-        if key in body.config:
-            cfg[key] = body.config[key]
-    repo.config = cfg
+    repo.config = _clean_repo_config(repo.config or {}, body.config)
     db.commit()
     record(workspace_id, "repository_configured", f"Updated {repo.full_name} configuration", actor=user.id)
     return S.repository(repo)

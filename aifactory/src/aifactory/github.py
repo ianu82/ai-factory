@@ -127,6 +127,19 @@ class GitHub:
             for r in repos[:limit]
         ]
 
+    async def accessible_repos_page(self, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+        batch = await self.request("GET", "/user/repos", params={
+            "per_page": per_page, "page": page, "sort": "pushed",
+        })
+        return {
+            "items": [{
+                "full_name": r["full_name"], "default_branch": r.get("default_branch") or "main",
+                "private": r.get("private", False), "description": r.get("description") or "",
+                "can_push": bool((r.get("permissions") or {}).get("push")), "pushed_at": r.get("pushed_at"),
+            } for r in batch],
+            "next_page": page + 1 if len(batch) == per_page else None,
+        }
+
     async def branch_sha(self, full_name: str, branch: str) -> str:
         data = await self.request("GET", f"/repos/{full_name}/git/ref/heads/{branch}")
         return data["object"]["sha"]

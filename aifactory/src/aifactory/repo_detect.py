@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Any
 
 from .github import GitHub, GitHubError
@@ -22,13 +23,17 @@ async def _file(gh: GitHub, full_name: str, path: str, ref: str) -> str | None:
 async def detect(gh: GitHub, full_name: str, ref: str) -> dict[str, Any]:
     config: dict[str, Any] = {"setup": [], "checks": [], "smoke": [], "protected_paths": [], "context": ""}
     notes: list[str] = []
+    config["start_detection"] = {"available": False, "reason": "No recognized web start script; enter a command that listens on $PORT."}
     package = await _file(gh, full_name, "package.json", ref)
     if package:
         try:
             pkg = json.loads(package)
         except json.JSONDecodeError:
             pkg = {}
-        scripts = pkg.get("scripts") or {}
+        if not isinstance(pkg, dict):
+            pkg = {}
+        raw_scripts = pkg.get("scripts")
+        scripts = {k: v for k, v in raw_scripts.items() if isinstance(v, str)} if isinstance(raw_scripts, dict) else {}
         manager = "npm"
         if await _file(gh, full_name, "pnpm-lock.yaml", ref):
             manager = "pnpm"
@@ -49,6 +54,25 @@ async def detect(gh: GitHub, full_name: str, ref: str) -> dict[str, Any]:
             config["smoke"].append(f"{run} build")
         if "test" in scripts:
             config["smoke"].append(f"{run} test")
+        # Only suggest known web CLIs with documented host/port flags. A generic
+        # `node`, library, or arbitrary script is not evidence of a runnable app.
+        for name in ("dev", "start"):
+            script = scripts.get(name, "").strip()
+            if re.fullmatch(r"(?:vite|vite dev|vite preview|next dev|next start|astro dev|astro preview|nuxt dev|nuxt start)", script):
+                flags = '-H 0.0.0.0 -p "$PORT"' if script.startswith("next ") else '--host 0.0.0.0 --port "$PORT"'
+                separator = " --" if manager == "npm" else ""
+                start = f"{run} {name}{separator} {flags}"
+                # Runtime QA executes setup then qa.start, not smoke. Preview
+                # and production servers need build output in a fresh checkout.
+                if script in ("vite preview", "next start", "astro preview", "nuxt start"):
+                    if not scripts.get("build", "").strip():
+                        config["start_detection"]["reason"] = f"{script} requires a build script before it can serve a fresh checkout."
+                        continue
+                    start = f"{run} build && {start}"
+                config["qa"] = {"start": start}
+                config["start_detection"] = {"available": True, "requires_confirmation": True,
+                                             "reason": "Review before saving; must listen on $PORT."}
+                break
         notes.append(f"Node project ({manager})")
     pyproject = await _file(gh, full_name, "pyproject.toml", ref)
     if pyproject is not None:
