@@ -216,9 +216,17 @@ def test_repository_precedents_apply_only_to_their_own_repository():
         for title, scope, task_id in (("Keep trailing slashes", "repository", task.id), ("Use UK English", "workspace", None)):
             s.add(Decision(workspace_id=ws.id, outcome_id=outcome.id, task_id=task_id, kind="question", title=title,
                            status="resolved", resolution="answer", reusable=True, scope=scope, resolved_at=utcnow()))
-        ws_id, a_id, b_id = ws.id, a.id, b.id
+        ws_id, a_id, b_id, outcome_id, task_id = ws.id, a.id, b.id, outcome.id, task.id
 
     titles = lambda repo=None: sorted(d.title for d in precedents(ws_id, repo))  # noqa: E731
     assert titles(a_id) == ["Keep trailing slashes", "Use UK English"]
     assert titles(b_id) == ["Use UK English"]
     assert titles() == ["Keep trailing slashes", "Use UK English"]
+
+    # Many newer decisions about repository A must not crowd out what applies to B.
+    with session_scope() as s:
+        for i in range(60):
+            s.add(Decision(workspace_id=ws_id, outcome_id=outcome_id, task_id=task_id, kind="question", title=f"A{i}",
+                           status="resolved", resolution="answer", reusable=True, scope="repository",
+                           resolved_at=utcnow()))
+    assert titles(b_id) == ["Use UK English"]

@@ -80,10 +80,10 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
 def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -> list[Decision]:
     """Reusable, attributed human decisions that apply to this workspace (and repository)."""
     with session_scope() as s:
-        rows = (s.query(Decision)
-                .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved", Decision.reusable.is_(True),
-                        Decision.scope.in_(("workspace", "repository")))
-                .order_by(Decision.resolved_at.desc()).limit(limit * 4).all())
+        query = (s.query(Decision)
+                 .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved",
+                         Decision.reusable.is_(True), Decision.scope.in_(("workspace", "repository")))
+                 .order_by(Decision.resolved_at.desc(), Decision.id))
 
         def repos_of(d: Decision) -> set[str]:
             """The repository a repository-scoped decision was made about (its task's, else its outcome's)."""
@@ -94,8 +94,17 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
             return set(outcome.repo_ids or []) if outcome is not None else set()
 
         # A repository-scoped decision applies only to its own repository; without a repository (planning across
-        # an outcome's repositories) all of them apply.
-        return [d for d in rows if d.scope == "workspace" or repo_id is None or repo_id in repos_of(d)][:limit]
+        # an outcome's repositories) all of them apply. Page until enough apply: other repositories' decisions
+        # must not crowd out older applicable ones.
+        found: list[Decision] = []
+        offset, page = 0, max(limit * 4, 20)
+        while len(found) < limit:
+            rows = query.offset(offset).limit(page).all()
+            found += [d for d in rows if d.scope == "workspace" or repo_id is None or repo_id in repos_of(d)]
+            if len(rows) < page:
+                break
+            offset += page
+        return found[:limit]
 
 
 @dataclass
