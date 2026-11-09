@@ -44,6 +44,7 @@ class Orchestrator:
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._stopping = False
         self._last_signal_sync = float("-inf")
+        self._linear_task: asyncio.Task | None = None
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -59,6 +60,9 @@ class Orchestrator:
             job.cancel()
         if self._loop_task:
             self._loop_task.cancel()
+        if self._linear_task:
+            self._linear_task.cancel()
+            await asyncio.gather(self._linear_task, return_exceptions=True)
         await asyncio.sleep(0)
 
     def wake(self) -> None:
@@ -89,6 +93,10 @@ class Orchestrator:
                 await asyncio.to_thread(self._promote)
                 self._schedule()
                 await self._maybe_sync_signals()
+                from ..linear_outbox import Dispatcher
+
+                if self._linear_task is None or self._linear_task.done():
+                    self._linear_task = asyncio.create_task(Dispatcher().dispatch(), name="linear-outbox")
                 await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()

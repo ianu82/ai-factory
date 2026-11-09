@@ -142,6 +142,29 @@ class Outcome(Base):
     __table_args__ = (UniqueConstraint("workspace_id", "number"),)
 
 
+class LinearOperation(Base):
+    __tablename__ = "linear_operations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"), index=True)
+    issue_id: Mapped[str] = mapped_column(String(200))
+    semantic_key: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(20))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    remote_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    claim: Mapped[str] = mapped_column(String(32), default="")
+    lease_until: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    next_attempt: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(String(30), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (UniqueConstraint("workspace_id", "semantic_key"),)
+
+
 class Plan(Base):
     __tablename__ = "plans"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)

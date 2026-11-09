@@ -23,9 +23,10 @@ class LinearProvider(Protocol):
     async def team_states(self, team_id: str) -> list[dict[str, Any]]: ...
     async def issues(self, team_id: str, state_id: str, label: str) -> list[dict[str, Any]]: ...
     async def issue_state(self, issue_id: str) -> dict[str, Any]: ...
+    async def issue_states(self, issue_ids: list[str]) -> dict[str, dict[str, Any] | LinearError]: ...
     async def update_issue_state(self, issue_id: str, state_id: str) -> None: ...
     async def comments(self, issue_id: str) -> list[dict[str, Any]]: ...
-    async def create_comment(self, issue_id: str, body: str) -> dict[str, Any]: ...
+    async def create_comment(self, issue_id: str, body: str, *, comment_id: str | None = None) -> dict[str, Any]: ...
 
 
 def resolve_token(workspace_id: str) -> str:
@@ -47,7 +48,7 @@ class Linear:
         self._token = token
         self._transport = transport
 
-    async def _request(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _request(self, query: str, variables: dict[str, Any] | None = None, *, partial: bool = False) -> dict[str, Any]:
         try:
             async with httpx.AsyncClient(transport=self._transport, timeout=httpx.Timeout(15, connect=5)) as client:
                 response = await client.post("https://api.linear.app/graphql", headers={"Authorization": self._token},
@@ -61,6 +62,8 @@ class Linear:
             if not response.is_success:
                 raise LinearError("http")
             payload = _object(response.json())
+            if partial and isinstance(payload.get("data"), dict):
+                return payload
             if payload.get("errors"):
                 errors = payload["errors"]
                 codes = {error.get("extensions", {}).get("code") for error in errors
@@ -127,14 +130,36 @@ class Linear:
             issueUpdate(id: $id, input: $input) { success } }""", {"id": issue_id, "input": {"stateId": state_id}})
         self._mutation(data, "issueUpdate")
 
+    async def issue_states(self, issue_ids: list[str]) -> dict[str, dict[str, Any] | LinearError]:
+        aliases = {f"issue{index}": issue_id for index, issue_id in enumerate(issue_ids)}
+        declarations = ", ".join(f"${alias}: String!" for alias in aliases)
+        fields = " ".join(f"{alias}: issue(id: ${alias}) {{ state {{ id name }} }}" for alias in aliases)
+        payload = await self._request(f"query({declarations}) {{ {fields} }}", aliases, partial=True)
+        result: dict[str, dict[str, Any] | LinearError] = {}
+        for alias, issue_id in aliases.items():
+            errors = [error for error in payload.get("errors", [])
+                      if not error.get("path") or error["path"][0] == alias]
+            try:
+                if errors:
+                    codes = {error.get("extensions", {}).get("code") for error in errors}
+                    category = "rate_limit" if codes & {"RATELIMITED", "RATE_LIMITED"} else "graphql"
+                    if codes & {"AUTHENTICATION_ERROR", "UNAUTHENTICATED"}:
+                        category = "authentication"
+                    raise LinearError(category)
+                result[issue_id] = _object(_object(payload["data"].get(alias)).get("state"), "id", "name")
+            except LinearError as exc:
+                result[issue_id] = exc
+        return result
+
     async def comments(self, issue_id: str) -> list[dict[str, Any]]:
         return await self._nodes("""query($id: String!, $after: String) { issue(id: $id) {
             comments(first: 100, after: $after) { nodes { id body } pageInfo { hasNextPage endCursor } }
             } }""", {"id": issue_id}, ("issue", "comments"), ("id", "body"))
 
-    async def create_comment(self, issue_id: str, body: str) -> dict[str, Any]:
+    async def create_comment(self, issue_id: str, body: str, *, comment_id: str | None = None) -> dict[str, Any]:
+        supplied_id = {"id": comment_id} if comment_id else {}
         data = await self._request("""mutation($input: CommentCreateInput!) {
-            commentCreate(input: $input) { success comment { id body } } }""", {"input": {"issueId": issue_id, "body": body}})
+            commentCreate(input: $input) { success comment { id body } } }""", {"input": {"issueId": issue_id, "body": body, **supplied_id}})
         return _object(self._mutation(data, "commentCreate").get("comment"), "id", "body")
 
     @staticmethod
