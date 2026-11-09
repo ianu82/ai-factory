@@ -332,3 +332,68 @@ def test_vm_protected_image_reads_check_and_open_on_vm_filesystem(tmp_path, monk
         await vm.close()
 
     asyncio.run(go())
+
+
+def test_exec_retries_only_calls_that_never_started(tmp_path, monkeypatch):
+    from aifactory.sandbox import SandboxError
+
+    local = LocalSandbox("src", root=tmp_path / "local").create()
+    local.work.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=local.work, check=True)
+    (local.work / "app.txt").write_text("hello\n")
+    unstarted = "VM bridge: ExecNotStartedError: tcp-proxy exec WebSocket connection failed; no command was sent."
+
+    class Flaky(FakeBridge):
+        failures: list[str] = []
+
+        async def call(self, op, args=None, timeout=600):
+            if op in ("exec", "spawn") and self.failures:
+                self.calls.append(f"{op}:failed")
+                raise SandboxError(self.failures.pop(0))
+            return await super().call(op, args, timeout)
+
+    bridge = Flaky(tmp_path / "vm")
+    monkeypatch.setattr("aifactory.vm.VMBridge.get", classmethod(lambda cls: bridge))
+    monkeypatch.setattr("aifactory.vm.UNSTARTED_DELAYS", (0, 0))
+
+    async def go():
+        vm = await RailwayVMSandbox.from_local(local)
+        bridge.failures = [unstarted, unstarted]  # two transient failures, then the command runs once
+        assert (await vm.exec("cat app.txt")).output.strip() == "hello"
+        assert bridge.calls.count("exec:failed") == 2
+        bridge.failures = [unstarted] * 3  # still failing after the bounded retries: the error surfaces
+        with pytest.raises(SandboxError, match="no command was sent"):
+            await vm.exec("cat app.txt")
+        bridge.failures = ["VM bridge: connection reset after the command started"]  # never retried
+        with pytest.raises(SandboxError, match="after the command started"):
+            await vm.exec("cat app.txt")
+        assert not bridge.failures
+        # The bridge rejects a spawn whose exec never started (it waits for the start), so it is retried too.
+        bridge.failures = [unstarted]
+        process = await vm.spawn("true")
+        assert bridge.calls.count("spawn:failed") == 1 and process.proc_id
+        await vm.close()
+
+    asyncio.run(go())
+
+
+def test_exit_event_before_watching_is_not_lost():
+    from aifactory.vm import VMBridge
+
+    async def go():
+        bridge = VMBridge()
+        stdout = asyncio.StreamReader()
+
+        class Proc:
+            returncode = None
+
+        bridge.proc = Proc()
+        bridge.proc.stdout = stdout
+        reader = asyncio.create_task(bridge._read())
+        stdout.feed_data(b'{"event": "exit", "proc": "p1", "exitCode": 0}\n')
+        await asyncio.sleep(0.01)  # the event is read before anyone watches p1
+        assert (await asyncio.wait_for(bridge.watch_exit("p1"), 1))["exitCode"] == 0
+        stdout.feed_eof()
+        await reader
+
+    asyncio.run(go())

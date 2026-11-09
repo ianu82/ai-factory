@@ -3,13 +3,20 @@
 // the Railway token stays in this process and VMs are created with an empty environment.
 import readline from 'node:readline';
 import {randomUUID} from 'node:crypto';
-import {Sandbox} from 'railway';
+import {ExecNotStartedError, Sandbox} from 'railway';
 import WebSocket from 'ws';
+
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+// The railway SDK retries a connection that failed before the command started once (connectWithRetry), so a
+// start can take two handshakes. A spawn is acknowledged without a session name only after both would have
+// failed, plus a margin for minting the second token.
+const SDK_CONNECT_ATTEMPTS = 2;
+const SPAWN_START_WAIT_MS = SDK_CONNECT_ATTEMPTS * HANDSHAKE_TIMEOUT_MS + 15_000;
 
 class ExecWebSocket extends WebSocket {
   constructor(address, protocols, options) {
     if (protocols && typeof protocols === 'object' && !Array.isArray(protocols)) { options = protocols; protocols = undefined; }
-    super(address, protocols, {...options, handshakeTimeout: 30000});
+    super(address, protocols, {...options, handshakeTimeout: HANDSHAKE_TIMEOUT_MS});
   }
 }
 
@@ -71,6 +78,24 @@ const ops = {
     const sandbox = await box(a.id);
     const proc = randomUUID();
     const handle = sandbox.exec(a.command, {cwd: a.cwd, env: a.env, captureOutput: false});
+    // Reply only once the command has started (its durable session is named), has already ended, or the
+    // handshake timeout plus a margin has passed. A failure to start then rejects this call, so the caller can
+    // retry an exec that never ran (ExecNotStartedError) instead of seeing a process that exits before it began.
+    const ended = Promise.resolve(handle).then(() => 'ended');
+    // A start failure rejects the session name with ExecNotStartedError: surface it so the caller retries.
+    // Any other rejection (e.g. no durable session assigned) says nothing about the start, so keep waiting for
+    // the handle or the timer rather than risk a second copy of a command that did start.
+    const started = Promise.resolve(handle.sessionName).then(() => 'started', (error) => {
+      if (error instanceof ExecNotStartedError || error?.name === 'ExecNotStartedError') throw error;
+      return new Promise(() => {});
+    });
+    let timer;
+    const waited = new Promise((resolve) => { timer = setTimeout(() => resolve('unknown'), SPAWN_START_WAIT_MS); });
+    try {
+      await Promise.race([started, ended, waited]);
+    } finally {
+      clearTimeout(timer);
+    }
     procs.set(proc, handle);
     Promise.resolve(handle).then(
       (r) => send({event: 'exit', proc, exitCode: r?.exitCode ?? null}),
