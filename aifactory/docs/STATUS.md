@@ -75,7 +75,56 @@ Platform fixes made along the way: verifier VMs failed three tests even on main 
 the Codex CLI tests), fixed in #247; rebuilds after a parallel merge no longer exhaust the attempt budget (#202);
 PRs merged or closed on GitHub are reconciled (#230); live updates recover after deploys (#230).
 
-Each delivered Factory issue will be listed here with its classification once merged.
+### Factory-built PRs merged overnight (times UTC)
+
+None of these is unattended. "Assisted" means the operator acted under Ian's delegation: sending reviewer
+findings back as "Request changes", retrying exhausted attempts with guidance, or approving the merge that this
+repository's policy reserves for a person.
+
+| PR | Factory task | What the operator did | Classification |
+| --- | --- | --- | --- |
+| #237 (23:38) | #17 T3 attributed memory | One round of review findings; merged once the revision fixed them | Assisted |
+| #218 (00:17) | #14 T1 Linear client, encrypted credential | One review round; one retry after environment-caused failures; the branch auto-rebased after a parallel merge | Assisted |
+| #214 (00:17) | #12 T2 benchmark suites | Two review rounds; auto-rebased | Assisted |
+| #213 (01:14) | #13 T3 preview detected commands | Two review rounds; one retry | Assisted |
+| #251 (01:14) | #15 T3 attachments for every agent session | One review round (an out-of-scope finding was left to #16 T1 and noted on the PR); one retry | Assisted |
+| #259 (01:48) | #14 T2 Linear configuration and team discovery | One review round | Assisted |
+| #231 (01:50) | #13 T4 full-page onboarding | Two review rounds; retries, including one after a transient VM bridge failure | Assisted |
+| #261 (02:05) | #13 T2 credential diagnostics | Three retries, one correcting the operator's own too-broad guidance; clean on first review | Assisted |
+| #263 (02:44) | #13 T6 searchable repository selection | Merge approval only | Assisted (merge approval only) |
+| #255 (02:48) | #12 T5 delivery metrics | Three review rounds | Assisted |
+
+Every merge followed the same rule: the Factory was waiting on a person, CI and the Factory's verification
+were green, and the reviewer bot found nothing on the final commit. Leftover threads were answered with where
+the fix is before being resolved.
+
+### Platform changes made because of what the night showed
+
+- **Revisions start from today's main** (#250). A revision built on a stale base got no CI and stalled. It now
+  rebases first (`--onto` the recorded base). When CI never arrives because main moved, the branch is
+  rebased and rechecked. A branch someone else pushed to is never adopted.
+- **Conflicts keep reviewed work** (#257). Parallel tasks kept conflicting in `models.py` and `api.py`. A
+  conflicting revision now carries the earlier change over with a three-way apply and resolves only the
+  overlapping lines, instead of re-implementing from scratch. Leftover conflict markers are rejected.
+- **Verifiers stop failing tasks over pre-existing failures** (#260). A failure identical on the base commit
+  and unrelated to the task is evidence, not a failed criterion. Opt-in suites run only when the task needs them.
+- **Verifiers judge by the same decisions as builders** (#262). Answers that clarified a criterion reached the
+  builder but not the verifier, so tasks failed on the original wording (#14 T4, #15 T1). Repository-scoped
+  precedents now apply only to their repository; before, they leaked to every repository.
+- **Pull requests page** (#253): unresolved review threads mean Needs attention, and Factory revisions show as
+  In progress. **Signals** (#252): check notes are proposed only for checks the repository still runs.
+- **One automatic retry round** (#258, in review at the time of writing): when attempts run out on concrete,
+  relayed findings, the Factory retries once with a fresh budget before asking a person.
+
+### Operator mistakes, owned
+
+- Reused a nonce (`o16t5-retry1`) from earlier in the night, so the bootstrap correctly skipped that retry
+  twice as already applied. Nonces must be unique across the workspace's history.
+- Told #13 T2 that a failed retest must never downgrade a valid token. That is right only for transient
+  failures; the verifier caught it and the corrected retry delivered #261.
+- Told #16 T1 to redact only long base64 runs, which let small images leak. The corrected guidance redacts
+  the exact payloads the session sent.
+- Clock estimates in the overnight notes ran an hour fast for a while. The times above come from GitHub.
 
 ## Roadmap
 
