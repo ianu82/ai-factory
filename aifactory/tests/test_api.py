@@ -537,3 +537,44 @@ def test_meta_reverify_capability_is_optional_and_explicit(client):
     capabilities = response.json().get("capabilities", {})
     if "reverify" in capabilities:
         assert type(capabilities["reverify"]) is bool
+
+
+def test_runs_config_version_filter_is_exact_scoped_and_before_limit(client, signed_in):
+    from datetime import timedelta
+
+    from aifactory.db import utcnow
+    from aifactory.models import Outcome
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        other = Workspace(org_id=ws.org_id, name="Private workspace", slug="private")
+        s.add(other)
+        s.flush()
+        o = Outcome(workspace_id=ws_id, number=1, title="Our outcome")
+        theirs = Outcome(workspace_id=other.id, number=1, title="Private outcome")
+        s.add_all([o, theirs])
+        s.flush()
+        now = utcnow()
+        matching = Run(workspace_id=ws_id, outcome_id=o.id, role="builder", harness="native",
+                       config_version="abc123", started_at=now - timedelta(minutes=3))
+        s.add_all([matching,
+                   Run(workspace_id=ws_id, outcome_id=o.id, role="planner", harness="native",
+                       config_version="abc1234", started_at=now),
+                   Run(workspace_id=ws_id, outcome_id=o.id, role="verifier", harness="native",
+                       config_version=None, started_at=now - timedelta(minutes=1)),
+                   Run(workspace_id=other.id, outcome_id=theirs.id, role="builder", harness="native",
+                       config_version="abc123", started_at=now)])
+        s.flush()
+        expected = matching.id
+    response = client.get(f"/api/workspaces/{ws_id}/runs?config_version=abc123&limit=1")
+    assert response.status_code == 200
+    assert [r["id"] for r in response.json()] == [expected]
+    assert response.json()[0]["config_version"] == "abc123"
+    assert client.get(f"/api/workspaces/{ws_id}/runs?config_version=abc").json() == []
+    assert client.get(f"/api/workspaces/{ws_id}/runs?config_version=").json() == []
+    assert any(r["config_version"] is None for r in client.get(f"/api/workspaces/{ws_id}/runs").json())
+    client.post("/auth/logout")
+    client.cookies.clear()
+    client.post("/auth/dev", json={"email": "outsider@example.com", "organization": "Other org"})
+    assert client.get(f"/api/workspaces/{ws_id}/runs?config_version=abc123").status_code == 404

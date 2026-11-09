@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 SIDECAR = Path(__file__).resolve().parents[2] / "vmbridge" / "sidecar.mjs"
 SIDECAR_ALT = Path("/app/vmbridge/sidecar.mjs")
 
+CODEX_VM_VERSION = "0.167.0"
+
 # Debian packages and build steps for the QA image; Railway builds it once and caches it.
 QA_TEMPLATE: dict[str, Any] = {
     "packages": ["git", "curl", "ca-certificates", "xz-utils", "python3", "python3-pip", "python3-venv",
@@ -39,7 +41,7 @@ QA_TEMPLATE: dict[str, Any] = {
         " | tar -xJ -C /usr/local --strip-components=1",
         "python3 -m pip install --break-system-packages --quiet playwright==1.64.1",
         "python3 -m playwright install --with-deps chromium",
-        "npm install -g --no-audit --no-fund @openai/codex@0.167.0",
+        f"npm install -g --no-audit --no-fund @openai/codex@{CODEX_VM_VERSION}",
         "mkdir -p /work",
     ],
     "workdir": "/work",
