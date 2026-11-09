@@ -27,6 +27,12 @@ def isolated_env(tmp_path, monkeypatch):
 
     config.reset_settings_cache()
     fallbacks.set_bootstrap_workspace(None)  # server credentials serve only a bootstrap workspace a test declares
+    from aifactory import inference_limits
+
+    # Admission guards are process-wide and keyed by provider config, which fakes share across tests: a send
+    # still inside a previous test's rate window would otherwise leak into the next test's counts.
+    with inference_limits._registry_lock:
+        inference_limits._registry.clear()
     security.reset_crypto_cache()
     if shared:
         from aifactory.models import Base
