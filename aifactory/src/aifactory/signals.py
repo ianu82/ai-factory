@@ -116,7 +116,7 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                     link = f"{base}/w/{workspace_id}/outcomes/{outcome.id}" if base.startswith("https") else ""
                     try:
                         await gh.comment(repo.full_name, issue["number"],
-                                         f"AI Factory picked this up as outcome #{outcome.number}."
+                                         f"MindsHub AI Factory picked this up as outcome #{outcome.number}."
                                          + (f" Follow progress: {link}" if link else ""))
                     except Exception:
                         pass
