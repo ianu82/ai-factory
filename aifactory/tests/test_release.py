@@ -1,4 +1,4 @@
-"""Release checker: promotes staging's commit to `release` only when it is ready, then confirms production."""
+"""Release checker: short, restart-safe runs that confirm production and promote staging's commit."""
 
 from __future__ import annotations
 
@@ -15,8 +15,14 @@ STAGING = "https://staging.example"
 PROD = "https://prod.example"
 OLD = "a" * 40
 NEW = "b" * 40
+OTHER = "c" * 40
 NOW = datetime(2026, 11, 9, 22, 0, tzinfo=timezone.utc)
 APP = '<html><div id="root"></div><script type="module" src="/assets/index-1.js"></script></html>'
+HOLD = "release-hold"
+
+
+def iso(moment: datetime) -> str:
+    return moment.isoformat()
 
 
 class Clock:
@@ -31,13 +37,18 @@ class Clock:
 
 
 class World:
-    """GitHub, staging and production as the release checker sees them."""
+    """GitHub, staging and production as the release checker sees them. Defaults: a confirmed release three
+    hours old, and staging soaked on a newer commit that changes Factory code."""
 
     def __init__(self) -> None:
         self.clock = Clock()
         self.release = OLD
-        self.staging = {"ok": True, "commit": NEW, "started_at": (NOW - timedelta(minutes=45)).isoformat()}
-        self.staging_down_for = 0  # health calls that fail before staging answers
+        self.moved_at: datetime | None = NOW - timedelta(hours=3)
+        self.marks: dict[str, str] = {OLD: "success"}
+        self.mark_posts: list[tuple[str, str]] = []
+        self.production = {"ok": True, "commit": OLD, "started_at": iso(NOW - timedelta(hours=3))}
+        self.staging = {"ok": True, "commit": NEW, "started_at": iso(NOW - timedelta(minutes=45))}
+        self.staging_down_for = 0
         self.files = ["aifactory/src/aifactory/api.py"]
         self.status = "ahead"
         self.on_main = "identical"
@@ -45,40 +56,58 @@ class World:
                        {"name": "postgres", "status": "completed", "conclusion": "success"}]
         self.asset_status = 200
         self.me_status = 401
-        self.live_after = 600  # seconds after the release that production reports the new commit
-        self.restart_after: int | None = None  # seconds after the release that production restarts
-        self.released_at: datetime | None = None
-        self.patches: list[dict] = []
-        self.issues: list[dict] = []
-        self.comments: list[dict] = []
+        self.holds: list[dict] = []
         self.open_issues: list[dict] = []
+        self.labels: set[str] = set()
+        self.issues: list[dict] = []
+        self.patches: list[dict] = []
         self.github_calls = 0
 
     def github(self, request: httpx.Request) -> httpx.Response:
         self.github_calls += 1
-        path, method = request.url.path, request.method
-        if path == f"/repos/{REPO}/git/ref/heads/release":
+        path, method, params = request.url.path, request.method, request.url.params
+        base = f"/repos/{REPO}"
+        if path == f"{base}/git/ref/heads/release":
             return httpx.Response(200, json={"object": {"sha": self.release}})
-        if path == f"/repos/{REPO}/compare/{OLD}...{NEW}":
+        if path == f"{base}/activity":
+            return httpx.Response(200, json=[{"timestamp": iso(self.moved_at)}] if self.moved_at else [])
+        if path.startswith(f"{base}/commits/") and path.endswith("/status"):
+            sha = path.split("/")[-2]
+            statuses = [{"context": "factory/release", "state": self.marks[sha]}] if sha in self.marks else []
+            return httpx.Response(200, json={"statuses": [{"context": "ci/other", "state": "success"}, *statuses]})
+        if path.startswith(f"{base}/statuses/") and method == "POST":
+            sha, body = path.split("/")[-1], json.loads(request.content)
+            assert body["context"] == "factory/release"
+            self.marks[sha] = body["state"]
+            self.mark_posts.append((sha, body["state"]))
+            return httpx.Response(201, json={})
+        if path == f"{base}/issues" and method == "GET":
+            if params.get("labels") == HOLD:
+                return httpx.Response(200, json=self.holds)
+            return httpx.Response(200, json=self.open_issues + self.holds)
+        if path == f"{base}/issues" and method == "POST":
+            body = json.loads(request.content)
+            self.issues.append(body)
+            issue = {"number": 100 + len(self.issues), "title": body["title"]}
+            (self.holds if HOLD in body.get("labels", []) else self.open_issues).append(issue)
+            return httpx.Response(201, json=issue)
+        if path == f"{base}/labels/{HOLD}":
+            return httpx.Response(200 if HOLD in self.labels else 404, json={})
+        if path == f"{base}/labels" and method == "POST":
+            self.labels.add(json.loads(request.content)["name"])
+            return httpx.Response(201, json={})
+        if path == f"{base}/compare/{OLD}...{NEW}":
             return httpx.Response(200, json={"status": self.status, "ahead_by": 3,
                                              "files": [{"filename": f} for f in self.files]})
-        if path == f"/repos/{REPO}/compare/{NEW}...main":
+        if path == f"{base}/compare/{NEW}...main":
             return httpx.Response(200, json={"status": self.on_main})
-        if path == f"/repos/{REPO}/commits/{NEW}/check-runs":
+        if path == f"{base}/commits/{NEW}/check-runs":
             return httpx.Response(200, json={"check_runs": self.checks})
-        if path == f"/repos/{REPO}/git/refs/heads/release" and method == "PATCH":
+        if path == f"{base}/git/refs/heads/release" and method == "PATCH":
             body = json.loads(request.content)
             self.patches.append(body)
-            self.release, self.released_at = body["sha"], self.clock.now()
+            self.release, self.moved_at = body["sha"], self.clock.now()
             return httpx.Response(200, json={"object": {"sha": body["sha"]}})
-        if path == f"/repos/{REPO}/issues" and method == "GET":
-            return httpx.Response(200, json=self.open_issues)
-        if path == f"/repos/{REPO}/issues" and method == "POST":
-            self.issues.append(json.loads(request.content))
-            return httpx.Response(201, json={"number": 9})
-        if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/comments") and method == "POST":
-            self.comments.append(json.loads(request.content))
-            return httpx.Response(201, json={})
         return httpx.Response(404, json={"message": f"unexpected {method} {path}"})
 
     def web(self, request: httpx.Request) -> httpx.Response:
@@ -89,13 +118,7 @@ class World:
                 return httpx.Response(502)
             return httpx.Response(200, json=self.staging)
         if url == f"{PROD}/api/health":
-            if self.released_at is None or self.clock.now() < self.released_at + timedelta(seconds=self.live_after):
-                return httpx.Response(200, json={"ok": True, "commit": OLD,
-                                                 "started_at": (NOW - timedelta(hours=2)).isoformat()})
-            started = self.released_at + timedelta(seconds=self.live_after)
-            if self.restart_after is not None and self.clock.now() >= self.released_at + timedelta(seconds=self.restart_after):
-                started = self.released_at + timedelta(seconds=self.restart_after)
-            return httpx.Response(200, json={"ok": True, "commit": NEW, "started_at": started.isoformat()})
+            return httpx.Response(200, json=self.production)
         if url == f"{STAGING}/":
             return httpx.Response(200, text=APP)
         if url == f"{STAGING}/assets/index-1.js":
@@ -121,16 +144,36 @@ def world() -> World:
     return World()
 
 
-def test_releases_a_soaked_candidate_and_confirms_production_stays_up(world):
+# --- promotion ---------------------------------------------------------------------------------------------------
+def test_promotes_staging_commit_and_ends_the_run_there(world):
     result = world.run()
-    assert result.status == "released", result.as_dict()
+    assert result.status == "promoted", result.as_dict()
     assert world.patches == [{"sha": NEW, "force": False}]  # fast-forward only
-    assert world.issues == [] and world.comments == []
-    assert any("Production stayed healthy" in s for s in result.steps)
+    assert world.issues == [] and world.mark_posts == []
+
+
+def test_the_next_runs_confirm_production_goes_live_on_the_promotion(world):
+    world.run()
+    world.clock.sleep(5 * 60)
+    assert world.run().status == "held"  # production still on the old release, inside the go-live window
+    world.production = {"ok": True, "commit": NEW, "started_at": iso(world.clock.now())}
+    assert "confirming" in world.run().detail  # live, but only just started
+    world.clock.sleep(6 * 60)
+    world.staging["commit"] = NEW
+    result = world.run()
+    assert (NEW, "success") in world.mark_posts
+    assert result.status == "held" and "last release" in result.detail  # the 2-hour interval applies next
+
+
+def test_releases_are_at_least_the_interval_apart(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    result = world.run()
+    assert result.status == "held" and "60 minutes ago" in result.detail
+    assert world.patches == []
 
 
 def test_staging_must_run_the_candidate_for_the_soak_period(world):
-    world.staging["started_at"] = (NOW - timedelta(minutes=10)).isoformat()
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=10))
     result = world.run()
     assert result.status == "held" and "10 of 30 minutes" in result.detail
     assert world.patches == [] and world.issues == []
@@ -143,12 +186,71 @@ def test_no_factory_code_changed_means_no_release_and_no_restart(world):
     assert world.patches == []
 
 
-def test_nothing_to_do_when_release_already_runs_staging_commit(world):
-    world.release = NEW
+def test_nothing_to_do_when_staging_runs_the_release(world):
+    world.staging["commit"] = OLD
     assert world.run().status == "nothing"
     assert world.patches == []
 
 
+# --- confirming production ---------------------------------------------------------------------------------------
+def test_an_unconfirmed_release_is_confirmed_before_anything_else(world):
+    world.marks = {}
+    result = world.run()
+    assert world.mark_posts == [(OLD, "success")]
+    assert result.status == "promoted"
+
+
+def test_production_that_only_just_started_is_not_confirmed_yet(world):
+    world.marks = {}
+    world.production["started_at"] = iso(NOW - timedelta(minutes=2))
+    result = world.run()
+    assert result.status == "held" and "confirming" in result.detail
+    assert world.mark_posts == [] and world.patches == []
+
+
+def test_waits_while_production_deploys_the_release(world):
+    world.marks, world.moved_at = {}, NOW - timedelta(minutes=10)
+    world.production["commit"] = OTHER
+    result = world.run()
+    assert result.status == "held" and "Waiting for production" in result.detail
+    assert world.holds == [] and world.patches == []
+
+
+def test_a_release_that_never_goes_live_holds_releases_and_marks_the_commit(world):
+    world.marks, world.moved_at = {}, NOW - timedelta(minutes=60)
+    world.production["commit"] = OTHER
+    result = world.run()
+    assert result.status == "failed" and "Production reports ccccccc" in result.detail
+    assert world.mark_posts == [(OLD, "failure")]
+    assert len(world.issues) == 1 and world.issues[0]["labels"] == [HOLD] and HOLD in world.labels
+    assert world.patches == []
+    # Every later run stops at the hold until a person closes it.
+    assert "on hold" in world.run().detail
+    assert len(world.issues) == 1
+
+
+def test_an_open_hold_stops_everything(world):
+    world.holds = [{"number": 7, "title": "Release hold: rollback in progress"}]
+    result = world.run()
+    assert result.status == "held" and "#7" in result.detail
+    assert world.patches == [] and world.mark_posts == []
+
+
+def test_a_rolled_back_release_marked_do_not_release_holds(world):
+    world.marks = {OLD: "failure"}
+    result = world.run()
+    assert result.status == "held" and "do-not-release" in result.detail
+    assert world.patches == []
+
+
+def test_a_commit_marked_do_not_release_is_never_promoted(world):
+    world.marks[NEW] = "failure"
+    result = world.run()
+    assert result.status == "held" and "do-not-release" in result.detail
+    assert world.patches == []
+
+
+# --- gates before a promotion ------------------------------------------------------------------------------------
 def test_pending_checks_hold_the_release_without_an_issue(world):
     world.checks.append({"name": "codex", "status": "in_progress", "conclusion": None})
     result = world.run()
@@ -156,19 +258,14 @@ def test_pending_checks_hold_the_release_without_an_issue(world):
     assert world.patches == [] and world.issues == []
 
 
-def test_failed_checks_block_the_release_and_open_an_issue(world):
+def test_failed_checks_block_the_release_and_are_reported_once(world):
     world.checks[1]["conclusion"] = "failure"
     result = world.run()
     assert result.status == "failed" and "postgres" in result.detail
     assert world.patches == []
-    assert len(world.issues) == 1 and NEW[:7] in world.issues[0]["title"]
-
-
-def test_a_repeated_failure_comments_on_the_open_issue(world):
-    world.checks[1]["conclusion"] = "failure"
-    world.open_issues = [{"number": 5, "title": f"Release check failed at {NEW[:7]}"}]
+    assert len(world.issues) == 1 and NEW[:7] in world.issues[0]["title"] and "labels" not in world.issues[0]
     world.run()
-    assert world.issues == [] and len(world.comments) == 1
+    assert len(world.issues) == 1  # the open issue already reports it
 
 
 def test_staging_smoke_failure_blocks_the_release(world):
@@ -180,14 +277,14 @@ def test_staging_smoke_failure_blocks_the_release(world):
 
 def test_smoke_reports_auth_that_lets_anonymous_calls_through(world):
     world.me_status = 200
-    gh, web = world.clients()
+    _gh, web = world.clients()
     problems = smoke(web, STAGING)
     assert problems and "expected 401" in problems[0]
 
 
 def test_staging_briefly_down_during_a_deploy_is_retried(world):
     world.staging_down_for = 2
-    assert world.run().status == "released"
+    assert world.run().status == "promoted"
 
 
 def test_staging_that_stays_down_fails(world):
@@ -195,21 +292,6 @@ def test_staging_that_stays_down_fails(world):
     result = world.run()
     assert result.status == "failed" and "Staging is not healthy" in result.detail
     assert world.patches == []
-
-
-def test_production_that_never_reports_the_release_is_reported(world):
-    world.live_after = 3 * 3600
-    result = world.run()
-    assert result.status == "failed" and "did not report" in result.detail
-    assert world.patches == [{"sha": NEW, "force": False}]
-    assert len(world.issues) == 1
-
-
-def test_production_restarting_right_after_the_release_is_reported(world):
-    world.restart_after = world.live_after + 120
-    result = world.run()
-    assert result.status == "failed" and "restarted" in result.detail
-    assert len(world.issues) == 1
 
 
 def test_release_only_moves_forward(world):
@@ -225,15 +307,17 @@ def test_candidate_must_be_on_main(world):
     assert world.patches == []
 
 
+# --- controls ---------------------------------------------------------------------------------------------------
 def test_paused_releases_touch_nothing(world):
     result = world.run(paused=True)
     assert result.status == "held" and world.github_calls == 0
 
 
-def test_dry_run_checks_everything_but_does_not_move_release(world):
+def test_dry_run_changes_nothing(world):
+    world.marks = {}
     result = world.run(dry_run=True)
-    assert result.status == "would_release"
-    assert world.patches == []
+    assert result.status == "would_promote"
+    assert world.patches == [] and world.mark_posts == [] and world.issues == []
 
 
 def test_health_reports_when_the_process_started(client):

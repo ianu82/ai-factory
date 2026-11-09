@@ -1,16 +1,29 @@
 """Release checker: promote what staging runs to the branch production deploys from.
 
 Merges land on `main` as soon as they are ready, and staging (its own Railway environment) deploys every
-commit of `main`. Production deploys only from `release`. A scheduled `aifactory release-check` (a Railway cron
-service) fast-forwards `release` to the commit staging runs, and only when all of these hold:
+commit of `main`. Production deploys only from `release`. `aifactory release-check` runs every 15 minutes (a
+Railway cron service). Each run is short and safe to interrupt: it works out the state from GitHub and the two
+deployments, does at most one thing, and ends right after moving `release`, so the redeploy it causes never cuts
+a run in half.
 
-- staging is healthy on that commit and has run it without restarting for the soak period;
-- the commit changes the Factory's code since the last release (otherwise a release restarts production for nothing);
-- every GitHub check on the commit passed;
-- staging passes smoke checks: the web app and its assets load, the API answers, and auth rejects anonymous calls.
+A run, in order:
 
-It then confirms that production reports the new commit and stays up without restarting. Anything that needs a
-person (failed checks, failed smoke, a release that did not go live) opens or updates a GitHub issue.
+1. Stops if releases are paused or an open issue labelled `release-hold` exists.
+2. Confirms the current release. Production must report the `release` commit and have run it for a few minutes;
+   the commit then gets a green `factory/release` status. If production has not gone live on it in time, the run
+   marks that commit "do not release", opens a `release-hold` issue and stops. A person rolls back or fixes, then
+   closes the hold.
+3. Waits until the last release is at least the release interval old (2 hours by default).
+4. Promotes the commit staging runs when all of these hold:
+   - staging has run it without restarting for the soak period;
+   - it changes the Factory's code since the last release;
+   - it is on `main` and ahead of `release`, and not marked "do not release";
+   - every GitHub check on it passed;
+   - staging passes smoke checks.
+
+Failures before a promotion open one issue per commit and change nothing. A commit is marked "do not release"
+with a failed `factory/release` commit status: by the checker when a release fails in production, or by a person
+during a rollback.
 """
 
 from __future__ import annotations
@@ -48,9 +61,12 @@ class ReleaseConfig:
     source_branch: str = "main"
     paths: tuple[str, ...] = ("aifactory/",)
     soak_minutes: int = 30
+    interval_minutes: int = 120
     live_timeout_minutes: int = 40
     stable_minutes: int = 5
     poll_seconds: int = 30
+    hold_label: str = "release-hold"
+    status_context: str = "factory/release"
     paused: bool = False
 
     @classmethod
@@ -75,6 +91,7 @@ class ReleaseConfig:
                    source_branch=env("AIFACTORY_RELEASE_SOURCE_BRANCH", "main"),
                    paths=tuple(p.strip() for p in env("AIFACTORY_RELEASE_PATHS", "aifactory/").split(",") if p.strip()),
                    soak_minutes=number("AIFACTORY_RELEASE_SOAK_MINUTES", 30),
+                   interval_minutes=number("AIFACTORY_RELEASE_INTERVAL_MINUTES", 120),
                    live_timeout_minutes=number("AIFACTORY_RELEASE_LIVE_TIMEOUT_MINUTES", 40),
                    stable_minutes=number("AIFACTORY_RELEASE_STABLE_MINUTES", 5),
                    poll_seconds=max(1, number("AIFACTORY_RELEASE_POLL_SECONDS", 30)),
@@ -83,11 +100,12 @@ class ReleaseConfig:
 
 @dataclass
 class Result:
-    status: str  # released | would_release | nothing | held | failed
+    status: str  # promoted | would_promote | nothing | held | failed
     detail: str
     commit: str = ""
     previous: str = ""
     steps: list[str] = field(default_factory=list)
+    reported: bool = False  # already opened its own issue
 
     @property
     def failed(self) -> bool:
@@ -112,12 +130,12 @@ def _health(web: httpx.Client, base: str) -> dict[str, Any]:
     return body if isinstance(body, dict) else {"ok": False, "error": "unexpected body"}
 
 
-def _started(health: dict[str, Any]) -> datetime | None:
+def _time(value: Any) -> datetime | None:
     try:
-        value = datetime.fromisoformat(str(health.get("started_at") or ""))
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
     except ValueError:
         return None
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def smoke(web: httpx.Client, base: str) -> list[str]:
@@ -153,6 +171,7 @@ class Releaser:
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self.cfg, self.gh, self.web, self.sleep, self.now = cfg, gh, web, sleep, now
         self.steps: list[str] = []
+        self.dry_run = False
 
     # --- GitHub -----------------------------------------------------------------------------------------------
     def _gh(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -168,6 +187,15 @@ class Releaser:
         if response.status_code != 200:
             raise ReleaseError(f"Reading branch {branch}: HTTP {response.status_code}")
         return response.json()["object"]["sha"]
+
+    def _moved_at(self, branch: str) -> datetime | None:
+        """When the branch last moved (push, merge, creation or rollback), from the repository activity log."""
+        response = self._gh("GET", f"/repos/{self.cfg.repo}/activity",
+                            params={"ref": f"refs/heads/{branch}", "per_page": 1})
+        if response.status_code != 200:
+            raise ReleaseError(f"Reading activity for {branch}: HTTP {response.status_code}")
+        items = response.json()
+        return _time(items[0].get("timestamp")) if items else None
 
     def _compare(self, base: str, head: str) -> dict[str, Any]:
         response = self._gh("GET", f"/repos/{self.cfg.repo}/compare/{base}...{head}")
@@ -188,22 +216,54 @@ class Releaser:
                 break
         return runs
 
-    def report(self, result: Result) -> None:
-        """Open an issue for a failure, or comment on the open one with the same title."""
-        title = f"Release check failed at {result.commit[:7] or 'unknown commit'}"
-        body = (f"{result.detail}\n\nCandidate: `{result.commit or 'unknown'}`\nCurrent release: `{result.previous or 'unknown'}`\n\n"
-                "Steps:\n" + "\n".join(f"- {s}" for s in result.steps) +
-                "\n\nThe release checker will retry at its next run. Production keeps running the current release.")
+    def _mark(self, sha: str) -> str | None:
+        """This checker's verdict on a commit: success (live in production), failure (do not release) or None."""
+        response = self._gh("GET", f"/repos/{self.cfg.repo}/commits/{sha}/status")
+        if response.status_code != 200:
+            raise ReleaseError(f"Reading statuses for {sha[:7]}: HTTP {response.status_code}")
+        for status in response.json().get("statuses") or []:
+            if status.get("context") == self.cfg.status_context:
+                return status.get("state")
+        return None
+
+    def _set_mark(self, sha: str, state: str, description: str) -> None:
+        if self.dry_run:
+            self.step(f"Dry run: would mark {sha[:7]} {state}")
+            return
+        response = self._gh("POST", f"/repos/{self.cfg.repo}/statuses/{sha}",
+                            json={"state": state, "context": self.cfg.status_context, "description": description[:140]})
+        if response.status_code not in (200, 201):
+            raise ReleaseError(f"Marking {sha[:7]} {state}: HTTP {response.status_code}")
+
+    def _open_issues(self, **params: Any) -> list[dict[str, Any]]:
+        response = self._gh("GET", f"/repos/{self.cfg.repo}/issues", params={"state": "open", "per_page": 100, **params})
+        if response.status_code != 200:
+            raise ReleaseError(f"Listing issues: HTTP {response.status_code}")
+        return [i for i in response.json() if "pull_request" not in i]
+
+    def _open_issue(self, title: str, body: str, labels: list[str] | None = None) -> None:
+        """One issue per title: a repeated failure is already reported and is not posted again."""
+        if self.dry_run:
+            self.step(f"Dry run: would open issue {title!r}")
+            return
         try:
-            existing = self._gh("GET", f"/repos/{self.cfg.repo}/issues", params={"state": "open", "per_page": 100})
-            match = next((i for i in (existing.json() if existing.status_code == 200 else [])
-                          if i.get("title") == title and "pull_request" not in i), None)
-            if match:
-                self._gh("POST", f"/repos/{self.cfg.repo}/issues/{match['number']}/comments", json={"body": body})
-            else:
-                self._gh("POST", f"/repos/{self.cfg.repo}/issues", json={"title": title, "body": body})
+            if any(i.get("title") == title for i in self._open_issues()):
+                return
+            if labels:
+                for label in labels:
+                    if self._gh("GET", f"/repos/{self.cfg.repo}/labels/{label}").status_code == 404:
+                        self._gh("POST", f"/repos/{self.cfg.repo}/labels",
+                                 json={"name": label, "color": "b60205",
+                                       "description": "Stops the release checker until closed"})
+            self._gh("POST", f"/repos/{self.cfg.repo}/issues",
+                     json={"title": title, "body": body, **({"labels": labels} if labels else {})})
         except (ReleaseError, httpx.HTTPError) as exc:  # reporting must never hide the result itself
-            log.error("Could not report the release failure on GitHub: %s", exc)
+            log.error("Could not open the release issue on GitHub: %s", exc)
+
+    def _body(self, result: Result, extra: str = "") -> str:
+        return (f"{result.detail}\n\nCommit: `{result.commit or 'unknown'}`\nRelease branch was at: "
+                f"`{result.previous or 'unknown'}`\n\nSteps:\n" + "\n".join(f"- {s}" for s in self.steps) +
+                (f"\n\n{extra}" if extra else ""))
 
     # --- the check ----------------------------------------------------------------------------------------------
     def step(self, text: str) -> None:
@@ -211,19 +271,79 @@ class Releaser:
         self.steps.append(text)
 
     def run(self, dry_run: bool = False) -> Result:
+        self.dry_run = dry_run
         try:
-            result = self._run(dry_run)
-        except (ReleaseError, httpx.HTTPError, KeyError, ValueError) as exc:
+            result = self._run()
+        except (ReleaseError, httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
             result = Result("failed", f"Release check error: {exc}")
         result.steps = self.steps
-        if result.failed:
-            self.report(result)
+        if result.failed and not result.reported:
+            self._open_issue(f"Release check failed at {result.commit[:7] or 'unknown commit'}", self._body(
+                result, "Production keeps running the current release. The checker tries again on its next run."))
         return result
 
-    def _run(self, dry_run: bool) -> Result:
+    def _minutes_since(self, moment: datetime | None) -> float | None:
+        return None if moment is None else (self.now() - moment).total_seconds() / 60
+
+    def _run(self) -> Result:
         cfg = self.cfg
         if cfg.paused:
             return Result("held", "Releases are paused (AIFACTORY_RELEASE_PAUSED).")
+        holds = self._open_issues(labels=cfg.hold_label)
+        if holds:
+            return Result("held", f"Releases are on hold until #{holds[0]['number']} is closed: {holds[0].get('title', '')}")
+
+        current = self._ref(cfg.branch)
+        if current is None:
+            return Result("failed", f"Branch {cfg.branch} does not exist; create it at the commit production runs.")
+        since_move = self._minutes_since(self._moved_at(cfg.branch))
+
+        confirmed = self._confirm_production(current, since_move)
+        if confirmed is not None:
+            return confirmed
+
+        if since_move is not None and since_move < cfg.interval_minutes:
+            return Result("held", f"The last release was {since_move:.0f} minutes ago; the next can follow after "
+                                  f"{cfg.interval_minutes}.", previous=current)
+        return self._promote(current)
+
+    def _confirm_production(self, current: str, since_move: float | None) -> Result | None:
+        """None when production runs the current release, confirmed; otherwise the reason to stop this run."""
+        cfg = self.cfg
+        mark = self._mark(current)
+        if mark == "failure":
+            return Result("held", f"{cfg.branch} is at {current[:7]}, which is marked do-not-release. "
+                                  f"Roll {cfg.branch} back or ship a fix.", current, current)
+        live = _health(self.web, cfg.production_url)
+        if live.get("ok") and live.get("commit") == current:
+            up = self._minutes_since(_time(live.get("started_at")))
+            if mark == "success":
+                self.step(f"Production runs {current[:7]}, confirmed earlier")
+                return None
+            if up is not None and up < cfg.stable_minutes:
+                return Result("held", f"Production has run {current[:7]} for {up:.0f} minutes; confirming after "
+                                      f"{cfg.stable_minutes}.", current, current)
+            self._set_mark(current, "success", "Live in production")
+            self.step(f"Production confirmed on {current[:7]}")
+            return None
+        if since_move is not None and since_move < cfg.live_timeout_minutes:
+            seen = str(live.get("commit") or "")[:7] or live.get("error", "no answer")
+            return Result("held", f"Waiting for production to go live on {current[:7]} (moved {since_move:.0f} minutes "
+                                  f"ago; production reports {seen}).", current, current)
+        seen = str(live.get("commit") or "")[:7] or live.get("error", "no answer")
+        waited = "an unknown time" if since_move is None else f"{since_move:.0f} minutes"
+        result = Result("failed", f"Production reports {seen}, but {cfg.branch} has been at {current[:7]} for {waited}.",
+                        current, current)
+        self._set_mark(current, "failure", "Did not go live or stay healthy in production")
+        self._open_issue(f"Release hold: {current[:7]} did not go live in production", self._body(result, (
+            f"Releases are on hold while this issue is open, and {current[:7]} is marked do-not-release. Check the "
+            f"Railway deployment. To roll back, move `{cfg.branch}` to the last good release. Close this issue once "
+            "production is healthy; the checker then releases the next commit staging runs.")), [cfg.hold_label])
+        result.reported = True
+        return result
+
+    def _promote(self, current: str) -> Result:
+        cfg = self.cfg
         staging = _health(self.web, cfg.staging_url)
         for _ in range(STAGING_RETRIES):  # a deploy briefly takes staging down; don't call that a failure
             if staging.get("ok"):
@@ -232,99 +352,71 @@ class Releaser:
             staging = _health(self.web, cfg.staging_url)
         candidate = str(staging.get("commit") or "")
         if not staging.get("ok"):
-            return Result("failed", f"Staging is not healthy: {staging.get('error') or staging}", candidate)
+            return Result("failed", f"Staging is not healthy: {staging.get('error') or staging}", candidate, current)
         if not candidate:
-            return Result("failed", "Staging does not report its commit (RAILWAY_GIT_COMMIT_SHA).")
-        started = _started(staging)
+            return Result("failed", "Staging does not report its commit (RAILWAY_GIT_COMMIT_SHA).", previous=current)
+        started = _time(staging.get("started_at"))
         if started is None:
-            return Result("held", "Staging does not report when it started yet.", candidate)
-        ran = (self.now() - started).total_seconds() / 60
-        self.step(f"Staging runs {candidate[:7]}, up {ran:.0f} min")
+            return Result("held", "Staging does not report when it started yet.", candidate, current)
+        ran = self._minutes_since(started) or 0.0
+        self.step(f"Staging runs {candidate[:7]}, up {ran:.0f} minutes")
 
-        previous = self._ref(cfg.branch)
-        if previous is None:
-            return Result("failed", f"Branch {cfg.branch} does not exist; create it at the commit production runs.",
-                          candidate)
-        if previous == candidate:
-            return Result("nothing", f"{cfg.branch} is already at {candidate[:7]}.", candidate, previous)
-        compare = self._compare(previous, candidate)
+        if candidate == current:
+            return Result("nothing", f"{cfg.branch} is already at {candidate[:7]}.", candidate, current)
+        compare = self._compare(current, candidate)
         status = compare.get("status")
         if status in ("identical", "behind"):
-            return Result("nothing", f"Staging's {candidate[:7]} is not ahead of {cfg.branch} ({status}).", candidate, previous)
+            return Result("nothing", f"Staging's {candidate[:7]} is not ahead of {cfg.branch} ({status}).", candidate, current)
         if status != "ahead":
-            return Result("failed", f"{candidate[:7]} has diverged from {cfg.branch} at {previous[:7]}; "
-                                    "release only moves forward.", candidate, previous)
+            return Result("failed", f"{candidate[:7]} has diverged from {cfg.branch} at {current[:7]}; "
+                                    "release only moves forward.", candidate, current)
         files = [f.get("filename", "") for f in compare.get("files") or []]
         if len(files) < COMPARE_FILE_LIMIT and not any(f.startswith(cfg.paths) for f in files):
             return Result("nothing", f"No Factory code changed in {compare.get('ahead_by', '?')} commit(s) since "
-                                     f"{previous[:7]}; no restart needed.", candidate, previous)
-        self.step(f"{compare.get('ahead_by', '?')} commit(s) since {cfg.branch} at {previous[:7]} change Factory code")
+                                     f"{current[:7]}; no restart needed.", candidate, current)
+        self.step(f"{compare.get('ahead_by', '?')} commit(s) since {cfg.branch} at {current[:7]} change Factory code")
 
-        on_source = self._compare(candidate, cfg.source_branch).get("status")
-        if on_source not in ("ahead", "identical"):
-            return Result("failed", f"{candidate[:7]} is not on {cfg.source_branch}.", candidate, previous)
-
+        if self._compare(candidate, cfg.source_branch).get("status") not in ("ahead", "identical"):
+            return Result("failed", f"{candidate[:7]} is not on {cfg.source_branch}.", candidate, current)
+        if self._mark(candidate) == "failure":
+            return Result("held", f"{candidate[:7]} is marked do-not-release; waiting for a newer commit on staging.",
+                          candidate, current)
         if ran < cfg.soak_minutes:
             return Result("held", f"Staging has run {candidate[:7]} for {ran:.0f} of {cfg.soak_minutes} minutes.",
-                          candidate, previous)
+                          candidate, current)
 
         runs = self._check_runs(candidate)
         if not runs:
-            return Result("held", f"No GitHub checks reported on {candidate[:7]} yet.", candidate, previous)
+            return Result("held", f"No GitHub checks reported on {candidate[:7]} yet.", candidate, current)
         pending = sorted({r.get("name", "?") for r in runs if r.get("status") != "completed"})
         if pending:
-            return Result("held", "Checks still running: " + ", ".join(pending), candidate, previous)
+            return Result("held", "Checks still running: " + ", ".join(pending), candidate, current)
         failing = sorted({r.get("name", "?") for r in runs if r.get("conclusion") not in OK_CONCLUSIONS})
         if failing:
-            return Result("failed", "Checks failed: " + ", ".join(failing), candidate, previous)
+            return Result("failed", "Checks failed: " + ", ".join(failing), candidate, current)
         self.step(f"{len(runs)} GitHub check(s) passed")
 
         problems = smoke(self.web, cfg.staging_url)
         if problems:
-            return Result("failed", "Staging smoke failed: " + "; ".join(problems), candidate, previous)
+            return Result("failed", "Staging smoke failed: " + "; ".join(problems), candidate, current)
         self.step("Staging smoke checks passed")
 
         again = _health(self.web, cfg.staging_url)
-        if not again.get("ok") or again.get("commit") != candidate or _started(again) != started:
-            return Result("held", "Staging changed during the check; trying again next run.", candidate, previous)
+        if not again.get("ok") or again.get("commit") != candidate or _time(again.get("started_at")) != started:
+            return Result("held", "Staging changed during the check; trying again next run.", candidate, current)
 
-        if dry_run:
-            return Result("would_release", f"Would move {cfg.branch} from {previous[:7]} to {candidate[:7]}.",
-                          candidate, previous)
+        if self.dry_run:
+            return Result("would_promote", f"Would move {cfg.branch} from {current[:7]} to {candidate[:7]}.",
+                          candidate, current)
+        # The last action of a run: the deploy this starts may restart this checker, which is then finished.
         moved = self._gh("PATCH", f"/repos/{cfg.repo}/git/refs/heads/{cfg.branch}",
                          json={"sha": candidate, "force": False})
         if moved.status_code != 200:
             return Result("failed", f"Moving {cfg.branch} to {candidate[:7]} was refused: HTTP {moved.status_code}.",
-                          candidate, previous)
-        self.step(f"Moved {cfg.branch} from {previous[:7]} to {candidate[:7]}")
-        return self._confirm_live(candidate, previous)
-
-    def _confirm_live(self, candidate: str, previous: str) -> Result:
-        cfg = self.cfg
-        deadline = self.now().timestamp() + cfg.live_timeout_minutes * 60
-        live: dict[str, Any] = {}
-        while True:
-            live = _health(self.web, cfg.production_url)
-            if live.get("ok") and live.get("commit") == candidate:
-                break
-            if self.now().timestamp() >= deadline:
-                seen = live.get("commit", "")[:7] or live.get("error", "no answer")
-                return Result("failed", f"Production did not report {candidate[:7]} within {cfg.live_timeout_minutes} "
-                                        f"minutes (last seen: {seen}). Check the Railway deployment.", candidate, previous)
-            self.sleep(cfg.poll_seconds)
-        started = _started(live)
-        self.step(f"Production is live on {candidate[:7]}")
-        stable_until = self.now().timestamp() + cfg.stable_minutes * 60
-        while self.now().timestamp() < stable_until:
-            self.sleep(cfg.poll_seconds)
-            check = _health(self.web, cfg.production_url)
-            if not check.get("ok") or check.get("commit") != candidate:
-                return Result("failed", f"Production became unhealthy after the release: "
-                                        f"{check.get('error') or check.get('commit', '')[:7]}.", candidate, previous)
-            if started is not None and _started(check) != started:
-                return Result("failed", "Production restarted within minutes of the release.", candidate, previous)
-        self.step(f"Production stayed healthy for {cfg.stable_minutes} minutes")
-        return Result("released", f"Released {candidate[:7]} (previous {previous[:7]}).", candidate, previous)
+                          candidate, current)
+        self.step(f"Moved {cfg.branch} from {current[:7]} to {candidate[:7]}")
+        return Result("promoted", f"Moved {cfg.branch} to {candidate[:7]} (from {current[:7]}); the next runs confirm "
+                                  "production goes live on it.", candidate, current)
 
 
 def release_check(dry_run: bool = False) -> Result:
