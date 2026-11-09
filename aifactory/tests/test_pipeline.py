@@ -583,6 +583,17 @@ def test_an_attempt_that_ended_in_an_infrastructure_failure_is_not_retried_autom
     assert "auto_retry" not in _event_kinds(outcome_id)
 
 
+def test_automatic_retry_rounds_from_bootstrap_are_clamped(factory):
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    with session_scope() as s:  # bootstrap writes settings directly, without the API's clamp
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 50}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"), timeout=120)
+    _, results, title, _ = _attempts_and_block(outcome_id)
+    assert len(results) == 4 and title == "T1 did not pass after 1 attempts and 3 automatic retries"
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:

@@ -94,14 +94,19 @@ class TaskRunner:
         record(self.ws, kind, message, outcome_id=self.task.outcome_id, task_id=self.task_id, level=level, data=data)
 
     def evidence(self, key: str, value: Any) -> None:
+        self._set_evidence({key: value})
+
+    def _set_evidence(self, values: dict[str, Any]) -> None:
+        """Record evidence keys in one transaction ("attempts" appends)."""
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
             ev = json.loads(json.dumps(task.evidence or {}))
-            if key == "attempts":
-                ev.setdefault("attempts", []).append(value)
-            else:
-                ev[key] = value
+            for key, value in values.items():
+                if key == "attempts":
+                    ev.setdefault("attempts", []).append(value)
+                else:
+                    ev[key] = value
             task.evidence = ev
             self.task.evidence = ev
 
@@ -461,7 +466,7 @@ class TaskRunner:
         """Attempts ran out. When the last one failed on concrete, actionable feedback, start a fresh budget with that
         feedback instead of asking a person, up to ``auto_retry_rounds`` times between human decisions."""
         ev = self.task.evidence or {}
-        rounds = int(self.settings.get("auto_retry_rounds", 1))
+        rounds = max(0, min(int(self.settings.get("auto_retry_rounds", 1) or 0), 3))  # bootstrap values skip the API clamp
         used = int(ev.get("auto_retries", 0))
         attempts = [a for a in ev.get("attempts", []) if isinstance(a, dict)]
         # Only the attempt that just ran out counts: some failures (an unreadable sandbox) record nothing, and an
@@ -469,8 +474,8 @@ class TaskRunner:
         last = attempts[-1] if attempts and attempts[-1].get("n") == self.task.attempt else {}
         if used >= rounds or last.get("result") not in ("verification_failed", "checks_failed", "policy"):
             return False
-        self.evidence("auto_retries", used + 1)
-        self.evidence("attempt_base", self.task.attempt)
+        # Counter and fresh budget together: a crash in between must not spend the round without granting it.
+        self._set_evidence({"auto_retries": used + 1, "attempt_base": self.task.attempt})
         self.event("auto_retry", f"{self.task.key} used its attempts on concrete findings; retrying with a fresh budget "
                    f"before asking a person ({used + 1} of {rounds})", level="warn")
         return True
