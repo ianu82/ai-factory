@@ -1091,8 +1091,9 @@ def _actionable(attempt: dict[str, Any]) -> bool:
         return bool(attempt.get("detail"))
     if result == "verification_failed":
         verdict = attempt.get("verdict") or {}  # optional report fields may be null
+        # Exactly what the feedback relays to the next attempt: unmet criteria and blocker/major findings.
         return (any(c.get("status") != "pass" for c in verdict.get("criteria") or [])
-                or bool(verdict.get("findings")))
+                or any(f.get("severity") in ("blocker", "major") for f in verdict.get("findings") or []))
     return False
 
 

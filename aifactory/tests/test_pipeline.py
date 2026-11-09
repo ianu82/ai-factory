@@ -651,6 +651,8 @@ def test_only_actionable_failures_earn_an_automatic_retry():
     assert delivery._actionable({"result": "verification_failed", "verdict": {
         "criteria": [{"criterion": "c", "status": "fail"}], "findings": []}})
     assert delivery._actionable({"result": "verification_failed", "verdict": {
+        "criteria": [{"criterion": "c", "status": "pass"}], "findings": [{"severity": "major", "description": "x"}]}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {  # minor findings are not relayed
         "criteria": [{"criterion": "c", "status": "pass"}], "findings": [{"severity": "minor", "description": "x"}]}})
     assert not delivery._actionable({"result": "verification_failed", "verdict": {
         "verdict": "fail", "criteria": [{"criterion": "c", "status": "pass"}], "findings": []}})
