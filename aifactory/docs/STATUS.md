@@ -1,6 +1,6 @@
 # AI Factory v2 — status against the roadmap
 
-Updated 8 November 2026. Evidence links point to real runs on the live service
+Updated 9 November 2026. Evidence links point to real runs on the live service
 (https://factory-production-f28b.up.railway.app) against `ianu82/calorie-tracker` and
 `ianu82/ai-factory`. "Unattended" means no human or operator action after the work was
 admitted (a GitHub issue labelled `factory:auto`). Anything else is marked assisted, and an
@@ -75,7 +75,60 @@ Platform fixes made along the way: verifier VMs failed three tests even on main 
 the Codex CLI tests), fixed in #247; rebuilds after a parallel merge no longer exhaust the attempt budget (#202);
 PRs merged or closed on GitHub are reconciled (#230); live updates recover after deploys (#230).
 
-Each delivered Factory issue will be listed here with its classification once merged.
+### Factory-built PRs merged overnight (8–9 November, times UTC)
+
+None of these is unattended. "Assisted" means the operator acted under Ian's delegation: sending reviewer
+findings back as "Request changes", retrying exhausted attempts with guidance, or approving the merge that this
+repository's policy reserves for a person.
+
+| PR | Factory task | What the operator did | Classification |
+| --- | --- | --- | --- |
+| #212 (21:13) | #13 T1 onboarding progress and readiness | Merge approval given as a delegated decision after verification, CI and the reviewer bot were clean; smoke passed | Assisted (merge approval only) |
+| #237 (23:38) | #17 T3 attributed memory | One round of review findings; merged once the revision fixed them | Assisted |
+| #218 (00:17) | #14 T1 Linear client, encrypted credential | One review round; one retry after environment-caused failures; the branch auto-rebased after a parallel merge | Assisted |
+| #214 (00:17) | #12 T2 benchmark suites | Two review rounds; auto-rebased | Assisted |
+| #213 (01:14) | #13 T3 preview detected commands | Two review rounds; one retry | Assisted |
+| #251 (01:14) | #15 T3 attachments for every agent session | One review round (an out-of-scope finding was left to #16 T1 and noted on the PR); one retry | Assisted |
+| #259 (01:48) | #14 T2 Linear configuration and team discovery | One review round | Assisted |
+| #231 (01:50) | #13 T4 full-page onboarding | Two review rounds; retries, including one after a transient VM bridge failure | Assisted |
+| #261 (02:05) | #13 T2 credential diagnostics | Three retries, one correcting the operator's own too-broad guidance; clean on first review | Assisted |
+| #263 (02:44) | #13 T6 searchable repository selection | Merge approval only | Assisted (merge approval only) |
+| #255 (02:48) | #12 T5 delivery metrics | Three review rounds | Assisted |
+| #265 (03:36) | #14 T3 restart-safe Linear intake | One review round | Assisted |
+| #268 (04:10) | #14 T6 Linear settings, source links and decision anchors in the web app | Merge approval only | Assisted (merge approval only) |
+
+Every merge followed the same rule: the Factory was waiting on a person, CI and the Factory's verification
+were green, and the reviewer bot found nothing on the final commit. Leftover threads were answered with where
+the fix is before being resolved.
+
+### Platform changes made because of what the night showed
+
+- **Revisions start from today's main** (#250). A revision built on a stale base got no CI and stalled. It now
+  rebases first (`--onto` the recorded base). When CI never arrives because main moved, the branch is
+  rebased and rechecked. A branch someone else pushed to is never adopted.
+- **Conflicts keep reviewed work** (#257). Parallel tasks kept conflicting in `models.py` and `api.py`. A
+  conflicting revision now carries the earlier change over with a three-way apply and resolves only the
+  overlapping lines, instead of re-implementing from scratch. Leftover conflict markers are rejected.
+- **Verifiers stop failing tasks over pre-existing failures** (#260). A failure identical on the base commit
+  and unrelated to the task is evidence, not a failed criterion. Opt-in suites run only when the task needs them.
+- **Verifiers judge by the same decisions as builders** (#262). Answers that clarified a criterion reached the
+  builder but not the verifier, so tasks failed on the original wording (#14 T4, #15 T1). Repository-scoped
+  precedents now apply only to their repository; before, they leaked to every repository.
+- **Pull requests page** (#253): unresolved review threads mean Needs attention, and Factory revisions show as
+  In progress. **Signals** (#252): check notes are proposed only for checks the repository still runs.
+- **One automatic retry round** (#258): when attempts run out on concrete findings that the feedback relays
+  (unmet criteria, blocker/major findings, failed checks, required runtime QA failures), the Factory retries once
+  with a fresh budget before asking a person. Settings → Throughput and limits sets the number of rounds (0–3).
+
+### Operator mistakes, owned
+
+- Reused a nonce (`o16t5-retry1`) from earlier in the night, so the bootstrap correctly skipped that retry
+  twice as already applied. Nonces must be unique across the workspace's history.
+- Told #13 T2 that a failed retest must never downgrade a valid token. That is right only for transient
+  failures; the verifier caught it and the corrected retry delivered #261.
+- Told #16 T1 to redact only long base64 runs, which let small images leak. The corrected guidance redacts
+  the exact payloads the session sent.
+- Clock estimates in the overnight notes ran an hour fast for a while. The times above come from GitHub.
 
 ## Roadmap
 
@@ -84,14 +137,14 @@ Each delivered Factory issue will be listed here with its classification once me
 | F01 Codex qualification | Unattended delivery done | PR #17 |
 | F18 Anton unattended delivery | Done, including independent rejection of a defective candidate | PR #18 |
 | F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 (native), #8 (Anton, unattended); Codex ran on MindsHub in #195 |
-| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected) | First self-change verified then lost to a rebase conflict (#195) |
+| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | Overnight 8–9 Nov: thirteen Factory-built PRs merged into `ai-factory` (#212, #237, #218, #214, #213, #251, #259, #231, #261, #263, #255, #265, #268), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
 | F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18, #25/#26 |
 | F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by repository, lockfiles and setup; setup skipped on a hit, saved after a clean miss, older ones pruned | Live: checkpoint saved in #8 (11 s); both parallel tasks of #9 booted their own VM from it in 6–9 s with setup skipped |
 | F04 Coding model choice | Models per role from the provider's live list | — |
 | F19 MindsHub sign-in & onboarding | API-key sign-in live; orgs/workspaces from MindsHub Auth; invited admins; setup checklist | OIDC coded; needs the domain on MindsHub's redirect allowlist (deliberately not blocking) |
 | F07 Workspaces | Isolated repos, credentials, policies, budgets, history | Two-workspace live test not yet run |
 | F08 Internal app | Inbox (grouped compact rows, inline actions, detail pane), Outcomes, Pull requests (GitHub, grouped by what each needs), Runs, Signals, Decisions, Settings; responsive; live updates that recover after deploys | Rendered with fixtures and live data |
-| F09 Acceptance & recovery | Durable stages; restarts resume without cancelling (an interrupted attempt is redone, not counted); operator retry/resolve; revert on smoke failure; in-app recovery guide (Inbox → How recovery works); costs reconciled from MindsHub usage when it lags | — |
+| F09 Acceptance & recovery | Durable stages; restarts resume without cancelling (an interrupted attempt is redone, not counted); operator retry/resolve; one automatic retry round when attempts run out on concrete findings (#258); revert on smoke failure; in-app recovery guide (Inbox → How recovery works); costs reconciled from MindsHub usage when it lags | — |
 | F10 Visual & risk review | Runtime QA screenshots/probes as verifier evidence and in PRs; protected paths and change-size limits | Visual diffing against the base not built |
 | F11 Watch & intervene | Live activity, guidance delivered to the active agent, cancel, **take over** from a task or from a stuck task's decision (candidate pushed as an unverified draft PR, task ends `handed_over`) | — |
 | F12 Product signals | GitHub issues, failing main CI, smoke/release failures, **product feedback API** (workspace key) and hand-logged feedback | Analytics/error-tracker connectors not built |
