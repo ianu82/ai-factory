@@ -293,12 +293,18 @@ class TaskRunner:
         carried = await sb.exec(f"git diff --binary --full-index {base} {shlex.quote(earlier)} | "
                                 "git apply --3way --whitespace=nowarn", timeout=300) if earlier else None
         unmerged = await sb.exec("git diff --name-only --diff-filter=U", timeout=60)
-        conflicted = sorted(set(unmerged.output.split())) if unmerged.ok else []
-        if carried is None or (not carried.ok and not conflicted):
+        conflicted = sorted(set(unmerged.output.splitlines())) if unmerged.ok else []
+        # A conflict git cannot mark up in text (binary files) would be silently settled in main's favour by the
+        # next `git add`: such a change is not carried over.
+        marked = await sb.exec("grep -l -E '^<{7} ' -- " + " ".join(shlex.quote(f) for f in conflicted),
+                               timeout=60) if conflicted else None
+        unmarked = [f for f in conflicted if f not in set(marked.output.splitlines() if marked else [])]
+        if carried is None or (not carried.ok and not conflicted) or unmarked:
             await sb.exec(f"git reset -q --hard {main}", timeout=120)
+            why = f" ({', '.join(unmarked)} cannot be merged line by line)" if unmarked else ""
             self.feedback.append(f"- Your previous branch conflicts with newer commits on {default} and could not be "
-                                 f"carried over, so this revision starts from the latest {default}. Re-implement the "
-                                 "change on top of it; all earlier feedback still applies.")
+                                 f"carried over{why}, so this revision starts from the latest {default}. Re-implement "
+                                 "the change on top of it; all earlier feedback still applies.")
             self.event("rebuild_on_main", f"{branch} conflicts with {default}; the revision restarts from the latest "
                        "code", level="warn")
             return

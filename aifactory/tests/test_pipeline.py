@@ -378,6 +378,40 @@ def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_o
     assert "land greet.sh" in git("log", "--format=%s", "main", cwd=bare)
 
 
+def test_a_binary_conflict_is_never_settled_silently_in_mains_favour(factory):
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    (seed / "logo.bin").write_bytes(b"A\x00base")
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", "logo", cwd=seed)
+    git("push", "-q", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+    told = []
+
+    def builder(messages):
+        if "cannot be merged line by line" in messages[1]["content"]:
+            told.append(True)
+        n = step(messages)
+        if n == 0:
+            return {"content": "", "tool_calls": [
+                call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}),
+                call("write_file", {"path": "logo.bin", "content": "A\x00task"}, 1)]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "greeting and logo"})]}
+
+    def move():
+        (seed / "logo.bin").write_bytes(b"A\x00main")
+        git("commit", "-qam", "new logo", cwd=seed)
+        git("push", "-q", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+        return git("rev-parse", "HEAD", cwd=seed)
+
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    assert told
+    kinds = _event_kinds(outcome_id)
+    assert "rebuild_on_main" in kinds and "rebase_conflicts" not in kinds, " ".join(kinds)
+    _approve_and_finish(factory, outcome_id)
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:logo.bin", cwd=bare) == "A\x00task"
+
+
 def test_conflict_markers_are_found_only_at_the_start_of_added_lines():
     diff = (b"diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1,5 @@\n+<<<<<<< ours\n+x\n+=======\n"
             b"+y\n+>>>>>>> theirs\ndiff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n"
