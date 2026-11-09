@@ -446,6 +446,14 @@ def test_delegation_reaches_another_workspace_only_to_relay_and_only_where_the_d
                                title=f"Merge {key}", options=[{"value": "approve", "label": "Merge"},
                                                               {"value": "reject", "label": "Request changes"}]))
                 tasks[key] = t.id
+            # GitHub refused a merge: retrying would merge again, so it is never a relay.
+            t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key="T3", title="T3", repo_id=repo.id,
+                     status="blocked", stage="merge", pr_number=8)
+            s.add(t)
+            s.flush()
+            s.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="unblock",
+                           title="GitHub refused the merge", options=[{"value": "retry", "label": "Retry"}]))
+            tasks["T3"] = t.id
             ids[name] = (ws.id, o.id, tasks)
     products, elsewhere = ids["Products"], ids["Elsewhere"]
     monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
@@ -455,6 +463,8 @@ def test_delegation_reaches_another_workspace_only_to_relay_and_only_where_the_d
              "comment": "Address the reviewer's comment on api.py.", "reusable": True, "nonce": "p-reject"},
             {"workspace": products[0], "outcome": 1, "task": "T2", "kind": "approve_merge", "resolution": "approve",
              "nonce": "p-approve"},
+            {"workspace": products[0], "outcome": 1, "task": "T3", "kind": "unblock", "resolution": "retry",
+             "nonce": "p-retry-merge"},
             {"workspace": elsewhere[0], "outcome": 1, "task": "T1", "kind": "approve_merge", "resolution": "reject",
              "comment": "Not a member here.", "nonce": "e-reject"}],
         "guidance": [{"workspace": products[0], "outcome": 1, "body": "Reply on each thread.", "nonce": "p-guide"},
@@ -473,5 +483,6 @@ def test_delegation_reaches_another_workspace_only_to_relay_and_only_where_the_d
                 if m.body == "Reply on each thread."] == ["Reply on each thread."]
         # ...but the operator never approves there, and does nothing where the delegator is not a member.
         assert s.get(Task, products[2]["T2"]).status == "awaiting_approval"
+        assert s.get(Task, products[2]["T3"]).status == "blocked"  # a retry at the merge stage would merge
         assert s.get(Task, elsewhere[2]["T1"]).status == "awaiting_approval"
         assert not s.query(Message).filter(Message.outcome_id == elsewhere[1]).count()

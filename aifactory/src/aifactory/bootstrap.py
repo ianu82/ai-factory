@@ -253,6 +253,8 @@ def _operator_user(db, delegated_by: str):
 # Outside the bootstrap workspace the operator may only relay; anything that approves, spends, stops or merges
 # stays with that workspace's people.
 RELAY_ONLY = {("approve_merge", "reject"), ("question", "answer"), ("unblock", "retry"), ("unblock", "acknowledge")}
+# Resuming a task at one of these stages would merge, release or revert: never a relay.
+MERGING_STAGES = {"merge", "release", "revert"}
 
 
 def _delegation_target(db, bootstrap_workspace_id: str, item: dict, delegated_by: str, *, kind: str = "",
@@ -370,6 +372,14 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
             decision = query.order_by(Decision.created_at.desc()).first()
             if decision is None:
                 continue
+            if target != workspace_id and item["resolution"] != "reject" and decision.task_id:
+                from .models import Task
+
+                stuck = db.get(Task, decision.task_id)
+                if stuck is not None and stuck.stage in MERGING_STAGES:
+                    log.error("Delegated %s refused for #%s %s: resuming its %s stage would merge, release or revert",
+                              item["resolution"], outcome.number, stuck.key, stuck.stage)
+                    continue
             try:
                 # Only the bootstrap workspace takes operator decisions as reusable precedents.
                 reusable = bool(item.get("reusable")) and target == workspace_id
