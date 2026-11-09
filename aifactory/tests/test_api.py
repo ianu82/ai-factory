@@ -425,3 +425,111 @@ def test_workspace_admin_can_explicitly_check_models(client, signed_in, monkeypa
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200
     assert {role["status"] for role in r.json()["roles"].values()} == {"supported"}
+
+
+def test_parallel_delivery_settings_survive_unrelated_edits(client, signed_in):
+    from aifactory.models import Repository
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    path = f"/api/workspaces/{ws_id}"
+    response = client.patch(path, json={"settings": {"planning_concurrency": 3}})
+    assert response.status_code == 200
+    assert response.json()["settings"]["planning_concurrency"] == 3
+    response = client.patch(path, json={"settings": {"concurrency": 4}})
+    assert response.status_code == 200
+    assert response.json()["settings"]["planning_concurrency"] == 3
+    assert client.get("/api/me").json()["workspaces"][0]["settings"]["planning_concurrency"] == 3
+
+    with session_scope() as db:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app", config={})
+        db.add(repo)
+        db.flush()
+        repo_id = repo.id
+    repo_path = f"{path}/repositories/{repo_id}"
+    for mode in ("overlap", "always", "never"):
+        merge = {"mode": "approval", "method": "merge", "revalidate": False, "reverify": mode}
+        response = client.patch(repo_path, json={"config": {"merge": merge}})
+        assert response.status_code == 200
+        assert response.json()["config"]["merge"] == merge
+        response = client.patch(repo_path, json={"config": {"context": "Updated team notes"}})
+        assert response.status_code == 200
+        assert response.json()["config"]["merge"] == merge
+        assert client.get(f"{path}/repositories").json()[0]["config"]["merge"] == merge
+
+    client.post("/auth/logout")
+    client.cookies.clear()
+    client.post("/auth/dev", json={"email": "member@example.com", "organization": "MindsDB"})
+    from aifactory.models import Membership
+
+    member_id = client.get("/api/me").json()["user"]["id"]
+    with session_scope() as db:
+        db.query(Membership).filter_by(workspace_id=ws_id, user_id=member_id).one().role = "member"
+    assert client.patch(path, json={"settings": {"planning_concurrency": 5}}).status_code == 403
+    assert client.patch(repo_path, json={"config": {"merge": {"reverify": "never"}}}).status_code == 403
+
+
+def test_waiting_ci_is_serialized_in_task_cards_and_outcome_tracks(client, signed_in):
+    from aifactory.models import Outcome, Plan, Repository, Task
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as db:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app")
+        outcome = Outcome(workspace_id=ws_id, number=1, title="Parked delivery", status="running")
+        db.add_all([repo, outcome])
+        db.flush()
+        plan = Plan(outcome_id=outcome.id)
+        db.add(plan)
+        db.flush()
+        db.add(Task(workspace_id=ws_id, outcome_id=outcome.id, repo_id=repo.id, plan_id=plan.id,
+                    key="T1", title="Waiting", status="waiting_ci", stage="ci",
+                    evidence={"ci": {"state": "pending"}}))
+        outcome_id = outcome.id
+    path = f"/api/workspaces/{ws_id}/outcomes"
+    detail = client.get(f"{path}/{outcome_id}")
+    assert detail.status_code == 200
+    task = detail.json()["tasks"][0]
+    assert (task["status"], task["stage"], task["evidence"]["ci"]["state"]) == ("waiting_ci", "ci", "pending")
+    listing = client.get(path)
+    assert listing.status_code == 200
+    outcome = listing.json()[0]
+    assert outcome["progress"] == {"done": 0, "total": 1}
+    assert outcome["track"][0] == {
+        "key": "T1", "status": "waiting_ci", "stage": "ci", "evidence": {"ci": {"state": "pending"}},
+    }
+
+
+def test_saved_workspace_planning_limit_controls_dispatch(client, signed_in, monkeypatch):
+    """The editable API setting limits actual planners, not just serialized settings."""
+    from aifactory.models import Outcome
+    from aifactory.pipeline.orchestrator import Orchestrator
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"planning_concurrency": 1}}).status_code == 200
+    with session_scope() as db:
+        db.add_all(Outcome(workspace_id=ws_id, number=n, title=f"Plan {n}", status="planning")
+                   for n in range(1, 4))
+    orch = Orchestrator()
+    started = []
+
+    def spawn(outcome_id):
+        started.append(outcome_id)
+        # Dispatch accounts for an admitted job immediately, before the next candidate.
+        orch._planning[outcome_id] = (None, None)
+
+    monkeypatch.setattr(orch, "_spawn_plan", spawn)
+    orch._schedule()
+    assert len(started) == 1
+    orch._schedule()
+    assert len(started) == 1
+    assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"planning_concurrency": 2}}).status_code == 200
+    orch._schedule()
+    assert len(started) == 2
+
+
+def test_meta_reverify_capability_is_optional_and_explicit(client):
+    """Old servers omit the flag; supporting servers must send a boolean, not a label."""
+    response = client.get("/api/meta")
+    assert response.status_code == 200
+    capabilities = response.json().get("capabilities", {})
+    if "reverify" in capabilities:
+        assert type(capabilities["reverify"]) is bool

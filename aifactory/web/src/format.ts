@@ -51,6 +51,7 @@ export const TASK_STATUS: Record<string, { label: string; tone: Tone }> = {
   pending: { label: "Waiting on dependencies", tone: "idle" },
   queued: { label: "Queued", tone: "idle" },
   running: { label: "Running", tone: "active" },
+  waiting_ci: { label: "Waiting for CI", tone: "idle" },
   needs_input: { label: "Needs input", tone: "human" },
   awaiting_approval: { label: "Merge needs approval", tone: "human" },
   failed: { label: "Did not pass", tone: "bad" },
