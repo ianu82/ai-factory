@@ -477,7 +477,7 @@ class TaskRunner:
         # Only the attempt that just ran out counts: some failures (an unreadable sandbox) record nothing, and an
         # older record must not turn an infrastructure failure into an automatic retry.
         last = attempts[-1] if attempts and attempts[-1].get("n") == self.task.attempt else {}
-        if used >= rounds or last.get("result") not in ("verification_failed", "checks_failed", "policy"):
+        if used >= rounds or not _actionable(last):
             return False
         # Counter and fresh budget together: a crash in between must not spend the round without granting it.
         self._set_evidence({"auto_retries": used + 1, "attempt_base": self.task.attempt})
@@ -1074,6 +1074,20 @@ class TaskRunner:
             log.warning("issue settlement failed for %s: %s", self.task_id, exc)
         self.update(status="completed", stage="done", finished_at=utcnow(), summary=summary, blocked_reason="")
         self.event("task_completed", f"{self.task.key} complete: {summary}", level="success")
+
+
+def _actionable(attempt: dict[str, Any]) -> bool:
+    """Whether an attempt's record gives the next attempt something concrete to fix."""
+    result = attempt.get("result")
+    if result == "checks_failed":
+        return any(not c.get("ok") for c in attempt.get("checks", []))
+    if result == "policy":
+        return bool(attempt.get("detail"))
+    if result == "verification_failed":
+        verdict = attempt.get("verdict") or {}
+        return (any(c.get("status") != "pass" for c in verdict.get("criteria", []))
+                or bool(verdict.get("findings")))
+    return False
 
 
 def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -647,6 +647,20 @@ def test_a_requested_revision_starts_with_a_fresh_budget_and_automatic_round(fac
         assert "attempt_base" not in task.evidence and "auto_retries" not in task.evidence
 
 
+def test_only_actionable_failures_earn_an_automatic_retry():
+    assert delivery._actionable({"result": "verification_failed", "verdict": {
+        "criteria": [{"criterion": "c", "status": "fail"}], "findings": []}})
+    assert delivery._actionable({"result": "verification_failed", "verdict": {
+        "criteria": [{"criterion": "c", "status": "pass"}], "findings": [{"severity": "minor", "description": "x"}]}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {
+        "verdict": "fail", "criteria": [{"criterion": "c", "status": "pass"}], "findings": []}})
+    assert not delivery._actionable({"result": "verification_failed", "verdict": {"verdict": "fail"}})
+    assert delivery._actionable({"result": "checks_failed", "checks": [{"command": "t", "ok": False}]})
+    assert not delivery._actionable({"result": "checks_failed", "checks": []})
+    assert delivery._actionable({"result": "policy", "detail": "- Too big"})
+    assert not delivery._actionable({"result": "builder_failed"}) and not delivery._actionable({})
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:
