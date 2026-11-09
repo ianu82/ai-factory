@@ -206,17 +206,19 @@ def test_configured_workspace_and_global_overrides(queue, monkeypatch, phase):
     asyncio.run(go())
 
 
-def test_resumptions_precede_fresh_urgent_builds_without_exceeding_caps(queue, monkeypatch):
+def test_priority_first_then_resumptions_without_exceeding_caps(queue, monkeypatch):
+    """Work starts by priority; within one priority, resumed work precedes new work."""
     set_limit(monkeypatch, "delivery", 1)
     fresh = queue("delivery", priority=0, age=-100)
     repair = queue("delivery", requester="b", priority=2, stage="ci_repair")
     merge = queue("delivery", requester="a", priority=0, stage="merge")
     restarted = queue("delivery", requester="a", priority=3, started=True)
+    fresh_normal = queue("delivery", requester="c", priority=2, age=-200)
 
     async def go():
         jobs = Jobs(monkeypatch)
         try:
-            for item_id in [merge, repair, restarted, fresh]:
+            for item_id in [merge, fresh, repair, fresh_normal, restarted]:
                 await jobs.tick()
                 assert jobs.started[-1] == item_id
                 await jobs.tick()

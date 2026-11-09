@@ -13,7 +13,8 @@ class Candidate:
     priority: int
     requester: str | None
     created_at: datetime
-    # Resumptions precede new delivery work, independently of outcome priority.
+    # Within one priority, resumptions (0) precede new delivery work (1). Priority always comes first: work is
+    # started by priority, so urgent new work is never held behind less urgent resumptions.
     dispatch_class: int = 0
 
 
@@ -28,17 +29,17 @@ class RequesterTurns:
 
     def choose(self, eligible: list[Candidate]) -> Candidate:
         """Choose without consuming a turn; the caller records only actual dispatches."""
-        rank = min((c.dispatch_class, c.priority) for c in eligible)
+        rank = min((c.priority, c.dispatch_class) for c in eligible)
         heads: dict[tuple[bool, str], Candidate] = {}
         for candidate in eligible:
-            if (candidate.dispatch_class, candidate.priority) != rank:
+            if (candidate.priority, candidate.dispatch_class) != rank:
                 continue
             requester = self._requester(candidate)
             previous = heads.get(requester)
             if previous is None or (candidate.created_at, candidate.id) < (previous.created_at, previous.id):
                 heads[requester] = candidate
         requesters = sorted(heads)
-        last = self.last_served.get(rank[1])
+        last = self.last_served.get(rank[0])
         # A stable requester ring also works when the last requester has no eligible work.
         next_requester = next((r for r in requesters if last is None or r > last), requesters[0])
         return heads[next_requester]
