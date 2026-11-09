@@ -1,6 +1,7 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { api, type Run } from "../api";
+import { api, type Run, type ScorerResult } from "../api";
 import { useWs } from "../App";
 import { ago, duration, HARNESS_LABEL, money, tokens } from "../format";
 import { Dot, Empty, Skeleton } from "../ui";
@@ -46,7 +47,8 @@ export function RunsPage() {
                 <tr key={r.id} onClick={() => navigate(`/w/${ws.id}/outcomes/${r.outcome_id}`)} style={{ cursor: "pointer" }} title={r.error || undefined}>
                   <td style={{ width: 14 }}><Dot tone={RUN_TONE[r.status] || "idle"} title={r.status} /></td>
                   <td><b style={{ fontWeight: 550 }}>{r.role}</b> <span className="muted">· {HARNESS_LABEL[r.harness]}{r.attempt > 1 ? ` · attempt ${r.attempt}` : ""}</span>
-                    {r.error && <div className="muted" style={{ fontSize: 12, maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.error}</div>}</td>
+                    {r.error && <div className="muted" style={{ fontSize: 12, maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.error}</div>}
+                    <RunScores run={r} workspaceId={ws.id} /></td>
                   <td style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     <span className="ref">#{r.outcome_number}{r.task_key ? ` ${r.task_key}` : ""}</span> {r.outcome_title}
                   </td>
@@ -66,4 +68,32 @@ export function RunsPage() {
       </div>
     </>
   );
+}
+
+function RunScores({ run, workspaceId }: { run: Run; workspaceId: string }) {
+  const [open, setOpen] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const details = useQuery({
+    queryKey: ["scores", workspaceId, run.id, offset],
+    queryFn: () => api<ScorerResult[]>(`/api/workspaces/${workspaceId}/runs/${run.id}/scores?limit=20&offset=${offset}`),
+    enabled: open,
+  });
+  if (!run.score_summary?.count) return null;
+  return <div style={{ fontSize: 12 }} onClick={e => e.stopPropagation()}>
+    {run.scores?.map(score => <div key={score.id}>
+      {score.scorer_id}: {score.status === "succeeded"
+        ? `${score.classification} · ${score.score} · ${score.passed ? "pass" : "fail"}` : score.status}
+    </div>)}
+    <div className="muted">Judging: {money(run.score_summary.cost_usd, run.score_summary.cost_known)}</div>
+    {!run.score_summary.cost_known && <div className="muted" title="MindsHub retries automatically. OpenAI retained usage is repriced when pricing is configured. Missing usage requires admin billing reconciliation through the attempts API.">Judge cost pending reconciliation</div>}
+    <button onClick={() => setOpen(!open)}>{open ? "Hide scores" : `Score details (${run.score_summary.count})`}</button>
+    {open && <div>
+      {details.isLoading ? <span>Loading…</span> : details.isError ? <span>Could not load scores</span> : details.data?.map(score => <div key={score.id}>
+        <b>{score.scorer_id}</b> · {score.classification || score.status} · {score.score} · {money(score.cost_usd, score.cost_known)}
+        <div className="muted" style={{ whiteSpace: "pre-wrap", maxWidth: 500 }}>{score.reasoning || score.error}</div>
+      </div>)}
+      <button disabled={offset === 0} onClick={() => setOffset(offset - 20)}>Previous</button>
+      <button disabled={!details.data || details.data.length < 20} onClick={() => setOffset(offset + 20)}>Next</button>
+    </div>}
+  </div>;
 }

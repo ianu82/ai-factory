@@ -248,7 +248,16 @@ export interface Task {
   updated_at: string;
 }
 
+export interface ScorerResult {
+  id: string; scorer_id: string; definition_version: string; status: string;
+  classification: string | null; score: number | null; passed: boolean | null;
+  reasoning: string; error: string;
+  cost_usd: number; cost_known: boolean;
+}
+
 export interface Run {
+  scores?: Omit<ScorerResult, "reasoning" | "error">[];
+  score_summary?: { count: number; cost_usd: number; cost_known: boolean };
   id: string;
   task_id: string | null;
   outcome_id: string;

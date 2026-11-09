@@ -27,7 +27,7 @@ class ScriptedModel:
 
     async def chat(self, *, model, messages, tools=None, ledger=None, **_kwargs):
         system = messages[0]["content"]
-        role = "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
+        role = "scorer" if "You are a scorer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
         ScriptedModel.calls.append(role)
         if ledger:
             ledger.check()

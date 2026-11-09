@@ -403,3 +403,51 @@ class MemoryEntry(Base):
     source: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ScorerResult(Base):
+    """A judge's verdict; usage includes every attempt, including interrupted calls."""
+
+    __tablename__ = "scorer_results"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    scorer_id: Mapped[str] = mapped_column(String(80))
+    definition_version: Mapped[str] = mapped_column(String(64))
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON)
+    automatic_key: Mapped[str | None] = mapped_column(String(180), nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    classification: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    reasoning: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ScorerAttempt(Base):
+    """Separate provider sessions retain cost provenance across retries and credential changes."""
+
+    __tablename__ = "scorer_attempts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    result_id: Mapped[str] = mapped_column(ForeignKey("scorer_results.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(20), default="")
+    model: Mapped[str] = mapped_column(String(100), default="")
+    # Nullable for additive migration: old attempts do not prove usage was returned.
+    usage_known: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    cost_reconciliation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    cost_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    cost_retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -90,16 +90,16 @@ def workspace_models(settings: dict[str, Any]) -> ModelSelection:
     )
 
 
-def resolve_provider(workspace_id: str) -> ProviderConfig:
+def resolve_provider(workspace_id: str, *, required_provider: str | None = None) -> ProviderConfig:
     """Pick the workspace's configured provider and decrypt its key (control plane only)."""
     settings = get_settings()
     with session_scope() as s:
         ws = s.get(Workspace, workspace_id)
         if ws is None:
             raise InferenceError("Workspace not found")
-        preferred = (ws.settings or {}).get("provider") or "mindshub"
+        preferred = required_provider or (ws.settings or {}).get("provider") or "mindshub"
         secrets = {sec.kind: sec for sec in s.query(Secret).filter(Secret.workspace_id == workspace_id)}
-        order = [preferred] + [p for p in PROVIDERS if p != preferred]
+        order = [preferred] if required_provider else [preferred] + [p for p in PROVIDERS if p != preferred]
         for provider in order:
             sec = secrets.get(PROVIDERS[provider]["secret"])
             if sec is not None and sec.status != "invalid":
@@ -112,9 +112,9 @@ def resolve_provider(workspace_id: str) -> ProviderConfig:
         # Server-level bootstrap keys (explicitly configured by the operator) are a fallback.
         if preferred == "mindshub" and settings.bootstrap_mindshub_key:
             key, provider = settings.bootstrap_mindshub_key, "mindshub"
-        elif settings.bootstrap_openai_key:
+        elif settings.bootstrap_openai_key and required_provider in (None, "openai"):
             key, provider = settings.bootstrap_openai_key, "openai"
-        elif settings.bootstrap_mindshub_key:
+        elif settings.bootstrap_mindshub_key and required_provider in (None, "mindshub"):
             key, provider = settings.bootstrap_mindshub_key, "mindshub"
         if key and provider != preferred:
             import os

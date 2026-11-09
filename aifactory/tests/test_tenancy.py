@@ -197,3 +197,82 @@ def test_model_checks_require_workspace_admin(client, signed_in, monkeypatch):
     assert client.post(f"/api/workspaces/{ws_id}/models/check").status_code == 403
     client.post("/auth/logout")
     assert client.post(f"/api/workspaces/{ws_id}/models/check").status_code == 401
+
+
+def test_scorer_routes_workspace_object_and_paid_judge_boundaries(client, signed_in, monkeypatch):
+    from aifactory import scorers
+    from aifactory.models import Membership, Run
+
+    ws = signed_in['workspaces'][0]['id']
+    ids = _seed(ws)
+    with session_scope() as s:
+        run = Run(workspace_id=ws, outcome_id=ids['outcome'], role='planner', harness='native', status='succeeded')
+        s.add(run)
+        s.flush()
+        run_id = run.id
+    root = f'/api/workspaces/{ws}'
+    other = TestClient(client.app)
+    other.post('/auth/dev', json={'email': 'judge@example.test', 'organization': 'Other'})
+    me = other.get('/api/me').json()
+    foreign = f"/api/workspaces/{me['workspaces'][0]['id']}"
+    def forbidden(_):
+        raise AssertionError('unauthorized judge dispatch')
+    monkeypatch.setattr(scorers, 'resolve_provider', forbidden)
+    for suffix in ['/scorers', f'/runs/{run_id}/scores', f'/runs/{run_id}/scores?limit=1&offset=1']:
+        assert other.get(root + suffix).status_code == 404
+    assert other.post(root + f'/runs/{run_id}/scores', json={'scorer_id': 'planner-quality'}).status_code == 404
+    assert other.get(foreign + f'/runs/{run_id}/scores').status_code == 404
+    assert other.post(foreign + f'/runs/{run_id}/scores', json={'scorer_id': 'planner-quality'}).status_code == 404
+    with session_scope() as s:
+        s.add(Membership(workspace_id=ws, user_id=me['user']['id'], role='viewer'))
+    assert other.get(root + '/scorers').status_code == 200
+    assert other.get(root + f'/runs/{run_id}/scores').json() == []
+    assert other.get(root + f'/runs/{run_id}/scores?limit=1&offset=1').json() == []
+    assert other.post(root + f'/runs/{run_id}/scores', json={'scorer_id': 'planner-quality'}).status_code == 403
+    with session_scope() as s:
+        from aifactory.models import ScorerResult
+        assert s.query(ScorerResult).count() == 0
+
+
+def test_scorer_cost_routes_tenancy_and_admin_only(client, signed_in):
+    from aifactory import scorers
+    from aifactory.models import Membership, Run, ScorerAttempt
+    from aifactory.db import utcnow
+
+    ws = signed_in['workspaces'][0]['id']
+    ids = _seed(ws)
+    with session_scope() as s:
+        run = Run(workspace_id=ws, outcome_id=ids['outcome'], role='planner', harness='native', status='succeeded')
+        s.add(run)
+        s.flush()
+        score = scorers.reserve(s, run, scorers.BUILTIN)
+        attempt = ScorerAttempt(workspace_id=ws, result_id=score.id, provider='openai',
+                                cost_known=False, finished_at=utcnow())
+        s.add(attempt)
+        s.flush()
+        suffix = f'/runs/{run.id}/scores/{score.id}/attempts'
+        cost_suffix = suffix + f'/{attempt.id}/cost'
+    root = f'/api/workspaces/{ws}'
+    body = {'cost_usd': .2, 'evidence': 'Provider billing export'}
+    other = TestClient(client.app)
+    assert other.get(root + suffix).status_code == 401
+    assert other.post(root + cost_suffix, json=body).status_code == 401
+    other.post('/auth/dev', json={'email': 'cost-auditor@example.test', 'organization': 'Other'})
+    me = other.get('/api/me').json()
+    foreign = f"/api/workspaces/{me['workspaces'][0]['id']}"
+    for prefix in (root, foreign):
+        assert other.get(prefix + suffix).status_code == 404
+        assert other.post(prefix + cost_suffix, json=body).status_code == 404
+    for role in ('viewer', 'member'):
+        with session_scope() as s:
+            member = s.query(Membership).filter_by(workspace_id=ws, user_id=me['user']['id']).first()
+            if member:
+                member.role = role
+            else:
+                s.add(Membership(workspace_id=ws, user_id=me['user']['id'], role=role))
+        assert other.get(root + suffix).status_code == 200
+        assert other.post(root + cost_suffix, json=body).status_code == 403
+    # Object checks apply even for an authorized owner, at every path level.
+    assert client.get(root + suffix.replace('/scores/', '/scores/wrong')).status_code == 404
+    assert client.post(root + cost_suffix.replace('/attempts/', '/attempts/wrong'), json=body).status_code == 404
+    assert client.post(root + cost_suffix, json=body).status_code == 200
