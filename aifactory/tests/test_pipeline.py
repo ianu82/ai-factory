@@ -617,6 +617,36 @@ def test_failed_check_output_survives_a_restart_into_the_next_attempt(factory):
     assert len(notes) == 1 and "`sh test.sh` failed (exit 1)" in notes[0] and "expected greeting, got: Hello" in notes[0]
 
 
+def test_a_requested_revision_starts_with_a_fresh_budget_and_automatic_round(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="awaiting_approval", stage="merge", attempt=5, pr_number=3,
+                    evidence={"attempt_base": 3, "auto_retries": 1, "attempts": []})
+        s.add(task)
+        s.flush()
+        decision = Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind="approve_merge",
+                            title="Approve merge", options=[{"value": "approve", "label": "Merge"},
+                                                            {"value": "reject", "label": "Request changes"}])
+        s.add(decision)
+        s.flush()
+        task_id, decision_id = task.id, decision.id
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "reject", comment="Rename the flag.")
+    db.close()
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.stage == "revise" and task.attempt == 0
+        assert "attempt_base" not in task.evidence and "auto_retries" not in task.evidence
+
+
 def test_automatic_retries_can_be_turned_off(factory):
     ScriptedModel.scripts["verifier"] = _always_failing_verifier
     with session_scope() as s:
