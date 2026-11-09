@@ -250,11 +250,46 @@ def _operator_user(db, delegated_by: str):
     return operator
 
 
+# Outside the bootstrap workspace the operator may only relay; anything that approves, spends, stops or merges
+# stays with that workspace's people.
+RELAY_ONLY = {("approve_merge", "reject"), ("question", "answer"), ("unblock", "retry"), ("unblock", "acknowledge")}
+# Resuming a task at one of these stages would merge, release or revert: never a relay.
+MERGING_STAGES = {"merge", "release", "revert"}
+
+
+def _delegation_target(db, bootstrap_workspace_id: str, item: dict, delegated_by: str, *, kind: str = "",
+                       resolution: str | None = None) -> str | None:
+    """The workspace a delegated item acts in: the bootstrap workspace by default, or another workspace (by id)
+    where the delegating person is a member, so the operator never does what they could not do themselves.
+    Outside the bootstrap workspace only RELAY_ONLY resolutions apply (guidance has resolution None)."""
+    target = str(item.get("workspace") or bootstrap_workspace_id)
+    if target == bootstrap_workspace_id:
+        return target
+    if resolution is not None and (kind, resolution) not in RELAY_ONLY:
+        log.error("Delegated %s '%s' refused in workspace %s: the operator only relays there", kind, resolution,
+                  target)
+        return None
+    from sqlalchemy import func
+
+    from .auth import ROLE_RANK
+    from .models import Membership, User
+
+    user = (db.query(User).filter(func.lower(User.email) == delegated_by.strip().lower(), User.is_system.is_(False))
+            .first() if delegated_by else None)
+    member = user and db.query(Membership).filter(Membership.workspace_id == target,
+                                                  Membership.user_id == user.id).first()
+    if not member or ROLE_RANK.get(member.role, 0) < ROLE_RANK["member"]:
+        log.error("Delegated item refused in workspace %s: %s is not a member there", target, delegated_by or "nobody")
+        return None
+    return target
+
+
 def _guidance_delegated(workspace_id: str, items: list[dict], delegated_by: str) -> None:
     """Post guidance to an outcome (or one task) as the operator under a person's delegation, like the app's
     guidance box: outcome-level guidance reaches every task of the outcome, including tasks not started yet.
 
-    Each item: {"outcome": N, "task": "T2" (optional), "body": "...", "nonce": "..."}; each nonce posts once.
+    Each item: {"outcome": N, "task": "T2" (optional), "body": "...", "nonce": "...", "workspace": id (optional,
+    see _delegation_target)}; each nonce posts once per workspace.
     """
     if not items:
         return
@@ -267,12 +302,15 @@ def _guidance_delegated(workspace_id: str, items: list[dict], delegated_by: str)
         operator = _operator_user(db, delegated_by)
         for item in items:
             body, nonce = str(item.get("body") or "").strip(), str(item.get("nonce") or "")
-            outcome = db.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+            target = _delegation_target(db, workspace_id, item, delegated_by)
+            if target is None:
+                continue
+            outcome = db.query(Outcome).filter(Outcome.workspace_id == target,
                                                Outcome.number == int(item.get("outcome", 0))).first()
             if outcome is None or not body or not nonce:
                 continue
             if any((e.data or {}).get("nonce") == nonce for e in db.query(Event).filter(  # once per workspace
-                    Event.workspace_id == workspace_id, Event.kind == "guidance")):
+                    Event.workspace_id == target, Event.kind == "guidance")):
                 continue
             task_id = None
             if item.get("task"):
@@ -281,9 +319,9 @@ def _guidance_delegated(workspace_id: str, items: list[dict], delegated_by: str)
                     continue
                 task_id = task.id
             # The message and its nonce-bearing event commit together, so a crash can never post it twice.
-            db.add(Message(workspace_id=workspace_id, outcome_id=outcome.id, task_id=task_id, author_id=operator.id,
+            db.add(Message(workspace_id=target, outcome_id=outcome.id, task_id=task_id, author_id=operator.id,
                            author_kind="user", body=body))
-            record(workspace_id, "guidance", f"{operator.name}: {body[:200]}", outcome_id=outcome.id, task_id=task_id,
+            record(target, "guidance", f"{operator.name}: {body[:200]}", outcome_id=outcome.id, task_id=task_id,
                    actor="operator", data={"intervention": True, "nonce": nonce, "delegated_by": delegated_by},
                    session=db)
             db.commit()
@@ -295,7 +333,8 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
     """Resolve open decisions as an operator acting under a person's explicit delegation.
 
     Each item: {"outcome": N, "task": "T1" (optional), "kind": "approve_merge"|"question"|..., "resolution": "...",
-    "comment": "...", "reusable": bool, "nonce": "..."}. The decision records the operator identity and who delegated it.
+    "comment": "...", "reusable": bool, "nonce": "...", "workspace": id (optional, see _delegation_target)}. The
+    decision records the operator identity and who delegated it.
     """
     if not items:
         return
@@ -309,7 +348,11 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
         operator = _operator_user(db, delegated_by)
         name = operator.name
         for item in items:
-            outcome = db.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+            target = _delegation_target(db, workspace_id, item, delegated_by, kind=str(item.get("kind", "")),
+                                        resolution=str(item.get("resolution", "")))
+            if target is None:
+                continue
+            outcome = db.query(Outcome).filter(Outcome.workspace_id == target,
                                                Outcome.number == int(item.get("outcome", 0))).first()
             if outcome is None:
                 continue
@@ -329,9 +372,19 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
             decision = query.order_by(Decision.created_at.desc()).first()
             if decision is None:
                 continue
+            if target != workspace_id and item["resolution"] != "reject" and decision.task_id:
+                from .models import Task
+
+                stuck = db.get(Task, decision.task_id)
+                if stuck is not None and stuck.stage in MERGING_STAGES:
+                    log.error("Delegated %s refused for #%s %s: resuming its %s stage would merge, release or revert",
+                              item["resolution"], outcome.number, stuck.key, stuck.stage)
+                    continue
             try:
+                # Only the bootstrap workspace takes operator decisions as reusable precedents.
+                reusable = bool(item.get("reusable")) and target == workspace_id
                 result = resolve(db, decision, operator, item["resolution"], item.get("comment", ""),
-                                 bool(item.get("reusable")), item.get("scope", "workspace" if item.get("reusable") else "item"))
+                                 reusable, item.get("scope", "workspace") if reusable else "item")
                 if result.get("handover"):
                     from .pipeline.handover import publish_candidate
 
@@ -339,7 +392,7 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
             except DecisionError as exc:
                 log.error("Delegated decision for #%s not applied: %s", outcome.number, exc)
                 continue
-            record(workspace_id, "operator_decision",
+            record(target, "operator_decision",
                    f"{name} resolved '{decision.title}': {item['resolution']}", outcome_id=outcome.id,
                    actor="operator", data={"nonce": nonce, "decision_id": decision.id, "delegated_by": delegated_by})
     finally:

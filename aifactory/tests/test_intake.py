@@ -408,3 +408,81 @@ def test_bootstrap_guidance_reaches_tasks_once_and_is_attributed_to_the_operator
         assert [m.body for m in s.query(Message).filter(Message.outcome_id == other_id)] == ["New guidance."]
         names = {s.get(User, m.author_id).name for m in s.query(Message).filter(Message.workspace_id == ws_id)}
         assert names == {"Operator (delegated by ian@example.com)", "Operator (delegated by ceo@example.com)"}
+
+
+def test_delegation_reaches_another_workspace_only_to_relay_and_only_where_the_delegator_is_a_member(monkeypatch):
+    from aifactory.models import Decision, Message, Plan, Task, User
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ian = User(email="ian@mindsdb.com", name="Ian")
+        s.add(ian)
+        s.flush()
+        ids = {}
+        for name, member in (("Products", True), ("Elsewhere", False)):
+            ws = Workspace(org_id=org.id, name=name, slug=name.lower(), settings={})
+            s.add(ws)
+            s.flush()
+            if member:
+                s.add(Membership(workspace_id=ws.id, user_id=ian.id, role="owner"))
+            repo = Repository(workspace_id=ws.id, full_name=f"acme/{name.lower()}", default_branch="main", config={})
+            s.add(repo)
+            s.flush()
+            o = Outcome(workspace_id=ws.id, number=1, title="Work", repo_ids=[repo.id], status="attention")
+            s.add(o)
+            s.flush()
+            plan = Plan(outcome_id=o.id, status="approved", content={})
+            s.add(plan)
+            s.flush()
+            tasks = {}
+            for key in ("T1", "T2"):
+                t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key=key, title=key, repo_id=repo.id,
+                         status="awaiting_approval", stage="merge", pr_number=7)
+                s.add(t)
+                s.flush()
+                s.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="approve_merge",
+                               title=f"Merge {key}", options=[{"value": "approve", "label": "Merge"},
+                                                              {"value": "reject", "label": "Request changes"}]))
+                tasks[key] = t.id
+            # GitHub refused a merge: retrying would merge again, so it is never a relay.
+            t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key="T3", title="T3", repo_id=repo.id,
+                     status="blocked", stage="merge", pr_number=8)
+            s.add(t)
+            s.flush()
+            s.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="unblock",
+                           title="GitHub refused the merge", options=[{"value": "retry", "label": "Retry"}]))
+            tasks["T3"] = t.id
+            ids[name] = (ws.id, o.id, tasks)
+    products, elsewhere = ids["Products"], ids["Elsewhere"]
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "Acme", "workspace": "Operator", "delegated_by": "ian@mindsdb.com",
+        "resolve": [
+            {"workspace": products[0], "outcome": 1, "task": "T1", "kind": "approve_merge", "resolution": "reject",
+             "comment": "Address the reviewer's comment on api.py.", "reusable": True, "nonce": "p-reject"},
+            {"workspace": products[0], "outcome": 1, "task": "T2", "kind": "approve_merge", "resolution": "approve",
+             "nonce": "p-approve"},
+            {"workspace": products[0], "outcome": 1, "task": "T3", "kind": "unblock", "resolution": "retry",
+             "nonce": "p-retry-merge"},
+            {"workspace": elsewhere[0], "outcome": 1, "task": "T1", "kind": "approve_merge", "resolution": "reject",
+             "comment": "Not a member here.", "nonce": "e-reject"}],
+        "guidance": [{"workspace": products[0], "outcome": 1, "body": "Reply on each thread.", "nonce": "p-guide"},
+                     {"workspace": elsewhere[0], "outcome": 1, "body": "Not a member here.", "nonce": "e-guide"}]}))
+
+    async def run():
+        return apply_bootstrap()
+
+    asyncio.run(run())
+    with session_scope() as s:
+        # Change requests and guidance reach a workspace where the delegator is a member...
+        assert (s.get(Task, products[2]["T1"]).status, s.get(Task, products[2]["T1"]).stage) == ("queued", "revise")
+        rejected = s.query(Decision).filter(Decision.task_id == products[2]["T1"]).one()
+        assert rejected.status == "resolved" and rejected.reusable is False
+        assert [m.body for m in s.query(Message).filter(Message.outcome_id == products[1])
+                if m.body == "Reply on each thread."] == ["Reply on each thread."]
+        # ...but the operator never approves there, and does nothing where the delegator is not a member.
+        assert s.get(Task, products[2]["T2"]).status == "awaiting_approval"
+        assert s.get(Task, products[2]["T3"]).status == "blocked"  # a retry at the merge stage would merge
+        assert s.get(Task, elsewhere[2]["T1"]).status == "awaiting_approval"
+        assert not s.query(Message).filter(Message.outcome_id == elsewhere[1]).count()
