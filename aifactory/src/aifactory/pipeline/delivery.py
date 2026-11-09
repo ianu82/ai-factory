@@ -18,8 +18,8 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import GitHub, GitHubError, resolve_token
-from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, apply_in_sandbox, checkout, extract_patch, protected_violations,
-                      publish, rebase_branch, revert_commit)
+from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, apply_in_sandbox, checkout,
+                      conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
@@ -266,8 +266,10 @@ class TaskRunner:
 
     async def _bring_branch_up_to_date(self, branch: str) -> None:
         """Revise on top of today's base branch. GitHub runs no pull-request checks while a branch conflicts, so a
-        revision pushed from a stale base would wait for CI forever. A clean rebase keeps the earlier work; a
-        conflicting one restarts the work tree from the latest base and tells the builder why."""
+        revision pushed from a stale base would wait for CI forever. A clean rebase keeps the earlier work. When it
+        conflicts, the earlier change is carried onto the latest base with a three-way apply: everything that merges
+        cleanly is kept, and only the lines both sides changed are left with conflict markers for the builder to
+        resolve, instead of re-implementing reviewed work from scratch."""
         sb, default = self.builder, self.repo.default_branch
         found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
         main = found.output.strip() if found.ok else ""
@@ -282,15 +284,42 @@ class TaskRunner:
             self.event("rebased", f"Brought {branch} up to date with {default} ({main[:8]}) before revising")
             return
         await sb.exec("git rebase --abort", timeout=60)
+        base = shlex.quote(self.task.base_sha)
+        earlier = (await sb.exec("git rev-parse HEAD", timeout=60)).output.strip()
         reset = await sb.exec(f"git reset -q --hard {main}", timeout=120)
         if not reset.ok:
             raise SandboxError(f"Could not restart {branch} from {default}: {reset.output[-400:]}")
         self.update(base_sha=main)
-        self.feedback.append(f"- Your previous branch conflicts with newer commits on {default}, so this revision starts "
-                             f"from the latest {default}. Re-implement the change on top of it; all earlier feedback "
-                             "still applies.")
-        self.event("rebuild_on_main", f"{branch} conflicts with {default}; the revision restarts from the latest code",
-                   level="warn")
+        carried = await sb.exec(f"git diff --binary --full-index {base} {shlex.quote(earlier)} | "
+                                "git apply --3way --whitespace=nowarn", timeout=300) if earlier else None
+        unmerged = await sb.exec("git diff --name-only --diff-filter=U", timeout=60)
+        conflicted = sorted(set(unmerged.output.splitlines())) if unmerged.ok else []
+        # A conflict git cannot mark up in text (binary files) would be silently settled in main's favour by the
+        # next `git add`: such a change is not carried over.
+        marked = await sb.exec("grep -l -E '^<{7} ' -- " + " ".join(shlex.quote(f) for f in conflicted),
+                               timeout=60) if conflicted else None
+        unmarked = [f for f in conflicted if f not in set(marked.output.splitlines() if marked else [])]
+        if carried is None or (not carried.ok and not conflicted) or unmarked:
+            await sb.exec(f"git reset -q --hard {main}", timeout=120)
+            why = f" ({', '.join(unmarked)} cannot be merged line by line)" if unmarked else ""
+            self.feedback.append(f"- Your previous branch conflicts with newer commits on {default} and could not be "
+                                 f"carried over{why}, so this revision starts from the latest {default}. Re-implement "
+                                 "the change on top of it; all earlier feedback still applies.")
+            self.event("rebuild_on_main", f"{branch} conflicts with {default}; the revision restarts from the latest "
+                       "code", level="warn")
+            return
+        if conflicted:
+            self.feedback.append(
+                f"- Newer commits on {default} changed the same lines as your earlier change. This revision starts from "
+                f"the latest {default} with your earlier change already re-applied; these files contain conflict markers "
+                f"where both sides changed the same lines: {', '.join(conflicted)}. In each conflict the `ours` side is "
+                f"the latest {default} and the `theirs` side is your earlier change. Resolve every conflict so both "
+                "intents survive (never drop the newer main changes), remove all `<<<<<<<`, `=======` and `>>>>>>>` "
+                "lines, then address the remaining feedback.")
+            self.event("rebase_conflicts", f"Carried {branch} onto {default} ({main[:8]}); the builder resolves "
+                       f"conflicts in {', '.join(conflicted)[:300]}", level="warn", files=conflicted)
+        else:
+            self.event("rebased", f"Carried {branch} onto {default} ({main[:8]}) before revising")
 
     def _policy_problem(self, patch: Patch) -> str:
         if patch.empty:
@@ -299,6 +328,10 @@ class TaskRunner:
         bad = protected_violations(patch.files, protected)
         if bad:
             return f"- You modified protected paths {bad}. Revert those files completely; they must not change."
+        marked = conflict_marker_files(patch)
+        if marked:
+            return (f"- Unresolved merge conflict markers remain in {marked}. Resolve each conflict so both sides' "
+                    "intent survives and remove every `<<<<<<<`, `=======` and `>>>>>>>` line.")
         limit = int(self.cfg.get("max_changed_lines") or self.settings["limits"].get("max_changed_lines", 1500))
         if patch.changed_lines > limit:
             return (f"- The change is {patch.changed_lines} lines, over the {limit}-line limit. Remove unrelated or "
@@ -851,14 +884,14 @@ class TaskRunner:
                        f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
                        "rebased or merged.", status="needs_input")
         if not clean:
+            # The revision checks out the branch, carries it onto the latest base and leaves only the overlapping
+            # lines for the builder to resolve (see _bring_branch_up_to_date).
             self._fresh_budget_after_base_moved("conflicts with newer commits")
-            self.feedback.append(f"- Your change conflicts with newer commits on {self.repo.default_branch}. "
-                                 f"Re-implement it on top of the latest code.\n{detail[-1500:]}")
             self.update(branch=self.task.branch, stage="build")
             if self.builder:
                 await self.builder.close()
                 self.builder = None
-            await self.deliver(continue_from_branch=False)
+            await self.deliver(continue_from_branch=True)
             return
         self.update(head_sha=detail, base_sha=main_sha)
         sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
