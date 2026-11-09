@@ -89,6 +89,7 @@ def mask(value: str) -> str:
 
 
 _SECRET_PATTERNS = [
+    re.compile(r"lin_(?:api|oauth)_[A-Za-z0-9_-]+"),
     re.compile(r"mdb_[A-Za-z0-9_-]+\.[A-Za-z0-9_\-.]+"),
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -103,7 +104,7 @@ def redact(text: str, extra: tuple[str, ...] = ()) -> str:
     if not text:
         return text
     for value in extra:
-        if value and len(value) >= 8:
+        if value:
             text = text.replace(value, "[redacted]")
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(lambda m: (m.group(1) if m.groups() else "") + "[redacted]", text)

@@ -157,6 +157,7 @@ const CRED_HELP: Record<string, { what: string; placeholder: string }> = {
   mindshub_api_key: { what: "Powers every planner, builder and verifier session. Create a key in MindsHub console → API keys.", placeholder: "mdb_…" },
   github_token: { what: "Fine-grained token with Contents, Pull requests and Commit statuses (read & write) on the repositories this workspace may change.", placeholder: "github_pat_…" },
   openai_api_key: { what: "Optional alternative provider.", placeholder: "sk-…" },
+  linear_api_key: { what: "Personal Linear API key. Used only by the control plane, never sent to sandboxes.", placeholder: "lin_api_…" },
 };
 
 function Credentials() {
