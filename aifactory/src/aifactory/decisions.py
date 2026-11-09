@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from .db import utcnow
-from .events import notify, record
+from .events import record
 from .models import Decision, Message, Outcome, Plan, Task, User
 from .pipeline.orchestrator import orchestrator
 from .pipeline.planning import approve_plan
@@ -27,7 +27,12 @@ def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
     return ev
 
 def resolve(db: Session, decision: Decision, user: User, resolution: str, comment: str = "",
-            reusable: bool = False, scope: str = "item") -> dict[str, Any]:
+            reusable: bool = False, scope: str = "item", *, action_id: str | None = None,
+            pending_events: list[dict] | None = None) -> dict[str, Any]:
+    if action_id and (pending_events is None or not (
+            (decision.kind == "question" and resolution == "answer") or
+            (decision.kind == "unblock" and decision.task_id and resolution == "retry"))):
+        raise DecisionError("Unsupported Mind resolution")
     if decision.status != "open":
         raise DecisionError("This decision is already resolved")
     valid = {o.get("value") for o in decision.options or []} | {"dismiss"}
@@ -36,6 +41,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
     decision.resolution = resolution
     decision.comment = comment.strip()[:8000]
+    decision.attribution = {"source": "mind", "action_id": action_id} if action_id else None
     decision.resolved_by = user.id
     decision.resolved_at = utcnow()
     decision.reusable = bool(reusable and comment.strip())
@@ -48,7 +54,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     def guidance(text: str) -> None:
         if text.strip() and outcome:
             db.add(Message(workspace_id=decision.workspace_id, outcome_id=outcome.id, task_id=task.id if task else None,
-                           author_id=user.id, author_kind="user", body=text.strip()))
+                           author_id=user.id, author_kind="user", body=text.strip(),
+                           attribution=decision.attribution))
 
     kind = decision.kind
     if kind == "approve_plan" and outcome:
@@ -132,14 +139,24 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             elif resolution == "cancel":
                 outcome.status = "cancelled"
                 orchestrator.cancel_outcome(outcome.id)
-    db.commit()
-    record(decision.workspace_id, "decision_resolved", f"{user.name or user.email}: {resolution} — {decision.title}",
-           outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
-           data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
-                 "reusable": decision.reusable, "scope": decision.scope})
-    notify(decision.workspace_id, "decision", decision.id)
-    if outcome:
-        notify(decision.workspace_id, "outcome", outcome.id)
+    author = (user.name or user.email) + (" via Mind" if action_id else "")
+    payload = record(decision.workspace_id, "decision_resolved", f"{author}: {resolution} — {decision.title}",
+                     outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
+                     data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
+                           "reusable": decision.reusable, "scope": decision.scope, **(decision.attribution or {})},
+                     session=db, publish=False)
+    if pending_events is not None:
+        pending_events.append(payload)
+        # Keep this on the object timeline even when retry has no guidance text.
+        if action_id and resolution == "retry" and outcome:
+            db.add(Message(workspace_id=decision.workspace_id, outcome_id=outcome.id,
+                           task_id=decision.task_id, author_id=user.id, author_kind="user",
+                           body="Retried task" + (f": {comment.strip()}" if comment.strip() else "."),
+                           attribution=decision.attribution))
+    else:
+        db.commit()
+        from .work_services import publish_changes
+        publish_changes([payload])
     result: dict[str, Any] = {"ok": True}
     if dropped and task and task.pr_number:
         result["dropped"] = dropped
@@ -151,5 +168,6 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             orchestrator.cancel_task(take_over)
         except HandoverError as exc:
             result["error"] = str(exc)
-    orchestrator.wake()
+    if pending_events is None:
+        orchestrator.wake()
     return result

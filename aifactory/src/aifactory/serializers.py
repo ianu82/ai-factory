@@ -108,14 +108,23 @@ def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None 
 
 
 def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {"id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
+    attribution = d.attribution or {}
+    context = dict(context or {})
+    if attribution.get("source") == "mind":
+        from sqlalchemy.orm import object_session
+        db = object_session(d)
+        person = db.get(User, d.resolved_by) if db and d.resolved_by else None
+        context["resolved_by_name"] = ((person.name or person.email) if person else "Person") + " via Mind"
+    return {"attribution": attribution, "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,
             "resolved_at": ts(d.resolved_at), "reusable": d.reusable, "scope": d.scope,
             "outcome_id": d.outcome_id, "task_id": d.task_id, "created_at": ts(d.created_at), **(context or {})}
 
 
 def message(m: Message, author: str = "") -> dict[str, Any]:
-    return {"id": m.id, "outcome_id": m.outcome_id, "task_id": m.task_id, "author_kind": m.author_kind,
+    if (m.attribution or {}).get("source") == "mind":
+        author += " via Mind"
+    return {"author_id": m.author_id, "attribution": m.attribution or {}, "id": m.id, "outcome_id": m.outcome_id, "task_id": m.task_id, "author_kind": m.author_kind,
             "author": author, "body": m.body, "delivered": m.delivered, "created_at": ts(m.created_at)}
 
 

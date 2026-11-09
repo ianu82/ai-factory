@@ -369,6 +369,7 @@ class Decision(Base):
     comment: Mapped[str] = mapped_column(Text, default="")
     resolved_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attribution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     reusable: Mapped[bool] = mapped_column(Boolean, default=False)
     scope: Mapped[str] = mapped_column(String(30), default="item")  # item|repository|workspace
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -385,6 +386,7 @@ class Message(Base):
     author_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     author_kind: Mapped[str] = mapped_column(String(10), default="user")  # user|factory
     body: Mapped[str] = mapped_column(Text)
+    attribution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     delivered: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -550,3 +552,33 @@ class GateVerdict(Base):
                          name="uq_gate_candidate_session"),
         Index("ix_gate_scope", "workspace_id", "gate", "verdict"),
     )
+
+
+class MindAction(Base):
+    """Private confirmation ledger; target and kind are immutable after proposal."""
+    __tablename__ = "mind_actions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    thread_id: Mapped[str] = mapped_column(String(32), index=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"))
+    task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class MindActionResult(Base):
+    """Structured private thread continuation, never a shared object message."""
+    __tablename__ = "mind_action_results"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    thread_id: Mapped[str] = mapped_column(String(32), index=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    action_id: Mapped[str] = mapped_column(ForeignKey("mind_actions.id"), unique=True)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
