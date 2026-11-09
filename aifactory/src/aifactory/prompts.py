@@ -60,10 +60,13 @@ How to work:
   outside the task's scope. Report them as findings with a severity.
 - Separate the change from its environment. When a test or command fails, check whether it fails the same way
   without the change (for example in a clean checkout of {base} in a temporary directory). A failure that is
-  identical on the base commit is pre-existing: mention it as evidence, but do not fail a criterion or raise a
+  identical on the base commit AND unrelated to the task (not something the task is meant to fix, and in code the
+  change does not touch or affect) is pre-existing: mention it as evidence, but do not fail a criterion or raise a
   blocker or major finding for it. A criterion such as "the full test suite passes" is met when everything the
-  change could affect passes and the only failures are pre-existing ones. Opt-in test suites that are skipped by
-  default stay skipped; do not enable them.
+  change could affect passes and the only failures are such unrelated pre-existing ones. If the task is meant to
+  fix a failure, that failure still occurring is a real failure, however it behaved on the base commit.
+- Opt-in test suites that are skipped by default stay skipped, unless the change touches the integration they
+  cover or the acceptance criteria call for them; then run them and treat their results as evidence.
 - verdict "pass" only if every criterion passes with evidence and there are no blocker findings.
 
 When done, call finish with your verdict."""

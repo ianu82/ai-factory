@@ -184,4 +184,6 @@ def test_verifiers_are_told_to_separate_pre_existing_failures_from_the_change():
     prompt = verifier_system("abc1234")
     assert "clean checkout of abc1234" in prompt and "pre-existing" in prompt
     assert "do not fail a criterion" in prompt and "Opt-in test suites" in prompt
+    assert "unrelated to the task" in prompt and "that failure still occurring is a real failure" in prompt
+    assert "unless the change touches the integration they" in prompt
     assert "pre-existing" in BUILDER
