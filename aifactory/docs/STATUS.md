@@ -96,6 +96,9 @@ repository's policy reserves for a person.
 | #255 (02:48) | #12 T5 delivery metrics | Three review rounds | Assisted |
 | #265 (03:36) | #14 T3 restart-safe Linear intake | One review round | Assisted |
 | #268 (04:10) | #14 T6 Linear settings, source links and decision anchors in the web app | Merge approval only | Assisted (merge approval only) |
+| #220 (04:58) | #15 T1 validated staged attachments | Two review rounds; four retries, including the operator decision to validate images by decoding them with Pillow | Assisted |
+| #256 (05:45) | #16 T5 per-role image capability checks | Two review rounds; retries, one delayed by the operator's reused nonce | Assisted |
+| #221 (06:44) | #15 T2 attachment intake and outcome detail | One review round; its question (backend missing) answered once #220 merged | Assisted |
 
 Every merge followed the same rule: the Factory was waiting on a person, CI and the Factory's verification
 were green, and the reviewer bot found nothing on the final commit. Leftover threads were answered with where
@@ -120,6 +123,19 @@ the fix is before being resolved.
   (unmet criteria, blocker/major findings, failed checks, required runtime QA failures), the Factory retries once
   with a fresh budget before asking a person. Settings → Throughput and limits sets the number of rounds (0–3).
 
+- **Attempt budgets survive restarts** (#269). After a person retries a task, attempt numbers restart at 1 while
+  earlier records are kept. A restart then counted an interrupted attempt as finished and skipped the automatic
+  round (#15 T4). Records now belong to a budget epoch.
+- **A flaky frozen-v1 CI test no longer blocks** (#271). One timing-sensitive Railway transport test failed
+  intermittently, holding a deploy and failing a Factory PR. CI retries that suite once and says so.
+
+### Where the queue stands (morning of 9 November)
+
+Outcomes #12–#17, the first Factory-builds-Factory wave, are partly delivered, and their remaining tasks are in
+revision with change requests or retries applied. Outcomes #18–#38 (about 130 tasks) have been planned but have
+not delivered yet: they wait behind the concurrency limit while review rounds occupy slots. Concurrency was raised
+from 5 to 7 overnight and to 9 in the morning.
+
 ### Operator mistakes, owned
 
 - Reused a nonce (`o16t5-retry1`) from earlier in the night, so the bootstrap correctly skipped that retry
@@ -137,7 +153,7 @@ the fix is before being resolved.
 | F01 Codex qualification | Unattended delivery done | PR #17 |
 | F18 Anton unattended delivery | Done, including independent rejection of a defective candidate | PR #18 |
 | F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 (native), #8 (Anton, unattended); Codex ran on MindsHub in #195 |
-| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | Overnight 8–9 Nov: thirteen Factory-built PRs merged into `ai-factory` (#212, #237, #218, #214, #213, #251, #259, #231, #261, #263, #255, #265, #268), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
+| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | Overnight 8–9 Nov: sixteen Factory-built PRs merged into `ai-factory` (#212, #237, #218, #214, #213, #251, #259, #231, #261, #263, #255, #265, #268, #220, #256, #221), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
 | F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18, #25/#26 |
 | F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by repository, lockfiles and setup; setup skipped on a hit, saved after a clean miss, older ones pruned | Live: checkpoint saved in #8 (11 s); both parallel tasks of #9 booted their own VM from it in 6–9 s with setup skipped |
 | F04 Coding model choice | Models per role from the provider's live list | — |
