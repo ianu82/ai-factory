@@ -280,3 +280,16 @@ def test_extract_patch_excludes_all_root_scratch_and_external_files(tmp_path, sc
     assert (clean / "source.py").read_text() == "after\n"
     assert not (clean / ".factory").exists()
     asyncio.run(sb.close())
+
+
+def test_rate_limit_settings_parse_and_fall_back(monkeypatch):
+    from aifactory.config import get_settings, reset_settings_cache
+
+    monkeypatch.setenv("AIFACTORY_MINDSHUB_REQUESTS_PER_MINUTE", "120")
+    monkeypatch.setenv("AIFACTORY_OPENAI_REQUESTS_PER_MINUTE", "not-a-number")
+    reset_settings_cache()
+    try:
+        settings = get_settings()
+        assert settings.mindshub_requests_per_minute == 120 and settings.openai_requests_per_minute == 50
+    finally:
+        reset_settings_cache()

@@ -15,6 +15,14 @@ def _bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _int(name: str, default: int) -> int:
+    """An integer environment setting; a missing or malformed value falls back to the default."""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def concurrency_limit(value: object, default: int) -> int:
     """Normalize execution/planning limits, including legacy stored settings."""
     try:
