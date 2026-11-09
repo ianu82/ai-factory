@@ -830,16 +830,34 @@ def list_runs(workspace_id: str, limit: int = 100, user: User = Depends(current_
 @router.get("/workspaces/{workspace_id}/stats")
 def stats(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    outcomes = db.query(Outcome).filter(Outcome.workspace_id == workspace_id).all()
-    tasks = db.query(Task).filter(Task.workspace_id == workspace_id).all()
-    runs = db.query(Run).filter(Run.workspace_id == workspace_id).all()
+    from .metrics import benchmark, first_attempt_result, workspace_metrics
+
+    outcomes = [o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id) if not benchmark(o)]
+    outcome_ids = {o.id for o in outcomes}
+    tasks = [t for t in db.query(Task).filter(Task.workspace_id == workspace_id)
+             if t.outcome_id in outcome_ids and not benchmark(t)]
+    task_ids = {t.id for t in tasks}
+    runs = [r for r in db.query(Run).filter(Run.workspace_id == workspace_id)
+            if r.outcome_id in outcome_ids and (not r.task_id or r.task_id in task_ids) and not benchmark(r)]
     decisions = db.query(Decision).filter(Decision.workspace_id == workspace_id).all()
     merged = [t for t in tasks if t.merge_sha]
     by_status: dict[str, int] = {}
     for o in outcomes:
         by_status[o.status] = by_status.get(o.status, 0) + 1
-    first_pass = sum(1 for t in merged if len((t.evidence or {}).get("attempts", [])) <= 1)
+    metrics = workspace_metrics(db, workspace_id)
+    # The legacy Runs UI divides this counter by tasks.merged. Keep that
+    # population while using durable attempt/check history instead of list length.
+    merged_ids = {t.id for t in merged}
+    journals: dict[str, list[Event]] = {}
+    if merged_ids:
+        for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.task_id.in_(merged_ids)).order_by(Event.id):
+            journals.setdefault(e.task_id, []).append(e)
+    repos = {r.id: r for r in db.query(Repository).filter(Repository.workspace_id == workspace_id)}
+    first_pass = sum(first_attempt_result(t, journals.get(t.id, []),
+                                         (repos[t.repo_id].config or {}).get("checks", [])
+                                         if t.repo_id in repos else None) is True for t in merged)
     return {
+        "metrics": metrics,
         "outcomes": by_status,
         "tasks": {"total": len(tasks), "completed": sum(t.status == "completed" for t in tasks), "merged": len(merged),
                   "first_attempt": first_pass, "smoke_failed": sum(t.status == "smoke_failed" for t in tasks)},
