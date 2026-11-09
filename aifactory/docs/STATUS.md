@@ -93,6 +93,7 @@ repository's policy reserves for a person.
 | #261 (02:05) | #13 T2 credential diagnostics | Three retries, one correcting the operator's own too-broad guidance; clean on first review | Assisted |
 | #263 (02:44) | #13 T6 searchable repository selection | Merge approval only | Assisted (merge approval only) |
 | #255 (02:48) | #12 T5 delivery metrics | Three review rounds | Assisted |
+| #265 (03:36) | #14 T3 restart-safe Linear intake | One review round | Assisted |
 
 Every merge followed the same rule: the Factory was waiting on a person, CI and the Factory's verification
 were green, and the reviewer bot found nothing on the final commit. Leftover threads were answered with where
