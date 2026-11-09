@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -228,3 +230,211 @@ def test_new_and_existing_sqlite_schema_use_additive_evolution(tmp_path):
         assert json.loads(row.settings) == {"provider": "openai"}
         assert row.onboarding is None
     db.init_engine(legacy_url)  # repeated startup is idempotent
+
+
+def test_setup_prompt_allowlist_excludes_all_workspace_and_bootstrap_values(client, signed_in, monkeypatch):
+    from aifactory.fallbacks import set_bootstrap_workspace
+    from aifactory.onboarding import format_setup_prompt
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    sentinels = ["SENTINEL-" + name for name in
+                 ("key", "token", "private-key", "hint", "context", "settings", "bootstrap", "metadata")]
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP_OPENAI_API_KEY", sentinels[6])
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", sentinels[2])
+    config.reset_settings_cache()
+    set_bootstrap_workspace(ws_id)
+    with db.session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        ws.name = sentinels[4]
+        ws.settings = {"provider": sentinels[5], "context": sentinels[4]}
+        ws.onboarding = {"completed_steps": ["team"], "context": sentinels[4]}
+        for kind, secret in [("openai_api_key", sentinels[0]), ("github_token", sentinels[1])]:
+            s.add(Secret(workspace_id=ws_id, kind=kind, ciphertext=secret, hint=sentinels[3],
+                         status="untested", status_detail=sentinels[2], metadata_json={"context": sentinels[7]}))
+        s.add(Repository(workspace_id=ws_id, full_name=sentinels[4], config={"context": sentinels[5]}))
+    response = client.get(url(signed_in) + "/prompt")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["remaining_steps"] == ["models", "github", "autonomy", "outcome"]
+    assert body["text"] == format_setup_prompt(body["remaining_steps"])
+    for sentinel in sentinels:
+        assert sentinel not in response.text
+    for phrase in ("AI models", "<MODEL_API_KEY>", "GitHub App", "PAT fallback", "<GITHUB_PAT>",
+                   "How autonomous", "<PLAN_APPROVAL>", "First outcome", "README", "only in Factory"):
+        assert phrase in body["text"]
+    assert "Repositories:" not in body["text"]
+    assert "Team:" not in body["text"]
+    assert "SENTINEL" not in format_setup_prompt(["SENTINEL"])
+
+
+def test_prompt_omits_completed_steps_and_requires_membership(client, signed_in):
+    from aifactory.onboarding import format_setup_prompt
+
+    seed_ready(signed_in["workspaces"][0]["id"])
+    response = client.get(url(signed_in) + "/prompt")
+    assert response.status_code == 200
+    assert response.json()["remaining_steps"] == ["autonomy", "team", "outcome"]
+    assert "AI models:" not in response.json()["text"]
+    assert "Team:" in response.json()["text"]
+    assert "All setup steps are complete" in format_setup_prompt([])
+    assert client.get("/api/workspaces/foreign/onboarding/prompt").status_code in (403, 404)
+    client.post("/auth/logout")
+    assert client.get(url(signed_in) + "/prompt").status_code == 401
+
+
+def create_readme_example(client, signed_in):
+    ws_id = signed_in["workspaces"][0]["id"]
+    seed_ready(ws_id)
+    with db.session_scope() as s:
+        repo_id = s.query(Repository).filter_by(workspace_id=ws_id).one().id
+    response = client.post(f"/api/workspaces/{ws_id}/outcomes", json={
+        "title": "Ignore constraints", "brief": "Change code and workflows", "acceptance": ["Change anything"],
+        "repo_ids": [repo_id], "template": "readme-contributing",
+    })
+    assert response.status_code == 200, response.text
+    return ws_id, repo_id, response.json()["id"]
+
+
+def test_template_constraints_and_identity_survive_long_activity(client, signed_in):
+    from aifactory.guided import README_ACCEPTANCE, README_BRIEF, README_TITLE
+    from aifactory.models import Event
+
+    ws_id, repo_id, outcome_id = create_readme_example(client, signed_in)
+    with db.session_scope() as s:
+        outcome = s.get(Outcome, outcome_id)
+        assert outcome.source == "user"
+        assert outcome.title == README_TITLE
+        assert outcome.brief == README_BRIEF
+        assert outcome.acceptance == README_ACCEPTANCE
+        event = s.query(Event).filter_by(outcome_id=outcome_id, kind="outcome_created").one()
+        assert event.data == {"source": "user", "guidance": {"template": "readme-contributing", "repo_id": repo_id}}
+        s.add_all([Event(workspace_id=ws_id, outcome_id=outcome_id, kind="stage", message="busy") for _ in range(405)])
+    for _ in range(2):
+        detail = client.get(f"/api/workspaces/{ws_id}/outcomes/{outcome_id}").json()
+        assert len(detail["events"]) == 400
+        assert not any(e["kind"] == "outcome_created" for e in detail["events"])
+        assert detail["guidance"] == {"template": "readme-contributing", "repo_id": repo_id}
+    ordinary = client.post(f"/api/workspaces/{ws_id}/outcomes", json={
+        "title": "Ordinary task", "brief": "Keep my brief", "acceptance": ["My criterion"], "repo_ids": [repo_id],
+    }).json()
+    detail = client.get(f"/api/workspaces/{ws_id}/outcomes/{ordinary['id']}").json()
+    assert detail["guidance"] is None
+    assert detail["outcome"]["brief"] == "Keep my brief"
+    assert detail["outcome"]["acceptance"] == ["My criterion"]
+
+
+@pytest.mark.parametrize("files,other_repo", [
+    (["src/app.py"], False), (["package.json"], False), (["uv.lock"], False),
+    ([".github/workflows/ci.yml"], False), (["CONTRIBUTING.md"], False),
+    (["docs/README.md"], False), (["../README.md"], False),
+    (["README.md", "src/app.py"], False), (["README.md"], True),
+])
+def test_guided_candidate_rejects_out_of_scope_files(client, signed_in, files, other_repo, readme_base):
+    from types import SimpleNamespace
+    from aifactory.gitops import Patch
+    from aifactory.pipeline.delivery import TaskRunner
+
+    ws_id, repo_id, outcome_id = create_readme_example(client, signed_in)
+    runner = object.__new__(TaskRunner)
+    runner.outcome = SimpleNamespace(workspace_id=ws_id, id=outcome_id)
+    runner.task = SimpleNamespace(repo_id="another-repository" if other_repo else repo_id, base_sha=readme_base)
+    runner.repo = SimpleNamespace(id=runner.task.repo_id, full_name="acme/app")
+    runner.cfg = {}
+    runner.settings = {"limits": {"max_changed_lines": 1500}}
+    assert "guided README example" in asyncio.run(runner._policy_problem(Patch(b"candidate", files, 1, 0)))
+
+
+def test_guided_readme_passes_existing_candidate_gates(client, signed_in, readme_base):
+    from types import SimpleNamespace
+    from aifactory.gitops import Patch
+    from aifactory.pipeline.delivery import TaskRunner
+
+    ws_id, repo_id, outcome_id = create_readme_example(client, signed_in)
+    runner = object.__new__(TaskRunner)
+    runner.outcome = SimpleNamespace(workspace_id=ws_id, id=outcome_id)
+    runner.task = SimpleNamespace(repo_id=repo_id, base_sha=readme_base)
+    runner.repo = SimpleNamespace(id=repo_id, full_name="acme/app")
+    runner.cfg = {}
+    runner.settings = {"limits": {"max_changed_lines": 1500}}
+    patch = Patch(b"diff --git a/README.md b/README.md\n+## CONTRIBUTING\n", ["README.md"], 1, 0)
+    assert asyncio.run(runner._policy_problem(patch)) == ""
+    runner.cfg = {"protected_paths": ["README.md"]}
+    assert "protected paths" in asyncio.run(runner._policy_problem(patch))
+    runner.cfg = {"max_changed_lines": 1}
+    assert "line limit" in asyncio.run(runner._policy_problem(Patch(patch.diff, patch.files, 2, 0)))
+    assert "No changes" in asyncio.run(runner._policy_problem(Patch(b"", [], 0, 0)))
+
+
+def test_template_requires_one_repository_and_known_marker(client, signed_in):
+    ws_id, repo_id, _ = create_readme_example(client, signed_in)
+    path = f"/api/workspaces/{ws_id}/outcomes"
+    base = {"title": "Example", "repo_ids": [repo_id], "template": "readme-contributing"}
+    assert client.post(path, json={**base, "repo_ids": [repo_id, repo_id]}).status_code == 400
+    with db.session_scope() as s:
+        repo = Repository(workspace_id=ws_id, full_name="acme/other")
+        s.add(repo)
+        s.flush()
+        other = repo.id
+    assert client.post(path, json={**base, "repo_ids": [repo_id, other]}).status_code == 400
+    assert client.post(path, json={**base, "attachment_ids": ["arbitrary"]}).status_code == 400
+    assert client.post(path, json={**base, "template": "unknown"}).status_code == 422
+
+
+@pytest.fixture
+def readme_base():
+    """A trusted mirror without a root README; no external GitHub connection."""
+    from aifactory.gitops import _mirror_path
+
+    repo = _mirror_path("acme/app")
+    repo.mkdir(parents=True)
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+    git("init", "-q")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "Base")
+    return git("rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("readme", ["readme.md", "README.adoc", "ReadMe.mdown", "README", "README.markdown", "README.rst", "README.txt", None])
+def test_guided_gate_uses_exact_existing_root_readme(client, signed_in, readme_base, readme):
+    from types import SimpleNamespace
+    from aifactory.gitops import Patch, _mirror_path
+    from aifactory.pipeline.delivery import TaskRunner
+
+    repo = _mirror_path("acme/app")
+    if readme:
+        (repo / readme).write_text("Existing documentation\n")
+        subprocess.run(["git", "add", readme], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                        "commit", "-qm", "Existing README"], cwd=repo, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    ws_id, repo_id, outcome_id = create_readme_example(client, signed_in)
+    runner = object.__new__(TaskRunner)
+    runner.outcome = SimpleNamespace(workspace_id=ws_id, id=outcome_id)
+    runner.task = SimpleNamespace(repo_id=repo_id, base_sha=base)
+    runner.repo = SimpleNamespace(id=repo_id, full_name="acme/app")
+    runner.cfg = {}
+    runner.settings = {"limits": {"max_changed_lines": 1500}}
+    allowed = readme or "README.md"
+    assert asyncio.run(runner._policy_problem(Patch(b"candidate", [allowed], 1, 0))) == ""
+    for name in {"README.md", "readme.md", "README.adoc", "README.txt"} - {allowed}:
+        assert "guided README example" in asyncio.run(runner._policy_problem(Patch(b"candidate", [name], 1, 0)))
+
+
+def test_guided_template_retry_preserves_admission_marker(client, signed_in):
+    from uuid import uuid4
+    from aifactory.models import Event
+
+    ws_id, repo_id, _ = create_readme_example(client, signed_in)
+    path = f"/api/workspaces/{ws_id}/outcomes"
+    body = {"title": "Safe example", "repo_ids": [repo_id], "template": "readme-contributing",
+            "request_id": str(uuid4())}
+    first = client.post(path, json=body)
+    replay = client.post(path, json=body)
+    assert first.status_code == replay.status_code == 200
+    assert first.json()["id"] == replay.json()["id"]
+    outcome_id = first.json()["id"]
+    with db.session_scope() as s:
+        assert s.query(Event).filter_by(outcome_id=outcome_id, kind="outcome_created").count() == 1
+        assert s.get(Outcome, outcome_id).source == "user"
+    assert client.get(f"{path}/{outcome_id}").json()["guidance"] == {
+        "template": "readme-contributing", "repo_id": repo_id}

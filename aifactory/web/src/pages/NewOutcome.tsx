@@ -7,23 +7,27 @@ import { useWs } from "../App";
 import { Modal, useToast } from "../ui";
 import { AttachmentPicker, pasteImages, useAttachmentQueue } from "../components/Attachments";
 
-export function NewOutcome({ onClose }: { onClose: () => void }) {
+export function NewOutcome({ onClose, initialRepository, safeExample = false, firstOutcome = false }: { onClose: () => void; initialRepository?: string; safeExample?: boolean; firstOutcome?: boolean }) {
   const { ws, meta } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
   const navigate = useNavigate();
   const repos = useQuery({ queryKey: ["repos", ws.id], queryFn: () => api<Repo[]>(`/api/workspaces/${ws.id}/repositories`) });
-  const [title, setTitle] = useState("");
-  const [brief, setBrief] = useState("");
-  const [criteria, setCriteria] = useState("");
-  const [picked, setPicked] = useState<string[]>([]);
+  const [title, setTitle] = useState(safeExample ? "Add or improve the CONTRIBUTING section in README" : "");
+  const [brief, setBrief] = useState(safeExample
+    ? "Add or improve a CONTRIBUTING section in the selected repository’s root README, using repository facts. Preserve unrelated documentation and existing README content. Do not change code, dependencies, workflows, or any other file."
+    : "");
+  const [criteria, setCriteria] = useState(safeExample
+    ? "Only the selected repository’s root README changes.\nCONTRIBUTING instructions are supported by repository facts.\nUnrelated documentation and existing README content are preserved.\nNo code, dependency, workflow, or other non-README changes."
+    : "");
+  const [picked, setPicked] = useState<string[]>(initialRepository ? [initialRepository] : []);
   const [harness, setHarness] = useState<string>("");
   const [priority, setPriority] = useState(2);
   const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(false);
   const submitting = useRef(false);
   const attachments = useAttachmentQueue(ws.id);
-  const draft = { title, brief, attachment_ids: attachments.ids, repo_ids: picked, harness: harness || null, priority,
+  const draft = { title, brief, ...(safeExample ? { template: "readme-contributing" } : {}), attachment_ids: attachments.ids, repo_ids: picked, harness: harness || null, priority,
     acceptance: criteria.split("\n").map((c) => c.replace(/^\s*[-*\d.]+\s*/, "").trim()).filter(Boolean) };
   const requestId = useOutcomeRequestId(draft);
   const titleRef = useRef<HTMLInputElement>(null);
@@ -42,6 +46,13 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
         method: "POST",
         json: { ...draft, request_id: requestId },
       });
+      if (firstOutcome) {
+        // Outcome creation has succeeded: a progress-save failure must never cause a duplicate submission.
+        try {
+          await api(`/api/workspaces/${ws.id}/onboarding`, { method: "PATCH", json: { action: "complete", step: "outcome", first_outcome_id: o.id } });
+          qc.invalidateQueries({ queryKey: ["onboarding", ws.id] });
+        } catch { toast("Outcome created; setup progress could not be saved. You can select it on returning to setup.", true); }
+      }
       attachments.finishSubmission(true);
       qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });
       toast(`#${o.number} queued for planning`);
@@ -71,11 +82,12 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
       </>
     }>
       <div onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void submit(); } }} style={{ display: "contents" }}>
-        <input ref={titleRef} className="title-input" placeholder="What should be true when this is done?" value={title}
+        {safeExample && <p role="note">Guided README example: only the selected repository’s root README may change. Add or improve CONTRIBUTING using repository facts, preserve unrelated documentation, and make no code, dependency or workflow changes. These constraints are enforced by Factory.</p>}
+        <input disabled={safeExample} ref={titleRef} className="title-input" placeholder="What should be true when this is done?" value={title}
           onChange={(e) => setTitle(e.target.value)} aria-label="Outcome title" maxLength={300} />
-        <textarea className="brief-input" placeholder="Context, constraints, links, who it's for… The planner reads the code, so describe the goal rather than the steps."
+        <textarea disabled={safeExample} className="brief-input" placeholder="Context, constraints, links, who it's for… The planner reads the code, so describe the goal rather than the steps."
           onPaste={(event) => pasteImages(event, attachments)} value={brief} onChange={(e) => setBrief(e.target.value)} aria-label="Description" />
-        <AttachmentPicker queue={attachments} />
+        {!safeExample && <AttachmentPicker queue={attachments} />}
         <div className="field">
           <span>Repositories</span>
           {repos.data?.length === 0 ? (
@@ -86,7 +98,7 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
                 const on = picked.includes(r.id);
                 return (
                   <button key={r.id} type="button" className={`chip ${on ? "on" : ""}`} aria-pressed={on}
-                    onClick={() => setPicked(on ? picked.filter((x) => x !== r.id) : [...picked, r.id])}>{r.full_name}</button>
+                    disabled={safeExample} onClick={() => setPicked(on ? picked.filter((x) => x !== r.id) : [...picked, r.id])}>{r.full_name}</button>
                 );
               })}
             </div>
@@ -98,7 +110,7 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
           <>
             <label className="field">
               <span>Acceptance criteria <span className="faint" style={{ fontWeight: 400 }}>· optional, one per line</span></span>
-              <textarea className="textarea" value={criteria} onChange={(e) => setCriteria(e.target.value)}
+              <textarea disabled={safeExample} className="textarea" value={criteria} onChange={(e) => setCriteria(e.target.value)}
                 placeholder={"Exports include every logged entry\nThe file opens in Excel without warnings"} />
               <span className="hint">The planner turns these into per-task criteria; an independent verifier checks each one.</span>
             </label>

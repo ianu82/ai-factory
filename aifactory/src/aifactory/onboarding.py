@@ -170,3 +170,31 @@ async def update_onboarding(workspace_id: str, request: Request, user: User = De
     ws.onboarding = state
     db.commit()
     return snapshot(db, ws)
+
+
+# Only these static strings may enter the copyable prompt. Never format workspace
+# names, settings, credential hints, diagnostics, repository context, or secrets.
+SETUP_PROMPT_STEPS = {
+    "models": "AI models: choose <MODEL_PROVIDER> and <MODEL>. Enter <MODEL_API_KEY> only in Factory's AI models step, never in this chat.",
+    "github": "GitHub: install the GitHub App if offered and review its repository access. Otherwise use the PAT fallback: enter <GITHUB_PAT> only in Factory, never in this chat. Never share a token, private key, or client secret with an assistant.",
+    "repositories": "Repositories: choose <REPOSITORY> visible to the GitHub connection; review <SETUP_COMMANDS>, <TEST_COMMANDS> and <START_COMMAND_OR_NO_APP> against repository facts in Factory.",
+    "autonomy": "How autonomous: review <PLAN_APPROVAL> and <MERGE_APPROVAL> in Factory. Prefer Approve first while learning; review exactly what automatic runs can do.",
+    "team": "Team: review <TEAM_MEMBERS_AND_ROLES> in Factory and confirm who can approve plans and merges. Do not paste personal team details here.",
+    "outcome": "First outcome: select one repository and try the guided README CONTRIBUTING example (README only, preserve unrelated documentation, use repository facts; no code, dependency or workflow changes), or choose a blank form. Review the plan, checks, independent verification, PR, CI, approval and smoke evidence in Factory.",
+}
+
+
+def format_setup_prompt(remaining_steps) -> str:
+    lines = ["Help me complete Factory setup one step at a time. Ask for choices, not secrets. "
+             "Keys must be entered only in Factory; never ask me to paste credentials here."]
+    lines.extend(SETUP_PROMPT_STEPS[step] for step in STEPS if step in remaining_steps)
+    if len(lines) == 1:
+        lines.append("All setup steps are complete; no setup values are needed.")
+    return "\n\n".join(lines)
+
+
+@router.get("/prompt")
+def setup_prompt(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    state = snapshot(db, _workspace(db, user, workspace_id))
+    remaining = [step for step in STEPS if step not in state.completed_steps]
+    return {"remaining_steps": remaining, "text": format_setup_prompt(remaining)}

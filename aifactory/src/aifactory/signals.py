@@ -25,7 +25,8 @@ log = logging.getLogger(__name__)
 
 def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: str, brief: str, repo_ids: list[str],
                       *, acceptance: list[str] | None = None, harness: str | None = None, source: str = "user",
-                      signal_id: str | None = None, priority: int = 2, status: str = "planning") -> Outcome:
+                      signal_id: str | None = None, priority: int = 2, status: str = "planning",
+                      guidance: dict | None = None) -> Outcome:
     number = db.execute(update(Workspace).where(Workspace.id == workspace_id).values(
         outcome_seq=Workspace.outcome_seq + 1).returning(Workspace.outcome_seq)).scalar_one()
     outcome = Outcome(workspace_id=workspace_id, number=number, title=title.strip()[:300], brief=brief.strip(),
@@ -35,7 +36,7 @@ def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: 
     db.add(outcome)
     db.flush()
     record(workspace_id, "outcome_created", f"#{outcome.number} {outcome.title}", outcome_id=outcome.id,
-           actor=user.id if user else "factory", data={"source": source}, session=db)
+           actor=user.id if user else "factory", data={"source": source, **({"guidance": guidance} if guidance else {})}, session=db)
     notify(workspace_id, "outcome", outcome.id)
     return outcome
 

@@ -23,6 +23,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
     queryFn: () => api<Detail>(`/api/workspaces/${ws.id}/outcomes/${outcomeId}`),
     refetchInterval: (query) => (["completed", "cancelled"].includes(query.state.data?.outcome.status || "") ? false : 15_000),
   });
+  const [guided, setGuided] = useState(true);
   const [showAll, setShowAll] = useState(false);
   const { hash } = useLocation();
   const targetDecisionId = hash.startsWith("#decision-") ? hash.slice("#decision-".length) : focusDecisionId;
@@ -70,6 +71,23 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
         </div>
       </header>
 
+      {q.data.guidance && <section className="p-sec" aria-label="Guided outcome">
+        <button className="btn sm" onClick={() => setGuided(!guided)}>{guided ? "Dismiss guide" : "Reopen guide"}</button>
+        {guided && <>
+          <h3>Your guided README outcome · {outcome.status}</h3>
+          <p>Only the selected repository’s root README may change. Inspect the CONTRIBUTING section for accurate instructions and preservation of unrelated content.</p>
+          <ol>
+            <li><a href="#guided-plan">Planning & plan review</a>: Factory reads repository facts and proposes tasks. Check scope; approve only when the plan is README-only.</li>
+            <li><a href="#guided-tasks">Building & checks</a>: the worker prepares a candidate. Open the task for its diff and command results; no action unless a decision asks you.</li>
+            <li><a href="#guided-tasks">Independent verification</a>: a separate reviewer checks the criteria. Read its verdict and evidence, not just the summary.</li>
+            <li><a href="#guided-tasks">Pull request & CI</a>: open the task’s PR link to inspect the exact README diff and GitHub checks.</li>
+            <li><a href="#guided-decisions">Merge or approval</a>: review any open decision below. Approval policies still apply; this guide does not grant permission to merge.</li>
+            <li><a href="#guided-activity">Smoke</a>: after merge, inspect smoke results in task evidence and activity. Completed means Factory finished its configured gates.</li>
+          </ol>
+        </>}
+      </section>}
+
+      <div id="guided-decisions" />
       {open.length > 0 && (
         <section className="p-sec" aria-label="Needs you">
           {open.map((d) => <DecisionCard key={d.id} d={d} focused={d.id === targetDecisionId} />)}
@@ -81,7 +99,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
       )}
 
       <section className="p-sec">
-        <h3>Tasks {tasks.length > 0 && <span className="r faint num">{outcome.progress.done} of {tasks.length} delivered</span>}</h3>
+        <h3 id="guided-tasks">Tasks {tasks.length > 0 && <span className="r faint num">{outcome.progress.done} of {tasks.length} delivered</span>}</h3>
         {tasks.length === 0 ? (
           <div className="muted" style={{ fontSize: 13 }}>
             {outcome.status === "planning" ? "The planner is reading the repositories and drafting tasks…" : "No tasks yet."}
@@ -104,7 +122,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
 
       {plan && (
         <section className="p-sec">
-          <h3>Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : "approved by policy") : plan.status}</span></h3>
+          <h3 id="guided-plan">Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : "approved by policy") : plan.status}</span></h3>
           <Prose text={plan.summary} />
           {(plan.content.risks || []).length > 0 && (
             <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--muted)", fontSize: 12.5 }}>
@@ -117,7 +135,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
       <Conversation outcomeId={outcome.id} messages={messages} active={active} />
 
       <section className="p-sec">
-        <h3>
+        <h3 id="guided-activity">
           Activity
           <span className="r"><label className="check" style={{ fontSize: 12 }}><input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> agent detail</label></span>
         </h3>

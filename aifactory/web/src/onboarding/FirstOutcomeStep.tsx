@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { api, type Outcome, type Repo } from "../api";
+import { NewOutcome } from "../pages/NewOutcome";
 import { useOutcomeRequestId } from "../outcomeDraft";
 import { type OnboardingStepProps } from "./api";
 
@@ -20,6 +21,7 @@ export function FirstOutcomeStep({ workspace, progress, readOnly, onComplete }: 
   const navigate = useNavigate();
   const repos = useQuery({ queryKey: ["repos", workspace.id], queryFn: () => api<Repo[]>(`/api/workspaces/${workspace.id}/repositories`) });
   const outcomes = useQuery({ queryKey: ["outcomes", workspace.id], queryFn: () => api<Outcome[]>(`/api/workspaces/${workspace.id}/outcomes`) });
+  const [safeExample, setSafeExample] = useState(false);
   const [repoId, setRepoId] = useState("");
   const [title, setTitle] = useState("");
   const [brief, setBrief] = useState("");
@@ -65,9 +67,16 @@ export function FirstOutcomeStep({ workspace, progress, readOnly, onComplete }: 
         <fieldset disabled={busy || readOnly || !repo}>
           <legend>Describe your first outcome</legend>
           <label className="field" htmlFor="first-repository">Repository<select id="first-repository" className="select" value={repo?.id || ""} onChange={(e) => setRepoId(e.target.value)}>{repos.data?.map((r) => <option key={r.id} value={r.id}>{r.full_name}</option>)}</select></label>
+          {repo && <section aria-label="Safe README example">
+            <h2>Safe README example</h2>
+            <p>Add or improve CONTRIBUTING in this repository’s root README, using repository facts and preserving unrelated documentation. No code, dependency, workflow or other file changes.</p>
+            <button className="btn" type="button" disabled={!progress.ready} onClick={() => setSafeExample(true)}>Try guided README example</button>
+            {!progress.ready && <p>Finish AI models, GitHub and Repositories before starting the guided example.</p>}
+          </section>}
           {repo && <><p>{repo.config.detected?.length ? `Detected stack: ${repo.config.detected.join(", ")}` : "Stack unknown: examples ask the planner to inspect the repository, not assume a framework."}</p>
             <p>Choose one of three starting points, then edit it. Examples never submit.</p>
             <div className="onboarding-examples">{outcomeExamples(repo).map((example) => <button className="btn" type="button" key={example.title} onClick={() => { setTitle(example.title); setBrief(example.brief); }}>{example.title}</button>)}</div></>}
+          <button className="btn" type="button" onClick={() => { setTitle(""); setBrief(""); }}>Blank form</button>
           <label className="field" htmlFor="first-title">Outcome title<input id="first-title" className="input" required minLength={3} maxLength={300} value={title} onChange={(e) => setTitle(e.target.value)} /></label>
           <label className="field" htmlFor="first-description">Description<textarea id="first-description" className="textarea" value={brief} onChange={(e) => setBrief(e.target.value)} /></label>
         </fieldset>
@@ -80,6 +89,7 @@ export function FirstOutcomeStep({ workspace, progress, readOnly, onComplete }: 
       </section>}
       {outcomes.isError && <p role="alert">Could not check for previously created outcomes. <button className="btn" onClick={() => outcomes.refetch()}>Retry existing outcomes</button></p>}
     </>}
+    {safeExample && repo && <NewOutcome initialRepository={repo.id} safeExample firstOutcome onClose={() => setSafeExample(false)} />}
     {error && <p role="alert">{error}</p>}
   </section>;
 }

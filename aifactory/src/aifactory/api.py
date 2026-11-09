@@ -25,6 +25,7 @@ from .decisions import DecisionError, resolve
 from .events import bus, event_dict, notify, record
 from .fallbacks import available as fallback_credentials
 from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_token
+from .guided import README_TEMPLATE, README_TITLE, README_BRIEF, README_ACCEPTANCE, outcome_guidance
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
@@ -672,6 +673,7 @@ class OutcomeCreate(BaseModel):
     priority: int = 2
     attachment_ids: list[str] = Field(default_factory=list)
     request_id: UUID | None = None
+    template: Literal["readme-contributing"] | None = None
 
 
 def _outcome_rows(db: Session, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
@@ -722,6 +724,8 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
     repos = db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.id.in_(body.repo_ids)).all()
     if len(repos) != len(set(body.repo_ids)):
         raise HTTPException(400, "Unknown repository")
+    if body.template and (len(body.repo_ids) != 1 or body.attachment_ids):
+        raise HTTPException(400, "The README example requires exactly one repository and no attachments")
     if body.harness and body.harness not in ("native", "codex", "anton"):
         raise HTTPException(400, "Unknown harness")
     try:
@@ -738,9 +742,11 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
     if claimed != len(uploads):
         db.rollback()
         raise HTTPException(409, "Attachment is no longer available")
-    outcome = outcome_from_text(db, workspace_id, user, body.title, body.brief, [r.id for r in repos],
-                                acceptance=body.acceptance, harness=body.harness, priority=max(0, min(body.priority, 3)),
-                                signal_id=marker)
+    outcome = outcome_from_text(db, workspace_id, user, README_TITLE if body.template else body.title,
+                                README_BRIEF if body.template else body.brief, [r.id for r in repos],
+                                acceptance=README_ACCEPTANCE if body.template else body.acceptance,
+                                harness=body.harness, priority=max(0, min(body.priority, 3)), signal_id=marker,
+                                guidance={"template": README_TEMPLATE, "repo_id": repos[0].id} if body.template else None)
     if uploads:
         db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.outcome_id == claim_id).update(
             {Artifact.outcome_id: outcome.id}, synchronize_session=False)
@@ -771,6 +777,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
     open_count = sum(1 for d in decisions if d.status == "open")
     return {
+        "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
                    | {"created_by_name": users.get(o.created_by or "", "")},
         "repositories": [{"id": rid, "full_name": repos.get(rid, "?")} for rid in o.repo_ids],
