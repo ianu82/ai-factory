@@ -92,7 +92,10 @@ export function OutcomesPage() {
 }
 
 function OutcomeRow({ o, selected, onSelect, repos }: { o: Outcome; selected: boolean; onSelect: () => void; repos: string[] }) {
-  const s = OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
+  // Planned but no task has left the queue yet: every task waits for a free slot or for its dependencies.
+  const queued = o.status === "running" && o.progress.total > 0 && o.progress.started === 0;
+  const s = queued ? { label: "Queued", tone: "idle" as const }
+    : OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
   return (
     <li className={`row ${selected ? "selected" : ""}`} onClick={onSelect} tabIndex={0} aria-selected={selected}
       onKeyDown={(e) => e.key === "Enter" && onSelect()}>
@@ -102,7 +105,8 @@ function OutcomeRow({ o, selected, onSelect, repos }: { o: Outcome; selected: bo
         <div className="sub">
           <span className="ref">#{o.number}</span>
           <LinearIssueLink issue={o.linear_issue} />
-          <span style={{ color: s.tone === "human" ? "var(--human)" : s.tone === "bad" ? "var(--bad)" : undefined, fontWeight: s.tone === "human" ? 550 : undefined }}>
+          <span title={queued ? "Planned. Tasks start as delivery slots free up; the limit is set in Settings → Throughput." : undefined}
+            style={{ color: s.tone === "human" ? "var(--human)" : s.tone === "bad" ? "var(--bad)" : undefined, fontWeight: s.tone === "human" ? 550 : undefined }}>
             {o.open_decisions > 0 ? `${s.label} · ${o.open_decisions} decision${o.open_decisions > 1 ? "s" : ""}` : s.label}
           </span>
           {o.progress.total > 0 && <span className="num">{o.progress.done}/{o.progress.total} tasks</span>}

@@ -51,7 +51,16 @@ export function InboxPage() {
     };
   }, [ws.id, q.data, qc]);
 
-  const decisions = [...(q.data?.decisions || [])].sort((a, b) => (a.priority ?? 2) - (b.priority ?? 2) || a.created_at.localeCompare(b.created_at));
+  const [order, setOrderState] = useState<"priority" | "newest">(() => {
+    try { return localStorage.getItem("factory:inbox:order") === "newest" ? "newest" : "priority"; } catch { return "priority"; }
+  });
+  const setOrder = (next: "priority" | "newest") => {
+    setOrderState(next);
+    try { localStorage.setItem("factory:inbox:order", next); } catch { /* per-viewer convenience only */ }
+  };
+  const decisions = [...(q.data?.decisions || [])].sort((a, b) => order === "newest"
+    ? b.created_at.localeCompare(a.created_at)
+    : (a.priority ?? 2) - (b.priority ?? 2) || a.created_at.localeCompare(b.created_at));
   const selected = decisions.find((d) => d.id === decisionId) || null;
   const select = (d: Decision) => navigate(`/w/${ws.id}/inbox/${d.id}`);
   const close = () => navigate(`/w/${ws.id}/inbox`);
@@ -74,8 +83,10 @@ export function InboxPage() {
     }
   };
 
-  const groups = GROUPS.map((g) => ({ ...g, rows: decisions.filter((d) => g.kinds.includes(d.kind)) }))
-    .concat([{ key: "other", label: "Other", kinds: [], rows: decisions.filter((d) => !GROUPS.some((g) => g.kinds.includes(d.kind))) }])
+  // Priority groups decisions by what they ask for; Newest is one chronological list.
+  const byKind = GROUPS.map((g) => ({ ...g, rows: decisions.filter((d) => g.kinds.includes(d.kind)) }))
+    .concat([{ key: "other", label: "Other", kinds: [], rows: decisions.filter((d) => !GROUPS.some((g) => g.kinds.includes(d.kind))) }]);
+  const groups = (order === "newest" ? [{ key: "newest", label: "Newest first", kinds: [] as string[], rows: decisions }] : byKind)
     .filter((g) => g.rows.length);
 
   const onRowKey = (e: React.KeyboardEvent<HTMLLIElement>, d: Decision) => {
@@ -92,9 +103,13 @@ export function InboxPage() {
     <>
       <div className="page-head">
         <h1>Inbox</h1>
-        <span className="muted" style={{ fontSize: 12.5 }}>{decisions.length ? `${decisions.length} need${decisions.length === 1 ? "s" : ""} you` : ""}</span>
+        <span className="muted" style={{ fontSize: 12.5, whiteSpace: "nowrap" }}>{decisions.length ? `${decisions.length} need${decisions.length === 1 ? "s" : ""} you` : ""}</span>
         <span className="spacer" />
         <button className="btn sm ghost" onClick={() => setGuide(true)}><LifeBuoy /> How recovery works</button>
+      </div>
+      <div className="toolbar" role="group" aria-label="Sort decisions">
+        <button className={`chip ${order === "priority" ? "on" : ""}`} aria-pressed={order === "priority"} onClick={() => setOrder("priority")}>Priority</button>
+        <button className={`chip ${order === "newest" ? "on" : ""}`} aria-pressed={order === "newest"} onClick={() => setOrder("newest")}>Newest</button>
       </div>
       {guide && <RecoveryGuide onClose={() => setGuide(false)} />}
       <div className={`split ${selected ? "with-panel" : ""}`}>

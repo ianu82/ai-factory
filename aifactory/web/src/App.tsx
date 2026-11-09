@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import { Activity, GitPullRequest, Inbox as InboxIcon, Library, LogOut, Menu, Plus, Radio, Settings as SettingsIcon, Target } from "lucide-react";
+import { Activity, GitPullRequest, Inbox as InboxIcon, Library, ListChecks, LogOut, Menu, Plus, Radio, Settings as SettingsIcon, Target } from "lucide-react";
 import { api, ApiError, type Me, type Meta, type Workspace } from "./api";
 import { useLive } from "./live";
 import { Avatar } from "./ui";
@@ -15,7 +15,7 @@ import { DecisionsPage } from "./pages/Decisions";
 import { SettingsPage } from "./pages/Settings";
 import { NewOutcome } from "./pages/NewOutcome";
 import { Onboarding } from "./onboarding/Onboarding";
-import { memberHasDeferred, useOnboarding } from "./onboarding/state";
+import { memberHasDeferred, STEP_LABELS, useOnboarding } from "./onboarding/state";
 
 type Ctx = { me: Me; meta: Meta; ws: Workspace; live: string; openCapture: () => void };
 const WorkspaceCtx = createContext<Ctx | null>(null);
@@ -137,6 +137,13 @@ function Sidebar() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const onboarding = useOnboarding(ws.id);
+  // Steps still missing, plus completed ones whose credential could not be confirmed (for example a GitHub token
+  // tested before repository-scoped checks existed). Nothing left: no link.
+  const setupSteps = onboarding.data ? Array.from(new Set([...(onboarding.data.missing_steps || []),
+    ...(onboarding.data.validation_uncertain_steps || [])])) : [];
+  const setupLeft = onboarding.data && (!onboarding.data.ready || onboarding.data.deferred) ? Math.max(setupSteps.length, 1)
+    : setupSteps.length;
+  const setupTitle = setupSteps.length ? `Left to do: ${setupSteps.map((s) => STEP_LABELS[s] || s).join(", ")}` : "Finish setting up this workspace";
   const inbox = useQuery({
     queryKey: ["inbox", ws.id],
     queryFn: () => api<{ decisions: unknown[] }>(`/api/workspaces/${ws.id}/inbox`),
@@ -189,8 +196,13 @@ function Sidebar() {
       <NavLink to={`${base}/runs`} className="nav-item"><Activity /> Runs</NavLink>
       <NavLink to={`${base}/signals`} className="nav-item"><Radio /> Signals</NavLink>
       <NavLink to={`${base}/decisions`} className="nav-item"><Library /> Decisions</NavLink>
-      <NavLink to={`${base}/onboarding`} className="nav-item">{onboarding.data?.deferred ? "Resume onboarding" : "Finish workspace setup"}</NavLink>
       <div className="sidebar-foot">
+        {setupLeft > 0 && (
+          <NavLink to={`${base}/onboarding`} className="nav-item" title={setupTitle}>
+            <ListChecks /> {onboarding.data?.deferred ? "Resume setup" : "Finish setup"}
+            <span className="count" aria-label={`${setupLeft} setup ${setupLeft === 1 ? "step" : "steps"} left`}>{setupLeft}</span>
+          </NavLink>
+        )}
         <NavLink to={`${base}/settings`} className="nav-item"><SettingsIcon /> Settings</NavLink>
         <div className="nav-sep" />
         <div className="me">

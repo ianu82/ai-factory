@@ -293,3 +293,16 @@ def test_rate_limit_settings_parse_and_fall_back(monkeypatch):
         assert settings.mindshub_requests_per_minute == 120 and settings.openai_requests_per_minute == 50
     finally:
         reset_settings_cache()
+
+
+def test_outcome_progress_distinguishes_queued_from_started_work():
+    from aifactory.models import Outcome, Task
+    from aifactory.serializers import outcome
+
+    o = Outcome(id="o1", workspace_id="w", number=31, title="t", repo_ids=[], status="running")
+    queued = [Task(id=f"t{i}", key=f"T{i}", status=s, attempt=0) for i, s in enumerate(["queued", "pending", "pending"])]
+    assert outcome(o, queued)["progress"] == {"done": 0, "total": 3, "started": 0, "active": 0}
+    mixed = queued[:2] + [Task(id="t9", key="T9", status="running", attempt=1)]
+    assert outcome(o, mixed)["progress"] == {"done": 0, "total": 3, "started": 1, "active": 1}
+    retried = [Task(id="t8", key="T8", status="queued", attempt=2, pr_number=4)]  # back in the queue after work
+    assert outcome(o, retried)["progress"]["started"] == 1
