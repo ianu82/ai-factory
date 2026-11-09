@@ -85,22 +85,29 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
                          Decision.reusable.is_(True), Decision.scope.in_(("workspace", "repository")))
                  .order_by(Decision.resolved_at.desc(), Decision.id))
 
-        def repos_of(d: Decision) -> set[str]:
-            """The repository a repository-scoped decision was made about (its task's, else its outcome's)."""
-            task = s.get(Task, d.task_id) if d.task_id else None
-            if task is not None:
-                return {task.repo_id}
-            outcome = s.get(Outcome, d.outcome_id) if d.outcome_id else None
-            return set(outcome.repo_ids or []) if outcome is not None else set()
+        def applicable(rows: list[Decision]) -> list[Decision]:
+            """A repository-scoped decision applies to the repository it was made about (its task's, else its
+            outcome's). Repositories are looked up once per page, not once per decision."""
+            if repo_id is None:
+                return rows
+            scoped = [d for d in rows if d.scope == "repository"]
+            task_ids = {d.task_id for d in scoped if d.task_id}
+            outcome_ids = {d.outcome_id for d in scoped if not d.task_id and d.outcome_id}
+            task_repo = dict(s.query(Task.id, Task.repo_id).filter(Task.id.in_(task_ids)).all()) if task_ids else {}
+            outcome_repos = ({oid: set(repos or []) for oid, repos in
+                              s.query(Outcome.id, Outcome.repo_ids).filter(Outcome.id.in_(outcome_ids)).all()}
+                             if outcome_ids else {})
+            return [d for d in rows if d.scope == "workspace"
+                    or (d.task_id and task_repo.get(d.task_id) == repo_id)
+                    or (not d.task_id and repo_id in outcome_repos.get(d.outcome_id, set()))]
 
-        # A repository-scoped decision applies only to its own repository; without a repository (planning across
-        # an outcome's repositories) all of them apply. Page until enough apply: other repositories' decisions
-        # must not crowd out older applicable ones.
+        # Without a repository (planning across an outcome's repositories) every decision applies. Page until
+        # enough apply: other repositories' decisions must not crowd out older applicable ones.
         found: list[Decision] = []
         offset, page = 0, max(limit * 4, 20)
         while len(found) < limit:
             rows = query.offset(offset).limit(page).all()
-            found += [d for d in rows if d.scope == "workspace" or repo_id is None or repo_id in repos_of(d)]
+            found += applicable(rows)
             if len(rows) < page:
                 break
             offset += page
