@@ -123,4 +123,10 @@ suite against a throwaway Postgres (CI does both). UI fixture for rendering chec
 | `AIFACTORY_BOOTSTRAP` | JSON: organization, workspace, invited admins, repositories (+config), settings, declared outcomes |
 | `AIFACTORY_BOOTSTRAP_GITHUB_TOKEN` / `..._OPENAI_API_KEY` / `..._MINDSHUB_API_KEY` | Server fallback credentials until a workspace stores its own |
 | `AIFACTORY_GLOBAL_CONCURRENCY` | Server-wide cap on concurrent tasks |
+| `AIFACTORY_MINDSHUB_REQUESTS_PER_MINUTE` / `AIFACTORY_OPENAI_REQUESTS_PER_MINUTE` | Positive per-credential rolling-minute model request limits (default 50 each; minimum 1) |
 | `MINDSHUB_OIDC_CLIENT_ID` | Enables "Continue with MindsHub" |
+
+Model admission is shared across native, Anton and gateway calls in the Factory process,
+including retries and credentials reused by multiple workspaces. Each provider/base URL and
+full credential digest shares a 16-request concurrency cap; gateway streams hold capacity
+until cleanup. Waiting emits run activity with elapsed time, never credential material.

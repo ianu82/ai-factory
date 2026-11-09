@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from .config import get_settings
+from .inference_limits import admission
 from .db import session_scope
 from .models import Run, Secret, Workspace
 from .security import decrypt
@@ -30,16 +31,6 @@ PROVIDERS = {
 
 # USD per million tokens (input, output). Workspaces can override in settings["pricing"].
 DEFAULT_PRICING: dict[str, tuple[float, float]] = {}
-
-_semaphores: dict[str, asyncio.Semaphore] = {}
-
-
-def _provider_semaphore(key: str) -> asyncio.Semaphore:
-    # MindsHub allows 20 concurrent requests per organization; stay under it.
-    if key not in _semaphores:
-        _semaphores[key] = asyncio.Semaphore(16)
-    return _semaphores[key]
-
 
 class InferenceError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False, status: int | None = None):
@@ -323,8 +314,8 @@ class ModelClient:
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                async with _provider_semaphore(self.provider.api_key[-12:]):
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=20.0)) as client:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=20.0)) as client:
+                    async with admission(self.provider, self.session_id):
                         response = await client.post(url, headers=self.provider.headers(self.session_id),
                                                      content=json.dumps(body))
                 if response.status_code == 200:
