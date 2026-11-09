@@ -527,6 +527,10 @@ async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depend
 
 def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(current)
+    if "require_trusted_issue_author" in patch:
+        if type(patch["require_trusted_issue_author"]) is not bool:
+            raise HTTPException(422, "require_trusted_issue_author must be a boolean")
+        cfg["require_trusted_issue_author"] = patch["require_trusted_issue_author"]
     if "review" in patch:
         try:
             cfg["review"] = {**(current.get("review") or {}), **validate_review(patch["review"])}
@@ -1319,6 +1323,7 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
             return S.signal(sig)
         raise HTTPException(409, "Linear signals are managed by configured Linear intake")
     if body.action == "ignore":
+        sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
         sig.status = "ignored"
         db.commit()
         return S.signal(sig)
@@ -1333,11 +1338,18 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         db.commit()
         notify(workspace_id, "signal", sig.id)
         return S.signal(sig)
+    sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
+    if sig.outcome_id:
+        db.commit()
+        return S.signal(sig)  # accepting again must not create duplicate work
+    worker = (sig.data or {}).get("worker") if sig.source == "github_issue" else None
+    if worker not in ("native", "codex", "anton"):
+        worker = None
     repo_ids = [sig.repo_id] if sig.repo_id else [r.id for r in db.query(Repository).filter(
         Repository.workspace_id == workspace_id).limit(1)]
     outcome = outcome_from_text(db, workspace_id, user, body.title or sig.title,
                                 (body.brief or sig.body or "") + (f"\n\nSource: {sig.url}" if sig.url else ""),
-                                repo_ids, source="signal", signal_id=sig.id)
+                                repo_ids, source="signal", signal_id=sig.id, harness=worker)
     sig.status, sig.outcome_id = "accepted", outcome.id
     db.commit()
     orchestrator.wake()

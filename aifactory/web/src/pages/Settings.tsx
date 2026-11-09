@@ -427,6 +427,7 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
   const [open, setOpen] = useState(false);
   const c = repo.config;
   const [form, setForm] = useState({
+    require_trusted_issue_author: c.require_trusted_issue_author !== false,
     setup: lines(c.setup), checks: lines(c.checks), smoke: lines(c.smoke), protected_paths: lines(c.protected_paths),
     context: c.context || "", merge_mode: c.merge?.mode || "", method: c.merge?.method || "squash", reverify: c.merge?.reverify ?? "overlap",
     health_url: c.release?.health_url || "", release_mode: c.release?.mode || "", require_ci: !!c.require_ci,
@@ -435,7 +436,7 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
     try {
       await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "PATCH", json: { config: {
         setup: unlines(form.setup), checks: unlines(form.checks), smoke: unlines(form.smoke), protected_paths: unlines(form.protected_paths),
-        context: form.context, require_ci: form.require_ci,
+        context: form.context, require_ci: form.require_ci, require_trusted_issue_author: form.require_trusted_issue_author,
         merge: { ...c.merge, mode: form.merge_mode || undefined, method: form.method, ...(supportsReverify ? { reverify: form.reverify } : {}) },
         release: { ...c.release, mode: form.release_mode || undefined, health_url: form.health_url || undefined },
       } } });
@@ -499,6 +500,8 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
             <label className="field"><span>Health check after release</span><input className="input mono" placeholder="https://app.example.com/health" value={form.health_url} disabled={!admin} onChange={(e) => setForm({ ...form, health_url: e.target.value })} /></label>
           </div>
           <label className="check"><input type="checkbox" checked={form.require_ci} disabled={!admin} onChange={(e) => setForm({ ...form, require_ci: e.target.checked })} /> Require GitHub CI checks before merging</label>
+          <label className="check"><input type="checkbox" checked={form.require_trusted_issue_author} disabled={!admin} onChange={(e) => setForm({ ...form, require_trusted_issue_author: e.target.checked })} /> Require trusted issue authors for automatic work</label>
+          <p className="hint">Enabled by default: factory:auto issues start only when their author currently has write or admin access. Other issues, or permissions that cannot be verified, need a person to accept them in Signals. Turning this off allows the automatic label alone to start work in this repository. Held proposals still need acceptance.</p>
           {admin && <div style={{ display: "flex", gap: 8 }}><button className="btn primary" onClick={save}>Save</button><span style={{ flex: 1 }} /><button className="btn ghost danger" onClick={remove}>Disconnect</button></div>}
         </div>
       )}

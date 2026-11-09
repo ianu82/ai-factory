@@ -5,6 +5,7 @@ import { ArrowUpRight, ExternalLink, MessageSquarePlus, RefreshCw } from "lucide
 import { api, type Repo, type Signal } from "../api";
 import { useWs } from "../App";
 import { ago } from "../format";
+import { signalAcceptanceReason } from "../signalAcceptance";
 import { Dot, Empty, Modal, Prose, Skeleton, useToast } from "../ui";
 
 const SOURCE: Record<string, string> = {
@@ -161,12 +162,14 @@ function ProposalCard({ s, repo, act }: { s: Signal; repo?: string; act: (s: Sig
 }
 
 function SignalRow({ s, repo, act, canAct }: { s: Signal; repo?: string; act: (s: Signal, a: "accept" | "ignore") => void; canAct: boolean }) {
+  const acceptanceReason = signalAcceptanceReason(s);
   const handled = s.source === "improvement" ? ({ accepted: "applied", ignored: "set aside", resolved: "no longer supported by the evidence" } as Record<string, string>)[s.status] : s.status;
   return (
     <li className="row" style={{ cursor: "default" }}>
       <Dot tone={s.status === "new" ? (s.source.includes("failure") ? "bad" : "human") : "idle"} />
       <div style={{ minWidth: 0 }}>
         <div className="title">{s.title}</div>
+        {acceptanceReason && <div className="muted">{acceptanceReason}</div>}
         <div className="sub">
           <span>{SOURCE[s.source] || s.source}</span>
           {repo && <span className="mono wide">{repo}</span>}
