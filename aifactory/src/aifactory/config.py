@@ -15,10 +15,11 @@ def _bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _int(name: str, default: int) -> int:
+def concurrency_limit(value: object, default: int) -> int:
+    """Normalize execution/planning limits, including legacy stored settings."""
     try:
-        return int(os.environ.get(name, default))
-    except ValueError:
+        return max(1, min(int(value), 50))
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -46,6 +47,7 @@ class Settings:
     jobs_dir: Path
     sandbox_user: str
     global_concurrency: int
+    global_planning_concurrency: int
     orchestrator_enabled: bool
     internal_url: str
     allowed_emails: tuple[str, ...] = field(default_factory=tuple)
@@ -79,7 +81,8 @@ def get_settings() -> Settings:
         bootstrap_github_token=os.environ.get("AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", ""),
         jobs_dir=Path(os.environ.get("AIFACTORY_JOBS_DIR", str(data_dir / "jobs"))).resolve(),
         sandbox_user=os.environ.get("AIFACTORY_SANDBOX_USER", ""),
-        global_concurrency=max(1, _int("AIFACTORY_GLOBAL_CONCURRENCY", 8)),
+        global_concurrency=concurrency_limit(os.environ.get("AIFACTORY_GLOBAL_CONCURRENCY"), 8),
+        global_planning_concurrency=concurrency_limit(os.environ.get("AIFACTORY_GLOBAL_PLANNING_CONCURRENCY"), 4),
         orchestrator_enabled=_bool("AIFACTORY_ORCHESTRATOR", True),
         internal_url=os.environ.get("AIFACTORY_INTERNAL_URL", f"http://127.0.0.1:{port}").rstrip("/"),
         allowed_emails=tuple(e.strip().lower() for e in os.environ.get("AIFACTORY_ALLOWED_EMAILS", "").split(",") if e.strip()),

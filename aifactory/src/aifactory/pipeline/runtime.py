@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import get_settings
+from ..config import concurrency_limit, get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..gateway import GatewayGrant, issue, revoke
@@ -23,6 +23,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
+    "planning_concurrency": 2,
     "max_attempts": 3,
     # When attempts run out on concrete feedback (verifier findings, failed checks, policy), try once more with a
     # fresh budget before asking a person: relaying findings into a retry is not a decision.
@@ -45,6 +46,8 @@ def merged_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
             out[key] = value if value is not None else default
     for key, value in (raw or {}).items():
         out.setdefault(key, value)
+    for key in ("concurrency", "planning_concurrency"):
+        out[key] = concurrency_limit(out[key], DEFAULT_SETTINGS[key])
     return out
 
 

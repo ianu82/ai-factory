@@ -119,6 +119,18 @@ def test_settings_are_validated(client, signed_in):
     assert settings["autonomy"]["merge"] == "approval" and settings["autonomy"]["plan"] == "auto"
 
 
+@pytest.mark.parametrize("value,expected", [(None, 2), ("6", 6), (0, 1), (-5, 1), (500, 50), ("bad", 2), ([], 2)])
+def test_planning_settings_default_and_normalization(client, signed_in, value, expected):
+    ws = signed_in["workspaces"][0]
+    assert ws["settings"]["planning_concurrency"] == 2
+    response = client.patch(f"/api/workspaces/{ws['id']}", json={"settings": {"planning_concurrency": value}})
+    assert response.status_code == 200, response.text
+    assert response.json()["settings"]["planning_concurrency"] == expected
+    saved = client.get("/api/me").json()["workspaces"][0]["settings"]
+    assert saved["planning_concurrency"] == expected
+    assert saved["concurrency"] == 3
+
+
 def test_gateway_pins_model_enforces_budget_and_records_usage(client, signed_in, monkeypatch):
     ws_id = signed_in["workspaces"][0]["id"]
     with session_scope() as s:
