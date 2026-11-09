@@ -383,7 +383,8 @@ class RailwayVMSandbox:
         transfer = "/tmp/factory-write-" + uuid.uuid4().hex
         await self.bridge.call("write", {"id": self.vm_id, "path": transfer,
                                          "base64": base64.b64encode(content).decode()})
-        script = (inspect.getsource(safe_write) + "\nimport os\n"
+        # Postponed annotations: the helper's `int | None` must not be evaluated by an older VM python3.
+        script = ("from __future__ import annotations\n" + inspect.getsource(safe_write) + "\nimport os\n"
                   + "fd = os.open(" + repr(transfer) + ", os.O_RDONLY | os.O_NOFOLLOW)\n"
                   + "with os.fdopen(fd, 'rb') as f: content = f.read()\n"
                   + "safe_write(" + repr(str(self.work)) + ", " + repr(rel) + ", content)")
