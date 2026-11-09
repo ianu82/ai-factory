@@ -216,6 +216,28 @@ class GitHub:
     async def repo(self, full_name: str) -> dict[str, Any]:
         return await self.request("GET", f"/repos/{full_name}")
 
+    async def repository_author_permission(self, full_name: str, author: str) -> str | None:
+        """Current repository access, never issue association or label ownership.
+
+        GitHub may represent write access as ``push`` or in user.permissions.
+        Unknown/malformed responses are not evidence of trusted access.
+        """
+        from urllib.parse import quote
+
+        data = await self.request("GET", f"/repos/{full_name}/collaborators/{quote(author, safe='')}/permission")
+        if not isinstance(data, dict):
+            return None
+        permission = data.get("permission")
+        if permission in ("admin", "write", "push"):
+            return permission
+        permissions = (data.get("user") or {}).get("permissions") if isinstance(data.get("user"), dict) else None
+        if isinstance(permissions, dict):
+            if permissions.get("admin") is True:
+                return "admin"
+            if permissions.get("push") is True:
+                return "push"
+        return permission if isinstance(permission, str) else None
+
     async def accessible_repos(self, limit: int = 200) -> list[dict[str, Any]]:
         repos: list[dict[str, Any]] = []
         page = 1

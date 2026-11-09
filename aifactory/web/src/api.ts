@@ -166,6 +166,7 @@ export interface Repo {
     merge?: { mode?: string; method?: string; revalidate?: boolean; reverify?: "overlap" | "always" | "never" };
     release?: { mode?: string; health_url?: string; expect_text?: string };
     require_ci?: boolean;
+    require_trusted_issue_author?: boolean;
   };
 }
 
@@ -385,6 +386,7 @@ export interface Signal {
   repo_id: string | null;
   data: {
     rule?: string;
+    acceptance_reason?: string;
     action?: { type: "settings" | "repo_config" | "team_note" | "review"; label?: string; note?: string; repo_id?: string; set?: Record<string, unknown> };
     evidence?: { label: string; detail?: string; outcome_id?: string; task_id?: string; url?: string }[];
   };

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from aifactory import auth as auth_module
 from aifactory import signals as signals_module
 from aifactory.bootstrap import apply_bootstrap
@@ -60,6 +62,9 @@ def test_labelled_issues_become_outcomes_once_and_plain_label_is_only_proposed(m
             if labels == "factory":
                 return [{"number": 8, "title": "Slow log page", "body": "", "html_url": "https://gh/8", "user": {}}]
             return []
+
+        async def repository_author_permission(self, full_name, author):
+            return "write"
 
         async def comment(self, full_name, number, body):
             comments.append((number, body))
@@ -486,3 +491,228 @@ def test_delegation_reaches_another_workspace_only_to_relay_and_only_where_the_d
         assert s.get(Task, products[2]["T3"]).status == "blocked"  # a retry at the merge stage would merge
         assert s.get(Task, elsewhere[2]["T1"]).status == "awaiting_approval"
         assert not s.query(Message).filter(Message.outcome_id == elsewhere[1]).count()
+
+
+class IntakeGitHub:
+    """Fake current permissions independent of issue association and labels."""
+    permission = "read"
+
+    def __init__(self, token):
+        self.lookups = []
+        self.comments = []
+        self.ci_requests = []
+        self.rows = {}
+
+    async def issues(self, full_name, labels="", since=None):
+        return self.rows.get(full_name, []) if labels == "factory:auto" else []
+
+    async def repository_author_permission(self, full_name, author):
+        self.lookups.append((full_name, author))
+        if isinstance(self.permission, Exception):
+            raise self.permission
+        return self.permission
+
+    async def comment(self, full_name, number, body):
+        self.comments.append((full_name, number))
+
+    async def request(self, method, path, **kwargs):
+        self.ci_requests.append(path)
+        return {"workflow_runs": []}
+
+
+def intake_issue(number=1, author="contributor", worker="codex"):
+    return {"number": number, "title": f"Issue {number}", "body": "Do work", "html_url": f"https://gh/{number}",
+            "user": {"login": author} if author else None, "author_association": "OWNER",
+            "labels": [{"name": "factory:auto"}, {"name": f"worker:{worker}"}]}
+
+
+def sync_intake(ws_id):
+    with SessionLocal() as db:
+        return asyncio.run(signals_module.sync_github(db, ws_id, "fake-token"))
+
+
+def seed_intake_repo(ws_id, name="acme/app", config=None):
+    with session_scope() as db:
+        repo = Repository(workspace_id=ws_id, full_name=name, config=config or {})
+        db.add(repo)
+        db.flush()
+        return repo.id
+
+
+@pytest.mark.parametrize("permission", ["write", "admin", "push", "read", "triage", "maintain", "unknown", None])
+def test_auto_intake_checks_current_author_permission(client, signed_in, monkeypatch, permission):
+    ws_id = signed_in["workspaces"][0]["id"]
+    seed_intake_repo(ws_id)
+    gh = IntakeGitHub("t")
+    gh.permission = permission
+    gh.rows = {"acme/app": [intake_issue()]}
+    monkeypatch.setattr(signals_module, "GitHub", lambda token: gh)
+    trusted = permission in ("write", "admin", "push")
+    assert sync_intake(ws_id)["accepted"] == int(trusted)
+    gh.permission = "admin"  # a held proposal must not be promoted on the next poll
+    assert sync_intake(ws_id)["accepted"] == 0
+    with session_scope() as db:
+        sig = db.query(Signal).one()
+        assert sig.count == 2
+        assert sig.status == ("accepted" if trusted else "new")
+        assert db.query(Outcome).count() == int(trusted)
+        if trusted:
+            assert db.query(Outcome).one().harness == "codex"
+        else:
+            assert "Acceptance needed" in sig.data["acceptance_reason"]
+            assert len(sig.data["acceptance_reason"]) < 200
+    assert gh.lookups == [("acme/app", "contributor")]
+    assert len(gh.comments) == int(trusted)
+
+
+@pytest.mark.parametrize("failure", ["missing", "denied", "network"])
+def test_unverifiable_authors_fail_closed_without_stopping_sync(client, signed_in, monkeypatch, failure):
+    import httpx
+    from aifactory.github import GitHubError
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    seed_intake_repo(ws_id)
+    seed_intake_repo(ws_id, "acme/second", {"require_trusted_issue_author": False})
+    gh = IntakeGitHub("t")
+    gh.permission = GitHubError("secret-provider-detail", 403) if failure == "denied" else httpx.ConnectError("secret-provider-detail")
+    gh.rows = {"acme/app": [intake_issue(1, None if failure == "missing" else "author"),
+                            intake_issue(2, None if failure == "missing" else "author")],
+               "acme/second": [intake_issue(3)]}
+    monkeypatch.setattr(signals_module, "GitHub", lambda token: gh)
+    assert sync_intake(ws_id)["accepted"] == 1
+    assert len(gh.ci_requests) == 4
+    with session_scope() as db:
+        assert db.query(Outcome).count() == 1
+        held = db.query(Signal).filter(Signal.status == "new").all()
+        assert len(held) == 2
+        assert all("secret-provider-detail" not in json.dumps(s.data) for s in held)
+        assert all("Acceptance needed" in s.data["acceptance_reason"] for s in held)
+    assert len(gh.lookups) == (0 if failure == "missing" else 2)
+
+
+@pytest.mark.parametrize("worker", ["codex", "native", "anton"])
+def test_human_acceptance_retains_held_worker_and_is_idempotent(client, signed_in, monkeypatch, worker):
+    ws_id = signed_in["workspaces"][0]["id"]
+    repo_id = seed_intake_repo(ws_id)
+    gh = IntakeGitHub("t")
+    gh.rows = {"acme/app": [intake_issue(worker=worker)]}
+    monkeypatch.setattr(signals_module, "GitHub", lambda token: gh)
+    assert sync_intake(ws_id)["accepted"] == 0
+    # Even turning the rule off must not silently accept an already held proposal.
+    with session_scope() as db:
+        db.get(Repository, repo_id).config = {"require_trusted_issue_author": False}
+        sig_id = db.query(Signal).one().id
+    gh.rows["acme/app"][0]["labels"] = []
+    assert sync_intake(ws_id)["accepted"] == 0
+    for _ in range(2):
+        response = client.post(f"/api/workspaces/{ws_id}/signals/{sig_id}", json={"action": "accept"})
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "accepted"
+    assert sync_intake(ws_id)["accepted"] == 0
+    with session_scope() as db:
+        outcome = db.query(Outcome).one()
+        assert outcome.harness == worker
+        assert outcome.signal_id == sig_id
+        assert db.query(Signal).count() == 1
+
+
+@pytest.mark.parametrize("role", ["owner", "admin", "member", "viewer"])
+def test_only_admins_can_change_issue_author_trust(client, signed_in, role):
+    ws_id = signed_in["workspaces"][0]["id"]
+    repo_id = seed_intake_repo(ws_id, config={"context": "keep"})
+    with session_scope() as db:
+        db.query(Membership).filter_by(workspace_id=ws_id, user_id=signed_in["user"]["id"]).one().role = role
+    for value in (False, True):
+        response = client.patch(f"/api/workspaces/{ws_id}/repositories/{repo_id}",
+                                json={"config": {"require_trusted_issue_author": value}})
+        assert response.status_code == (200 if role in ("owner", "admin") else 403), response.text
+        if response.status_code == 200:
+            assert response.json()["config"] == {"context": "keep", "require_trusted_issue_author": value}
+    with session_scope() as db:
+        if role in ("member", "viewer"):
+            assert db.get(Repository, repo_id).config == {"context": "keep"}
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false", "true", [], {}])
+def test_issue_author_trust_requires_a_json_boolean(client, signed_in, value):
+    ws_id = signed_in["workspaces"][0]["id"]
+    repo_id = seed_intake_repo(ws_id)
+    response = client.patch(f"/api/workspaces/{ws_id}/repositories/{repo_id}",
+                            json={"config": {"require_trusted_issue_author": value}})
+    assert response.status_code == 422
+    with session_scope() as db:
+        assert db.get(Repository, repo_id).config == {}
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"permission": "write"}, "write"), ({"permission": "admin"}, "admin"),
+    ({"permission": "push"}, "push"), ({"permission": "read"}, "read"),
+    ({"permission": "triage"}, "triage"), ({}, None), ([], None),
+    ({"user": {"permissions": {"push": True}}}, "push"),
+    ({"user": {"permissions": {"admin": True}}}, "admin"),
+    ({"user": {"permissions": {"push": "true"}}}, None),
+])
+def test_github_author_permission_lookup(monkeypatch, payload, expected):
+    from aifactory.github import GitHub
+
+    gh = GitHub("not-a-real-token")
+
+    async def request(method, path):
+        assert method == "GET"
+        assert path == "/repos/acme/app/collaborators/issue-author/permission"
+        return payload
+
+    monkeypatch.setattr(gh, "request", request)
+    assert asyncio.run(gh.repository_author_permission("acme/app", "issue-author")) == expected
+
+
+@pytest.mark.parametrize("config", [{}, {"require_trusted_issue_author": True}])
+def test_opt_out_is_repository_scoped_and_deduplicated(client, signed_in, monkeypatch, config):
+    ws_id = signed_in["workspaces"][0]["id"]
+    seed_intake_repo(ws_id, config=config)
+    seed_intake_repo(ws_id, "acme/opt-out", {"require_trusted_issue_author": False})
+    gh = IntakeGitHub("t")
+    gh.rows = {"acme/app": [intake_issue(1, author=None)],
+               "acme/opt-out": [intake_issue(2, author=None)]}
+    monkeypatch.setattr(signals_module, "GitHub", lambda token: gh)
+    assert sync_intake(ws_id)["accepted"] == 1
+    assert sync_intake(ws_id)["accepted"] == 0
+    assert gh.lookups == []
+    assert gh.comments == [("acme/opt-out", 2)]
+    with session_scope() as db:
+        assert db.query(Outcome).count() == 1
+        sigs = {s.external_id: s for s in db.query(Signal)}
+        assert sigs["acme/app#1"].status == "new"
+        assert sigs["acme/opt-out#2"].status == "accepted"
+        assert all(s.count == 2 for s in sigs.values())
+
+
+@pytest.mark.parametrize("action", ["accept", "ignore"])
+def test_handling_held_issue_clears_acceptance_prompt(client, signed_in, monkeypatch, action):
+    ws_id = signed_in["workspaces"][0]["id"]
+    seed_intake_repo(ws_id)
+    gh = IntakeGitHub("t")
+    gh.rows = {"acme/app": [intake_issue(worker="codex")]}
+    monkeypatch.setattr(signals_module, "GitHub", lambda token: gh)
+    assert sync_intake(ws_id)["accepted"] == 0
+    with session_scope() as db:
+        sig = db.query(Signal).one()
+        assert "Acceptance needed" in sig.data["acceptance_reason"]
+        sig_id = sig.id
+    for _ in range(2):
+        response = client.post(f"/api/workspaces/{ws_id}/signals/{sig_id}", json={"action": action})
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == ("accepted" if action == "accept" else "ignored")
+        assert "acceptance_reason" not in response.json()["data"]
+        assert response.json()["data"]["worker"] == "codex"
+    gh.permission = "admin"
+    assert sync_intake(ws_id)["accepted"] == 0
+    response = client.get(f"/api/workspaces/{ws_id}/signals")
+    assert response.status_code == 200
+    assert all("acceptance_reason" not in sig["data"] for sig in response.json())
+    with session_scope() as db:
+        sig = db.get(Signal, sig_id)
+        assert "acceptance_reason" not in sig.data
+        assert db.query(Outcome).count() == int(action == "accept")
+        if action == "accept":
+            assert db.query(Outcome).one().harness == "codex"

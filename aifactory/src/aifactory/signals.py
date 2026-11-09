@@ -65,7 +65,8 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
     """Pull GitHub issues and failing default-branch CI runs as signals.
 
     Issues labelled ``factory`` become proposed signals. Issues labelled ``factory:auto``
-    (pre-authorized work) become outcomes immediately and are acknowledged on the issue.
+    (pre-authorized work) become outcomes when the author has current write/admin access,
+    unless the repository explicitly opts out of that trust rule.
     """
     from .config import get_settings
 
@@ -100,9 +101,31 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                         sig.status, sig.outcome_id = "accepted", existing.id
                         db.commit()
                         continue
+                    if (sig.data or {}).get("acceptance_reason"):
+                        db.commit()
+                        continue  # a held issue always needs a person, even after permissions change
                     author = (issue.get("user") or {}).get("login", "")
                     names = {(lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in issue.get("labels") or []}
                     worker = next((n.split(":", 1)[1] for n in names if n in ("worker:native", "worker:codex", "worker:anton")), None)
+                    # Persist the worker before holding a proposal so human acceptance
+                    # uses the same worker as automatic acceptance would have used.
+                    sig.data = {**(sig.data or {}), "worker": worker}
+                    if cfg.get("require_trusted_issue_author") is not False:
+                        reason = ""
+                        if not author:
+                            reason = "Acceptance needed: the issue author is missing."
+                        else:
+                            try:
+                                permission = await gh.repository_author_permission(repo.full_name, author)
+                                if permission not in ("write", "admin", "push"):
+                                    reason = "Acceptance needed: the issue author does not have verified write or admin access."
+                            except Exception:
+                                # Never persist provider messages: they can contain credentials.
+                                reason = "Acceptance needed: the issue author's repository permission could not be verified."
+                        if reason:
+                            sig.data = {**sig.data, "acceptance_reason": reason}
+                            db.commit()
+                            continue
                     outcome = outcome_from_text(
                         db, workspace_id, None, issue["title"],
                         f"{issue.get('body') or ''}\n\nSource: {issue['html_url']} (opened by {author}, labelled {auto_label})",
