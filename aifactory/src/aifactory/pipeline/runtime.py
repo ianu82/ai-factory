@@ -14,7 +14,7 @@ from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, Message, Outcome, Run, Workspace
+from ..models import Decision, Message, Outcome, Run, Task, Workspace
 from ..sandbox import LocalSandbox
 from .attachments import prepare_attachments
 
@@ -80,10 +80,38 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
 def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -> list[Decision]:
     """Reusable, attributed human decisions that apply to this workspace (and repository)."""
     with session_scope() as s:
-        rows = (s.query(Decision)
-                .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved", Decision.reusable.is_(True))
-                .order_by(Decision.resolved_at.desc()).limit(limit * 2).all())
-        return [d for d in rows if d.scope in ("workspace", "repository")][:limit]
+        query = (s.query(Decision)
+                 .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved",
+                         Decision.reusable.is_(True), Decision.scope.in_(("workspace", "repository")))
+                 .order_by(Decision.resolved_at.desc(), Decision.id))
+
+        def applicable(rows: list[Decision]) -> list[Decision]:
+            """A repository-scoped decision applies to the repository it was made about (its task's, else its
+            outcome's). Repositories are looked up once per page, not once per decision."""
+            if repo_id is None:
+                return rows
+            scoped = [d for d in rows if d.scope == "repository"]
+            task_ids = {d.task_id for d in scoped if d.task_id}
+            outcome_ids = {d.outcome_id for d in scoped if not d.task_id and d.outcome_id}
+            task_repo = dict(s.query(Task.id, Task.repo_id).filter(Task.id.in_(task_ids)).all()) if task_ids else {}
+            outcome_repos = ({oid: set(repos or []) for oid, repos in
+                              s.query(Outcome.id, Outcome.repo_ids).filter(Outcome.id.in_(outcome_ids)).all()}
+                             if outcome_ids else {})
+            return [d for d in rows if d.scope == "workspace"
+                    or (d.task_id and task_repo.get(d.task_id) == repo_id)
+                    or (not d.task_id and repo_id in outcome_repos.get(d.outcome_id, set()))]
+
+        # Without a repository (planning across an outcome's repositories) every decision applies. Page until
+        # enough apply: other repositories' decisions must not crowd out older applicable ones.
+        found: list[Decision] = []
+        offset, page = 0, max(limit * 4, 20)
+        while len(found) < limit:
+            rows = query.offset(offset).limit(page).all()
+            found += applicable(rows)
+            if len(rows) < page:
+                break
+            offset += page
+        return found[:limit]
 
 
 @dataclass
