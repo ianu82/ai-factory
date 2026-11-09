@@ -28,6 +28,37 @@ export async function api<T = any>(path: string, init: RequestInit & { json?: un
   return res.json();
 }
 
+/** JSON uploads keep the existing API/error contract, with actual transport progress. */
+export function uploadJson<T>(path: string, json: unknown, signal: AbortSignal, onProgress: (loaded: number, total: number) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    const clean = () => signal.removeEventListener("abort", abort);
+    xhr.open("POST", path);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+    xhr.onerror = () => { clean(); reject(new ApiError(0, "Upload failed. Check your connection and retry.")); };
+    xhr.onabort = () => { clean(); reject(new DOMException("Upload cancelled", "AbortError")); };
+    xhr.onload = () => {
+      clean();
+      let body: any;
+      try { body = JSON.parse(xhr.responseText); } catch { /* handled below */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (body === undefined) reject(new ApiError(xhr.status, "Invalid upload response"));
+        else resolve(body as T);
+      } else {
+        const detail = body?.detail;
+        const message = typeof detail === "string" ? detail : Array.isArray(detail) ? detail.map((d: any) => d.msg).join("; ") : xhr.statusText;
+        reject(new ApiError(xhr.status, message || `Request failed (${xhr.status})`));
+      }
+    };
+    if (signal.aborted) { reject(new DOMException("Upload cancelled", "AbortError")); return; }
+    signal.addEventListener("abort", abort, { once: true });
+    xhr.send(JSON.stringify(json));
+  });
+}
+
 export type Role = "owner" | "admin" | "member" | "viewer";
 
 export type LinearStage = "queued" | "building" | "verifying" | "merging" | "done" | "blocked";
@@ -300,6 +331,7 @@ export interface Plan {
 }
 
 export interface OutcomeDetail {
+  attachments: Artifact[];
   outcome: Outcome;
   repositories: { id: string; full_name: string }[];
   plans: Plan[];

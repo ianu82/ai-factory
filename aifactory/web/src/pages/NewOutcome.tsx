@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { api, type Outcome, type Repo } from "../api";
 import { useWs } from "../App";
 import { Modal, useToast } from "../ui";
+import { AttachmentPicker, pasteImages, useAttachmentQueue } from "../components/Attachments";
 
 export function NewOutcome({ onClose }: { onClose: () => void }) {
   const { ws, meta } = useWs();
@@ -19,6 +20,8 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
   const [priority, setPriority] = useState(2);
   const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(false);
+  const submitting = useRef(false);
+  const attachments = useAttachmentQueue(ws.id);
   const titleRef = useRef<HTMLInputElement>(null);
   useEffect(() => titleRef.current?.focus(), []);
   useEffect(() => {
@@ -26,21 +29,26 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
   }, [repos.data, picked.length]);
 
   const submit = async () => {
-    if (title.trim().length < 3 || picked.length === 0) return;
+    if (submitting.current || attachments.blocked || title.trim().length < 3 || picked.length === 0) return;
+    submitting.current = true;
+    attachments.submitting = true;
     setBusy(true);
     try {
       const o = await api<Outcome>(`/api/workspaces/${ws.id}/outcomes`, {
         method: "POST",
-        json: { title, brief, repo_ids: picked, harness: harness || null, priority,
+        json: { title, brief, attachment_ids: attachments.ids, repo_ids: picked, harness: harness || null, priority,
                 acceptance: criteria.split("\n").map((c) => c.replace(/^\s*[-*\d.]+\s*/, "").trim()).filter(Boolean) },
       });
+      attachments.finishSubmission(true);
       qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });
       toast(`#${o.number} queued for planning`);
       onClose();
       navigate(`/w/${ws.id}/outcomes/${o.id}`);
     } catch (err) {
+      attachments.finishSubmission(false);
       toast((err as Error).message, true);
     } finally {
+      submitting.current = false;
       setBusy(false);
     }
   };
@@ -54,16 +62,17 @@ export function NewOutcome({ onClose }: { onClose: () => void }) {
         </span>
         <span className="spacer" />
         <button className="btn ghost" onClick={onClose}>Cancel</button>
-        <button className="btn primary" onClick={submit} disabled={busy || title.trim().length < 3 || picked.length === 0}>
+        <button className="btn primary" onClick={submit} disabled={busy || attachments.blocked || title.trim().length < 3 || picked.length === 0}>
           {busy ? "Submitting…" : "Start"}
         </button>
       </>
     }>
-      <div onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(); }} style={{ display: "contents" }}>
+      <div onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void submit(); } }} style={{ display: "contents" }}>
         <input ref={titleRef} className="title-input" placeholder="What should be true when this is done?" value={title}
           onChange={(e) => setTitle(e.target.value)} aria-label="Outcome title" maxLength={300} />
         <textarea className="brief-input" placeholder="Context, constraints, links, who it's for… The planner reads the code, so describe the goal rather than the steps."
-          value={brief} onChange={(e) => setBrief(e.target.value)} aria-label="Description" />
+          onPaste={(event) => pasteImages(event, attachments)} value={brief} onChange={(e) => setBrief(e.target.value)} aria-label="Description" />
+        <AttachmentPicker queue={attachments} />
         <div className="field">
           <span>Repositories</span>
           {repos.data?.length === 0 ? (
