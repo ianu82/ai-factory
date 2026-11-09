@@ -91,6 +91,7 @@ def record(
     actor: str = "factory",
     data: dict[str, Any] | None = None,
     session: Session | None = None,
+    publish: bool = True,
 ) -> dict[str, Any]:
     clean = json.loads(redact(json.dumps(data or {}, default=str)))
     event = Event(
@@ -113,7 +114,8 @@ def record(
             s.add(event)
             s.flush()
             payload = event_dict(event)
-    bus.publish({"type": "event", **payload})
+    if publish:
+        bus.publish({"type": "event", **payload})
     if kind not in ("agent_thought", "agent_tool"):
         log.info("[%s %s%s] %s: %s", workspace_id[:6], (outcome_id or "-")[:6], f"/{task_id[:6]}" if task_id else "",
                  kind, payload["message"][:300])

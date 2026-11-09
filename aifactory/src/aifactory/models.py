@@ -113,12 +113,34 @@ class Repository(Base):
     __table_args__ = (UniqueConstraint("workspace_id", "full_name"),)
 
 
+class Workstream(Base):
+    __tablename__ = "workstreams"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    slug: Mapped[str] = mapped_column(String(80))
+    name: Mapped[str] = mapped_column(String(200))
+    goal: Mapped[str] = mapped_column(String(2000))
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    default_repo_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    state: Mapped[str] = mapped_column(String(20), default="active")
+    worker_override: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    plan_approval_override: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    merge_approval_override: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    priority_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    outcome_budget_override: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (UniqueConstraint("workspace_id", "slug"),)
+
+
 class Outcome(Base):
     """What a team asked for. Decomposed by a plan into tasks."""
 
     __tablename__ = "outcomes"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    workstream_id: Mapped[str | None] = mapped_column(ForeignKey("workstreams.id"), nullable=True, index=True)
     number: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(300))
     brief: Mapped[str] = mapped_column(Text, default="")

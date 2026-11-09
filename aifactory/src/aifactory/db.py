@@ -83,6 +83,7 @@ def init_engine(url: str | None = None) -> Engine:
     Base.metadata.create_all(_engine)
     _add_missing_columns(_engine)
     _migrate_benchmark_trial_link(_engine)
+    _migrate_workstream_link(_engine)
     harden_data_dir()
     return _engine
 
@@ -124,6 +125,25 @@ def _migrate_benchmark_trial_link(engine: Engine) -> None:
                 conn.execute(text(
                     "ALTER TABLE runs ADD CONSTRAINT fk_runs_benchmark_trial_id "
                     "FOREIGN KEY (benchmark_trial_id) REFERENCES benchmark_trials (id)"
+                ))
+
+
+def _migrate_workstream_link(engine: Engine) -> None:
+    """Existing tables need their new index (and, on Postgres, foreign key) explicitly."""
+    from sqlalchemy import inspect, text
+
+    from .models import Outcome
+
+    with engine.begin() as conn:
+        for index in Outcome.__table__.indexes:
+            if index.name == "ix_outcomes_workstream_id":
+                index.create(conn, checkfirst=True)
+        if engine.dialect.name == "postgresql":
+            keys = inspect(conn).get_foreign_keys("outcomes")
+            if not any(k["constrained_columns"] == ["workstream_id"] for k in keys):
+                conn.execute(text(
+                    "ALTER TABLE outcomes ADD CONSTRAINT fk_outcomes_workstream_id "
+                    "FOREIGN KEY (workstream_id) REFERENCES workstreams (id)"
                 ))
 
 
