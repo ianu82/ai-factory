@@ -53,6 +53,10 @@ class Settings:
     allowed_emails: tuple[str, ...] = field(default_factory=tuple)
     allowed_org_ids: tuple[str, ...] = field(default_factory=tuple)
 
+    # Positive provider-wide rolling-minute allowances (shared across workspaces).
+    mindshub_requests_per_minute: int = 50
+    openai_requests_per_minute: int = 50
+
     @property
     def secure_cookies(self) -> bool:
         return self.public_url.startswith("https://")
@@ -85,6 +89,8 @@ def get_settings() -> Settings:
         global_planning_concurrency=concurrency_limit(os.environ.get("AIFACTORY_GLOBAL_PLANNING_CONCURRENCY"), 4),
         orchestrator_enabled=_bool("AIFACTORY_ORCHESTRATOR", True),
         internal_url=os.environ.get("AIFACTORY_INTERNAL_URL", f"http://127.0.0.1:{port}").rstrip("/"),
+        mindshub_requests_per_minute=max(1, _int("AIFACTORY_MINDSHUB_REQUESTS_PER_MINUTE", 50)),
+        openai_requests_per_minute=max(1, _int("AIFACTORY_OPENAI_REQUESTS_PER_MINUTE", 50)),
         allowed_emails=tuple(e.strip().lower() for e in os.environ.get("AIFACTORY_ALLOWED_EMAILS", "").split(",") if e.strip()),
         allowed_org_ids=tuple(o.strip() for o in os.environ.get("AIFACTORY_ALLOWED_ORG_IDS", "").split(",") if o.strip()),
     )

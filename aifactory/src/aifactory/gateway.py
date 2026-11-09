@@ -13,12 +13,14 @@ import json
 from dataclasses import dataclass
 from datetime import timedelta
 
+import anyio
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .db import session_scope, utcnow
 from .inference import BudgetExceeded, ProviderConfig, UsageLedger, extract_usage
+from .inference_limits import acquire
 from .models import RunToken
 from .security import new_token, token_hash
 
@@ -111,35 +113,61 @@ async def proxy(path: str, request: Request):
     payload = json.dumps(body).encode()
     for attempt in range(3):
         client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0))
-        upstream_request = client.build_request("POST", url, headers=headers, content=payload)
-        upstream = await client.send(upstream_request, stream=True)
-        if upstream.status_code == 429 and upstream.headers.get("x-should-retry", "").lower() != "false" and attempt < 2:
-            retry_after = upstream.headers.get("retry-after", "5")
-            await upstream.aclose()
-            await client.aclose()
-            await asyncio.sleep(min(20.0, float(retry_after) if retry_after.replace(".", "").isdigit() else 5.0))
-            continue
-        break
-    if upstream.status_code >= 400:
-        detail = (await upstream.aread()).decode(errors="replace")[:800]
-        await upstream.aclose()
-        await client.aclose()
-        status = upstream.status_code
-        code = {401: "credential_refused", 402: "wallet_empty", 403: "permission_denied", 404: "model_not_found",
-                429: "rate_limited"}.get(status, "upstream_error")
-        return _error(400 if status in (401, 402, 403, 404, 429) else 502, code,
-                      f"Provider returned {status}: {detail}")
+        upstream = None
+        permit = None
+        cleaned = False
 
-    if not stream:
-        data = await upstream.aread()
-        await upstream.aclose()
-        await client.aclose()
+        async def cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            # Starlette cancels the relay's AnyIO scope on disconnect. Shield resource
+            # cleanup, and release even if either upstream close itself raises.
+            with anyio.CancelScope(shield=True):
+                try:
+                    if upstream is not None:
+                        await upstream.aclose()
+                finally:
+                    try:
+                        await client.aclose()
+                    finally:
+                        if permit is not None:
+                            permit.release()
+
         try:
-            parsed = json.loads(data)
-        except json.JSONDecodeError:
-            parsed = {}
-        grant.ledger.add(grant.model, extract_usage(parsed))
-        return JSONResponse(parsed, status_code=200)
+            upstream_request = client.build_request("POST", url, headers=headers, content=payload)
+            permit = await acquire(grant.provider, grant.run_id)
+            upstream = await client.send(upstream_request, stream=True)
+            retry = (upstream.status_code == 429
+                     and upstream.headers.get("x-should-retry", "").lower() != "false" and attempt < 2)
+            if retry:
+                retry_after = upstream.headers.get("retry-after", "5")
+            elif upstream.status_code >= 400:
+                detail = (await upstream.aread()).decode(errors="replace")[:800]
+                status = upstream.status_code
+                code = {401: "credential_refused", 402: "wallet_empty", 403: "permission_denied", 404: "model_not_found",
+                        429: "rate_limited"}.get(status, "upstream_error")
+                return _error(400 if status in (401, 402, 403, 404, 429) else 502, code,
+                              f"Provider returned {status}: {detail}")
+            elif not stream:
+                data = await upstream.aread()
+                try:
+                    parsed = json.loads(data)
+                except json.JSONDecodeError:
+                    parsed = {}
+                grant.ledger.add(grant.model, extract_usage(parsed))
+                return JSONResponse(parsed, status_code=200)
+            else:
+                break  # Transfer the permit and upstream ownership to the response.
+        except BaseException:
+            await cleanup()
+            raise
+        finally:
+            if upstream is not None and (upstream.status_code >= 400 or not stream):
+                await cleanup()
+        # No concurrency permit is held during upstream retry backoff.
+        await asyncio.sleep(min(20.0, float(retry_after) if retry_after.replace(".", "").isdigit() else 5.0))
 
     async def relay():
         usage = None
@@ -158,8 +186,22 @@ async def proxy(path: str, request: Request):
                         except json.JSONDecodeError:
                             pass
         finally:
-            await upstream.aclose()
-            await client.aclose()
-            grant.ledger.add(grant.model, usage)
+            try:
+                await cleanup()
+            finally:
+                grant.ledger.add(grant.model, usage)
 
-    return StreamingResponse(relay(), media_type=upstream.headers.get("content-type", "text/event-stream"))
+    class GatewayStream(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                # Close a suspended iterator on downstream send failure as well.
+                # Also covers disconnect before the iterator is ever started.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await self.body_iterator.aclose()
+                    finally:
+                        await cleanup()
+
+    return GatewayStream(relay(), media_type=upstream.headers.get("content-type", "text/event-stream"))

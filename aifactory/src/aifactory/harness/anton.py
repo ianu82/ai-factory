@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..inference import BudgetExceeded
+from ..inference_limits import admission
 from .anton_tools import replace_session_tools
 from .anton_web import sandbox_web_tools
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
@@ -43,6 +44,31 @@ def _usage(response: Any) -> tuple[int, int] | None:
     if isinstance(inp, int) and isinstance(out, int):
         return inp, out
     return None
+
+
+class _AdmittedResponses:
+    """Keep SDK compatibility retries inside the hook individually admitted."""
+
+    def __init__(self, responses, config, run_id):
+        self.responses = responses
+        self.config = config
+        self.run_id = run_id
+
+    def __getattr__(self, name):
+        return getattr(self.responses, name)
+
+    async def create(self, **body):
+        async with admission(self.config, self.run_id):
+            return await self.responses.create(**body)
+
+
+async def _create_admitted_response(config, run_id, create, provider, body):
+    # The SDK hook can send again directly when an optional parameter is refused.
+    # Wrap its resource, not the whole hook, so every actual send is admitted and
+    # recursive hook retries never hold a permit while waiting for another one.
+    if not isinstance(provider._client.responses, _AdmittedResponses):
+        provider._client.responses = _AdmittedResponses(provider._client.responses, config, run_id)
+    return await create(provider, body)
 
 
 class AntonHarness:
@@ -85,7 +111,8 @@ class AntonHarness:
                     state["error"] = str(exc)
                     raise _Stop() from exc
                 state["calls"] += 1
-                response = await OpenAIProvider._create_response(provider, body)
+                response = await _create_admitted_response(
+                    provider_cfg, session.run_id, OpenAIProvider._create_response, provider, body)
                 session.ledger.add(session.model, _usage(response))
                 return response
 
@@ -139,7 +166,7 @@ class AntonHarness:
                             flavor=OpenAIProvider.FLAVOR_OPENAI, reasoning_effort=session.reasoning_effort)
         try:
             provider._client._client.follow_redirects = False
-            provider._client = provider._client.with_options(default_headers=provider_cfg.headers(session.run_id) | {
+            provider._client = provider._client.with_options(max_retries=0, default_headers=provider_cfg.headers(session.run_id) | {
                 "Authorization": f"Bearer {provider_cfg.api_key}"})
         except AttributeError:
             pass

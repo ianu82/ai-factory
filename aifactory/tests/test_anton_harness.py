@@ -14,6 +14,7 @@ anton = pytest.importorskip("anton.core.session")
 
 from fastapi import FastAPI, Request  # noqa: E402
 
+from aifactory.inference_limits import provider_guard  # noqa: E402
 from aifactory.harness.anton import AntonHarness  # noqa: E402
 from aifactory.harness.base import HarnessSession  # noqa: E402
 from aifactory.harness.schemas import BUILDER_REPORT  # noqa: E402
@@ -103,6 +104,9 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     assert result.report == {"status": "done", "summary": "Wrote hello.txt"}
     assert (sb.work / "hello.txt").read_text() == "hi from anton\n"
     assert ledger.input_tokens >= 200 and ledger.calls >= 2
+    guard = provider_guard(provider)
+    assert guard.active == 0
+    assert len(guard._sends) == len(requests)
     tool_names = {t.get("name") for t in requests[0].get("tools", [])}
     assert {"write_file", "finish", "run", "read_image"} <= tool_names
     assert "scratchpad" not in tool_names
