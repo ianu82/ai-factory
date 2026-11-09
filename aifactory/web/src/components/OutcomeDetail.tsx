@@ -10,6 +10,8 @@ import { DecisionCard } from "./DecisionCard";
 import { TaskCard } from "./TaskCard";
 import { LinearIssueLink } from "./LinearIssueLink";
 
+import { OutcomeAttachments } from "./Attachments";
+
 const QUIET = new Set(["agent_thought", "agent_tool"]);
 
 export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcomeId: string; onClose: () => void; focusDecisionId?: string }) {
@@ -91,6 +93,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
 
       <section className="p-sec">
         <h3>Request</h3>
+        <OutcomeAttachments workspaceId={ws.id} outcomeId={outcome.id} attachments={q.data.attachments || []} />
         {outcome.brief ? <Prose text={outcome.brief} /> : <span className="faint">No description</span>}
         {outcome.acceptance.length > 0 && (
           <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--body)" }}>
