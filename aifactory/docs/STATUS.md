@@ -75,7 +75,7 @@ Platform fixes made along the way: verifier VMs failed three tests even on main 
 the Codex CLI tests), fixed in #247; rebuilds after a parallel merge no longer exhaust the attempt budget (#202);
 PRs merged or closed on GitHub are reconciled (#230); live updates recover after deploys (#230).
 
-### Factory-built PRs merged overnight (times UTC)
+### Factory-built PRs merged overnight (8–9 November, times UTC)
 
 None of these is unattended. "Assisted" means the operator acted under Ian's delegation: sending reviewer
 findings back as "Request changes", retrying exhausted attempts with guidance, or approving the merge that this
@@ -83,6 +83,7 @@ repository's policy reserves for a person.
 
 | PR | Factory task | What the operator did | Classification |
 | --- | --- | --- | --- |
+| #212 (21:13) | #13 T1 onboarding progress and readiness | Merge approval given as a delegated decision after verification, CI and the reviewer bot were clean; smoke passed | Assisted (merge approval only) |
 | #237 (23:38) | #17 T3 attributed memory | One round of review findings; merged once the revision fixed them | Assisted |
 | #218 (00:17) | #14 T1 Linear client, encrypted credential | One review round; one retry after environment-caused failures; the branch auto-rebased after a parallel merge | Assisted |
 | #214 (00:17) | #12 T2 benchmark suites | Two review rounds; auto-rebased | Assisted |
