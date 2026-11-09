@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from . import attachments as A
@@ -31,6 +31,7 @@ from .models import (Artifact, Decision, Event, Membership, Message, Organizatio
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+from .review import review_policy, validate_review
 from .repo_detect import detect
 from .sandbox import isolation_available
 from .security import decrypt, encrypt, mask, redact
@@ -110,7 +111,12 @@ class WorkspaceUpdate(BaseModel):
 
 
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        review = review_policy(raw)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     merged = merged_settings(raw)
+    merged["review"] = review
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -145,7 +151,13 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
         # earns server fallback credentials); people can never set or clear them through the API.
         patch = {k: v for k, v in body.settings.items() if not str(k).startswith("_")}
         before = merged_settings(ws.settings)
-        ws.settings = _clean_settings({**before, **patch})
+        updated = {**before, **patch}
+        if "review" in patch:
+            try:
+                updated["review"] = {**before["review"], **validate_review(patch["review"])}
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+        ws.settings = _clean_settings(updated)
         changes = {k: ws.settings[k] for k in patch if before.get(k) != ws.settings.get(k)}
     if body.paused is not None:
         ws.paused = body.paused
@@ -426,10 +438,16 @@ class RepoReleaseSelection(BaseModel):
 
 
 class RepoCommands(BaseModel):
+    review: dict[str, Any] | None = None
     setup: list[str] | None = None
     checks: list[str] | None = None
     qa: RepoQACommands | None = None
     release: RepoReleaseSelection | None = None
+
+    @field_validator("review")
+    @classmethod
+    def valid_review(cls, value):
+        return validate_review(value)
 
 
 class RepoConnect(BaseModel):
@@ -470,6 +488,11 @@ async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depend
 
 def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(current)
+    if "review" in patch:
+        try:
+            cfg["review"] = {**(current.get("review") or {}), **validate_review(patch["review"])}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
     for key in ("setup", "checks", "smoke", "protected_paths"):
         if key in patch:
             cfg[key] = [str(x).strip() for x in patch[key] or [] if str(x).strip()]

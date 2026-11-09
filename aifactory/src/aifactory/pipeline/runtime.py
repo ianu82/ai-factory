@@ -16,9 +16,11 @@ from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
 from ..models import Decision, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
+from ..review import DEFAULT_REVIEW
 from .attachments import prepare_attachments
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "review": DEFAULT_REVIEW,
     "provider": "mindshub",
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},

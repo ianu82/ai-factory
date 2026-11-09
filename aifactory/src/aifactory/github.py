@@ -278,6 +278,123 @@ class GitHub:
     async def comment(self, full_name: str, number: int, body: str) -> None:
         await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body})
 
+    async def _review_pages(self, path: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = await self.request("GET", path, params={"per_page": 100, "page": page})
+            if not isinstance(batch, list):
+                raise GitHubError("Malformed GitHub review response")
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+            page += 1
+
+    async def reviews(self, full_name: str, number: int) -> list[dict[str, Any]]:
+        return await self._review_pages(f"/repos/{full_name}/pulls/{number}/reviews")
+
+    async def issue_comments(self, full_name: str, number: int) -> list[dict[str, Any]]:
+        return await self._review_pages(f"/repos/{full_name}/issues/{number}/comments")
+
+    async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        response = await self.request("POST", "/graphql", json={"query": query, "variables": variables})
+        # Partial data MUST NOT be used to decide that feedback is clean.
+        if not isinstance(response, dict) or response.get("errors") or not isinstance(response.get("data"), dict):
+            raise GitHubError("GitHub GraphQL returned errors or missing data")
+        return response["data"]
+
+    async def review_threads(self, full_name: str, number: int) -> list[dict[str, Any]]:
+        owner, name = full_name.split("/", 1)
+        comment_fields = """id fullDatabaseId databaseId body url createdAt updatedAt path line originalLine diffHunk
+            author { login __typename } pullRequestReview { fullDatabaseId databaseId state }
+            replyTo { fullDatabaseId databaseId }"""
+        connection = "pageInfo { hasNextPage endCursor }"
+        query = """query($owner:String!, $name:String!, $number:Int!, $after:String) {
+            repository(owner:$owner, name:$name) { pullRequest(number:$number) {
+                reviewThreads(first:100, after:$after) { nodes {
+                    id isResolved path line originalLine
+                    comments(first:100) { nodes { %s } %s }
+                } %s }
+            } }
+        }""" % (comment_fields, connection, connection)
+        nested_query = """query($id:ID!, $after:String) {
+            node(id:$id) { ... on PullRequestReviewThread {
+                comments(first:100, after:$after) { nodes { %s } %s }
+            } }
+        }""" % (comment_fields, connection)
+
+        def page_info(value: Any) -> tuple[list, str | None]:
+            if not isinstance(value, dict) or not isinstance(value.get("nodes"), list):
+                raise GitHubError("Incomplete GitHub review connection")
+            info = value.get("pageInfo") or {}
+            if type(info.get("hasNextPage")) is not bool or any(not isinstance(n, dict) for n in value["nodes"]):
+                raise GitHubError("Incomplete GitHub review page")
+            cursor = info.get("endCursor") if info["hasNextPage"] else None
+            if info["hasNextPage"] and not cursor:
+                raise GitHubError("Missing GitHub review page cursor")
+            return value["nodes"], cursor
+
+        threads: list[dict[str, Any]] = []
+        after = None
+        seen = set()
+        while True:
+            data = await self.graphql(query, {"owner": owner, "name": name, "number": number, "after": after})
+            pull = ((data.get("repository") or {}).get("pullRequest") or {})
+            nodes, cursor = page_info(pull.get("reviewThreads"))
+            for thread in nodes:
+                if not thread.get("id") or type(thread.get("isResolved")) is not bool:
+                    raise GitHubError("Incomplete GitHub review thread")
+                comments, comment_cursor = page_info(thread.get("comments"))
+                comments = list(comments)
+                comment_seen = set()
+                while comment_cursor:
+                    if comment_cursor in comment_seen:
+                        raise GitHubError("Repeated GitHub review comment cursor")
+                    comment_seen.add(comment_cursor)
+                    more = await self.graphql(nested_query, {"id": thread["id"], "after": comment_cursor})
+                    batch, comment_cursor = page_info((more.get("node") or {}).get("comments"))
+                    comments.extend(batch)
+                thread = {**thread, "comments": {"nodes": comments}}
+                threads.append(thread)
+            if cursor is None:
+                return threads
+            if cursor in seen:
+                raise GitHubError("Repeated GitHub review thread cursor")
+            seen.add(cursor)
+            after = cursor
+
+    async def reply_review_comment(self, full_name: str, number: int, comment_id: str | int,
+                                   body: str) -> dict[str, Any]:
+        from .review import FACTORY_REPLY_MARKER
+
+        return await self.request("POST", f"/repos/{full_name}/pulls/{number}/comments/{comment_id}/replies",
+                                  json={"body": f"{body}\n\n{FACTORY_REPLY_MARKER}"}, retries=0)
+
+    async def resolve_review_thread(self, thread_id: str) -> dict[str, Any]:
+        data = await self.graphql("""mutation($id:ID!) {
+            resolveReviewThread(input:{threadId:$id}) { thread { id isResolved } }
+        }""", {"id": thread_id})
+        thread = (data.get("resolveReviewThread") or {}).get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id or thread.get("isResolved") is not True:
+            raise GitHubError("GitHub did not confirm review thread resolution")
+        return thread
+
+    async def review_feedback(self, full_name: str, number: int, policy: dict) -> list[dict[str, Any]]:
+        """Collect a complete authenticated snapshot; never swallow provider errors."""
+        from .review import normalize_feedback, review_policy
+
+        policy = review_policy({"review": policy})
+        if policy["address"] == "off":
+            return []
+        identity = await self.user()
+        pull = await self.pull(full_name, number)
+        if not identity.get("login") or not (pull.get("user") or {}).get("login"):
+            raise GitHubError("GitHub review identity is unavailable")
+        return normalize_feedback(reviews=await self.reviews(full_name, number),
+                                  threads=await self.review_threads(full_name, number),
+                                  comments=await self.issue_comments(full_name, number),
+                                  policy=policy, identity=identity, pull_author=pull["user"])
+
     async def _actions_checks(self, full_name: str, sha: str) -> list[dict[str, Any]]:
         """Fine-grained tokens often lack the Checks permission; Actions read covers workflow jobs."""
         runs = await self.request("GET", f"/repos/{full_name}/actions/runs", params={"head_sha": sha, "per_page": 50})
