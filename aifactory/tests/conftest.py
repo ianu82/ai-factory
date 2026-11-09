@@ -23,9 +23,10 @@ def isolated_env(tmp_path, monkeypatch):
     for key in ("AIFACTORY_BOOTSTRAP_OPENAI_API_KEY", "AIFACTORY_BOOTSTRAP_MINDSHUB_API_KEY",
                 "AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(key, raising=False)
-    from aifactory import config, db, security
+    from aifactory import config, db, fallbacks, security
 
     config.reset_settings_cache()
+    fallbacks.set_bootstrap_workspace(None)  # server credentials serve only a bootstrap workspace a test declares
     security.reset_crypto_cache()
     if shared:
         from aifactory.models import Base

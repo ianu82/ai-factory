@@ -56,22 +56,41 @@ def _changed(applied: dict[str, str], key: str, value) -> bool:
     return True
 
 
+BOOTSTRAP_MARKER = "_bootstrap_workspace"
+
+
 def apply_bootstrap() -> str | None:
+    from .fallbacks import set_bootstrap_workspace
+
+    set_bootstrap_workspace(None)
     cfg = bootstrap_config()
     if not cfg:
         return None
     with session_scope() as s:
-        org = s.query(Organization).filter(Organization.name == cfg.get("organization", "Factory")).first()
-        if org is None:
-            org = Organization(name=cfg.get("organization", "Factory"))
-            s.add(org)
-            s.flush()
-        ws = s.query(Workspace).filter(Workspace.org_id == org.id, Workspace.name == cfg.get("workspace", "Factory")).first()
+        # The managed workspace carries a marker in its settings (the API strips "_" keys), found first and in
+        # any organization: renaming the workspace in the app, or its organization through MindsHub sign-in,
+        # keeps it. Without one, the first startup adopts the oldest workspace of the configured name in the
+        # configured organization; a later namesake never takes over its configuration or credentials.
+        ws = next((w for w in s.query(Workspace).order_by(Workspace.created_at, Workspace.id)
+                   if (w.settings or {}).get(BOOTSTRAP_MARKER) is True), None)
         if ws is None:
-            ws = Workspace(org_id=org.id, name=cfg.get("workspace", "Factory"), slug="default",
-                           settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
-            s.add(ws)
-            s.flush()
+            org = s.query(Organization).filter(Organization.name == cfg.get("organization", "Factory")).first()
+            if org is None:
+                org = Organization(name=cfg.get("organization", "Factory"))
+                s.add(org)
+                s.flush()
+            in_org = (s.query(Workspace).filter(Workspace.org_id == org.id)
+                      .order_by(Workspace.created_at, Workspace.id).all())
+            ws = next((w for w in in_org if w.name == cfg.get("workspace", "Factory")), None)
+            if ws is None:
+                taken = {w.slug for w in in_org}  # sign-in may already have made this org's "default" workspace
+                slug = next(c for c in ("default", "factory", *(f"factory-{n}" for n in range(2, 1000)))
+                            if c not in taken)
+                ws = Workspace(org_id=org.id, name=cfg.get("workspace", "Factory"), slug=slug,
+                               settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
+                s.add(ws)
+                s.flush()
+        set_bootstrap_workspace(ws.id)
         settings = merged_settings(ws.settings)
         overrides = cfg.get("settings") or {}
         applied = dict(settings.get("_bootstrap") or {})
@@ -79,6 +98,7 @@ def apply_bootstrap() -> str | None:
             if _changed(applied, key, value):  # otherwise keep what people set in the app since
                 settings[key] = {**settings.get(key, {}), **value} if isinstance(value, dict) else value
         settings["_bootstrap"] = applied
+        settings[BOOTSTRAP_MARKER] = True
         settings["invites"] = {**(settings.get("invites") or {}),
                                **{e.lower(): "owner" for e in cfg.get("admins", [])}}
         ws.settings = settings

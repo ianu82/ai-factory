@@ -422,6 +422,8 @@ def apply(db: Session, sig: Signal, user: User, *, note: str | None = None) -> s
         settings = dict(ws.settings or {})
         for path, value in (action.get("set") or {}).items():
             section, _, leaf = path.partition(".")
+            if section.startswith("_"):  # the operator bootstrap's bookkeeping is never a proposal target
+                continue
             settings[section] = {**(settings.get(section) or {}), leaf: value} if leaf else value
         ws.settings = settings
         summary = ", ".join(f"{k} → {v}" for k, v in (action.get("set") or {}).items())

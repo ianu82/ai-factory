@@ -198,6 +198,9 @@ def test_bootstrap_compatibility_is_not_reported_as_validated(client, signed_in,
     monkeypatch.setenv("AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", "bootstrap-github-secret")
     config.reset_settings_cache()
     ws_id = signed_in["workspaces"][0]["id"]
+    from aifactory.fallbacks import set_bootstrap_workspace
+
+    set_bootstrap_workspace(ws_id)  # server credentials apply to the operator's bootstrap workspace only
     with db.session_scope() as s:
         s.add(Repository(workspace_id=ws_id, full_name="acme/bootstrap"))
     result = client.get(url(signed_in))

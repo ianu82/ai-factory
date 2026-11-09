@@ -327,6 +327,9 @@ def test_model_check_bootstrap_override_matches_runtime(client, signed_in, monke
     monkeypatch.setenv("AIFACTORY_BOOTSTRAP_OPENAI_MODEL", "bootstrap-model")
     reset_settings_cache()
     ws_id = signed_in["workspaces"][0]["id"]
+    from aifactory.fallbacks import set_bootstrap_workspace
+
+    set_bootstrap_workspace(ws_id)  # server credentials apply to the operator's bootstrap workspace only
     client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"models": {
         "planner": "a", "builder": "b", "verifier": "c"}}})
     seen = []
