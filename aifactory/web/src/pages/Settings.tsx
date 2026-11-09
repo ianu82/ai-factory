@@ -77,8 +77,8 @@ function Policies() {
   const save = useSaveSettings();
   const s = ws.settings;
   const admin = ws.role === "owner" || ws.role === "admin";
-  const [nums, setNums] = useState({ concurrency: s.concurrency, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd });
-  useEffect(() => setNums({ concurrency: s.concurrency, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd }), [s]);
+  const [nums, setNums] = useState({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd });
+  useEffect(() => setNums({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd }), [s]);
   const autonomy = (key: keyof Settings["autonomy"], v: "auto" | "approval") => save({ autonomy: { ...s.autonomy, [key]: v } });
   return (
     <>
@@ -97,12 +97,13 @@ function Policies() {
         <p>Independent tasks run side by side up to the concurrency limit. Merges into the same repository are serialized and revalidated against the latest main.</p>
         <div className="s-grid">
           <label className="field"><span>Tasks in parallel</span><input className="input num" type="number" min={1} max={50} value={nums.concurrency} disabled={!admin} onChange={(e) => setNums({ ...nums, concurrency: Number(e.target.value) })} /><span className="hint">1–50</span></label>
+          <label className="field"><span>Plans in parallel</span><input className="input num" type="number" min={1} max={50} step={1} value={nums.planning_concurrency} disabled={!admin} onChange={(e) => setNums({ ...nums, planning_concurrency: Number(e.target.value) })} /><span className="hint">1–50 · default 2 per workspace; also bounded by the Factory-wide limit</span></label>
           <label className="field"><span>Attempts per task</span><input className="input num" type="number" min={1} max={8} value={nums.max_attempts} disabled={!admin} onChange={(e) => setNums({ ...nums, max_attempts: Number(e.target.value) })} /><span className="hint">Failed checks or verification feed the next attempt</span></label>
           <label className="field"><span>Automatic retry rounds</span><input className="input num" type="number" min={0} max={3} value={nums.auto_retry_rounds} disabled={!admin} onChange={(e) => setNums({ ...nums, auto_retry_rounds: Number(e.target.value) })} /><span className="hint">When attempts run out on concrete findings, start a fresh set before asking you (0–3)</span></label>
           <label className="field"><span>Budget per agent session (USD)</span><input className="input num" type="number" min={0.5} step={0.5} value={nums.run_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, run_usd: Number(e.target.value) })} /></label>
           <label className="field"><span>Budget per outcome (USD)</span><input className="input num" type="number" min={1} step={1} value={nums.outcome_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, outcome_usd: Number(e.target.value) })} /><span className="hint">Work pauses for a decision when reached</span></label>
         </div>
-        {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, max_attempts: nums.max_attempts, auto_retry_rounds: nums.auto_retry_rounds, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
+        {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, planning_concurrency: nums.planning_concurrency, max_attempts: nums.max_attempts, auto_retry_rounds: nums.auto_retry_rounds, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
       </section>
     </>
   );
@@ -419,14 +420,15 @@ const lines = (xs?: string[]) => (xs || []).join("\n");
 const unlines = (s: string) => s.split("\n").map((x) => x.trim()).filter(Boolean);
 
 function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
-  const { ws } = useWs();
+  const { ws, meta } = useWs();
+  const supportsReverify = meta.capabilities?.reverify === true;
   const qc = useQueryClient();
   const toast = useToast();
   const [open, setOpen] = useState(false);
   const c = repo.config;
   const [form, setForm] = useState({
     setup: lines(c.setup), checks: lines(c.checks), smoke: lines(c.smoke), protected_paths: lines(c.protected_paths),
-    context: c.context || "", merge_mode: c.merge?.mode || "", method: c.merge?.method || "squash",
+    context: c.context || "", merge_mode: c.merge?.mode || "", method: c.merge?.method || "squash", reverify: c.merge?.reverify ?? "overlap",
     health_url: c.release?.health_url || "", release_mode: c.release?.mode || "", require_ci: !!c.require_ci,
   });
   const save = async () => {
@@ -434,8 +436,8 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
       await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "PATCH", json: { config: {
         setup: unlines(form.setup), checks: unlines(form.checks), smoke: unlines(form.smoke), protected_paths: unlines(form.protected_paths),
         context: form.context, require_ci: form.require_ci,
-        merge: { mode: form.merge_mode || undefined, method: form.method, revalidate: true },
-        release: { mode: form.release_mode || undefined, health_url: form.health_url || undefined },
+        merge: { ...c.merge, mode: form.merge_mode || undefined, method: form.method, ...(supportsReverify ? { reverify: form.reverify } : {}) },
+        release: { ...c.release, mode: form.release_mode || undefined, health_url: form.health_url || undefined },
       } } });
       toast("Repository saved");
       await Promise.all([
@@ -486,6 +488,10 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
               <select className="select" value={form.method} disabled={!admin} onChange={(e) => setForm({ ...form, method: e.target.value })}>
                 <option value="squash">Squash</option><option value="merge">Merge commit</option><option value="rebase">Rebase</option>
               </select></label>
+            {supportsReverify && <label className="field"><span>Independent review after rebase</span>
+              <select className="select" value={form.reverify} disabled={!admin} onChange={(e) => setForm({ ...form, reverify: e.target.value as "overlap" | "always" | "never" })}>
+                <option value="overlap">When changes overlap (default)</option><option value="always">Always</option><option value="never">Never</option>
+              </select><span className="hint">Overlap: review again when main changed the same files or directories. Always: review every rebased candidate. Never: skip independent re-review. Review includes runtime QA when configured; checks and required CI still rerun.</span></label>}
             <label className="field"><span>Releases</span>
               <select className="select" value={form.release_mode} disabled={!admin} onChange={(e) => setForm({ ...form, release_mode: e.target.value })}>
                 <option value="">Not managed by the Factory</option><option value="on_merge">Deploys when main changes</option>

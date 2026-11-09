@@ -104,6 +104,7 @@ export interface Settings {
   models: { default?: string; planner?: string; builder?: string; verifier?: string };
   harness: { builder: string; verifier: string; planner: string };
   concurrency: number;
+  planning_concurrency?: number;
   max_attempts: number;
   auto_retry_rounds?: number;
   autonomy: { plan: "auto" | "approval"; merge: "auto" | "approval"; release: "auto" | "approval" };
@@ -141,6 +142,7 @@ export interface Me {
 }
 
 export interface Meta {
+  capabilities?: { reverify?: boolean };
   auth: { oidc: boolean; api_key: boolean; dev: boolean };
   harnesses: { name: string; label: string; available: boolean; detail: string }[];
   sandbox: { isolation: string };
@@ -161,7 +163,7 @@ export interface Repo {
     detected?: string[];
     qa?: { start?: string; [key: string]: unknown };
     start_detection?: { available: boolean; reason: string };
-    merge?: { mode?: string; method?: string; revalidate?: boolean };
+    merge?: { mode?: string; method?: string; revalidate?: boolean; reverify?: "overlap" | "always" | "never" };
     release?: { mode?: string; health_url?: string; expect_text?: string };
     require_ci?: boolean;
   };

@@ -8,8 +8,12 @@ import { DiffView, GateTrack, Mark, Prose, Status, useToast } from "../ui";
 
 const STAGE_TEXT: Record<string, string> = {
   prepare: "Preparing a fresh checkout", build: "Building", revise: "Revising", checks: "Running checks",
-  verify: "Independent verification", publish: "Publishing", ci: "Waiting for CI", merge: "Merging", smoke: "Smoke testing",
-  release: "Watching the release", done: "Done",
+  verify: "Independent verification", publish: "Publishing", ci: "Checking CI", merge: "Merging", smoke: "Smoke testing",
+  ci_repair: "Repairing CI", revalidate: "Revalidating after rebase", revalidate_prepare: "Preparing revalidation",
+  revalidate_setup: "Setting up the rebased candidate", revalidate_checks: "Checking the rebased candidate",
+  revalidate_verify: "Independent review after rebase",
+  reverify: "Independent review after rebase", revalidate_publish: "Publishing the rebased candidate",
+  release: "Watching the release", revert: "Reverting the merge", done: "Done",
 };
 
 export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs: Run[]; defaultOpen?: boolean }) {
@@ -34,12 +38,13 @@ export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs
         <GateTrack task={task} large />
         <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 12.5, alignItems: "center", flexWrap: "wrap" }}>
           <Status status={task.status} kind="task" label={label} />
+          {task.status === "waiting_ci" && <span className="muted">Not holding a task slot</span>}
           <span className="muted">{task.repo}</span>
           {task.attempt > 0 && <span className="muted">attempt {task.attempt}</span>}
           <span className="muted num">{money(task.cost_usd, task.cost_known)}</span>
           {task.depends_on.length > 0 && task.status === "pending" && <span className="muted">after {task.depends_on.join(", ")}</span>}
         </div>
-        {task.blocked_reason && task.status !== "completed" && (
+        {task.blocked_reason && task.status !== "completed" && task.status !== "waiting_ci" && (
           <div className="prose clamp" style={{ marginTop: 8, fontSize: 12.5, color: "var(--bad)" }}>{task.blocked_reason}</div>
         )}
       </div>
@@ -121,9 +126,9 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
           <>
             <dt>CI</dt>
             <dd>
-              {task.evidence.ci.state === "none" ? "No CI checks reported for this repository" : task.evidence.ci.state}
+              {task.status === "waiting_ci" ? "pending" : task.evidence.ci.state === "none" ? "No CI checks reported for this repository" : task.evidence.ci.state}
               {(task.evidence.ci.checks || []).map((c) => (
-                <div key={c.name} className="checkline"><Mark status={c.conclusion === "success" ? "pass" : c.conclusion ? "fail" : "none"} />
+                <div key={c.name} className="checkline"><Mark status={task.status === "waiting_ci" ? "none" : c.conclusion === "success" ? "pass" : c.conclusion ? "fail" : "none"} />
                   {c.url ? <a className="linkish" href={c.url} target="_blank" rel="noreferrer">{c.name} <ExternalLink /></a> : c.name}</div>
               ))}
             </dd>
