@@ -7,6 +7,9 @@ import { ONBOARDING_STEPS, onboardingQueryKey, patchOnboarding, type OnboardingA
 import { deferMember, STEP_LABELS, useOnboarding } from "./state";
 import { ModelStep } from "./ModelStep";
 import { GitHubStep } from "./GitHubStep";
+import { AutonomyStep } from "./AutonomyStep";
+import { TeamStep } from "./TeamStep";
+import { FirstOutcomeStep } from "./FirstOutcomeStep";
 import { RepositoryStep } from "./RepositoryStep";
 
 export function Onboarding() {
@@ -88,11 +91,12 @@ export function Onboarding() {
                 onNavigate={(next) => save({ action: "navigate", step: next })}
                 onComplete={save} onDefer={leave} /> : step === "repositories" ? <RepositoryStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
                 onNavigate={(next) => save({ action: "navigate", step: next })}
-                onComplete={save} onDefer={leave} /> : <section className="onboarding-unavailable" aria-label="Step availability">
-                <h2>This step is not available yet</h2>
-                <p>The guided {STEP_LABELS[progress.data.current_step]} component has not landed yet. Continuing only changes your place; it does not complete this step or change workspace configuration.</p>
-                <p>You can leave for now and return here when it is available. Existing Settings remain accessible in the normal app.</p>
-              </section>}
+                onComplete={save} onDefer={leave} /> : step === "autonomy" ? <AutonomyStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
+                onNavigate={(next) => save({ action: "navigate", step: next })} onComplete={save} onDefer={leave} />
+                : step === "team" ? <TeamStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
+                onNavigate={(next) => save({ action: "navigate", step: next })} onComplete={save} onDefer={leave} />
+                : <FirstOutcomeStep key={ws.id} workspace={ws} progress={progress.data} readOnly={!admin}
+                onNavigate={(next) => save({ action: "navigate", step: next })} onComplete={save} onDefer={leave} />}
             </> : <>
               <h1 ref={heading} tabIndex={-1}>An admin needs to finish workspace setup</h1>
               <p>Your {ws.role} role can view setup progress, but only an owner or admin can configure this workspace. Ask a workspace admin to finish the steps below.</p>
@@ -108,7 +112,7 @@ export function Onboarding() {
           <footer className="onboarding-actions">
             {admin && progress.data ? <>
               <button className="btn" disabled={busy || index === 0} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index - 1] }))}>Back</button>
-              {step !== "models" && step !== "github" && step !== "repositories" && <button className="btn primary" disabled={busy || index === ONBOARDING_STEPS.length - 1} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index + 1] }))}>Continue</button>}
+
             </> : <span className="muted">Workspace setup · read-only</span>}
           </footer>
         </main>

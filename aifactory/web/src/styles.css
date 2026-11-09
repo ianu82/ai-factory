@@ -605,3 +605,15 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
 .attachment-full { display: block; max-width: 100%; max-height: 70vh; object-fit: contain; margin: 0 auto 12px; }
 .attachment-open:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
 @media (max-width: 600px) { .attachment-actions { align-items: flex-start; flex-direction: column; } }
+
+/* Guided setup uses the same controls and tokens as Settings. */
+.onboarding-content fieldset { min-width: 0; margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--r); }
+.onboarding-policy { display: flex; align-items: flex-start; gap: 12px; margin: 16px 0; cursor: pointer; }
+.onboarding-policy input { flex: 0 0 auto; margin-top: 4px; }
+.onboarding-policy small { display: block; color: var(--muted); }
+.onboarding-content .mono, .onboarding-content .s-line { overflow-wrap: anywhere; }
+.onboarding-content .s-line { flex-wrap: wrap; gap: 12px; }
+.onboarding-content .s-line .field { max-width: 100%; }
+.onboarding-content .input, .onboarding-content .select, .onboarding-content .textarea { max-width: 100%; }
+.onboarding-examples, .onboarding-recovery { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.onboarding-examples .btn { white-space: normal; text-align: left; overflow-wrap: anywhere; }
