@@ -117,6 +117,8 @@ class VMBridge:
         self.proc: asyncio.subprocess.Process | None = None
         self.pending: dict[int, asyncio.Future] = {}
         self.exits: dict[str, asyncio.Future] = {}
+        # Exit events that arrive before anyone watches them (a process that ends right after it starts).
+        self.unclaimed: dict[str, dict] = {}
         self.next_id = 0
         self.lock = asyncio.Lock()
         self.reader: asyncio.Task | None = None
@@ -156,6 +158,10 @@ class VMBridge:
                     fut = self.exits.pop(message["proc"])
                     if not fut.done():
                         fut.set_result(message)
+                elif message["event"] == "exit" and message.get("proc"):
+                    self.unclaimed[message["proc"]] = message
+                    while len(self.unclaimed) > 256:  # bounded: unwatched processes must not accumulate
+                        self.unclaimed.pop(next(iter(self.unclaimed)))
                 continue
             fut = self.pending.pop(message.get("id"), None)
             if fut and not fut.done():
@@ -184,7 +190,10 @@ class VMBridge:
 
     def watch_exit(self, proc: str) -> asyncio.Future:
         fut = asyncio.get_running_loop().create_future()
-        self.exits[proc] = fut
+        if proc in self.unclaimed:  # it already ended before the caller started watching
+            fut.set_result(self.unclaimed.pop(proc))
+        else:
+            self.exits[proc] = fut
         return fut
 
 

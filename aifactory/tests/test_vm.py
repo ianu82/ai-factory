@@ -368,6 +368,32 @@ def test_exec_retries_only_calls_that_never_started(tmp_path, monkeypatch):
         with pytest.raises(SandboxError, match="after the command started"):
             await vm.exec("cat app.txt")
         assert not bridge.failures
+        # The bridge rejects a spawn whose exec never started (it waits for the start), so it is retried too.
+        bridge.failures = [unstarted]
+        process = await vm.spawn("true")
+        assert bridge.calls.count("spawn:failed") == 1 and process.proc_id
         await vm.close()
+
+    asyncio.run(go())
+
+
+def test_exit_event_before_watching_is_not_lost():
+    from aifactory.vm import VMBridge
+
+    async def go():
+        bridge = VMBridge()
+        stdout = asyncio.StreamReader()
+
+        class Proc:
+            returncode = None
+
+        bridge.proc = Proc()
+        bridge.proc.stdout = stdout
+        reader = asyncio.create_task(bridge._read())
+        stdout.feed_data(b'{"event": "exit", "proc": "p1", "exitCode": 0}\n')
+        await asyncio.sleep(0.01)  # the event is read before anyone watches p1
+        assert (await asyncio.wait_for(bridge.watch_exit("p1"), 1))["exitCode"] == 0
+        stdout.feed_eof()
+        await reader
 
     asyncio.run(go())

@@ -71,6 +71,18 @@ const ops = {
     const sandbox = await box(a.id);
     const proc = randomUUID();
     const handle = sandbox.exec(a.command, {cwd: a.cwd, env: a.env, captureOutput: false});
+    // Reply only once the command has started (its durable session is named), has already ended, or 15 s
+    // have passed. A failure to start then rejects this call, so the caller can retry an exec that never ran
+    // (ExecNotStartedError) instead of seeing a process that exits before it began.
+    const ended = Promise.resolve(handle).then(() => 'ended');
+    const started = Promise.resolve(handle.sessionName).then(() => 'started', () => 'unknown');
+    let timer;
+    const waited = new Promise((resolve) => { timer = setTimeout(() => resolve('unknown'), 15_000); });
+    try {
+      await Promise.race([started, ended, waited]);
+    } finally {
+      clearTimeout(timer);
+    }
     procs.set(proc, handle);
     Promise.resolve(handle).then(
       (r) => send({event: 'exit', proc, exitCode: r?.exitCode ?? null}),
