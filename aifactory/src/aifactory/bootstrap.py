@@ -117,7 +117,11 @@ def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
     """Operator cancellation of outcomes: a declared key (e.g. an accidental duplicate), or "#N" for outcome
     number N from any source (e.g. an intake outcome replaced by a re-scoped one). "#N" applies only while no
     task has ever started (no attempt, stage, start or PR; an interrupted task is persisted as queued with
-    those markers), so it never stops or strands work in flight; otherwise it is skipped and logged."""
+    those markers), so it never discards work in flight; otherwise it is skipped and logged.
+
+    {"outcome": N, "discard_started": true} is the explicit form that also discards started work. It runs
+    before the orchestrator starts, so no task is live in this process; outcomes with a pull request are
+    still refused (closing PRs belongs to the app's own cancel)."""
     if not keys:
         return
     from .events import record
@@ -125,6 +129,9 @@ def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
 
     with session_scope() as s:
         for key in keys:
+            discard = isinstance(key, dict) and key.get("discard_started") is True
+            if isinstance(key, dict):
+                key = f"#{key.get('outcome')}"
             key = str(key)
             by_number = key.startswith("#") and key[1:].isdigit()
             query = s.query(Outcome).filter(Outcome.workspace_id == workspace_id)
@@ -135,8 +142,11 @@ def _cancel_declared(workspace_id: str, keys: list[str]) -> None:
             tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
             started = [t.key for t in tasks if t.status not in ("pending", "queued", "cancelled")
                        or t.attempt or t.stage or t.started_at is not None or t.pr_number]
-            if by_number and started:
-                log.error("Not cancelling #%s: work has started on %s", outcome.number, ", ".join(started))
+            with_prs = [t.key for t in tasks if t.pr_number and t.status != "completed"]
+            if by_number and (with_prs or (started and not discard)):
+                log.error("Not cancelling #%s: %s", outcome.number,
+                          f"open pull requests on {', '.join(with_prs)}" if with_prs
+                          else f"work has started on {', '.join(started)}")
                 continue
             outcome.status = "cancelled"
             for t in tasks:
