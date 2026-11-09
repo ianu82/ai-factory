@@ -14,7 +14,7 @@ from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, Message, Outcome, Run, Workspace
+from ..models import Decision, Message, Outcome, Run, Task, Workspace
 from ..sandbox import LocalSandbox
 from .attachments import prepare_attachments
 
@@ -81,9 +81,21 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
     """Reusable, attributed human decisions that apply to this workspace (and repository)."""
     with session_scope() as s:
         rows = (s.query(Decision)
-                .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved", Decision.reusable.is_(True))
-                .order_by(Decision.resolved_at.desc()).limit(limit * 2).all())
-        return [d for d in rows if d.scope in ("workspace", "repository")][:limit]
+                .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved", Decision.reusable.is_(True),
+                        Decision.scope.in_(("workspace", "repository")))
+                .order_by(Decision.resolved_at.desc()).limit(limit * 4).all())
+
+        def repos_of(d: Decision) -> set[str]:
+            """The repository a repository-scoped decision was made about (its task's, else its outcome's)."""
+            task = s.get(Task, d.task_id) if d.task_id else None
+            if task is not None:
+                return {task.repo_id}
+            outcome = s.get(Outcome, d.outcome_id) if d.outcome_id else None
+            return set(outcome.repo_ids or []) if outcome is not None else set()
+
+        # A repository-scoped decision applies only to its own repository; without a repository (planning across
+        # an outcome's repositories) all of them apply.
+        return [d for d in rows if d.scope == "workspace" or repo_id is None or repo_id in repos_of(d)][:limit]
 
 
 @dataclass

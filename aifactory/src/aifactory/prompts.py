@@ -166,7 +166,7 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
         lines += ["", "## What people decided or asked for on this work",
                   "These answers and requests refine the specification and acceptance criteria. Where one clarifies "
                   "or relaxes a criterion, judge the criterion as clarified; check that requested fixes were made.",
-                  *[f"- {g[:1500]}" for g in guidance[-12:]]]
+                  *[f"- {g}" for g in guidance[-12:]]]
     if checks:
         lines += ["", "## Configured checks already run by the factory on this candidate"]
         for check in checks:
