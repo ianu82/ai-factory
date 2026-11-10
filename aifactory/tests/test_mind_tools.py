@@ -20,7 +20,7 @@ def world():
         db.add_all([org, *users]); db.flush()
         work = []
         for i in range(3):
-            ws = Workspace(org_id=org.id, name=f"Workspace {i}", slug=str(i))
+            ws = Workspace(org_id=org.id, name=f"Workspace {i}", slug=str(i), outcome_seq=1)  # outcome #1 below
             db.add(ws); db.flush()
             if i < 2:
                 for u in users:
@@ -56,6 +56,10 @@ def world():
 def test_read_family_authorization_and_redaction(world, name, person):
     db, users, work = world
     context = Context(db, users[person].id)
+    if name == "pull_requests":  # the fixture's tasks have not opened pull requests yet
+        for _, _, t, *_ in work:
+            t.pr_number, t.pr_url = 12, "https://github.com/org/repo/pull/12"
+        db.commit()
     for i, (ws, o, *_) in enumerate(work):
         args = {"workspace_id": ws.id}
         if name == "outcome_detail":
@@ -98,7 +102,7 @@ def test_production_transcripts_bounded_cursor_and_progress(world):
     assert read_call("overview", args, context)["items"][0]["counts"]["waiting"] == 2
 
 
-@pytest.mark.parametrize("name", ["runs", "list_tasks", "open_decisions", "outcome_detail"])
+@pytest.mark.parametrize("name", ["runs", "list_tasks", "open_decisions", "outcome_detail", "pull_requests"])
 def test_forged_nested_ids(world, name):
     db, users, work = world
     with pytest.raises(HTTPException):
@@ -147,3 +151,82 @@ def test_a_task_with_huge_evidence_reads_bounded_and_truncated(world):
     evidence = detail["items"][0]["tasks"][0]["evidence"]
     assert len(evidence) == MAX_ITEMS
     assert detail["truncated"]
+
+
+def test_pull_requests_report_recorded_ci_decisions_and_the_page_snapshot(world, monkeypatch):
+    import time
+
+    from aifactory import pulls
+    db, users, work = world
+    ws, o, t, question, unblock, *_ = work[0]
+    t.pr_number, t.pr_url, t.head_sha, t.status = 309, "https://github.com/org/repo0/pull/309", "c" * 40, "awaiting_approval"
+    t.evidence = {"ci": {"state": "failure", "head": "c" * 40, "at": "2026-11-10T10:00:00",
+                         "checks": [{"name": "tests", "status": "completed", "conclusion": "failure"},
+                                    {"name": "lint", "status": "completed", "conclusion": "success"},
+                                    {"name": "postgres", "status": "in_progress"}]}, "smoke": {"state": "passed"}}
+    db.commit()
+    context = Context(db, users[0].id)
+    result = read_call("pull_requests", {"workspace_id": ws.id}, context)
+    item = result["items"][0]
+    assert (item["repository"], item["number"], item["merged"]) == ("org/repo0", 309, False)
+    assert item["ci"]["state"] == "failure" and item["ci"]["failing"] == ["tests"] and item["ci"]["pending"] == ["postgres"]
+    assert item["smoke"] == "passed" and item["task"]["key"] == "T1" and item["outcome"]["number"] == 1
+    assert item["decision"]["id"] in (question.id, unblock.id) and item["decision"]["options"]
+    assert "github" not in item and "github_fetched_at" not in result
+    assert read_call("pull_requests", {"workspace_id": ws.id, "state": "merged"}, context)["items"] == []
+    with pytest.raises(HTTPException):
+        read_call("pull_requests", {"workspace_id": ws.id, "state": "closed"}, context)
+    # The app's Pull requests page snapshot (never a GitHub call from Mind) adds review threads when it is recent.
+    snapshot = {"fetched_at": time.time(), "items": [{"repo": "org/repo0", "number": 309, "group": "attention",
+                "reason": "2 unresolved review comments from codex", "detail": {"open_threads": 2,
+                "open_thread_authors": ["codex"], "mergeable_state": "clean"}, "ci": {"state": "failure"}}]}
+    monkeypatch.setitem(pulls._cache, (ws.id, "open"), (time.monotonic(), snapshot))
+    item = read_call("pull_requests", {"workspace_id": ws.id}, context)["items"][0]
+    assert item["github"]["open_threads"] == 2 and item["github"]["open_thread_authors"] == ["codex"]
+    monkeypatch.setitem(pulls._cache, (ws.id, "open"), (time.monotonic(), {**snapshot, "fetched_at": time.time() - 3600}))
+    assert "github" not in read_call("pull_requests", {"workspace_id": ws.id}, context)["items"][0]
+    t.merge_sha, t.status = "d" * 40, "completed"
+    db.commit()
+    assert read_call("pull_requests", {"workspace_id": ws.id}, context)["items"] == []
+    assert read_call("pull_requests", {"workspace_id": ws.id, "state": "merged"}, context)["items"][0]["merged"]
+
+
+def test_reads_name_what_proposals_need(world):
+    db, users, work = world
+    ws, o, t, question, *_ = work[0]
+    t.pr_number = 5
+    db.commit()
+    context = Context(db, users[0].id)
+    repos = read_call("repositories", {"workspace_id": ws.id}, context)
+    assert [r["full_name"] for r in repos["items"]] == ["org/repo0"]
+    assert repos["citations"][0]["href"] == f"/w/{ws.id}/settings/repositories"
+    decisions = read_call("open_decisions", {"workspace_id": ws.id}, context)["items"]
+    asked = next(d for d in decisions if d["id"] == question.id)
+    assert asked["options"] == [{"value": "answer"}] and asked["task_key"] == "T1" and asked["pr_number"] == 5
+    assert asked["outcome_number"] == 1 and asked["actionable"] is True
+    from aifactory.models import Message
+    db.add(Message(workspace_id=ws.id, outcome_id=o.id, author_id=users[1].id, body="Prefer the cache"))
+    db.commit()
+    detail = read_call("outcome_detail", {"workspace_id": ws.id, "outcome_id": o.id}, context)["items"][0]
+    assert {d["id"] for d in detail["decisions"]} == {question.id, work[0][4].id}
+    assert detail["messages"][0]["body"] == "Prefer the cache" and detail["messages"][0]["author"] == "Bob"
+
+
+def test_nested_tool_arguments_are_bounded_and_closed():
+    from aifactory.mind.tools import validate_arguments
+    schema = {"type": "object", "properties": {"workspace_id": {"type": "string"}, "tasks": {"type": "array", "maxItems": 2,
+              "minItems": 1, "items": {"type": "object", "properties": {"key": {"type": "string", "maxLength": 3},
+              "acceptance": {"type": "array", "items": {"type": "string"}}}, "required": ["key"],
+              "additionalProperties": False}}}, "required": ["workspace_id"], "additionalProperties": False}
+    validate_arguments(schema, {"workspace_id": "w", "tasks": [{"key": "T1", "acceptance": ["ok"]}]})
+    for bad, where in [({"workspace_id": "w", "tasks": []}, "tasks"),
+                       ({"workspace_id": "w", "tasks": [{"key": "T1"}] * 3}, "tasks"),
+                       ({"workspace_id": "w", "tasks": [{"key": "TOOLONG"}]}, "tasks[0].key"),
+                       ({"workspace_id": "w", "tasks": [{"acceptance": []}]}, "missing key"),
+                       ({"workspace_id": "w", "tasks": [{"key": "T1", "sneaky": SECRET}]}, "unknown argument"),
+                       ({"workspace_id": "w", "tasks": [{"key": "T1", "acceptance": [" "]}]}, "tasks[0].acceptance[0]"),
+                       ({"workspace_id": "w", "tasks": {"key": "T1"}}, "tasks"),
+                       ("not an object", "Invalid tool arguments")]:
+        with pytest.raises(HTTPException) as exc:
+            validate_arguments(schema, bad)
+        assert exc.value.status_code == 422 and where in exc.value.detail and SECRET not in exc.value.detail

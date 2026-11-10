@@ -84,6 +84,7 @@ def init_engine(url: str | None = None) -> Engine:
     _add_missing_columns(_engine)
     _migrate_benchmark_trial_link(_engine)
     _migrate_workstream_link(_engine)
+    _migrate_mind_action_scope(_engine)
     harden_data_dir()
     return _engine
 
@@ -145,6 +146,61 @@ def _migrate_workstream_link(engine: Engine) -> None:
                     "ALTER TABLE outcomes ADD CONSTRAINT fk_outcomes_workstream_id "
                     "FOREIGN KEY (workstream_id) REFERENCES workstreams (id)"
                 ))
+
+
+def _migrate_mind_action_scope(engine: Engine) -> None:
+    """A Mind card for workspace-level work (a new outcome) has no outcome yet: mind_actions.outcome_id became
+    nullable. PostgreSQL drops the constraint in place. SQLite cannot alter a column, so it rebuilds the table as
+    sqlite.org/lang_altertable.html describes: in one transaction with foreign keys off, a copy of the stored
+    definition without that NOT NULL, every row copied, the old table dropped, the copy renamed and its indexes
+    recreated. Idempotent: a nullable column (any new database) is left alone."""
+    import re
+
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if not inspector.has_table("mind_actions"):
+        return
+    column = next((c for c in inspector.get_columns("mind_actions") if c["name"] == "outcome_id"), None)
+    if column is None or column["nullable"]:
+        return
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE mind_actions ALTER COLUMN outcome_id DROP NOT NULL"))
+        return
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.connect() as conn:
+        table = conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mind_actions'").scalar_one()
+        indexes = [row[0] for row in conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'mind_actions' AND sql IS NOT NULL")]
+        rebuilt, named = re.subn(r'^\s*CREATE TABLE\s+"?mind_actions"?(?=[\s(])', "CREATE TABLE mind_actions_rebuild",
+                                 table, count=1)
+        rebuilt, relaxed = re.subn(r"(\boutcome_id\s+VARCHAR(?:\(\d+\))?)\s+NOT NULL", r"\1", rebuilt, count=1)
+        if not (named and relaxed):
+            raise RuntimeError("mind_actions has an unexpected definition; outcome_id cannot be made nullable")
+        conn.commit()  # end the reads: the pragma below is ignored inside a transaction
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        try:
+            conn.exec_driver_sql("BEGIN")
+            conn.exec_driver_sql("DROP TABLE IF EXISTS mind_actions_rebuild")
+            conn.exec_driver_sql(rebuilt)
+            conn.exec_driver_sql("INSERT INTO mind_actions_rebuild SELECT * FROM mind_actions")
+            conn.exec_driver_sql("DROP TABLE mind_actions")
+            conn.exec_driver_sql("ALTER TABLE mind_actions_rebuild RENAME TO mind_actions")
+            for statement in indexes:
+                conn.exec_driver_sql(statement)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                conn.commit()
+            finally:
+                conn.invalidate()  # this connection never returns to the pool with altered pragmas
 
 
 def harden_data_dir() -> None:

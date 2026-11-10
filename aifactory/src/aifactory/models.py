@@ -599,13 +599,16 @@ class GateVerdict(Base):
 
 
 class MindAction(Base):
-    """Private confirmation ledger; target and kind are immutable after proposal."""
+    """Private confirmation ledger; target and kind are immutable after proposal.
+
+    A card for workspace-level work (a new outcome) has no outcome until it is confirmed (db.py relaxes older
+    tables)."""
     __tablename__ = "mind_actions"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     thread_id: Mapped[str] = mapped_column(String(32), index=True)
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
-    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"))
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     decision_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     kind: Mapped[str] = mapped_column(String(30))

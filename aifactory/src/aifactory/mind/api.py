@@ -335,7 +335,20 @@ class PrivateTools:
     async def _call(self, name, arguments):
         with SessionLocal() as db:
             thread = store.owned(db, self.context.user_id, self.context.thread_id)
-            result = await Tools(Context(db, self.context.user_id, thread.id)).call(name, arguments)
+            try:
+                result = await Tools(Context(db, self.context.user_id, thread.id)).call(name, arguments)
+            except HTTPException as exc:
+                if not (400 <= exc.status_code < 500 and isinstance(exc.detail, str)):
+                    raise
+                db.rollback()
+                # The Factory's own refusal (an argument, a role, a changed or finished target) names what to fix
+                # in fixed words, so the model can correct the call or explain it. Nothing was saved, and the
+                # thread's scope does not widen.
+                refusal = scrub({"refused": True, "status": exc.status_code, "reason": exc.detail[:300]},
+                                secrets_for(db, self.context.user_id, thread.workspace_ids))
+                await self.emit({"type": "tool_finished", "data": {"call_id": str(self.calls), "name": name,
+                                 "summary": "Factory refused the call", "citations": []}})
+                return refusal
             # A read or proposal in a workspace joined after the thread began widens the thread's scope before
             # anything derived from it is kept, so revoking that membership later hides the thread (owned()).
             touched = {arguments.get("workspace_id") if isinstance(arguments, dict) else None}

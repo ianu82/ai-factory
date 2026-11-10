@@ -822,39 +822,12 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
             result = S.outcome(existing, tasks.get(existing.id, []), runs.get(existing.id, []), decisions.get(existing.id, 0))
             db.commit()
             return result
-    repos = db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.id.in_(body.repo_ids)).all()
-    if len(repos) != len(set(body.repo_ids)):
-        raise HTTPException(400, "Unknown repository")
-    if body.template and (len(body.repo_ids) != 1 or body.attachment_ids):
-        raise HTTPException(400, "The README example requires exactly one repository and no attachments")
-    if body.harness and body.harness not in ("native", "codex", "anton"):
-        raise HTTPException(400, "Unknown harness")
-    try:
-        uploads = A.validate_staged(db, workspace_id, user.id, body.attachment_ids)
-    except LookupError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    # Claim before creating any outcome/events. The conditional UPDATE serializes
-    # competing submissions on both SQLite and Postgres; a loser rolls back all claims.
-    claim_id = new_id()
-    claimed = A.staged_query(db, workspace_id, user.id).filter(Artifact.id.in_(body.attachment_ids)).update(
-        {Artifact.outcome_id: claim_id}, synchronize_session=False)
-    if claimed != len(uploads):
-        db.rollback()
-        raise HTTPException(409, "Attachment is no longer available")
-    outcome = outcome_from_text(db, workspace_id, user, README_TITLE if body.template else body.title,
-                                README_BRIEF if body.template else body.brief, [r.id for r in repos],
-                                acceptance=README_ACCEPTANCE if body.template else body.acceptance,
-                                harness=body.harness, priority=max(0, min(body.priority, 3)), signal_id=marker,
-                                guidance={"template": README_TEMPLATE, "repo_id": repos[0].id} if body.template else None)
-    if uploads:
-        db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.outcome_id == claim_id).update(
-            {Artifact.outcome_id: outcome.id}, synchronize_session=False)
-        record(workspace_id, "attachments_added", f"{user.name or user.email} added {len(uploads)} attachments",
-               outcome_id=outcome.id, actor=user.id,
-               data={"ids": [a.id for a in uploads], "names": [a.name for a in uploads], "count": len(uploads)}, session=db)
-    A.cleanup_staged(db)
+    from .work_services import create_outcome as create
+
+    # The same service creates a confirmed Mind card's outcome.
+    outcome = create(db, user, workspace_id, title=body.title, brief=body.brief, repo_ids=body.repo_ids,
+                     acceptance=body.acceptance, harness=body.harness, priority=body.priority,
+                     attachment_ids=body.attachment_ids, template=body.template, signal_id=marker)
     db.commit()
     orchestrator.wake()
     return S.outcome(outcome, [], [])
@@ -880,7 +853,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     return {
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
-                   | {"created_by_name": users.get(o.created_by or "", "")},
+                   | {"created_by_name": _creator(users.get(o.created_by or "", ""), o)},
         "repositories": [{"id": rid, "full_name": repos.get(rid, "?")} for rid in o.repo_ids],
         "attachments": [S.artifact(a) for a in db.query(Artifact).filter(
             Artifact.workspace_id == workspace_id, Artifact.outcome_id == o.id, Artifact.kind == "attachment")
@@ -894,52 +867,33 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     }
 
 
+def _creator(name: str, outcome: Outcome) -> str:
+    return f"{name} via Mind" if name and outcome.source == "mind" else name
+
+
 @router.post("/workspaces/{workspace_id}/outcomes/{outcome_id}/cancel")
 async def cancel_outcome(workspace_id: str, outcome_id: str, user: User = Depends(current_user),
                          db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "member")
-    o = db.get(Outcome, outcome_id)
-    if o is None or o.workspace_id != workspace_id:
-        raise HTTPException(404, "Outcome not found")
-    o.status = "cancelled"
-    with_prs = []
-    for t in db.query(Task).filter(Task.outcome_id == o.id, Task.status.notin_(["completed", "abandoned"])):
-        t.status = "cancelled"
-        if t.pr_number:
-            with_prs.append(t.id)
-    for d in db.query(Decision).filter(Decision.outcome_id == o.id, Decision.status == "open"):
-        d.status = "superseded"
-    db.commit()
-    orchestrator.cancel_outcome(o.id)
-    record(workspace_id, "outcome_cancelled", f"{user.name or user.email} cancelled #{o.number}", outcome_id=o.id,
-           actor=user.id, level="warn")
-    notify(workspace_id, "outcome", o.id)
-    if with_prs:
-        from .pipeline.handover import close_dropped_pull
+    # Shared with Mind's cancel card: cancel and supersede, commit, publish, then stop the work and close its PRs.
+    from .work_services import cancel_outcome as cancel, finish, publish_changes
 
-        for task_id in with_prs:
-            await close_dropped_pull(task_id, user.name or user.email, "Cancelled")
+    _ws(db, user, workspace_id, "member")
+    payload, later = cancel(db, user, workspace_id, outcome_id)
+    db.commit()
+    publish_changes([payload])
+    await finish(later, user)
     return {"ok": True}
 
 
 @router.post("/workspaces/{workspace_id}/tasks/{task_id}/cancel")
 async def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "member")
-    t = db.get(Task, task_id)
-    if t is None or t.workspace_id != workspace_id:
-        raise HTTPException(404, "Task not found")
-    if t.status not in ("completed",):
-        t.status = "cancelled"
-    db.commit()
-    orchestrator.cancel_task(task_id)
-    record(workspace_id, "task_cancelled", f"{user.name or user.email} stopped {t.key}", outcome_id=t.outcome_id,
-           task_id=t.id, actor=user.id, level="warn")
-    notify(workspace_id, "task", t.id, outcome_id=t.outcome_id)
-    orchestrator.wake()
-    if t.status == "cancelled" and t.pr_number:
-        from .pipeline.handover import close_dropped_pull
+    from .work_services import cancel_task as cancel, finish, publish_changes
 
-        await close_dropped_pull(t.id, user.name or user.email, "Cancelled")
+    _ws(db, user, workspace_id, "member")
+    payload, later = cancel(db, user, workspace_id, task_id)
+    db.commit()
+    publish_changes([payload])
+    await finish(later, user)
     return {"ok": True}
 
 

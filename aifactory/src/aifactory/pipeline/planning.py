@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from sqlalchemy.orm import Session
+
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import resolve_credential as resolve_token
@@ -105,40 +107,77 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                                {"value": "cancel", "label": "Cancel"}])
 
 
-def approve_plan(plan_id: str, approved_by: str | None) -> bool:
+def approve_plan(plan_id: str, approved_by: str | None, *, session: Session | None = None,
+                 pending_events: list[dict] | None = None, by: str | None = None,
+                 attribution: dict | None = None) -> bool:
     """Materialize tasks idempotently; automatic approval holds the settings lock.
 
     False means a person must approve. The policy check and approval are one
-    transaction so onboarding activation cannot slip between them.
+    transaction so onboarding activation cannot slip between them. With a session
+    (a confirmed Mind card), the approval joins the caller's transaction and its
+    event waits in pending_events until the caller has committed.
     """
-    with session_scope() as s:
-        plan = s.get(Plan, plan_id)
-        outcome = s.get(Outcome, plan.outcome_id)
-        workspace_id = outcome.workspace_id
-        ws = lock_workspace(s, workspace_id)
-        s.refresh(plan)
-        if plan.status == "approved":
-            return True
-        settings = merged_settings(ws.settings)
-        if approved_by is None and settings["autonomy"].get("plan") != "auto":
-            return False
-        repos = {r.full_name.lower(): r for r in s.query(Repository).filter(Repository.workspace_id == workspace_id)}
-        plan.status = "approved"
-        plan.approved_by = approved_by
-        plan.approved_at = utcnow()
-        builder = outcome.harness or settings["harness"].get("builder") or "native"
-        verifier = outcome.harness or settings["harness"].get("verifier") or builder
-        for item in plan.content.get("tasks", []):
-            repo = repos.get(item["repo"].lower())
-            s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],
-                       title=item["title"][:300], spec=item["spec"], acceptance=list(item.get("acceptance") or []),
-                       repo_id=repo.id, depends_on=list(item.get("depends_on") or []), harness=builder,
-                       verifier_harness=verifier, status="pending"))
-        outcome.status = "running"
-        outcome.blocked_reason = ""
-        outcome_id = outcome.id
-    who = "policy (automatic)" if approved_by is None else "a team member"
-    record(workspace_id, "plan_approved", f"Plan approved by {who}", outcome_id=outcome_id, level="success",
-           actor=approved_by or "policy", data={"plan_id": plan_id})
-    notify(workspace_id, "outcome", outcome_id)
+    if session is None:
+        with session_scope() as s:
+            approved, workspace_id, outcome_id = _approve(s, plan_id, approved_by)
+    else:
+        approved, workspace_id, outcome_id = _approve(session, plan_id, approved_by)
+    if outcome_id is None:  # already approved, or waiting for a person
+        return approved
+    who = by or ("policy (automatic)" if approved_by is None else "a team member")
+    payload = record(workspace_id, "plan_approved", f"Plan approved by {who}", outcome_id=outcome_id, level="success",
+                     actor=approved_by or "policy", data={"plan_id": plan_id, **(attribution or {})}, session=session,
+                     publish=session is None)
+    if session is None:
+        notify(workspace_id, "outcome", outcome_id)
+    else:
+        pending_events.append(payload)
     return True
+
+
+def _approve(s: Session, plan_id: str, approved_by: str | None) -> tuple[bool, str | None, str | None]:
+    plan = s.get(Plan, plan_id)
+    outcome = s.get(Outcome, plan.outcome_id)
+    workspace_id = outcome.workspace_id
+    ws = lock_workspace(s, workspace_id)
+    s.refresh(plan)
+    if plan.status == "approved":
+        return True, None, None
+    settings = merged_settings(ws.settings)
+    if approved_by is None and settings["autonomy"].get("plan") != "auto":
+        return False, None, None
+    repos = {r.full_name.lower(): r for r in s.query(Repository).filter(Repository.workspace_id == workspace_id)}
+    plan.status = "approved"
+    plan.approved_by = approved_by
+    plan.approved_at = utcnow()
+    builder = outcome.harness or settings["harness"].get("builder") or "native"
+    verifier = outcome.harness or settings["harness"].get("verifier") or builder
+    for item in plan.content.get("tasks", []):
+        repo = repos.get(item["repo"].lower())
+        s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],
+                   title=item["title"][:300], spec=item["spec"], acceptance=list(item.get("acceptance") or []),
+                   repo_id=repo.id, depends_on=list(item.get("depends_on") or []), harness=builder,
+                   verifier_harness=verifier, status="pending"))
+    outcome.status = "running"
+    outcome.blocked_reason = ""
+    return True, workspace_id, outcome.id
+
+
+def adopt_plan(s: Session, outcome: Outcome, report: dict, user, *, action_id: str,
+               pending_events: list[dict]) -> Plan:
+    """A plan a person worked out with Mind becomes the outcome's approved plan, in the caller's transaction: the
+    Factory skips its own planning and starts building. The report has passed validate_report("planner", ...) with
+    repository names as connected; the person's confirmation is the plan approval the autonomy policy asks for."""
+    by = (user.name or user.email) + " via Mind"
+    attribution = {"source": "mind", "action_id": action_id}
+    version = s.query(Plan).filter(Plan.outcome_id == outcome.id).count() + 1
+    plan = Plan(outcome_id=outcome.id, version=version, summary=report.get("summary", ""), content=report)
+    s.add(plan)
+    s.flush()
+    pending_events.append(record(outcome.workspace_id, "plan_proposed",
+                                 f"Plan v{version}: {len(report.get('tasks', []))} task(s), worked out by {by}",
+                                 outcome_id=outcome.id, level="success", actor=user.id,
+                                 data={"plan_id": plan.id, **attribution}, session=s, publish=False))
+    approve_plan(plan.id, approved_by=user.id, session=s, pending_events=pending_events, by=by,
+                 attribution=attribution)
+    return plan
