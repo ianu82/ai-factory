@@ -74,8 +74,21 @@ class Target:
 
 
 def digest(state: dict) -> str:
-    """Only a digest is kept: redacting the saved card can never make an unchanged target look changed."""
+    """Only a digest of the target's state is kept (MindAction.digest), outside the scrubbed card: redacting the
+    saved card can never make an unchanged target look changed."""
     return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def redacted(value: Any) -> Any:
+    """Credential patterns removed value by value, before a card is saved: none is left to run on into a
+    neighbouring value when the whole record is scrubbed later (api.scrub matches across values)."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {k: redacted(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redacted(v) for v in value]
+    return value
 
 
 def live(context: Context, workspace_id: str, outcome_id: str, task_id: str | None = None):
@@ -522,7 +535,7 @@ def ask_of(action: MindAction) -> Ask:
 
 def kind_of(action: MindAction) -> Kind:
     spec = KINDS.get(action.kind)
-    if spec is None or "state" not in (action.snapshot or {}):
+    if spec is None or not action.digest:
         raise HTTPException(409, "This card predates Mind's current actions; ask Mind to propose it again")
     return spec
 
@@ -549,7 +562,7 @@ def legacy_view(action: MindAction) -> tuple[dict, str]:
 def card(action: MindAction, context: Context) -> dict:
     workspace = context.db.get(Workspace, action.workspace_id)
     spec = KINDS.get(action.kind)
-    if spec is not None and "state" in (action.snapshot or {}):
+    if spec is not None and action.digest:
         labels = action.snapshot.get("labels") or {}
         obj, effect = spec.object(action, labels), spec.effect(labels, action)
     else:
@@ -576,8 +589,9 @@ def propose(name: str, args: dict, context: Context) -> dict:
     action = MindAction(owner_id=context.user_id, thread_id=context.thread_id, kind=kind,
                         workspace_id=args["workspace_id"], outcome_id=checked.outcome.id if checked.outcome else None,
                         task_id=checked.task.id if checked.task else None,
-                        decision_id=checked.decision.id if checked.decision else None, fields=fields,
-                        snapshot={"labels": checked.labels, "params": checked.params, "state": digest(checked.state)})
+                        decision_id=checked.decision.id if checked.decision else None, fields=redacted(fields),
+                        snapshot={"params": redacted(checked.params), "labels": redacted(checked.labels)},
+                        digest=digest(checked.state))
     context.db.add(action)
     context.db.commit()
     return card(action, context)
@@ -645,7 +659,7 @@ def confirm(context: Context, action_id: str, expected_revision: int, *, finish_
         claim(context, action, expected_revision, status="executing")
         spec = kind_of(action)
         checked = spec.check(context, ask_of(action))
-        if digest(checked.state) != action.snapshot.get("state"):
+        if digest(checked.state) != action.digest:
             raise HTTPException(409, "Action target changed; propose a new card")
         user = current(context)
         result = spec.execute(context, action, checked, user, payloads, later)
@@ -721,7 +735,7 @@ def confirm_action(thread_id: str, action_id: str, body: ConfirmBody,
     if action is not None and action.status == "pending":
         # A secret saved after the card was proposed is still never posted to shared work: neither the shown fields
         # nor the saved parameters a card executes from (a plan's specs, acceptance and risks). The target's state
-        # is only a digest, so this never makes an unchanged target look changed. The rewrite is a compare-and-swap
+        # is a digest in its own column, so this never makes an unchanged target look changed. The rewrite is a compare-and-swap
         # on the revision the person is confirming, so a concurrent edit is never overwritten (a changed revision
         # then fails the confirmation's own claim with 409).
         fields, snapshot = clean_value(action.fields), clean_value(action.snapshot)

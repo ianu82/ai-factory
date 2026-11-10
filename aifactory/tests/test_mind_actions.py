@@ -579,7 +579,8 @@ def test_legacy_mind_actions_table_allows_workspace_cards(tmp_path):
     engine = create_engine(url)
     ddl = str(CreateTable(MindAction.__table__).compile(engine))
     ddl, count = re.subn(r"(outcome_id VARCHAR\(32\))", r"\1 NOT NULL", ddl, count=1)
-    assert count == 1
+    ddl, dropped = re.subn(r"\n\s*digest VARCHAR\(64\),", "", ddl, count=1)  # production's table predates it
+    assert count == dropped == 1
     with engine.begin() as conn:
         conn.execute(text(ddl))
         for index in MindAction.__table__.indexes:
@@ -592,7 +593,8 @@ def test_legacy_mind_actions_table_allows_workspace_cards(tmp_path):
     database.init_engine(url)
     database.init_engine(url)  # idempotent
     inspector = inspect(database.engine())
-    assert next(c for c in inspector.get_columns("mind_actions") if c["name"] == "outcome_id")["nullable"]
+    columns = {c["name"]: c for c in inspector.get_columns("mind_actions")}
+    assert columns["outcome_id"]["nullable"] and columns["digest"]["nullable"]
     assert {i["name"] for i in inspector.get_indexes("mind_actions")} >= {i.name for i in MindAction.__table__.indexes}
     assert "mind_actions" in {k["referred_table"] for k in inspector.get_foreign_keys("mind_action_results")}
     with database.engine().connect() as conn:

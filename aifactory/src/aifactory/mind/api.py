@@ -362,7 +362,8 @@ class PrivateTools:
             for action in db.query(MindAction).filter_by(thread_id=thread.id, owner_id=self.context.user_id):
                 clean = scrub({"fields": action.fields, "snapshot": action.snapshot, "result": action.result},
                               secrets_for(db, self.context.user_id, thread.workspace_ids))
-                action.fields, action.snapshot, action.result = clean["fields"], clean["snapshot"], clean["result"]
+                # By position: a credential running on into the next key may rename it (scrub never drops one).
+                action.fields, action.snapshot, action.result = clean.values()
             db.commit()
         await self.emit({"type": "tool_finished", "data": {"call_id": str(self.calls), "name": name,
                          "summary": "Factory tool completed", "citations": result.get("citations", [])}})

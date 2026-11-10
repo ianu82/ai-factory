@@ -616,6 +616,9 @@ class MindAction(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # A digest of the target's state at proposal, which a confirmation must still match. It lives outside the
+    # scrubbed JSON: redaction (which can span neighbouring values) must never alter it. Null on older cards.
+    digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
