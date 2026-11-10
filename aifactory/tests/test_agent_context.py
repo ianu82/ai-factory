@@ -119,6 +119,32 @@ def test_plan_context_lists_other_tasks_and_what_dependencies_merged(factory):
     assert plan_context("0" * 32) == []
 
 
+def test_dependencies_in_other_repositories_are_not_in_the_checkout(factory):
+    from aifactory.models import Repository
+
+    oid = new_outcome(factory)
+    with session_scope() as s:
+        api = Repository(workspace_id=factory["ws"], full_name="acme/api", default_branch="main", config={})
+        plan = Plan(outcome_id=oid, version=1, status="approved", summary="Two repositories.")
+        s.add_all([api, plan])
+        s.flush()
+        common = {"workspace_id": factory["ws"], "outcome_id": oid, "plan_id": plan.id}
+        s.add_all([
+            Task(**common, repo_id=factory["repo"], key="T1", title="Schema", status="completed", pr_number=7,
+                 merge_sha="abcdef1234567890", evidence={"builder_report": {"summary": "Added the users table."}}),
+            Task(**common, repo_id=api.id, key="T2", title="Endpoint", status="completed", pr_number=3,
+                 merge_sha="0123456789abcdef", evidence={"builder_report": {"summary": "Added GET /users."}})])
+        mine = Task(**common, repo_id=factory["repo"], key="T3", title="Client", status="queued", depends_on=["T1", "T2"])
+        s.add(mine)
+        s.flush()
+        mine_id = mine.id
+    lines = "\n".join(plan_context(mine_id))
+    assert ("## Work this task builds on (merged into the base branch before it started)\n"
+            "- T1: Schema (PR #7, merged as abcdef1234). Added the users table.") in lines
+    assert ("## Work in other repositories this task builds on (merged there, not in this checkout)\n"
+            "- T2: Endpoint (acme/api PR #3, merged as 0123456789). Added GET /users.") in lines
+
+
 def test_plan_context_keeps_dependencies_past_the_listed_tasks(factory):
     from aifactory.pipeline.context import SIBLINGS
 

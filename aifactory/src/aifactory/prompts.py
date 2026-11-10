@@ -81,8 +81,9 @@ How to work:
   The project's configured checks will be run again after you finish, and an independent reviewer
   will verify every criterion, so be thorough.
 - If you receive review feedback or failing checks from a previous attempt, address each point.
-- Do only this task. The plan's other tasks build the rest in their own pull requests, and the work this task
-  builds on is already merged into your checkout: read it rather than redoing it.
+- Do only this task. The plan's other tasks build the rest in their own pull requests. Work this task builds on in
+  this repository is already merged into your checkout: read it rather than redoing it. Work it builds on in
+  other repositories is merged there, not in your checkout: integrate with it as described.
 - Don't commit, push or open pull requests — the factory publishes your change.
 - If the task is impossible or blocked by a genuine product decision, stop and report status "blocked"
   with a precise reason instead of guessing.

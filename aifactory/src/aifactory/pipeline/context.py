@@ -55,10 +55,19 @@ def plan_context(task_id: str) -> list[str]:
                 lines.append(f"- {t.key}: {t.title} [{repos.get(t.repo_id, '?')}] ({t.status}{after})")
             if unlisted:
                 lines.append(f"- (and {unlisted} more)")
-        if built_on:
-            lines += ["", "## Work this task builds on (merged into the base branch before it started)"]
-            for t in built_on:
-                where = f"PR #{t.pr_number}" if t.pr_number else "no pull request"
+        # Each task checks out only its own repository: dependencies elsewhere are merged there, not here.
+        here = [t for t in built_on if t.repo_id == task.repo_id]
+        elsewhere = [t for t in built_on if t.repo_id != task.repo_id]
+        for heading, group, repo in (
+                ("## Work this task builds on (merged into the base branch before it started)", here, False),
+                ("## Work in other repositories this task builds on (merged there, not in this checkout)",
+                 elsewhere, True)):
+            if not group:
+                continue
+            lines += ["", heading]
+            for t in group:
+                where = f"{repos.get(t.repo_id, '?')} " if repo else ""
+                where += f"PR #{t.pr_number}" if t.pr_number else "no pull request"
                 merged = f", merged as {t.merge_sha[:10]}" if t.merge_sha else ", not merged"
                 report = (t.evidence or {}).get("builder_report") or {}
                 summary = clip(report.get("summary") or t.summary, SUMMARY_CHARS)
