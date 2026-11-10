@@ -133,6 +133,32 @@ def test_unsafe_support_paths(path):
         validate_bundle(Bundle(skills=[skill(files={path: "x"})]), set())
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="search-only traversal needs O_PATH (Linux)")
+def test_skill_folder_under_search_only_ancestor(tmp_path):
+    # An isolated sandbox user may traverse a parent it cannot list (mode 0o100 here).
+    parent = tmp_path / "parent"
+    folder = parent / "inner" / "skill"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(render_skill(skill()))
+    parent.chmod(0o100)
+    try:
+        if os.geteuid() != 0:
+            with pytest.raises(PermissionError):
+                os.listdir(parent)
+        assert read_skill_folder(folder).name == skill().name
+    finally:
+        parent.chmod(0o700)
+
+
+def test_skill_folder_rejects_symlinked_ancestor(tmp_path):
+    real = tmp_path / "real"
+    (real / "skill").mkdir(parents=True)
+    (real / "skill" / "SKILL.md").write_text(render_skill(skill()))
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    with pytest.raises(DefinitionError):
+        read_skill_folder(tmp_path / "link" / "skill")
+
+
 @pytest.mark.parametrize("kind", ["symlink", "directory-link", "fifo", "binary", "invalid-utf8"])
 def test_reject_unsupported_files(tmp_path, kind):
     tmp_path = tmp_path / "skill"
