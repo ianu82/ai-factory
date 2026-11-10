@@ -187,6 +187,22 @@ def test_an_answer_lost_in_a_restart_is_posted_by_the_next_process(factory):
         assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
 
 
+def test_an_old_unanswered_record_is_still_answered_after_a_restart(factory):
+    from aifactory.db import utcnow
+
+    with session_scope() as s:
+        s.add(Event(workspace_id=factory["ws"], kind="operator_relay", message="old", actor="operator",
+                    created_at=utcnow() - timedelta(days=3),
+                    data={"comment_id": 99, "author": "ianu82", "results": ["retry #7: retrying T1"],
+                          "html_url": "https://github.com/acme/app/issues/5#issuecomment-99", "acknowledged": False}))
+    assert poll(Relay()) == []
+    assert len(FakeGH.replies) == 1 and "retry #7: retrying T1" in FakeGH.replies[0]
+    assert "issuecomment-99" in FakeGH.replies[0]
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_relay").one().data["acknowledged"] is True
+    assert poll(Relay()) == [] and len(FakeGH.replies) == 1  # answered once
+
+
 def test_a_login_that_is_not_a_collaborator_is_refused(factory):
     FakeGH.permissions = {}
     FakeGH.comments = [command(15, REQUEST_CHANGES)]
@@ -248,6 +264,11 @@ def test_item_errors_name_what_is_malformed():
     assert item_error("guidance", {"outcome": 7, "body": "x", "task": 1}) == "task must be a string"
     assert item_error("retry", {"key": "dup"}) is None and item_error("retry", {}) is not None
     assert item_error("cancel", "#4") is None and item_error("cancel", {"outcome": "x"}) is not None
+    assert item_error("retry", {"outcome": 7, "include_cancelled": "false"}) == "include_cancelled must be true or false"
+    assert item_error("resolve", {"outcome": 7, "kind": "question", "resolution": "answer", "reusable": "false"}) \
+        == "reusable must be true or false"
+    assert item_error("cancel", {"outcome": 7, "discard_started": "yes"}) == "discard_started must be true or false"
+    assert item_error("retry", {"outcome": 7, "include_cancelled": True}) is None
 
 
 def test_a_head_guard_skips_a_decision_judged_on_an_older_commit(factory):

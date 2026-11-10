@@ -87,6 +87,7 @@ def _number(value: Any) -> int | None:
 
 
 STRING_FIELDS = ("task", "kind", "resolution", "comment", "body", "nonce", "head", "workspace", "key", "scope")
+BOOL_FIELDS = ("include_cancelled", "reusable", "discard_started")  # "false" as a string would read as true
 
 
 def item_error(kind: str, item: Any) -> str | None:
@@ -96,13 +97,15 @@ def item_error(kind: str, item: Any) -> str | None:
         if isinstance(item, str):
             return None if item.strip() else "a cancel key must not be empty"
         if isinstance(item, dict) and _number(item.get("outcome")) is not None:
-            return None
+            return _flag_error(item)
         return 'a cancel item is "#N", a declared key, or {"outcome": N}'
     if not isinstance(item, dict):
         return "an item must be an object"
     bad = next((f for f in STRING_FIELDS if f in item and not isinstance(item[f], str)), None)
     if bad:
         return f"{bad} must be a string"
+    if _flag_error(item):
+        return _flag_error(item)
     if ("outcome" in item or kind != "retry") and _number(item.get("outcome")) is None:
         return "outcome must be an outcome number"
     if kind == "resolve" and not (item.get("kind") and item.get("resolution")):
@@ -131,6 +134,11 @@ async def _permission(gh, repository: str, login: str) -> str | None:
     return permission if isinstance(permission, str) else None
 
 
+def _flag_error(item: dict) -> str | None:
+    bad = next((f for f in BOOL_FIELDS if f in item and type(item[f]) is not bool), None)
+    return f"{bad} must be true or false" if bad else None
+
+
 def _time(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
@@ -151,6 +159,17 @@ def _handled(workspace_id: str, comment_id: int, now: datetime) -> tuple[int, di
             if (e.data or {}).get("comment_id") == comment_id:
                 return e.id, dict(e.data or {})
     return None
+
+
+def _unanswered(workspace_id: str) -> list[tuple[int, dict]]:
+    """Relay records whose answer never posted, however old: a restarted process answers them."""
+    from .db import session_scope
+    from .models import Event
+
+    with session_scope() as s:
+        return [(e.id, dict(e.data or {})) for e in s.query(Event).filter(
+            Event.workspace_id == workspace_id, Event.kind == EVENT).order_by(Event.id)
+            if (e.data or {}).get("acknowledged") is False]
 
 
 def _mark_acknowledged(event_id: int) -> None:
@@ -201,6 +220,7 @@ class Relay:
         self.since: datetime | None = None  # GitHub's `since` (updated at or after) for the next poll
         self.seen: set[int] = set()  # commands this process handled and answered; the events table covers restarts
         self.unanswered: dict[int, tuple[dict[str, Any], int, list[str]]] = {}  # comment id -> (comment, event, lines)
+        self.loaded = False  # whether this process has picked up answers an earlier one never posted
 
     async def run(self) -> None:
         """Poll on its own schedule: slow maintenance in the scheduler loop must never delay an operator's cancel
@@ -240,6 +260,13 @@ class Relay:
             if len(batch) < 100:
                 break
             page += 1
+        if not self.loaded:
+            for event_id, data in await asyncio.to_thread(_unanswered, cfg["workspace"]):
+                comment = {"id": data.get("comment_id"), "html_url": data.get("html_url") or "",
+                           "user": {"login": data.get("author") or ""}}
+                if comment["id"]:
+                    self.unanswered.setdefault(int(comment["id"]), (comment, event_id, list(data.get("results") or [])))
+            self.loaded = True
         for comment_id, (comment, event_id, lines) in list(self.unanswered.items()):
             await self._answer(gh, cfg, comment, event_id, lines)  # applied earlier; only the answer failed
         handled = []
@@ -276,7 +303,7 @@ class Relay:
         payload = await asyncio.to_thread(
             record, cfg["workspace"], EVENT, f"Operator relay from {login or 'unknown'}: " + "; ".join(lines)[:300],
             actor="operator", level="info" if applied else "warn",
-            data={"comment_id": comment_id, "author": login, "results": lines,
+            data={"comment_id": comment_id, "author": login, "results": lines, "html_url": comment.get("html_url"),
                   "delegated_by": cfg["delegated_by"], "acknowledged": False})
         if applied:
             self.wake()
