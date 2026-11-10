@@ -28,7 +28,7 @@ from ..security import decrypt, _SECRET_PATTERNS
 from . import store
 from .contracts import CreateThread, SubmitMessage, TurnContext
 from .routing import PrivateRoute  # noqa: F401 - also re-exported for callers of mind.api
-from .provider import MindUnavailable
+from .provider import REASONS, MindUnavailable
 from .tools import Context, Tools
 
 
@@ -230,10 +230,14 @@ async def readiness(runtime, workspace_id, ledger):
     if isinstance(result, dict):
         ready = result.get("status") == "ready" or result.get("available") is True
         model = result.get("model_id", result.get("model"))
+        code = result.get("reason")
     else:
-        ready, model = result.available, result.model
-    return {"status": "ready" if ready else "unavailable", "model_id": model if ready else None,
-            "reason": None if ready else "Mind is unavailable. Check workspace inference settings."}
+        ready, model, code = result.available, result.model, result.reason
+    # The provider's fixed public reasons tell the person what to fix (add a key, the model is missing); anything
+    # else stays generic, so no provider text ever reaches the dock.
+    reason = None if ready else REASONS.get(code) if isinstance(code, str) and code in REASONS else (
+        "Mind is unavailable. Check workspace inference settings.")
+    return {"status": "ready" if ready else "unavailable", "model_id": model if ready else None, "reason": reason}
 
 
 def thread_view(db, thread):
@@ -501,9 +505,11 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
                 safe = scrub_events(cut_open_credential(events), secrets_for(session, user_id, scope))
+            # The turn has a final status now. A client that stops reading during this last flush (the browser
+            # treats an error frame as the end of its work) must not turn it into "interrupted".
+            flushed = True
             for event in safe[released:]:
                 yield encoded(event)
-            flushed = True
         finally:
             # Starlette cancels the response task in an AnyIO cancel scope on
             # http.disconnect. Shield the await AND persistence: otherwise the

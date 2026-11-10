@@ -27,6 +27,12 @@ test("SSE accepts terminal event at EOF, ignores trailing frames and cancels rea
   assert.equal(received.length, 1);
   assert.equal(cancelled, true);
 });
+test("SSE reads past an error frame to done, then reports the error", async () => {
+  const received: MindEvent[] = [];
+  const body = 'event: error\ndata: {"message":"Budget stopped"}\n\n' + `data: ${JSON.stringify(done)}\n\n`;
+  await assert.rejects(readMindSSE(response(body), new AbortController().signal, (e) => received.push(e)), /Budget stopped/);
+  assert.deepEqual(received.map((e) => e.type), ["error", "done"]);
+});
 test("SSE reports error, malformed JSON, missing terminal, HTTP failure and missing body", async () => {
   for (const [body, error] of [["", /before completion/], ['data: {"type":"text_delta","text":"partial"}\n\n', /before completion/], ["data: invalid\n\n", /Invalid/], ['event: error\ndata: {"message":"Budget stopped"}\n\n', /Budget stopped/]] as const) {
     await assert.rejects(readMindSSE(response(body), new AbortController().signal, () => {}), error);
