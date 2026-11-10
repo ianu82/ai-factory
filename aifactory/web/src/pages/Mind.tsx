@@ -158,7 +158,7 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
       {unseen && <button type="button" className="mind-jump" onClick={() => { if (pane.current) { scroll.current.jump(pane.current); setUnseen(false); } }}><ArrowDown /> New reply</button>}
       <div className="mind-bottom">
         <div className="mind-column">
-          <Notice status={state.status} workspaceId={workspaceId} onRetry={threadWorkspace ? recheck : undefined} />
+          <Notice status={state.status} workspaceId={threadWorkspace || workspaceId} onRetry={threadWorkspace ? recheck : undefined} />
           <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy}
             disabled={loading || failed || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
         </div>

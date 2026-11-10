@@ -307,6 +307,12 @@ async def status(workspace_id: str, user: User = Depends(current_user), db: Sess
     try:
         result = await readiness(runtime, workspace_id, ledger)
         await ledger.reconcile()
+        if result.get("status") == "ready":
+            # A send refuses while any of the person's charges is unsettled, so "ready" says whether one is. A fresh
+            # session sees what reconcile just committed (this request's session may hold an older snapshot).
+            with SessionLocal() as session:
+                pending = session.query(MindCharge).filter_by(user_id=user.id, settled=False).first() is not None
+            result = {**result, "accounting": "pending" if pending else "settled"}
     except store.AccountingError as exc:
         result = {"status": "unavailable", "model_id": None, "reason": str(exc)}
     except Exception:

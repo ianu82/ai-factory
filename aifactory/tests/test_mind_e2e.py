@@ -84,7 +84,7 @@ def test_real_engine_answers_through_the_app(app_as, people, monkeypatch):
         thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()
         assert sorted(thread["workspace_ids"]) == sorted([people["first"], people["second"]])
         status = client.get("/api/mind/status", params={"workspace_id": people["first"]}).json()
-        assert status == {"status": "ready", "model_id": MODEL, "reason": None}
+        assert status == {"status": "ready", "model_id": MODEL, "reason": None, "accounting": "settled"}
         probes = len(requests)
         context = {"workspace_id": people["first"], "kind": "inbox", "id": people["first"], "label": "Inbox"}
         events = send(client, thread["id"], "What needs me today? " + KEY, context)

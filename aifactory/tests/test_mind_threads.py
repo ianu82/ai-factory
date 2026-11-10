@@ -328,6 +328,19 @@ async def test_simultaneous_submissions_claim_thread_and_disconnect_persists(wor
     assert send(world, thread, "once").status_code == 409
 
 
+async def test_status_reports_pending_accounting_until_the_charge_settles(world):
+    client, runtime, _, ids = world
+    runtime.total = None  # the provider cannot report this session's cost yet
+    ledger = store.TurnLedger(ids[0], ids[2], runtime=runtime)
+    await ledger.before_call()
+    await ledger.after_call(None)
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("ready", "pending")
+    runtime.total = .5  # reconciliation can settle it now
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("ready", "settled")
+
+
 def test_charged_failed_readiness_and_zero_budget(world):
     client, runtime, _, ids = world
     async def probe(workspace_id, ledger):

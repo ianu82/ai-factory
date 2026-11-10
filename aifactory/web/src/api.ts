@@ -542,7 +542,7 @@ export interface MindWireMessage {
   steps?: { name: string }[];
 }
 export interface MindWireHistory { thread: MindWireThread; messages: MindWireMessage[] }
-export interface MindWireStatus { status: "ready" | "unavailable"; model_id: string | null; reason?: string }
+export interface MindWireStatus { status: "ready" | "unavailable"; model_id: string | null; reason?: string; accounting?: "pending" | "settled" }
 export interface MindWireUsage {
   thread_cost: { usd: number | null; known: boolean };
   daily_spend: number | null; daily_limit: number;

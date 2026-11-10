@@ -14,7 +14,8 @@ export function mindCard(c: MindWireCard): MindCard {
 export const mindMessage = (m: MindWireMessage) => ({ id: m.id, role: m.role, content: m.text, citations: citations(m.citations), cards: (m.action_cards || []).map(mindCard),
   steps: (m.steps || []).map((s) => ({ name: s.name, done: true })), failed: m.status === "failed" || m.status === "interrupted" });
 export function mindStatus(s: MindWireStatus): MindStatus {
-  return { model: s.model_id, available: s.status === "ready", reason: s.reason, budget_state: "ok" };
+  // Ready with a charge still settling is not ready to send: the next message would be refused (accounting_pending).
+  return { model: s.model_id, available: s.status === "ready", reason: s.reason, budget_state: s.accounting === "pending" ? "pending_accounting" : "ok" };
 }
 export function mindBudget(code?: string): MindStatus["budget_state"] {
   return code === "budget_exceeded" ? "budget_exceeded" : code === "accounting_pending" || code === "accounting_busy" ? "pending_accounting" : "ok";
