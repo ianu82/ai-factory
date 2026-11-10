@@ -134,6 +134,19 @@ def test_completion_leaves_a_cancelled_outcome_alone(factory):
     assert completions(first) == 0
 
 
+def test_acceptance_racing_a_cancel_leaves_the_task_untouched(factory):
+    oid, first, second, did = merged_with_dependent(factory)
+    with session_scope() as s:
+        s.get(Outcome, oid).status = "cancelled"  # cancelled after the decision was opened
+    with session_scope() as s:
+        resolve(s, s.get(Decision, did), s.get(User, factory["user"]), "acknowledge")
+    with session_scope() as s:
+        task = s.get(Task, first)
+        assert (task.status, task.stage) == ("smoke_failed", "smoke")
+        assert task.blocked_reason == "Smoke checks failed"
+    assert completions(first) == 0
+
+
 def test_accepted_completion_settles_source_issues(factory, monkeypatch):
     settled = []
 

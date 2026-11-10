@@ -142,9 +142,12 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             elif resolution == "revert":
                 task.status, task.stage, task.blocked_reason = "queued", "revert", ""
             elif resolution in ACCEPTING:
-                task.blocked_reason = ""
-                if accepted_after_merge(task) and (event := complete_accepted(db, task, user.name or user.email)):
-                    completed.append(event)
+                if accepted_after_merge(task):
+                    # The guarded completion clears the blocked reason itself; a task stopped meanwhile keeps it.
+                    if event := complete_accepted(db, task, user.name or user.email):
+                        completed.append(event)
+                else:
+                    task.blocked_reason = ""
                 if resolution == "fix":
                     from .signals import outcome_from_text
 
