@@ -16,7 +16,7 @@ PLANNER_REPORT: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "key": {"type": "string", "description": "Short id like T1, T2."},
+                    "key": {"type": "string", "description": "Short id like T1, T2 (at most 20 characters)."},
                     "title": {"type": "string"},
                     "repo": {"type": "string", "description": "owner/name of the repository this task changes."},
                     "spec": {"type": "string", "description": "Precise implementation guidance: files, approach, edge cases, tests to add."},
@@ -114,6 +114,9 @@ VERIFIER_REPORT: dict[str, Any] = {
 SCHEMAS = {"planner": PLANNER_REPORT, "builder": BUILDER_REPORT, "verifier": VERIFIER_REPORT}
 
 
+TASK_KEY_LIMIT = 20  # Task.key column width
+
+
 def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]:
     """Light, forgiving validation: returns (normalized_report, error)."""
     if not isinstance(report, dict):
@@ -142,6 +145,8 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
                                   + ("Write the concrete security and robustness rules this change must keep."
                                      if field == "constraints" else "List the files this task will change."))
             task.setdefault("depends_on", [])
+            if len(str(task["key"])) > TASK_KEY_LIMIT:
+                return None, f"tasks[{i}] key {task['key']!r} is longer than {TASK_KEY_LIMIT} characters; use a short key like T1."
             if task["key"] in keys:
                 return None, f"Duplicate task key {task['key']}."
             keys.add(task["key"])
@@ -152,7 +157,7 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
         if _has_cycle(tasks):
             return None, "Task dependencies contain a cycle."
         report.setdefault("risks", [])
-        _sequence_shared_files(tasks)
+        sequence_shared_files(tasks)
     if role == "verifier":
         if report.get("verdict") not in ("pass", "fail"):
             return None, "verdict must be pass or fail."
@@ -198,11 +203,12 @@ def _ancestors(tasks: list[dict[str, Any]], key: str) -> set[str]:
     return seen
 
 
-def _sequence_shared_files(tasks: list[dict[str, Any]]) -> None:
+def sequence_shared_files(tasks: list[dict[str, Any]]) -> None:
     """Tasks in one repository that change the same file run one after the other.
 
     Parallel edits to one file conflict when the first merges, and the rebuild repeats the work. A later task
     (in plan order) gains a dependency on an earlier one it overlaps, unless one already depends on the other.
+    Safe to run again (planning does after it normalizes repository names): it never adds a cycle or a repeat.
     """
     for i, later in enumerate(tasks):
         mine = {f.strip().lstrip("./") for f in later.get("files") or []}
@@ -240,23 +246,44 @@ def _overlap(a: set[str], b: set[str]) -> bool:
 
 
 _CONSTRAINT_LABEL = re.compile(r"^\W*C(\d+)\b", re.IGNORECASE)
+_NON_WORD = re.compile(r"[^a-z0-9]+")
+
+
+def _words(text: str) -> str:
+    return " " + _NON_WORD.sub(" ", text.lower()).strip() + " "
+
+
+def _judges(entry: str, requirement: str) -> bool:
+    """Whether a report entry (normalized) names a requirement: it repeats the requirement's opening words, or it
+    is a long enough quote from it."""
+    want = _words(requirement)
+    if not want.strip():
+        return False
+    return _words(" ".join(want.split()[:12])) in entry or (len(entry.strip()) >= 20 and entry in want)
 
 
 def missing_coverage(acceptance: list[str], constraints: list[str], criteria: list[Any]) -> list[str]:
-    """What a passing verifier report left unjudged: each constraint by label (C1, C2, …) or its text, and
-    acceptance criteria by count. A pass that skips any of them is not evidence."""
+    """What a passing verifier report left unjudged. Every constraint and every acceptance criterion needs its own
+    report entry: a constraint by its label (C1, C2, … up to the number of constraints) or its text, a criterion
+    by its text (the verifier is told to repeat it). One entry never counts for two requirements. A pass that
+    skips any of them is not evidence."""
     reported = [str(c.get("criterion", "")).strip() for c in criteria if isinstance(c, dict)]
-    labels = {int(m.group(1)) for r in reported if (m := _CONSTRAINT_LABEL.match(r))}
-    about_constraints = {i for i, r in enumerate(reported) if _CONSTRAINT_LABEL.match(r)}
-    missing = []
+    entries = [_words(r) for r in reported]
+    labels = [int(m.group(1)) if (m := _CONSTRAINT_LABEL.match(r)) else 0 for r in reported]
+    required: list[tuple[str, list[int]]] = []
     for j, text in enumerate(constraints):
-        head = text.strip()[:40].lower()
-        by_text = [i for i, r in enumerate(reported) if head and head in r.lower()]
-        about_constraints.update(by_text)
-        if (j + 1) not in labels and not by_text:
-            missing.append(f"C{j + 1}")
-    # Entries that judge a constraint (by label or by text) never count as acceptance coverage.
-    plain = [r for i, r in enumerate(reported) if i not in about_constraints]
-    if len(plain) < len(acceptance):
-        missing.append(f"{len(acceptance) - len(plain)} of {len(acceptance)} acceptance criteria")
-    return missing
+        required.append((f"C{j + 1}", [i for i, e in enumerate(entries) if labels[i] == j + 1 or _judges(e, text)]))
+    for k, text in enumerate(acceptance):
+        required.append((f"acceptance criterion {k + 1}", [i for i, e in enumerate(entries) if _judges(e, text)]))
+    owner: dict[int, int] = {}  # report entry -> requirement it counts for (maximum bipartite matching)
+
+    def assign(req: int, seen: set[int]) -> bool:
+        for i in required[req][1]:
+            if i not in seen:
+                seen.add(i)
+                if i not in owner or assign(owner[i], seen):
+                    owner[i] = req
+                    return True
+        return False
+
+    return [name for n, (name, _) in enumerate(required) if not assign(n, set())]

@@ -12,6 +12,7 @@ from aifactory.models import Message, Plan, Task
 from aifactory.pipeline import planning
 from aifactory.pipeline.runtime import guidance_history
 
+from .fakes import ScriptedModel, call, step
 from .test_pipeline import factory, new_outcome  # noqa: F401 - workspace, repository and user fixture
 
 
@@ -131,10 +132,10 @@ def test_a_pass_must_judge_every_constraint_and_criterion():
             {"criterion": "C2", "status": "pass"}]
     assert missing_coverage(["Works"], ["Bounded to 1 MiB", "Never logs the token"], full) == []
     assert missing_coverage(["Works"], ["Bounded to 1 MiB", "Never logs the token"], full[:2]) == ["C2"]
-    assert missing_coverage(["Works", "Tested"], [], full[:1]) == ["1 of 2 acceptance criteria"]
+    assert missing_coverage(["Works", "Tested"], [], full[:1]) == ["acceptance criterion 2"]
     by_text = [{"criterion": "Works"}, {"criterion": "never logs the token: checked with a probe"}]
     assert missing_coverage(["Works"], ["Never logs the token"], by_text) == []
-    assert missing_coverage(["Works"], ["Never logs the token"], []) == ["C1", "1 of 1 acceptance criteria"]
+    assert missing_coverage(["Works"], ["Never logs the token"], []) == ["C1", "acceptance criterion 1"]
 
 
 def test_two_globs_that_could_name_one_file_are_sequenced():
@@ -147,4 +148,53 @@ def test_a_constraint_judged_by_text_is_not_acceptance_coverage():
     from aifactory.harness.schemas import missing_coverage
 
     only_constraint = [{"criterion": "Never logs the token: probed", "status": "pass"}]
-    assert missing_coverage(["Works"], ["Never logs the token"], only_constraint) == ["1 of 1 acceptance criteria"]
+    assert missing_coverage(["Works"], ["Never logs the token"], only_constraint) == ["acceptance criterion 1"]
+
+
+def test_every_requirement_needs_its_own_report_entry():
+    from aifactory.harness.schemas import missing_coverage
+
+    # Two entries for one criterion do not cover a second, unexamined one.
+    twice = [{"criterion": "Build succeeds"}, {"criterion": "Build succeeds"}]
+    assert missing_coverage(["Parser rejects bad input", "Build succeeds"], [], twice) == ["acceptance criterion 1"]
+    # Constraints sharing an opening phrase each need an entry.
+    shared = ["Uploaded files are stored outside the web root", "Uploaded files are stored with random names"]
+    one = [{"criterion": "Works"}, {"criterion": "Uploaded files are stored outside the web root: probed"}]
+    assert missing_coverage(["Works"], shared, one) == ["C2"]
+    assert missing_coverage(["Works"], shared, [*one, {"criterion": "C2: random names checked"}]) == []
+
+
+def test_an_acceptance_criterion_that_starts_like_a_label_is_still_a_criterion():
+    from aifactory.harness.schemas import missing_coverage
+
+    report = [{"criterion": "C1 parser accepts valid input", "status": "pass"}]
+    assert missing_coverage(["C1 parser accepts valid input"], [], report) == []
+    # With a real constraint C1 as well, the one entry cannot count twice.
+    assert missing_coverage(["C1 parser accepts valid input"], ["Bounded input"], report) == ["acceptance criterion 1"]
+
+
+def test_task_keys_must_fit_the_stored_key():
+    long = task("T1-update-the-parser-module", ["a.py"])
+    ok, err = validate_report("planner", plan(long))
+    assert ok is None and "longer than 20" in err
+
+
+def test_planning_sequences_shared_files_after_fixing_repository_names(factory):
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        return {"content": "", "tool_calls": [call("finish", {
+            "summary": "Two changes to one file.",
+            "tasks": [{"key": "T1", "title": "One", "repo": "acme/demo", "spec": "s", "acceptance": ["one"],
+                       "constraints": ["c"], "files": ["greet.sh"], "depends_on": []},
+                      {"key": "T2", "title": "Two", "repo": "acme/dmeo", "spec": "s", "acceptance": ["two"],
+                       "constraints": ["c"], "files": ["greet.sh"], "depends_on": []}],
+            "questions": [], "risks": []})]}
+
+    ScriptedModel.scripts["planner"] = planner
+    oid = new_outcome(factory)
+    asyncio.run(planning.plan_outcome(oid, asyncio.Event()))
+    with session_scope() as s:
+        content = s.query(Plan).filter_by(outcome_id=oid).one().content
+    assert [t["repo"] for t in content["tasks"]] == ["acme/demo", "acme/demo"]
+    assert content["tasks"][1]["depends_on"] == ["T1"]

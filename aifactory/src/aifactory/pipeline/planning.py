@@ -9,6 +9,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
+from ..harness.schemas import sequence_shared_files
 from ..models import Outcome, Plan, Repository, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLANNER, plan_prompt
@@ -69,6 +70,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         for task in report["tasks"]:
             task["repo"] = repos[0].full_name
         problems = []
+        sequence_shared_files(report["tasks"])  # tasks the planner named differently may share files
     with session_scope() as s:
         for old in s.query(Plan).filter(Plan.outcome_id == outcome_id, Plan.status == "proposed"):
             old.status = "superseded"
