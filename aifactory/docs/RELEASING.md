@@ -134,7 +134,8 @@ Who counts as an operator:
   each comment, so removing someone takes effect on the next poll. Comments from integrations or synced external
   users have no Linear author and never count. The Factory reads and replies with the bootstrap workspace's Linear
   API key (Settings → Linear), which needs comment write access; until that key is saved the channel logs the
-  missing key and waits.
+  missing key and waits. Replies are posted as the key's owner, often an operator: they start with
+  `Factory relay for`, which the poller skips, and never with `/factory`, so they are never taken as commands.
 - **GitHub.** `operators` lists logins, and GitHub is asked for each command whether that login has write access
   to the repository. The Factory uses the workspace's GitHub access, which needs Issues write to reply.
 

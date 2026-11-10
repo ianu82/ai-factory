@@ -510,3 +510,18 @@ def test_a_failing_channel_is_polled_less_often(linear_factory, monkeypatch, cap
     relay.last_poll = relay.resume_at = float("-inf")
     asyncio.run(relay.maybe_poll())
     assert relay.failures == 0 and FakeLinear.lists == 1
+
+
+def test_the_factorys_own_linear_replies_are_never_commands(linear_factory):
+    # The Linear key is the operator's own, so the Factory's replies are authored by a listed, active operator.
+    echoed = "Factory relay for https://linear.app/acme/issue/ENG-5#comment-c-0 (by Ian):\n" \
+             "- not applied: the json block is not valid JSON\n/factory\n```json\n{\"retry\": [{\"outcome\": 7}]}\n```"
+    FakeLinear.comments = [{**linear_command("c-9", {"retry": [{"outcome": 7}]}), "body": echoed}]
+    assert poll() == []
+    assert FakeLinear.replies == []
+    FakeLinear.comments = [linear_command("c-10", {"guidance": [{"outcome": 7, "task": "T1", "body": "Real."}]})]
+    relay = Relay()
+    assert poll(relay) == ["c-10"]
+    [(_, reply)] = FakeLinear.replies
+    assert reply.startswith("Factory relay for ") and FakeLinear.comments[-1]["user"] == IAN
+    assert poll(relay, at=NOW + timedelta(seconds=30)) == [] and len(FakeLinear.replies) == 1

@@ -43,7 +43,8 @@ POLL_SECONDS = 30
 MAX_AGE = timedelta(hours=24)
 MAX_BACKOFF = timedelta(minutes=10)  # a failing answer or poll is tried at most this rarely
 COMMAND = "/factory"
-REPLY_MARKER = "<!-- ai-factory:operator-relay -->"
+REPLY_MARKER = "<!-- ai-factory:operator-relay -->"  # GitHub replies; Linear's markdown may drop HTML comments
+REPLY_HEADER = "Factory relay for "  # every reply's first line, on both channels
 EVENT = "operator_relay"
 KINDS = ("cancel", "retry", "resolve", "guidance")  # applied in the bootstrap's order
 WRITE = {"admin", "maintain", "write", "push"}
@@ -232,6 +233,13 @@ def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable
     return lines
 
 
+def _is_reply(body: str) -> bool:
+    """Whether a comment is one of the Factory's own replies. The Factory writes as an operator (on GitHub as the
+    workspace's account, on Linear as the owner of its API key), so its replies are told apart by their marker, never
+    by their author; and they never start with the command word, so they are never commands either."""
+    return REPLY_MARKER in body or body.lstrip().startswith(REPLY_HEADER)
+
+
 def _backoff(failures: int) -> timedelta:
     """The wait after the given number of failures in a row: one poll, then doubling, at most ten minutes."""
     return min(MAX_BACKOFF, timedelta(seconds=POLL_SECONDS * 2 ** min(failures - 1, 10)))
@@ -409,7 +417,7 @@ class Relay:
         handled: list[int | str] = []
         for comment in sorted(comments, key=lambda c: (c["created_at"] or now, c["id"])):
             comment_id, body = comment["id"], comment["body"]
-            if not comment_id or comment_id in self.seen or comment_id in self.unanswered or REPLY_MARKER in body:
+            if not comment_id or comment_id in self.seen or comment_id in self.unanswered or _is_reply(body):
                 continue
             if not body.lstrip().startswith(COMMAND):
                 continue
@@ -451,7 +459,7 @@ class Relay:
         """Post the result lines on the control issue. A failed answer is tried again after a growing delay: once
         per poll at first, at most once every ten minutes, with one log line per try."""
         comment_id = comment["id"]
-        text = "\n".join([f"Factory relay for {comment.get('url') or comment_id} "
+        text = "\n".join([f"{REPLY_HEADER}{comment.get('url') or comment_id} "
                           f"(by {comment.get('author') or 'unknown'}):", *[f"- {line}" for line in lines]])
         try:
             await channel.reply(comment_id, text)
