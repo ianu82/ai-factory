@@ -18,7 +18,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Decision, Outcome, Task, User, Workspace
-from ..sandbox import host_capacity
+from ..sandbox import disk_report, host_capacity, purge_quarantine, quarantine_orphaned_jobs
 from .delivery import Stop, TaskRunner
 from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
@@ -35,6 +35,7 @@ HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_fa
 
 class Orchestrator:
     def __init__(self) -> None:
+        self._purge_task: asyncio.Task | None = None
         self.instance = f"{os.getpid()}"
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
@@ -52,6 +53,10 @@ class Orchestrator:
     def start(self) -> None:
         if self._loop_task is None:
             log.info("capacity %s", host_capacity())
+            trash = quarantine_orphaned_jobs()
+            if trash is not None:
+                log.info("moved job directories left by the previous run aside: %s", trash.name)
+            self._purge_task = asyncio.create_task(asyncio.to_thread(purge_quarantine), name="purge-jobs")
             self._recover()
             self._loop_task = asyncio.create_task(self._run(), name="orchestrator")
             from ..linear_sync import LinearSync
@@ -142,6 +147,11 @@ class Orchestrator:
     def log_inventory(self) -> None:
         """Operator visibility in the server log: open work, its state and what it waits on."""
         from ..models import Decision
+
+        try:
+            log.info("inventory disk %s", disk_report())
+        except OSError as exc:
+            log.warning("inventory disk unavailable: %s", exc)
 
         with session_scope() as s:
             open_outcomes = s.query(Outcome).filter(Outcome.status.notin_(["completed", "cancelled"])).all()
