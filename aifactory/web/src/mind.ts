@@ -1,4 +1,4 @@
-import type { MindCard, MindContext, MindEvent, MindHistory, MindMessage, MindStatus, MindThread, Role } from "./api";
+import type { MindCard, MindContext, MindEvent, MindHistory, MindMessage, MindStatus, MindStep, MindThread, Role } from "./api";
 
 /** Incremental UTF-8/SSE decoder; handles CR, LF, CRLF and multiline data. */
 export async function readMindSSE(response: Response, signal: AbortSignal, receive: (event: MindEvent) => void): Promise<void> {
@@ -70,6 +70,8 @@ export interface MindTransport {
   list(signal: AbortSignal): Promise<MindThread[]>;
   create(workspace: string, signal: AbortSignal): Promise<MindHistory>;
   history(thread: string, signal: AbortSignal): Promise<MindHistory>;
+  /** Whether Mind can answer for this workspace now (no thread needed). */
+  status?(workspace: string, signal: AbortSignal): Promise<MindStatus>;
   send(thread: string, body: { content: string; context: MindContext | null }, signal: AbortSignal, receive: (event: MindEvent) => void): Promise<void>;
   revise(thread: string, card: MindCard, fields: Record<string, string>, signal: AbortSignal): Promise<MindCard>;
   dismiss(thread: string, card: MindCard, signal: AbortSignal): Promise<MindCard>;
@@ -79,8 +81,10 @@ export interface MindState {
   userId: string | null; open: boolean; threads: MindThread[]; active: MindThread | null;
   messages: MindMessage[]; status: MindStatus | null; context: MindContext | null;
   busy: boolean; pendingCards: string[]; draft: string; progress: string; error: string; announcement: string; announcementId: number;
+  /** The current (or last) turn's steps and when it started, for the live "Working for" line and the rail. */
+  steps: MindStep[]; startedAt: number | null;
 }
-const initial = (userId: string | null): MindState => ({ userId, open: false, threads: [], active: null, messages: [], status: null, context: null, busy: false, pendingCards: [], draft: "", progress: "", error: "", announcement: "", announcementId: 0 });
+const initial = (userId: string | null): MindState => ({ userId, open: false, threads: [], active: null, messages: [], status: null, context: null, busy: false, pendingCards: [], draft: "", progress: "", error: "", announcement: "", announcementId: 0, steps: [], startedAt: null });
 export const mindPrivateKey = (userId: string) => ["mind", userId] as const;
 export function canConfirm(card: MindCard, roles: Record<string, Role>, pending: string[] = []): boolean {
   const role = roles[card.workspace_id];
@@ -166,24 +170,52 @@ export class MindController {
     await this.request((s) => this.transport.history(thread, s), (h) => this.load(h));
     if (generation === this.generation) this.update({ busy: false });
   }
+  /** Load whether Mind can answer for a workspace, before any conversation exists. */
+  async checkStatus(workspace: string) {
+    const status = this.transport.status;
+    if (!status) return;
+    await this.request((s) => status.call(this.transport, workspace, s), (value) => this.update({ status: value }));
+  }
+  /** Leave the current conversation (a new one starts on the next send). */
+  leave() { this.cancel(); this.update({ active: null, messages: [], error: "", steps: [], startedAt: null }); }
+  /** A new conversation that opens with the person's first message. Returns the new thread's id. */
+  async start(workspace: string, content: string): Promise<string | null> {
+    if (!content.trim()) return null;
+    await this.create(workspace);
+    const active = this.state.active;
+    if (!active) return null;
+    void this.send(content);
+    return active.id;
+  }
   async reload() { if (this.state.active) await this.select(this.state.active.id); else await this.list(); }
   async send(content: string) {
     const { active, context, status, busy } = this.state;
     if (!content.trim() || !active || busy || !status?.available || status.budget_state !== "ok") return;
-    this.update({ busy: true, draft: "", progress: "Thinking…", error: "", messages: [...this.state.messages, { id: `local-${Date.now()}`, role: "user", content: content.trim() }] });
+    const startedAt = Date.now();
+    this.update({ busy: true, draft: "", progress: "Thinking…", error: "", steps: [], startedAt, messages: [...this.state.messages, { id: `local-${startedAt}`, role: "user", content: content.trim() }] });
     const generation = this.generation;
     await this.request((signal) => this.transport.send(active.id, { content: content.trim(), context }, signal, (event) => {
       if (generation !== this.generation || signal.aborted) return;
       switch (event.type) {
         case "text_delta": this.update({ draft: this.state.draft + event.text }); break;
-        case "tool_start": this.update({ progress: `Reading ${event.name}…` }); break;
-        case "tool_result": this.update({ progress: `Read ${event.name}` }); break;
+        case "tool_start": this.update({ progress: stepLabel(event.name, false), steps: [...this.state.steps, { name: event.name, done: false }] }); break;
+        case "tool_result": {
+          const steps = [...this.state.steps];
+          const open = steps.findIndex((s) => s.name === event.name && !s.done);
+          const done = { name: event.name, done: true, citations: event.citations?.length || 0 };
+          if (open >= 0) steps[open] = done; else steps.push(done);
+          this.update({ progress: stepLabel(event.name, true), steps }); break;
+        }
         case "status": this.update({ status: event.status }); break;
         case "action_card": {
           // A proposal is inert. Only confirm() can call the action endpoint.
           this.update({ messages: [...this.state.messages, { id: `card-${event.card.id}`, role: "assistant", content: "", cards: [event.card] }] }); break;
         }
-        case "done": this.update({ active: event.thread, status: event.status, messages: [...this.state.messages.filter((m) => !m.id.startsWith("card-")), event.message], draft: "", announcement: `Mind: ${event.message.content}`, announcementId: this.state.announcementId + 1 }); break;
+        case "done": {
+          // The saved reply, with the steps and duration this browser watched.
+          const message = { ...event.message, steps: this.state.steps.length ? this.state.steps : event.message.steps, durationMs: Date.now() - startedAt };
+          this.update({ active: event.thread, status: event.status, messages: [...this.state.messages.filter((m) => !m.id.startsWith("card-")), message], draft: "", announcement: `Mind: ${event.message.content}`, announcementId: this.state.announcementId + 1 }); break;
+        }
         case "error": this.update({ error: event.message, ...(event.reason === "budget_exceeded" || event.reason === "pending_accounting" ? { status: { ...this.state.status!, budget_state: event.reason } } : {}) }); break;
       }
     }), () => {});
@@ -230,6 +262,36 @@ export function mindSuggestions(context: MindContext | null): string[] {
 }
 /** Only trusted in-app route shapes become router links. No protocol-relative URLs. */
 export function mindLink(url: string): "internal" | "external" | null {
-  if (/^\/w\/[^/?#]+\/(?:inbox|outcomes|runs|pulls|signals|decisions|settings)(?:[/?#]|$)/.test(url) && !/[\\\u0000-\u0020]/.test(url)) return "internal";
+  if (/^\/w\/[^/?#]+\/(?:inbox|outcomes|runs|pulls|signals|decisions|settings|mind)(?:[/?#]|$)/.test(url) && !/[\\\u0000-\u0020]/.test(url)) return "internal";
   try { const parsed = new URL(url); return parsed.protocol === "https:" || parsed.protocol === "http:" ? "external" : null; } catch { return null; }
+}
+
+/** What a Factory tool does, in the words a person uses. Unknown tools keep their own name. */
+const STEP_LABELS: Record<string, [string, string]> = {
+  overview: ["Checking the workspace overview", "Checked the workspace overview"],
+  list_outcomes: ["Looking through outcomes", "Looked through outcomes"],
+  list_tasks: ["Looking through tasks", "Looked through tasks"],
+  outcome_detail: ["Reading an outcome", "Read an outcome"],
+  open_decisions: ["Checking open decisions", "Checked open decisions"],
+  runs: ["Reading recent runs", "Read recent runs"],
+  recent_events: ["Reading recent activity", "Read recent activity"],
+  pull_requests: ["Checking pull requests", "Checked pull requests"],
+  propose_send_guidance: ["Drafting guidance for your approval", "Drafted guidance for your approval"],
+  propose_answer_question: ["Drafting an answer for your approval", "Drafted an answer for your approval"],
+  propose_retry_task: ["Preparing a retry for your approval", "Prepared a retry for your approval"],
+  propose_resolve_decision: ["Preparing a decision for your approval", "Prepared a decision for your approval"],
+  propose_create_outcome: ["Drafting a new outcome for your approval", "Drafted a new outcome for your approval"],
+};
+export function stepLabel(name: string, done: boolean): string {
+  const known = STEP_LABELS[name];
+  if (known) return known[done ? 1 : 0];
+  const words = name.replace(/^propose_/, "").replace(/_/g, " ");
+  return name.startsWith("propose_") ? `${done ? "Prepared" : "Preparing"} ${words} for your approval` : `${done ? "Used" : "Using"} ${words}`;
+}
+export function formatDuration(ms: number | null | undefined): string | null {
+  if (ms == null || ms < 0) return null;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }

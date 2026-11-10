@@ -495,13 +495,17 @@ export interface MindCard {
   effect?: string;
   result?: { text: string; citations?: MindCitation[] };
 }
+/** One thing Mind did during a turn: a Factory read or a proposal, by tool name. */
+export interface MindStep { name: string; done: boolean; citations?: number }
 export interface MindMessage {
   id: string; role: "user" | "assistant"; content: string;
   citations?: MindCitation[]; cards?: MindCard[];
+  /** The turn's steps; durationMs only when this browser timed the turn. */
+  steps?: MindStep[]; durationMs?: number; failed?: boolean;
 }
 export interface MindThread {
   id: string; title: string; workspace_id: string;
-  cost_usd: number | null; cost_known: boolean;
+  cost_usd: number | null; cost_known: boolean; updated_at?: string;
 }
 export interface MindStatus {
   model: string | null; available: boolean; reason?: string;
@@ -510,7 +514,8 @@ export interface MindStatus {
 export interface MindHistory { thread: MindThread; messages: MindMessage[]; status: MindStatus }
 export type MindEvent =
   | { type: "text_delta"; text: string }
-  | { type: "tool_start" | "tool_result"; name: string }
+  | { type: "tool_start"; name: string }
+  | { type: "tool_result"; name: string; citations?: MindCitation[] }
   | { type: "action_card"; card: MindCard }
   | { type: "status"; status: MindStatus }
   | { type: "done"; message: MindMessage; thread: MindThread; status: MindStatus }
@@ -527,11 +532,12 @@ export interface MindWireCard {
 }
 export interface MindWireThread {
   id: string; title: string; billing_workspace_id: string; model_id: string | null;
-  status: string; cost: { usd: number | null; known: boolean };
+  status: string; cost: { usd: number | null; known: boolean }; updated_at?: string;
 }
 export interface MindWireMessage {
   id: string; role: "user" | "assistant"; text: string;
   citations: MindWireCitation[]; action_cards: MindWireCard[]; status: string;
+  steps?: { name: string }[];
 }
 export interface MindWireHistory { thread: MindWireThread; messages: MindWireMessage[] }
 export interface MindWireStatus { status: "ready" | "unavailable"; model_id: string | null; reason?: string }

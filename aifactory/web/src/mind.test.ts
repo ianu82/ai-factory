@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MindController, canConfirm, mindCost, mindLink, mindPrivateKey, mindRouteContext, mindSuggestions, readMindSSE, validMindBudget, type MindTransport } from "./mind.ts";
+import { MindController, canConfirm, formatDuration, mindCost, mindLink, mindPrivateKey, mindRouteContext, mindSuggestions, readMindSSE, stepLabel, validMindBudget, type MindTransport } from "./mind.ts";
 import type { MindCard, MindEvent, MindHistory } from "./api.ts";
 
 const card: MindCard = { id: "c1", revision: 1, kind: "create_outcome", workspace_id: "target", title: "Create outcome", fields: { title: "Original", brief: "A brief" }, status: "proposed" };
@@ -244,7 +244,7 @@ test("token/tool progress is visual only; completion announces once; terminal bu
     receive({ type: "tool_start", name: "read_runs" });
     assert.equal(c.getSnapshot().announcement, "");
     assert.equal(c.getSnapshot().draft, "Some more");
-    assert.match(c.getSnapshot().progress, /read_runs/);
+    assert.match(c.getSnapshot().progress, /read runs/);
     receive(done);
   };
   await c.send("question");
@@ -278,22 +278,45 @@ test("identical consecutive completions each get a new live-region identity, nev
   assert.equal(c.getSnapshot().announcementId, 0);
 });
 
-test("mobile sheet and backdrop stack below shared modals regardless of mount order", async () => {
+test("Mind's floating controls stay below shared modals", async () => {
   const { readFile } = await import("node:fs/promises");
-  const dockStyles = await readFile(new URL("./components/MindDock.css", import.meta.url), "utf8");
+  const mindStyles = await readFile(new URL("./components/mind/Mind.css", import.meta.url), "utf8");
   const sharedStyles = await readFile(new URL("./styles.css", import.meta.url), "utf8");
-  const mobileStyles = dockStyles.slice(dockStyles.indexOf("@media (max-width: 760px)"));
   const layer = (styles: string, selector: string) => {
     const rule = styles.split(`${selector} {`)[1]?.split("}")[0];
     const value = rule?.match(/z-index:\s*(\d+)/)?.[1];
     assert.ok(value, `${selector} must declare a stacking layer`);
     return Number(value);
   };
-  const backdrop = layer(mobileStyles, ".mind-scrim");
-  const sheet = layer(mobileStyles, ".mind-dock");
-  const modal = layer(sharedStyles, ".scrim");
-  assert.ok(backdrop < sheet, "Mind controls must be above their own backdrop");
-  assert.ok(sheet < modal, "the modal owning focus must not be covered by Mind");
+  assert.ok(layer(mindStyles, ".mind-jump") < layer(sharedStyles, ".scrim"), "a modal owning focus must not be covered by Mind");
+});
+
+test("a turn records the steps Mind took and how long it worked, and labels tools in plain words", async () => {
+  const { controller: c, transport } = harness(); await c.create("billing");
+  transport.send = async (_thread, _body, _signal, receive) => {
+    receive({ type: "tool_start", name: "open_decisions" });
+    assert.deepEqual(c.getSnapshot().steps, [{ name: "open_decisions", done: false }]);
+    assert.equal(c.getSnapshot().progress, "Checking open decisions");
+    receive({ type: "tool_result", name: "open_decisions", citations: [{ label: "Retry?", url: "/w/a/inbox" }] });
+    receive({ type: "tool_start", name: "outcome_detail" });
+    receive({ type: "tool_result", name: "outcome_detail" });
+    receive(done);
+  };
+  await c.send("What needs me?");
+  const reply = c.getSnapshot().messages.at(-1)!;
+  assert.deepEqual(reply.steps, [{ name: "open_decisions", done: true, citations: 1 }, { name: "outcome_detail", done: true, citations: 0 }]);
+  assert.equal(typeof reply.durationMs, "number");
+  assert.equal(stepLabel("propose_retry_task", false), "Preparing a retry for your approval");
+  assert.equal(stepLabel("brand_new_tool", true), "Used brand new tool");
+  assert.equal(stepLabel("propose_rename_thing", true), "Prepared rename thing for your approval");
+  assert.equal(formatDuration(12_400), "12s");
+  assert.equal(formatDuration(125_000), "2m 5s");
+  assert.equal(formatDuration(null), null);
+});
+
+test("Mind pages are trusted in-app links", () => {
+  assert.equal(mindLink("/w/ws1/mind/t1"), "internal");
+  assert.equal(mindLink("/w/ws1/mind"), "internal");
 });
 
 test("mobile focus trap yields Escape, Tab, focus and restoration to another modal", async () => {

@@ -248,7 +248,10 @@ def thread_view(db, thread):
 
 def message_view(row, history=False):
     keys = ("id", "thread_id", "role", "text", "context", "citations", "action_cards", "status", "created_at")
-    return {k: getattr(row, k) for k in keys} | ({"history": row.history} if history else {})
+    # The tools a reply used, by name only: the page shows them as the reply's steps.
+    tools = (row.history or {}).get("tools") if isinstance(row.history, dict) else None
+    steps = [{"name": str(t.get("name") or "")} for t in tools or [] if isinstance(t, dict) and t.get("name")]
+    return {k: getattr(row, k) for k in keys} | {"steps": steps} | ({"history": row.history} if history else {})
 
 
 def transcript(db, thread, history=False):
