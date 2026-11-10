@@ -374,7 +374,42 @@ class Decision(Base):
     attribution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     reusable: Mapped[bool] = mapped_column(Boolean, default=False)
     scope: Mapped[str] = mapped_column(String(30), default="item")  # item|repository|workspace
+    # Absent on legacy questions: judges must not infer that missing safety data means safe.
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    review: Mapped["DecisionReview | None"] = relationship(
+        foreign_keys="DecisionReview.decision_id", uselist=False, lazy="selectin")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DecisionReview(Base):
+    """One durable judge processing slot per question; reports stay structured JSON.
+
+    A correction is a separate attributed Decision, never an edit of the cited answer.
+    Question fingerprints let workers discard results for an obsolete revision.
+    """
+
+    __tablename__ = "decision_reviews"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    decision_id: Mapped[str] = mapped_column(ForeignKey("decisions.id"), unique=True)
+    state: Mapped[str] = mapped_column(String(20), default="pending")
+    question_revision: Mapped[int] = mapped_column(Integer, default=1)
+    question_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
+    mode: Mapped[str] = mapped_column(String(20), default="decide")
+    proposed_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    effective_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    answer: Mapped[str] = mapped_column(Text, default="")
+    resolution: Mapped[str] = mapped_column(String(60), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    citations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    closest_decisions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    correction_decision_id: Mapped[str | None] = mapped_column(ForeignKey("decisions.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Message(Base):
