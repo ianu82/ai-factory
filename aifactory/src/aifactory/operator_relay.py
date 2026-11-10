@@ -114,6 +114,23 @@ def item_error(kind: str, item: Any) -> str | None:
     return None
 
 
+async def _permission(gh, repository: str, login: str) -> str | None:
+    """The login's current permission on the repository. Only "not a collaborator" (404) is a definite no; a rate
+    limit or an outage raises, so the command is retried on the next poll instead of being refused for good."""
+    from urllib.parse import quote
+
+    from .github import GitHubError
+
+    try:
+        data = await gh.request("GET", f"/repos/{repository}/collaborators/{quote(login, safe='')}/permission")
+    except GitHubError as exc:
+        if exc.status == 404:
+            return None
+        raise
+    permission = data.get("permission") if isinstance(data, dict) else None
+    return permission if isinstance(permission, str) else None
+
+
 def _time(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
@@ -256,7 +273,7 @@ class Relay:
         created = _time(comment.get("created_at"))
         if created is None or now - created > MAX_AGE:
             return ["not applied: first seen more than 24 hours after it was written"]
-        permission = await gh.repository_author_permission(cfg["repository"], login)
+        permission = await _permission(gh, cfg["repository"], login)
         if permission not in WRITE:
             return [f"not applied: {login} has no write access to {cfg['repository']}"]
         items, error = parse(str(comment.get("body") or ""))

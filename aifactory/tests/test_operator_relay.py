@@ -25,19 +25,24 @@ class FakeGH:
     comments: list[dict] = []
     replies: list[str] = []
     permissions: dict[str, str] = {}
+    rate_limited = False
     lists = 0
 
     def __init__(self, token):
         pass
 
     async def request(self, method, path, *, params=None, **_):
-        assert method == "GET" and path == "/repos/acme/app/issues/5/comments" and params["since"]
+        assert method == "GET"
+        if path.startswith("/repos/acme/app/collaborators/") and path.endswith("/permission"):
+            if FakeGH.rate_limited:
+                raise github_module.GitHubError("API rate limit exceeded", 403)
+            login = path.split("/")[-2]
+            if login not in FakeGH.permissions:
+                raise github_module.GitHubError("Not Found", 404)
+            return {"permission": FakeGH.permissions[login]}
+        assert path == "/repos/acme/app/issues/5/comments" and params["since"]
         FakeGH.lists += 1
         return list(FakeGH.comments)
-
-    async def repository_author_permission(self, full_name, author):
-        assert full_name == "acme/app"
-        return FakeGH.permissions.get(author)
 
     async def comment(self, full_name, number, body):
         assert (full_name, number) == ("acme/app", 5)
@@ -92,6 +97,7 @@ def factory(monkeypatch):
     monkeypatch.setattr(github_module, "GitHub", FakeGH)
     monkeypatch.setattr(github_module, "resolve_credential", lambda workspace_id: "token")
     FakeGH.comments, FakeGH.replies, FakeGH.permissions, FakeGH.lists = [], [], {"ianu82": "admin"}, 0
+    FakeGH.rate_limited = False
     return ids
 
 
@@ -137,6 +143,26 @@ def test_commands_from_others_without_write_access_or_too_old_do_not_apply(facto
     assert poll() == [4]
     assert decision_state() == ("open", "")
     assert "ianu82 has no write access to acme/app" in FakeGH.replies[-1]
+
+
+def test_a_rate_limited_permission_check_retries_instead_of_refusing(factory):
+    FakeGH.rate_limited = True
+    FakeGH.comments = [command(14, REQUEST_CHANGES)]
+    relay = Relay()
+    with pytest.raises(github_module.GitHubError):
+        poll(relay)
+    assert FakeGH.replies == [] and decision_state() == ("open", "")
+    FakeGH.rate_limited = False
+    assert poll(relay) == [14]
+    assert decision_state() == ("resolved", "reject")
+
+
+def test_a_login_that_is_not_a_collaborator_is_refused(factory):
+    FakeGH.permissions = {}
+    FakeGH.comments = [command(15, REQUEST_CHANGES)]
+    assert poll() == [15]
+    assert decision_state() == ("open", "")
+    assert "ianu82 has no write access" in FakeGH.replies[0]
 
 
 def test_plain_comments_are_ignored_and_bad_commands_are_answered(factory):
