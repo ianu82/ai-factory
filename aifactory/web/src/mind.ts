@@ -181,6 +181,10 @@ export class MindController {
   /** A new conversation that opens with the person's first message. Returns the new thread's id. */
   async start(workspace: string, content: string): Promise<string | null> {
     if (!content.trim()) return null;
+    // Check first, so a refused first message never leaves an empty conversation behind.
+    await this.checkStatus(workspace);
+    const ready = this.state.status;
+    if (this.transport.status && (!ready?.available || ready.budget_state !== "ok")) return null;
     await this.create(workspace);
     const { active, status } = this.state;
     // Open the conversation only when its first message can actually be sent.

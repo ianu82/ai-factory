@@ -26,7 +26,8 @@ export function MindNav({ workspaceId }: { workspaceId: string }) {
     return () => document.removeEventListener("keydown", onKey);
   }, [navigate, base]);
   if (!state.userId) return null;
-  const threads = state.threads.slice(0, SHOWN);
+  const started = state.threads.filter((t) => t.title); // a conversation without a first message is not listed
+  const threads = started.slice(0, SHOWN);
   return <div className="mind-nav">
     <div className="mind-nav-row">
       <NavLink to={`${base}/mind`} end className={({ isActive }) => `nav-item${isActive || onHome ? " active" : ""}`}><Brain /> My Mind</NavLink>
@@ -38,7 +39,7 @@ export function MindNav({ workspaceId }: { workspaceId: string }) {
           {t.title || "Untitled conversation"}
         </NavLink>
       </li>)}
-      {state.threads.length > SHOWN && <li><NavLink to={`${base}/mind`} end className="mind-nav-thread more">All conversations</NavLink></li>}
+      {started.length > SHOWN && <li><NavLink to={`${base}/mind`} end className="mind-nav-thread more">All conversations</NavLink></li>}
     </ul>}
   </div>;
 }

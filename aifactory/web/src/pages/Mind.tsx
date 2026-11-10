@@ -65,7 +65,7 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
     else composer.current?.fill(text); // nothing was sent: keep the person's words
   };
   const checking = !state.status;
-  const recent = state.threads.slice(0, 12);
+  const recent = state.threads.filter((t) => t.title).slice(0, 12); // a conversation without a first message is not one yet
   return <div className="mind-home">
     <div className="mind-home-column">
       <h1>My Mind</h1>
@@ -139,7 +139,8 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
             disabled={loading || failed || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
         </div>
       </div>
-      <div className="sr" aria-live="polite">{state.announcement}</div>
+      {/* Keyed by completion, so two identical replies are each announced. */}
+      <div className="sr" aria-live="polite"><span key={state.announcementId}>{state.announcement}</span></div>
     </div>
     <MindRail messages={state.messages} busy={state.busy} steps={state.steps} startedAt={state.startedAt}
       workspace={workspaces.find((w) => w.id === state.active?.workspace_id)?.name} cost={state.active ? mindCost(state.active) : null} />

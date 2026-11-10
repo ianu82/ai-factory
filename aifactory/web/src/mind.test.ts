@@ -460,10 +460,17 @@ test("wire unavailable, accounting and budget codes map to explicit blocked stat
 test("a new conversation opens only when its first message can be sent", async () => {
   const { controller: c, transport } = harness();
   transport.create = async () => ({ ...history(), messages: [], status: { model: null, available: false, reason: "Add a key", budget_state: "ok" } });
-  let sent = false;
+  let sent = false, created = 0;
   transport.send = async () => { sent = true; };
   assert.equal(await c.start("billing", "Hello"), null);
   assert.equal(sent, false);
+  // With a status check, an unavailable Mind creates no conversation at all.
+  transport.status = async () => ({ model: null, available: false, reason: "Add a key", budget_state: "ok" });
+  const create = transport.create;
+  transport.create = async (...args) => { created++; return create(...args); };
+  assert.equal(await c.start("billing", "Hello"), null);
+  assert.equal(created, 0);
+  transport.status = async () => history().status;
   transport.create = async () => ({ ...history(), messages: [] });
   assert.equal(await c.start("billing", "Hello"), "t1");
 });
