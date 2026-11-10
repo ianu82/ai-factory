@@ -166,12 +166,11 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     if pending_events is not None:
         pending_events.extend(completed)
         pending_events.append(payload)
-        # Keep this on the object timeline even when retry has no guidance text.
-        if action_id and resolution == "retry" and outcome:
+        # Keep a retry without guidance text on the object timeline. With text, guidance() already posted it.
+        if action_id and resolution == "retry" and outcome and not comment.strip():
             db.add(Message(workspace_id=decision.workspace_id, outcome_id=outcome.id,
                            task_id=decision.task_id, author_id=user.id, author_kind="user",
-                           body="Retried task" + (f": {comment.strip()}" if comment.strip() else "."),
-                           attribution=decision.attribution))
+                           body="Retried task.", attribution=decision.attribution))
     else:
         db.commit()
         from .work_services import publish_changes

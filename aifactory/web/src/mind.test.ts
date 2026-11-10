@@ -158,6 +158,46 @@ test("failed confirms release pending state and errors are visible; retry requir
   await c.send("try again");
   assert.equal(calls.some((call) => call.name === "confirm"), false);
 });
+test("a thread list that recovers on reload clears its earlier error", async () => {
+  const { controller: c, transport } = harness();
+  const list = transport.list;
+  transport.list = async () => { throw new Error("Could not load threads"); };
+  await c.list();
+  assert.match(c.getSnapshot().error, /Could not load threads/);
+  transport.list = list;
+  await c.reload();
+  assert.equal(c.getSnapshot().error, "");
+  assert.equal(c.getSnapshot().threads.length, 1);
+});
+test("a thread list that completes later keeps a newer error from another action", async () => {
+  const { controller: c, transport } = harness();
+  await c.create("billing");
+  transport.list = async () => { throw new Error("Could not load threads"); };
+  await c.list();
+  let release = () => {};
+  transport.list = () => new Promise((resolve) => { release = () => resolve([history().thread]); });
+  const pending = c.list();
+  transport.confirm = async () => { throw new Error("Permission changed"); };
+  await c.confirm(card);
+  assert.match(c.getSnapshot().error, /Permission changed/);
+  release();
+  await pending;
+  assert.match(c.getSnapshot().error, /Permission changed/);
+  assert.equal(c.getSnapshot().threads.length, 1);
+});
+test("an older thread list that finishes after a newer one failed leaves the newer failure", async () => {
+  const { controller: c, transport } = harness();
+  let release = () => {};
+  transport.list = () => new Promise((resolve) => { release = () => resolve([history().thread]); });
+  const older = c.list();
+  transport.list = async () => { throw new Error("Could not load threads"); };
+  await c.list();
+  assert.match(c.getSnapshot().error, /Could not load threads/);
+  release();
+  await older;
+  assert.match(c.getSnapshot().error, /Could not load threads/);
+  assert.equal(c.getSnapshot().threads.length, 0);
+});
 test("budget validation allows zero/nonnegative finite values, rejects empty/negative/nonfinite", () => {
   for (const value of ["0", "10", "0.001", "100.50"]) assert.equal(validMindBudget(value), true);
   for (const value of ["", " ", "-1", "Infinity", "NaN", "1e999", "bad"]) assert.equal(validMindBudget(value), false);

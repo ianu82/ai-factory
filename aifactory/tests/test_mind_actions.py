@@ -241,3 +241,14 @@ def test_object_http_views_keep_real_actor_with_mind_label(client, world):
     assert view["messages"][0]["author"] == "Alice via Mind"
     event = next(e for e in view["events"] if e["kind"] == "decision_resolved")
     assert event["actor"] == users[0].id and "Alice via Mind" in event["message"]
+
+
+@pytest.mark.parametrize("text", ["Please continue", ""])
+def test_confirmed_retry_records_one_timeline_message(world, text):
+    db, users, work = world
+    ws, o, t, _, unblock, *_ = work[0]
+    ctx = Context(db, users[0].id, "thread")
+    args = {"workspace_id": ws.id, "outcome_id": o.id, "task_id": t.id, "decision_id": unblock.id}
+    card = propose("propose_retry_task", {**args, "text": text} if text else args, ctx)
+    assert confirm(ctx, card["id"], 1)["status"] == "succeeded"
+    assert [m.body for m in db.query(Message)] == [text or "Retried task."]

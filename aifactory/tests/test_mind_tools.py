@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from aifactory.db import SessionLocal
-from aifactory.mind.tools import Context, REGISTRY, read_call
+from aifactory.mind.tools import MAX_ITEMS, Context, REGISTRY, clean, read_call
 from aifactory.models import Decision, Event, Membership, Organization, Outcome, Plan, Repository, Run, Task, User, Workspace
 
 SECRET = "sk-" + "s" * 40
@@ -128,3 +128,22 @@ def test_running_ci_is_waiting_and_explicit_run_scope(world):
     assert counts["waiting"] == counts["waiting_ci"] == 1 and counts["running"] == 0
     with pytest.raises(HTTPException):
         read_call("runs", {"workspace_id": ws.id, "run_id": work[1][5].id}, context)
+
+
+def test_objects_are_bounded_like_lists():
+    state = [False]
+    result = clean({f"key{i}": {"nested": list(range(3))} for i in range(5000)}, state)
+    assert len(result) == MAX_ITEMS and state[0]
+    small = [False]
+    assert clean({"a": 1}, small) == {"a": 1} and not small[0]
+
+
+def test_a_task_with_huge_evidence_reads_bounded_and_truncated(world):
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    t.evidence = {f"check{i}": "x" * 100 for i in range(5000)}
+    db.commit()
+    detail = read_call("outcome_detail", {"workspace_id": ws.id, "outcome_id": o.id}, Context(db, users[0].id))
+    evidence = detail["items"][0]["tasks"][0]["evidence"]
+    assert len(evidence) == MAX_ITEMS
+    assert detail["truncated"]
