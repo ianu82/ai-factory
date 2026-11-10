@@ -124,6 +124,9 @@ class World:
                                              "commits": [{"sha": c} for c in self.line]})
         if path.startswith(f"{base}/compare/{OLD}...") and path.split("...")[-1] in self.line:
             return httpx.Response(200, json={"status": "ahead", "files": [{"filename": f} for f in self.files]})
+        if path == f"{base}/commits" and method == "GET":
+            assert params.get("sha") == NEW
+            return httpx.Response(200, json=[{"sha": c} for c in reversed(self.line)] + [{"sha": OLD}])
         if path == f"{base}/compare/{NEW}...main":
             return httpx.Response(200, json={"status": self.on_main})
         if path.startswith(f"{base}/commits/") and path.endswith("/check-runs"):
@@ -230,14 +233,16 @@ def test_a_busy_main_still_releases_the_newest_commit_staging_has_run_long_enoug
     assert NEW in world.staged  # this run recorded when staging started NEW
 
 
-def test_commits_never_seen_alone_count_from_the_earliest_later_observation(world):
+def test_only_commits_staging_deployed_are_candidates(world):
+    # EARLY never ran on staging by itself (it may be a side-branch commit of a merge): never promoted, even
+    # though later commits that contain it soaked; MID needs its own 30 minutes.
     world.line = [EARLY, MID, NEW]
     world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
-    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=20))}"  # MID: only 20 minutes
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=20))}"
     result = world.run()
     assert result.status == "held" and "long enough" in result.detail
     assert world.patches == []
-    world.clock.sleep(15 * 60)  # MID (and EARLY, contained in it) now soaked 35 minutes
+    world.clock.sleep(15 * 60)  # MID now on staging for 35 minutes
     assert world.run().status == "promoted"
     assert world.patches == [{"sha": MID, "force": False}]
 

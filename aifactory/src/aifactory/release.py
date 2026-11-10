@@ -262,6 +262,24 @@ class Releaser:
         if response.status_code not in (200, 201):
             raise ReleaseError(f"Recording staging for {sha[:7]}: HTTP {response.status_code}")
 
+    def _recent_commits(self, head: str, stop: str) -> list[str]:
+        """Commits from head back to (not including) stop, newest first, at most candidate_window of them.
+        The commits list is newest-first and paged, unlike compare, which caps at 250 and orders oldest-first."""
+        found: list[str] = []
+        for page in range(1, 4):
+            response = self._gh("GET", f"/repos/{self.cfg.repo}/commits",
+                                params={"sha": head, "per_page": 100, "page": page})
+            if response.status_code != 200:
+                raise ReleaseError(f"Listing commits from {head[:7]}: HTTP {response.status_code}")
+            batch = [c.get("sha") for c in response.json() if c.get("sha")]
+            for sha in batch:
+                if sha == stop or len(found) >= self.cfg.candidate_window:
+                    return found or [head]
+                found.append(sha)
+            if len(batch) < 100:
+                break
+        return found or [head]
+
     def _open_issues(self, **params: Any) -> list[dict[str, Any]]:
         response = self._gh("GET", f"/repos/{self.cfg.repo}/issues", params={"state": "open", "per_page": 100, **params})
         if response.status_code != 200:
@@ -469,21 +487,17 @@ class Releaser:
         self._note_staged(candidate, started)
 
         # Merges keep replacing staging's commit, so waiting for its current commit to soak would starve releases
-        # while the Factory is busy. Promote the newest commit that has been on staging for the soak period,
-        # counting the time staging ran it or any later commit (which contains it).
-        line = [c.get("sha") for c in compare.get("commits") or [] if c.get("sha")][-cfg.candidate_window:]
-        if not line or line[-1] != candidate:
-            line.append(candidate)
-        earliest: datetime | None = None
-        soaked_since: dict[str, datetime | None] = {}
-        for sha in reversed(line):
-            since = started if sha == candidate else self._staged_since(sha)
-            if since is not None and (earliest is None or since < earliest):
-                earliest = since
-            soaked_since[sha] = earliest
+        # while the Factory is busy. Promote the newest commit staging actually deployed (it has its own
+        # factory/staging record, so it is a tree staging ran, never a side-branch commit) whose code has been on
+        # staging for the soak period: since staging started it, every later commit staging ran contains it.
+        line = self._recent_commits(candidate, current)
+        soaked_since: dict[str, datetime | None] = {
+            sha: started if sha == candidate else self._staged_since(sha) for sha in line}
         chosen, reasons = None, []
-        for sha in reversed(line):
+        for sha in line:
             since = soaked_since[sha]
+            if since is None:
+                continue  # never deployed on staging by itself
             minutes = self._minutes_since(since) or 0.0 if since else 0.0
             if minutes < cfg.soak_minutes:
                 reasons.append(f"{sha[:7]} {minutes:.0f}/{cfg.soak_minutes} min")
@@ -493,6 +507,9 @@ class Releaser:
                 continue
             if sha != candidate:
                 part = self._compare(current, sha)
+                if part.get("status") != "ahead":
+                    reasons.append(f"{sha[:7]} is not a fast-forward of {cfg.branch}")
+                    continue
                 part_files = [f.get("filename", "") for f in part.get("files") or []]
                 if len(part_files) < COMPARE_FILE_LIMIT and not any(f.startswith(cfg.paths) for f in part_files):
                     return Result("nothing", f"No Factory code changed up to the newest soaked commit {sha[:7]}.",
@@ -516,8 +533,8 @@ class Releaser:
             if len(line) == 1 and ran < cfg.soak_minutes:
                 return Result("held", f"Staging has run {candidate[:7]} for {ran:.0f} of {cfg.soak_minutes} minutes.",
                               candidate, current)
-            soaked = any((self._minutes_since(soaked_since[sha]) or 0.0) >= cfg.soak_minutes
-                         for sha in line if soaked_since[sha] is not None)
+            soaked = any((self._minutes_since(since) or 0.0) >= cfg.soak_minutes
+                         for since in soaked_since.values() if since is not None)
             lead = "Nothing releasable yet" if soaked else "No commit has been on staging long enough yet"
             return Result("held", f"{lead}: " + "; ".join(reasons[:6]), candidate, current)
 
