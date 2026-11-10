@@ -106,7 +106,8 @@ export interface CredentialsResponse {
 
 export interface Settings {
   provider: "mindshub" | "openai";
-  models: { default?: string; planner?: string; builder?: string; verifier?: string };
+  decision_judges: DecisionJudgeMode;
+  models: { default?: string; planner?: string; builder?: string; verifier?: string; judge?: string };
   harness: { builder: string; verifier: string; planner: string };
   concurrency: number;
   planning_concurrency?: number;
@@ -296,7 +297,44 @@ export interface Run {
   task_key?: string | null;
 }
 
+export type DecisionJudgeMode = "off" | "suggest" | "decide";
+export type DecisionJudgeVerdict = "decide" | "send_back" | "hold";
+export interface DecisionJudgeCitation {
+  decision_id: string;
+  passage: string;
+}
+export interface DecisionJudgeReport {
+  verdict: DecisionJudgeVerdict;
+  resolution: string;
+  answer: string;
+  summary: string;
+  citations: DecisionJudgeCitation[];
+  closest_decisions: string[];
+}
+export interface DecisionReview {
+  id: string;
+  state: string;
+  question_revision: number;
+  question_fingerprint: string;
+  run_id: string | null;
+  mode: DecisionJudgeMode;
+  proposed_verdict: DecisionJudgeVerdict | null;
+  effective_verdict: DecisionJudgeVerdict | null;
+  answer: string;
+  resolution: string;
+  summary: string;
+  citations: DecisionJudgeCitation[];
+  closest_decisions: string[];
+  report: Partial<DecisionJudgeReport>;
+  correction_decision_id: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 export interface Decision {
+  judge: DecisionReview | null;
   id: string;
   kind: string;
   title: string;

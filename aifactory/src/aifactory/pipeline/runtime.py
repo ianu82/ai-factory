@@ -26,6 +26,7 @@ from .attachments import prepare_attachments
 DEFAULT_SETTINGS: dict[str, Any] = {
     "review": DEFAULT_REVIEW,
     "provider": "mindshub",
+    "decision_judges": "decide",
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
@@ -284,7 +285,8 @@ def outcome_cost(outcome_id: str) -> tuple[float, bool]:
 
 
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,
-                  task_id: str | None = None, options: list[dict[str, Any]] | None = None) -> str:
+                  task_id: str | None = None, options: list[dict[str, Any]] | None = None,
+                  metadata: dict[str, Any] | None = None) -> str:
     with session_scope() as s:
         existing = (s.query(Decision)
                     .filter(Decision.workspace_id == workspace_id, Decision.kind == kind, Decision.status == "open",
@@ -292,12 +294,13 @@ def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcom
         if existing:
             existing.body = body
             existing.title = title
+            existing.metadata_json = metadata
             if options is not None:
                 existing.options = options
             decision_id = existing.id
         else:
             decision = Decision(workspace_id=workspace_id, kind=kind, title=title, body=body,
-                                outcome_id=outcome_id, task_id=task_id, options=options or [])
+                                outcome_id=outcome_id, task_id=task_id, options=options or [], metadata_json=metadata)
             s.add(decision)
             s.flush()
             decision_id = decision.id

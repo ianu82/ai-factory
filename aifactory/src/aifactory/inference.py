@@ -69,6 +69,7 @@ class ModelSelection:
     planner: str
     builder: str
     verifier: str
+    judge: str
 
 
 def workspace_models(settings: dict[str, Any]) -> ModelSelection:
@@ -78,6 +79,7 @@ def workspace_models(settings: dict[str, Any]) -> ModelSelection:
         planner=models.get("planner") or default,
         builder=models.get("builder") or default,
         verifier=models.get("verifier") or default,
+        judge=models.get("judge") or default,
     )
 
 

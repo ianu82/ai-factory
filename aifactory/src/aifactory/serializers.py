@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .models import Artifact, Decision, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace, Workstream
+from .models import Artifact, Decision, DecisionReview, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace, Workstream
 
 
 def ts(value: datetime | None) -> str | None:
@@ -107,6 +107,16 @@ def outcome(o: Outcome, tasks: list[Task] | None = None, runs: list[Run] | None 
                       for t in sorted(tasks, key=lambda t: t.key)]}
 
 
+def judge(r: DecisionReview) -> dict[str, Any]:
+    return {"id": r.id, "state": r.state, "question_revision": r.question_revision,
+            "question_fingerprint": r.question_fingerprint, "run_id": r.run_id, "mode": r.mode,
+            "proposed_verdict": r.proposed_verdict, "effective_verdict": r.effective_verdict,
+            "answer": r.answer, "resolution": r.resolution, "summary": r.summary,
+            "citations": r.citations, "closest_decisions": r.closest_decisions, "report": r.report,
+            "correction_decision_id": r.correction_decision_id, "created_at": ts(r.created_at),
+            "updated_at": ts(r.updated_at), "started_at": ts(r.started_at), "finished_at": ts(r.finished_at)}
+
+
 def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, Any]:
     attribution = d.attribution or {}
     context = dict(context or {})
@@ -118,6 +128,7 @@ def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, An
     return {"attribution": attribution, "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,
             "resolved_at": ts(d.resolved_at), "reusable": d.reusable, "scope": d.scope,
+            "judge": judge(d.review) if d.review and d.review.workspace_id == d.workspace_id else None,
             "outcome_id": d.outcome_id, "task_id": d.task_id, "created_at": ts(d.created_at), **(context or {})}
 
 
