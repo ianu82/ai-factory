@@ -157,8 +157,41 @@ def test_a_malformed_item_fails_alone(factory):
     assert poll() == [12]
     with session_scope() as s:
         assert [m.body for m in s.query(Message).all()] == ["Still delivered."]
-    assert "guidance item 1: not applied, ValueError" in FakeGH.replies[0]
+    assert "guidance item 1: not applied, outcome must be an outcome number" in FakeGH.replies[0]
     assert "guidance #7 T1: posted" in FakeGH.replies[0]
+
+
+def test_an_unexpected_failure_leaves_the_command_for_the_next_poll(factory, monkeypatch):
+    from aifactory import bootstrap
+
+    real, calls = bootstrap._guidance_delegated, []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(bootstrap, "_guidance_delegated", flaky)
+    FakeGH.comments = [command(13, {"guidance": [{"outcome": 7, "task": "T1", "body": "Once."}]})]
+    relay = Relay()
+    with pytest.raises(RuntimeError):
+        poll(relay)
+    assert FakeGH.replies == []  # not answered and not marked handled
+    assert poll(relay) == [13]
+    assert "guidance #7 T1: posted" in FakeGH.replies[0]
+    with session_scope() as s:
+        assert [m.body for m in s.query(Message).all()] == ["Once."]
+
+
+def test_item_errors_name_what_is_malformed():
+    from aifactory.operator_relay import item_error
+
+    assert item_error("resolve", {"outcome": 7, "kind": "approve_merge", "resolution": "reject"}) is None
+    assert item_error("resolve", {"outcome": 7, "kind": "approve_merge"}) == "a resolve item needs kind and resolution"
+    assert item_error("guidance", {"outcome": 7, "body": "x", "task": 1}) == "task must be a string"
+    assert item_error("retry", {"key": "dup"}) is None and item_error("retry", {}) is not None
+    assert item_error("cancel", "#4") is None and item_error("cancel", {"outcome": "x"}) is not None
 
 
 def test_a_head_guard_skips_a_decision_judged_on_an_older_commit(factory):

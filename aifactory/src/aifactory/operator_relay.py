@@ -78,6 +78,42 @@ def parse(body: str) -> tuple[dict[str, list] | None, str]:
     return data, ""
 
 
+def _number(value: Any) -> int | None:
+    if type(value) is int and value > 0:
+        return value
+    if isinstance(value, str) and value.strip().isdigit() and int(value) > 0:
+        return int(value)
+    return None
+
+
+STRING_FIELDS = ("task", "kind", "resolution", "comment", "body", "nonce", "head", "workspace", "key", "scope")
+
+
+def item_error(kind: str, item: Any) -> str | None:
+    """Why an item is malformed (None when well formed). Malformed items are answered, never retried; anything
+    that fails later is an infrastructure problem, and the command is retried on the next poll."""
+    if kind == "cancel":
+        if isinstance(item, str):
+            return None if item.strip() else "a cancel key must not be empty"
+        if isinstance(item, dict) and _number(item.get("outcome")) is not None:
+            return None
+        return 'a cancel item is "#N", a declared key, or {"outcome": N}'
+    if not isinstance(item, dict):
+        return "an item must be an object"
+    bad = next((f for f in STRING_FIELDS if f in item and not isinstance(item[f], str)), None)
+    if bad:
+        return f"{bad} must be a string"
+    if ("outcome" in item or kind != "retry") and _number(item.get("outcome")) is None:
+        return "outcome must be an outcome number"
+    if kind == "resolve" and not (item.get("kind") and item.get("resolution")):
+        return "a resolve item needs kind and resolution"
+    if kind == "guidance" and not str(item.get("body") or "").strip():
+        return "a guidance item needs a body"
+    if kind == "retry" and "outcome" not in item and not str(item.get("key") or "").strip():
+        return "a retry item needs an outcome or a declared key"
+    return None
+
+
 def _time(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
@@ -114,13 +150,14 @@ def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable
     lines: list[str] = []
     for kind in KINDS:
         for n, item in enumerate(items.get(kind) or []):
-            # One item at a time: a malformed item (e.g. a non-numeric outcome) fails alone, and every other item
-            # still applies and gets its own line.
-            try:
-                lines += steps[kind]([item])
-            except Exception as exc:
-                log.exception("operator relay %s item %s failed", kind, n + 1)
-                lines.append(f"{kind} item {n + 1}: not applied, {type(exc).__name__}: {str(exc)[:200]}")
+            # One item at a time, so each gets its own line. A malformed item is answered and skipped; any other
+            # failure (a locked database, a lost connection) propagates and the whole command is retried on the
+            # next poll, where items already applied are skipped by their nonces or state.
+            error = item_error(kind, item)
+            if error:
+                lines.append(f"{kind} item {n + 1}: not applied, {error}")
+                continue
+            lines += steps[kind]([item])
     return lines
 
 
@@ -132,6 +169,13 @@ class Relay:
         self.last_poll = float("-inf")
         self.since: datetime | None = None  # GitHub's `since` (updated at or after) for the next poll
         self.seen: set[int] = set()  # commands this process handled; the events table covers restarts
+
+    async def run(self) -> None:
+        """Poll on its own schedule: slow maintenance in the scheduler loop must never delay an operator's cancel
+        or change request."""
+        while True:
+            await self.maybe_poll()
+            await asyncio.sleep(POLL_SECONDS)
 
     async def maybe_poll(self) -> None:
         if time.monotonic() - self.last_poll < POLL_SECONDS:

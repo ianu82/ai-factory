@@ -51,6 +51,7 @@ class Orchestrator:
         from ..operator_relay import Relay
 
         self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
+        self._relay_task: asyncio.Task | None = None
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -65,6 +66,7 @@ class Orchestrator:
             from ..linear_sync import LinearSync
 
             self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
+            self._relay_task = asyncio.create_task(self._relay.run(), name="operator-relay")
 
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
@@ -79,6 +81,9 @@ class Orchestrator:
         if self._linear_task:
             self._linear_task.cancel()
             await asyncio.gather(self._linear_task, return_exceptions=True)
+        if self._relay_task:
+            self._relay_task.cancel()
+            await asyncio.gather(self._relay_task, return_exceptions=True)
         await asyncio.sleep(0)
 
     def wake(self) -> None:
@@ -138,7 +143,6 @@ class Orchestrator:
                 await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
-                await self._relay.maybe_poll()
                 await self._maybe_inventory()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
