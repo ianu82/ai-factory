@@ -7,6 +7,9 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "", data: string[] = [], eventName = "", terminal = false;
+  // An error frame is reported at once but does not end the read: the server still sends usage and done, and the
+  // caller needs them to reload the saved turn. The error is thrown once the stream is complete.
+  let failure: MindEvent | null = null;
   const abort = () => { void reader.cancel().catch(() => {}); };
   signal.addEventListener("abort", abort, { once: true });
   const dispatch = () => {
@@ -21,7 +24,7 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
     eventName = "";
     if (!event || typeof event.type !== "string") throw new Error("Invalid Mind stream event");
     receive(event);
-    if (event.type === "error") { terminal = true; throw new Error(event.message || "Mind request failed"); }
+    if (event.type === "error") failure = failure || event;
     if (event.type === "done") terminal = true;
   };
   const line = (value: string) => {
@@ -54,6 +57,7 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
       drain(done);
       if (done) break;
     }
+    if (failure) throw new Error((failure as { message?: string }).message || "Mind request failed");
     if (!terminal) throw new Error("Mind stream ended before completion. Reload history before retrying.");
   } finally {
     signal.removeEventListener("abort", abort);

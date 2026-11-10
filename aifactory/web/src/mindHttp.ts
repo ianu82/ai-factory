@@ -47,6 +47,7 @@ export function createMindHttpTransport(request: typeof api, response: typeof ap
         method: "POST", headers: { Accept: "text/event-stream" }, signal,
         json: { text: body.content, client_message_id: crypto.randomUUID(), context: body.context },
       });
+      let failure: unknown = null;
       await readStream(res, signal, (event) => {
         // T1 envelopes every event; untrusted payloads are rendered as text only.
         const wire = event as unknown as { type: string; data: Record<string, any> };
@@ -60,7 +61,14 @@ export function createMindHttpTransport(request: typeof api, response: typeof ap
           case "error": receive({ type: "error", message: data.message, reason: mindBudget(data.code) === "ok" ? data.code : mindBudget(data.code) }); break;
           case "done": terminal = data.status; break;
         }
-      });
+      }).catch((error) => { if (signal.aborted || terminal !== "failed") throw error; failure = error; });
+      if (failure) {
+        // The server finished and saved the failed turn: show what was saved (any partial reply) and its cost.
+        const saved = await load(thread, signal);
+        const last = [...saved.messages].reverse().find((m) => m.role === "assistant");
+        if (last) receive({ type: "done", message: last, thread: saved.thread, status: usage ? mindUsage(saved.status, usage) : saved.status });
+        throw failure;
+      }
       if (terminal !== "complete") throw new Error("Mind reply was interrupted. Reload the thread before retrying.");
       const h = await load(thread, signal);
       const message = [...h.messages].reverse().find((m) => m.role === "assistant");

@@ -371,3 +371,37 @@ def test_each_mind_module_imports_on_its_own(module):
     result = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, text=True, env=env,
                             timeout=120)
     assert result.returncode == 0, result.stderr[-2000:]
+
+
+@pytest.mark.parametrize("code,expected", [("missing_key", "Add a saved MindsHub Inference key"),
+                                           ("model_absent", "Claude Opus 5.5 is not available"),
+                                           ("raw provider text sk-abcdefghijklmnopqrstu", "Check workspace inference settings")])
+def test_status_names_what_to_fix_with_fixed_public_reasons_only(app_as, people, code, expected):
+    client, app, _ = app_as
+
+    class Unready:
+        async def readiness(self, workspace_id, *, ledger):
+            return mp.Readiness(False, code)
+
+    app.state.mind_runtime = Unready()
+    status = client.get("/api/mind/status", params={"workspace_id": people["first"]}).json()
+    assert status["status"] == "unavailable" and expected in status["reason"] and "sk-" not in status["reason"]
+
+
+def test_a_failed_turn_keeps_its_status_when_the_reader_stops_at_the_error(app_as, people):
+    client, app, _ = app_as
+
+    class Failing(ProposingRuntime):
+        async def run_turn(self, context, history, emit, tools, ledger):
+            await emit({"type": "text_delta", "text": "Partial answer"})
+            raise mp.MindUnavailable("provider_failure")
+
+    app.state.mind_runtime = Failing(people)
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    with client.stream("POST", f"/api/mind/threads/{thread}/messages",
+                       json={"text": "Status?", "client_message_id": "fail-1"}) as response:
+        for line in response.iter_lines():  # stop reading at the error frame, as the browser used to
+            if line.startswith("data: ") and json.loads(line[6:])["type"] == "error":
+                break
+    saved = client.get(f"/api/mind/threads/{thread}").json()
+    assert saved["messages"][1]["status"] == "failed" and saved["messages"][1]["text"] == "Partial answer"
