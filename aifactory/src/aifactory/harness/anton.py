@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..images import ImageResult
 from ..inference import BudgetExceeded
 from ..inference_limits import admission
 from .anton_tools import replace_session_tools
@@ -134,7 +135,14 @@ class AntonHarness:
                 for note in session.take_guidance():
                     session.on_progress("guidance", "Delivered team guidance to the agent", {"text": note[:500]})
                     return f"Guidance from your team (takes priority, then retry): {note}"
-                return await toolbox.call(name, arguments)
+                output = await toolbox.call(name, arguments)
+                if isinstance(output, ImageResult):
+                    from anton.core.tools.registry import ToolOutcome
+                    return ToolOutcome(content=[
+                        {"type": "text", "text": output.description},
+                        {"type": "image", "source": {"type": "base64", "media_type": output.mime_type,
+                                                       "data": output.data}}], ok=True)
+                return output
             return handler
 
         async def finish_handler(_session, arguments):

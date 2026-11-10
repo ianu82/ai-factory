@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
+from collections import deque
 
 from ..sandbox import SCRATCH, read_text, write_text
+from ..images import DiagnosticStream, ImageResult, disable_images, is_image_rejection
+from ..inference import InferenceError
+from .tools import ToolBox
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
 from .schemas import validate_report
 
@@ -86,18 +91,51 @@ class CodexHarness:
             f"--dangerously-bypass-approvals-and-sandbox -C {shlex.quote(work)} -m {shlex.quote(session.model)} "
             f"--output-schema {scratch}/schema.json -o {scratch}/last.json - < {scratch}/prompt.md"
         )
-        events: list[dict] = []
+        toolbox = ToolBox(session)
+        image_paths = []
+        if not session.images_disabled:
+            for path in session.image_paths[:12]:
+                image = await toolbox.call("view_image", {"path": path})
+                if isinstance(image, ImageResult):
+                    image_paths.append(str(sandbox.resolve(path)))
+        image_flags = "".join(" --image " + shlex.quote(path) for path in image_paths)
+        plain_command = command
+        command = command.replace(" exec --json", " exec" + image_flags + " --json")
+        diagnostics = DiagnosticStream(session.image_redactor)
+        events: deque[dict] = deque(maxlen=128)
+        turn_count = 0
         pending = bytearray()
+        dropping_record = False
 
         def on_output(block: bytes) -> None:
-            pending.extend(block)
-            while b"\n" in pending:
-                line, _, rest = bytes(pending).partition(b"\n")
-                pending[:] = rest
+            nonlocal turn_count, dropping_record
+            text = block.decode("utf-8", "replace")
+            diagnostics.feed(text)
+            # Parse every bounded record, including when the VM returns many at
+            # once. Discard oversized records through their terminating newline.
+            for fragment in block.splitlines(keepends=True):
+                complete = fragment.endswith(b"\n")
+                if not dropping_record and len(pending) + len(fragment) <= 64 * 1024:
+                    pending.extend(fragment)
+                else:
+                    pending.clear()
+                    dropping_record = True
+                if not complete:
+                    continue
+                if dropping_record:
+                    dropping_record = False
+                    continue
+                line = bytes(pending)
+                pending.clear()
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(event, dict):
+                    continue
+                event = json.loads(session.image_redactor(json.dumps(event)))
+                if event.get("type") == "turn.completed":
+                    turn_count += 1
                 events.append(event)
                 item = event.get("item") or {}
                 kind = item.get("type") or item.get("item_type")
@@ -107,7 +145,7 @@ class CodexHarness:
                 elif event.get("type") == "item.completed" and kind == "file_change":
                     session.on_progress("edit", "Codex changed files", {"changes": item.get("changes", [])[:20]})
                 elif event.get("type") == "item.completed" and kind in ("agent_message", "reasoning"):
-                    text = str(item.get("text", ""))[:600]
+                    text = session.image_redactor(str(item.get("text", "")))[:600]
                     if text:
                         session.on_progress("thought", text, {})
 
@@ -118,7 +156,22 @@ class CodexHarness:
             env={"FACTORY_GATEWAY_TOKEN": session.gateway_token, "CODEX_HOME": str(codex_home)},
             on_output=on_output,
         )
-        turns = sum(1 for e in events if e.get("type") == "turn.completed") or session.ledger.calls
+        # The gateway preserves the original provider status in its message even
+        # when it normalises the HTTP envelope for the CLI's retry policy.
+        failure = next((event for event in reversed(events)
+                        if event.get("type") in ("turn.failed", "error")), None)
+        failure_text = _failure_text(failure) if failure else session.image_redactor(result.output)
+        status = _provider_status(failure_text)
+        error = InferenceError(failure_text, status=status)
+        if image_paths and not result.timed_out and result.exit_code != 0 and is_image_rejection(error):
+            disable_images(session)
+            pending.clear()
+            events.clear()
+            result = await sandbox.exec(
+                plain_command, timeout=max(60.0, session.remaining() - 30),
+                env={"FACTORY_GATEWAY_TOKEN": session.gateway_token, "CODEX_HOME": str(codex_home)},
+                on_output=on_output)
+        turns = turn_count or session.ledger.calls
         if result.timed_out:
             raise HarnessFailed("Codex exceeded its time budget")
         try:
@@ -126,14 +179,14 @@ class CodexHarness:
         except Exception:
             raw = ""
         report = _parse_report(raw)
-        if report is None:
+        if report is None or result.exit_code != 0:
             failure = next((e for e in reversed(events) if e.get("type") in ("turn.failed", "error")), None)
-            detail = json.dumps(failure)[:600] if failure else result.output[-800:]
+            detail = session.image_redactor(json.dumps(failure))[:600] if failure else session.image_redactor(result.output)[-800:]
             raise HarnessFailed(f"Codex did not return a report (exit {result.exit_code}): {detail}")
         report, error = validate_report(session.role, report)
         if report is None:
             raise HarnessFailed(f"Codex report was invalid: {error}")
-        return HarnessResult(report=report, turns=turns, log=result.output[-4000:])
+        return HarnessResult(report=report, turns=turns, log=diagnostics.finish()[-4000:])
 
 
 def _parse_report(raw: str):
@@ -150,3 +203,20 @@ def _parse_report(raw: str):
         return json.loads(raw[start:end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _provider_status(text: str) -> int | None:
+    # Prefer upstream provenance over the gateway/CLI HTTP status.
+    match = re.search(r"Provider returned\s+(\d{3})", text, re.I)
+    if not match:
+        match = re.search(r'(?:HTTP(?: status)?|status(?:_code)?["\s:]*)[ :=]*(\d{3})', text, re.I)
+    return int(match.group(1)) if match else None
+
+
+def _failure_text(value) -> str:
+    if isinstance(value, dict):
+        # Preserve status fields as well as the original upstream error message.
+        return "\n".join(f"{key}: {_failure_text(child)}" for key, child in value.items())
+    if isinstance(value, list):
+        return "\n".join(_failure_text(child) for child in value)
+    return str(value)

@@ -8,9 +8,11 @@ visible, and an invalid final report gets another chance with the exact problem 
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 from ..inference import BudgetExceeded, InferenceError
+from ..images import ImageResult, disable_images, is_image_rejection, strip_image_parts
 from .base import HarnessFailed, HarnessResult, HarnessSession
 from .schemas import validate_report
 from .tools import ToolBox, clip, finish_tool, tool_specs
@@ -33,6 +35,9 @@ class NativeHarness:
             {"role": "system", "content": session.system},
             {"role": "user", "content": session.prompt},
         ]
+        if hasattr(session.client, "image_redactor"):
+            session.client.image_redactor = session.image_redactor
+        image_tool_ids: set[str] = set()
         turns = nudges = report_attempts = 0
         while True:
             if session.cancelled.is_set():
@@ -61,7 +66,13 @@ class NativeHarness:
             except BudgetExceeded as exc:
                 raise HarnessFailed(str(exc)) from exc
             except InferenceError as exc:
-                raise HarnessFailed(f"Model request failed: {exc}") from exc
+                has_images = any(isinstance(m.get("content"), list) and any(
+                    p.get("type") == "image_url" for p in m["content"]) for m in messages)
+                if has_images and not session.images_disabled and is_image_rejection(exc):
+                    strip_image_parts(messages, image_tool_ids)
+                    disable_images(session)
+                    continue
+                raise HarnessFailed(f"Model request failed: {session.image_redactor(str(exc))}") from exc
             turns += 1
             calls = message.get("tool_calls") or []
             assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
@@ -71,7 +82,7 @@ class NativeHarness:
                 assistant["_raw"] = message["_raw"]  # Responses API: replay reasoning items verbatim
             messages.append(assistant)
             if message.get("content"):
-                session.on_progress("thought", clip(message["content"], 600), {})
+                session.on_progress("thought", clip(session.image_redactor(message["content"]), 600), {})
             if not calls:
                 nudges += 1
                 if nudges > 4:
@@ -79,6 +90,7 @@ class NativeHarness:
                 messages.append({"role": "user", "content": "Continue using the tools. When finished, call finish with your report."})
                 continue
             accepted: dict[str, Any] | None = None
+            images: list[dict[str, Any]] = []
             for call in calls:
                 fn = call.get("function") or {}
                 name = fn.get("name", "")
@@ -101,9 +113,19 @@ class NativeHarness:
                     output = "Report already accepted."
                 else:
                     output = await toolbox.call(name, args)
+                if isinstance(output, ImageResult):
+                    images.extend(output.parts())
+                    image_tool_ids.add(call.get("id", ""))
+                    output = output.description
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": output})
+            if images:
+                messages.append({"role": "user", "content": images})
             if accepted is not None:
-                return HarnessResult(report=accepted, turns=turns, transcript=messages[-6:], log="\n".join(toolbox.log))
+                # Diagnostics are copies; accepted report data is never rewritten.
+                transcript = deepcopy(messages[-6:])
+                strip_image_parts(transcript)
+                transcript = json.loads(session.image_redactor(json.dumps(transcript)))
+                return HarnessResult(report=accepted, turns=turns, transcript=transcript, log="\n".join(toolbox.log))
 
     def _trim(self, messages: list[dict[str, Any]]) -> None:
         """Keep the conversation within budget by eliding the oldest tool outputs."""

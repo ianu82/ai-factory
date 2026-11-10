@@ -18,6 +18,7 @@ from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
+from ..images import ImageRedactor
 from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from ..review import DEFAULT_REVIEW
@@ -190,16 +191,20 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings, max_cost_usd=budgets.get("run_usd"),
                          max_tokens=budgets.get("run_tokens"))
     client = ModelClient(provider, session_id=run_id)
+    image_redactor = ImageRedactor()
+    if hasattr(client, "image_redactor"):
+        client.image_redactor = image_redactor
     turns = limits.get(f"{spec.role}_turns", 80)
     harness = get_harness(spec.harness)
     gateway_token = ""
     result: HarnessResult | None = None
     error = ""
     status = "succeeded"
+    session = None
     try:
         if spec.harness == "codex":
             gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
-                                               provider=provider, ledger=ledger))
+                                               provider=provider, ledger=ledger, image_redactor=image_redactor))
         record(spec.workspace_id, "run_started", f"{harness.label} {spec.role} started on {model}",
                outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
                data={"role": spec.role, "harness": spec.harness, "model": model, "provider": provider.provider,
@@ -207,13 +212,26 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         notify(spec.workspace_id, "run", run_id)
 
         last_progress = {"t": 0.0}
+        image_fallback_warned = False
 
         def on_progress(kind: str, message: str, data: dict[str, Any]) -> None:
+            nonlocal image_fallback_warned
+            if kind == "image_fallback":
+                if not image_fallback_warned:
+                    image_fallback_warned = True
+                    from ..images import IMAGE_FAILURE
+                    record(spec.workspace_id, "agent_image_fallback", IMAGE_FAILURE, level="warn",
+                           outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
+                           data={"role": spec.role})
+                return
             # Commands, edits and guidance are always journaled; chatter is rate-limited.
             now = time.monotonic()
             if kind in ("thought", "tool") and now - last_progress["t"] < 4:
                 return
             last_progress["t"] = now
+            if session is not None:
+                message = session.image_redactor(message)
+                data = json.loads(session.image_redactor(json.dumps(data, default=str)))
             record(spec.workspace_id, f"agent_{kind}", message, outcome_id=spec.outcome_id, task_id=spec.task_id,
                    run_id=run_id, data={"role": spec.role, **data})
 
@@ -225,7 +243,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.
             gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
             gateway_token=gateway_token,
-            reasoning_effort=settings.get("reasoning_effort"),
+            reasoning_effort=settings.get("reasoning_effort"), image_redactor=image_redactor,
         )
         context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
         session.prompt += context
@@ -234,7 +252,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         status, error = "cancelled", "Cancelled"
         raise
     except Exception as exc:  # harness failures are recorded, never hidden
-        status, error = "failed", str(exc) or type(exc).__name__
+        status, error = "failed", (session.image_redactor(str(exc)) if session else str(exc)) or type(exc).__name__
     finally:
         if gateway_token:
             revoke(run_id)

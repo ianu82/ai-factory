@@ -345,7 +345,8 @@ class RailwayVMSandbox:
                 on_output(raw.encode())
             except Exception:
                 pass
-        output, truncated = _clip(raw.encode())
+        redactor = getattr(self, "image_redactor", None)
+        output, truncated = _clip((redactor(raw) if redactor else raw).encode())
         timed_out = bool(result.get("timedOut"))
         exit_code = result.get("exitCode")
         return ExecResult(command=command, exit_code=124 if timed_out else (exit_code if exit_code is not None else 1),

@@ -277,6 +277,10 @@ class LocalSandbox:
             preexec_fn=self._preexec(),
         )
         self._groups.add(proc.pid)
+        from .images import DiagnosticStream
+
+        redactor = getattr(self, "image_redactor", None)
+        diagnostics = DiagnosticStream(redactor) if redactor and redactor.payloads else None
         chunks: list[bytes] = []
         total = 0
         timed_out = False
@@ -289,7 +293,10 @@ class LocalSandbox:
                 if not block:
                     break
                 total += len(block)
-                chunks.append(block)
+                if diagnostics:
+                    diagnostics.feed(block.decode("utf-8", "replace"))
+                else:
+                    chunks.append(block)
                 if on_output is not None:
                     try:
                         on_output(block)
@@ -319,7 +326,7 @@ class LocalSandbox:
                 except asyncio.TimeoutError:
                     pass
             self._groups.discard(proc.pid)
-        data = b"".join(chunks)
+        data = diagnostics.finish().encode() if diagnostics else b"".join(chunks)
         output, truncated = _clip(data)
         return ExecResult(
             command=command,
@@ -433,12 +440,21 @@ async def write_bytes(sandbox, relative: str, content: bytes) -> None:
 
 
 async def read_bytes(sandbox, relative: str, limit: int | None = None, from_end: bool = False) -> bytes:
+    if limit is not None and limit < 0:
+        raise SandboxError("Invalid read limit")
     if _is_vm(sandbox):
         return await sandbox.read_bytes_async(relative, limit, from_end)
-    data = sandbox.resolve(relative).read_bytes()
-    if limit:
-        return data[-limit:] if from_end else data[:limit]
-    return data
+    import stat
+
+    path = sandbox.resolve(relative)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise SandboxError("Not a regular file")
+        if limit is not None and from_end:
+            handle.seek(max(0, info.st_size - limit))
+        return handle.read(limit) if limit is not None else handle.read()
 
 
 async def read_image_bytes(sandbox, relative: str, limit: int) -> bytes:

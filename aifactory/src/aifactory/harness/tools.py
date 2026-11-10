@@ -4,12 +4,14 @@ agent can recover instead of the run aborting."""
 
 from __future__ import annotations
 
+import base64
 import json
 import shlex
 import time
 from typing import Any
 
-from ..sandbox import SandboxError
+from ..images import ImageResult, MAX_IMAGES, MAX_IMAGE_BYTES, image_mime
+from ..sandbox import SandboxError, read_image_bytes
 from ..sandbox import read_text as sb_read_text
 from ..sandbox import write_text as sb_write_text
 from .base import HarnessSession
@@ -30,6 +32,8 @@ def clip(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 
 
 READ_TOOLS = [
+    _fn("view_image", "View a PNG, JPEG, GIF or WebP inside the sandbox (max 5 MiB, 12 images per session).",
+        {"path": {"type": "string"}}, ["path"]),
     _fn("list_files", "List tracked and new files under a directory of the repository.",
         {"path": {"type": "string", "description": "Directory relative to the repo root (default '.')."},
          "pattern": {"type": "string", "description": "Optional glob such as '*.ts' or 'src/**/*.py'."}}, []),
@@ -66,18 +70,43 @@ def tool_specs(writable: bool) -> list[dict[str, Any]]:
 class ToolBox:
     def __init__(self, session: HarnessSession):
         self.session = session
+        session.sandbox.image_redactor = session.image_redactor
         self.log: list[str] = []
+        for image in session.image_inputs:
+            session.image_redactor.add(image.get("content", ""))
 
-    async def call(self, name: str, args: Any) -> str:
+    async def call(self, name: str, args: Any) -> str | ImageResult:
         output = await self._tool(self.session, name, args)
-        self.log.append(f"{name} {json.dumps(args)[:300] if isinstance(args, dict) else str(args)[:300]}")
+        detail = json.dumps(args) if isinstance(args, dict) else str(args)
+        self.log.append(f"{name} {self.session.image_redactor(detail)[:300]}")
+        if isinstance(output, str):
+            output = self.session.image_redactor(output)
         return output
 
-    async def _tool(self, session: HarnessSession, name: str, args: Any) -> str:
+    async def _tool(self, session: HarnessSession, name: str, args: Any) -> str | ImageResult:
         if not isinstance(args, dict):
             return "Error: tool arguments were not valid JSON. Retry with a JSON object."
         sandbox = session.sandbox
         try:
+            if name == "view_image":
+                if session.images_disabled:
+                    return "Error: image input is disabled; use files and text only."
+                if session.image_deliveries >= MAX_IMAGES:
+                    return "Error: session limit of 12 images reached."
+                path = args["path"]
+                if not isinstance(path, str) or not path.strip():
+                    return "Error: path must be a nonempty string."
+                raw = await read_image_bytes(sandbox, path, MAX_IMAGE_BYTES)
+                mime = image_mime(raw, path)
+                # Remote reads yield; another tool call may have used the last slot.
+                if session.image_deliveries >= MAX_IMAGES:
+                    return "Error: session limit of 12 images reached."
+                encoded = base64.b64encode(raw).decode("ascii")
+                session.image_redactor.add(encoded)
+                session.image_deliveries += 1
+                from pathlib import PurePosixPath
+                name = PurePosixPath(path).name.replace("\n", " ").replace("\r", " ")
+                return ImageResult(f"{name} ({mime}, {len(raw)} bytes)", mime, encoded)
             if name == "list_files":
                 path = args.get("path") or "."
                 sandbox.resolve(path)
@@ -88,7 +117,7 @@ class ToolBox:
                     cmd += f" | grep -E {shlex.quote(_glob_to_regex(pattern))}"
                 result = await sandbox.exec(cmd + " | head -n 3000", timeout=60)
                 session.on_progress("tool", f"Listed files in {path}", {"tool": name})
-                return clip(result.output or "(no files)")
+                return clip(session.image_redactor(result.output or "(no files)"))
             if name == "read_file":
                 text = await sb_read_text(sandbox, args["path"])
                 lines = text.splitlines()
@@ -98,7 +127,7 @@ class ToolBox:
                 body = "\n".join(f"{i:>5}\t{lines[i - 1]}" for i in range(start, end + 1)) if lines else "(empty file)"
                 more = f"\n… file has {len(lines)} lines; showing {start}-{end}" if end < len(lines) or start > 1 else ""
                 session.on_progress("tool", f"Read {args['path']}", {"tool": name, "path": args["path"]})
-                return clip(body + more)
+                return clip(session.image_redactor(body + more))
             if name == "search":
                 path = args.get("path") or "."
                 sandbox.resolve(path)
@@ -108,17 +137,17 @@ class ToolBox:
                        f"--exclude-dir=node_modules {shlex.quote(args['pattern'])} {shlex.quote(path)}; fi | head -n 400")
                 result = await sandbox.exec(cmd, timeout=60)
                 session.on_progress("tool", f"Searched for {args['pattern'][:80]}", {"tool": name})
-                return clip(result.output or "(no matches)")
+                return clip(session.image_redactor(result.output or "(no matches)"))
             if name == "run":
                 timeout = max(10, min(int(args.get("timeout_seconds") or 300), 1800, int(session.command_timeout),
                                       int(max(30, session.remaining() - 60))))
                 command = str(args["command"])
-                session.on_progress("command", command[:300], {"tool": name})
+                session.on_progress("command", session.image_redactor(command)[:300], {"tool": name})
                 started = time.monotonic()
                 result = await sandbox.exec(command, timeout=timeout)
                 session.on_progress("command_result", f"exit {result.exit_code} in {time.monotonic() - started:.0f}s",
-                                    {"command": command[:300], "exit_code": result.exit_code, "timed_out": result.timed_out})
-                return clip(result.for_model())
+                                    {"command": session.image_redactor(command)[:300], "exit_code": result.exit_code, "timed_out": result.timed_out})
+                return clip(session.image_redactor(result.for_model()))
             if name == "write_file" and session.writable:
                 await sb_write_text(sandbox, args["path"], args.get("content", ""))
                 session.on_progress("edit", f"Wrote {args['path']}", {"tool": name, "path": args["path"]})

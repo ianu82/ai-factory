@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 import anyio
@@ -19,6 +19,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .db import session_scope, utcnow
+from .images import ImageRedactor, collect_image_payloads
 from .inference import BudgetExceeded, ProviderConfig, UsageLedger, extract_usage
 from .inference_limits import acquire
 from .models import RunToken
@@ -37,6 +38,7 @@ class GatewayGrant:
     model: str
     provider: ProviderConfig
     ledger: UsageLedger
+    image_redactor: ImageRedactor = field(default_factory=ImageRedactor, repr=False)
 
 
 _grants: dict[str, GatewayGrant] = {}
@@ -99,6 +101,7 @@ async def proxy(path: str, request: Request):
         body = json.loads(raw)
     except json.JSONDecodeError:
         return _error(400, "invalid_json", "Request body must be JSON")
+    collect_image_payloads(body, grant.image_redactor)
     body.pop("client_metadata", None)
     requested = body.get("model")
     if requested and requested != grant.model:
@@ -144,7 +147,7 @@ async def proxy(path: str, request: Request):
             if retry:
                 retry_after = upstream.headers.get("retry-after", "5")
             elif upstream.status_code >= 400:
-                detail = (await upstream.aread()).decode(errors="replace")[:800]
+                detail = grant.image_redactor((await upstream.aread()).decode(errors="replace"))[:800]
                 status = upstream.status_code
                 code = {401: "credential_refused", 402: "wallet_empty", 403: "permission_denied", 404: "model_not_found",
                         429: "rate_limited"}.get(status, "upstream_error")

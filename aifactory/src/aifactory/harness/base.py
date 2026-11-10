@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
 from ..inference import ModelClient, UsageLedger
+from ..images import ImageRedactor
 from ..sandbox import LocalSandbox
 
 
@@ -48,6 +49,11 @@ class HarnessSession:
     # Stored originals: {name: filename, mime_type: detected media type, content: base64 bytes}.
     # Harnesses own provider-specific image delivery/fallback.
     image_inputs: list[dict[str, str]] = field(default_factory=list)
+    image_paths: list[str] = field(default_factory=list)
+    image_redactor: ImageRedactor = field(default_factory=ImageRedactor, repr=False)
+    image_deliveries: int = 0
+    images_disabled: bool = False
+    image_warning_sent: bool = False
     # Host-supplied, workspace-scoped opt-ins. Tools fail closed when absent.
     tool_policy: dict[str, Any] = field(default_factory=dict)
 

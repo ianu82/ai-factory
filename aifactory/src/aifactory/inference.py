@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from .images import ImageRedactor, collect_image_payloads
 from .config import get_settings
 from .inference_limits import admission
 from .db import session_scope
@@ -219,7 +220,13 @@ def to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif role == "system":
             items.append({"role": "developer", "content": m.get("content") or ""})
         else:
-            items.append({"role": role or "user", "content": m.get("content") or ""})
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content = [({"type": "input_image", "image_url": p["image_url"]["url"]}
+                            if p.get("type") == "image_url" else
+                            {"type": "input_text", "text": p["text"]} if p.get("type") == "text" else p)
+                           for p in content]
+            items.append({"role": role or "user", "content": content})
     return items
 
 
@@ -257,6 +264,7 @@ class ModelClient:
 
     def __init__(self, provider: ProviderConfig, *, timeout: float = 300.0, max_retries: int = 4,
                  session_id: str | None = None, wire: str | None = None, log_errors: bool = True):
+        self.image_redactor = ImageRedactor()
         self.provider = provider
         self.timeout = timeout
         self.max_retries = max_retries
@@ -320,6 +328,7 @@ class ModelClient:
         return choices[0].get("message") or {}
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        collect_image_payloads(body, self.image_redactor)
         url = self.provider.base_url + path
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -330,7 +339,7 @@ class ModelClient:
                                                      content=json.dumps(body))
                 if response.status_code == 200:
                     return response.json()
-                detail = _error_detail(response)
+                detail = _error_detail(response, self.image_redactor)
                 if response.status_code == 402:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
                 if response.headers.get("x-should-retry", "").lower() == "false":
@@ -421,12 +430,13 @@ class ModelClient:
         return sorted(set(names))
 
 
-def _error_detail(response: httpx.Response) -> str:
+def _error_detail(response: httpx.Response, redactor: ImageRedactor | None = None) -> str:
+    redact = redactor or ImageRedactor()
     try:
         data = response.json()
         err = data.get("error", data)
         if isinstance(err, dict):
-            return str(err.get("message") or err.get("detail") or err)[:500]
-        return str(err)[:500]
+            return redact(str(err.get("message") or err.get("detail") or err))[:500]
+        return redact(str(err))[:500]
     except Exception:
-        return response.text[:300]
+        return redact(response.text)[:300]
