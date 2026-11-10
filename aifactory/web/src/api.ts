@@ -177,6 +177,7 @@ export interface Repo {
     require_ci?: boolean;
     require_trusted_issue_author?: boolean;
     steward?: { mode?: "off" | "propose" | "fix"; fix_minutes?: number };
+    review?: { mode?: "off" | "all" | "labelled"; allow_untrusted_local?: boolean; [key: string]: unknown };
   };
 }
 

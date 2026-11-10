@@ -555,7 +555,7 @@ class RepoCommands(BaseModel):
     @field_validator("review")
     @classmethod
     def valid_review(cls, value):
-        return validate_review(value)
+        return validate_review(value, repository=True)
 
 
 class RepoConnect(BaseModel):
@@ -612,7 +612,8 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
             raise HTTPException(422, str(exc)) from None
     if "review" in patch:
         try:
-            cfg["review"] = {**(current.get("review") or {}), **validate_review(patch["review"])}
+            cfg["review"] = {"mode": "off", "allow_untrusted_local": False,
+                             **(current.get("review") or {}), **validate_review(patch["review"], repository=True)}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
     for key in ("setup", "checks", "smoke", "protected_paths"):
