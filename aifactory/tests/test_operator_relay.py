@@ -363,6 +363,7 @@ class FakeLinear:
     create_fails = 0
     posts_then_fails = False
     lists = 0
+    lookups = 0
 
     def __init__(self, token, **_):
         assert token == "lin_api_key"
@@ -374,7 +375,13 @@ class FakeLinear:
     async def comments_since(self, issue_id, since):
         assert issue_id == "issue-uuid" and since.endswith("Z")
         FakeLinear.lists += 1
-        return list(FakeLinear.comments)
+        cutoff = datetime.fromisoformat(since)
+        return [c for c in FakeLinear.comments if datetime.fromisoformat(c["createdAt"]) >= cutoff]
+
+    async def comments_by_id(self, issue_id, comment_ids):
+        assert issue_id == "issue-uuid" and comment_ids
+        FakeLinear.lookups += 1
+        return [{"id": c["id"], "body": c["body"]} for c in FakeLinear.comments if c["id"] in comment_ids]
 
     async def create_comment(self, issue_id, body, *, comment_id=None):
         assert issue_id == "issue-uuid" and comment_id
@@ -401,7 +408,7 @@ def linear_factory(factory, monkeypatch):
         "organization": "Acme", "workspace": "Acme", "delegated_by": "ian@mindsdb.com", "control": LINEAR_CONTROL}))
     monkeypatch.setattr(linear_module, "Linear", FakeLinear)
     monkeypatch.setattr(linear_module, "resolve_token", lambda workspace_id: "lin_api_key")
-    FakeLinear.comments, FakeLinear.replies, FakeLinear.lists = [], [], 0
+    FakeLinear.comments, FakeLinear.replies, FakeLinear.lists, FakeLinear.lookups = [], [], 0, 0
     FakeLinear.create_fails, FakeLinear.posts_then_fails = 0, False
     return factory
 
@@ -448,17 +455,17 @@ def test_only_listed_active_linear_members_count(linear_factory):
         linear_command("c-3", REQUEST_CHANGES, user={**IAN, "active": False}),
         linear_command("c-4", REQUEST_CHANGES, user={**IAN, "guest": True}),
         linear_command("c-5", REQUEST_CHANGES, user=None),  # an integration or a synced external user
-        linear_command("c-6", REQUEST_CHANGES, age=timedelta(hours=25)),
+        linear_command("c-6", REQUEST_CHANGES, age=timedelta(hours=25)),  # older than any listing: never applied
         linear_command("c-7", {"guidance": [{"outcome": 7, "task": "T1", "body": "From the deputy."}]}, user=deputy),
     ]
-    assert sorted(poll()) == ["c-2", "c-3", "c-4", "c-5", "c-6", "c-7"]
+    assert sorted(poll()) == ["c-2", "c-3", "c-4", "c-5", "c-7"]
     assert decision_state() == ("open", "")
     replies = {reply.split("#comment-")[1].split(" ")[0]: reply for _, reply in FakeLinear.replies}
     assert "Mallory is not a listed operator" in replies["c-2"]
     assert "Ian is not an active member of the Linear workspace" in replies["c-3"]
     assert "Ian is not an active member of the Linear workspace" in replies["c-4"]
     assert "unknown is not a listed operator" in replies["c-5"]
-    assert "more than 24 hours" in replies["c-6"]
+    assert "c-6" not in replies
     assert "guidance #7 T1: posted" in replies["c-7"]  # listed by user id
     with session_scope() as s:
         assert [m.body for m in s.query(Message).all()] == ["From the deputy."]
@@ -525,3 +532,26 @@ def test_the_factorys_own_linear_replies_are_never_commands(linear_factory):
     [(_, reply)] = FakeLinear.replies
     assert reply.startswith("Factory relay for ") and FakeLinear.comments[-1]["user"] == IAN
     assert poll(relay, at=NOW + timedelta(seconds=30)) == [] and len(FakeLinear.replies) == 1
+
+
+def test_a_linear_answer_posted_before_a_long_restart_is_found_by_its_id(linear_factory):
+    from aifactory.db import utcnow
+
+    with session_scope() as s:
+        event = Event(workspace_id=linear_factory["ws"], kind="operator_relay", message="old", actor="operator",
+                      created_at=utcnow() - timedelta(days=3),
+                      data={"comment_id": "c-11", "author": "Ian", "results": ["retry #7: retrying T1"],
+                            "url": "https://linear.app/acme/issue/ENG-5#comment-c-11", "channel": "linear:ENG-5",
+                            "acknowledged": False})
+        s.add(event)
+    relay = Relay()
+    reply_id = relay.channel(control()).reply_id("c-11")
+    # The answer posted three days ago, but its response was lost; no listing reaches back that far.
+    FakeLinear.comments = [{"id": reply_id, "body": "Factory relay for ...", "url": "", "user": IAN,
+                            "createdAt": (NOW - timedelta(days=3)).isoformat()}]
+    assert poll(relay) == []
+    assert FakeLinear.replies == [] and FakeLinear.lookups == 1 and not relay.unanswered
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_relay").one().data["acknowledged"] is True
+    poll(relay, at=NOW + timedelta(seconds=30))
+    assert FakeLinear.lookups == 1  # nothing left to look up

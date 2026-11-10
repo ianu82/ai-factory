@@ -142,6 +142,7 @@ Who counts as an operator:
 Replies that fail (a missing permission, an outage) are retried with a growing delay: the next poll, then twice
 as long each time, at most one try per command every ten minutes, with one log line per try. A channel whose
 polls fail (a missing Linear key, an exhausted rate limit) backs off the same way and recovers on its first good
-poll. Answers that never posted are retried after a restart too; a Linear reply carries an id fixed per command,
-so a reply whose response was lost is recognised rather than posted twice. Switching the channel leaves the old
+poll. Answers that never posted are retried after a restart too. A Linear reply carries an id fixed per command,
+and the Factory looks that id up before each retry, so a reply whose response was lost is recognised rather than
+posted twice, however long ago it was posted. Switching the channel leaves the old
 channel's unanswered replies unposted; the commands themselves were applied.

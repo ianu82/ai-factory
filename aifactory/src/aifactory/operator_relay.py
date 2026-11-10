@@ -286,6 +286,9 @@ class GitHubChannel:
     def reply_id(self, comment_id: int | str) -> str | None:
         return None
 
+    async def posted(self, comment_ids: list[int | str]) -> set[int | str]:
+        return set()  # GitHub replies carry no fixed id; a lost response can post a second reply
+
     async def reply(self, comment_id: int | str, text: str) -> None:
         await self.gh.comment(self.cfg["repository"], self.cfg["issue"], f"{REPLY_MARKER}\n{text}")
 
@@ -334,6 +337,15 @@ class LinearChannel:
         response was lost) is recognised in the next listing instead of posting twice."""
         digest = hashlib.sha256(f"ai-factory:operator-relay:{self.key}:{comment_id}".encode()).digest()
         return str(uuid.UUID(bytes=digest[:16], version=4))
+
+    async def posted(self, comment_ids: list[int | str]) -> set[int | str]:
+        """The commands among these whose answer an earlier try did post, looked up by the answer's fixed id: the
+        try's response may have been lost, and a restart a day later lists no comment that old."""
+        if not comment_ids:
+            return set()
+        replies = {self.reply_id(comment_id): comment_id for comment_id in comment_ids}
+        found = await self.linear.comments_by_id(await self._issue_id(), list(replies))
+        return {replies[node["id"]] for node in found if node["id"] in replies}
 
     async def reply(self, comment_id: int | str, text: str) -> None:
         await self.linear.create_comment(await self._issue_id(), text, comment_id=self.reply_id(comment_id))
@@ -409,10 +421,14 @@ class Relay:
                     self.unanswered.setdefault(comment["id"], Pending(comment, event_id, lines))
             self.loaded = True
         listed = {comment["id"] for comment in comments}
-        for comment_id, pending in list(self.unanswered.items()):  # applied earlier; only the answer failed
-            if channel.reply_id(comment_id) in listed:
-                await self._acknowledged(comment_id, pending.event_id)  # an earlier try did post it
-            elif pending.next_try is None or now >= pending.next_try:
+        # Answers that failed earlier (the commands were applied), due again; an earlier try may have posted one.
+        due = {comment_id: pending for comment_id, pending in self.unanswered.items()
+               if channel.reply_id(comment_id) in listed or pending.next_try is None or now >= pending.next_try}
+        posted = await channel.posted([comment_id for comment_id in due if channel.reply_id(comment_id) not in listed])
+        for comment_id, pending in due.items():
+            if comment_id in posted or channel.reply_id(comment_id) in listed:
+                await self._acknowledged(comment_id, pending.event_id)
+            else:
                 await self._answer(channel, pending.comment, pending.event_id, pending.lines, now)
         handled: list[int | str] = []
         for comment in sorted(comments, key=lambda c: (c["created_at"] or now, c["id"])):

@@ -28,6 +28,7 @@ class LinearProvider(Protocol):
     async def comments(self, issue_id: str) -> list[dict[str, Any]]: ...
     async def issue(self, issue_id: str) -> dict[str, Any]: ...
     async def comments_since(self, issue_id: str, since: str) -> list[dict[str, Any]]: ...
+    async def comments_by_id(self, issue_id: str, comment_ids: list[str]) -> list[dict[str, Any]]: ...
     async def create_comment(self, issue_id: str, body: str, *, comment_id: str | None = None) -> dict[str, Any]: ...
 
 
@@ -170,6 +171,12 @@ class Linear:
             nodes { id body createdAt url user { id name email active guest app } }
             pageInfo { hasNextPage endCursor } } } }""", {"id": issue_id, "filter": {"createdAt": {"gte": since}}},
             ("issue", "comments"), ("id", "body", "createdAt"))
+
+    async def comments_by_id(self, issue_id: str, comment_ids: list[str]) -> list[dict[str, Any]]:
+        """Which of these comments exist on the issue, however old."""
+        return await self._nodes("""query($id: String!, $filter: CommentFilter, $after: String) { issue(id: $id) {
+            comments(first: 100, after: $after, filter: $filter) { nodes { id body } pageInfo { hasNextPage endCursor } }
+            } }""", {"id": issue_id, "filter": {"id": {"in": comment_ids}}}, ("issue", "comments"), ("id", "body"))
 
     async def create_comment(self, issue_id: str, body: str, *, comment_id: str | None = None) -> dict[str, Any]:
         supplied_id = {"id": comment_id} if comment_id else {}
