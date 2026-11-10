@@ -47,7 +47,8 @@ jobs:
 
   postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The Postgres suite takes ~11 min plus ~4 min of setup; 15 min started cancelling PRs (#302, #321).
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: aifactory
