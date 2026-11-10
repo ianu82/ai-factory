@@ -104,16 +104,19 @@ def scrub(value, secrets=()):
                 if lo < hi:
                     masks[path][lo:hi] = b"\1" * (hi - lo)
             offset += len(s)
-    mark(leaves)
     def values_only(group):
         return [(p, s) for p, s in group if not any(isinstance(x, tuple) and x[0] == "key" for x in p)]
 
+    # Keys are scrubbed one by one. A span across structure never rewrites a key: that would change the shape
+    # of the value (and collapse entries whose keys collide).
+    for leaf in leaves:
+        if leaf[0] and isinstance(leaf[0][-1], tuple) and leaf[0][-1][0] == "key":
+            mark([leaf])
     mark(values_only(leaves))
     # Transport metadata must not break credentials split across event payloads.
     if isinstance(value, list) and value and isinstance(value[0], dict) and "seq" in value[0]:
         roots = [(i, ("value", list(event).index("data"))) for i, event in enumerate(value)]
         payloads = [(p, s) for p, s in leaves if any(p[:2] == root for root in roots)]
-        mark(payloads)
         mark(values_only(payloads))
     # Locate text/content fields without flattening away the original offset map.
     text_paths = set()
@@ -148,6 +151,13 @@ def scrub(value, secrets=()):
             return [rebuild(child, path + (i,)) for i, child in enumerate(v)]
         return v
     return rebuild(value)
+
+
+def scrub_events(events, secrets=()):
+    """SSE envelopes are built by this module; only their payloads carry content. All payloads are scrubbed as
+    one value, so a credential split across events is still found, and every envelope keeps its shape."""
+    payloads = scrub([event["data"] for event in events], secrets)
+    return [{**event, "data": data} for event, data in zip(events, payloads)]
 
 
 _PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
@@ -434,7 +444,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 # longest credential's worth of later token text AND structured
                 # data. Scrub the original complete buffer, never substitutions.
                 tail = max([len(s) for s in secrets] + [256])
-                safe = scrub(events, secrets)
+                safe = scrub_events(events, secrets)
                 tokens = [e["data"].get("text", "") if e["type"] == "token" else "" for e in events]
                 text = "".join(tokens)
                 ends = list(itertools.accumulate(len(t) for t in tokens))
@@ -449,7 +459,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 store.owned(session, user_id, thread_id)
                 events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
-                safe = cut_open_credential(scrub(events, secrets_for(session, user_id, scope)))
+                safe = cut_open_credential(scrub_events(events, secrets_for(session, user_id, scope)))
             for event in safe[released:]:
                 yield encoded(event)
             flushed = True
@@ -472,9 +482,9 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 # Persist even on disconnect. No durable worker or public event bus.
                 with SessionLocal() as session:
                     secrets = secrets_for(session, user_id, scope)
-                    safe = cut_open_credential(scrub(events, secrets))
+                    safe = cut_open_credential(scrub_events(events, secrets))
                     row = session.get(MindMessage, assistant_id)
-                    row.text = "".join(e["data"]["text"] for e in safe if e["type"] == "token")
+                    row.text = "".join(e["data"].get("text", "") for e in safe if e["type"] == "token")
                     row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]
                     row.action_cards = [e["data"]["card"] for e in safe if e["type"] == "action_card"]
                     row.history = {"tools": [e["data"] for e in safe if e["type"] == "tool_finished"]}

@@ -526,6 +526,9 @@ def test_a_streamed_private_key_is_never_released_in_part(world, closed):
     thread = create(world)
     response = send(world, thread)
     assert "B" * 20 not in response.text  # neither while streaming nor in the final flush
+    es = events(response)
+    assert all(set(e) == {"seq", "thread_id", "message_id", "type", "data"} for e in es)  # envelopes keep shape
+    assert es[-1]["data"] == {"status": "complete"}
     text = client.get(f"/api/mind/threads/{thread}").json()["messages"][1]["text"]
     assert "B" * 20 not in text and "[redacted]" in text and text.startswith("Here it is: ")
     if closed:
