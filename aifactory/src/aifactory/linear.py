@@ -26,6 +26,8 @@ class LinearProvider(Protocol):
     async def issue_states(self, issue_ids: list[str]) -> dict[str, dict[str, Any] | LinearError]: ...
     async def update_issue_state(self, issue_id: str, state_id: str) -> None: ...
     async def comments(self, issue_id: str) -> list[dict[str, Any]]: ...
+    async def issue(self, issue_id: str) -> dict[str, Any]: ...
+    async def comments_since(self, issue_id: str, since: str) -> list[dict[str, Any]]: ...
     async def create_comment(self, issue_id: str, body: str, *, comment_id: str | None = None) -> dict[str, Any]: ...
 
 
@@ -155,6 +157,19 @@ class Linear:
         return await self._nodes("""query($id: String!, $after: String) { issue(id: $id) {
             comments(first: 100, after: $after) { nodes { id body } pageInfo { hasNextPage endCursor } }
             } }""", {"id": issue_id}, ("issue", "comments"), ("id", "body"))
+
+    async def issue(self, issue_id: str) -> dict[str, Any]:
+        """An issue by UUID or identifier (such as ENG-123)."""
+        data = await self._request("query($id: String!) { issue(id: $id) { id identifier url } }", {"id": issue_id})
+        return _object(data.get("issue"), "id", "identifier")
+
+    async def comments_since(self, issue_id: str, since: str) -> list[dict[str, Any]]:
+        """An issue's comments created at or after `since` (ISO 8601), with their authors (null for integrations)."""
+        return await self._nodes("""query($id: String!, $filter: CommentFilter, $after: String) { issue(id: $id) {
+            comments(first: 100, after: $after, filter: $filter) {
+            nodes { id body createdAt url user { id name email active guest app } }
+            pageInfo { hasNextPage endCursor } } } }""", {"id": issue_id, "filter": {"createdAt": {"gte": since}}},
+            ("issue", "comments"), ("id", "body", "createdAt"))
 
     async def create_comment(self, issue_id: str, body: str, *, comment_id: str | None = None) -> dict[str, Any]:
         supplied_id = {"id": comment_id} if comment_id else {}

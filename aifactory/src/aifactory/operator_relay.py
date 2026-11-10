@@ -3,29 +3,37 @@
 The bootstrap's ``resolve``, ``guidance``, ``retry`` and ``cancel`` items apply only when production starts
 (``AIFACTORY_BOOTSTRAP`` is read at startup), and production restarts only on a release, at least two hours
 apart, so a relayed review finding, retry or piece of guidance could wait hours. This channel takes the same
-items from comments on one GitHub issue that the bootstrap names, and applies them on the next poll (every 30
-seconds)::
+items from comments on one control issue that the bootstrap names, a GitHub issue or a Linear issue, and applies
+them on the next poll (every 30 seconds)::
 
     "control": {"repository": "owner/name", "issue": 123, "operators": ["github-login"]}
+    "control": {"linear": {"issue": "ENG-123"}, "operators": ["linear-user-email-or-id"]}
 
 A command is a comment that starts with ``/factory`` and holds one fenced ``json`` block: an object with any of
 ``resolve``, ``guidance``, ``retry`` and ``cancel``, each a list in the bootstrap's own item format. Items
-without a nonce get one from the comment id, so a command applies once. Only commands by a listed operator login
-who has write access to that repository (asked of GitHub for each command) apply, and only while the command is
-less than a day old when first seen. The Factory answers each command with what it applied or skipped.
+without a nonce get one from the comment id, so a command applies once. Only commands by a listed operator apply,
+and only while the command is less than a day old when first seen. On GitHub the operator is a login with write
+access to that repository (asked of GitHub for each command); on Linear, an active member (not a guest or an app)
+of the workspace the Factory's Linear key belongs to, named by email or user id. The Factory answers each command
+with what it applied or skipped, on the same issue; an answer that fails is retried with a growing delay (at most
+one try per comment every ten minutes), so a missing permission cannot spend the API quota.
 
-Nothing new is trusted: the Factory reads with the GitHub access it already has and adds no credential, and the
-items keep the bootstrap's delegation rules (actions are recorded as the operator under ``delegated_by``; only
-relays outside the bootstrap workspace; ``head`` guards). A live cancel never discards started work.
+Nothing new is trusted: the Factory reads with the access it already has (the workspace's GitHub access, or its
+Linear API key) and adds no credential, and the items keep the bootstrap's delegation rules (actions are recorded
+as the operator under ``delegated_by``; only relays outside the bootstrap workspace; ``head`` guards). A live
+cancel never discards started work.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -33,6 +41,7 @@ log = logging.getLogger(__name__)
 
 POLL_SECONDS = 30
 MAX_AGE = timedelta(hours=24)
+MAX_BACKOFF = timedelta(minutes=10)  # a failing answer or poll is tried at most this rarely
 COMMAND = "/factory"
 REPLY_MARKER = "<!-- ai-factory:operator-relay -->"
 EVENT = "operator_relay"
@@ -50,13 +59,21 @@ def control() -> dict[str, Any] | None:
     raw, workspace = cfg.get("control"), bootstrap_workspace()
     if not isinstance(raw, dict) or not workspace:
         return None
-    repository, issue = str(raw.get("repository") or "").strip(), raw.get("issue")
     operators = {str(o).strip().casefold() for o in raw.get("operators") or [] if str(o).strip()}
+    common = {"operators": operators, "workspace": workspace, "delegated_by": str(cfg.get("delegated_by") or "")}
+    if "linear" in raw:
+        linear = raw["linear"] if isinstance(raw["linear"], dict) else {}
+        issue = linear.get("issue").strip() if isinstance(linear.get("issue"), str) else ""
+        if not issue or "repository" in raw or "issue" in raw or not operators:
+            log.error("Bootstrap control on Linear needs only linear.issue (such as ENG-123) and operator emails or "
+                      "user ids")
+            return None
+        return {"channel": "linear", "issue": issue, **common}
+    repository, issue = str(raw.get("repository") or "").strip(), raw.get("issue")
     if repository.count("/") != 1 or type(issue) is not int or issue <= 0 or not operators:
         log.error("Bootstrap control needs a repository (owner/name), an issue number and operator logins")
         return None
-    return {"repository": repository, "issue": issue, "operators": operators, "workspace": workspace,
-            "delegated_by": str(cfg.get("delegated_by") or "")}
+    return {"channel": "github", "repository": repository, "issue": issue, **common}
 
 
 def parse(body: str) -> tuple[dict[str, list] | None, str]:
@@ -147,7 +164,7 @@ def _time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _handled(workspace_id: str, comment_id: int, now: datetime) -> tuple[int, dict] | None:
+def _handled(workspace_id: str, comment_id: int | str, now: datetime) -> tuple[int, dict] | None:
     """The record of an earlier poll (perhaps before a restart) that handled this command: (event id, data)."""
     from .db import session_scope
     from .models import Event
@@ -156,20 +173,24 @@ def _handled(workspace_id: str, comment_id: int, now: datetime) -> tuple[int, di
     with session_scope() as s:
         for e in s.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == EVENT,
                                        Event.created_at >= cutoff).order_by(Event.id):
-            if (e.data or {}).get("comment_id") == comment_id:
+            if str((e.data or {}).get("comment_id")) == str(comment_id):  # GitHub ids are numbers, Linear's UUIDs
                 return e.id, dict(e.data or {})
     return None
 
 
-def _unanswered(workspace_id: str) -> list[tuple[int, dict]]:
-    """Relay records whose answer never posted, however old: a restarted process answers them."""
+def _unanswered(workspace_id: str, channel: str) -> list[tuple[int, dict]]:
+    """This channel's relay records whose answer never posted, however old: a restarted process answers them."""
     from .db import session_scope
     from .models import Event
+
+    def same_channel(data: dict) -> bool:
+        # Records from before channels were named came from the GitHub control issue.
+        return data.get("channel") == channel if data.get("channel") else channel.startswith("github:")
 
     with session_scope() as s:
         return [(e.id, dict(e.data or {})) for e in s.query(Event).filter(
             Event.workspace_id == workspace_id, Event.kind == EVENT).order_by(Event.id)
-            if (e.data or {}).get("acknowledged") is False]
+            if (e.data or {}).get("acknowledged") is False and same_channel(e.data or {})]
 
 
 def _mark_acknowledged(event_id: int) -> None:
@@ -211,16 +232,129 @@ def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable
     return lines
 
 
+def _backoff(failures: int) -> timedelta:
+    """The wait after the given number of failures in a row: one poll, then doubling, at most ten minutes."""
+    return min(MAX_BACKOFF, timedelta(seconds=POLL_SECONDS * 2 ** min(failures - 1, 10)))
+
+
+class GitHubChannel:
+    """Commands on a GitHub issue, read and answered with the workspace's GitHub access."""
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        from .github import GitHub, resolve_credential
+
+        self.cfg = cfg
+        self.gh = GitHub(resolve_credential(cfg["workspace"]))
+        self.key = f"github:{cfg['repository']}#{cfg['issue']}"
+
+    async def comments(self, since: datetime) -> list[dict[str, Any]]:
+        from .github import GitHubError
+
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = await self.gh.request("GET", f"/repos/{self.cfg['repository']}/issues/{self.cfg['issue']}/comments",
+                                          params={"since": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "per_page": 100,
+                                                  "page": page})
+            if not isinstance(batch, list):
+                raise GitHubError("Malformed GitHub comments response")
+            rows += batch
+            if len(batch) < 100:
+                break
+            page += 1
+        return [{"id": int(c.get("id") or 0), "body": str(c.get("body") or ""),
+                 "author": str((c.get("user") or {}).get("login") or ""), "created_at": _time(c.get("created_at")),
+                 "url": str(c.get("html_url") or "")} for c in rows if isinstance(c, dict)]
+
+    def listed(self, comment: dict[str, Any]) -> bool:
+        return comment["author"].casefold() in self.cfg["operators"]
+
+    async def refusal(self, comment: dict[str, Any]) -> str | None:
+        login = comment["author"]
+        if await _permission(self.gh, self.cfg["repository"], login) not in WRITE:
+            return f"{login} has no write access to {self.cfg['repository']}"
+        return None
+
+    def reply_id(self, comment_id: int | str) -> str | None:
+        return None
+
+    async def reply(self, comment_id: int | str, text: str) -> None:
+        await self.gh.comment(self.cfg["repository"], self.cfg["issue"], f"{REPLY_MARKER}\n{text}")
+
+
+class LinearChannel:
+    """Commands on a Linear issue, read and answered with the workspace's Linear API key. A comment's author is a
+    member of the workspace the key belongs to (integrations and synced external users have none)."""
+
+    def __init__(self, cfg: dict[str, Any], issues: dict[str, str]) -> None:
+        from .linear import Linear, resolve_token
+
+        self.cfg = cfg
+        self.linear = Linear(resolve_token(cfg["workspace"]))
+        self.issues = issues  # configured issue (identifier or UUID) -> UUID, kept by the relay across polls
+        self.key = f"linear:{cfg['issue']}"
+
+    async def _issue_id(self) -> str:
+        if self.cfg["issue"] not in self.issues:
+            self.issues[self.cfg["issue"]] = (await self.linear.issue(self.cfg["issue"]))["id"]
+        return self.issues[self.cfg["issue"]]
+
+    async def comments(self, since: datetime) -> list[dict[str, Any]]:
+        nodes = await self.linear.comments_since(await self._issue_id(), since.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+        rows = []
+        for node in nodes:
+            user = node.get("user") if isinstance(node.get("user"), dict) else {}
+            rows.append({"id": str(node["id"]), "body": str(node.get("body") or ""), "user": user,
+                         "author": str(user.get("name") or user.get("email") or ""),
+                         "created_at": _time(node.get("createdAt")), "url": str(node.get("url") or "")})
+        return rows
+
+    def listed(self, comment: dict[str, Any]) -> bool:
+        user = comment.get("user") or {}
+        names = {str(user.get(field) or "").strip().casefold() for field in ("id", "email")} - {""}
+        return bool(names & self.cfg["operators"])
+
+    async def refusal(self, comment: dict[str, Any]) -> str | None:
+        user = comment.get("user") or {}
+        # Read with the comment in this poll, so a deactivated or downgraded operator stops counting at once.
+        if user.get("active") is not True or user.get("guest") is not False or user.get("app") is not False:
+            return f"{comment['author'] or 'unknown'} is not an active member of the Linear workspace"
+        return None
+
+    def reply_id(self, comment_id: int | str) -> str | None:
+        """The answer's own comment id, fixed per command: a retried answer whose first try did post (but whose
+        response was lost) is recognised in the next listing instead of posting twice."""
+        digest = hashlib.sha256(f"ai-factory:operator-relay:{self.key}:{comment_id}".encode()).digest()
+        return str(uuid.UUID(bytes=digest[:16], version=4))
+
+    async def reply(self, comment_id: int | str, text: str) -> None:
+        await self.linear.create_comment(await self._issue_id(), text, comment_id=self.reply_id(comment_id))
+
+
+@dataclass
+class Pending:
+    """A handled command whose answer has not posted yet."""
+
+    comment: dict[str, Any]
+    event_id: int
+    lines: list[str]
+    failures: int = 0
+    next_try: datetime | None = None
+
+
 class Relay:
     """Polls the control issue from the orchestrator's loop."""
 
     def __init__(self, wake: Callable[[], None] = lambda: None) -> None:
         self.wake = wake
         self.last_poll = float("-inf")
-        self.since: datetime | None = None  # GitHub's `since` (updated at or after) for the next poll
-        self.seen: set[int] = set()  # commands this process handled and answered; the events table covers restarts
-        self.unanswered: dict[int, tuple[dict[str, Any], int, list[str]]] = {}  # comment id -> (comment, event, lines)
+        self.since: datetime | None = None  # comments created (Linear) or updated (GitHub) from here, next poll
+        self.seen: set[int | str] = set()  # commands this process handled and answered; events cover restarts
+        self.unanswered: dict[int | str, Pending] = {}  # by comment id
         self.loaded = False  # whether this process has picked up answers an earlier one never posted
+        self.linear_issues: dict[str, str] = {}
+        self.failures = 0  # polls failed in a row
+        self.resume_at = float("-inf")  # monotonic time before which a failing channel is not polled again
 
     async def run(self) -> None:
         """Poll on its own schedule: slow maintenance in the scheduler loop must never delay an operator's cancel
@@ -230,48 +364,51 @@ class Relay:
             await asyncio.sleep(POLL_SECONDS)
 
     async def maybe_poll(self) -> None:
-        if time.monotonic() - self.last_poll < POLL_SECONDS:
+        clock = time.monotonic()
+        if clock - self.last_poll < POLL_SECONDS or clock < self.resume_at:
             return
-        self.last_poll = time.monotonic()
+        self.last_poll = clock
         cfg = control()
         if cfg is None:
             return
         try:
             await self.poll(cfg)
-        except Exception:  # never let a GitHub or database hiccup reach the scheduler
-            log.exception("operator relay poll failed")
+        except Exception as exc:  # never let a GitHub, Linear or database hiccup reach the scheduler
+            # Back off a channel that keeps failing (a missing key or permission, an exhausted rate limit), so it
+            # costs a call every ten minutes at most; one log line per step, with the traceback on the first.
+            self.failures += 1
+            wait = _backoff(self.failures)
+            self.resume_at = time.monotonic() + wait.total_seconds()
+            log.warning("operator relay poll failed (%d in a row); next poll in %ds: %s", self.failures,
+                        wait.total_seconds(), exc, exc_info=self.failures == 1)
+        else:
+            self.failures = 0
 
-    async def poll(self, cfg: dict[str, Any], now: datetime | None = None) -> list[int]:
+    def channel(self, cfg: dict[str, Any]) -> GitHubChannel | LinearChannel:
+        return LinearChannel(cfg, self.linear_issues) if cfg.get("channel") == "linear" else GitHubChannel(cfg)
+
+    async def poll(self, cfg: dict[str, Any], now: datetime | None = None) -> list[int | str]:
         """Handle new commands; returns the comment ids handled."""
-        from .github import GitHub, GitHubError, resolve_credential
-
         now = now or datetime.now(timezone.utc)
-        gh = GitHub(resolve_credential(cfg["workspace"]))
-        since = self.since or now - MAX_AGE
-        comments: list[dict[str, Any]] = []
-        page = 1
-        while True:
-            batch = await gh.request("GET", f"/repos/{cfg['repository']}/issues/{cfg['issue']}/comments",
-                                     params={"since": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "per_page": 100,
-                                             "page": page})
-            if not isinstance(batch, list):
-                raise GitHubError("Malformed GitHub comments response")
-            comments += batch
-            if len(batch) < 100:
-                break
-            page += 1
+        channel = self.channel(cfg)
+        comments = await channel.comments(self.since or now - MAX_AGE)
         if not self.loaded:
-            for event_id, data in await asyncio.to_thread(_unanswered, cfg["workspace"]):
-                comment = {"id": data.get("comment_id"), "html_url": data.get("html_url") or "",
-                           "user": {"login": data.get("author") or ""}}
+            for event_id, data in await asyncio.to_thread(_unanswered, cfg["workspace"], channel.key):
+                comment = {"id": data.get("comment_id"), "url": data.get("url") or data.get("html_url") or "",
+                           "author": data.get("author") or ""}
                 if comment["id"]:
-                    self.unanswered.setdefault(int(comment["id"]), (comment, event_id, list(data.get("results") or [])))
+                    lines = list(data.get("results") or [])
+                    self.unanswered.setdefault(comment["id"], Pending(comment, event_id, lines))
             self.loaded = True
-        for comment_id, (comment, event_id, lines) in list(self.unanswered.items()):
-            await self._answer(gh, cfg, comment, event_id, lines)  # applied earlier; only the answer failed
-        handled = []
-        for comment in sorted(comments, key=lambda c: (str(c.get("created_at") or ""), int(c.get("id") or 0))):
-            comment_id, body = int(comment.get("id") or 0), str(comment.get("body") or "")
+        listed = {comment["id"] for comment in comments}
+        for comment_id, pending in list(self.unanswered.items()):  # applied earlier; only the answer failed
+            if channel.reply_id(comment_id) in listed:
+                await self._acknowledged(comment_id, pending.event_id)  # an earlier try did post it
+            elif pending.next_try is None or now >= pending.next_try:
+                await self._answer(channel, pending.comment, pending.event_id, pending.lines, now)
+        handled: list[int | str] = []
+        for comment in sorted(comments, key=lambda c: (c["created_at"] or now, c["id"])):
+            comment_id, body = comment["id"], comment["body"]
             if not comment_id or comment_id in self.seen or comment_id in self.unanswered or REPLY_MARKER in body:
                 continue
             if not body.lstrip().startswith(COMMAND):
@@ -282,64 +419,71 @@ class Relay:
                 if data.get("acknowledged"):
                     self.seen.add(comment_id)
                 else:  # handled before a restart, but its answer never posted
-                    await self._answer(gh, cfg, comment, event_id, list(data.get("results") or []))
+                    await self._answer(channel, comment, event_id, list(data.get("results") or []), now)
                 continue
-            await self._handle(gh, cfg, comment, now)
+            await self._handle(channel, cfg, comment, now)
             handled.append(comment_id)
-        # Overlap the next window by a minute (clock skew between GitHub and this host); handled ids are skipped.
+        # Overlap the next window by a minute (clock skew between the tracker and this host); handled ids are
+        # skipped.
         self.since = now - timedelta(minutes=1)
         return handled
 
-    async def _handle(self, gh, cfg: dict[str, Any], comment: dict[str, Any], now: datetime) -> None:
+    async def _handle(self, channel, cfg: dict[str, Any], comment: dict[str, Any], now: datetime) -> None:
         from .events import record
 
-        comment_id = int(comment["id"])
-        login = str((comment.get("user") or {}).get("login") or "")
-        lines = await self._apply(gh, cfg, comment, login, now)
+        author = comment["author"]
+        lines = await self._apply(channel, cfg, comment, now)
         applied = any(line.endswith((": applied", ": posted", ": cancelled")) or ": retrying " in line
                       for line in lines)
         # Recorded before the answer: a crash after it never applies a command twice (nonces also guard each item).
         # The record says whether the answer posted, so a failed answer is retried without applying again.
         payload = await asyncio.to_thread(
-            record, cfg["workspace"], EVENT, f"Operator relay from {login or 'unknown'}: " + "; ".join(lines)[:300],
+            record, cfg["workspace"], EVENT, f"Operator relay from {author or 'unknown'}: " + "; ".join(lines)[:300],
             actor="operator", level="info" if applied else "warn",
-            data={"comment_id": comment_id, "author": login, "results": lines, "html_url": comment.get("html_url"),
-                  "delegated_by": cfg["delegated_by"], "acknowledged": False})
+            data={"comment_id": comment["id"], "author": author, "results": lines, "url": comment["url"],
+                  "channel": channel.key, "delegated_by": cfg["delegated_by"], "acknowledged": False})
         if applied:
             self.wake()
-        await self._answer(gh, cfg, comment, int(payload["id"]), lines)
+        await self._answer(channel, comment, int(payload["id"]), lines, now)
 
-    async def _answer(self, gh, cfg: dict[str, Any], comment: dict[str, Any], event_id: int,
-                      lines: list[str]) -> None:
-        """Post the result lines on the control issue; until that succeeds every poll tries again."""
-        comment_id = int(comment["id"])
-        login = str((comment.get("user") or {}).get("login") or "")
-        reply = "\n".join([REPLY_MARKER, f"Factory relay for {comment.get('html_url') or comment_id} "
-                                         f"(by {login or 'unknown'}):", *[f"- {line}" for line in lines]])
+    async def _answer(self, channel, comment: dict[str, Any], event_id: int, lines: list[str],
+                      now: datetime) -> None:
+        """Post the result lines on the control issue. A failed answer is tried again after a growing delay: once
+        per poll at first, at most once every ten minutes, with one log line per try."""
+        comment_id = comment["id"]
+        text = "\n".join([f"Factory relay for {comment.get('url') or comment_id} "
+                          f"(by {comment.get('author') or 'unknown'}):", *[f"- {line}" for line in lines]])
         try:
-            await gh.comment(cfg["repository"], cfg["issue"], reply)
+            await channel.reply(comment_id, text)
         except Exception as exc:
-            log.warning("operator relay could not answer comment %s yet: %s", comment_id, exc)
-            self.unanswered[comment_id] = (comment, event_id, lines)
+            pending = self.unanswered.get(comment_id) or Pending(comment, event_id, lines)
+            pending.failures += 1
+            wait = _backoff(pending.failures)
+            pending.next_try = now + wait
+            self.unanswered[comment_id] = pending
+            log.warning("operator relay could not answer comment %s (try %d); next try in %ds: %s", comment_id,
+                        pending.failures, wait.total_seconds(), exc)
             return
+        await self._acknowledged(comment_id, event_id)
+
+    async def _acknowledged(self, comment_id: int | str, event_id: int) -> None:
         self.unanswered.pop(comment_id, None)
         self.seen.add(comment_id)
         await asyncio.to_thread(_mark_acknowledged, event_id)
 
-    async def _apply(self, gh, cfg: dict[str, Any], comment: dict[str, Any], login: str,
-                     now: datetime) -> list[str]:
-        if login.casefold() not in cfg["operators"]:
-            return [f"not applied: {login or 'unknown'} is not a listed operator"]
-        created = _time(comment.get("created_at"))
+    async def _apply(self, channel, cfg: dict[str, Any], comment: dict[str, Any], now: datetime) -> list[str]:
+        if not channel.listed(comment):
+            return [f"not applied: {comment['author'] or 'unknown'} is not a listed operator"]
+        created = comment["created_at"]
         if created is None or now - created > MAX_AGE:
             return ["not applied: first seen more than 24 hours after it was written"]
-        permission = await _permission(gh, cfg["repository"], login)
-        if permission not in WRITE:
-            return [f"not applied: {login} has no write access to {cfg['repository']}"]
-        items, error = parse(str(comment.get("body") or ""))
+        refusal = await channel.refusal(comment)
+        if refusal:
+            return [f"not applied: {refusal}"]
+        items, error = parse(comment["body"])
         if items is None:
             return [f"not applied: {error}"]
-        comment_id = int(comment["id"])
+        comment_id = comment["id"]
         for kind in ("retry", "resolve", "guidance"):
             if kind in items:
                 items[kind] = [{**item, "nonce": str(item.get("nonce") or f"relay-{comment_id}-{kind}-{n}")}

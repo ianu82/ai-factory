@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from aifactory import github as github_module
+from aifactory import linear as linear_module
 from aifactory.bootstrap import apply_bootstrap
 from aifactory.db import session_scope
+from aifactory.linear import LinearError
 from aifactory.models import Decision, Event, Message, Organization, Outcome, Plan, Repository, Task, Workspace
 from aifactory.operator_relay import REPLY_MARKER, Relay, control, parse
 
@@ -27,6 +30,7 @@ class FakeGH:
     permissions: dict[str, str] = {}
     rate_limited = False
     comment_fails = 0
+    comment_calls = 0
     lists = 0
 
     def __init__(self, token):
@@ -47,6 +51,7 @@ class FakeGH:
 
     async def comment(self, full_name, number, body):
         assert (full_name, number) == ("acme/app", 5)
+        FakeGH.comment_calls += 1
         if FakeGH.comment_fails:
             FakeGH.comment_fails -= 1
             raise github_module.GitHubError("GitHub unreachable", 502)
@@ -101,12 +106,12 @@ def factory(monkeypatch):
     monkeypatch.setattr(github_module, "GitHub", FakeGH)
     monkeypatch.setattr(github_module, "resolve_credential", lambda workspace_id: "token")
     FakeGH.comments, FakeGH.replies, FakeGH.permissions, FakeGH.lists = [], [], {"ianu82": "admin"}, 0
-    FakeGH.rate_limited, FakeGH.comment_fails = False, 0
+    FakeGH.rate_limited, FakeGH.comment_fails, FakeGH.comment_calls = False, 0, 0
     return ids
 
 
-def poll(relay: Relay | None = None) -> list[int]:
-    return asyncio.run((relay or Relay()).poll(control(), now=NOW))
+def poll(relay: Relay | None = None, at: datetime = NOW) -> list:
+    return asyncio.run((relay or Relay()).poll(control(), now=at))
 
 
 def decision_state() -> tuple[str, str | None]:
@@ -168,8 +173,10 @@ def test_a_failed_answer_is_retried_without_applying_again(factory):
     assert poll(relay) == [16]  # applied; the answer failed
     assert decision_state() == ("resolved", "reject") and FakeGH.replies == []
     FakeGH.comments = []  # later polls no longer list it (GitHub's since window has moved on)
-    poll(relay)  # the second answer attempt fails too
-    poll(relay)
+    poll(relay, at=NOW + timedelta(seconds=30))  # the second answer attempt fails too
+    poll(relay, at=NOW + timedelta(seconds=60))  # backing off: the next try is a minute after the second
+    assert FakeGH.comment_calls == 2
+    poll(relay, at=NOW + timedelta(seconds=90))
     assert len(FakeGH.replies) == 1 and "approve_merge reject: applied" in FakeGH.replies[0]
     with session_scope() as s:
         assert s.query(Event).filter(Event.kind == "operator_relay").one().data["acknowledged"] is True
@@ -325,3 +332,181 @@ def test_parse_accepts_only_the_bootstrap_item_kinds():
     assert parse("/factory no block")[0] is None
     assert parse("/factory\n```json\n{\"retry\": []}\n```")[1] == "retry must be a non-empty list"
     assert parse("/factory\n```json\n{\"guidance\": [\"text\"]}\n```")[1] == "every guidance item must be an object"
+
+
+def test_failed_answers_back_off_to_one_try_every_ten_minutes(factory, caplog):
+    FakeGH.comment_fails = 1000  # the token cannot comment on issues
+    FakeGH.comments = [command(18, REQUEST_CHANGES)]
+    relay = Relay()
+    caplog.set_level(logging.WARNING, logger="aifactory.operator_relay")
+    tries = []
+    for second in range(0, 3601, 30):  # an hour of polls
+        before = FakeGH.comment_calls
+        poll(relay, at=NOW + timedelta(seconds=second))
+        if FakeGH.comment_calls > before:
+            tries.append(second)
+    assert tries[:7] == [0, 30, 90, 210, 450, 930, 1530]  # doubling from one poll, then every ten minutes
+    assert {b - a for a, b in zip(tries[5:], tries[6:])} == {600}
+    assert len(tries) == 10  # not 121
+    assert len([r for r in caplog.records if "could not answer comment 18" in r.getMessage()]) == len(tries)
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1  # applied once throughout
+
+
+IAN = {"id": "user-ian", "name": "Ian", "email": "ian@example.com", "active": True, "guest": False, "app": False}
+LINEAR_CONTROL = {"linear": {"issue": "ENG-5"}, "operators": ["Ian@Example.com", "user-deputy"]}
+
+
+class FakeLinear:
+    comments: list[dict] = []
+    replies: list[tuple[str, str]] = []  # (comment id, body)
+    create_fails = 0
+    posts_then_fails = False
+    lists = 0
+
+    def __init__(self, token, **_):
+        assert token == "lin_api_key"
+
+    async def issue(self, issue_id):
+        assert issue_id == "ENG-5"
+        return {"id": "issue-uuid", "identifier": "ENG-5", "url": "https://linear.app/acme/issue/ENG-5"}
+
+    async def comments_since(self, issue_id, since):
+        assert issue_id == "issue-uuid" and since.endswith("Z")
+        FakeLinear.lists += 1
+        return list(FakeLinear.comments)
+
+    async def create_comment(self, issue_id, body, *, comment_id=None):
+        assert issue_id == "issue-uuid" and comment_id
+        if FakeLinear.create_fails and not FakeLinear.posts_then_fails:
+            FakeLinear.create_fails -= 1
+            raise LinearError("authentication")
+        FakeLinear.replies.append((comment_id, body))
+        FakeLinear.comments.append({"id": comment_id, "body": body, "createdAt": NOW.isoformat(), "url": "", "user": IAN})
+        if FakeLinear.create_fails:  # it posted, but the response never arrived
+            FakeLinear.create_fails -= 1
+            raise LinearError("timeout")
+        return {"id": comment_id, "body": body}
+
+
+def linear_command(comment_id: str, payload, *, user=IAN, age=timedelta(minutes=1)) -> dict:
+    return {"id": comment_id, "body": "/factory\n```json\n" + json.dumps(payload) + "\n```",
+            "createdAt": (NOW - age).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "url": f"https://linear.app/acme/issue/ENG-5#comment-{comment_id}", "user": user}
+
+
+@pytest.fixture
+def linear_factory(factory, monkeypatch):
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "Acme", "workspace": "Acme", "delegated_by": "ian@mindsdb.com", "control": LINEAR_CONTROL}))
+    monkeypatch.setattr(linear_module, "Linear", FakeLinear)
+    monkeypatch.setattr(linear_module, "resolve_token", lambda workspace_id: "lin_api_key")
+    FakeLinear.comments, FakeLinear.replies, FakeLinear.lists = [], [], 0
+    FakeLinear.create_fails, FakeLinear.posts_then_fails = 0, False
+    return factory
+
+
+def test_control_names_a_github_or_a_linear_issue(factory, monkeypatch):
+    assert control()["channel"] == "github"
+
+    def with_control(value):
+        monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({"organization": "Acme", "workspace": "Acme",
+                                                              "control": value}))
+        return control()
+
+    cfg = with_control(LINEAR_CONTROL)
+    assert (cfg["channel"], cfg["issue"], cfg["operators"]) == ("linear", "ENG-5", {"ian@example.com", "user-deputy"})
+    assert with_control({**LINEAR_CONTROL, "repository": "acme/app"}) is None  # one channel, not both
+    assert with_control({"linear": {"issue": " "}, "operators": ["ian@example.com"]}) is None
+    assert with_control({"linear": {"issue": "ENG-5"}, "operators": []}) is None
+
+
+def test_a_linear_command_applies_once_and_is_answered_on_linear(linear_factory):
+    FakeLinear.comments = [linear_command("c-1", REQUEST_CHANGES)]
+    relay = Relay()
+    assert poll(relay) == ["c-1"]
+    assert decision_state() == ("resolved", "reject")
+    [(reply_id, reply)] = FakeLinear.replies
+    assert reply.startswith("Factory relay for https://linear.app/acme/issue/ENG-5#comment-c-1 (by Ian):")
+    assert "approve_merge reject: applied" in reply and "guidance #7 T1: posted" in reply
+    assert reply_id == relay.channel(control()).reply_id("c-1")  # fixed per command
+    assert FakeGH.lists == 0 and FakeGH.replies == []  # nothing on GitHub
+    with session_scope() as s:
+        relay_event = s.query(Event).filter(Event.kind == "operator_relay").one()
+        assert relay_event.data["channel"] == "linear:ENG-5" and relay_event.data["acknowledged"] is True
+    # The same process, a restarted one and the Factory's own reply change nothing.
+    assert poll(relay, at=NOW + timedelta(seconds=30)) == [] and poll(Relay()) == []
+    assert len(FakeLinear.replies) == 1
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
+
+
+def test_only_listed_active_linear_members_count(linear_factory):
+    deputy = {**IAN, "id": "user-deputy", "name": "Deputy", "email": "deputy@example.com"}
+    FakeLinear.comments = [
+        linear_command("c-2", REQUEST_CHANGES, user={**IAN, "id": "user-m", "name": "Mallory", "email": "m@example.com"}),
+        linear_command("c-3", REQUEST_CHANGES, user={**IAN, "active": False}),
+        linear_command("c-4", REQUEST_CHANGES, user={**IAN, "guest": True}),
+        linear_command("c-5", REQUEST_CHANGES, user=None),  # an integration or a synced external user
+        linear_command("c-6", REQUEST_CHANGES, age=timedelta(hours=25)),
+        linear_command("c-7", {"guidance": [{"outcome": 7, "task": "T1", "body": "From the deputy."}]}, user=deputy),
+    ]
+    assert sorted(poll()) == ["c-2", "c-3", "c-4", "c-5", "c-6", "c-7"]
+    assert decision_state() == ("open", "")
+    replies = {reply.split("#comment-")[1].split(" ")[0]: reply for _, reply in FakeLinear.replies}
+    assert "Mallory is not a listed operator" in replies["c-2"]
+    assert "Ian is not an active member of the Linear workspace" in replies["c-3"]
+    assert "Ian is not an active member of the Linear workspace" in replies["c-4"]
+    assert "unknown is not a listed operator" in replies["c-5"]
+    assert "more than 24 hours" in replies["c-6"]
+    assert "guidance #7 T1: posted" in replies["c-7"]  # listed by user id
+    with session_scope() as s:
+        assert [m.body for m in s.query(Message).all()] == ["From the deputy."]
+
+
+def test_a_linear_answer_that_did_post_is_not_posted_twice(linear_factory):
+    FakeLinear.create_fails, FakeLinear.posts_then_fails = 1, True
+    FakeLinear.comments = [linear_command("c-8", REQUEST_CHANGES)]
+    relay = Relay()
+    assert poll(relay) == ["c-8"]  # applied; the answer posted but its response was lost
+    assert relay.unanswered
+    poll(relay, at=NOW + timedelta(seconds=30))  # the next listing shows the answer's fixed id
+    assert len(FakeLinear.replies) == 1 and not relay.unanswered
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_relay").one().data["acknowledged"] is True
+
+
+def test_github_answers_are_not_posted_on_linear(linear_factory):
+    with session_scope() as s:
+        s.add(Event(workspace_id=linear_factory["ws"], kind="operator_relay", message="old", actor="operator",
+                    data={"comment_id": 98, "author": "ianu82", "results": ["retry #7: retrying T1"],
+                          "html_url": "https://github.com/acme/app/issues/5#issuecomment-98", "acknowledged": False}))
+    assert poll(Relay()) == []
+    assert FakeLinear.replies == [] and FakeGH.replies == []
+
+
+def test_a_failing_channel_is_polled_less_often(linear_factory, monkeypatch, caplog):
+    calls = []
+
+    def missing_key(workspace_id):
+        calls.append(workspace_id)
+        raise LinearError("not_configured")
+
+    monkeypatch.setattr(linear_module, "resolve_token", missing_key)
+    caplog.set_level(logging.WARNING, logger="aifactory.operator_relay")
+    relay = Relay()
+    asyncio.run(relay.maybe_poll())
+    assert relay.failures == 1 and len(calls) == 1
+    relay.last_poll = float("-inf")  # the poll interval has passed, but the backoff has not
+    asyncio.run(relay.maybe_poll())
+    assert len(calls) == 1
+    relay.last_poll = relay.resume_at = float("-inf")
+    asyncio.run(relay.maybe_poll())
+    assert relay.failures == 2 and len(calls) == 2
+    warnings = [r for r in caplog.records if "poll failed" in r.getMessage()]
+    assert [bool(w.exc_info) for w in warnings] == [True, False]  # one line per step, one traceback
+    assert "next poll in 60s" in warnings[1].getMessage()
+    monkeypatch.setattr(linear_module, "resolve_token", lambda workspace_id: "lin_api_key")
+    relay.last_poll = relay.resume_at = float("-inf")
+    asyncio.run(relay.maybe_poll())
+    assert relay.failures == 0 and FakeLinear.lists == 1
