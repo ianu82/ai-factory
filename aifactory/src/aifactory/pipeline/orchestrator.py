@@ -18,7 +18,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Decision, Outcome, Task, User, Workspace
-from ..sandbox import disk_report, host_capacity, purge_quarantine, quarantine_orphaned_jobs
+from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .delivery import Stop, TaskRunner
 from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
@@ -160,6 +160,10 @@ class Orchestrator:
             log.info("inventory disk %s", disk_report())
         except OSError as exc:
             log.warning("inventory disk unavailable: %s", exc)
+        try:
+            log.info("inventory processes %s", process_report())
+        except OSError as exc:
+            log.warning("inventory processes unavailable: %s", exc)
 
         with session_scope() as s:
             open_outcomes = s.query(Outcome).filter(Outcome.status.notin_(["completed", "cancelled"])).all()
