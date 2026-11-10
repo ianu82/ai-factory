@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MindController, canConfirm, mindCost, mindLink, mindPrivateKey, mindRouteContext, mindSuggestions, readMindSSE, validMindBudget, type MindTransport } from "./mind.ts";
+import { MindController, canConfirm, mindContextLabel, mindCost, mindLink, mindModelLine, mindPrivateKey, mindRouteContext, mindSuggestions, readMindSSE, validMindBudget, type MindTransport } from "./mind.ts";
 import type { MindCard, MindEvent, MindHistory } from "./api.ts";
 
 const card: MindCard = { id: "c1", revision: 1, kind: "create_outcome", workspace_id: "target", title: "Create outcome", fields: { title: "Original", brief: "A brief" }, status: "proposed" };
@@ -425,5 +425,27 @@ test("wire unavailable, accounting and budget codes map to explicit blocked stat
   assert.equal(mindBudget("accounting_pending"), "pending_accounting");
   for (const [daily_spend, daily_limit, state] of [[0, 0, "budget_exceeded"], [10, 10, "budget_exceeded"], [null, 10, "pending_accounting"], [1, 10, "ok"]] as const) {
     assert.equal(mindUsage(status, { daily_spend, daily_limit, thread_cost: { usd: null, known: false } }).budget_state, state);
+  }
+});
+
+test("the dock labels its context by number and title, never by database ID", () => {
+  const outcome = mindRouteContext("/w/ws/outcomes/1c6b2c32ea194edcb1d419d53a02c624")!;
+  assert.equal(mindContextLabel(outcome), "This outcome");
+  assert.equal(mindContextLabel(outcome, { outcome: { number: 39, title: "Mind v1" } }), "#39 Mind v1");
+  const long = mindContextLabel(outcome, { outcome: { number: 39, title: "Mind v1: a delivery lead in a dock on every screen (Opus 5.5)" } });
+  assert.ok(long.startsWith("#39 Mind v1: a delivery lead") && long.endsWith("…") && long.length <= 60);
+  const decision = mindRouteContext("/w/ws/inbox/d1")!;
+  assert.equal(mindContextLabel(decision), "This decision");
+  assert.equal(mindContextLabel(decision, { decision: { title: "Approve merge: Add a.txt" } }), "Approve merge: Add a.txt");
+  assert.equal(mindContextLabel(mindRouteContext("/w/ws/runs")!), "Runs");
+  for (const label of [mindContextLabel(outcome), mindContextLabel(decision)]) assert.ok(!label.includes("1c6b2c32") && !label.includes("d1"));
+});
+test("the dock header names the reported model, or says the Mind is unavailable", () => {
+  assert.equal(mindModelLine(null), "Claude Opus 5.5");
+  assert.equal(mindModelLine({ model: "opus-5-5", available: true, budget_state: "ok" }), "opus-5-5");
+  assert.equal(mindModelLine({ model: null, available: true, budget_state: "ok" }), "Claude Opus 5.5");
+  assert.equal(mindModelLine({ model: null, available: false, reason: "Model missing", budget_state: "ok" }), "Unavailable");
+  for (const status of [null, { model: null, available: true, budget_state: "ok" as const }]) {
+    assert.ok(!mindModelLine(status).includes("identity unavailable"));
   }
 });

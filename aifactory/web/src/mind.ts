@@ -211,6 +211,20 @@ export function mindRouteContext(pathname: string): MindContext | null {
   const object = id && (kind === "outcomes" || kind === "inbox");
   return { workspace_id, kind: object ? kind === "outcomes" ? "outcome" : "decision" : kind, id: object ? id : workspace_id, ...(object && kind === "outcomes" ? { outcome_id: id } : {}), label: object ? `${kind === "outcomes" ? "Outcome" : "Decision"} ${id}` : kind[0].toUpperCase() + kind.slice(1) };
 }
+/** What the dock shows for its context: the outcome's number and title, or the decision's title, from what the page
+ * already loaded; never a raw database ID. */
+export function mindContextLabel(context: MindContext, loaded: { outcome?: { number: number; title: string } | null;
+                                                                  decision?: { title: string } | null } = {}): string {
+  const clip = (text: string) => text.length > 60 ? `${text.slice(0, 59).trimEnd()}…` : text;
+  if (context.kind === "outcome") return loaded.outcome ? clip(`#${loaded.outcome.number} ${loaded.outcome.title}`) : "This outcome";
+  if (context.kind === "decision") return loaded.decision ? clip(loaded.decision.title) : "This decision";
+  return context.label;
+}
+/** The dock header's model line: the model the status reports, "Unavailable" when it reports none can run. */
+export function mindModelLine(status: MindStatus | null): string {
+  if (status && !status.available) return "Unavailable";
+  return status?.model || "Claude Opus 5.5";
+}
 export function mindSuggestions(context: MindContext | null): string[] {
   switch (context?.kind) {
     case "outcome": return ["What is blocking this outcome?", "Summarize progress and the next decision.", "Why did the latest attempt fail?"];

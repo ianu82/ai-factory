@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Link, useLocation } from "react-router-dom";
+import { skipToken, useQuery } from "@tanstack/react-query";
 import { api, apiResponse, type Me, type MindCard, type MindCitation, type MindContext, type Role } from "../api";
-import { MindController, canConfirm, mindCost, mindLink, mindRouteContext, mindSuggestions, readMindSSE, type MindTransport } from "../mind";
+import { MindController, canConfirm, mindContextLabel, mindCost, mindLink, mindModelLine, mindRouteContext, mindSuggestions, readMindSSE, type MindTransport } from "../mind";
 import { createMindHttpTransport } from "../mindHttp";
 import { MindScroll } from "../mindScroll";
 import { containModalFocus } from "../modalFocus";
@@ -104,6 +105,15 @@ export function MindDock({ workspaceId }: { workspaceId?: string }) {
   const [focusRequest, setFocusRequest] = useState(0);
   const wasOpen = useRef(false);
   const currentWorkspace = workspaceId || state.context?.workspace_id || workspaces[0]?.id;
+  // Label the context from what the page already loaded (same query keys); the dock never fetches for a label.
+  const context = state.context;
+  const outcome = useQuery<{ outcome?: { number: number; title: string } }>({
+    queryKey: ["outcome", context?.workspace_id, context?.outcome_id], queryFn: skipToken });
+  const inbox = useQuery<{ decisions?: { id: string; title: string }[] }>({
+    queryKey: ["inbox", context?.workspace_id], queryFn: skipToken });
+  const contextLabel = context ? mindContextLabel(context, {
+    outcome: context.kind === "outcome" ? outcome.data?.outcome : null,
+    decision: context.kind === "decision" ? inbox.data?.decisions?.find((d) => d.id === context.id) : null }) : "";
   useEffect(() => {
     const media = window.matchMedia("(max-width: 760px)");
     const change = () => setMobile(media.matches);
@@ -144,7 +154,7 @@ export function MindDock({ workspaceId }: { workspaceId?: string }) {
     {state.open && <>
       {mobile && <div className="mind-scrim" onClick={() => controller.setOpen(false)} />}
       <aside id="mind-dock" ref={panel} className="mind-dock" role={mobile ? "dialog" : "complementary"} aria-modal={mobile ? true : undefined} aria-labelledby="mind-heading" tabIndex={-1}>
-        <header><div><h2 id="mind-heading">Mind</h2><div className="muted">{status?.model || "Claude Opus 5.5 · exact identity unavailable"}</div></div><button className="btn sm ghost" aria-label="Collapse Mind" onClick={() => { controller.setOpen(false); if (!mobile) trigger.current?.focus(); }}>Collapse</button></header>
+        <header><div><h2 id="mind-heading">Mind</h2><div className="muted">{mindModelLine(status)}</div></div><button className="btn sm ghost" aria-label="Collapse Mind" onClick={() => { controller.setOpen(false); if (!mobile) trigger.current?.focus(); }}>Collapse</button></header>
         <div className="mind-thread-controls">
           <label className="field"><span>Thread</span><select className="select" value={state.active?.id || ""} disabled={state.busy} onChange={(e) => { if (e.target.value) void controller.select(e.target.value); }}><option value="">Choose a thread</option>{state.threads.map((thread) => <option key={thread.id} value={thread.id}>{thread.title || "Untitled thread"}</option>)}</select></label>
           <div className="mind-actions"><button className="btn sm" disabled={state.busy || !currentWorkspace} onClick={() => { if (currentWorkspace) void controller.create(currentWorkspace); }}>New thread</button><button className="btn sm ghost" disabled={state.busy} onClick={() => void controller.reload()}>Reload</button>{state.busy && <button className="btn sm ghost" onClick={() => controller.cancel()}>Stop</button>}</div>
@@ -166,7 +176,7 @@ export function MindDock({ workspaceId }: { workspaceId?: string }) {
           setNewReply(false);
         }}>New reply ↓</button>}
         <div className="mind-compose">
-          {state.context && <div className="mind-context"><span>Context: {state.context.label}</span><button className="btn sm ghost" aria-label="Remove Mind context" onClick={() => controller.removeContext()}>Remove</button></div>}
+          {state.context && <div className="mind-context"><span>Context: {contextLabel}</span><button className="btn sm ghost" aria-label="Remove Mind context" onClick={() => controller.removeContext()}>Remove</button></div>}
           <div className="mind-suggestions">{mindSuggestions(state.context).map((ask) => <button className="btn sm ghost" key={ask} onClick={() => { setText(ask); composer.current?.focus(); }}>{ask}</button>)}</div>
           <form onSubmit={(e) => { e.preventDefault(); if (!blocked && !state.busy && text.trim()) { void controller.send(text); setText(""); } }}>
             <label className="field"><span>Message Mind</span><textarea ref={composer} className="textarea" rows={3} value={text} onChange={(e) => setText(e.target.value)} placeholder="Ask what is happening and why…" /></label>
