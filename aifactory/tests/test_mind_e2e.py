@@ -410,3 +410,24 @@ def test_a_failed_turn_keeps_its_status_when_the_reader_stops_at_the_error(app_a
             break
         time.sleep(0.05)
     assert saved["messages"][1]["status"] == "failed" and saved["messages"][1]["text"] == "Partial answer"
+
+
+def test_a_finished_turn_is_saved_before_its_done_frame(app_as, people):
+    client, app, _ = app_as
+
+    class Answering(ProposingRuntime):
+        async def run_turn(self, context, history, emit, tools, ledger):
+            await ledger.before_call()
+            await emit({"type": "text_delta", "text": "Saved before done."})
+            await ledger.after_call(0.01)
+
+    app.state.mind_runtime = Answering(people)
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    with client.stream("POST", f"/api/mind/threads/{thread}/messages",
+                       json={"text": "Hello", "client_message_id": "saved-1"}) as response:
+        for line in response.iter_lines():
+            if line.startswith("data: ") and json.loads(line[6:])["type"] == "done":
+                # What the page does on "done": reload. The reply is already saved, with no polling.
+                saved = client.get(f"/api/mind/threads/{thread}").json()["messages"][1]
+                assert saved["status"] == "complete" and saved["text"] == "Saved before done."
+                break

@@ -469,6 +469,25 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 if not asyncio.current_task().cancelling():
                     await queue.put(None)
 
+        persisted = False
+
+        def persist(status):
+            nonlocal persisted
+            with SessionLocal() as session:
+                secrets = secrets_for(session, user_id, scope)
+                safe = scrub_events(cut_open_credential(events), secrets)
+                row = session.get(MindMessage, assistant_id)
+                row.text = "".join(e["data"].get("text", "") for e in safe if e["type"] == "token")
+                row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]
+                row.action_cards = [e["data"]["card"] for e in safe if e["type"] == "action_card"]
+                row.history = {"tools": [e["data"] for e in safe if e["type"] == "tool_finished"]}
+                row.status = status
+                session.execute(update(MindThread).where(MindThread.id == thread_id,
+                    MindThread.active_turn == turn_id).values(active_turn=None, lease_until=None,
+                    status=status, updated_at=utcnow()))
+                session.commit()
+            persisted = True
+
         def envelope(typ, data):
             return {"seq": len(events) + 1, "thread_id": thread_id, "message_id": assistant_id,
                     "type": typ, "data": data}
@@ -508,8 +527,10 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
                 safe = scrub_events(cut_open_credential(events), secrets_for(session, user_id, scope))
-            # The turn has a final status now. A client that stops reading during this last flush (the browser
-            # treats an error frame as the end of its work) must not turn it into "interrupted".
+            # Save the finished turn before its last frames go out: a client that reloads on "done" must find it
+            # saved. The turn has a final status now, so a client that stops reading during this last flush (the
+            # browser treats an error frame as the end of its work) must not turn it into "interrupted".
+            persist(terminal)
             flushed = True
             for event in safe[released:]:
                 yield encoded(event)
@@ -529,19 +550,9 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                     item = queue.get_nowait()
                     if item is not None:
                         events.append(envelope(*item))
-                # Persist even on disconnect. No durable worker or public event bus.
-                with SessionLocal() as session:
-                    secrets = secrets_for(session, user_id, scope)
-                    safe = scrub_events(cut_open_credential(events), secrets)
-                    row = session.get(MindMessage, assistant_id)
-                    row.text = "".join(e["data"].get("text", "") for e in safe if e["type"] == "token")
-                    row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]
-                    row.action_cards = [e["data"]["card"] for e in safe if e["type"] == "action_card"]
-                    row.history = {"tools": [e["data"] for e in safe if e["type"] == "tool_finished"]}
-                    row.status = terminal
-                    session.execute(update(MindThread).where(MindThread.id == thread_id,
-                        MindThread.active_turn == turn_id).values(active_turn=None, lease_until=None,
-                        status=terminal, updated_at=utcnow()))
-                    session.commit()
+                # Persist even on disconnect (unless the finished turn was saved before its last frames).
+                # No durable worker or public event bus.
+                if not persisted:
+                    persist(terminal)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
