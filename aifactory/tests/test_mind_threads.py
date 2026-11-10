@@ -490,3 +490,43 @@ async def test_same_session_midnight_cumulative_usage_is_allocated_per_call(worl
         assert store.cost(db.query(MindCharge).filter_by(session_id=ledger.session_id)) == {"usd": 20, "known": True}
     with pytest.raises(store.AccountingError, match="exhausted"):
         await ledger.before_call()
+
+
+def test_reads_in_a_newly_joined_workspace_widen_the_thread_scope(world):
+    client, runtime, _, ids = world
+    thread = create(world)  # Alice's memberships at creation: workspace A only
+    with SessionLocal() as db:
+        db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        db.commit()
+
+    async def run_turn(context, history, emit, tools, ledger):
+        await ledger.before_call()
+        await tools.call("overview", {"workspace_id": ids[3]})
+        await emit({"type": "token", "data": {"text": "Workspace B is quiet."}})
+        await ledger.after_call(runtime.total)
+
+    runtime.run_turn = run_turn
+    assert events(send(world, thread))[-1]["data"] == {"status": "complete"}
+    with SessionLocal() as db:
+        assert ids[3] in db.get(MindThread, thread).workspace_ids
+        db.query(Membership).filter_by(user_id=ids[0], workspace_id=ids[3]).delete()
+        db.commit()
+    # What Mind read in B stays with B: losing B hides the whole thread.
+    assert client.get(f"/api/mind/threads/{thread}").status_code == 404
+    assert thread not in [t["id"] for t in client.get("/api/mind/threads").json()]
+
+
+@pytest.mark.parametrize("closed", [True, False])
+def test_a_streamed_private_key_is_never_released_in_part(world, closed):
+    client, runtime, _, _ = world
+    body = ["B" * 120 for _ in range(5)]
+    tail = ["\n-----END PRIVATE KEY-----", " That was a key."] if closed else [" (cut off)"]
+    runtime.output = [{"type": "token", "data": {"text": t}} for t in
+                      ["Here it is: ", "-----BEGIN PRIVATE KEY-----\n", *body, *tail]]
+    thread = create(world)
+    response = send(world, thread)
+    assert "B" * 20 not in response.text  # neither while streaming nor in the final flush
+    text = client.get(f"/api/mind/threads/{thread}").json()["messages"][1]["text"]
+    assert "B" * 20 not in text and "[redacted]" in text and text.startswith("Here it is: ")
+    if closed:
+        assert text.endswith("That was a key.")

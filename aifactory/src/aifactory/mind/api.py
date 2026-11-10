@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import json
+import re
 from datetime import timedelta
 from uuid import uuid4
 
@@ -148,6 +150,41 @@ def scrub(value, secrets=()):
     return rebuild(value)
 
 
+_PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+
+
+def open_credential(text: str, *, final: bool = False) -> int | None:
+    """Where a credential that may still be arriving starts in streamed text, or None.
+
+    A private key block without its END marker can be any length; so can a token pattern whose match runs to
+    the end of the text so far (more of it may follow). Neither can be recognized as a whole yet, so nothing
+    from its start on may be released. When the stream has ended (final), only an unclosed key block remains
+    open: complete token matches are redacted by scrub()."""
+    starts = [m.start() for m in _PEM_START.finditer(text) if not _PEM_END.search(text, m.end())]
+    if not final:
+        starts += [m.start() for pattern in _SECRET_PATTERNS for m in pattern.finditer(text) if m.end() == len(text)]
+    return min(starts, default=None)
+
+
+def cut_open_credential(events: list[dict]) -> list[dict]:
+    """Redact reply text from the start of a private key block that never closed to the end of the reply."""
+    text = "".join(e["data"].get("text", "") for e in events if e["type"] == "token")
+    start = open_credential(text, final=True)
+    if start is None:
+        return events
+    out, offset = [], 0
+    for event in events:
+        if event["type"] == "token":
+            piece = event["data"].get("text", "")
+            begin, offset = offset, offset + len(piece)  # offsets in the original reply text
+            if offset > start:
+                piece = piece[:max(0, start - begin)] + ("[redacted]" if begin <= start else "")
+                event = {**event, "data": {**event["data"], "text": piece}}
+        out.append(event)
+    return out
+
+
 class UnavailableRuntime:
     async def readiness(self, workspace_id, *, ledger):
         return {"status": "unavailable", "model_id": None, "reason": "Mind runtime is not configured."}
@@ -251,6 +288,13 @@ class PrivateTools:
         with SessionLocal() as db:
             thread = store.owned(db, self.context.user_id, self.context.thread_id)
             result = await Tools(Context(db, self.context.user_id, thread.id)).call(name, arguments)
+            # A read or proposal in a workspace joined after the thread began widens the thread's scope before
+            # anything derived from it is kept, so revoking that membership later hides the thread (owned()).
+            touched = {arguments.get("workspace_id") if isinstance(arguments, dict) else None}
+            touched |= {c.get("workspace_id") for c in result.get("citations") or [] if isinstance(c, dict)}
+            touched = {w for w in touched if isinstance(w, str) and w}
+            if not touched <= set(thread.workspace_ids):
+                thread.workspace_ids = sorted(set(thread.workspace_ids) | touched)
             result = scrub(result, secrets_for(db, self.context.user_id, thread.workspace_ids))
             # Proposal rows are also private persistence: scrub the complete record.
             from ..models import MindAction
@@ -391,9 +435,13 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 # data. Scrub the original complete buffer, never substitutions.
                 tail = max([len(s) for s in secrets] + [256])
                 safe = scrub(events, secrets)
+                tokens = [e["data"].get("text", "") if e["type"] == "token" else "" for e in events]
+                text = "".join(tokens)
+                ends = list(itertools.accumulate(len(t) for t in tokens))
+                # Nothing at or after an unfinished credential leaves until it can be recognized whole.
+                hold = open_credential(text)
                 for i in range(released, len(events)):
-                    later_tokens = sum(len(e["data"].get("text", "")) for e in events[i + 1:] if e["type"] == "token")
-                    if later_tokens < tail:
+                    if len(text) - ends[i] < tail or (hold is not None and ends[i] > hold):
                         break
                     yield encoded(safe[i])
                     released = i + 1
@@ -401,7 +449,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 store.owned(session, user_id, thread_id)
                 events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
-                safe = scrub(events, secrets_for(session, user_id, scope))
+                safe = cut_open_credential(scrub(events, secrets_for(session, user_id, scope)))
             for event in safe[released:]:
                 yield encoded(event)
             flushed = True
@@ -424,7 +472,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 # Persist even on disconnect. No durable worker or public event bus.
                 with SessionLocal() as session:
                     secrets = secrets_for(session, user_id, scope)
-                    safe = scrub(events, secrets)
+                    safe = cut_open_credential(scrub(events, secrets))
                     row = session.get(MindMessage, assistant_id)
                     row.text = "".join(e["data"]["text"] for e in safe if e["type"] == "token")
                     row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]
