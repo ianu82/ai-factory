@@ -432,7 +432,7 @@ test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts"
   assert.equal(events.find((e) => e.type === "text_delta")?.text, "Complete 🧠");
   const completed = events.at(-1);
   assert.equal(completed?.type, "done");
-  if (completed?.type === "done") assert.equal(completed.status.budget_state, "pending_accounting");
+  if (completed?.type === "done") assert.equal(completed.status?.budget_state, "pending_accounting");
   assert.equal(calls.some((c) => c.path.endsWith("/confirm")), false);
   const action = h.messages[0].cards![0];
   await t.revise("thread", action, { text: "Edited" }, signal);
@@ -442,6 +442,41 @@ test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts"
   const confirmed = await t.confirm("thread", action, signal);
   assert.equal(confirmed.status, "confirmed");
   assert.match(confirmed.result!.text, /Completed: Send guidance/);
+});
+
+test("a failed turn reloads its saved reply without another paid readiness check, and keeps its budget failure", async () => {
+  const { createMindHttpTransport } = await import("./mindHttp.ts");
+  const wireThread = { id: "thread", title: "Delivery", billing_workspace_id: "billing", model_id: "opus-5-5", cost: { usd: 0.4, known: true } };
+  const paths: string[] = [];
+  const request: any = async (path: string) => {
+    paths.push(path);
+    if (path.startsWith("/api/mind/status?")) return { status: "ready", model_id: "opus-5-5" };
+    return { thread: wireThread, messages: [{ id: "reply", role: "assistant", text: "Partial", citations: [], action_cards: [], status: "failed" }] };
+  };
+  const envelope = (type: string, data: unknown) => `data: ${JSON.stringify({ seq: 1, thread_id: "thread", message_id: "reply", type, data })}\n\n`;
+  const stream = envelope("token", { text: "Partial" }) + envelope("error", { code: "budget_exceeded", message: "This reply hit its spending limit." })
+    + envelope("usage", { thread_cost: wireThread.cost, daily_spend: 1, daily_limit: 10 }) + envelope("done", { status: "failed" });
+  const t = createMindHttpTransport(request, (async () => response(stream)) as any, readMindSSE);
+  const events: MindEvent[] = [];
+  await assert.rejects(t.send("thread", { content: "Question", context: null }, new AbortController().signal, (e) => events.push(e)), /spending limit/);
+  assert.equal(paths.some((p) => p.startsWith("/api/mind/status?")), false);
+  const completed = events.at(-1);
+  assert.equal(completed?.type, "done");
+  if (completed?.type === "done") {
+    assert.equal(completed.status, undefined);
+    assert.equal(completed.budget, "budget_exceeded");
+    assert.equal(completed.message.content, "Partial");
+  }
+  // The controller keeps the blocked state through the reload instead of re-enabling the composer.
+  const { controller: c, transport } = harness();
+  await c.select("thread");
+  transport.send = async (_thread, _body, _signal, receive) => {
+    for (const event of events) receive(event);
+    throw new Error("This reply hit its spending limit.");
+  };
+  await c.send("Question");
+  assert.equal(c.state.status?.budget_state, "budget_exceeded");
+  assert.equal(c.state.messages.at(-1)?.content, "Partial");
 });
 
 test("wire unavailable, accounting and budget codes map to explicit blocked states", async () => {

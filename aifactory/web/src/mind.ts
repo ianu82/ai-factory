@@ -221,7 +221,9 @@ export class MindController {
         case "done": {
           // The saved reply, with the steps and duration this browser watched.
           const message = { ...event.message, steps: this.state.steps.length ? this.state.steps : event.message.steps, durationMs: Date.now() - startedAt };
-          this.update({ active: event.thread, status: event.status, messages: [...this.state.messages.filter((m) => !m.id.startsWith("card-")), message], draft: "", announcement: `Mind: ${event.message.content}`, announcementId: this.state.announcementId + 1 }); break;
+          const kept = this.state.status;
+          const status = event.status ?? (kept && event.budget ? { ...kept, budget_state: event.budget } : kept);
+          this.update({ active: event.thread, status, messages: [...this.state.messages.filter((m) => !m.id.startsWith("card-")), message], draft: "", announcement: `Mind: ${event.message.content}`, announcementId: this.state.announcementId + 1 }); break;
         }
         case "error": this.update({ error: event.message, ...(event.reason === "budget_exceeded" || event.reason === "pending_accounting" ? { status: { ...this.state.status!, budget_state: event.reason } } : {}) }); break;
       }

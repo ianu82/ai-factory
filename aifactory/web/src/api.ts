@@ -518,7 +518,8 @@ export type MindEvent =
   | { type: "tool_result"; name: string; citations?: MindCitation[] }
   | { type: "action_card"; card: MindCard }
   | { type: "status"; status: MindStatus }
-  | { type: "done"; message: MindMessage; thread: MindThread; status: MindStatus }
+  /** A failed turn carries no fresh status (no second readiness check), only the budget state its failure implies. */
+  | { type: "done"; message: MindMessage; thread: MindThread; status?: MindStatus; budget?: MindStatus["budget_state"] }
   | { type: "error"; message: string; reason?: string };
 
 /** T1/T3 HTTP shapes; the dock uses a small presentation projection above. */
