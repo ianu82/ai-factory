@@ -16,6 +16,7 @@ import { SettingsPage } from "./pages/Settings";
 import { NewOutcome } from "./pages/NewOutcome";
 import { Onboarding } from "./onboarding/Onboarding";
 import { memberHasDeferred, STEP_LABELS, useOnboarding } from "./onboarding/state";
+import { MindDock, MindProvider, MindRouteContext } from "./components/MindDock";
 
 type Ctx = { me: Me; meta: Meta; ws: Workspace; live: string; openCapture: () => void };
 const WorkspaceCtx = createContext<Ctx | null>(null);
@@ -25,7 +26,10 @@ export function App() {
   const me = useQuery({ queryKey: ["me"], queryFn: () => api<Me>("/api/me"), retry: false });
   const meta = useQuery({ queryKey: ["meta"], queryFn: () => api<Meta>("/api/meta"), staleTime: 60_000 });
   const unauth = me.error instanceof ApiError && me.error.status === 401;
+  // One Mind for the signed-in person, above every route: threads survive navigation and workspace switches,
+  // and signing out (no person) erases private state.
   return (
+    <MindProvider me={unauth ? null : me.data ?? null}>
     <Routes>
       <Route path="/signin" element={<SignIn meta={meta.data} />} />
       <Route
@@ -45,6 +49,7 @@ export function App() {
           : <Loading error={me.error} />}
       />
     </Routes>
+    </MindProvider>
   );
 }
 
@@ -128,6 +133,9 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
       </div>
       {capture && !blockCapture && <NewOutcome onClose={() => setCapture(false)} />}
       </>}
+      {/* Outside the page routes, so it stays mounted on every workspace screen, onboarding and Settings included. */}
+      <MindRouteContext />
+      <MindDock workspaceId={ws.id} />
     </WorkspaceCtx.Provider>
   );
 }

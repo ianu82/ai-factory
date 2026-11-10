@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -26,8 +27,16 @@ from ..security import decrypt, redact
 
 
 class Ledger(Protocol):
+    """check() before each paid send; add() after it. A ledger may also define admit(), called once per send
+    right before the request goes out (inside provider admission), instead of a second check(). admit() and
+    add() may be coroutines, so a durable ledger can claim and release its lease around each send."""
     def check(self) -> None: ...
     def add(self, model: str, usage: tuple[int, int] | None) -> None: ...
+
+
+async def _ledger_step(result) -> None:
+    if inspect.isawaitable(result):
+        await result
 
 
 REASONS = {
@@ -119,7 +128,7 @@ class _Responses:
             terminal = False
             try:
                 async with admission(self.config, self.session_id):
-                    self.ledger.check()
+                    await _ledger_step(getattr(self.ledger, "admit", self.ledger.check)())
                     self.calls += 1
                     sent = True
                     try:
@@ -157,7 +166,7 @@ class _Responses:
                         await stream.close()
                 finally:
                     if sent:
-                        self.ledger.add(self.model, usage)
+                        await _ledger_step(self.ledger.add(self.model, usage))
         return events()
 
 
@@ -270,8 +279,8 @@ class MindProvider:
         self.ttl, self.timeout = min(ttl, 60), min(timeout, 30)
         self._ready: dict[tuple, tuple[float, Readiness]] = {}
 
-    async def readiness(self, workspace_id: str, ledger: Ledger) -> Readiness:
-        session_id = "mind-ready-" + uuid4().hex
+    async def readiness(self, workspace_id: str, ledger: Ledger, session_id: str | None = None) -> Readiness:
+        session_id = session_id or "mind-ready-" + uuid4().hex
         credential = None
         model = None
         cache_hit = False

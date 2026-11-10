@@ -1,4 +1,4 @@
-"""Unregistered private Mind router. T5 owns application wiring.
+"""Private Mind router, registered by app.py under /api.
 
 All projections (including model history and SSE) pass through scrub() as one
 original value. Exact-value matches are unioned before any replacement, so one
@@ -29,6 +29,7 @@ from ..models import MindCharge, MindMessage, MindThread, Secret, User
 from ..security import decrypt, _SECRET_PATTERNS
 from . import store
 from .contracts import CreateThread, SubmitMessage, TurnContext
+from .provider import MindUnavailable
 from .tools import Context, Tools
 
 
@@ -330,6 +331,15 @@ class PrivateTools:
         self.calls += 1
         if self.calls > 12:
             raise store.AccountingError("turn_limit")
+        try:
+            return await self._call(name, arguments)
+        except Exception:
+            # The dock shows the step as finished; the engine gives the model only a fixed error string.
+            await self.emit({"type": "tool_finished", "data": {"call_id": str(self.calls), "name": name,
+                             "summary": "Factory tool unavailable", "citations": []}})
+            raise
+
+    async def _call(self, name, arguments):
         with SessionLocal() as db:
             thread = store.owned(db, self.context.user_id, self.context.thread_id)
             result = await Tools(Context(db, self.context.user_id, thread.id)).call(name, arguments)
@@ -449,6 +459,9 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
             except store.AccountingError as exc:
                 terminal = "failed"
                 await queue.put(("error", {"code": exc.code, "message": str(exc)}))
+            except MindUnavailable as exc:  # fixed public reasons only, never provider text
+                terminal = "failed"
+                await queue.put(("error", {"code": exc.reason, "message": str(exc)}))
             except asyncio.CancelledError:
                 raise
             except Exception:

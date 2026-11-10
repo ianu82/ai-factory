@@ -40,6 +40,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "run_minutes": 60,
                "ci_minutes": 45, "max_changed_lines": 1500},
     "reasoning_effort": "medium",
+    # Per person per UTC day across all their workspaces, the lowest of their workspaces' limits (mind/store.py).
+    "mind": {"daily_budget_usd": 10.0},
 }
 
 

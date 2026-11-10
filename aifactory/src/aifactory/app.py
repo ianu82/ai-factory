@@ -19,6 +19,9 @@ from .auth import router as auth_router
 from .config import get_settings
 from .db import init_engine
 from .gateway import router as gateway_router
+from .mind.actions import router as mind_actions_router
+from .mind.api import router as mind_router
+from .mind.runtime import EngineRuntime
 from .onboarding import router as onboarding_router
 from .pulls import router as pulls_router
 from .pipeline.orchestrator import orchestrator
@@ -73,6 +76,10 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
     app.include_router(gateway_router)
     app.include_router(onboarding_router)
     app.include_router(pulls_router)
+    # Mind: private threads and streams (T1), confirmations (T3), over the restricted engine (T2).
+    app.include_router(mind_router, prefix="/api")
+    app.include_router(mind_actions_router, prefix="/api")
+    app.state.mind_runtime = EngineRuntime()
 
     if (WEB_DIST / "index.html").exists():
         app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
