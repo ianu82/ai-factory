@@ -61,6 +61,7 @@ class World:
         self.asset_status = 200
         self.me_status = 401
         self.smoke_runs = 0
+        self.asset_fails_from_run: int | None = None  # the script bundle 404s from this smoke run on
         self.redeploy_at: tuple[int, dict] | None = None  # (nth smoke run, staging health from then on)
         self.store: list[dict] = []  # every issue: number, title, labels, created_at, state
         self.labels: set[str] = set()
@@ -162,6 +163,8 @@ class World:
         if url == f"{STAGING}/":
             return httpx.Response(200, text=APP)
         if url == f"{STAGING}/assets/index-1.js":
+            if self.asset_fails_from_run and self.smoke_runs + 1 >= self.asset_fails_from_run:
+                return httpx.Response(404, text="")
             return httpx.Response(self.asset_status, text="x" * 5000)
         if url == f"{STAGING}/api/meta":
             return httpx.Response(200, json={"auth": {"api_key": True}})
@@ -311,6 +314,24 @@ def test_a_deploy_during_the_promotion_smoke_holds_the_release(world):
     world.redeploy_at = (2, {"ok": True, "commit": OTHER, "started_at": iso(NOW)})
     result = world.run()
     assert result.status == "held" and "changed during the check" in result.detail
+    assert world.patches == []
+
+
+def test_a_recorded_smoke_failure_holds_staging_current_deployment(world):
+    world.staged[NEW] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke failed"  # this very start
+    result = world.run()  # both smoke runs now pass
+    assert result.status == "held" and "failed smoke" in result.detail
+    assert world.patches == []
+
+
+def test_a_promotion_smoke_failure_is_recorded_and_sticks(world):
+    world.asset_fails_from_run = 2  # the observation passes, the promotion-time smoke fails
+    assert world.run().status == "failed"
+    assert world.staged[NEW].endswith("smoke failed")
+    world.asset_fails_from_run = None
+    world.smoke_runs = 0
+    result = world.run()
+    assert result.status == "held" and "failed smoke" in result.detail
     assert world.patches == []
 
 

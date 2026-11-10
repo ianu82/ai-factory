@@ -515,7 +515,15 @@ class Releaser:
         # factory/staging record, so it is a tree staging ran, never a side-branch commit) whose code has been on
         # staging for the soak period: since staging started it, every later commit staging ran contains it.
         line = self._recent_commits(candidate, current)
-        records = {sha: (started, None) if sha == candidate else self._staging_record(sha) for sha in line}
+        def staging_record(sha: str) -> tuple[datetime | None, bool | None]:
+            if sha != candidate:
+                return self._staging_record(sha)
+            # Staging's current deployment soaks from the start it reports now; a recorded verdict counts only
+            # when it was recorded for that same start.
+            since, verdict = self._staging_record(sha)
+            return started, verdict if since == started else None
+
+        records = {sha: staging_record(sha) for sha in line}
         soaked_since: dict[str, datetime | None] = {sha: record[0] for sha, record in records.items()}
         chosen, reasons = None, []
         for sha in line:
@@ -528,6 +536,9 @@ class Releaser:
                 continue
             if self._mark(sha) == "failure":
                 reasons.append(f"{sha[:7]} is marked do-not-release")
+                continue
+            if records[sha][1] is False:
+                reasons.append(f"{sha[:7]} failed smoke while staging ran it (sticky until staging restarts it)")
                 continue
             if sha != candidate and records[sha][1] is not True:
                 # The smoke run below tests staging's current tree; an older commit needs its own passing result.
@@ -568,6 +579,11 @@ class Releaser:
 
         problems = smoke(self.web, cfg.staging_url)
         if problems:
+            if self._still_running(candidate, started):
+                try:  # sticky: a later passing run of this deployment must not release it
+                    self._note_staged(candidate, started, smoke_ok=False)
+                except ReleaseError as exc:
+                    self.step(f"Could not record the smoke failure: {exc}")
             return Result("failed", "Staging smoke failed: " + "; ".join(problems), chosen, current)
         self.step("Staging smoke checks passed")
 
