@@ -215,7 +215,7 @@ def test_the_plan_reviewer_model_defaults_to_opus_on_mindshub():
 
 
 def test_revisions_stop_at_the_outcome_budget(factory, monkeypatch):
-    spend = iter([0.0, 45.0])  # before the first review, then before the revision
+    spend = iter([0.0, 0.0, 45.0])  # before planning, before the first review, then before the revision
     monkeypatch.setattr(planning, "outcome_cost", lambda _oid: (next(spend), False))
     ScriptedModel.scripts["plan_reviewer"] = revise
     oid = new_outcome(factory)
@@ -228,7 +228,8 @@ def test_revisions_stop_at_the_outcome_budget(factory, monkeypatch):
 
 
 def test_a_plan_is_not_reviewed_past_the_outcome_budget(factory, monkeypatch):
-    monkeypatch.setattr(planning, "outcome_cost", lambda _oid: (40.0, True))
+    spend = iter([0.0, 40.0])  # before planning, then before the review
+    monkeypatch.setattr(planning, "outcome_cost", lambda _oid: (next(spend), True))
     oid = new_outcome(factory)
     status, plans, tasks, decision, roles = plan(oid)
     assert status == "awaiting_approval" and tasks == 0 and roles == ["planner"]
@@ -255,3 +256,25 @@ def test_a_review_that_cannot_start_keeps_the_plan(factory, monkeypatch):
     assert plans == [(1, "proposed", "error")]
     assert decision[0] == "approve_plan"
     assert "The plan review could not start: No model provider key" in decision[1]
+
+
+def test_an_outcome_over_budget_is_not_planned_until_a_person_continues(factory, monkeypatch):
+    from aifactory.decisions import resolve
+    from aifactory.models import User
+
+    monkeypatch.setattr(planning, "outcome_cost", lambda _oid: (50.0, True))
+    oid = new_outcome(factory)
+    status, plans, tasks, decision, roles = plan(oid)
+    assert status == "blocked" and plans == [] and roles == []
+    kind, body = decision
+    assert kind == "budget" and "The outcome reached its $40 budget ($50.00 spent)" in body
+    with session_scope() as s:
+        budget = s.query(Decision).filter_by(outcome_id=oid, kind="budget", status="open").one()
+        resolve(s, budget, s.get(User, factory["user"]), "retry")
+    assert planning._continued_past_budget(oid)
+    status, plans, tasks, decision, roles = plan(oid)  # one full planning run, reviewed
+    assert status == "running" and tasks == 1 and roles == ["planner", "plan_reviewer"]
+    with session_scope() as s:
+        s.get(Outcome, oid).status = "planning"  # e.g. a later revision request
+    status, *_, roles = plan(oid)
+    assert status == "blocked" and roles == ["planner", "plan_reviewer"]  # the grant covered one run only

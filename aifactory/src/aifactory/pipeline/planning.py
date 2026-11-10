@@ -16,7 +16,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
-from ..models import Outcome, Plan, Repository, Task
+from ..models import Decision, Outcome, Plan, Repository, Run, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
@@ -76,6 +76,22 @@ def _over_budget(outcome_id: str, settings: dict[str, Any]) -> str:
     return f"The outcome reached its ${budget:.0f} budget (${spent:.2f} spent)" if spent >= budget else ""
 
 
+def _continued_past_budget(outcome_id: str) -> bool:
+    """A person chose to continue planning past the budget since the last planning session started. Budget
+    decisions are never delegated to judges, so only a person grants this, and each grant covers one planning run."""
+    with session_scope() as s:
+        decided = (s.query(Decision.resolved_at)
+                   .filter(Decision.outcome_id == outcome_id, Decision.task_id.is_(None), Decision.kind == "budget",
+                           Decision.status == "resolved", Decision.resolution == "retry")
+                   .order_by(Decision.resolved_at.desc()).first())
+        if decided is None or decided[0] is None:
+            return False
+        last = (s.query(Run.started_at).filter(Run.outcome_id == outcome_id, Run.task_id.is_(None),
+                                               Run.role.in_(("planner", "plan_reviewer")))
+                .order_by(Run.started_at.desc()).first())
+        return last is None or decided[0] > last[0]
+
+
 def _save_plan(workspace_id: str, outcome_id: str, version: int, report: dict[str, Any], run: Any,
                review: dict[str, Any] | None) -> str:
     with session_scope() as s:
@@ -106,6 +122,21 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         set_outcome(outcome_id, status="blocked", blocked_reason="No repositories are selected for this outcome.")
         return
     settings = workspace_settings(workspace_id)
+    # Replans (a person's revision or answer, a judge's answer, a retry) keep the outcome's earlier spending, so the
+    # budget is checked before the first session too. A person who continues anyway allows one more planning run.
+    continued = _continued_past_budget(outcome_id)
+
+    def over_budget() -> str:
+        return "" if continued else _over_budget(outcome_id, settings)
+
+    if over := over_budget():
+        set_outcome(outcome_id, status="blocked", blocked_reason=f"{over}; planning stopped.")
+        open_decision(workspace_id, "budget", f"Outcome #{snapshot.number} reached its budget",
+                      f"{over}, so planning stopped before starting another session. Raise the outcome budget in "
+                      "Settings and continue, continue anyway for one more planning run, or cancel the outcome.",
+                      outcome_id=outcome_id, options=[{"value": "retry", "label": "Continue anyway"},
+                                                      {"value": "cancel", "label": "Cancel outcome"}])
+        return
     harness_name = snapshot.harness or settings["harness"].get("planner") or "native"
     # Automatic approval means the plan reviewer approves; with "approve first" a person reviews instead.
     reviewed = settings["autonomy"].get("plan") == "auto"
@@ -125,7 +156,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         repositories = {r.full_name: r.config or {} for r in repos}
         revision = None
         for revisions in range(PLAN_REVIEW_ROUNDS + 1):
-            if revisions and (stopped := _over_budget(outcome_id, settings)):
+            if revisions and (stopped := over_budget()):
                 break  # every round starts two sessions: a revision must not overrun the outcome's budget
             prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id), work, revision)
             run, result, error = await run_agent(SessionSpec(
@@ -138,7 +169,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
             problems = _check_repos(report, repos)
             review = None
             if reviewed and not problems and not report.get("questions"):
-                if over := _over_budget(outcome_id, settings):
+                if over := over_budget():
                     review = {"verdict": "error", "summary": f"{over}, so the plan was not reviewed.", "findings": []}
                 else:
                     review = await _review(snapshot, repos, decisions, work, report, harness_name, sandbox,
