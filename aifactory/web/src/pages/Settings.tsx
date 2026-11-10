@@ -193,7 +193,7 @@ function Models() {
                 {options.map((o) => <option key={o} value={o}>{o}</option>)}
               </select>
               {role === "plan_reviewer" && <span className="hint">Reviews every plan before building starts, unless a person approves plans.</span>}
-              {role !== "default" && role !== "plan_reviewer" && <span className="hint" role="status">
+              {role !== "default" && <span className="hint" role="status">
                 <Dot tone={currentCheck?.roles[role].status === "supported" ? "good" : currentCheck?.roles[role].status === "unsupported" ? "bad" : currentCheck ? "warn" : "idle"} />{" "}
                 {checking && !dirty ? "Checking image input…" : currentCheck ? <>
                   {currentCheck.roles[role].model} · Images: {currentCheck.roles[role].status === "unknown" ? "unknown (check failed)" : currentCheck.roles[role].status}

@@ -42,7 +42,12 @@ def recording_planner(messages):
 
 
 @pytest.fixture(autouse=True)
-def recorded(factory):
+def recorded(factory, monkeypatch):
+    from aifactory.inference import ProviderConfig
+    from aifactory.pipeline import runtime
+
+    # Runs go to MindsHub, as in production, so the reviewer defaults to Opus 5.5.
+    monkeypatch.setattr(runtime, "resolve_provider", lambda ws: ProviderConfig("mindshub", "http://model.test", "k", "Test"))
     REVIEW_PROMPTS.clear()
     PLANNER_PROMPTS.clear()
     ScriptedModel.scripts["planner"] = recording_planner
@@ -212,6 +217,10 @@ def test_the_plan_reviewer_model_defaults_to_opus_on_mindshub():
     assert workspace_models({"models": {"default": "gpt-terra"}}).plan_reviewer == PLAN_REVIEWER_MODEL == "opus-5-5"
     assert workspace_models({"models": {"default": "a", "verifier": "b"}, "provider": "openai"}).plan_reviewer == "b"
     assert workspace_models({"models": {"plan_reviewer": "c"}, "provider": "openai"}).plan_reviewer == "c"
+    # The provider that serves the run decides, when resolve_provider falls back to another one.
+    on_mindshub = {"models": {"default": "a", "verifier": "b"}, "provider": "mindshub"}
+    assert workspace_models(on_mindshub, provider="openai").plan_reviewer == "b"
+    assert workspace_models({**on_mindshub, "provider": "openai"}, provider="mindshub").plan_reviewer == "opus-5-5"
 
 
 def test_revisions_stop_at_the_outcome_budget(factory, monkeypatch):

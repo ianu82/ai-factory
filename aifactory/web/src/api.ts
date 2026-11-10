@@ -124,7 +124,7 @@ export interface Settings {
 
 export interface ModelCheckResult {
   provider: string | null;
-  roles: Record<"planner" | "builder" | "verifier", {
+  roles: Record<"planner" | "plan_reviewer" | "builder" | "verifier", {
     model: string;
     status: "supported" | "unsupported" | "unknown";
     explanation: string;

@@ -77,11 +77,13 @@ class ModelSelection:
 PLAN_REVIEWER_MODEL = "opus-5-5"
 
 
-def workspace_models(settings: dict[str, Any]) -> ModelSelection:
+def workspace_models(settings: dict[str, Any], provider: str | None = None) -> ModelSelection:
+    """The model for each role. Pass the provider that will serve the run (resolve_provider can fall back
+    to another one), so the plan reviewer's default is a model that provider has."""
     models = settings.get("models") or {}
     default = models.get("default") or "gpt-terra"
     verifier = models.get("verifier") or default
-    on_mindshub = (settings.get("provider") or "mindshub") == "mindshub"
+    on_mindshub = (provider or settings.get("provider") or "mindshub") == "mindshub"
     return ModelSelection(
         planner=models.get("planner") or default,
         builder=models.get("builder") or default,

@@ -242,10 +242,11 @@ def test_model_check_sends_valid_png_and_deduplicates_inherited_roles(client, si
     _mock_image_provider(monkeypatch, upstream)
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200, r.text
-    assert sorted(seen) == ["default-model", "other-model"]
+    assert sorted(seen) == ["default-model", "opus-5-5", "other-model"]
     roles = r.json()["roles"]
     assert roles["planner"]["model"] == roles["verifier"]["model"] == "default-model"
     assert roles["builder"]["model"] == "other-model"
+    assert roles["plan_reviewer"]["model"] == "opus-5-5"
     assert {role["status"] for role in roles.values()} == {"supported"}
 
 
@@ -291,7 +292,9 @@ def test_model_check_classifies_provider_errors_safely(client, signed_in, monkey
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200
     assert {role["status"] for role in r.json()["roles"].values()} == {expected}
-    assert len(seen) == 1  # no retries, including include-removal, or text-only fallback
+    # One probe per distinct model (the default and the plan reviewer's), with no retries,
+    # include-removal, or text-only fallback.
+    assert len(seen) == 2
     assert "mdb_secret-never-expose" not in r.text + caplog.text
     assert message not in r.text
 
@@ -317,7 +320,8 @@ def test_model_check_missing_credentials_and_builtin_default(client, signed_in, 
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200
     assert r.json()["provider"] is None
-    assert {role["model"] for role in r.json()["roles"].values()} == {"gpt-terra"}
+    assert {role: result["model"] for role, result in r.json()["roles"].items()} == {
+        "planner": "gpt-terra", "plan_reviewer": "opus-5-5", "builder": "gpt-terra", "verifier": "gpt-terra"}
     assert {role["status"] for role in r.json()["roles"].values()} == {"unknown"}
 
 
@@ -384,7 +388,7 @@ def test_model_catalog_never_probes_selected_models(client, signed_in, monkeypat
 def test_model_checks_report_distinct_results_independently(client, signed_in, monkeypatch):
     ws_id = signed_in["workspaces"][0]["id"]
     client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"models": {
-        "planner": "accepts", "builder": "rejects", "verifier": "unavailable"}}})
+        "planner": "accepts", "plan_reviewer": "accepts", "builder": "rejects", "verifier": "unavailable"}}})
     seen = []
 
     def upstream(request):
@@ -398,8 +402,31 @@ def test_model_checks_report_distinct_results_independently(client, signed_in, m
     _mock_image_provider(monkeypatch, upstream)
     roles = client.post(f"/api/workspaces/{ws_id}/models/check").json()["roles"]
     assert len(seen) == 3
-    assert [roles[role]["status"] for role in ("planner", "builder", "verifier")] == [
-        "supported", "unsupported", "unknown"]
+    assert [roles[role]["status"] for role in ("planner", "plan_reviewer", "builder", "verifier")] == [
+        "supported", "supported", "unsupported", "unknown"]
+
+
+def test_model_check_picks_the_plan_reviewer_default_for_the_resolved_provider(client, signed_in, monkeypatch):
+    """A MindsHub workspace whose only key is OpenAI's runs on OpenAI, so its reviewer default is the verifier's."""
+    from aifactory import model_checks
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"provider": "mindshub", "models": {
+        "default": "default-model", "verifier": "verifier-model"}}})
+    seen = []
+
+    def upstream(request):
+        seen.append(json.loads(request.content)["model"])
+        return httpx.Response(200, json={"output": []})
+
+    _mock_image_provider(monkeypatch, upstream)
+    monkeypatch.setattr(model_checks, "resolve_provider", lambda _: ProviderConfig(
+        "openai", "https://provider.test/v1", "key", "OpenAI"))
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200 and r.json()["provider"] == "openai"
+    assert sorted(seen) == ["default-model", "verifier-model"]
+    assert r.json()["roles"]["plan_reviewer"] == {
+        "model": "verifier-model", "status": "supported", "explanation": "The model accepted image input."}
 
 
 def test_model_check_overall_timeout_is_bounded(client, signed_in, monkeypatch):
