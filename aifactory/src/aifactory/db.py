@@ -77,6 +77,10 @@ def init_engine(url: str | None = None) -> Engine:
         kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
     else:
         kwargs.update(pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=1800)
+    if _engine is not None:
+        # Re-initialisation (every test, each create_app) must not leave the old pool's connections open: on
+        # PostgreSQL they count against max_connections until garbage collection ("too many clients").
+        _engine.dispose()
     _engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
         _configure_sqlite(_engine)

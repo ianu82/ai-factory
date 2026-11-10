@@ -13,7 +13,9 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -110,6 +112,10 @@ class Repository(Base):
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
+    # Delete review identities/evidence on disconnect, retaining outcomes and runs
+    # as the cumulative cost history, just like other outcome attribution.
+    reviews: Mapped[list["PullReview"]] = relationship(cascade="all, delete-orphan")
+
     __table_args__ = (UniqueConstraint("workspace_id", "full_name"),)
 
 
@@ -149,7 +155,7 @@ class Outcome(Base):
     harness: Mapped[str | None] = mapped_column(String(20), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="planning", index=True)
     priority: Mapped[int] = mapped_column(Integer, default=2)  # 0 urgent .. 3 low
-    source: Mapped[str] = mapped_column(String(40), default="user")  # user|signal|improvement
+    source: Mapped[str] = mapped_column(String(40), default="user")  # user|signal|improvement|review
     signal_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     summary: Mapped[str] = mapped_column(Text, default="")
     blocked_reason: Mapped[str] = mapped_column(Text, default="")
@@ -192,6 +198,56 @@ class LinearWarningOperation(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# Stable states for one review of one immutable PR head.
+REVIEW_STATUSES = ("queued", "running", "passed", "failed", "blocked", "superseded")
+
+
+class PullReview(Base):
+    """One PR identity and its cumulative, review-only budgeting outcome."""
+
+    __tablename__ = "pull_reviews"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    pr_number: Mapped[int] = mapped_column(Integer)
+    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"), unique=True)
+    head_sha: Mapped[str] = mapped_column(String(64), default="")
+    comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    outcome: Mapped[Outcome] = relationship()
+    attempts: Mapped[list["ReviewAttempt"]] = relationship(
+        back_populates="review", order_by="ReviewAttempt.created_at", cascade="all, delete-orphan")
+
+    __table_args__ = (UniqueConstraint("repo_id", "pr_number"),)
+
+
+class ReviewAttempt(Base):
+    """Durable verdict and evidence for a PR head; retries reuse this record."""
+
+    __tablename__ = "review_attempts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    review_id: Mapped[str] = mapped_column(ForeignKey("pull_reviews.id"), index=True)
+    head_sha: Mapped[str] = mapped_column(String(64))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    verdict: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    review: Mapped[PullReview] = relationship(back_populates="attempts")
+
+    __table_args__ = (
+        UniqueConstraint("review_id", "head_sha"),
+        CheckConstraint("status IN ('queued', 'running', 'passed', 'failed', 'blocked', 'superseded')",
+                        name="ck_review_attempt_status"),
+    )
 
 
 class Plan(Base):

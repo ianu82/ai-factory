@@ -91,6 +91,8 @@ class TaskRunner:
             task = s.get(Task, self.task_id)
             self.task = Task(**{c.name: getattr(task, c.name) for c in Task.__table__.columns})
             outcome = s.get(Outcome, task.outcome_id)
+            if outcome.source == "review":
+                raise ValueError("Review outcomes cannot enter task delivery")
             self.outcome = Outcome(**{c.name: getattr(outcome, c.name) for c in Outcome.__table__.columns})
             repo = s.get(Repository, task.repo_id)
             self.repo = Repository(**{c.name: getattr(repo, c.name) for c in Repository.__table__.columns})

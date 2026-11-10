@@ -233,3 +233,27 @@ async def test_failed_readiness_invalidates_previous_success(monkeypatch):
         monkeypatch.setattr(mp, "saved_credential", lambda _: credential)
         with pytest.raises(mp.MindUnavailable):
             await adapter.open("ws", ready, "chat", Ledger())
+
+
+def test_mindshub_catalog_ids_select_opus_5_5_and_nothing_else():
+    # MindsHub's catalog (10 Nov 2026) names Opus 5.5 "opus-5-5", next to the aliases "opus" and "opus-5".
+    assert mp.select_model(["opus", "opus-5", "opus-5-5", "gpt-sol-6-1", "fable-5-1"]) == "opus-5-5"
+    with pytest.raises(mp.MindUnavailable) as exc:
+        mp.select_model(["opus", "opus-5", "opus-5-6", "opus-5-50"])
+    assert exc.value.reason == "model_absent"
+
+
+@pytest.mark.parametrize("reported,selected,same", [
+    ("opus-5-5", "opus-5-5", True),
+    ("claude-opus-5-5-20261101", "opus-5-5", True),
+    ("anthropic/claude-opus-5.5", "opus-5-5", True),
+    ("claude-opus-5", "opus-5-5", False),
+    ("claude-opus-5-6", "opus-5-5", False),
+    ("opus-5-50", "opus-5-5", False),
+    ("gpt-opus-5-5-fast", "opus-5-5", False),
+    ("claude-opus-5-5.1", "opus-5-5", False),
+    ("gpt-sol-6-1", "opus-5-5", False),
+    (None, "opus-5-5", False),
+])
+def test_a_response_naming_the_same_generation_is_not_a_substitution(reported, selected, same):
+    assert mp.same_model(reported, selected) is same

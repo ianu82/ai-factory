@@ -197,10 +197,11 @@ def test_configuration_round_trips(client, signed_in, monkeypatch):
     r = client.post(base + "/repositories", json={"full_name": "owner/repo", "config": {"review": {"max_rounds": 0}}})
     assert r.status_code == 200, r.text
     repo_id = r.json()["id"]
-    assert r.json()["config"]["review"] == {"max_rounds": 0}
+    assert r.json()["config"]["review"] == {"max_rounds": 0, "mode": "off", "allow_untrusted_local": False}
     r = client.patch(base + f"/repositories/{repo_id}", json={"config": {"review": {"reviewers": "bots"}}})
     assert r.status_code == 200, r.text
-    assert r.json()["config"]["review"] == {"max_rounds": 0, "reviewers": "bots"}
+    assert r.json()["config"]["review"] == {"max_rounds": 0, "reviewers": "bots",
+                                             "mode": "off", "allow_untrusted_local": False}
     me = client.get("/api/me").json()
     repo = client.get(base + "/repositories").json()[0]
     assert review_policy(me["workspaces"][0]["settings"], repo["config"]) == {
@@ -229,7 +230,8 @@ def test_api_rejects_invalid_review_policies(client, signed_in, invalid):
     # Rejected writes must not change either persisted config.
     assert client.get("/api/me").json()["workspaces"][0]["settings"]["review"] == DEFAULT_REVIEW
     assert client.get(base + "/repositories").json()[0]["config"] == {
-        "steward": {"mode": "propose", "fix_minutes": 60}}
+        "steward": {"mode": "propose", "fix_minutes": 60},
+        "review": {"mode": "off", "allow_untrusted_local": False}}
     with session_scope() as s:
         assert s.get(Repository, repo_id).config == {}
 

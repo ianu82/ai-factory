@@ -48,6 +48,10 @@ class Orchestrator:
         self._stopping = False
         self._last_signal_sync = float("-inf")
         self._linear_task: asyncio.Task | None = None
+        from ..operator_relay import Relay
+
+        self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
+        self._relay_task: asyncio.Task | None = None
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -62,6 +66,7 @@ class Orchestrator:
             from ..linear_sync import LinearSync
 
             self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
+            self._relay_task = asyncio.create_task(self._relay.run(), name="operator-relay")
 
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
@@ -76,6 +81,9 @@ class Orchestrator:
         if self._linear_task:
             self._linear_task.cancel()
             await asyncio.gather(self._linear_task, return_exceptions=True)
+        if self._relay_task:
+            self._relay_task.cancel()
+            await asyncio.gather(self._relay_task, return_exceptions=True)
         await asyncio.sleep(0)
 
     def wake(self) -> None:
@@ -353,7 +361,7 @@ class Orchestrator:
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""
         with session_scope() as s:
-            outcomes = s.query(Outcome).filter(Outcome.status.in_(["running", "attention"])).all()
+            outcomes = s.query(Outcome).filter(Outcome.source != "review", Outcome.status.in_(["running", "attention"])).all()
             for outcome in outcomes:
                 tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
                 by_key = {t.key: t for t in tasks}
@@ -412,13 +420,13 @@ class Orchestrator:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
-                        for o in s.query(Outcome).filter(Outcome.status == "planning")]
+                        for o in s.query(Outcome).filter(Outcome.source != "review", Outcome.status == "planning")]
             queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Task.status == "queued")]
+                      .filter(Outcome.source != "review", Task.status == "queued")]
             planning_by_ws: dict[str, int] = {}
             for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1
