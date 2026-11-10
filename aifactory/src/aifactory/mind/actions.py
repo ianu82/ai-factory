@@ -719,14 +719,16 @@ def confirm_action(thread_id: str, action_id: str, body: ConfirmBody,
     clean_value, _ = _private(db, user, thread_id)
     action = db.query(MindAction).filter_by(id=action_id, thread_id=thread_id, owner_id=user.id).one_or_none()
     if action is not None and action.status == "pending":
-        # A secret saved after the card was proposed is still never posted to shared work. The rewrite is a
-        # compare-and-swap on the revision the person is confirming, so a concurrent edit is never overwritten
-        # (a changed revision then fails the confirmation's own claim with 409).
-        fields = clean_value(action.fields)
-        if fields != action.fields:
+        # A secret saved after the card was proposed is still never posted to shared work: neither the shown fields
+        # nor the saved parameters a card executes from (a plan's specs, acceptance and risks). The target's state
+        # is only a digest, so this never makes an unchanged target look changed. The rewrite is a compare-and-swap
+        # on the revision the person is confirming, so a concurrent edit is never overwritten (a changed revision
+        # then fails the confirmation's own claim with 409).
+        fields, snapshot = clean_value(action.fields), clean_value(action.snapshot)
+        if fields != action.fields or snapshot != action.snapshot:
             db.execute(update(MindAction).where(MindAction.id == action.id, MindAction.status == "pending",
-                                                MindAction.revision == body.expected_revision).values(fields=fields),
-                       execution_options={"synchronize_session": False})
+                                                MindAction.revision == body.expected_revision)
+                       .values(fields=fields, snapshot=snapshot), execution_options={"synchronize_session": False})
             db.commit()
             db.expire(action)
     # This route runs in a worker thread: follow-ups (stopping jobs, GitHub) run on the app's event loop.

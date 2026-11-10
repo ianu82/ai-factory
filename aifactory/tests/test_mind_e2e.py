@@ -232,6 +232,33 @@ def test_a_plan_worked_out_with_mind_starts_building_once_confirmed(app_as, peop
         assert db.query(Event).filter_by(outcome_id=new.id, kind="planning_started").count() == 0  # no planner ran
 
 
+def test_a_secret_saved_after_a_plan_card_never_reaches_the_plan(app_as, people):
+    client, app, _ = app_as
+    opaque = "opaque-plan-secret-0007"  # no credential pattern would recognize it
+    task = planned(key="T1", title="Search endpoint", repo="acme/platform", spec=f"Call the index with {opaque}",
+                   acceptance=[f"Search works with {opaque}"])
+    app.state.mind_runtime = runtime = ScriptedCalls(people, [("propose_build_plan", {
+        "workspace_id": people["first"], "title": "Search", "text": "Search outcomes.", "tasks": [task],
+        "risks": [f"Rotating {opaque}"]})])
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    send(client, thread, "Plan search")
+    card = runtime.results[0]
+    with SessionLocal() as db:
+        assert opaque in json.dumps(db.get(MindAction, card["id"]).snapshot)  # not a secret when proposed
+        db.add(Secret(workspace_id=people["first"], kind="github_token", ciphertext=encrypt(opaque)))
+        db.commit()
+    confirmed = client.post(f"/api/mind/threads/{thread}/actions/{card['id']}/confirm", json={"expected_revision": 1})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "succeeded" and opaque not in confirmed.text
+    with SessionLocal() as db:
+        new = db.query(Outcome).filter_by(workspace_id=people["first"], number=8).one()
+        plan = db.query(Plan).filter_by(outcome_id=new.id).one()
+        built = db.query(Task).filter_by(outcome_id=new.id).one()
+        assert opaque not in json.dumps(plan.content) and "[redacted]" in built.spec
+        assert opaque not in built.spec + json.dumps(built.acceptance)
+        assert opaque not in json.dumps(db.get(MindAction, card["id"]).snapshot)
+
+
 def test_a_viewer_is_refused_and_its_thread_keeps_its_scope(app_as, people):
     client, app, actor = app_as
     actor[0] = people["bob"]  # a viewer of the first workspace, not a member of the second
