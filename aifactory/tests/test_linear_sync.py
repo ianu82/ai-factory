@@ -393,10 +393,28 @@ def test_concurrent_cycles_do_not_overlap(linked, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_workspace_deadline_uses_the_configured_timeout():
+    async def check():
+        loop = asyncio.get_running_loop()
+        before = loop.time()
+        when = linear_sync.workspace_deadline("ws").when()
+        assert before + linear_sync.WORKSPACE_TIMEOUT_SECONDS <= when <= loop.time() + linear_sync.WORKSPACE_TIMEOUT_SECONDS
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("stalled_phase", ["outbound", "intake"])
 def test_workspace_deadlines_isolate_dispatch_and_intake(linked, monkeypatch, stalled_phase):
     monkeypatch.setenv("AIFACTORY_SIGNAL_INTERVAL_SECONDS", "180")
-    monkeypatch.setattr(linear_sync, "WORKSPACE_TIMEOUT_SECONDS", 2)
+    deadlines: dict[str, asyncio.Timeout] = {}
+
+    def deadline(workspace_id):
+        # No real elapsed time, so heavy load can't change the result: healthy workspaces get no deadline, and the
+        # stalled one expires only when the scenario says so, after the healthy ones have finished.
+        deadlines[workspace_id] = asyncio.timeout(None)
+        return deadlines[workspace_id]
+
+    monkeypatch.setattr(linear_sync, "workspace_deadline", deadline)
     stalled_id = linked[0]
     healthy_ids = []
     with session_scope() as db:
@@ -448,13 +466,15 @@ def test_workspace_deadlines_isolate_dispatch_and_intake(linked, monkeypatch, st
                     if all(db.query(Outcome).filter_by(workspace_id=workspace_id).count() == 2
                            for workspace_id in healthy_ids):
                         return
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
 
         try:
-            await asyncio.wait_for(entered.wait(), 1)
-            await asyncio.wait_for(healthy_complete(), 1)
+            # These limits only stop a broken run from hanging; nothing here depends on how long work takes.
+            await asyncio.wait_for(entered.wait(), 60)
+            await asyncio.wait_for(healthy_complete(), 60)
             assert not cancelled.is_set()
-            await asyncio.wait_for(cycle_task, 5)
+            deadlines[stalled_id].reschedule(asyncio.get_running_loop().time())
+            await asyncio.wait_for(cycle_task, 60)
         finally:
             cycle_task.cancel()
             await asyncio.gather(cycle_task, return_exceptions=True)

@@ -22,6 +22,11 @@ WORKSPACE_CONCURRENCY = 4
 RETRY_SECONDS = 30
 
 
+def workspace_deadline(workspace_id: str) -> asyncio.Timeout:
+    """The deadline for one workspace's sync, so one stalled workspace never holds up the others."""
+    return asyncio.timeout(WORKSPACE_TIMEOUT_SECONDS)
+
+
 class LinearSync:
     def __init__(self, provider=None, wake=None):
         self.provider = provider or linear_config.provider
@@ -71,7 +76,7 @@ class LinearSync:
                     if time.monotonic() < self._retry_after.get(workspace_id, 0):
                         return
                     try:
-                        async with asyncio.timeout(WORKSPACE_TIMEOUT_SECONDS):
+                        async with workspace_deadline(workspace_id):
                             errors = await Dispatcher(self.provider).dispatch(workspace_id)
                             if (interval <= 0 or "rate_limit" in errors
                                     or time.monotonic() - self._last_intake.get(workspace_id, float("-inf")) < interval):
