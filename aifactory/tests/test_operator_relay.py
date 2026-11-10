@@ -129,13 +129,13 @@ def test_commands_from_others_without_write_access_or_too_old_do_not_apply(facto
     FakeGH.comments = [command(2, REQUEST_CHANGES, login="mallory"),
                        command(3, REQUEST_CHANGES, age=timedelta(hours=25))]
     assert poll() == [3, 2]  # oldest first
-    assert decision_state() == ("open", None)
+    assert decision_state() == ("open", "")
     assert "more than 24 hours" in FakeGH.replies[0]
     assert "mallory is not a listed operator" in FakeGH.replies[1]
     FakeGH.permissions = {"ianu82": "read"}
     FakeGH.comments = [command(4, REQUEST_CHANGES)]
     assert poll() == [4]
-    assert decision_state() == ("open", None)
+    assert decision_state() == ("open", "")
     assert "ianu82 has no write access to acme/app" in FakeGH.replies[-1]
 
 
@@ -145,7 +145,7 @@ def test_plain_comments_are_ignored_and_bad_commands_are_answered(factory):
                        command(7, raw="/factory\n```json\n{\"resolve\": [\n```"),
                        command(8, {"merge": [{"outcome": 7}]})]
     assert poll() == [7, 8]
-    assert decision_state() == ("open", None)
+    assert decision_state() == ("open", "")
     assert "not valid JSON" in FakeGH.replies[0]
     assert "any of cancel, retry, resolve, guidance" in FakeGH.replies[1]
 
@@ -155,8 +155,26 @@ def test_a_head_guard_skips_a_decision_judged_on_an_older_commit(factory):
                           "head": "0123456"}]}
     FakeGH.comments = [command(9, stale)]
     assert poll() == [9]
-    assert decision_state() == ("open", None)
+    assert decision_state() == ("open", "")
     assert "judged on 0123456 but the head is abc1234def" in FakeGH.replies[0]
+
+
+def test_a_live_cancel_stops_the_planner_of_the_outcome(factory, monkeypatch):
+    from aifactory.pipeline.orchestrator import orchestrator
+
+    stopped = []
+    monkeypatch.setattr(orchestrator, "cancel_outcome", lambda outcome_id: stopped.append(outcome_id))
+    with session_scope() as s:
+        planning = Outcome(workspace_id=factory["ws"], number=8, title="Still planning", repo_ids=[], status="planning")
+        s.add(planning)
+        s.flush()
+        planning_id = planning.id
+    FakeGH.comments = [command(11, {"cancel": ["#8"]})]
+    assert poll() == [11]
+    with session_scope() as s:
+        assert s.get(Outcome, planning_id).status == "cancelled"
+    assert stopped == [planning_id]  # the active planner is stopped, as the app's own cancel does
+    assert "cancel #8: cancelled" in FakeGH.replies[0]
 
 
 def test_a_live_cancel_never_discards_started_work(factory):

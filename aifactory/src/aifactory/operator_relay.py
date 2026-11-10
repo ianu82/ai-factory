@@ -97,13 +97,16 @@ def _handled(workspace_id: str, comment_id: int, now: datetime) -> bool:
             Event.workspace_id == workspace_id, Event.kind == EVENT, Event.created_at >= cutoff))
 
 
-def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable) -> list[str]:
-    """Apply a command's items with the bootstrap's own functions; one result line per item."""
+def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable,
+                 stop_outcome: Callable[[str], None]) -> list[str]:
+    """Apply a command's items with the bootstrap's own functions; one result line per item. Runs in a worker
+    thread: ``schedule`` and ``stop_outcome`` hand work back to the event loop."""
     from . import bootstrap
 
     workspace, delegated_by = cfg["workspace"], cfg["delegated_by"]
     steps = {
-        "cancel": lambda entries: bootstrap._cancel_declared(workspace, entries, live=True),
+        "cancel": lambda entries: bootstrap._cancel_declared(workspace, entries, live=True,
+                                                             on_cancelled=stop_outcome),
         "retry": lambda entries: bootstrap._retry_declared(workspace, entries),
         "resolve": lambda entries: bootstrap._resolve_delegated(workspace, entries, delegated_by, schedule=schedule),
         "guidance": lambda entries: bootstrap._guidance_delegated(workspace, entries, delegated_by),
@@ -218,6 +221,18 @@ class Relay:
                 items[kind] = [{**item, "nonce": str(item.get("nonce") or f"relay-{comment_id}-{kind}-{n}")}
                                for n, item in enumerate(items[kind])]
         loop = asyncio.get_running_loop()
+
+        def stop_outcome(outcome_id: str) -> None:
+            # As the app's own cancel: stop an active planner (it could otherwise overwrite the cancellation and
+            # start tasks) and any task jobs, on the event loop that owns them.
+            from .pipeline.orchestrator import orchestrator
+
+            asyncio.run_coroutine_threadsafe(_stop(orchestrator, outcome_id), loop).result(timeout=30)
+
         lines = await asyncio.to_thread(_apply_items, cfg, items,
-                                        lambda coro: asyncio.run_coroutine_threadsafe(coro, loop))
+                                        lambda coro: asyncio.run_coroutine_threadsafe(coro, loop), stop_outcome)
         return lines or ["nothing to apply"]
+
+
+async def _stop(orchestrator, outcome_id: str) -> None:
+    orchestrator.cancel_outcome(outcome_id)

@@ -160,7 +160,8 @@ def apply_bootstrap() -> str | None:
     return workspace_id
 
 
-def _cancel_declared(workspace_id: str, keys: list[str], *, live: bool = False) -> list[str]:
+def _cancel_declared(workspace_id: str, keys: list[str], *, live: bool = False,
+                     on_cancelled=None) -> list[str]:
     """Operator cancellation of outcomes: a declared key (e.g. an accidental duplicate), or "#N" for outcome
     number N from any source (e.g. an intake outcome replaced by a re-scoped one). "#N" applies only while no
     task has ever started (no attempt, stage, start or PR; an interrupted task is persisted as queued with
@@ -171,8 +172,11 @@ def _cancel_declared(workspace_id: str, keys: list[str], *, live: bool = False) 
     still refused (closing PRs belongs to the app's own cancel).
 
     ``live`` (an operator relay while the orchestrator runs, see operator_relay) never discards started work, by
-    key or by number: a task may be running in this process. Returns one line per item saying what happened."""
+    key or by number: a task may be running in this process. ``on_cancelled(outcome_id)`` runs after the
+    cancellation commits, as the app's cancel then stops the orchestrator's planner and jobs for the outcome.
+    Returns one line per item saying what happened."""
     results: list[str] = []
+    cancelled: list[str] = []
     if not keys:
         return results
     from .events import record
@@ -211,6 +215,10 @@ def _cancel_declared(workspace_id: str, keys: list[str], *, live: bool = False) 
             record(workspace_id, "outcome_cancelled", f"Operator cancelled #{outcome.number}{how}",
                    outcome_id=outcome.id, actor="operator", level="warn", session=s)
             results.append(f"cancel #{outcome.number}: cancelled")
+            cancelled.append(outcome.id)
+    if on_cancelled is not None:
+        for outcome_id in cancelled:
+            on_cancelled(outcome_id)
     return results
 
 
