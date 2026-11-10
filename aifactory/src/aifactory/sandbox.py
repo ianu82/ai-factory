@@ -161,6 +161,7 @@ class LocalSandbox:
         self.tmp = self.root / "tmp"
         self.uid: int | None = None
         self._groups: set[int] = set()
+        self._identities: set[int] = set()
         self._closed = False
 
     # lifecycle -----------------------------------------------------------------
@@ -206,6 +207,9 @@ class LocalSandbox:
             except (ProcessLookupError, PermissionError):
                 pass
         self._groups.clear()
+        for uid in list(self._identities):
+            await terminate_identity(self, uid)
+            self.release_identity(uid)
         if self.uid is not None:
             # Anything the job left running under its private identity.
             proc = await asyncio.create_subprocess_exec(
@@ -242,8 +246,31 @@ class LocalSandbox:
             env.update(extra)
         return env
 
-    def _preexec(self):
-        uid = self.uid
+    def reserve_identity(self) -> int:
+        """Reserve a scratchpad-only UID, sharing checkout access, not processes."""
+        if self.uid is None or not isolation_available():
+            raise SandboxError("Scratchpad requires sandbox isolation with a private UID")
+        uid = _uid_pool.acquire()
+        self._identities.add(uid)
+        return uid
+
+    async def remove_private_files(self, relative: str) -> None:
+        """Remove supervisor-owned session files after its processes are gone."""
+        path = self.resolve(relative)
+        if path == self.work or not relative.startswith(".factory/anton/"):
+            raise SandboxError("Not a scratchpad private directory")
+        await asyncio.to_thread(shutil.rmtree, path, True)
+        if path.exists():
+            raise SandboxError("Could not remove scratchpad private files")
+
+    def release_identity(self, uid: int) -> None:
+        """Release only after terminate_identity has verified the UID is empty."""
+        if uid in self._identities:
+            self._identities.remove(uid)
+            _uid_pool.release(uid)
+
+    def _preexec(self, identity: int | None = None):
+        uid = self.uid if identity is None else identity
         cpus = job_cpus(uid)
 
         def run() -> None:
@@ -253,7 +280,7 @@ class LocalSandbox:
                 # the container's process limit. A small, per-job CPU set keeps pools proportionate.
                 os.sched_setaffinity(0, cpus)
             if uid is not None:
-                os.setgroups([])
+                os.setgroups([self.uid] if identity is not None else [])
                 os.setgid(uid)
                 os.setuid(uid)
             os.umask(0o022)
@@ -332,20 +359,33 @@ class LocalSandbox:
         )
 
     async def spawn(self, command: str, *, env: dict[str, str] | None = None, log: str = ".factory/app.log",
-                    cwd: str | None = None) -> asyncio.subprocess.Process:
+                    cwd: str | None = None, identity: int | None = None) -> asyncio.subprocess.Process:
         """Start a long-running process (e.g. the app under test); it is stopped with the sandbox."""
         if self._closed:
             raise SandboxError("Sandbox is closed")
+        if identity is not None and identity not in self._identities:
+            raise SandboxError("Unreserved sandbox identity")
         log_path = self.resolve(log)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if self.uid is not None:
             os.chown(log_path.parent, self.uid, self.uid)
+        process_env = self.env(env)
+        if identity is not None:
+            # This is sandbox-owned setup, not an SDK/host environment overlay.
+            os.chown(log_path.parent, identity, self.uid)
+            os.chmod(log_path.parent, 0o2770)
+            for name in ("home", "tmp"):
+                path = log_path.parent / name
+                path.mkdir(exist_ok=True)
+                os.chown(path, identity, identity)
+                os.chmod(path, 0o700)
+            process_env.update(HOME=str(log_path.parent / "home"), TMPDIR=str(log_path.parent / "tmp"))
         handle = open(log_path, "ab")
         try:
             proc = await asyncio.create_subprocess_exec(
-                "/bin/bash", "-lc", command, cwd=str(self.resolve(cwd) if cwd else self.work), env=self.env(env),
+                "/bin/bash", "-lc", command, cwd=str(self.resolve(cwd) if cwd else self.work), env=process_env,
                 stdin=asyncio.subprocess.DEVNULL, stdout=handle, stderr=asyncio.subprocess.STDOUT,
-                preexec_fn=self._preexec())
+                preexec_fn=self._preexec(identity))
         finally:
             handle.close()
         if self.uid is not None:
@@ -435,10 +475,11 @@ async def write_bytes(sandbox, relative: str, content: bytes) -> None:
 async def read_bytes(sandbox, relative: str, limit: int | None = None, from_end: bool = False) -> bytes:
     if _is_vm(sandbox):
         return await sandbox.read_bytes_async(relative, limit, from_end)
-    data = sandbox.resolve(relative).read_bytes()
-    if limit:
-        return data[-limit:] if from_end else data[:limit]
-    return data
+    with sandbox.resolve(relative).open("rb") as handle:
+        if limit is not None and from_end:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - limit))
+        return handle.read(limit) if limit is not None else handle.read()
 
 
 async def read_image_bytes(sandbox, relative: str, limit: int) -> bytes:
@@ -508,3 +549,54 @@ def host_capacity() -> dict[str, Any]:
         quota, period = cpu.split()[:2]
         info["cpu_quota"] = round(int(quota) / int(period), 1)
     return info
+
+
+# Trusted lifecycle code, run by the sandbox supervisor, never by a cell. UID
+# ownership is the boundary: setsid, reparenting and env={} cannot escape it.
+_UID_SWEEP = '''import os, signal, sys, time
+uid = int(sys.argv[1])
+def live():
+    found = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        try:
+            path = '/proc/' + name
+            if os.stat(path).st_uid == uid:
+                state = open(path + '/stat').read().rsplit(')', 1)[1].split()[0]
+                if state != 'Z':
+                    found.append(int(name))
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return found
+for attempt in range(100):
+    pids = live()
+    if not pids:
+        sys.exit(0)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    time.sleep(.02)
+raise RuntimeError('Scratchpad UID still has live processes')
+'''
+
+
+async def terminate_identity(sandbox, uid: int) -> None:
+    """Kill and verify a reserved identity, independently of spawn handles."""
+    import shlex
+
+    if uid <= 0:
+        raise SandboxError("Scratchpad requires a private unprivileged UID")
+    if _is_vm(sandbox):
+        result = await sandbox.exec("python3 -c " + shlex.quote(_UID_SWEEP) + " " + str(uid), timeout=10)
+        if not result.ok:
+            raise SandboxError("Scratchpad UID cleanup failed: " + result.output)
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-c", _UID_SWEEP, str(uid), env=sandbox.env(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        output, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode:
+            raise SandboxError("Scratchpad UID cleanup failed: " + output.decode('utf-8', 'replace'))

@@ -19,7 +19,7 @@ from aifactory.harness.anton import AntonHarness  # noqa: E402
 from aifactory.harness.base import HarnessSession  # noqa: E402
 from aifactory.harness.schemas import BUILDER_REPORT  # noqa: E402
 from aifactory.inference import ModelClient, ProviderConfig, UsageLedger  # noqa: E402
-from aifactory.sandbox import LocalSandbox  # noqa: E402
+from aifactory.sandbox import LocalSandbox, isolation_available  # noqa: E402
 
 
 def _free_port() -> int:
@@ -54,6 +54,10 @@ def _fake_server(port: int, requests: list, web_enabled=False):
         elif web_enabled and len(outputs) == 2:
             call = {"type": "function_call", "id": "fc_web", "call_id": "call_web", "name": "web_fetch",
                     "status": "completed", "arguments": json.dumps({"url": f"http://127.0.0.1:{port}/page"})}
+        elif len(outputs) == (3 if web_enabled else 2):
+            call = {"type": "function_call", "id": "fc_pad", "call_id": "call_pad", "name": "scratchpad",
+                    "status": "completed", "arguments": json.dumps({"action": "exec", "name": "main", "code": "print(6 * 7)",
+                    "one_line_description": "Check sandbox runtime", "estimated_execution_time_seconds": 1})}
         else:
             call = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": "finish", "status": "completed",
                     "arguments": json.dumps({"status": "done", "summary": "Wrote hello.txt"})}
@@ -81,7 +85,26 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     requests: list = []
     server = _fake_server(port, requests, web_enabled)
     progress = []
+    from aifactory.harness import anton_runtime
+    original_factory = anton_runtime.runtime_factory
+    runtimes = []
+
+    def factory(session):
+        create = original_factory(session)
+        def tracked(**kwargs):
+            pad = create(**kwargs)
+            runtimes.append(pad)
+            return pad
+        return tracked
+
+    monkeypatch.setattr(anton_runtime, "runtime_factory", factory)
     try:
+        if isolation_available():
+            from pathlib import Path
+            for parent in (tmp_path, *tmp_path.parents):
+                if parent == Path("/tmp"):
+                    break
+                parent.chmod(0o755)
         sb = LocalSandbox("anton", root=tmp_path).create()
         sb.work.mkdir()
         import io
@@ -91,6 +114,7 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
         Image.new("RGB", (2, 2), "red").save(image, format="PNG")
         (sb.work / ".factory").mkdir()
         (sb.work / ".factory" / "screen.jpg").write_bytes(image.getvalue())
+        sb.adopt_work()
         provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
         ledger = UsageLedger(run_id="r", workspace_settings={})
         session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
@@ -109,7 +133,13 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     assert len(guard._sends) == len(requests)
     tool_names = {t.get("name") for t in requests[0].get("tools", [])}
     assert {"write_file", "finish", "run", "read_image"} <= tool_names
-    assert "scratchpad" not in tool_names
+    assert "scratchpad" in tool_names
+    assert runtimes and all(pad.session is session for pad in runtimes)
+    assert all(not pad.process_running and not pad._pending_cleanup for pad in runtimes)
+    if isolation_available():
+        assert any("42" in cell.stdout for pad in runtimes for cell in pad.cells)
+    else:
+        assert any("private UID" in json.dumps(body) for body in requests)
     if web_enabled:
         assert {"web_search", "web_fetch"} <= tool_names
         assert any(event[0] == "web_request" and event[2]["outcome"] == "success" for event in progress)

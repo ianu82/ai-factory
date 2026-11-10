@@ -427,7 +427,7 @@ class RailwayVMSandbox:
         raise SandboxError("Use read_text_async for VM sandboxes")
 
     async def read_text_async(self, relative: str, limit: int = 400_000) -> str:
-        data = await self.read_bytes_async(relative)
+        data = await self.read_bytes_async(relative, limit + 1)
         if b"\x00" in data[:8000]:
             raise SandboxError(f"Binary file: {relative}")
         text = data[:limit].decode("utf-8", "replace")

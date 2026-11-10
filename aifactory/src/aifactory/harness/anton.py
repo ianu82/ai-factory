@@ -3,7 +3,8 @@
 Anton's ChatSession runs in the control plane; its provider is pointed at the workspace's
 model provider with per-run accounting. Factory tools and a protected image reader
 access the job sandbox. Web tools are explicit policy opt-ins and execute only in
-the sandbox; SDK/native web, code-execution runtime, memory and skills stay disabled.
+the sandbox; SDK/native web, memory and skills stay disabled. Scratchpad cells
+run in a persistent sandbox process with a dedicated cleanup identity.
 """
 
 from __future__ import annotations
@@ -94,6 +95,8 @@ class AntonHarness:
         from anton.core.settings import CoreSettings
         from anton.core.tools.tool_defs import ToolDef
 
+        from .anton_runtime import runtime_factory
+
         toolbox = ToolBox(session)
         provider_cfg = session.client.provider
         state: dict[str, Any] = {"report": None, "calls": 0, "error": ""}
@@ -144,9 +147,6 @@ class AntonHarness:
             state["report"] = report
             raise _ReportReady()
 
-        def no_runtime(**_kwargs):
-            raise _Stop()
-
         specs = tool_specs(session.writable) + [finish_tool(session.report_schema)]
         tools = [ToolDef(t["function"]["name"], t["function"]["description"], t["function"]["parameters"],
                          finish_handler if t["function"]["name"] == "finish" else make_handler(t["function"]["name"]))
@@ -159,6 +159,14 @@ class AntonHarness:
                 # The pinned SDK registers built-ins before config.tools and
                 # deduplicates by name. Override only this session's registry,
                 # including on lazy rebuilds; never patch SDK ToolDefs globally.
+                scratchpad = next(t for t in chat.tool_registry.get_tool_defs() if t.name == "scratchpad")
+                scratchpad.description = (
+                    "Run Python in a persistent sandbox process with a private venv. "
+                    "Actions: exec, view, dump, install, reset, remove. Use print() for output. "
+                    "Only the sandbox environment is available; no SDK helpers, credentials "
+                    "or host packages are injected. Reset, timeout and cancellation lose the "
+                    "namespace and installed packages. Provide one_line_description and "
+                    "estimated_execution_time_seconds on exec. Session/tool time limits apply.")
                 chat.tool_registry.unregister_tool("read_image")
                 chat.tool_registry.register_tool(next(t for t in tools if t.name == "read_image"))
 
@@ -182,8 +190,8 @@ class AntonHarness:
                 "analytics_enabled": False, "skills_root": Path(temporary) / "skills", "skills_extra_roots": [],
                 "skills_artifact_roots": [], "skill_drafts_root": None})
             chat = SandboxChatSession(ChatSessionConfig(
-                llm_client=client, settings=settings, runtime_factory=no_runtime, session_id=uuid4().hex,
-                harness="anton", tools=tools, tool_allowlist=frozenset(t.name for t in tools),
+                llm_client=client, settings=settings, runtime_factory=runtime_factory(session), session_id=uuid4().hex,
+                harness="anton", tools=tools, tool_allowlist=frozenset({"scratchpad", *(t.name for t in tools)}),
                 background_memory=False, web_search_enabled=False, web_fetch_enabled=False,
                 connector_usage_notes={}, system_prompt_context=SystemPromptContext(suffix=session.system),
                 output_dir=temporary))
