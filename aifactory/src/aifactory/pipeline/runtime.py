@@ -66,12 +66,18 @@ def workspace_settings(workspace_id: str) -> dict[str, Any]:
         return merged_settings(ws.settings if ws else {})
 
 
-def guidance_history(outcome_id: str, task_id: str | None = None) -> list[str]:
-    """All team guidance so far for an outcome (and this task), for inclusion in new prompts."""
+def guidance_history(outcome_id: str, task_id: str | None = None, all_tasks: bool = False) -> list[str]:
+    """All team guidance so far for an outcome (and this task), for inclusion in new prompts.
+
+    all_tasks (for planning) also includes guidance given on each task, labelled with its key, so a re-plan
+    keeps the decisions made while building."""
     with session_scope() as s:
         rows = (s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user")
                 .order_by(Message.created_at).all())
-        return [m.body for m in rows if m.task_id in (None, task_id)]
+        if not all_tasks:
+            return [m.body for m in rows if m.task_id in (None, task_id)]
+        keys = {t.id: t.key for t in s.query(Task).filter(Task.outcome_id == outcome_id)}
+        return [m.body if not m.task_id else f"{keys.get(m.task_id, 'task')}: {m.body}" for m in rows]
 
 
 def take_guidance(outcome_id: str, task_id: str | None = None, since=None):

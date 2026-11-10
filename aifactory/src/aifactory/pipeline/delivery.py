@@ -23,6 +23,7 @@ from ..guided import README_TEMPLATE, outcome_guidance
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
+from ..harness.schemas import missing_coverage
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
@@ -487,6 +488,16 @@ class TaskRunner:
                 if report["verdict"] == "pass":
                     report = {**report, "verdict": "fail",
                               "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
+            if report["verdict"] == "pass":
+                # A pass must judge every criterion and constraint; an incomplete report is an unusable verifier
+                # session (retried without charging the builder), never independent evidence.
+                missing = missing_coverage(list(self.task.acceptance or []), list(self.task.constraints or []),
+                                           report.get("criteria") or [])
+                if missing:
+                    self.event("verification_unavailable",
+                               f"Verifier passed without judging {', '.join(missing)}; running a fresh verifier",
+                               level="warn")
+                    continue
             self.verifier_report = report
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))

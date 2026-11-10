@@ -92,6 +92,26 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
             );
           })}
         </ul>
+        {(task.constraints?.length ?? 0) > 0 && (
+          <>
+            <div className="muted" style={{ fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", margin: "10px 0 6px" }}>
+              Security and robustness constraints
+            </div>
+            <ul className="crit">
+              {task.constraints!.map((c, i) => {
+                const label = `C${i + 1}`;
+                const v = [...byCriterion.values()].find((x) => x.criterion.startsWith(label + ".") || x.criterion.startsWith(label + " ") || x.criterion === label || x.criterion.slice(0, 40) === c.slice(0, 40));
+                return (
+                  <li key={label}>
+                    <Mark status={v?.status || "none"} />
+                    <span>{label}. {c}</span>
+                    {v?.evidence && <span className="ev">{v.evidence}</span>}
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
         {lastVerdict?.findings && lastVerdict.findings.length > 0 && (
           <ul className="crit" style={{ marginTop: 8 }}>
             {lastVerdict.findings.map((f, i) => (

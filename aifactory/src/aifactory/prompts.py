@@ -21,6 +21,25 @@ How to work:
 - Ask questions ONLY for genuine product decisions you cannot resolve from the code, docs or brief
   (e.g. conflicting requirements). Otherwise make a sensible, explicit assumption and note it in risks.
 - Never plan changes to CI workflows, secrets or deployment configuration unless the outcome asks for it.
+- List in `files` the files each task will change. Tasks in one repository that change the same file run one
+  after the other, so split work by file where you can.
+
+Security and robustness are part of the plan, not something review discovers later. For every task, write
+`constraints`: the concrete rules the change must keep. Each must be checkable by a test or a probe the verifier
+can run. Work them out from what the task touches:
+- untrusted input (users, repositories, pull requests, issues, comments, model output): validate and bound it,
+  and never execute or trust it;
+- secrets and credentials: never stored, logged, echoed or sent to a model, and redaction that holds across
+  message, field, event and stream boundaries;
+- isolation: what must stay unreachable (other workspaces, the control plane, credentials, repository mirrors),
+  and what happens when isolation is unavailable (fail closed, never run with a weaker guarantee);
+- bounds: sizes, counts, memory, time and cost, enforced before the work is done;
+- concurrency and restarts: what must be atomic, idempotent or resumable, and which checks must be repeated
+  under a lock right before acting;
+- failure behaviour: what happens when a dependency fails, and never reporting success that can't be proven.
+Turn prior human decisions and team guidance that settle a design question into constraints, quoting them.
+Keep constraints specific to the task: no generic padding. When one task would need several independent security
+mechanisms, split it. Record your assumptions and the residual risks of the plan in `risks`.
 
 When done, call finish with your plan."""
 
@@ -67,7 +86,11 @@ How to work:
   fix a failure, that failure still occurring is a real failure, however it behaved on the base commit.
 - Opt-in test suites that are skipped by default stay skipped, unless the change touches the integration they
   cover or the acceptance criteria call for them; then run them and treat their results as evidence.
-- verdict "pass" only if every criterion passes with evidence and there are no blocker findings.
+- Constraints are criteria too: report on each one (C1, C2, …) and try to break it before you accept it:
+  oversized or malformed input, repeated and concurrent calls, interruption and restart, missing permissions or
+  isolation, secrets split across messages or fields. A constraint passes only with evidence from such a probe or
+  from a test that exercises it.
+- verdict "pass" only if every criterion and constraint passes with evidence and there are no blocker findings.
 
 When done, call finish with your verdict."""
 
@@ -84,12 +107,15 @@ def plan_prompt(outcome: Any, repos: list[Any], decisions: list[Any], guidance: 
             lines.append(f"  Team notes: {cfg['context']}")
         if cfg.get("checks"):
             lines.append(f"  Configured checks: {'; '.join(cfg['checks'])}")
+        if cfg.get("protected_paths"):
+            lines.append(f"  Never changed by the factory: {', '.join(cfg['protected_paths'])}")
     if decisions:
         lines += ["", "## Prior human decisions that apply (follow them)"]
         for d in decisions:
             lines.append(f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}")
     if guidance:
-        lines += ["", "## Guidance from the team", *[f"- {g}" for g in guidance]]
+        lines += ["", "## Guidance and decisions from the team on this outcome (turn them into constraints)",
+                  *[f"- {g}" for g in guidance]]
     lines += ["", "Use the repo value exactly as owner/name in each task."]
     return "\n".join(lines)
 
@@ -109,6 +135,14 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
         "",
         f"Repository: {repo.full_name}. The checkout is your working directory.",
     ]
+    constraints = list(getattr(task, "constraints", None) or [])
+    if constraints:
+        lines += ["", "## Security and robustness constraints (must hold; the verifier probes each one)",
+                  *[f"C{i + 1}. {c}" for i, c in enumerate(constraints)],
+                  "Prove each one with a test where you can."]
+    files = list(getattr(task, "files", None) or [])
+    if files:
+        lines += ["", "## Files this task is expected to change", *[f"- {f}" for f in files]]
     if outcome.brief:
         lines += ["", "## Original request (context)", outcome.brief[:4000]]
     if cfg.get("context"):
@@ -149,6 +183,9 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
         "",
         "## Acceptance criteria (report on every one, verbatim)",
         *[f"{i + 1}. {c}" for i, c in enumerate(task.acceptance)],
+        *(["", "## Constraints (report on every one as a criterion named C1, C2, …; probe each adversarially)",
+           *[f"C{i + 1}. {c}" for i, c in enumerate(getattr(task, "constraints", None) or [])]]
+          if getattr(task, "constraints", None) else []),
         "",
         f"Repository: {repo.full_name}. Base commit: {base_sha}. Run `git diff {base_sha}` to see the change.",
         "",

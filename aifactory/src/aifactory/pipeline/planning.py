@@ -9,6 +9,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
+from ..harness.schemas import sequence_shared_files
 from ..models import Outcome, Plan, Repository, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLANNER, plan_prompt
@@ -41,7 +42,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                            subdir=repo.full_name.replace("/", "__"), adopt=False)
         sandbox.adopt_work()
         decisions = precedents(workspace_id)
-        prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id))
+        prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id, all_tasks=True))
         run, result, error = await run_agent(SessionSpec(
             workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
             prompt=prompt, system=PLANNER, sandbox=sandbox, effective_settings=settings,
@@ -69,6 +70,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         for task in report["tasks"]:
             task["repo"] = repos[0].full_name
         problems = []
+        sequence_shared_files(report["tasks"])  # tasks the planner named differently may share files
     with session_scope() as s:
         for old in s.query(Plan).filter(Plan.outcome_id == outcome_id, Plan.status == "proposed"):
             old.status = "superseded"
@@ -132,6 +134,7 @@ def approve_plan(plan_id: str, approved_by: str | None) -> bool:
             repo = repos.get(item["repo"].lower())
             s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],
                        title=item["title"][:300], spec=item["spec"], acceptance=list(item.get("acceptance") or []),
+                       constraints=list(item.get("constraints") or []), files=list(item.get("files") or []),
                        repo_id=repo.id, depends_on=list(item.get("depends_on") or []), harness=builder,
                        verifier_harness=verifier, status="pending"))
         outcome.status = "running"

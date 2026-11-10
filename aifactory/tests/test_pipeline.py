@@ -31,7 +31,8 @@ def planner_script(messages):
     return {"content": "", "tool_calls": [call("finish", {
         "summary": "Change the greeting.",
         "tasks": [{"key": "T1", "title": "Update greeting", "repo": "acme/demo",
-                   "spec": "Make greet.sh print Hello, Factory!", "acceptance": [CRITERION], "depends_on": []}],
+                   "spec": "Make greet.sh print Hello, Factory!", "acceptance": [CRITERION],
+                   "constraints": ["Only greet.sh changes"], "files": ["greet.sh"], "depends_on": []}],
         "questions": [], "risks": []})]}
 
 
@@ -51,7 +52,8 @@ def passing_verifier(messages):
         return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh && git diff --stat HEAD"})]}
     return {"content": "", "tool_calls": [call("finish", {
         "verdict": "pass", "summary": "Greeting verified.",
-        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}], "findings": []})]}
+        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"},
+                     {"criterion": "C1", "status": "pass", "evidence": "git diff --stat"}], "findings": []})]}
 
 
 @pytest.fixture
@@ -790,9 +792,9 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("list_files", {})]}
         return {"content": "", "tool_calls": [call("finish", {"summary": "Two files", "questions": [], "tasks": [
-            {"key": "T1", "title": "Add a.txt", "repo": "acme/demo", "spec": "create a.txt", "acceptance": ["a.txt exists"],
+            {"key": "T1", "title": "Add a.txt", "repo": "acme/demo", "spec": "create a.txt", "acceptance": ["a.txt exists"], "constraints": ["Only a.txt"], "files": ["a.txt"],
              "depends_on": []},
-            {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "create b.txt", "acceptance": ["b.txt exists"],
+            {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "create b.txt", "acceptance": ["b.txt exists"], "constraints": ["Only b.txt"], "files": ["b.txt"],
              "depends_on": []}]})]}
 
     def builder(messages):
@@ -808,7 +810,8 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
         return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
-                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"},
+                             {"criterion": "C1", "status": "pass", "evidence": "ls"}], "findings": []})]}
 
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     with session_scope() as s:
@@ -1092,8 +1095,8 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("list_files", {})]}
         return {"content": "", "tool_calls": [call("finish", {"summary": "Two edits", "questions": [], "tasks": [
-            {"key": "T1", "title": "Write A", "repo": "acme/demo", "spec": "a", "acceptance": ["A written"], "depends_on": []},
-            {"key": "T2", "title": "Write B", "repo": "acme/demo", "spec": "b", "acceptance": ["B written"], "depends_on": []}]})]}
+            {"key": "T1", "title": "Write A", "repo": "acme/demo", "spec": "a", "acceptance": ["A written"], "constraints": ["Only A"], "files": ["a.txt"], "depends_on": []},
+            {"key": "T2", "title": "Write B", "repo": "acme/demo", "spec": "b", "acceptance": ["B written"], "constraints": ["Only B"], "files": ["b.txt"], "depends_on": []}]})]}
 
     def builder(messages):
         name = "A" if "Write A" in messages[1]["content"] else "B"
@@ -1107,7 +1110,8 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
         return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
-                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"},
+                             {"criterion": "C1", "status": "pass", "evidence": "ls"}], "findings": []})]}
 
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     with session_scope() as s:
@@ -1174,8 +1178,8 @@ def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("list_files", {})]}
         return {"content": "", "tool_calls": [call("finish", {"summary": "Two files", "questions": [], "tasks": [
-            {"key": "T1", "title": "Add a.txt", "repo": "acme/demo", "spec": "a", "acceptance": ["a.txt exists"], "depends_on": []},
-            {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "b", "acceptance": ["b.txt exists"], "depends_on": []}]})]}
+            {"key": "T1", "title": "Add a.txt", "repo": "acme/demo", "spec": "a", "acceptance": ["a.txt exists"], "constraints": ["Only a.txt"], "files": ["a.txt"], "depends_on": []},
+            {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "b", "acceptance": ["b.txt exists"], "constraints": ["Only b.txt"], "files": ["b.txt"], "depends_on": []}]})]}
 
     def builder(messages):
         name = "a.txt" if "Add a.txt" in messages[1]["content"] else "b.txt"
@@ -1188,7 +1192,8 @@ def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
         return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
-                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"},
+                             {"criterion": "C1", "status": "pass", "evidence": "ls"}], "findings": []})]}
 
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     FakeGitHub.issues_state = {}
