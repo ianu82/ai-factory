@@ -21,14 +21,18 @@ class ScriptedModel:
 
     scripts: dict[str, Callable[[list[dict[str, Any]]], dict[str, Any]]] = {}
     calls: list[str] = []
+    judge_calls: list[dict[str, Any]] = []
 
     def __init__(self, provider: ProviderConfig, **_kwargs):
         self.provider = provider
 
     async def chat(self, *, model, messages, tools=None, ledger=None, **_kwargs):
         system = messages[0]["content"]
-        role = "scorer" if "You are a scorer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
-        ScriptedModel.calls.append(role)
+        role = "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
+        if role == "judge":
+            ScriptedModel.judge_calls.append({"model": model, "messages": messages, "tools": tools, **_kwargs})
+        else:
+            ScriptedModel.calls.append(role)
         if ledger:
             ledger.check()
             ledger.add(model, (1000, 200))

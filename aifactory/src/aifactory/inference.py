@@ -245,6 +245,10 @@ def from_responses_output(data: dict[str, Any]) -> dict[str, Any]:
     if calls:
         message["tool_calls"] = calls
     message["_raw"] = raw
+    # Preserve all provider output types for tool-free callers to validate. Keep
+    # unknown items out of _raw: execution agents replay that transcript, and
+    # changing its established filtering would change existing role behavior.
+    message["_output_types"] = [item.get("type") for item in output]
     return message
 
 
