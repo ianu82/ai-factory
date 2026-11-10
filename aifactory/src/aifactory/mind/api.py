@@ -122,6 +122,11 @@ def scrub(value, secrets=()):
     def values_only(group):
         return [(p, s) for p, s in group if not any(isinstance(x, tuple) and x[0] == "key" for x in p)]
 
+    # A field that ends inside an unfinished credential (a key block without its END marker, an x-access-token
+    # without its @) can match no pattern: redact it from the credential's start to the field's end.
+    for path, s in leaves:
+        if (start := open_credential(s, final=True)) is not None:
+            masks[path][start:] = b"\1" * (len(s) - start)
     mark(leaves)  # content keys and values together: a credential split between a key and its value is found
     mark(values_only(leaves))
     # Transport metadata must not break credentials split across event payloads.
@@ -183,15 +188,26 @@ _PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 
 
-def open_credential(text: str, *, final: bool = False) -> int | None:
-    """Where a credential that may still be arriving starts in streamed text, or None.
+_UNFINISHED_URL_TOKEN = re.compile(r"x-access-token:[^@\s]*$")
+_TRAILING_RUN = re.compile(r"\S+$")
+_BEARER_PREFIX = re.compile(r"(?i)authorization:\s*(?:bearer\s*)?\S*$")
 
-    A private key block without its END marker can be any length; so can a token pattern whose match runs to
-    the end of the text so far (more of it may follow). Neither can be recognized as a whole yet, so nothing
-    from its start on may be released. When the stream has ended (final), only an unclosed key block remains
-    open: complete token matches are redacted by scrub()."""
+
+def open_credential(text: str, *, final: bool = False) -> int | None:
+    """Where a credential that may still be arriving (or that ended unfinished) starts in text, or None.
+
+    Every credential pattern except a private key block and the bearer header is a single run of non-space
+    characters, and some only match once a later delimiter arrives (x-access-token:…@). So while a stream is
+    open, the last run of non-space characters is held until a space ends it, and so are an unclosed key block,
+    a bearer header and any match that reaches the end. When text is final, an unclosed key block or an
+    x-access-token without its @ is still open: from its start to the end is a credential fragment."""
     starts = [m.start() for m in _PEM_START.finditer(text) if not _PEM_END.search(text, m.end())]
+    if unfinished := _UNFINISHED_URL_TOKEN.search(text):
+        starts.append(unfinished.start())
     if not final:
+        for pattern in (_TRAILING_RUN, _BEARER_PREFIX):
+            if held := pattern.search(text):
+                starts.append(held.start())
         starts += [m.start() for pattern in _SECRET_PATTERNS for m in pattern.finditer(text) if m.end() == len(text)]
     return min(starts, default=None)
 

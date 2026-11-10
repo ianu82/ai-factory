@@ -562,3 +562,27 @@ def test_context_from_a_newly_joined_workspace_widens_the_thread_scope(world):
         db.query(Membership).filter_by(user_id=ids[0], workspace_id=ids[3]).delete()
         db.commit()
     assert client.get(f"/api/mind/threads/{thread}").status_code == 404
+
+
+def test_a_streamed_credential_that_needs_a_later_delimiter_is_held(world):
+    client, runtime, _, _ = world
+    runtime.output = [{"type": "token", "data": {"text": t}} for t in
+                      ["Clone https://x-access-token:", *["p" * 100 for _ in range(4)], "@github.com/acme/app now."]]
+    thread = create(world)
+    response = send(world, thread)
+    assert "p" * 20 not in response.text
+    text = client.get(f"/api/mind/threads/{thread}").json()["messages"][1]["text"]
+    assert "p" * 20 not in text and text.endswith("github.com/acme/app now.") and "[redacted]" in text
+
+
+@pytest.mark.parametrize("kind", ["action_card", "tool_finished"])
+def test_unfinished_credentials_in_structured_events_are_redacted(world, kind):
+    client, runtime, _, _ = world
+    fragment = "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7"
+    data = ({"card": {"id": "c1", "fields": {"text": "Use " + fragment}}} if kind == "action_card" else
+            {"call_id": "1", "name": "read", "summary": "Found " + fragment, "citations": [{"label": fragment}]})
+    runtime.output = [{"type": kind, "data": data}, {"type": "token", "data": {"text": "Done."}}]
+    thread = create(world)
+    response = send(world, thread)
+    assert "MIIBVQ" not in response.text
+    assert "MIIBVQ" not in client.get(f"/api/mind/threads/{thread}").text
