@@ -12,20 +12,25 @@ Live: <https://factory-production-f28b.up.railway.app> (Railway project "AI Fact
 ## How a delivery works
 
 ```
-Outcome ──► Plan ──► Tasks (parallel, dependency-ordered)
-                       │
-                       ├─ Build      fresh sandbox, setup, builder session (Native | Codex | Anton)
-                       ├─ Checks     repository checks run by the Factory, failures → next attempt
-                       ├─ Verify     a *fresh* session of the verifier harness checks every criterion;
-                       │             runtime QA boots the app (in its own Railway VM when configured),
-                       │             screenshots pages and probes endpoints as evidence
-                       ├─ PR         patch applied to a pristine clone, pushed, PR opened with evidence
-                       ├─ CI         waits for GitHub checks; failures + logs → next attempt
-                       ├─ Merge      policy (auto/approval); same-repo merges serialized and revalidated
-                       ├─ Smoke      fresh checkout of the merge commit runs smoke commands
-                       ├─ Release    optional deploy-on-merge health check
-                       └─ Recover    smoke failure → revert PR (policy `recovery.smoke_failure: revert`)
+Outcome ──► Plan (reviewed) ──► Tasks (parallel, dependency-ordered)
+                                  │
+                                  ├─ Build      fresh sandbox, setup, builder session (Native | Codex | Anton)
+                                  ├─ Checks     repository checks run by the Factory, failures → next attempt
+                                  ├─ Verify     a *fresh* session of the verifier harness checks every criterion;
+                                  │             runtime QA boots the app (in its own Railway VM when configured),
+                                  │             screenshots pages and probes endpoints as evidence
+                                  ├─ PR         patch applied to a pristine clone, pushed, PR opened with evidence
+                                  ├─ CI         waits for GitHub checks; failures + logs → next attempt
+                                  ├─ Merge      policy (auto/approval); same-repo merges serialized and revalidated
+                                  ├─ Smoke      fresh checkout of the merge commit runs smoke commands
+                                  ├─ Release    optional deploy-on-merge health check
+                                  └─ Recover    smoke failure → revert PR (policy `recovery.smoke_failure: revert`)
 ```
+
+Before building starts, every plan is reviewed. By default the plan reviewer (Opus 5.5, or the
+`plan_reviewer` model in Settings → Models) checks it against the request and the code, approves it,
+or sends it back to the planner with findings, at most twice before a person decides. With plan
+approval set to "A person", a person reviews and approves every plan instead.
 
 Every stage is durable (`task.stage`), so approvals and restarts resume without repeating
 side effects. Failed attempts feed precise feedback (failing checks, verifier findings, CI

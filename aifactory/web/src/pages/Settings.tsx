@@ -102,8 +102,8 @@ function Policies() {
         {policy.isPending && <p role="status">Loading saved policy…</p>}
         {policy.isError && <p role="alert">Could not load saved policy: {policy.error.message} <button className="btn sm" onClick={() => policy.refetch()}>Retry</button></p>}
         {policy.data?.learning && <p role="status">Learning mode: plans and merges require approval while you learn. These controls save your post-learning preset; they do not remove approvals. After a fully completed outcome, an admin can explicitly apply the preset from Inbox. Repository and release approval controls still apply.</p>}
-        <div className="s-line"><div className="l"><b>Plans</b><span>Start building as soon as the planner finishes, or wait for approval.</span></div>
-          <Seg value={selected.plan} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("plan", v)} disabled={!admin || !policy.isSuccess} /></div>
+        <div className="s-line"><div className="l"><b>Plans</b><span>Who approves each plan before building starts. The plan reviewer (set under Models) checks it against the request and the code, sends weak plans back to the planner, and brings you any plan it cannot approve.</span></div>
+          <Seg value={selected.plan} options={[["auto", "Plan reviewer"], ["approval", "A person"]]} onChange={(v) => autonomy("plan", v)} disabled={!admin || !policy.isSuccess} /></div>
         <div className="s-line"><div className="l"><b>Merges</b><span>Merge verified PRs once CI passes, or ask a person.</span></div>
           <Seg value={selected.merge} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin || !policy.isSuccess} /></div>
         <div className="s-line"><div className="l"><b>Releases</b><span>For repositories that deploy when main changes, require approval before merging.</span></div>
@@ -176,7 +176,7 @@ function Models() {
     }
   };
   const currentCheck = !dirty && check?.fingerprint === fingerprint ? check.result : undefined;
-  const options = useMemo(() => Array.from(new Set([...(models.data?.models || []), m.default || "", m.planner || "", m.builder || "", m.verifier || ""].filter(Boolean))), [models.data, m]);
+  const options = useMemo(() => Array.from(new Set([...(models.data?.models || []), m.default || "", m.planner || "", m.plan_reviewer || "", m.builder || "", m.verifier || ""].filter(Boolean))), [models.data, m]);
   const harness = (role: keyof Settings["harness"], value: string) => save({ harness: { ...s.harness, [role]: value } });
   return (
     <>
@@ -185,14 +185,15 @@ function Models() {
         <p>{models.data?.provider ? `Using ${models.data.label}. ` : ""}Each role is pinned to an exact model; the Factory never silently substitutes another one.</p>
         {models.data?.error && <div className="err" style={{ marginBottom: 10 }}>{models.data.error}</div>}
         <div className="s-grid">
-          {(["default", "planner", "builder", "verifier"] as const).map((role) => (
+          {(["default", "planner", "plan_reviewer", "builder", "verifier"] as const).map((role) => (
             <label key={role} className="field">
-              <span>{role === "default" ? "Default model" : `${role[0].toUpperCase()}${role.slice(1)}`}</span>
+              <span>{role === "default" ? "Default model" : role === "plan_reviewer" ? "Plan reviewer" : `${role[0].toUpperCase()}${role.slice(1)}`}</span>
               <select className="select" value={m[role] || ""} disabled={!admin} onChange={(e) => { invalidateCheck(); setM({ ...m, [role]: e.target.value || undefined }); }}>
-                {role !== "default" && <option value="">Use default</option>}
+                {role !== "default" && <option value="">{role !== "plan_reviewer" ? "Use default" : s.provider === "mindshub" ? "Use opus-5-5" : "Use the verifier's model"}</option>}
                 {options.map((o) => <option key={o} value={o}>{o}</option>)}
               </select>
-              {role !== "default" && <span className="hint" role="status">
+              {role === "plan_reviewer" && <span className="hint">Reviews every plan before building starts, unless a person approves plans.</span>}
+              {role !== "default" && role !== "plan_reviewer" && <span className="hint" role="status">
                 <Dot tone={currentCheck?.roles[role].status === "supported" ? "good" : currentCheck?.roles[role].status === "unsupported" ? "bad" : currentCheck ? "warn" : "idle"} />{" "}
                 {checking && !dirty ? "Checking image input…" : currentCheck ? <>
                   {currentCheck.roles[role].model} · Images: {currentCheck.roles[role].status === "unknown" ? "unknown (check failed)" : currentCheck.roles[role].status}

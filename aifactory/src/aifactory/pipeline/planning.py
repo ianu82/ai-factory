@@ -1,9 +1,16 @@
-"""Planning: turn an outcome into an approved, dependency-ordered set of tasks."""
+"""Planning: turn an outcome into a reviewed, approved, dependency-ordered set of tasks.
+
+With automatic plan approval the plan reviewer (Opus 5.5 unless the workspace picks another model) checks each
+plan against the request and the code. It approves the plan, sends it back to the planner with findings (at most
+``PLAN_REVIEW_ROUNDS`` times), or hands it to a person. With "approve first" a person reviews every plan.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
+from typing import Any
 
 from ..db import session_scope, utcnow
 from ..events import notify, record
@@ -11,12 +18,69 @@ from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
 from ..models import Outcome, Plan, Repository, Task
 from ..onboarding_policy import lock_workspace
-from ..prompts import PLANNER, plan_prompt
+from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
 from .runtime import (SessionSpec, guidance_history, open_decision, precedents, run_agent, set_outcome,
                       merged_settings, workspace_settings)
 
 log = logging.getLogger(__name__)
+
+PLAN_REVIEW_ROUNDS = 2  # revisions the reviewer may ask for before a person decides
+ACTIVE_OUTCOME = ("planning", "running", "attention", "blocked", "needs_input", "awaiting_approval")
+OTHER_OUTCOMES = 20
+OTHER_TASKS = 8
+
+
+def other_work(workspace_id: str, outcome_id: str) -> list[str]:
+    """Other outcomes in progress or completed in the last week, with their tasks, so a plan neither repeats
+    nor collides with them. Bounded: titles only, at most ``OTHER_OUTCOMES`` outcomes."""
+    since = utcnow() - timedelta(days=7)
+    lines: list[str] = []
+    with session_scope() as s:
+        mine = Outcome.workspace_id == workspace_id, Outcome.id != outcome_id
+        active = (s.query(Outcome).filter(*mine, Outcome.status.in_(ACTIVE_OUTCOME))
+                  .order_by(Outcome.number.desc()).limit(OTHER_OUTCOMES).all())
+        done = (s.query(Outcome).filter(*mine, Outcome.status == "completed", Outcome.completed_at >= since)
+                .order_by(Outcome.number.desc()).limit(max(0, OTHER_OUTCOMES - len(active))).all())
+        repos = dict(s.query(Repository.id, Repository.full_name).filter(Repository.workspace_id == workspace_id))
+        for outcome in active + done:
+            lines.append(f"- #{outcome.number} {outcome.title[:150]} ({outcome.status})")
+            if outcome.status == "completed":
+                continue
+            tasks = (s.query(Task).filter(Task.outcome_id == outcome.id,
+                                          Task.status.notin_(("cancelled", "abandoned")))
+                     .order_by(Task.key).limit(OTHER_TASKS).all())
+            lines += [f"  - {t.key} {t.title[:150]} [{repos.get(t.repo_id, '?')}] ({t.status})" for t in tasks]
+    return lines
+
+
+def _check_repos(report: dict[str, Any], repos: list[Repository]) -> list[str]:
+    """Names of repositories the plan uses that the outcome did not select. A single-repository outcome owns
+    every task, so its tasks are corrected rather than rejected."""
+    by_name = {r.full_name.lower() for r in repos}
+    problems = [t["repo"] for t in report.get("tasks", []) if t["repo"].lower() not in by_name]
+    if problems and len(repos) == 1:
+        for task in report["tasks"]:
+            task["repo"] = repos[0].full_name
+        return []
+    return problems
+
+
+def _save_plan(workspace_id: str, outcome_id: str, version: int, report: dict[str, Any], run: Any,
+               review: dict[str, Any] | None) -> str:
+    with session_scope() as s:
+        for old in s.query(Plan).filter(Plan.outcome_id == outcome_id, Plan.status == "proposed"):
+            old.status = "superseded"
+        content = {**report, "review": review} if review else report
+        plan = Plan(outcome_id=outcome_id, version=version, summary=report.get("summary", ""), content=content,
+                    run_id=run.id if run else None)
+        s.add(plan)
+        s.flush()
+        plan_id = plan.id
+    record(workspace_id, "plan_proposed", f"Plan v{version}: {len(report.get('tasks', []))} task(s)",
+           outcome_id=outcome_id, level="success", data={"plan_id": plan_id})
+    notify(workspace_id, "plan", plan_id)
+    return plan_id
 
 
 async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
@@ -33,8 +97,12 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         return
     settings = workspace_settings(workspace_id)
     harness_name = snapshot.harness or settings["harness"].get("planner") or "native"
+    # Automatic approval means the plan reviewer approves; with "approve first" a person reviews instead.
+    reviewed = settings["autonomy"].get("plan") == "auto"
     record(workspace_id, "planning_started", f"Planning outcome #{snapshot.number}", outcome_id=outcome_id)
     sandbox = LocalSandbox(f"plan-{outcome_id[:12]}-{version}").create()
+    result = review = last = None
+    error, problems = "", []
     try:
         token = resolve_token(workspace_id)
         sandbox.work.mkdir(parents=True, exist_ok=True)
@@ -43,51 +111,58 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                            subdir=repo.full_name.replace("/", "__"), adopt=False)
         sandbox.adopt_work()
         decisions = precedents(workspace_id)
-        prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id))
-        run, result, error = await run_agent(SessionSpec(
-            workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
-            prompt=prompt, system=PLANNER, sandbox=sandbox, effective_settings=settings,
-            repositories={r.full_name: r.config or {} for r in repos}), cancelled)
+        work = other_work(workspace_id, outcome_id)
+        repositories = {r.full_name: r.config or {} for r in repos}
+        revision = None
+        for revisions in range(PLAN_REVIEW_ROUNDS + 1):
+            prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id), work, revision)
+            run, result, error = await run_agent(SessionSpec(
+                workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
+                prompt=prompt, system=PLANNER, sandbox=sandbox, effective_settings=settings,
+                repositories=repositories), cancelled)
+            if result is None:
+                break
+            report = result.report
+            problems = _check_repos(report, repos)
+            review = None
+            if reviewed and not problems and not report.get("questions"):
+                review = await _review(snapshot, repos, decisions, work, report, harness_name, sandbox, settings,
+                                       repositories, cancelled)
+            plan_id = _save_plan(workspace_id, outcome_id, version, report, run, review)
+            last = (plan_id, report, review)
+            if review:
+                _record_review(workspace_id, outcome_id, version, review)
+            version += 1
+            if not review or review["verdict"] != "revise" or revisions == PLAN_REVIEW_ROUNDS:
+                break
+            revision = {"plan": report, "review": review}
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         log.exception("planning setup failed")
-        result, error, run = None, str(exc), None
+        result, error = None, str(exc)
     finally:
         await sandbox.close()
+    if cancelled.is_set():
+        return
 
-    if result is None:
+    if last is None:
         set_outcome(outcome_id, status="blocked", blocked_reason=f"Planning failed: {error}")
         open_decision(workspace_id, "unblock", f"Planning failed for #{snapshot.number}",
                       f"The planner could not produce a plan.\n\n{error}",
                       outcome_id=outcome_id, options=[{"value": "retry", "label": "Retry planning"},
                                                       {"value": "cancel", "label": "Cancel outcome"}])
         return
-
-    report = result.report
-    by_name = {r.full_name.lower(): r for r in repos}
-    problems = [t["repo"] for t in report.get("tasks", []) if t["repo"].lower() not in by_name]
-    if problems and len(repos) == 1:
-        for task in report["tasks"]:
-            task["repo"] = repos[0].full_name
-        problems = []
-    with session_scope() as s:
-        for old in s.query(Plan).filter(Plan.outcome_id == outcome_id, Plan.status == "proposed"):
-            old.status = "superseded"
-        plan = Plan(outcome_id=outcome_id, version=version, summary=report.get("summary", ""), content=report,
-                    run_id=run.id if run else None)
-        s.add(plan)
-        s.flush()
-        plan_id = plan.id
-    record(workspace_id, "plan_proposed", f"Plan v{version}: {len(report.get('tasks', []))} task(s)",
-           outcome_id=outcome_id, level="success", data={"plan_id": plan_id})
-    notify(workspace_id, "plan", plan_id)
-
-    if problems:
+    plan_id, report, review = last
+    note = ""
+    if result is None:
+        # A revision failed: the last reviewed plan still stands, and a person decides on it.
+        note = f"The planner could not revise this plan after the review: {error[:1000]}"
+    elif problems:
         set_outcome(outcome_id, status="blocked", blocked_reason=f"Plan references unknown repositories: {problems}")
         return
     questions = report.get("questions") or []
-    if questions:
+    if questions and not note:
         body = "\n\n".join(f"**{q['question']}**\n{q.get('why', '')}" +
                            (("\nOptions: " + ", ".join(q["options"])) if q.get("options") else "") for q in questions)
         set_outcome(outcome_id, status="needs_input")
@@ -99,15 +174,55 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         open_decision(workspace_id, "question", f"Planner needs a decision for #{snapshot.number}", body,
                       outcome_id=outcome_id, options=options)
         return
-    if not approve_plan(plan_id, approved_by=None):
-        set_outcome(outcome_id, status="awaiting_approval")
-        open_decision(workspace_id, "approve_plan", f"Approve plan for #{snapshot.number}: {snapshot.title}",
-                      report.get("summary", ""), outcome_id=outcome_id,
-                      options=[{"value": "approve", "label": "Approve"}, {"value": "replan", "label": "Revise"},
-                               {"value": "cancel", "label": "Cancel"}])
+    if not note and review and review["verdict"] == "approve" and approve_plan(
+            plan_id, approved_by=None, reviewer=review.get("model") or "the plan reviewer"):
+        return
+    body = report.get("summary", "")
+    if review and not note:
+        reason = {"revise": f"it still had concerns after {PLAN_REVIEW_ROUNDS} revisions",
+                  "escalate": "it needs a person to decide", "error": "the review could not finish"}.get(
+                      review["verdict"], "")
+        if reason:
+            body += f"\n\n**The plan reviewer did not approve this plan: {reason}.**\n" + "\n".join(
+                describe_review(review))
+    if note:
+        body += f"\n\n**{note}**"
+        if review:
+            body += "\n\nThe review of this plan:\n" + "\n".join(describe_review(review))
+    set_outcome(outcome_id, status="awaiting_approval")
+    open_decision(workspace_id, "approve_plan", f"Approve plan for #{snapshot.number}: {snapshot.title}", body,
+                  outcome_id=outcome_id,
+                  options=[{"value": "approve", "label": "Approve"}, {"value": "replan", "label": "Revise"},
+                           {"value": "cancel", "label": "Cancel"}])
 
 
-def approve_plan(plan_id: str, approved_by: str | None) -> bool:
+async def _review(outcome: Outcome, repos: list[Repository], decisions: list[Any], work: list[str],
+                  report: dict[str, Any], harness_name: str, sandbox: LocalSandbox, settings: dict[str, Any],
+                  repositories: dict[str, Any], cancelled: asyncio.Event) -> dict[str, Any]:
+    """Review one plan in the planner's checkout. A review that cannot finish never approves."""
+    prompt = plan_review_prompt(outcome, repos, decisions, guidance_history(outcome.id), work, report)
+    run, result, error = await run_agent(SessionSpec(
+        workspace_id=outcome.workspace_id, outcome_id=outcome.id, task_id=None, role="plan_reviewer",
+        harness=harness_name, prompt=prompt, system=PLAN_REVIEWER, sandbox=sandbox, effective_settings=settings,
+        repositories=repositories), cancelled)
+    if result is None:
+        return {"verdict": "error", "summary": f"The plan review failed: {error[:1000]}", "findings": [],
+                "run_id": run.id, "model": run.model}
+    return {**result.report, "run_id": run.id, "model": run.model}
+
+
+def _record_review(workspace_id: str, outcome_id: str, version: int, review: dict[str, Any]) -> None:
+    verdict = review["verdict"]
+    text = {"approve": "approved", "revise": "sent back to the planner", "escalate": "referred to a person",
+            "error": "not reviewed"}.get(verdict, verdict)
+    record(workspace_id, "plan_reviewed", f"Plan v{version} {text} by the plan reviewer: "
+           f"{str(review.get('summary', ''))[:300]}", outcome_id=outcome_id,
+           level="success" if verdict == "approve" else "warn",
+           data={"verdict": verdict, "run_id": review.get("run_id"),
+                 "findings": len(review.get("findings") or [])})
+
+
+def approve_plan(plan_id: str, approved_by: str | None, reviewer: str | None = None) -> bool:
     """Materialize tasks idempotently; automatic approval holds the settings lock.
 
     False means a person must approve. The policy check and approval are one
@@ -141,7 +256,8 @@ def approve_plan(plan_id: str, approved_by: str | None) -> bool:
         outcome.status = "running"
         outcome.blocked_reason = ""
         outcome_id = outcome.id
-    who = "policy (automatic)" if approved_by is None else "a team member"
+    who = "a team member" if approved_by else (f"the plan reviewer ({reviewer})" if reviewer
+                                           else "policy (automatic)")
     record(workspace_id, "plan_approved", f"Plan approved by {who}", outcome_id=outcome_id, level="success",
            actor=approved_by or "policy", data={"plan_id": plan_id})
     notify(workspace_id, "outcome", outcome_id)

@@ -319,11 +319,11 @@ async def test_runner_uses_loaded_repository_snapshot(tmp_path, monkeypatch):
     await runner.run()
     with db.session_scope() as s:
         runs = s.query(Run).filter_by(outcome_id=oid).all()
-        assert {r.role for r in runs} == {"planner", "builder", "verifier"}
+        assert {r.role for r in runs} == {"planner", "plan_reviewer", "builder", "verifier"}
         for run in runs:
             assert run.config_version and serializers.run(run)["config_version"] == run.config_version
             assert run.config_snapshot["repositories"]["acme/demo"]["checks"] == loaded["checks"]
-            if run.role != "planner":
+            if run.role in ("builder", "verifier"):
                 expected, _ = versions.configuration_version(
                     role=run.role, system=prompts.BUILDER if run.role == "builder" else prompts.VERIFIER,
                     harness=run.harness, provider=ProviderConfig("openai", "http://model.test", "k", "Test"),

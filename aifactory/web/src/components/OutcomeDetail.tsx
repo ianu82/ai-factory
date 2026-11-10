@@ -122,12 +122,23 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
 
       {plan && (
         <section className="p-sec">
-          <h3 id="guided-plan">Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : "approved by policy") : plan.status}</span></h3>
+          <h3 id="guided-plan">Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : plan.content.review?.verdict === "approve" ? "approved by the plan reviewer" : "approved by policy") : plan.status}</span></h3>
           <Prose text={plan.summary} />
           {(plan.content.risks || []).length > 0 && (
             <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--muted)", fontSize: 12.5 }}>
               {(plan.content.risks || []).map((r: string) => <li key={r}>{r}</li>)}
             </ul>
+          )}
+          {plan.content.review && (
+            <div style={{ marginTop: 10, color: "var(--muted)", fontSize: 12.5 }}>
+              <b style={{ color: "var(--ink)", fontWeight: 550 }}>Plan review{plan.content.review.model ? ` · ${plan.content.review.model}` : ""}</b>
+              {plan.content.review.summary && <Prose text={plan.content.review.summary} />}
+              {(plan.content.review.findings || []).length > 0 && (
+                <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {(plan.content.review.findings || []).map((f, i) => <li key={i}>{f.severity}{f.task ? ` (${f.task})` : ""}: {f.description}</li>)}
+                </ul>
+              )}
+            </div>
           )}
         </section>
       )}

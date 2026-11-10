@@ -70,16 +70,24 @@ class ModelSelection:
     builder: str
     verifier: str
     judge: str
+    plan_reviewer: str
+
+
+# Plans are reviewed by the strongest available model unless the workspace picks one.
+PLAN_REVIEWER_MODEL = "opus-5-5"
 
 
 def workspace_models(settings: dict[str, Any]) -> ModelSelection:
     models = settings.get("models") or {}
     default = models.get("default") or "gpt-terra"
+    verifier = models.get("verifier") or default
+    on_mindshub = (settings.get("provider") or "mindshub") == "mindshub"
     return ModelSelection(
         planner=models.get("planner") or default,
         builder=models.get("builder") or default,
-        verifier=models.get("verifier") or default,
+        verifier=verifier,
         judge=models.get("judge") or default,
+        plan_reviewer=models.get("plan_reviewer") or (PLAN_REVIEWER_MODEL if on_mindshub else verifier),
     )
 
 

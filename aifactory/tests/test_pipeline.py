@@ -137,7 +137,7 @@ def test_outcome_is_planned_built_verified_merged_and_smoke_tested(factory):
         assert task.status == "completed" and task.merge_sha and task.pr_number == 1
         assert task.evidence["smoke"]["state"] == "passed"
         assert task.evidence["ci"]["state"] == "success"
-        assert {r.role for r in runs} == {"planner", "builder", "verifier"}
+        assert {r.role for r in runs} == {"planner", "plan_reviewer", "builder", "verifier"}
         assert all(r.input_tokens > 0 for r in runs)
         branch = task.branch
     assert FakeGitHub.merged == [1]

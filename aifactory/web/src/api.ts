@@ -108,7 +108,7 @@ export interface Settings {
   learning?: { status: "learning" | "applied"; preset: Settings["autonomy"] };
   provider: "mindshub" | "openai";
   decision_judges: DecisionJudgeMode;
-  models: { default?: string; planner?: string; builder?: string; verifier?: string; judge?: string };
+  models: { default?: string; planner?: string; plan_reviewer?: string; builder?: string; verifier?: string; judge?: string };
   harness: { builder: string; verifier: string; planner: string };
   concurrency: number;
   planning_concurrency?: number;
@@ -389,12 +389,19 @@ export interface Message {
   created_at: string;
 }
 
+export interface PlanReview {
+  verdict: "approve" | "revise" | "escalate" | "error";
+  summary?: string;
+  model?: string;
+  findings?: { severity: string; task?: string; description: string }[];
+}
+
 export interface Plan {
   id: string;
   version: number;
   status: string;
   summary: string;
-  content: { summary?: string; tasks?: any[]; risks?: string[]; questions?: any[] };
+  content: { summary?: string; tasks?: any[]; risks?: string[]; questions?: any[]; review?: PlanReview };
   approved_by: string | null;
   approved_at: string | null;
   created_at: string;
