@@ -66,6 +66,20 @@ def secrets_for(db, user_id, scoped=()):
     return tuple(filter(None, (decrypt(s.ciphertext) for s in db.query(Secret).filter(Secret.workspace_id.in_(ids)))))
 
 
+# Field names of the Mind wire format (threads, messages, contexts, citations, cards, stream envelopes and
+# payloads, tool results). The server writes them, so they never carry a credential, and they are not part of the
+# text a credential can span: a span across fields never rewrites the format. Every other key is content:
+# scanned together with values, and renamed when redacted.
+STRUCTURAL_KEYS = frozenset({
+    "thread", "messages", "id", "title", "billing_workspace_id", "workspace_ids", "model_id", "status",
+    "created_at", "updated_at", "cost", "usd", "known", "thread_id", "role", "text", "content", "context",
+    "citations", "action_cards", "history", "tools", "workspace_id", "kind", "outcome_id", "task_id", "label",
+    "href", "seq", "message_id", "type", "data", "call_id", "name", "summary", "card", "code", "message",
+    "thread_cost", "daily_spend", "daily_limit", "revision", "workspace", "object", "fields", "effect", "result",
+    "action_id", "ok", "reason", "detail", "items", "truncated", "provenance",
+})
+
+
 def scrub(value, secrets=()):
     """Union exact/pattern spans on original leaves, then replace each leaf span.
 
@@ -80,7 +94,8 @@ def scrub(value, secrets=()):
             leaves.append((path, v))
         elif isinstance(v, dict):
             for i, (k, child) in enumerate(v.items()):
-                collect(k, path + (("key", i),))
+                if k not in STRUCTURAL_KEYS:
+                    collect(k, path + (("key", i),))
                 collect(child, path + (("value", i),))
         elif isinstance(v, (list, tuple)):
             for i, child in enumerate(v):
@@ -107,16 +122,13 @@ def scrub(value, secrets=()):
     def values_only(group):
         return [(p, s) for p, s in group if not any(isinstance(x, tuple) and x[0] == "key" for x in p)]
 
-    # Keys are scrubbed one by one. A span across structure never rewrites a key: that would change the shape
-    # of the value (and collapse entries whose keys collide).
-    for leaf in leaves:
-        if leaf[0] and isinstance(leaf[0][-1], tuple) and leaf[0][-1][0] == "key":
-            mark([leaf])
+    mark(leaves)  # content keys and values together: a credential split between a key and its value is found
     mark(values_only(leaves))
     # Transport metadata must not break credentials split across event payloads.
     if isinstance(value, list) and value and isinstance(value[0], dict) and "seq" in value[0]:
         roots = [(i, ("value", list(event).index("data"))) for i, event in enumerate(value)]
         payloads = [(p, s) for p, s in leaves if any(p[:2] == root for root in roots)]
+        mark(payloads)
         mark(values_only(payloads))
     # Locate text/content fields without flattening away the original offset map.
     text_paths = set()
@@ -135,7 +147,9 @@ def scrub(value, secrets=()):
 
     def rebuild(v, path=()):
         if isinstance(v, str):
-            mask = masks[path]
+            mask = masks.get(path)
+            if mask is None:  # a field name of the wire format
+                return v
             parts, start = [], 0
             while start < len(v):
                 end = start + 1
@@ -145,8 +159,13 @@ def scrub(value, secrets=()):
                 start = end
             return "".join(parts)
         if isinstance(v, dict):
-            return {rebuild(k, path + (("key", i),)): rebuild(child, path + (("value", i),))
-                    for i, (k, child) in enumerate(v.items())}
+            out = {}
+            for i, (k, child) in enumerate(v.items()):
+                key = rebuild(k, path + (("key", i),))
+                while key in out:  # redacted keys never collapse into one entry
+                    key += "*"
+                out[key] = rebuild(child, path + (("value", i),))
+            return out
         if isinstance(v, (list, tuple)):
             return [rebuild(child, path + (i,)) for i, child in enumerate(v)]
         return v
@@ -327,6 +346,10 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
     store.recover(db, thread)
     if body.context:
         require_member(db, user, body.context.workspace_id)
+        # Context from a workspace joined after the thread began widens its scope in the same transaction that
+        # keeps the message, so revoking that membership later hides the thread (owned()).
+        if body.context.workspace_id not in thread.workspace_ids:
+            thread.workspace_ids = sorted(set(thread.workspace_ids) | {body.context.workspace_id})
     existing = db.query(MindMessage).filter_by(thread_id=thread_id, client_message_id=body.client_message_id).first()
     if existing:
         raise HTTPException(409, "Message already submitted; reload the thread")
