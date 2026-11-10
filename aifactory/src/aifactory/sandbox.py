@@ -96,6 +96,57 @@ def _clip(data: bytes) -> tuple[str, bool]:
     return f"{head}\n\n… [{len(data) - HEAD_BYTES - TAIL_BYTES:,} bytes omitted] …\n\n{tail}", True
 
 
+TRASH_PREFIX = ".trash-"
+_live_roots: set[Path] = set()  # job directories of sandboxes open in this process
+
+
+def quarantine_orphaned_jobs(jobs_dir: Path | None = None) -> Path | None:
+    """Move every job directory present at startup aside, in O(1) per directory.
+
+    Sandboxes never survive a restart: close() removes a job's directory, and an interrupted attempt is redone
+    in a fresh sandbox. So each restart used to leave every running job's checkout, virtualenv and node_modules
+    on the volume, and a resumed job reused its stale directory. Renaming keeps startup fast however much was
+    left; purge_quarantine() deletes the moved directories in the background.
+    """
+    root = jobs_dir or get_settings().jobs_dir
+    if not root.is_dir():
+        return None
+    live = {p.resolve() for p in _live_roots}
+    orphans = [p for p in root.iterdir() if not p.name.startswith(TRASH_PREFIX) and p.resolve() not in live]
+    if not orphans:
+        return None
+    trash = root / f"{TRASH_PREFIX}{time.time_ns()}"
+    trash.mkdir()
+    os.chmod(trash, 0o700)
+    for path in orphans:
+        try:
+            path.rename(trash / path.name)
+        except OSError:
+            shutil.rmtree(path, ignore_errors=True)
+    return trash
+
+
+def purge_quarantine(jobs_dir: Path | None = None) -> int:
+    """Delete quarantined job directories (slow for large checkouts; run it off the event loop)."""
+    root = jobs_dir or get_settings().jobs_dir
+    removed = 0
+    if root.is_dir():
+        for trash in root.glob(f"{TRASH_PREFIX}*"):
+            shutil.rmtree(trash, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def disk_report(data_dir: Path | None = None) -> dict[str, Any]:
+    """Volume usage for the inventory log, cheap enough to run every few minutes (no directory walks)."""
+    settings = get_settings()
+    usage = shutil.disk_usage(data_dir or settings.data_dir)
+    jobs = settings.jobs_dir
+    count = sum(1 for p in jobs.iterdir() if not p.name.startswith(TRASH_PREFIX)) if jobs.is_dir() else 0
+    return {"used_gb": round(usage.used / 1e9, 1), "total_gb": round(usage.total / 1e9, 1),
+            "used_percent": round(100 * usage.used / usage.total, 1) if usage.total else 0, "job_dirs": count}
+
+
 class LocalSandbox:
     """A job directory with optional per-job UID isolation."""
 
@@ -117,6 +168,7 @@ class LocalSandbox:
         for path in (self.root, self.home, self.tmp):
             path.mkdir(parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
+        _live_roots.add(self.root)
         if isolation_available():
             self.uid = _uid_pool.acquire()
         return self
@@ -143,6 +195,7 @@ class LocalSandbox:
         await self.kill_all()
         if self.uid is not None:
             _uid_pool.release(self.uid)
+        _live_roots.discard(self.root)
         if not keep_files:
             shutil.rmtree(self.root, ignore_errors=True)
 
