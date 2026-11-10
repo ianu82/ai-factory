@@ -390,10 +390,12 @@ def test_application_registers_the_mind_routers():
     from aifactory.app import create_app
     from aifactory.mind.runtime import EngineRuntime
     app = create_app(start_orchestrator=False)
-    paths = {getattr(route, "path", "") for route in app.routes}
-    assert {"/api/mind/threads", "/api/mind/status", "/api/mind/threads/{thread_id}/messages",
-            "/api/mind/threads/{thread_id}/actions/{action_id}/confirm"} <= paths
     assert isinstance(app.state.mind_runtime, EngineRuntime)
+    with TestClient(app) as anonymous:
+        # Registered routes refuse an anonymous caller; an unknown /api path is a plain 404.
+        assert anonymous.get("/api/mind/threads").status_code == 401
+        assert anonymous.get("/api/mind/threads/missing").status_code == 401
+        assert anonymous.get("/api/mind/nothing-here").status_code == 404
 
 
 @pytest.mark.parametrize("endpoint,payload", [

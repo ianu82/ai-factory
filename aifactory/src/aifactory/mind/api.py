@@ -214,7 +214,9 @@ def open_credential(text: str, *, final: bool = False) -> int | None:
 
 
 def cut_open_credential(events: list[dict]) -> list[dict]:
-    """Redact reply text from the start of a private key block that never closed to the end of the reply."""
+    """Redact reply text from the start of a credential that never finished (a key block without END, an
+    x-access-token without @) to the end of the reply. Runs on the original text, before scrub(): scrubbing first
+    would remove the start marker this needs to find."""
     text = "".join(e["data"].get("text", "") for e in events if e["type"] == "token")
     start = open_credential(text, final=True)
     if start is None:
@@ -521,7 +523,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 store.owned(session, user_id, thread_id)
                 events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
-                safe = cut_open_credential(scrub_events(events, secrets_for(session, user_id, scope)))
+                safe = scrub_events(cut_open_credential(events), secrets_for(session, user_id, scope))
             for event in safe[released:]:
                 yield encoded(event)
             flushed = True
@@ -544,7 +546,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 # Persist even on disconnect. No durable worker or public event bus.
                 with SessionLocal() as session:
                     secrets = secrets_for(session, user_id, scope)
-                    safe = cut_open_credential(scrub_events(events, secrets))
+                    safe = scrub_events(cut_open_credential(events), secrets)
                     row = session.get(MindMessage, assistant_id)
                     row.text = "".join(e["data"].get("text", "") for e in safe if e["type"] == "token")
                     row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]

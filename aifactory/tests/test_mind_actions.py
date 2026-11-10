@@ -9,7 +9,7 @@ from aifactory import serializers as S
 from aifactory.db import SessionLocal
 from aifactory.mind.actions import PROPOSALS, confirm, edit, execution_results, propose
 from aifactory.mind.tools import Context, Tools
-from aifactory.models import Decision, Event, Membership, Message, MindAction, User
+from aifactory.models import Decision, Event, Membership, Message, MindAction, MindThread, User
 from tests.test_mind_tools import world
 
 
@@ -154,6 +154,10 @@ def test_http_adapters_and_app_guidance(client, signed_in, world, monkeypatch):
     # Authenticate the seeded owner with the normal current_user dependency.
     from aifactory.auth import current_user
     client.app.dependency_overrides[current_user] = lambda: users[0]
+    # The HTTP routes serve only a thread the person owns, scoped to workspaces they are still a member of.
+    db.add(MindThread(id="thread", owner_id=users[0].id, billing_workspace_id=work[0][0].id,
+                      workspace_ids=sorted([work[0][0].id, work[1][0].id])))
+    db.commit()
     ctx, card = proposal(world)
     path = f'/api/mind/threads/thread/actions/{card["id"]}'
     assert client.patch(path, json={"expected_revision": 1, "kind": "retry_task", "text": "bad"}).status_code == 422
