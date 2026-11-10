@@ -18,7 +18,7 @@ from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, Message, Outcome, Run, ScorerResult, Task, Workspace
+from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from ..review import DEFAULT_REVIEW
 from .attachments import prepare_attachments
@@ -97,8 +97,13 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
     with session_scope() as s:
         query = (s.query(Decision)
                  .filter(Decision.workspace_id == workspace_id, Decision.status == "resolved",
-                         Decision.reusable.is_(True), Decision.scope.in_(("workspace", "repository")))
-                 .order_by(Decision.resolved_at.desc(), Decision.id))
+                         Decision.reusable.is_(True),
+                         ~Decision.review.has(DecisionReview.correction_decision_id.is_not(None)),
+                         Decision.scope.in_(("workspace", "repository")))
+                 .order_by(Decision.id.in_(s.query(DecisionReview.correction_decision_id).filter(
+                     DecisionReview.workspace_id == workspace_id,
+                     DecisionReview.correction_decision_id.is_not(None))).desc(),
+                           Decision.resolved_at.desc(), Decision.id))
 
         def applicable(rows: list[Decision]) -> list[Decision]:
             """A repository-scoped decision applies to the repository it was made about (its task's, else its
@@ -108,9 +113,9 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
             scoped = [d for d in rows if d.scope == "repository"]
             task_ids = {d.task_id for d in scoped if d.task_id}
             outcome_ids = {d.outcome_id for d in scoped if not d.task_id and d.outcome_id}
-            task_repo = dict(s.query(Task.id, Task.repo_id).filter(Task.id.in_(task_ids)).all()) if task_ids else {}
+            task_repo = dict(s.query(Task.id, Task.repo_id).filter(Task.workspace_id == workspace_id, Task.id.in_(task_ids)).all()) if task_ids else {}
             outcome_repos = ({oid: set(repos or []) for oid, repos in
-                              s.query(Outcome.id, Outcome.repo_ids).filter(Outcome.id.in_(outcome_ids)).all()}
+                              s.query(Outcome.id, Outcome.repo_ids).filter(Outcome.workspace_id == workspace_id, Outcome.id.in_(outcome_ids)).all()}
                              if outcome_ids else {})
             return [d for d in rows if d.scope == "workspace"
                     or (d.task_id and task_repo.get(d.task_id) == repo_id)

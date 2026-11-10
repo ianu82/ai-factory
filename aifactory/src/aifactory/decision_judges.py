@@ -92,7 +92,7 @@ def build_context(db: Session, decision: Decision) -> dict[str, Any]:
     outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.workspace_id == ws)}
     tasks = {t.id: t for t in db.query(Task).filter(Task.workspace_id == ws)}
     repos = {r.id: r for r in db.query(Repository).filter(Repository.workspace_id == ws)}
-    rows = db.query(Decision).filter(Decision.workspace_id == ws, Decision.status == "resolved",
+    rows = db.query(Decision).filter(Decision.workspace_id == ws, Decision.status.in_(("resolved", "superseded")),
         or_(Decision.resolution != "", Decision.comment != "")).order_by(Decision.created_at, Decision.id).all()
     messages = db.query(Message).filter(Message.workspace_id == ws, Message.author_kind == "user").order_by(
         Message.created_at, Message.id).all()
@@ -118,7 +118,9 @@ def build_context(db: Session, decision: Decision) -> dict[str, Any]:
             "outcome": {"id": outcome.id, "number": outcome.number, "title": outcome.title} if outcome else None,
             "task_id": task.id if task else None,
             "repositories": [{"id": r.id, "full_name": r.full_name} for r in associated],
-            "superseded_by": corrections.get(d.id)})
+            "superseded_by": corrections.get(d.id), "supersedes": (d.attribution or {}).get("supersedes"),
+            "priority": "correction" if (d.attribution or {}).get("source") == "judge_correction" else "original"})
+    records.sort(key=lambda r: (r["priority"] != "correction", bool(r["superseded_by"])))
     outcome, task, associated = associations(decision)
     guidance = [{"id": m.id, "body": m.body, "author": authors.get(m.author_id),
                  "created_at": ts(m.created_at), "outcome_id": m.outcome_id, "task_id": m.task_id}
@@ -126,6 +128,7 @@ def build_context(db: Session, decision: Decision) -> dict[str, Any]:
                 and (m.task_id is None or (task and m.task_id == task.id))]
     return {"question": {"id": decision.id, "kind": decision.kind, "title": decision.title,
                          "body": decision.body, "options": decision.options},
+            "record_policy": "Superseded records are history only; never follow or cite them. Prefer corrections over original answers.",
             "workspace_id": ws, "question_fingerprint": question_fingerprint(decision), "records": records,
             "outcome": {"id": outcome.id, "brief": outcome.brief, "acceptance": outcome.acceptance} if outcome else None,
             "task": {"id": task.id, "spec": task.spec, "acceptance": task.acceptance} if task else None,
@@ -207,4 +210,39 @@ def validate_report(db: Session, decision: Decision, report: Any,
                    for field in ("resolution", "comment")):
             raise ValueError("Citation passage does not match the supplied answer")
     result["citations"], result["closest_decisions"] = citations, closest
+    return result
+
+
+
+def judge_metrics(db: Session, workspace_id: str, *, now=None) -> dict[str, Any]:
+    """UTC inclusive [now-days, now] cohorts by finished_at (judged_at).
+
+    Overruled counts corrections to automatic decide/send_back reviews in that
+    cohort, regardless of correction date. Rate is a fraction, not a percentage.
+    Suggest reviews count as held; off/bypass and unfinished reviews never count.
+    """
+    from datetime import timedelta, timezone
+    from .db import utcnow
+
+    def utc(value):
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+    now = utc(now or utcnow())
+    reviews = db.query(DecisionReview).filter(DecisionReview.workspace_id == workspace_id,
+        DecisionReview.finished_at >= now - timedelta(days=30), DecisionReview.finished_at <= now,
+        DecisionReview.mode.in_(("decide", "suggest")),
+        DecisionReview.state.notin_(("pending", "running", "bypass", "bypassed")),
+        DecisionReview.effective_verdict.in_(("decide", "send_back", "hold"))).all()
+    result = {}
+    for days in (7, 30):
+        counts = dict(decided=0, sent_back=0, held=0, overruled=0)
+        for r in reviews:
+            if not now - timedelta(days=days) <= utc(r.finished_at) <= now:
+                continue
+            verdict = "hold" if r.mode == "suggest" else r.effective_verdict
+            counts[{"decide": "decided", "send_back": "sent_back", "hold": "held"}[verdict]] += 1
+            if verdict in ("decide", "send_back") and r.correction_decision_id:
+                counts["overruled"] += 1
+        denominator = counts["decided"] + counts["sent_back"]
+        result[f"days_{days}"] = {**counts, "overrule_rate": counts["overruled"] / denominator if denominator else 0.0}
     return result

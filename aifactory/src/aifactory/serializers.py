@@ -57,7 +57,7 @@ def run(r: Run) -> dict[str, Any]:
             "config_version": r.config_version, "provider": r.provider, "model": r.model, "attempt": r.attempt, "status": r.status, "turns": r.turns,
             "input_tokens": r.input_tokens, "output_tokens": r.output_tokens, "cost_usd": r.cost_usd,
             "cost_known": r.cost_known, "error": r.error, "result": r.result, "started_at": ts(r.started_at),
-            "finished_at": ts(r.finished_at)}
+            "finished_at": ts(r.finished_at), "judged_at": ts(r.finished_at)}
 
 
 def task(t: Task, runs: list[Run] | None = None, repo_name: str = "") -> dict[str, Any]:
@@ -124,18 +124,39 @@ def judge(r: DecisionReview) -> dict[str, Any]:
             "answer": r.answer, "resolution": r.resolution, "summary": r.summary,
             "citations": r.citations, "closest_decisions": r.closest_decisions, "report": r.report,
             "correction_decision_id": r.correction_decision_id, "created_at": ts(r.created_at),
-            "updated_at": ts(r.updated_at), "started_at": ts(r.started_at), "finished_at": ts(r.finished_at)}
+            "updated_at": ts(r.updated_at), "started_at": ts(r.started_at), "finished_at": ts(r.finished_at), "judged_at": ts(r.finished_at)}
+
+
+def actionable(d: Decision) -> bool:
+    """Pending model work is not human attention; legacy unreviewed work is."""
+    r = d.review
+    return d.status == "open" and (not r or (r.workspace_id == d.workspace_id
+        and r.state not in ("pending", "running") and r.finished_at is not None))
 
 
 def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, Any]:
     attribution = d.attribution or {}
     context = dict(context or {})
+    from sqlalchemy.orm import object_session
+    db = object_session(d)
+    correction = None
+    if d.review and d.review.workspace_id == d.workspace_id and d.review.correction_decision_id and db:
+        c = db.get(Decision, d.review.correction_decision_id)
+        if c and c.workspace_id == d.workspace_id:
+            person = db.get(User, c.resolved_by) if c.resolved_by else None
+            correction = {"id": c.id, "resolution": c.resolution, "answer": c.comment,
+                "resolved_by": c.resolved_by, "resolved_by_name": (person.name or person.email) if person else "",
+                "resolved_at": ts(c.resolved_at), "attribution": c.attribution or {}}
+    if d.resolved_by and db:
+        person = db.get(User, d.resolved_by)
+        context["resolved_by_name"] = (person.name or person.email) if person else ""
+    elif d.review and d.review.workspace_id == d.workspace_id and d.review.effective_verdict in ("decide", "send_back"):
+        context["resolved_by_name"] = "Decision judge"
     if attribution.get("source") == "mind":
-        from sqlalchemy.orm import object_session
-        db = object_session(d)
         person = db.get(User, d.resolved_by) if db and d.resolved_by else None
         context["resolved_by_name"] = ((person.name or person.email) if person else "Person") + " via Mind"
-    return {"attribution": attribution, "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
+    return {"attribution": attribution, "actionable": actionable(d), "correction": correction,
+            "supersedes": attribution.get("supersedes"), "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,
             "resolved_at": ts(d.resolved_at), "reusable": d.reusable, "scope": d.scope,
             "judge": judge(d.review) if d.review and d.review.workspace_id == d.workspace_id else None,

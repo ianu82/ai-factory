@@ -345,3 +345,316 @@ def test_late_report_rejected_after_question_revised_in_another_session(data, ch
         assert current.review is None
         for field, value in changes.items():
             assert getattr(current, field) == value
+
+
+def automatic(data, *, verdict="decide", scope="repository", task_status="running", outcome_status="running"):
+    ws, _, _, oid, tid, _, qid = data
+    with db.session_scope() as s:
+        q = s.get(Decision, qid)
+        q.status, q.resolution, q.comment, q.scope = "resolved", "answer", "Original judge answer", scope
+        q.resolved_at = db.utcnow()
+        s.get(Task, tid).status = task_status
+        s.get(Outcome, oid).status = outcome_status
+        s.add(DecisionReview(workspace_id=ws, decision_id=qid, state="completed", mode="decide",
+            effective_verdict=verdict, proposed_verdict=verdict, answer=q.comment,
+            summary="Original summary", citations=[{"decision_id": data[-2], "passage": "durable queue"}],
+            finished_at=db.utcnow()))
+
+
+@pytest.mark.parametrize("verdict", ["decide", "send_back"])
+def test_member_overrule_once_guidance_and_precedence(client, data, monkeypatch, verdict):
+    from aifactory.models import Membership
+    from aifactory.pipeline.runtime import precedents, take_guidance
+    from aifactory.events import bus
+
+    automatic(data, verdict=verdict)
+    ws, uid, repo, oid, tid, _, qid = data
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws, user_id=uid).one().role = "member"
+    take = take_guidance(oid, tid)
+    other = take_guidance(oid, "other-task")
+    notifications = []
+    monkeypatch.setattr(bus, "publish", lambda payload: notifications.append(payload))
+    path = f"/api/workspaces/{ws}/decisions/{qid}/overrule"
+    body = {"resolution": "answer", "answer": "Use a database instead.", "reason": "Queue is obsolete"}
+    response = client.post(path, json=body)
+    assert response.status_code == 200, response.text
+    cid = response.json()["correction_decision_id"]
+    assert client.post(path, json=body).status_code == 400
+    assert take() == [f"Correction to decision {qid}: Use a database instead.\nReason: Queue is obsolete"]
+    assert take() == [] and other() == []
+    assert notifications
+    with db.session_scope() as s:
+        q, c = s.get(Decision, qid), s.get(Decision, cid)
+        assert q.status == "superseded" and q.comment == q.review.answer == "Original judge answer"
+        assert q.review.correction_decision_id == cid and q.review.summary == "Original summary"
+        assert c.resolved_by == uid and c.resolved_at and c.reusable
+        assert c.attribution["reason"] == body["reason"] and c.attribution["supersedes"] == qid
+        assert (c.scope, c.task_id, c.outcome_id) == ("repository", tid, oid)
+        assert s.get(Task, tid).status == s.get(Outcome, oid).status == "running"
+        assert s.query(Message).filter_by(outcome_id=oid).count() == 1
+        ctx = build_context(s, q)
+        assert next(r for r in ctx["records"] if r["id"] == qid)["superseded_by"] == cid
+        assert next(r for r in ctx["records"] if r["id"] == cid)["priority"] == "correction"
+    with db.session_scope() as s:
+        newer = s.get(Decision, data[-2])
+        newer.reusable, newer.scope, newer.resolved_at = True, "workspace", db.utcnow() + timedelta(seconds=1)
+    assert precedents(ws, repo, limit=1)[0].id == cid
+    assert all(d.id != qid for d in precedents(ws, repo))
+    assert all(d.id not in (qid, cid) for d in precedents(ws, "different-repo"))
+    for url in (f"/api/workspaces/{ws}/decisions", f"/api/workspaces/{ws}/outcomes/{oid}"):
+        payload = client.get(url).json()
+        rows = payload if isinstance(payload, list) else payload["decisions"]
+        original = next(d for d in rows if d["id"] == qid)
+        assert original["resolved_by_name"] == "Decision judge"
+        assert original["correction"]["resolved_by_name"] == "Ian"
+        assert original["correction"]["attribution"]["reason"] == body["reason"]
+        assert original["judge"]["citations"]
+
+
+@pytest.mark.parametrize("verdict", ["decide", "send_back"])
+@pytest.mark.parametrize("outcome_status", ["running", "attention"])
+@pytest.mark.parametrize("task_status", [
+    "pending", "queued", "running", "waiting_ci", "needs_input", "awaiting_approval",
+    "blocked", "failed", "smoke_failed",
+])
+def test_active_work_receives_correction_without_resuming(client, data, verdict, task_status, outcome_status):
+    from aifactory.pipeline.runtime import guidance_history, take_guidance
+
+    automatic(data, verdict=verdict, task_status=task_status, outcome_status=outcome_status)
+    ws, _, _, oid, tid, _, qid = data
+    take = take_guidance(oid, tid)
+    other = take_guidance(oid, "other-task")
+    path = f"/api/workspaces/{ws}/decisions/{qid}/overrule"
+    body = {"resolution": "answer", "answer": "Correction", "reason": "New evidence"}
+    response = client.post(path, json=body)
+    assert response.status_code == 200, response.text
+    expected = [f"Correction to decision {qid}: Correction\nReason: New evidence"]
+    assert take() == expected
+    assert take() == [] and other() == []
+    # A CI wait or human pause can outlive the current agent session: the next
+    # session must also see the correction in its initial guidance history.
+    assert guidance_history(oid, tid) == expected
+    assert guidance_history(oid, "other-task") == []
+    assert client.post(path, json=body).status_code == 400
+    with db.session_scope() as s:
+        assert s.query(Message).filter_by(outcome_id=oid, task_id=tid).count() == 1
+        assert s.get(Task, tid).status == task_status
+        assert s.get(Outcome, oid).status == outcome_status
+
+
+@pytest.mark.parametrize("outcome_status", ["planning", "needs_input", "awaiting_approval", "blocked"])
+def test_active_outcome_only_receives_correction(client, data, outcome_status):
+    from aifactory.pipeline.runtime import take_guidance
+
+    automatic(data, outcome_status=outcome_status)
+    ws, _, _, oid, _, _, qid = data
+    with db.session_scope() as s:
+        s.get(Decision, qid).task_id = None
+    take = take_guidance(oid)
+    response = client.post(f"/api/workspaces/{ws}/decisions/{qid}/overrule",
+        json={"resolution": "answer", "answer": "Correction", "reason": "New evidence"})
+    assert response.status_code == 200, response.text
+    assert take() == [f"Correction to decision {qid}: Correction\nReason: New evidence"]
+    assert take() == []
+    with db.session_scope() as s:
+        assert s.get(Outcome, oid).status == outcome_status
+        assert s.query(Message).filter_by(outcome_id=oid, task_id=None).count() == 1
+
+
+@pytest.mark.parametrize("verdict", ["decide", "send_back"])
+@pytest.mark.parametrize("task_status,outcome_status", [("completed", "running"), ("cancelled", "running"),
+    ("abandoned", "running"), ("reverted", "running"), ("handed_over", "running"),
+    ("unknown", "running"), ("running", "unknown"),
+    ("running", "completed"), ("running", "cancelled"), ("running", "partially_completed")])
+def test_terminal_work_never_restarted(client, data, verdict, task_status, outcome_status):
+    automatic(data, verdict=verdict, task_status=task_status, outcome_status=outcome_status)
+    response = client.post(f"/api/workspaces/{data[0]}/decisions/{data[-1]}/overrule",
+        json={"resolution": "answer", "answer": "Correction", "reason": "New evidence"})
+    assert response.status_code == 200, response.text
+    with db.session_scope() as s:
+        assert s.get(Task, data[4]).status == task_status
+        assert s.get(Outcome, data[3]).status == outcome_status
+        assert s.query(Message).count() == 0
+
+
+def test_overrule_access_isolation_validation(client, data):
+    from aifactory.models import Membership
+
+    automatic(data)
+    ws, uid, _, _, _, _, qid = data
+    path = f"/api/workspaces/{ws}/decisions/{qid}/overrule"
+    body = {"resolution": "answer", "answer": "Correction", "reason": "Evidence"}
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws, user_id=uid).one().role = "viewer"
+    assert client.post(path, json=body).status_code == 403
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws, user_id=uid).one().role = "member"
+        foreign = Workspace(org_id=s.get(Workspace, ws).org_id, name="Foreign", slug="foreign")
+        s.add(foreign)
+        s.flush()
+        d = Decision(workspace_id=foreign.id, kind="question", title="Secret")
+        s.add(d)
+        s.flush()
+        foreign_id = d.id
+    assert client.post(path.replace(qid, foreign_id), json=body).status_code == 404
+    for invalid in ({"reason": ""}, {"reason": "  "}, {"answer": "  "}, {"resolution": "approve"}):
+        assert client.post(path, json={**body, **invalid}).status_code in (400, 422)
+    assert client.post(path, json={"resolution": "answer", "answer": "Text"}).status_code == 422
+    with db.session_scope() as s:
+        assert s.get(Decision, qid).status == "resolved"
+        assert s.get(Decision, qid).review.correction_decision_id is None
+        assert s.query(Message).count() == 0
+        assert s.query(Decision).filter_by(workspace_id=ws).count() == 2
+
+
+def test_held_library_and_pending_not_actionable(client, data):
+    ws, _, _, oid, _, _, qid = data
+    with db.session_scope() as s:
+        s.add(DecisionReview(workspace_id=ws, decision_id=qid, state="pending"))
+    assert qid not in [d["id"] for d in client.get(f"/api/workspaces/{ws}/inbox").json()["decisions"]]
+    payload = client.get(f"/api/workspaces/{ws}/outcomes/{oid}").json()
+    assert not next(d for d in payload["decisions"] if d["id"] == qid)["actionable"]
+    with db.session_scope() as s:
+        r = s.get(Decision, qid).review
+        r.state, r.effective_verdict, r.proposed_verdict = "completed", "hold", "decide"
+        r.mode, r.summary, r.answer, r.finished_at = "suggest", "Needs confirmation", "Proposed answer", db.utcnow()
+    for endpoint in ("inbox", "decisions"):
+        payload = client.get(f"/api/workspaces/{ws}/{endpoint}").json()
+        rows = payload["decisions"] if endpoint == "inbox" else payload
+        held = next(d for d in rows if d["id"] == qid)
+        assert held["actionable"] and held["judge"]["answer"] == "Proposed answer"
+        assert held["judge"]["summary"] == "Needs confirmation"
+
+
+def test_held_library_precedes_full_resolved_history(client, data):
+    ws, uid, _, oid, _, _, qid = data
+    now = db.utcnow()
+    with db.session_scope() as s:
+        s.add_all(Decision(workspace_id=ws, outcome_id=oid, kind="question",
+            title=f"Resolved question {i}", status="resolved", resolution="answer",
+            comment="Earlier answer", resolved_by=uid, resolved_at=now)
+            for i in range(300))
+        s.add(DecisionReview(workspace_id=ws, decision_id=qid, state="completed",
+            effective_verdict="hold", proposed_verdict="hold", summary="Needs a person",
+            finished_at=now))
+        pending = Decision(workspace_id=ws, outcome_id=oid, kind="question", title="Still judging")
+        s.add(pending)
+        s.flush()
+        pending_id = pending.id
+        s.add(DecisionReview(workspace_id=ws, decision_id=pending_id, state="pending"))
+    response = client.get(f"/api/workspaces/{ws}/decisions")
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) == 300
+    assert rows[0]["id"] == qid
+    assert rows[0]["resolved_at"] is None and rows[0]["actionable"]
+    assert rows[0]["judge"]["summary"] == "Needs a person"
+    assert pending_id not in {row["id"] for row in rows}
+    assert all(row["status"] == "resolved" for row in rows[1:])
+
+
+def test_judge_metrics_cohorts_utc_and_empty(client, data, monkeypatch):
+    from datetime import datetime, timezone
+    from aifactory.decision_judges import judge_metrics
+
+    ws = data[0]
+    # Non-UTC caller instant normalizes to midnight UTC.
+    now = datetime(2026, 11, 10, 2, tzinfo=timezone(timedelta(hours=2)))
+    naive = datetime(2026, 11, 10)
+    with db.session_scope() as s:
+        assert judge_metrics(s, ws, now=now)["days_7"] == dict(decided=0, sent_back=0, held=0, overruled=0, overrule_rate=0)
+        def add(days, verdict, *, mode="decide", state="completed", corrected=False, delta=timedelta(), workspace=ws):
+            q = Decision(workspace_id=workspace, kind="question", title="Q")
+            s.add(q)
+            s.flush()
+            s.add(DecisionReview(workspace_id=workspace, decision_id=q.id, state=state, mode=mode,
+                effective_verdict=verdict, finished_at=naive - timedelta(days=days) + delta,
+                correction_decision_id=data[-2] if corrected else None))
+        add(7, "decide", corrected=True)
+        add(7, "send_back", delta=timedelta(microseconds=-1))
+        add(30, "send_back", corrected=True)
+        add(30, "decide", delta=timedelta(microseconds=-1))
+        add(0, "hold")
+        add(1, "decide", mode="suggest")
+        add(1, "decide", mode="off")
+        add(1, "decide", state="pending")
+        add(1, "decide", state="bypassed")
+        add(0, "decide", delta=timedelta(microseconds=1))
+        foreign = Workspace(org_id=s.get(Workspace, ws).org_id, name="Other", slug="other")
+        s.add(foreign)
+        s.flush()
+        add(1, "decide", workspace=foreign.id)
+        s.flush()
+        stats = judge_metrics(s, ws, now=now)
+        assert stats["days_7"] == dict(decided=1, sent_back=0, held=2, overruled=1, overrule_rate=1)
+        assert stats["days_30"] == dict(decided=1, sent_back=2, held=2, overruled=2, overrule_rate=2/3)
+    monkeypatch.setattr(db, "utcnow", lambda: naive)
+    assert client.get(f"/api/workspaces/{ws}/stats").json()["decision_judges"] == stats
+    with db.session_scope() as s:
+        s.query(DecisionReview).filter(DecisionReview.mode == "decide").delete()
+        s.flush()
+        assert judge_metrics(s, ws, now=now)["days_7"]["overrule_rate"] == 0
+
+
+@pytest.mark.parametrize("change", ["pending", "suggest", "off", "hold", "stale", "foreign_association"])
+def test_only_current_automatic_verdict_can_be_overruled(client, data, change):
+    automatic(data)
+    with db.session_scope() as s:
+        q = s.get(Decision, data[-1])
+        if change == "pending":
+            q.review.state, q.review.finished_at = "pending", None
+        elif change in ("suggest", "off"):
+            q.review.mode = change
+        elif change == "hold":
+            q.review.effective_verdict = "hold"
+        elif change == "stale":
+            q.review.question_fingerprint = question_fingerprint(q)
+            q.body = "Changed after review"
+        else:
+            foreign = Workspace(org_id=s.get(Workspace, data[0]).org_id, name="Foreign", slug="foreign")
+            s.add(foreign)
+            s.flush()
+            s.get(Task, data[4]).workspace_id = foreign.id
+    response = client.post(f"/api/workspaces/{data[0]}/decisions/{data[-1]}/overrule",
+        json={"resolution": "answer", "answer": "Correction", "reason": "Evidence"})
+    assert response.status_code == 400, response.text
+    with db.session_scope() as s:
+        assert s.get(Decision, data[-1]).review.correction_decision_id is None
+        assert s.query(Message).count() == 0
+        assert s.query(Decision).count() == 2
+
+
+def test_stale_session_cannot_overrule_twice(data):
+    from aifactory.decisions import DecisionError, overrule
+    from aifactory.models import User
+
+    automatic(data)
+    with db.session_scope() as stale:
+        q = stale.get(Decision, data[-1])
+        assert q.review.correction_decision_id is None
+        stale.commit()
+        with db.session_scope() as first:
+            overrule(first, first.get(Decision, q.id), first.get(User, data[1]), "answer", "First", "Evidence")
+        with pytest.raises(DecisionError):
+            overrule(stale, q, stale.get(User, data[1]), "answer", "Second", "Other evidence")
+    with db.session_scope() as s:
+        assert s.query(Decision).count() == 3
+        assert s.query(Message).count() == 1
+
+
+def test_unblock_overrule_does_not_replay_retry(client, data):
+    automatic(data, verdict="send_back", scope="item")
+    with db.session_scope() as s:
+        q = s.get(Decision, data[-1])
+        q.kind, q.options, q.resolution = "unblock", [{"value": "retry"}], "retry"
+        task = s.get(Task, data[4])
+        task.attempt, task.stage, task.blocked_reason = 3, "verify", "Original reason"
+    response = client.post(f"/api/workspaces/{data[0]}/decisions/{data[-1]}/overrule",
+        json={"resolution": "retry", "answer": "Check the new docs", "reason": "Docs changed"})
+    assert response.status_code == 200, response.text
+    with db.session_scope() as s:
+        task = s.get(Task, data[4])
+        assert (task.status, task.stage, task.attempt, task.blocked_reason) == ("running", "verify", 3, "Original reason")
+        correction = s.get(Decision, response.json()["correction_decision_id"])
+        assert correction.scope == "item" and correction.reusable
