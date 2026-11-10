@@ -135,3 +135,16 @@ def test_a_pass_must_judge_every_constraint_and_criterion():
     by_text = [{"criterion": "Works"}, {"criterion": "never logs the token: checked with a probe"}]
     assert missing_coverage(["Works"], ["Never logs the token"], by_text) == []
     assert missing_coverage(["Works"], ["Never logs the token"], []) == ["C1", "1 of 1 acceptance criteria"]
+
+
+def test_two_globs_that_could_name_one_file_are_sequenced():
+    ok, _ = validate_report("planner", plan(task("T1", ["src/*.py"]), task("T2", ["src/model*"]),
+                                            task("T3", ["web/*.tsx"])))
+    assert {t["key"]: t["depends_on"] for t in ok["tasks"]} == {"T1": [], "T2": ["T1"], "T3": []}
+
+
+def test_a_constraint_judged_by_text_is_not_acceptance_coverage():
+    from aifactory.harness.schemas import missing_coverage
+
+    only_constraint = [{"criterion": "Never logs the token: probed", "status": "pass"}]
+    assert missing_coverage(["Works"], ["Never logs the token"], only_constraint) == ["1 of 1 acceptance criteria"]

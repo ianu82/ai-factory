@@ -217,9 +217,26 @@ def _sequence_shared_files(tasks: list[dict[str, Any]]) -> None:
             later["depends_on"] = [*later.get("depends_on", []), earlier["key"]]
 
 
+_WILDCARD = re.compile(r"[*?\[]")
+
+
+def _literal_prefix(pattern: str) -> str:
+    match = _WILDCARD.search(pattern)
+    return pattern if match is None else pattern[:match.start()]
+
+
 def _overlap(a: set[str], b: set[str]) -> bool:
-    """Paths or globs (either side) that could name the same file."""
-    return any(x == y or fnmatch.fnmatchcase(x, y) or fnmatch.fnmatchcase(y, x) for x in a for y in b)
+    """Paths or globs (either side) that could name the same file. Two globs overlap conservatively when their
+    literal prefixes nest (src/*.py and src/model* could both be src/models.py)."""
+    for x in a:
+        for y in b:
+            if x == y or fnmatch.fnmatchcase(x, y) or fnmatch.fnmatchcase(y, x):
+                return True
+            if _WILDCARD.search(x) and _WILDCARD.search(y):
+                px, py = _literal_prefix(x), _literal_prefix(y)
+                if px.startswith(py) or py.startswith(px):
+                    return True
+    return False
 
 
 _CONSTRAINT_LABEL = re.compile(r"^\W*C(\d+)\b", re.IGNORECASE)
@@ -230,12 +247,16 @@ def missing_coverage(acceptance: list[str], constraints: list[str], criteria: li
     acceptance criteria by count. A pass that skips any of them is not evidence."""
     reported = [str(c.get("criterion", "")).strip() for c in criteria if isinstance(c, dict)]
     labels = {int(m.group(1)) for r in reported if (m := _CONSTRAINT_LABEL.match(r))}
+    about_constraints = {i for i, r in enumerate(reported) if _CONSTRAINT_LABEL.match(r)}
     missing = []
     for j, text in enumerate(constraints):
         head = text.strip()[:40].lower()
-        if (j + 1) not in labels and not any(head and head in r.lower() for r in reported):
+        by_text = [i for i, r in enumerate(reported) if head and head in r.lower()]
+        about_constraints.update(by_text)
+        if (j + 1) not in labels and not by_text:
             missing.append(f"C{j + 1}")
-    plain = [r for r in reported if not _CONSTRAINT_LABEL.match(r)]
+    # Entries that judge a constraint (by label or by text) never count as acceptance coverage.
+    plain = [r for i, r in enumerate(reported) if i not in about_constraints]
     if len(plain) < len(acceptance):
         missing.append(f"{len(acceptance) - len(plain)} of {len(acceptance)} acceptance criteria")
     return missing
