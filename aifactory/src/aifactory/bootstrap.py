@@ -216,8 +216,11 @@ def _cancel_declared(workspace_id: str, keys: list[str], *, live: bool = False,
                    outcome_id=outcome.id, actor="operator", level="warn", session=s)
             results.append(f"cancel #{outcome.number}: cancelled")
             cancelled.append(outcome.id)
-    if on_cancelled is not None:
-        for outcome_id in cancelled:
+    from .events import notify
+
+    for outcome_id in cancelled:  # after the commit: open dashboards refetch, as after the app's own cancel
+        notify(workspace_id, "outcome", outcome_id)
+        if on_cancelled is not None:
             on_cancelled(outcome_id)
     return results
 
@@ -225,8 +228,9 @@ def _cancel_declared(workspace_id: str, keys: list[str], *, live: bool = False,
 def _retry_declared(workspace_id: str, items: list[dict]) -> list[str]:
     """One-shot operator retry of a blocked declared outcome; each nonce applies once. Returns one line per item."""
     results: list[str] = []
+    retried: list[str] = []
     from .db import utcnow
-    from .events import record
+    from .events import notify, record
     from .models import Decision, Event, Outcome
 
     with session_scope() as s:
@@ -276,6 +280,9 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> list[str]:
             record(workspace_id, "operator_retry", f"Operator retried {what} for #{outcome.number}",
                    outcome_id=outcome.id, actor="operator", session=s, data={"key": key, "nonce": nonce})
             results.append(f"retry {key}: retrying {what}")
+            retried.append(outcome.id)
+    for outcome_id in retried:  # after the commit, so open dashboards show the outcome running again
+        notify(workspace_id, "outcome", outcome_id)
     return results
 
 

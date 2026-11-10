@@ -173,8 +173,11 @@ def test_a_head_guard_skips_a_decision_judged_on_an_older_commit(factory):
 def test_a_live_cancel_stops_the_planner_of_the_outcome(factory, monkeypatch):
     from aifactory.pipeline.orchestrator import orchestrator
 
-    stopped = []
+    from aifactory import events
+
+    stopped, changed = [], []
     monkeypatch.setattr(orchestrator, "cancel_outcome", lambda outcome_id: stopped.append(outcome_id))
+    monkeypatch.setattr(events, "notify", lambda workspace_id, entity, entity_id, **_: changed.append((entity, entity_id)))
     with session_scope() as s:
         planning = Outcome(workspace_id=factory["ws"], number=8, title="Still planning", repo_ids=[], status="planning")
         s.add(planning)
@@ -185,6 +188,7 @@ def test_a_live_cancel_stops_the_planner_of_the_outcome(factory, monkeypatch):
     with session_scope() as s:
         assert s.get(Outcome, planning_id).status == "cancelled"
     assert stopped == [planning_id]  # the active planner is stopped, as the app's own cancel does
+    assert ("outcome", planning_id) in changed  # and open dashboards refetch it
     assert "cancel #8: cancelled" in FakeGH.replies[0]
 
 
