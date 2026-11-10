@@ -135,8 +135,9 @@ def _handled(workspace_id: str, comment_id: int, now: datetime) -> bool:
 
 def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable,
                  stop_outcome: Callable[[str], None]) -> list[str]:
-    """Apply a command's items with the bootstrap's own functions; one result line per item. Runs in a worker
-    thread: ``schedule`` and ``stop_outcome`` hand work back to the event loop."""
+    """Apply a command's items with the bootstrap's own functions; one result line per item. Runs on the event
+    loop, as the app's own decision endpoint does: resolving a decision can stop the orchestrator's planners and
+    jobs, which are asyncio tasks of this loop."""
     from . import bootstrap
 
     workspace, delegated_by = cfg["workspace"], cfg["delegated_by"]
@@ -266,19 +267,11 @@ class Relay:
             if kind in items:
                 items[kind] = [{**item, "nonce": str(item.get("nonce") or f"relay-{comment_id}-{kind}-{n}")}
                                for n, item in enumerate(items[kind])]
-        loop = asyncio.get_running_loop()
+        from .pipeline.orchestrator import orchestrator
 
-        def stop_outcome(outcome_id: str) -> None:
-            # As the app's own cancel: stop an active planner (it could otherwise overwrite the cancellation and
-            # start tasks) and any task jobs, on the event loop that owns them.
-            from .pipeline.orchestrator import orchestrator
-
-            asyncio.run_coroutine_threadsafe(_stop(orchestrator, outcome_id), loop).result(timeout=30)
-
-        lines = await asyncio.to_thread(_apply_items, cfg, items,
-                                        lambda coro: asyncio.run_coroutine_threadsafe(coro, loop), stop_outcome)
+        # On this loop (no worker thread): resolve() and a live cancel stop planners and jobs, which are this
+        # loop's tasks; follow-ups such as publishing a handover are scheduled on it too. As the app's cancel, a
+        # live cancel then stops the outcome's active planner, which could otherwise overwrite it and start tasks.
+        lines = _apply_items(cfg, items, asyncio.get_running_loop().create_task,
+                             lambda outcome_id: orchestrator.cancel_outcome(outcome_id))
         return lines or ["nothing to apply"]
-
-
-async def _stop(orchestrator, outcome_id: str) -> None:
-    orchestrator.cancel_outcome(outcome_id)

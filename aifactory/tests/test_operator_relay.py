@@ -209,7 +209,9 @@ def test_a_live_cancel_stops_the_planner_of_the_outcome(factory, monkeypatch):
     from aifactory import events
 
     stopped, changed = [], []
-    monkeypatch.setattr(orchestrator, "cancel_outcome", lambda outcome_id: stopped.append(outcome_id))
+    # get_running_loop() raises outside the event loop's thread: the planner is stopped on its own loop.
+    monkeypatch.setattr(orchestrator, "cancel_outcome",
+                        lambda outcome_id: stopped.append((outcome_id, asyncio.get_running_loop() is not None)))
     monkeypatch.setattr(events, "notify", lambda workspace_id, entity, entity_id, **_: changed.append((entity, entity_id)))
     with session_scope() as s:
         planning = Outcome(workspace_id=factory["ws"], number=8, title="Still planning", repo_ids=[], status="planning")
@@ -220,7 +222,7 @@ def test_a_live_cancel_stops_the_planner_of_the_outcome(factory, monkeypatch):
     assert poll() == [11]
     with session_scope() as s:
         assert s.get(Outcome, planning_id).status == "cancelled"
-    assert stopped == [planning_id]  # the active planner is stopped, as the app's own cancel does
+    assert stopped == [(planning_id, True)]  # the active planner is stopped, as the app's own cancel does
     assert ("outcome", planning_id) in changed  # and open dashboards refetch it
     assert "cancel #8: cancelled" in FakeGH.replies[0]
 
