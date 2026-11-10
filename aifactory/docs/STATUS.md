@@ -1,6 +1,6 @@
 # AI Factory v2 — status against the roadmap
 
-Updated 9 November 2026. Evidence links point to real runs on the live service
+Updated 10 November 2026. Evidence links point to real runs on the live service
 (https://factory-production-f28b.up.railway.app) against `ianu82/calorie-tracker` and
 `ianu82/ai-factory`. "Unattended" means no human or operator action after the work was
 admitted (a GitHub issue labelled `factory:auto`). Anything else is marked assisted, and an
@@ -147,6 +147,40 @@ Operator and peer-session PRs: #295 (relay decisions into other workspaces), #29
 (retry VM commands that never started), #300 (README), #304 (sign as MindsHub AI Factory), #305 (fix main),
 #316 (release checker), #317 (pin Playwright), #326 (decisions apply only to the head they were judged on).
 
+### Factory-built PRs merged overnight (9–10 November, times UTC)
+
+Same rule and classification. Since the release split, a merge goes to `main` and staging; production gets it at
+the next release. From 06:15 every unresolved review thread blocks a merge, including threads GitHub marks
+outdated, and each one is checked against the final code before it is resolved.
+
+| PR | Factory task | What the operator did | Classification |
+| --- | --- | --- | --- |
+| #312 (01:18) | #26 T1 decision-review persistence, settings and governance policy | One review round | Assisted |
+| #277 (01:36) | #17 T4 Anton Cortex and episodic recall on Factory memory | About five review rounds and one retry after GitHub push protection; eight threads checked and resolved | Assisted |
+| #280 (01:57) | #18 T2 CI-only work parked durably, without holding a delivery slot | Four review rounds, including a P1 on reverts across restarts | Assisted |
+| #289 (04:11) | #23 T1 learning approvals and an explicit post-delivery preset | Four review rounds; eight threads checked; operator decision that workspaces created by `AIFACTORY_BOOTSTRAP` keep their declared policies and do not enter learning mode | Assisted |
+| #324 (05:08) | #33 T1 per-repository steward policy | Two review rounds | Assisted |
+| #328 (05:25) | #14 T5 lifecycle reconciliation and non-blocking periodic Linear sync | One review round; one outdated P1 thread was checked only after the merge (it was fixed) | Assisted |
+| #336 (05:45) | #26 T2 tool-free, budgeted judge session | Merge only (clean first review) | Assisted (merge only) |
+| #285 (06:17) | #21 T1 validated, versioned definition snapshots | Five review rounds; seven threads checked. Post-merge smoke then failed in the Factory's isolated sandbox: the skill-folder reader opens every parent directory for reading, which a search-only parent refuses. CI and staging pass. A fix outcome is staged | Assisted; smoke failed after merge |
+
+Operator PRs: #326 (decisions apply only to the head they were judged on), #327 (status), #333 (the Postgres CI job
+reached its 15-minute limit on main and cancelled #302, #319, #321 and #331 with no failing test; the limit is now
+30 minutes, and #334 asks the Factory to make the suite faster).
+
+Scope decisions the operator made overnight, for Ian to revisit if he disagrees:
+- Image redaction (#270 and #16 T1 share one design): ignore whitespace, index each payload by 32-character anchors,
+  extend matches, so any fragment of 96 or more characters is caught wherever output was cut.
+- Mind (#309): every Mind output path (replayed history, transcript API, live stream, exports and logs) goes through
+  one scrubber that sees across message and event boundaries. Three review rounds each found a credential split
+  across two messages leaking through a different path.
+- Review intake (#330): the per-repository review opt-in stays hidden until T4 makes it do something.
+- Benchmarks (#329): trials fail closed. They run only in a Railway VM or a private-UID sandbox, never reuse a
+  prepared VM checkpoint, and get no live precedents.
+- Review watching (#340): it may use at most 20% of the GitHub credential's remaining hourly quota, so it never
+  competes with delivery.
+- The "People merge on GitHub" refinement of #19 T2 waits for the policy itself (#283) to land.
+
 ### Releases (since 9 November evening)
 
 Ian separated merging from releasing so that merges stop restarting production:
@@ -158,6 +192,10 @@ Ian separated merging from releasing so that merges stop restarting production:
   `docs/RELEASING.md`.
 - **First release:** `release` 6048ed0 → 59e21af at 00:14 UTC on 10 November, promoted by hand with the same
   gates, live and confirmed by 00:21.
+- **Automatic releases since then,** all by the checker with no manual step: 59e21af → 632c690 at 02:47,
+  → ca1b128 at 05:01 and → 3a331aa at 07:02 UTC. Production was healthy on each within two minutes. Decisions
+  staged for the Factory apply when production restarts, so they now wait for a release; one is due only when
+  `main` has new Factory code.
 - **Temporary credential.** The checker's `AIFACTORY_RELEASE_GITHUB_TOKEN` is, for now, a Railway reference to the
   Factory's bootstrap GitHub token (Ian: "Reuse existing for now"). It should become a fine-grained token limited
   to ianu82/ai-factory: Contents, Issues and Commit statuses read/write; Checks and Metadata read.
@@ -243,6 +281,8 @@ nobody approving until #22 (People merge on GitHub) ships.
 - Told #16 T1 to redact only long base64 runs, which let small images leak. The corrected guidance redacts
   the exact payloads the session sent.
 - Clock estimates in the overnight notes ran an hour fast for a while. The times above come from GitHub.
+- My merge script treated review threads that GitHub marks outdated as settled. #328 merged with one such P1
+  thread unchecked. It turned out to be fixed, and the script now counts every unresolved thread.
 
 ## Roadmap
 
