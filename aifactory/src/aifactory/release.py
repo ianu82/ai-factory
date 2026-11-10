@@ -15,8 +15,8 @@ A run, in order:
    closes the hold. A release confirmed earlier is never marked bad: a production blip is retried, and a longer
    outage opens one issue that becomes a hold only if it lasts.
 3. Waits until the last release is at least the release interval old (2 hours by default).
-4. Promotes the commit staging runs when all of these hold:
-   - staging has run it without restarting for the soak period;
+4. Promotes the newest commit staging has run (itself or a later commit containing it) for the soak period,
+   when all of these hold:
    - it changes the Factory's code since the last release;
    - it is on `main` and ahead of `release`, and not marked "do not release";
    - every GitHub check on it passed;
@@ -70,6 +70,8 @@ class ReleaseConfig:
     poll_seconds: int = 30
     hold_label: str = "release-hold"
     status_context: str = "factory/release"
+    staging_context: str = "factory/staging"
+    candidate_window: int = 40  # newest commits since the release considered for promotion
     paused: bool = False
 
     @classmethod
@@ -239,6 +241,27 @@ class Releaser:
         if response.status_code not in (200, 201):
             raise ReleaseError(f"Marking {sha[:7]} {state}: HTTP {response.status_code}")
 
+    def _staged_since(self, sha: str) -> datetime | None:
+        """When staging started running this commit, as recorded by an earlier run (None if never observed)."""
+        response = self._gh("GET", f"/repos/{self.cfg.repo}/commits/{sha}/status")
+        if response.status_code != 200:
+            raise ReleaseError(f"Reading statuses for {sha[:7]}: HTTP {response.status_code}")
+        for status in response.json().get("statuses") or []:
+            if status.get("context") == self.cfg.staging_context:
+                return _time(str(status.get("description") or "").removeprefix("Staging since ").strip())
+        return None
+
+    def _note_staged(self, sha: str, started: datetime) -> None:
+        """Record when staging started running a commit. This checker keeps no state between runs, and later merges
+        replace staging's commit, so the record lives on the commit as a status."""
+        if self.dry_run or self._staged_since(sha) is not None:
+            return
+        response = self._gh("POST", f"/repos/{self.cfg.repo}/statuses/{sha}",
+                            json={"state": "success", "context": self.cfg.staging_context,
+                                  "description": f"Staging since {started.isoformat()}"})
+        if response.status_code not in (200, 201):
+            raise ReleaseError(f"Recording staging for {sha[:7]}: HTTP {response.status_code}")
+
     def _open_issues(self, **params: Any) -> list[dict[str, Any]]:
         response = self._gh("GET", f"/repos/{self.cfg.repo}/issues", params={"state": "open", "per_page": 100, **params})
         if response.status_code != 200:
@@ -302,6 +325,7 @@ class Releaser:
         if current is None:
             return Result("failed", f"Branch {cfg.branch} does not exist; create it at the commit production runs.")
         since_move = self._minutes_since(self._moved_at(cfg.branch))
+        self._observe_staging()
 
         confirmed = self._confirm_production(current, since_move)
         if confirmed is not None:
@@ -311,6 +335,17 @@ class Releaser:
             return Result("held", f"The last release was {since_move:.0f} minutes ago; the next can follow after "
                                   f"{cfg.interval_minutes}.", previous=current)
         return self._promote(current)
+
+    def _observe_staging(self) -> None:
+        """Every run records when staging started its current commit, including runs that then wait for the
+        release interval, so a later run can promote a commit that has since been replaced on staging."""
+        staging = _health(self.web, self.cfg.staging_url)
+        commit, started = str(staging.get("commit") or ""), _time(staging.get("started_at"))
+        if staging.get("ok") and commit and started is not None:
+            try:
+                self._note_staged(commit, started)
+            except ReleaseError as exc:
+                self.step(f"Could not record staging's commit: {exc}")
 
     def _production(self) -> dict[str, Any]:
         """Production's health, asked again over a few minutes while it does not answer: a restart or a slow
@@ -429,35 +464,72 @@ class Releaser:
             return Result("nothing", f"No Factory code changed in {compare.get('ahead_by', '?')} commit(s) since "
                                      f"{current[:7]}; no restart needed.", candidate, current)
         self.step(f"{compare.get('ahead_by', '?')} commit(s) since {cfg.branch} at {current[:7]} change Factory code")
-
         if self._compare(candidate, cfg.source_branch).get("status") not in ("ahead", "identical"):
             return Result("failed", f"{candidate[:7]} is not on {cfg.source_branch}.", candidate, current)
-        if self._mark(candidate) == "failure":
-            return Result("held", f"{candidate[:7]} is marked do-not-release; waiting for a newer commit on staging.",
-                          candidate, current)
-        if ran < cfg.soak_minutes:
-            return Result("held", f"Staging has run {candidate[:7]} for {ran:.0f} of {cfg.soak_minutes} minutes.",
-                          candidate, current)
+        self._note_staged(candidate, started)
 
-        runs = self._check_runs(candidate)
-        if not runs:
-            return Result("held", f"No GitHub checks reported on {candidate[:7]} yet.", candidate, current)
-        pending = sorted({r.get("name", "?") for r in runs if r.get("status") != "completed"})
-        if pending:
-            return Result("held", "Checks still running: " + ", ".join(pending), candidate, current)
-        failing = sorted({r.get("name", "?") for r in runs if r.get("conclusion") not in OK_CONCLUSIONS})
-        if failing:
-            return Result("failed", "Checks failed: " + ", ".join(failing), candidate, current)
-        self.step(f"{len(runs)} GitHub check(s) passed")
+        # Merges keep replacing staging's commit, so waiting for its current commit to soak would starve releases
+        # while the Factory is busy. Promote the newest commit that has been on staging for the soak period,
+        # counting the time staging ran it or any later commit (which contains it).
+        line = [c.get("sha") for c in compare.get("commits") or [] if c.get("sha")][-cfg.candidate_window:]
+        if not line or line[-1] != candidate:
+            line.append(candidate)
+        earliest: datetime | None = None
+        soaked_since: dict[str, datetime | None] = {}
+        for sha in reversed(line):
+            since = started if sha == candidate else self._staged_since(sha)
+            if since is not None and (earliest is None or since < earliest):
+                earliest = since
+            soaked_since[sha] = earliest
+        chosen, reasons = None, []
+        for sha in reversed(line):
+            since = soaked_since[sha]
+            minutes = self._minutes_since(since) or 0.0 if since else 0.0
+            if minutes < cfg.soak_minutes:
+                reasons.append(f"{sha[:7]} {minutes:.0f}/{cfg.soak_minutes} min")
+                continue
+            if self._mark(sha) == "failure":
+                reasons.append(f"{sha[:7]} is marked do-not-release")
+                continue
+            if sha != candidate:
+                part = self._compare(current, sha)
+                part_files = [f.get("filename", "") for f in part.get("files") or []]
+                if len(part_files) < COMPARE_FILE_LIMIT and not any(f.startswith(cfg.paths) for f in part_files):
+                    return Result("nothing", f"No Factory code changed up to the newest soaked commit {sha[:7]}.",
+                                  sha, current)
+            runs = self._check_runs(sha)
+            pending = sorted({r.get("name", "?") for r in runs if r.get("status") != "completed"})
+            failing = sorted({r.get("name", "?") for r in runs if r.get("conclusion") not in OK_CONCLUSIONS})
+            if not runs or pending:
+                reasons.append(f"{sha[:7]} checks still running: {', '.join(pending)}" if runs
+                               else f"No GitHub checks reported on {sha[:7]} yet")
+                continue
+            if failing:
+                if sha == candidate:
+                    return Result("failed", "Checks failed: " + ", ".join(failing), candidate, current)
+                reasons.append(f"{sha[:7]} checks failed")
+                continue
+            chosen = sha
+            self.step(f"{len(runs)} GitHub check(s) passed on {sha[:7]}, on staging for {minutes:.0f} minutes")
+            break
+        if chosen is None:
+            if len(line) == 1 and ran < cfg.soak_minutes:
+                return Result("held", f"Staging has run {candidate[:7]} for {ran:.0f} of {cfg.soak_minutes} minutes.",
+                              candidate, current)
+            soaked = any((self._minutes_since(soaked_since[sha]) or 0.0) >= cfg.soak_minutes
+                         for sha in line if soaked_since[sha] is not None)
+            lead = "Nothing releasable yet" if soaked else "No commit has been on staging long enough yet"
+            return Result("held", f"{lead}: " + "; ".join(reasons[:6]), candidate, current)
 
         problems = smoke(self.web, cfg.staging_url)
         if problems:
-            return Result("failed", "Staging smoke failed: " + "; ".join(problems), candidate, current)
+            return Result("failed", "Staging smoke failed: " + "; ".join(problems), chosen, current)
         self.step("Staging smoke checks passed")
 
         again = _health(self.web, cfg.staging_url)
-        if not again.get("ok") or again.get("commit") != candidate or _time(again.get("started_at")) != started:
-            return Result("held", "Staging changed during the check; trying again next run.", candidate, current)
+        if not again.get("ok"):
+            return Result("held", "Staging changed during the check; trying again next run.", chosen, current)
+        candidate = chosen
 
         if self.dry_run:
             return Result("would_promote", f"Would move {cfg.branch} from {current[:7]} to {candidate[:7]}.",

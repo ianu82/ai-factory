@@ -51,6 +51,9 @@ class World:
         self.staging = {"ok": True, "commit": NEW, "started_at": iso(NOW - timedelta(minutes=45))}
         self.staging_down_for = 0
         self.files = ["aifactory/src/aifactory/api.py"]
+        self.line = [NEW]  # commits from the release (exclusive) to staging's commit, oldest first
+        self.staged: dict[str, str] = {}  # factory/staging descriptions recorded on commits
+        self.commit_checks: dict[str, list[dict]] = {}
         self.status = "ahead"
         self.on_main = "identical"
         self.checks = [{"name": "test", "status": "completed", "conclusion": "success"},
@@ -75,9 +78,14 @@ class World:
         if path.startswith(f"{base}/commits/") and path.endswith("/status"):
             sha = path.split("/")[-2]
             statuses = [{"context": "factory/release", "state": self.marks[sha]}] if sha in self.marks else []
+            if sha in self.staged:
+                statuses.append({"context": "factory/staging", "state": "success", "description": self.staged[sha]})
             return httpx.Response(200, json={"statuses": [{"context": "ci/other", "state": "success"}, *statuses]})
         if path.startswith(f"{base}/statuses/") and method == "POST":
             sha, body = path.split("/")[-1], json.loads(request.content)
+            if body["context"] == "factory/staging":
+                self.staged[sha] = body["description"]
+                return httpx.Response(201, json={})
             assert body["context"] == "factory/release"
             self.marks[sha] = body["state"]
             self.mark_posts.append((sha, body["state"]))
@@ -111,12 +119,16 @@ class World:
             self.labels.add(json.loads(request.content)["name"])
             return httpx.Response(201, json={})
         if path == f"{base}/compare/{OLD}...{NEW}":
-            return httpx.Response(200, json={"status": self.status, "ahead_by": 3,
-                                             "files": [{"filename": f} for f in self.files]})
+            return httpx.Response(200, json={"status": self.status, "ahead_by": len(self.line),
+                                             "files": [{"filename": f} for f in self.files],
+                                             "commits": [{"sha": c} for c in self.line]})
+        if path.startswith(f"{base}/compare/{OLD}...") and path.split("...")[-1] in self.line:
+            return httpx.Response(200, json={"status": "ahead", "files": [{"filename": f} for f in self.files]})
         if path == f"{base}/compare/{NEW}...main":
             return httpx.Response(200, json={"status": self.on_main})
-        if path == f"{base}/commits/{NEW}/check-runs":
-            return httpx.Response(200, json={"check_runs": self.checks})
+        if path.startswith(f"{base}/commits/") and path.endswith("/check-runs"):
+            sha = path.split("/")[-2]
+            return httpx.Response(200, json={"check_runs": self.commit_checks.get(sha, self.checks)})
         if path == f"{base}/git/refs/heads/release" and method == "PATCH":
             body = json.loads(request.content)
             self.patches.append(body)
@@ -200,6 +212,50 @@ def test_staging_must_run_the_candidate_for_the_soak_period(world):
     result = world.run()
     assert result.status == "held" and "10 of 30 minutes" in result.detail
     assert world.patches == [] and world.issues == []
+
+
+MID = "d" * 40
+EARLY = "e" * 40
+
+
+def test_a_busy_main_still_releases_the_newest_commit_staging_has_run_long_enough(world):
+    # Merges keep replacing staging's commit: NEW only just deployed, but MID ran 45 minutes ago and is contained
+    # in NEW, so it has been on staging for the soak period.
+    world.line = [EARLY, MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}"
+    result = world.run()
+    assert result.status == "promoted", result.as_dict()
+    assert world.patches == [{"sha": MID, "force": False}]
+    assert NEW in world.staged  # this run recorded when staging started NEW
+
+
+def test_commits_never_seen_alone_count_from_the_earliest_later_observation(world):
+    world.line = [EARLY, MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=20))}"  # MID: only 20 minutes
+    result = world.run()
+    assert result.status == "held" and "long enough" in result.detail
+    assert world.patches == []
+    world.clock.sleep(15 * 60)  # MID (and EARLY, contained in it) now soaked 35 minutes
+    assert world.run().status == "promoted"
+    assert world.patches == [{"sha": MID, "force": False}]
+
+
+def test_staging_is_recorded_even_while_the_interval_holds(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    assert world.run().status == "held"
+    assert world.staged[NEW].startswith("Staging since ")
+
+
+def test_a_soaked_commit_with_failing_checks_is_skipped_for_an_older_one(world):
+    world.line = [EARLY, MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=50))}"
+    world.staged[EARLY] = f"Staging since {iso(NOW - timedelta(minutes=70))}"
+    world.commit_checks[MID] = [{"name": "test", "status": "completed", "conclusion": "failure"}]
+    assert world.run().status == "promoted"
+    assert world.patches == [{"sha": EARLY, "force": False}]
 
 
 def test_no_factory_code_changed_means_no_release_and_no_restart(world):

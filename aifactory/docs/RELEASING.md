@@ -32,9 +32,11 @@ A run, in order:
    The checker closes that issue itself when production recovers. If the outage lasts 45 minutes, the issue
    becomes a `release-hold`.
 3. **Keeps releases at least 2 hours apart**, counted from when `release` last moved.
-4. **Promotes the commit staging runs** when all of these hold:
-   - staging has run it without restarting for 30 minutes. Staging's data comes from earlier versions, so this
-     also proves the upgrade;
+4. **Promotes the newest commit that has been on staging for 30 minutes**, when all of these hold:
+   - staging has run it, or a later commit that contains it, for 30 minutes. Every run records when staging
+     started its current commit as a `factory/staging` commit status (even runs that then wait for the release
+     interval), so a busy `main` that keeps replacing staging's commit still releases every 2 hours instead of
+     waiting for a quiet half hour. Staging's data comes from earlier versions, so this also proves the upgrade;
    - it changes the Factory's code (`aifactory/`) since the current release. Docs-only changes wait, because a
      release restarts production;
    - it is on `main`, ahead of `release`, and not marked do-not-release;
