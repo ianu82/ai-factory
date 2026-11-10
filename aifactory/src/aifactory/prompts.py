@@ -81,6 +81,8 @@ How to work:
   The project's configured checks will be run again after you finish, and an independent reviewer
   will verify every criterion, so be thorough.
 - If you receive review feedback or failing checks from a previous attempt, address each point.
+- Do only this task. The plan's other tasks build the rest in their own pull requests, and the work this task
+  builds on is already merged into your checkout: read it rather than redoing it.
 - Don't commit, push or open pull requests — the factory publishes your change.
 - If the task is impossible or blocked by a genuine product decision, stop and report status "blocked"
   with a precise reason instead of guessing.
@@ -110,6 +112,9 @@ How to work:
   fix a failure, that failure still occurring is a real failure, however it behaved on the base commit.
 - Opt-in test suites that are skipped by default stay skipped, unless the change touches the integration they
   cover or the acceptance criteria call for them; then run them and treat their results as evidence.
+- Judge the change by this task's criteria, and use the original request to read them as intended: a change
+  that meets the wording of the criteria but contradicts the request is a major finding. Work the plan gives to
+  another task is not missing from this one.
 - verdict "pass" only if every criterion passes with evidence and there are no blocker findings.
 
 When done, call finish with your verdict."""
@@ -193,7 +198,8 @@ def plan_review_prompt(outcome: Any, repos: list[Any], decisions: list[Any], gui
 
 
 def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisions: list[Any],
-                 guidance: list[str] | None = None) -> str:
+                 guidance: list[str] | None = None, sections: list[str] | None = None) -> str:
+    """``sections`` are preformatted: the plan around the task and the repository's instructions for agents."""
     cfg = repo.config or {}
     lines = [
         f"# Task {task.key}: {task.title}",
@@ -209,6 +215,7 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
     ]
     if outcome.brief:
         lines += ["", "## Original request (context)", outcome.brief[:4000]]
+    lines += sections or []
     if cfg.get("context"):
         lines += ["", "## Team notes", cfg["context"]]
     if cfg.get("checks"):
@@ -238,7 +245,9 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
 
 
 def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str, Any], checks: list[dict[str, Any]],
-                  decisions: list[Any] | None = None, guidance: list[str] | None = None) -> str:
+                  decisions: list[Any] | None = None, guidance: list[str] | None = None, outcome: Any = None,
+                  sections: list[str] | None = None) -> str:
+    """``sections`` are preformatted: the plan around the task and the repository's instructions for agents."""
     lines = [
         f"# Verify task {task.key}: {task.title}",
         "",
@@ -253,6 +262,13 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
         "## The implementer's claims (unverified)",
         str(builder_report.get("summary", ""))[:3000],
     ]
+    if outcome is not None:
+        lines += ["", f"## The original request: outcome #{outcome.number} {outcome.title}",
+                  "Context for reading the criteria as intended; the criteria above are what you report on.",
+                  (outcome.brief or "(no further description)")[:4000]]
+        if outcome.acceptance:
+            lines += ["Requested acceptance criteria:", *[f"- {c}" for c in outcome.acceptance]]
+    lines += sections or []
     context = (repo.config or {}).get("context")
     if context:
         lines += ["", "## Team notes about this repository and its test environment", context[:4000]]

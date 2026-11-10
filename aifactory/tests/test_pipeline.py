@@ -796,7 +796,8 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
              "depends_on": []}]})]}
 
     def builder(messages):
-        name = "a.txt" if "Add a.txt" in messages[1]["content"] else "b.txt"
+        # A builder's prompt lists the plan's other tasks too: identify the task by its heading.
+        name = "a.txt" if messages[1]["content"].startswith("# Task T1:") else "b.txt"
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("write_file", {"path": name, "content": name}),
                                                   call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}, 1)
@@ -1096,7 +1097,7 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
             {"key": "T2", "title": "Write B", "repo": "acme/demo", "spec": "b", "acceptance": ["B written"], "depends_on": []}]})]}
 
     def builder(messages):
-        name = "A" if "Write A" in messages[1]["content"] else "B"
+        name = "A" if messages[1]["content"].startswith("# Task T1:") else "B"
         if step(messages) == 0:  # both tasks rewrite the same line: whichever merges second conflicts
             return {"content": "", "tool_calls": [call("write_file", {"path": "shared.txt", "content": f"{name}\n"}),
                                                   call("write_file", {"path": f"{name}.txt", "content": name}, 1)]}
@@ -1178,7 +1179,8 @@ def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
             {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "b", "acceptance": ["b.txt exists"], "depends_on": []}]})]}
 
     def builder(messages):
-        name = "a.txt" if "Add a.txt" in messages[1]["content"] else "b.txt"
+        # A builder's prompt lists the plan's other tasks too: identify the task by its heading.
+        name = "a.txt" if messages[1]["content"].startswith("# Task T1:") else "b.txt"
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("write_file", {"path": name, "content": name})]}
         return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": f"added {name}"})]}
