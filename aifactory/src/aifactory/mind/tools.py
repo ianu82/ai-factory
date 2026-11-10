@@ -46,7 +46,9 @@ def clean(value: Any, state: list[bool] | None = None) -> Any:
             text = text[:MAX_TEXT] + "…"
         return text
     if isinstance(value, dict):
-        return {clean(str(k), state): clean(v, state) for k, v in value.items()}
+        if len(value) > MAX_ITEMS:  # stored objects (task evidence, event data) are bounded like lists
+            state[0] = True
+        return {clean(str(k), state): clean(v, state) for k, v in list(value.items())[:MAX_ITEMS]}
     if isinstance(value, (list, tuple)):
         if len(value) > MAX_ITEMS:
             state[0] = True

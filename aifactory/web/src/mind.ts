@@ -130,7 +130,7 @@ export class MindController {
       if (generation === this.generation && !controller.signal.aborted) this.update({ error: (error as Error).message });
     } finally { this.controllers.delete(controller); }
   }
-  async list() { await this.request((s) => this.transport.list(s), (threads) => this.update({ threads })); }
+  async list() { await this.request((s) => this.transport.list(s), (threads) => this.update({ threads, error: "" })); }
   private load(history: MindHistory) {
     this.update({ messages: history.messages, status: history.status, active: history.thread, threads: [history.thread, ...this.state.threads.filter((t) => t.id !== history.thread.id)], busy: false, error: "", draft: "", progress: "" });
   }

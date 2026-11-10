@@ -158,6 +158,17 @@ test("failed confirms release pending state and errors are visible; retry requir
   await c.send("try again");
   assert.equal(calls.some((call) => call.name === "confirm"), false);
 });
+test("a thread list that recovers on reload clears its earlier error", async () => {
+  const { controller: c, transport } = harness();
+  const list = transport.list;
+  transport.list = async () => { throw new Error("Could not load threads"); };
+  await c.list();
+  assert.match(c.getSnapshot().error, /Could not load threads/);
+  transport.list = list;
+  await c.reload();
+  assert.equal(c.getSnapshot().error, "");
+  assert.equal(c.getSnapshot().threads.length, 1);
+});
 test("budget validation allows zero/nonnegative finite values, rejects empty/negative/nonfinite", () => {
   for (const value of ["0", "10", "0.001", "100.50"]) assert.equal(validMindBudget(value), true);
   for (const value of ["", " ", "-1", "Infinity", "NaN", "1e999", "bad"]) assert.equal(validMindBudget(value), false);
