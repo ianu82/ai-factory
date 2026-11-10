@@ -17,10 +17,10 @@ from typing import Any
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..models import Outcome, Task, Workspace
+from ..models import Decision, Outcome, Task, User, Workspace
 from ..sandbox import host_capacity
 from .delivery import Stop, TaskRunner
-from .lifecycle import transition
+from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
 from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
 from .scheduling import Candidate, RequesterTurns
@@ -99,6 +99,26 @@ class Orchestrator:
                 task.lease_owner = ""
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
+        self._complete_accepted()
+
+    def _complete_accepted(self) -> None:
+        """Repair: acknowledging (or opening a fix for) a failed post-merge check used to leave the merged task
+        smoke_failed, so every task depending on it waited forever. Complete each one whose latest unblock decision
+        accepted the failure. Idempotent: a completed task no longer matches."""
+        with session_scope() as s:
+            for task in s.query(Task).filter(Task.status == "smoke_failed").all():
+                if not accepted_after_merge(task):
+                    continue
+                latest = (s.query(Decision).filter(Decision.task_id == task.id, Decision.kind == "unblock")
+                          .order_by(Decision.created_at.desc()).first())
+                if latest is None or latest.status != "resolved" or latest.resolution not in ACCEPTING:
+                    continue
+                outcome = s.get(Outcome, task.outcome_id)
+                if outcome is None or outcome.status == "cancelled":
+                    continue
+                person = s.get(User, latest.resolved_by) if latest.resolved_by else None
+                complete_accepted(s, task, (person.name or person.email) if person else "a person")
+                log.info("completed %s: its failed post-merge check was accepted before this fix", task.id)
 
     # scheduling ----------------------------------------------------------------
     async def _run(self) -> None:

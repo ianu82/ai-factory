@@ -1163,7 +1163,8 @@ class TaskRunner:
                 return
             self.block("unblock", f"Smoke checks failed after merging {self.task.key}",
                        "The change is merged but post-merge smoke checks failed. Revert it, create a follow-up fix, "
-                       "or acknowledge.", status="smoke_failed",
+                       "or acknowledge. A fix or an acknowledgement accepts the merged change, and the tasks that "
+                       "depend on it start.", status="smoke_failed",
                        options=[{"value": "revert", "label": "Revert the merge"},
                                 {"value": "fix", "label": "Create a fix outcome"},
                                 {"value": "acknowledge", "label": "Acknowledge"}])

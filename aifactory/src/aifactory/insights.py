@@ -87,7 +87,11 @@ def _merge_streaks(db: Session, ws: Workspace, repos: dict[str, Repository]) -> 
             continue
         streak = []
         for d, task in rows:  # newest first
-            if d.resolution != "approve" or task.status in ("smoke_failed", "reverted"):
+            ev = task.evidence or {}
+            # A merge whose post-merge checks failed ends the streak, even after a person accepted the failure.
+            if (d.resolution != "approve" or task.status in ("smoke_failed", "reverted")
+                    or (ev.get("smoke") or {}).get("state") == "failed"
+                    or (ev.get("release") or {}).get("state") == "unhealthy"):
                 break
             streak.append((d, task))
         if len(streak) < 5:
