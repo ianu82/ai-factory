@@ -169,6 +169,22 @@ test("a thread list that recovers on reload clears its earlier error", async () 
   assert.equal(c.getSnapshot().error, "");
   assert.equal(c.getSnapshot().threads.length, 1);
 });
+test("a thread list that completes later keeps a newer error from another action", async () => {
+  const { controller: c, transport } = harness();
+  await c.create("billing");
+  transport.list = async () => { throw new Error("Could not load threads"); };
+  await c.list();
+  let release = () => {};
+  transport.list = () => new Promise((resolve) => { release = () => resolve([history().thread]); });
+  const pending = c.list();
+  transport.confirm = async () => { throw new Error("Permission changed"); };
+  await c.confirm(card);
+  assert.match(c.getSnapshot().error, /Permission changed/);
+  release();
+  await pending;
+  assert.match(c.getSnapshot().error, /Permission changed/);
+  assert.equal(c.getSnapshot().threads.length, 1);
+});
 test("budget validation allows zero/nonnegative finite values, rejects empty/negative/nonfinite", () => {
   for (const value of ["0", "10", "0.001", "100.50"]) assert.equal(validMindBudget(value), true);
   for (const value of ["", " ", "-1", "Infinity", "NaN", "1e999", "bad"]) assert.equal(validMindBudget(value), false);

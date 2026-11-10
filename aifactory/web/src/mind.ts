@@ -97,6 +97,7 @@ export class MindController {
   private generation = 0;
   private roles: Record<string, Role> = {};
   private routeKey = "";
+  private listFailure = ""; // the error a failed thread list left; only a later successful list clears it
   constructor(privateTransport: MindTransport) { this.transport = privateTransport; }
   private transport: MindTransport;
   getSnapshot = () => this.state;
@@ -105,7 +106,7 @@ export class MindController {
   setIdentity(userId: string | null, roles: Record<string, Role> = {}) {
     this.roles = roles;
     if (userId === this.state.userId) return;
-    this.cancel(); this.routeKey = ""; this.state = initial(userId); this.update({});
+    this.cancel(); this.routeKey = ""; this.listFailure = ""; this.state = initial(userId); this.update({});
   }
   cancel() {
     this.generation++;
@@ -119,7 +120,7 @@ export class MindController {
   }
   setContext(context: MindContext | null) { this.update({ context }); }
   removeContext() { this.update({ context: null }); }
-  private async request<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void) {
+  private async request<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void, failed?: (message: string) => void) {
     if (!this.state.userId) return;
     const controller = new AbortController(), generation = this.generation;
     this.controllers.add(controller);
@@ -127,10 +128,20 @@ export class MindController {
       const result = await work(controller.signal);
       if (generation === this.generation && !controller.signal.aborted) apply(result);
     } catch (error) {
-      if (generation === this.generation && !controller.signal.aborted) this.update({ error: (error as Error).message });
+      if (generation === this.generation && !controller.signal.aborted) {
+        const message = (error as Error).message;
+        this.update({ error: message }); failed?.(message);
+      }
     } finally { this.controllers.delete(controller); }
   }
-  async list() { await this.request((s) => this.transport.list(s), (threads) => this.update({ threads, error: "" })); }
+  async list() {
+    await this.request((s) => this.transport.list(s), (threads) => {
+      // Clear only the error an earlier failed list left; a newer error from another action (send, confirm) stays.
+      const stale = this.listFailure !== "" && this.state.error === this.listFailure;
+      this.listFailure = "";
+      this.update(stale ? { threads, error: "" } : { threads });
+    }, (message) => { this.listFailure = message; });
+  }
   private load(history: MindHistory) {
     this.update({ messages: history.messages, status: history.status, active: history.thread, threads: [history.thread, ...this.state.threads.filter((t) => t.id !== history.thread.id)], busy: false, error: "", draft: "", progress: "" });
   }
