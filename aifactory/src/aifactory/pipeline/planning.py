@@ -20,7 +20,7 @@ from ..models import Outcome, Plan, Repository, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
-from .runtime import (SessionSpec, guidance_history, open_decision, precedents, run_agent, set_outcome,
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, run_agent, set_outcome,
                       merged_settings, workspace_settings)
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,16 @@ def _check_repos(report: dict[str, Any], repos: list[Repository]) -> list[str]:
     return problems
 
 
+def _over_budget(outcome_id: str, settings: dict[str, Any]) -> str:
+    """Why planning must not start another session, or "" while the outcome is within its budget. Spending whose
+    cost is known is a lower bound, so reaching the budget with it alone is conclusive."""
+    budget = settings["budgets"].get("outcome_usd")
+    if not budget:
+        return ""
+    spent, _ = outcome_cost(outcome_id)
+    return f"The outcome reached its ${budget:.0f} budget (${spent:.2f} spent)" if spent >= budget else ""
+
+
 def _save_plan(workspace_id: str, outcome_id: str, version: int, report: dict[str, Any], run: Any,
                review: dict[str, Any] | None) -> str:
     with session_scope() as s:
@@ -102,7 +112,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
     record(workspace_id, "planning_started", f"Planning outcome #{snapshot.number}", outcome_id=outcome_id)
     sandbox = LocalSandbox(f"plan-{outcome_id[:12]}-{version}").create()
     result = review = last = None
-    error, problems = "", []
+    error, problems, stopped = "", [], ""
     try:
         token = resolve_token(workspace_id)
         sandbox.work.mkdir(parents=True, exist_ok=True)
@@ -115,6 +125,8 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         repositories = {r.full_name: r.config or {} for r in repos}
         revision = None
         for revisions in range(PLAN_REVIEW_ROUNDS + 1):
+            if revisions and (stopped := _over_budget(outcome_id, settings)):
+                break  # every round starts two sessions: a revision must not overrun the outcome's budget
             prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id), work, revision)
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
@@ -126,8 +138,11 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
             problems = _check_repos(report, repos)
             review = None
             if reviewed and not problems and not report.get("questions"):
-                review = await _review(snapshot, repos, decisions, work, report, harness_name, sandbox, settings,
-                                       repositories, cancelled)
+                if over := _over_budget(outcome_id, settings):
+                    review = {"verdict": "error", "summary": f"{over}, so the plan was not reviewed.", "findings": []}
+                else:
+                    review = await _review(snapshot, repos, decisions, work, report, harness_name, sandbox,
+                                           settings, repositories, cancelled)
             plan_id = _save_plan(workspace_id, outcome_id, version, report, run, review)
             last = (plan_id, report, review)
             if review:
@@ -154,7 +169,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                                                       {"value": "cancel", "label": "Cancel outcome"}])
         return
     plan_id, report, review = last
-    note = ""
+    note = f"{stopped} before the planner could revise this plan." if stopped else ""
     if result is None:
         # A revision failed: the last reviewed plan still stands, and a person decides on it.
         note = f"The planner could not revise this plan after the review: {error[:1000]}"
@@ -201,10 +216,14 @@ async def _review(outcome: Outcome, repos: list[Repository], decisions: list[Any
                   repositories: dict[str, Any], cancelled: asyncio.Event) -> dict[str, Any]:
     """Review one plan in the planner's checkout. A review that cannot finish never approves."""
     prompt = plan_review_prompt(outcome, repos, decisions, guidance_history(outcome.id), work, report)
-    run, result, error = await run_agent(SessionSpec(
-        workspace_id=outcome.workspace_id, outcome_id=outcome.id, task_id=None, role="plan_reviewer",
-        harness=harness_name, prompt=prompt, system=PLAN_REVIEWER, sandbox=sandbox, effective_settings=settings,
-        repositories=repositories), cancelled)
+    try:
+        run, result, error = await run_agent(SessionSpec(
+            workspace_id=outcome.workspace_id, outcome_id=outcome.id, task_id=None, role="plan_reviewer",
+            harness=harness_name, prompt=prompt, system=PLAN_REVIEWER, sandbox=sandbox, effective_settings=settings,
+            repositories=repositories), cancelled)
+    except Exception as exc:  # setup failed before a session started (e.g. no model provider): keep the plan
+        log.exception("plan review could not start")
+        return {"verdict": "error", "summary": f"The plan review could not start: {str(exc)[:1000]}", "findings": []}
     if result is None:
         return {"verdict": "error", "summary": f"The plan review failed: {error[:1000]}", "findings": [],
                 "run_id": run.id, "model": run.model}
