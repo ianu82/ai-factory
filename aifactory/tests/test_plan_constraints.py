@@ -116,3 +116,22 @@ def test_planning_end_to_end_stores_constraints(factory):
     with session_scope() as s:
         tasks = s.query(Task).filter_by(outcome_id=oid).all()
         assert tasks and tasks[0].constraints == ["Only greet.sh changes"] and tasks[0].files == ["greet.sh"]
+
+
+def test_globs_count_as_overlapping_files():
+    ok, _ = validate_report("planner", plan(task("T1", ["src/*.py"]), task("T2", ["src/models.py"]),
+                                            task("T3", ["web/**"])))
+    assert {t["key"]: t["depends_on"] for t in ok["tasks"]} == {"T1": [], "T2": ["T1"], "T3": []}
+
+
+def test_a_pass_must_judge_every_constraint_and_criterion():
+    from aifactory.harness.schemas import missing_coverage
+
+    full = [{"criterion": "Works", "status": "pass"}, {"criterion": "C1. Bounded", "status": "pass"},
+            {"criterion": "C2", "status": "pass"}]
+    assert missing_coverage(["Works"], ["Bounded to 1 MiB", "Never logs the token"], full) == []
+    assert missing_coverage(["Works"], ["Bounded to 1 MiB", "Never logs the token"], full[:2]) == ["C2"]
+    assert missing_coverage(["Works", "Tested"], [], full[:1]) == ["1 of 2 acceptance criteria"]
+    by_text = [{"criterion": "Works"}, {"criterion": "never logs the token: checked with a probe"}]
+    assert missing_coverage(["Works"], ["Never logs the token"], by_text) == []
+    assert missing_coverage(["Works"], ["Never logs the token"], []) == ["C1", "1 of 1 acceptance criteria"]

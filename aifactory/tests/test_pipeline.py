@@ -52,7 +52,8 @@ def passing_verifier(messages):
         return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh && git diff --stat HEAD"})]}
     return {"content": "", "tool_calls": [call("finish", {
         "verdict": "pass", "summary": "Greeting verified.",
-        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}], "findings": []})]}
+        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"},
+                     {"criterion": "C1", "status": "pass", "evidence": "git diff --stat"}], "findings": []})]}
 
 
 @pytest.fixture
@@ -809,7 +810,8 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
         return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
-                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"},
+                             {"criterion": "C1", "status": "pass", "evidence": "ls"}], "findings": []})]}
 
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     with session_scope() as s:
@@ -1108,7 +1110,8 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
         return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
-                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"},
+                             {"criterion": "C1", "status": "pass", "evidence": "ls"}], "findings": []})]}
 
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     with session_scope() as s:
@@ -1189,7 +1192,8 @@ def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "ls"})]}
         return {"content": "", "tool_calls": [call("finish", {"verdict": "pass", "summary": "ok",
-                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"}], "findings": []})]}
+                "criteria": [{"criterion": criterion, "status": "pass", "evidence": "ls"},
+                             {"criterion": "C1", "status": "pass", "evidence": "ls"}], "findings": []})]}
 
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     FakeGitHub.issues_state = {}

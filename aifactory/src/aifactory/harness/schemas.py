@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+import re
 from typing import Any
 
 PLANNER_REPORT: dict[str, Any] = {
@@ -208,8 +210,32 @@ def _sequence_shared_files(tasks: list[dict[str, Any]]) -> None:
             if earlier.get("repo", "").lower() != later.get("repo", "").lower():
                 continue
             theirs = {f.strip().lstrip("./") for f in earlier.get("files") or []}
-            if not mine & theirs:
+            if not _overlap(mine, theirs):
                 continue
             if earlier["key"] in _ancestors(tasks, later["key"]) or later["key"] in _ancestors(tasks, earlier["key"]):
                 continue
             later["depends_on"] = [*later.get("depends_on", []), earlier["key"]]
+
+
+def _overlap(a: set[str], b: set[str]) -> bool:
+    """Paths or globs (either side) that could name the same file."""
+    return any(x == y or fnmatch.fnmatchcase(x, y) or fnmatch.fnmatchcase(y, x) for x in a for y in b)
+
+
+_CONSTRAINT_LABEL = re.compile(r"^\W*C(\d+)\b", re.IGNORECASE)
+
+
+def missing_coverage(acceptance: list[str], constraints: list[str], criteria: list[Any]) -> list[str]:
+    """What a passing verifier report left unjudged: each constraint by label (C1, C2, …) or its text, and
+    acceptance criteria by count. A pass that skips any of them is not evidence."""
+    reported = [str(c.get("criterion", "")).strip() for c in criteria if isinstance(c, dict)]
+    labels = {int(m.group(1)) for r in reported if (m := _CONSTRAINT_LABEL.match(r))}
+    missing = []
+    for j, text in enumerate(constraints):
+        head = text.strip()[:40].lower()
+        if (j + 1) not in labels and not any(head and head in r.lower() for r in reported):
+            missing.append(f"C{j + 1}")
+    plain = [r for r in reported if not _CONSTRAINT_LABEL.match(r)]
+    if len(plain) < len(acceptance):
+        missing.append(f"{len(acceptance) - len(plain)} of {len(acceptance)} acceptance criteria")
+    return missing
