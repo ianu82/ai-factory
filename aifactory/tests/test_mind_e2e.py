@@ -270,6 +270,8 @@ def test_the_runtime_adapter_builds_one_turn(people):
     assert call["session_id"] == provider.sessions[0] == "mind-turn"  # one MindsHub session for the turn
     assert call["prompt"].endswith("next") and "Outcome 7" in call["prompt"] and "evil" not in call["prompt"]
     assert "Mobile" in call["prompt"] and "Platform" in call["prompt"]
+    with SessionLocal() as db:  # a workspace offered to the model is in the thread's revocation scope
+        assert people["second"] in db.get(MindThread, thread_id).workspace_ids
     assert [e["type"] for e in seen] == ["tool_start", "text_delta"]  # finished tools come from the dispatcher
     assert ledger.reconciled == 1
 
@@ -334,3 +336,23 @@ def test_mind_budget_setting_defaults_and_accepts_zero(client, signed_in):
     r = client.patch(f"/api/workspaces/{ws}", json={"settings": {"mind": {"daily_budget_usd": 0}}})
     assert r.status_code == 200 and r.json()["settings"]["mind"] == {"daily_budget_usd": 0.0}
     assert r.json()["settings"]["concurrency"] == 4
+
+
+def test_workspace_names_reach_the_model_only_scrubbed(people):
+    opaque = "opaque-name-secret-0042"
+    with SessionLocal() as db:
+        db.get(Workspace, people["second"]).name = f"Mobile {opaque}"
+        db.add(Secret(workspace_id=people["first"], kind="github_token", ciphertext=encrypt(opaque)))
+        thread = MindThread(owner_id=people["alice"], billing_workspace_id=people["first"],
+                            workspace_ids=[people["first"]])
+        db.add(thread); db.commit()
+        context = TurnContext(people["alice"], thread.id, people["first"], (people["first"],))
+    engine = FakeEngine(FakeProvider())
+
+    async def emit(_):
+        pass
+
+    asyncio.run(mr.EngineRuntime(engine).run_turn(context, [{"role": "user", "text": "hi"}], emit, tools=None,
+                                                  ledger=FakeLedger()))
+    prompt = engine.calls[0]["prompt"]
+    assert opaque not in prompt and "Mobile [redacted]" in prompt

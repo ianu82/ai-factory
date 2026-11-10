@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException
 
 from ..db import SessionLocal
-from ..models import MindCharge, Workspace
+from ..models import MindCharge, MindThread, Workspace
 from .actions import execution_results
 from .api import scrub, secrets_for
 from .contracts import TurnContext
@@ -104,13 +104,19 @@ class EngineRuntime:
             raise ValueError("A Mind turn needs the person's message last")
         prior = [{"role": m["role"], "content": m["text"]} for m in messages[:-1] if (m.get("text") or "").strip()]
         with SessionLocal() as db:
-            # Confirmed results go to the provider: the same workspace-secret scrub as every other egress.
-            results = scrub(execution_results(Context(db, context.user_id, context.thread_id)),
-                            secrets_for(db, context.user_id, context.workspace_ids))
-            # The person's current memberships, including workspaces joined after the thread began (a read in one
-            # widens the thread scope, so revoking it later still hides the thread).
-            workspaces = [{"id": w.id, "name": w.name} for w in db.query(Workspace).filter(
-                Workspace.id.in_(memberships(db, context.user_id))).order_by(Workspace.name)]
+            current = memberships(db, context.user_id)
+            # Everything listed to the model enters the thread's scope first, so revoking any of these workspaces
+            # later hides the thread and the replies that may mention it (store.owned()).
+            thread = db.get(MindThread, context.thread_id)
+            if thread is not None and not set(current) <= set(thread.workspace_ids):
+                thread.workspace_ids = sorted(set(thread.workspace_ids) | set(current))
+                db.commit()
+            secrets = secrets_for(db, context.user_id, current)
+            # The provider sees confirmed results and workspace names only through the same workspace-secret scrub
+            # as every other egress.
+            results = scrub(execution_results(Context(db, context.user_id, context.thread_id)), secrets)
+            workspaces = scrub([{"id": w.id, "name": w.name} for w in db.query(Workspace).filter(
+                Workspace.id.in_(current)).order_by(Workspace.name)], secrets)
         bridge = LedgerBridge(ledger)
         ready = await self.provider.readiness(context.billing_workspace_id, bridge, session_id=ledger.session_id)
         if not ready.available:
