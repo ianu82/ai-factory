@@ -150,6 +150,17 @@ def test_plain_comments_are_ignored_and_bad_commands_are_answered(factory):
     assert "any of cancel, retry, resolve, guidance" in FakeGH.replies[1]
 
 
+def test_a_malformed_item_fails_alone(factory):
+    mixed = {"guidance": [{"outcome": "seven", "body": "broken"},
+                          {"outcome": 7, "task": "T1", "body": "Still delivered."}]}
+    FakeGH.comments = [command(12, mixed)]
+    assert poll() == [12]
+    with session_scope() as s:
+        assert [m.body for m in s.query(Message).all()] == ["Still delivered."]
+    assert "guidance item 1: not applied, ValueError" in FakeGH.replies[0]
+    assert "guidance #7 T1: posted" in FakeGH.replies[0]
+
+
 def test_a_head_guard_skips_a_decision_judged_on_an_older_commit(factory):
     stale = {"resolve": [{"outcome": 7, "task": "T1", "kind": "approve_merge", "resolution": "approve",
                           "head": "0123456"}]}

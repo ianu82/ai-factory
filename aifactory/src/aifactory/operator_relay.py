@@ -113,12 +113,14 @@ def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable
     }
     lines: list[str] = []
     for kind in KINDS:
-        if items.get(kind):
+        for n, item in enumerate(items.get(kind) or []):
+            # One item at a time: a malformed item (e.g. a non-numeric outcome) fails alone, and every other item
+            # still applies and gets its own line.
             try:
-                lines += steps[kind](items[kind])
-            except Exception as exc:  # a malformed item (e.g. a non-numeric outcome) stops only its own kind
-                log.exception("operator relay %s failed", kind)
-                lines.append(f"{kind}: stopped by an error ({type(exc).__name__}: {str(exc)[:200]})")
+                lines += steps[kind]([item])
+            except Exception as exc:
+                log.exception("operator relay %s item %s failed", kind, n + 1)
+                lines.append(f"{kind} item {n + 1}: not applied, {type(exc).__name__}: {str(exc)[:200]}")
     return lines
 
 
