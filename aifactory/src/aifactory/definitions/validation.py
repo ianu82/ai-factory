@@ -206,13 +206,22 @@ def read_skill_folder(folder: Path, **scope) -> Skill:
 
     try:
         # Reject symlinks anywhere in the supplied root path, not just its leaf.
+        # Ancestors need only search permission: O_PATH opens them without read
+        # access (an isolated sandbox user may traverse but not list them). Only
+        # the skill folder itself is opened for reading.
         root = Path(folder).absolute()
-        fd = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        parts = root.parts[1:]
+        search = getattr(os, "O_PATH", os.O_RDONLY)
+        fd = os.open(root.anchor, (search if parts else os.O_RDONLY) | os.O_DIRECTORY)
         try:
-            for part in root.parts[1:]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            for index, part in enumerate(parts):
+                mode = os.O_RDONLY if index == len(parts) - 1 else search
+                child = os.open(part, mode | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 os.close(fd)
                 fd = child
+                # O_PATH | O_NOFOLLOW can return a descriptor for a symlink itself.
+                if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise DefinitionError(f"Symlink or unsupported path in skill folder: {part}")
             walk(fd)
         finally:
             os.close(fd)
