@@ -124,6 +124,44 @@ Settings, PR filters in the toolbar, Inbox sorted by priority or newest, "Queued
 idle outcome by number, priority on declared outcomes); #292 (server credentials serve only the bootstrap
 workspace); #293 (delegated guidance).
 
+### Factory-built PRs merged in the afternoon and evening (9 November, times UTC)
+
+Same rule and classification. Rule changes on the day: Mind PRs merge with only P2/P3 findings open, with each
+filed as a follow-up issue (Ian: "Yes, merge with P2s"); P1s still get a fix round.
+
+| PR | Factory task | What the operator did | Classification |
+| --- | --- | --- | --- |
+| #281 (14:36) | #19 T1 review policy and GitHub feedback primitives | Approval through the Factory, then one review round | Assisted |
+| #284 (15:33) | #20 T1 workstream persistence and audited API | Two review rounds | Assisted |
+| #298 (17:16) | #39 T2 Mind: restricted Opus 5.5 engine | Merge approval only | Assisted (merge approval only) |
+| #286 (17:34) | #13 T7 autonomy, team and first-outcome steps | Approval through the Factory and one review round; completes outcome #13 | Assisted |
+| #294 (20:34) | #23 T5 README example in the first-outcome step | One review round | Assisted |
+| #310 (21:38) | #25 T1 regret ledger | Merge approval only | Assisted (merge approval only) |
+| #288 (21:44) | #23 T2 trusted issue authors for automatic intake | Two review rounds | Assisted |
+| #306 (22:12) | #23 T3 GitHub App JWT and installation-token transport | Merge approval only | Assisted (merge approval only) |
+| #303 (22:30) | #39 T4 Mind dock | One review round; a P2 left as #318 | Assisted |
+| #254 (23:03) | #12 T1 configuration fingerprints | Many review rounds; the operator closed the fingerprint scope | Assisted |
+| #301 (23:28) | #39 T3 Mind read registry and confirmed actions | One review round; P2s left as #322 and #323 | Assisted |
+
+Operator and peer-session PRs: #295 (relay decisions into other workspaces), #296 (start work by priority), #297
+(retry VM commands that never started), #300 (README), #304 (sign as MindsHub AI Factory), #305 (fix main),
+#316 (release checker), #317 (pin Playwright), #326 (decisions apply only to the head they were judged on).
+
+### Releases (since 9 November evening)
+
+Ian separated merging from releasing so that merges stop restarting production:
+- **`main`** takes pull requests as soon as they are ready, and deploys to the Railway `staging` environment:
+  its own SQLite volume and secret key, @mindsdb.com sign-in, no production data and no production
+  credentials.
+- **Production** deploys from the **`release`** branch, at most every 2 hours and only after staging has run the
+  commit for 30 minutes. The `release-check` cron service in production does this every 15 minutes; see
+  `docs/RELEASING.md`.
+- **First release:** `release` 6048ed0 → 59e21af at 00:14 UTC on 10 November, promoted by hand with the same
+  gates, live and confirmed by 00:21.
+- **Temporary credential.** The checker's `AIFACTORY_RELEASE_GITHUB_TOKEN` is, for now, a Railway reference to the
+  Factory's bootstrap GitHub token (Ian: "Reuse existing for now"). It should become a fine-grained token limited
+  to ianu82/ai-factory: Contents, Issues and Commit statuses read/write; Checks and Metadata read.
+
 ### Platform changes made because of what the night showed
 
 - **Revisions start from today's main** (#250). A revision built on a stale base got no CI and stalled. It now
@@ -188,6 +226,16 @@ nobody approving until #22 (People merge on GitHub) ships.
   to 11:30 (fixed in #290): #278's new test expected the progress shape from before #287. Each PR was green
   on its own base, and they share no files. Merges now go one at a time behind a green main, and the operator
   first tests the merge result against current main when a PR is behind it.
+- Merging is batched no more than hourly only since 9 November afternoon. Before that, five production deploys
+  in 2.5 hours kept restarting 35–45 minute builds. That waste is what motivated separating releases.
+- #304 was merged outside the loop and turned main red. It exposed a test-isolation bug from #298, fixed in #305.
+- Staged a merge approval for #283 that would have applied to a newer, unreviewed revision. I withdrew it by
+  hand before the restart; #326 now makes the Factory check the head itself.
+- Told #16 T1 to redact with an overlapping-shingle index and 8-character fragments. That cost about 776 MiB and
+  10 seconds per 5 MiB image, and the verifier rightly failed it. The retry uses sampled anchors with explicit
+  memory and time budgets.
+- Read a P1 finding on Mind's #309 as a P2. It was not merged; the follow-up issue was corrected.
+- Clock estimates in the evening notes again ran an hour fast for a while. The times above come from GitHub.
 - Reused a nonce (`o16t5-retry1`) from earlier in the night, so the bootstrap correctly skipped that retry
   twice as already applied. Nonces must be unique across the workspace's history.
 - Told #13 T2 that a failed retest must never downgrade a valid token. That is right only for transient
@@ -203,7 +251,7 @@ nobody approving until #22 (People merge on GitHub) ships.
 | F01 Codex qualification | Unattended delivery done | PR #17 |
 | F18 Anton unattended delivery | Done, including independent rejection of a defective candidate | PR #18 |
 | F02 MindsHub Inference | Live: workspace key from MindsHub sign-in, readiness check, per-run cost readback | Deliveries on MindsHub: #6 (native), #8 (Anton, unattended); Codex ran on MindsHub in #195 |
-| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | 8–9 Nov: twenty-four Factory-built PRs merged into `ai-factory` (sixteen overnight, eight during the day), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
+| F03 Factory builds Factory | `ai-factory` connected (merge needs approval, deploy config protected); revisions rebase onto current main, carry reviewed work through conflicts, and verifiers judge by the team's decisions | 8–9 Nov: thirty-five Factory-built PRs merged into `ai-factory` (sixteen overnight, nineteen during the day and evening), all assisted (see above); the first attempt (#195) was lost to a rebase conflict |
 | F05 Parallel execution | Per-workspace and global concurrency, dependency ordering, serialized revalidated merges | PRs #17/#18, #25/#26 |
 | F06 Prepared environments | Verifier VMs boot from a checkpoint keyed by repository, lockfiles and setup; setup skipped on a hit, saved after a clean miss, older ones pruned | Live: checkpoint saved in #8 (11 s); both parallel tasks of #9 booted their own VM from it in 6–9 s with setup skipped |
 | F04 Coding model choice | Models per role from the provider's live list | — |
