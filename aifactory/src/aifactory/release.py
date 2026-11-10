@@ -241,24 +241,40 @@ class Releaser:
         if response.status_code not in (200, 201):
             raise ReleaseError(f"Marking {sha[:7]} {state}: HTTP {response.status_code}")
 
-    def _staged_since(self, sha: str) -> datetime | None:
-        """When staging started running this commit, as recorded by an earlier run (None if never observed)."""
+    def _staging_record(self, sha: str) -> tuple[datetime | None, bool | None]:
+        """What an earlier run recorded for this commit on staging: when staging (last) started it, and whether
+        staging passed smoke checks while running it (None when never recorded)."""
         response = self._gh("GET", f"/repos/{self.cfg.repo}/commits/{sha}/status")
         if response.status_code != 200:
             raise ReleaseError(f"Reading statuses for {sha[:7]}: HTTP {response.status_code}")
-        for status in response.json().get("statuses") or []:
+        for status in response.json().get("statuses") or []:  # newest first: the latest record per context
             if status.get("context") == self.cfg.staging_context:
-                return _time(str(status.get("description") or "").removeprefix("Staging since ").strip())
-        return None
+                text = str(status.get("description") or "")
+                since = _time(text.removeprefix("Staging since ").split(";")[0].strip())
+                smoke_ok = True if "smoke passed" in text else False if "smoke failed" in text else None
+                return since, smoke_ok
+        return None, None
 
-    def _note_staged(self, sha: str, started: datetime) -> None:
-        """Record when staging started running a commit. This checker keeps no state between runs, and later merges
-        replace staging's commit, so the record lives on the commit as a status."""
-        if self.dry_run or self._staged_since(sha) is not None:
+    def _note_staged(self, sha: str, started: datetime, smoke_ok: bool | None = None) -> None:
+        """Record when staging started a commit and whether smoke passed on it. This checker keeps no state
+        between runs, and later merges replace staging's commit, so the record lives on the commit as a status. A
+        restart of the same commit (a newer start) resets the soak and the smoke result. Within one start a failure
+        is sticky: a later pass does not clear it, so a flaky tree is never promoted on its good runs."""
+        if self.dry_run:
             return
+        since, recorded_smoke = self._staging_record(sha)
+        newer = since is None or started > since
+        first_result = smoke_ok is not None and recorded_smoke is None
+        new_failure = smoke_ok is False and recorded_smoke is True
+        if not (newer or first_result or new_failure):
+            return
+        if not newer and since is not None:
+            started = since  # same start: keep its soak, change only the smoke result
+        smoke = "" if smoke_ok is None else f"; smoke {'passed' if smoke_ok else 'failed'}"
+        state = "failure" if smoke_ok is False else "success"
         response = self._gh("POST", f"/repos/{self.cfg.repo}/statuses/{sha}",
-                            json={"state": "success", "context": self.cfg.staging_context,
-                                  "description": f"Staging since {started.isoformat()}"})
+                            json={"state": state, "context": self.cfg.staging_context,
+                                  "description": f"Staging since {started.isoformat()}{smoke}"[:140]})
         if response.status_code not in (200, 201):
             raise ReleaseError(f"Recording staging for {sha[:7]}: HTTP {response.status_code}")
 
@@ -361,8 +377,10 @@ class Releaser:
         commit, started = str(staging.get("commit") or ""), _time(staging.get("started_at"))
         if staging.get("ok") and commit and started is not None:
             try:
-                self._note_staged(commit, started)
-            except ReleaseError as exc:
+                # Smoke the exact tree staging runs now, so an older commit is only ever promoted on a smoke result
+                # from when that commit itself was deployed.
+                self._note_staged(commit, started, smoke_ok=not smoke(self.web, self.cfg.staging_url))
+            except (ReleaseError, httpx.HTTPError) as exc:
                 self.step(f"Could not record staging's commit: {exc}")
 
     def _production(self) -> dict[str, Any]:
@@ -484,15 +502,14 @@ class Releaser:
         self.step(f"{compare.get('ahead_by', '?')} commit(s) since {cfg.branch} at {current[:7]} change Factory code")
         if self._compare(candidate, cfg.source_branch).get("status") not in ("ahead", "identical"):
             return Result("failed", f"{candidate[:7]} is not on {cfg.source_branch}.", candidate, current)
-        self._note_staged(candidate, started)
 
         # Merges keep replacing staging's commit, so waiting for its current commit to soak would starve releases
         # while the Factory is busy. Promote the newest commit staging actually deployed (it has its own
         # factory/staging record, so it is a tree staging ran, never a side-branch commit) whose code has been on
         # staging for the soak period: since staging started it, every later commit staging ran contains it.
         line = self._recent_commits(candidate, current)
-        soaked_since: dict[str, datetime | None] = {
-            sha: started if sha == candidate else self._staged_since(sha) for sha in line}
+        records = {sha: (started, None) if sha == candidate else self._staging_record(sha) for sha in line}
+        soaked_since: dict[str, datetime | None] = {sha: record[0] for sha, record in records.items()}
         chosen, reasons = None, []
         for sha in line:
             since = soaked_since[sha]
@@ -504,6 +521,10 @@ class Releaser:
                 continue
             if self._mark(sha) == "failure":
                 reasons.append(f"{sha[:7]} is marked do-not-release")
+                continue
+            if sha != candidate and records[sha][1] is not True:
+                # The smoke run below tests staging's current tree; an older commit needs its own passing result.
+                reasons.append(f"{sha[:7]} has no passing smoke result from when staging ran it")
                 continue
             if sha != candidate:
                 part = self._compare(current, sha)

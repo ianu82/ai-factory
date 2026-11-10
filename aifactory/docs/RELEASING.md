@@ -33,16 +33,19 @@ A run, in order:
    becomes a `release-hold`.
 3. **Keeps releases at least 2 hours apart**, counted from when `release` last moved.
 4. **Promotes the newest commit that has been on staging for 30 minutes**, when all of these hold:
-   - staging has run it, or a later commit that contains it, for 30 minutes. Every run records when staging
-     started its current commit as a `factory/staging` commit status (even runs that then wait for the release
-     interval), so a busy `main` that keeps replacing staging's commit still releases every 2 hours instead of
-     waiting for a quiet half hour. Staging's data comes from earlier versions, so this also proves the upgrade;
+   - staging has run it, or a later commit that contains it, for 30 minutes. Every run (even one that then waits
+     for the release interval) smoke-checks staging and records on its current commit, as a `factory/staging`
+     commit status, when staging started it and whether smoke passed. A busy `main` that keeps replacing
+     staging's commit therefore still releases every 2 hours instead of waiting for a quiet half hour. Staging's
+     data comes from earlier versions, so this also proves the upgrade. A restart of the same commit starts its
+     30 minutes again, and a smoke failure sticks until then;
    - it changes the Factory's code (`aifactory/`) since the current release. Docs-only changes wait, because a
      release restarts production;
    - it is on `main`, ahead of `release`, and not marked do-not-release;
    - every GitHub check on it passed (checks still running hold the release);
    - staging passes smoke checks: the web app and its script bundle load, `/api/meta` answers, and `/api/me`
-     refuses an anonymous caller.
+     refuses an anonymous caller. An older commit needs a passing result recorded while staging ran that commit
+     itself; staging's current commit is checked again before promotion.
 
    The next runs then confirm production, as in step 2.
 

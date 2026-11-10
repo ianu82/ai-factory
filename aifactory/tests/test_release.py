@@ -226,7 +226,7 @@ def test_a_busy_main_still_releases_the_newest_commit_staging_has_run_long_enoug
     # in NEW, so it has been on staging for the soak period.
     world.line = [EARLY, MID, NEW]
     world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
-    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}"
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke passed"
     result = world.run()
     assert result.status == "promoted", result.as_dict()
     assert world.patches == [{"sha": MID, "force": False}]
@@ -238,7 +238,7 @@ def test_only_commits_staging_deployed_are_candidates(world):
     # though later commits that contain it soaked; MID needs its own 30 minutes.
     world.line = [EARLY, MID, NEW]
     world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
-    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=20))}"
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=20))}; smoke passed"
     result = world.run()
     assert result.status == "held" and "long enough" in result.detail
     assert world.patches == []
@@ -256,11 +256,51 @@ def test_staging_is_recorded_even_while_the_interval_holds(world):
 def test_a_soaked_commit_with_failing_checks_is_skipped_for_an_older_one(world):
     world.line = [EARLY, MID, NEW]
     world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
-    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=50))}"
-    world.staged[EARLY] = f"Staging since {iso(NOW - timedelta(minutes=70))}"
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=50))}; smoke passed"
+    world.staged[EARLY] = f"Staging since {iso(NOW - timedelta(minutes=70))}; smoke passed"
     world.commit_checks[MID] = [{"name": "test", "status": "completed", "conclusion": "failure"}]
     assert world.run().status == "promoted"
     assert world.patches == [{"sha": EARLY, "force": False}]
+
+
+def test_an_older_commit_needs_its_own_passing_smoke_result(world):
+    # MID soaked, but smoke failed while staging ran it; NEW (which fixed it) has not soaked yet.
+    world.line = [MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke failed"
+    result = world.run()
+    assert result.status == "held" and "no passing smoke result" in result.detail
+    assert world.patches == []
+
+
+def test_each_run_records_staging_smoke_for_the_commit_it_runs(world):
+    world.moved_at = NOW - timedelta(minutes=60)  # held by the interval: only the observation happens
+    world.run()
+    assert world.staged[NEW].endswith("smoke passed")
+    world.asset_status = 404
+    world.staged.clear()
+    world.run()
+    assert world.staged[NEW].endswith("smoke failed")
+
+
+def test_a_smoke_failure_sticks_until_staging_restarts_the_commit(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    world.asset_status = 404
+    world.run()
+    world.asset_status = 200
+    world.run()  # passing again on the same start does not clear the failure
+    assert world.staged[NEW].endswith("smoke failed")
+    world.staging["started_at"] = iso(NOW + timedelta(minutes=1))
+    world.run()
+    assert world.staged[NEW].endswith("smoke passed")
+
+
+def test_a_restart_of_the_same_commit_resets_its_soak(world):
+    world.staged[NEW] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke passed"
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))  # Railway restarted NEW five minutes ago
+    result = world.run()
+    assert result.status == "held" and "5 of 30 minutes" in result.detail
+    assert world.staged[NEW].startswith(f"Staging since {iso(NOW - timedelta(minutes=5))}")
 
 
 def test_no_factory_code_changed_means_no_release_and_no_restart(world):
