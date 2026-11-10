@@ -333,7 +333,8 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
     """Resolve open decisions as an operator acting under a person's explicit delegation.
 
     Each item: {"outcome": N, "task": "T1" (optional), "kind": "approve_merge"|"question"|..., "resolution": "...",
-    "comment": "...", "reusable": bool, "nonce": "...", "workspace": id (optional, see _delegation_target)}. The
+    "comment": "...", "reusable": bool, "nonce": "...", "workspace": id (optional, see _delegation_target),
+    "head": sha (optional, at least 7 characters: apply only while the task's head is still that commit)}. The
     decision records the operator identity and who delegated it.
     """
     if not items:
@@ -372,6 +373,17 @@ def _resolve_delegated(workspace_id: str, items: list[dict], delegated_by: str) 
             decision = query.order_by(Decision.created_at.desc()).first()
             if decision is None:
                 continue
+            expected = str(item.get("head") or "").strip().lower()
+            if expected and decision.task_id:
+                # A decision judged on one commit must not apply to a newer one: an approval staged for a reviewed
+                # head would otherwise merge an unreviewed revision pushed before the next restart.
+                from .models import Task
+
+                current = (db.get(Task, decision.task_id).head_sha or "").lower()
+                if len(expected) < 7 or not current.startswith(expected):
+                    log.error("Delegated %s for #%s skipped: it was judged on %s but the task's head is %s",
+                              item["resolution"], outcome.number, expected[:12], current[:12] or "unknown")
+                    continue
             if target != workspace_id and item["resolution"] != "reject" and decision.task_id:
                 from .models import Task
 
