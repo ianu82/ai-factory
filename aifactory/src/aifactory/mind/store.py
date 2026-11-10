@@ -26,7 +26,7 @@ class AccountingError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__({
-            "budget_exhausted": "Mind's daily budget is exhausted. Try again after UTC midnight.",
+            "budget_exceeded": "Mind's daily budget is exhausted. Try again after UTC midnight.",
             "accounting_pending": "Mind usage is unresolved. Further paid calls are blocked until accounting reconciles.",
             "accounting_busy": "Another Mind request is being accounted for. Try again shortly.",
             "invalid_budget": "Mind's daily budget must be finite and nonnegative.",
@@ -70,6 +70,14 @@ def usage(db, user_id, thread_id=None):
     return {"thread_cost": cost(rows.filter_by(thread_id=thread_id)) if thread_id else {"usd": 0, "known": True},
             "daily_spend": cost(rows.filter(MindCharge.created_at >= today)),
             "daily_limit": effective_limit(db, user_id)}
+
+
+def wire_usage(db, user_id, thread_id=None):
+    """The usage event as the dock reads it (web/src/api.ts MindWireUsage): daily spend is a number, or null while
+    any of today's charges is unknown."""
+    current = usage(db, user_id, thread_id)
+    spend = current["daily_spend"]
+    return {**current, "daily_spend": spend["usd"] if spend["known"] else None}
 
 
 def recover(db, thread):
@@ -183,7 +191,7 @@ class TurnLedger:
                     raise AccountingError("accounting_pending")
                 daily = usage(db, self.user_id, self.thread_id)
                 if daily["daily_spend"]["usd"] >= daily["daily_limit"]:
-                    raise AccountingError("budget_exhausted")
+                    raise AccountingError("budget_exceeded")
                 db.add(MindCharge(user_id=self.user_id, thread_id=self.thread_id,
                     billing_workspace_id=self.billing_workspace_id, session_id=self.session_id, created_at=utcnow()))
                 db.commit()

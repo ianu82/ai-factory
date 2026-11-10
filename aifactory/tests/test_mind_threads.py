@@ -89,6 +89,8 @@ def test_lifecycle_personal_scope_and_private_bus(world, monkeypatch):
     es = events(send(world, thread))
     assert [e["type"] for e in es] == ["message_started", "token", "token", "usage", "done"]
     assert [e["seq"] for e in es] == list(range(1, 6))
+    assert es[-1]["data"] == {"status": "complete"}  # what web/src/mindHttp.ts accepts as a finished reply
+    assert es[-2]["data"]["daily_spend"] == .25 and es[-2]["data"]["daily_limit"] == 10  # number | null on the wire
     view = client.get(f"/api/mind/threads/{thread}").json()
     assert view["messages"][1]["text"] == "Hello world"
     assert view["thread"]["title"] == "What's happening?"
@@ -123,8 +125,8 @@ def test_validation_and_unavailable(world):
 def test_invalid_limits(world, value):
     with SessionLocal() as db:
         ws = db.get(Workspace, world[3][2]); ws.settings = {"mind": {"daily_budget_usd": value}}
-        # PostgreSQL JSON rejects NaN, validate in memory before persistence.
-        with pytest.raises(store.AccountingError, match="finite"):
+        # PostgreSQL JSON rejects NaN: validate the in-memory value without flushing it first.
+        with db.no_autoflush, pytest.raises(store.AccountingError, match="finite"):
             store.effective_limit(db, world[3][0])
 
 
@@ -139,7 +141,7 @@ def test_budget_across_workspaces_and_process_recreation(world):
     events(send(world, first))
     init_engine()  # Durable accounting, no process-local lock/counter.
     es = events(send(world, second))
-    assert next(e for e in es if e["type"] == "error")["data"]["code"] == "budget_exhausted"
+    assert next(e for e in es if e["type"] == "error")["data"]["code"] == "budget_exceeded"
     assert runtime.calls == 1
     with SessionLocal() as db:
         assert store.usage(db, ids[0])["daily_spend"]["usd"] == .25
@@ -450,6 +452,7 @@ async def test_asgi_disconnect_shields_partial_persistence(world):
     with SessionLocal() as db:
         assert db.get(MindThread, thread).active_turn is None
         assert store.usage(db, ids[0])["daily_spend"]["known"] is False
+        assert store.wire_usage(db, ids[0])["daily_spend"] is None  # unknown spend is null on the wire
 
 
 async def test_late_cumulative_growth_after_midnight_counts_today_once(world, monkeypatch):

@@ -352,7 +352,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                     if session.query(MindCharge).filter_by(
                             user_id=user_id, settled=False).first():
                         raise store.AccountingError("accounting_pending")
-                terminal = "completed"
+                terminal = "complete"  # the dock's wire value (web/src/mindHttp.ts)
             except store.AccountingError as exc:
                 terminal = "failed"
                 await queue.put(("error", {"code": exc.code, "message": str(exc)}))
@@ -399,7 +399,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                     released = i + 1
             with SessionLocal() as session:
                 store.owned(session, user_id, thread_id)
-                events.append(envelope("usage", store.usage(session, user_id, thread_id)))
+                events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
                 safe = scrub(events, secrets_for(session, user_id, scope))
             for event in safe[released:]:
