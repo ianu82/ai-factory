@@ -93,16 +93,29 @@ def saved_credential(workspace_id: str) -> Credential:
         raise MindUnavailable() from None
 
 
+# Claude Opus 5.5 under the names catalogs give it: anthropic/claude-opus-5.5, claude-opus-5-5-20261101, and
+# MindsHub's own opus-5-5. A complete generation only: never "opus", "opus-5", "5.6" or "5.50".
+_OPUS_5_5 = re.compile(r"(?:anthropic/)?(?:claude[-_ ])?opus[-_ ]5[._-]5(?:[-_]\d{8})?", re.IGNORECASE)
+_OPUS_5_5_IN = re.compile(r"opus[-_ ]?5[._-]5(?!\d)", re.IGNORECASE)
+
+
 def select_model(names: list[str]) -> str:
-    # Match a complete generation, not "5", "5.6", "5.50", or a display-name
-    # claim attached to an unrelated id. Return the actual catalog id unchanged.
-    pattern = r"(?:anthropic/)?claude[-_ ]opus[-_ ]5[._-]5(?:[-_]\d{8})?"
-    matches = {name for name in names if re.fullmatch(pattern, name, re.IGNORECASE)}
+    # Return the actual catalog id unchanged.
+    matches = {name for name in names if _OPUS_5_5.fullmatch(name)}
     if not matches:
         raise MindUnavailable("model_absent")
     if len(matches) != 1:
         raise MindUnavailable("ambiguous_catalog")
     return matches.pop()
+
+
+def same_model(reported: str | None, selected: str) -> bool:
+    """Whether the model a response names is the one Mind asked for. A provider can report the selected
+    generation under another of its names (MindsHub serves opus-5-5 and may answer as claude-opus-5-5-…); any
+    other model is a substitution."""
+    if not reported:
+        return False
+    return reported == selected or bool(_OPUS_5_5_IN.search(reported) and _OPUS_5_5_IN.search(selected))
 
 
 class _Responses:
@@ -143,11 +156,11 @@ class _Responses:
                         if response is not None:
                             usage = _usage(response) or usage
                             identity = getattr(response, "model", None)
-                            if identity and identity != self.model:
+                            if identity and not same_model(identity, self.model):
                                 raise MindUnavailable("model_substitution")
                         if kind in ("response.completed", "response.incomplete"):
                             terminal = True
-                            if getattr(response, "model", None) != self.model:
+                            if not same_model(getattr(response, "model", None), self.model):
                                 raise MindUnavailable("model_substitution")
                         if kind in ("response.failed", "error"):
                             raise MindUnavailable()
@@ -348,7 +361,7 @@ class MindProvider:
                 async for event in events:
                     if isinstance(event, StreamComplete):
                         response = event.response
-            if response is None or response.model != model:
+            if response is None or not same_model(response.model, model):
                 raise MindUnavailable("model_substitution")
             return response
 
