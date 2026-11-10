@@ -17,7 +17,7 @@ TEST_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe
 
 CHECK_TIMEOUT = 15.0
 CHECK_TOKENS = 32
-ROLES = ("planner", "builder", "verifier")
+ROLES = ("planner", "plan_reviewer", "builder", "verifier")
 
 
 def rejects_image_input(exc: Exception) -> bool:
@@ -54,17 +54,18 @@ def rejects_image_input(exc: Exception) -> bool:
 
 
 async def check_workspace_models(workspace_id: str, settings: dict[str, Any]) -> dict[str, Any]:
-    selected = workspace_models(settings)
-    effective = {role: getattr(selected, role) for role in ROLES}
     try:
         provider = resolve_provider(workspace_id)
     except Exception:
+        selected = workspace_models(settings)
         return {"provider": None, "roles": {
-            role: {"model": model, "status": "unknown",
+            role: {"model": getattr(selected, role), "status": "unknown",
                    "explanation": "Check failed: model provider credentials are unavailable."}
-            for role, model in effective.items()
+            for role in ROLES
         }}
-    effective = {role: provider.model_override or model for role, model in effective.items()}
+    # The same selection runtime makes: the resolved provider picks the plan reviewer's default.
+    selected = workspace_models(settings, provider=provider.provider)
+    effective = {role: provider.model_override or getattr(selected, role) for role in ROLES}
     client = ModelClient(provider, timeout=CHECK_TIMEOUT, max_retries=0, log_errors=False)
 
     async def probe(model: str) -> dict[str, str]:
