@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowDown, Check, Plus } from "lucide-react";
 import type { MindCitation, MindMessage, MindStatus } from "../api";
@@ -35,6 +35,23 @@ function Notice({ status, workspaceId, onRetry }: { status: MindStatus | null; w
   </div>;
 }
 
+/**
+ * While Mind is settling the cost of the last reply, check again every few seconds (for up to two minutes), so the
+ * composer unlocks by itself once accounting catches up instead of waiting for a reload.
+ */
+const SETTLE_EVERY_MS = 4_000;
+const SETTLE_TRIES = 30;
+function useSettleWatch(status: MindStatus | null, busy: boolean, check: (() => void) | null) {
+  const tries = useRef(0);
+  const pending = status?.budget_state === "pending_accounting";
+  useEffect(() => {
+    if (!pending) { tries.current = 0; return; }
+    if (busy || !check || tries.current >= SETTLE_TRIES) return;
+    const timer = window.setTimeout(() => { tries.current += 1; check(); }, SETTLE_EVERY_MS);
+    return () => window.clearTimeout(timer);
+  }, [status, pending, busy, check]);
+}
+
 function when(value?: string): string {
   if (!value) return "";
   const date = new Date(value);
@@ -58,6 +75,8 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
     void controller.list();
   }, [controller, state.userId, workspaceId]);
   const reason = blockedReason(state.status);
+  const recheck = useCallback(() => void controller.checkStatus(workspaceId), [controller, workspaceId]);
+  useSettleWatch(state.status, starting, recheck);
   const start = async (text: string) => {
     setStarting(true);
     const id = await controller.start(workspaceId, text);
@@ -70,7 +89,7 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
   return <div className="mind-home">
     <div className="mind-home-column">
       <h1>My Mind</h1>
-      <Notice status={state.status} workspaceId={workspaceId} onRetry={() => void controller.checkStatus(workspaceId)} />
+      <Notice status={state.status} workspaceId={workspaceId} onRetry={recheck} />
       <MindComposer ref={composer} large autoFocus onSend={start} disabled={!!reason || starting || checking}
         disabledReason={starting ? "Starting…" : checking ? "Checking that Mind can answer…" : reason || undefined}
         placeholder="Plan a feature together and hand it to the Factory to build, or ask what’s stuck and why…" />
@@ -106,6 +125,10 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
   const failed = state.active?.id !== threadId && !state.busy && !!state.error;
   const loading = state.active?.id !== threadId && !failed;
   const reason = blockedReason(state.status);
+  // Readiness belongs to the conversation's own workspace, which can differ from the one in the address bar.
+  const threadWorkspace = state.active?.id === threadId ? state.active.workspace_id : null;
+  const recheck = useCallback(() => { if (threadWorkspace) void controller.checkStatus(threadWorkspace); }, [controller, threadWorkspace]);
+  useSettleWatch(state.status, state.busy, threadWorkspace ? recheck : null);
   const actions = { confirm: (c: Parameters<typeof controller.confirm>[0]) => void controller.confirm(c),
                     dismiss: (c: Parameters<typeof controller.dismiss>[0]) => void controller.dismiss(c),
                     revise: (c: Parameters<typeof controller.revise>[0], f: Record<string, string>) => void controller.revise(c, f) };
@@ -135,7 +158,7 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
       {unseen && <button type="button" className="mind-jump" onClick={() => { if (pane.current) { scroll.current.jump(pane.current); setUnseen(false); } }}><ArrowDown /> New reply</button>}
       <div className="mind-bottom">
         <div className="mind-column">
-          <Notice status={state.status} workspaceId={workspaceId} />
+          <Notice status={state.status} workspaceId={workspaceId} onRetry={threadWorkspace ? recheck : undefined} />
           <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy}
             disabled={loading || failed || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
         </div>
