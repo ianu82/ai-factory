@@ -403,5 +403,10 @@ def test_a_failed_turn_keeps_its_status_when_the_reader_stops_at_the_error(app_a
         for line in response.iter_lines():  # stop reading at the error frame, as the browser used to
             if line.startswith("data: ") and json.loads(line[6:])["type"] == "error":
                 break
-    saved = client.get(f"/api/mind/threads/{thread}").json()
+    import time
+    for _ in range(100):  # the server saves the turn as its stream ends, which can follow the reader stopping
+        saved = client.get(f"/api/mind/threads/{thread}").json()
+        if saved["messages"][1]["status"] != "streaming":
+            break
+        time.sleep(0.05)
     assert saved["messages"][1]["status"] == "failed" and saved["messages"][1]["text"] == "Partial answer"
