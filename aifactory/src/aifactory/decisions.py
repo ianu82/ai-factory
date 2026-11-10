@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from .db import utcnow
 from .events import record
 from .models import Decision, Message, Outcome, Plan, Task, User
-from .pipeline.orchestrator import orchestrator
+from .pipeline.orchestrator import ACTIVE_TASK, HUMAN_TASK, orchestrator
 from .pipeline.planning import approve_plan
 
 
@@ -181,3 +181,76 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     if pending_events is None:
         orchestrator.wake()
     return result
+
+
+def overrule(db: Session, decision: Decision, user: User, resolution: str, answer: str,
+             reason: str) -> dict[str, Any]:
+    """Correct a completed automatic verdict without replaying its work transitions.
+
+    The review link is a compare-and-swap as well as a row lock: SQLite ignores
+    FOR UPDATE, so two stale requests must still never create two corrections.
+    All audit, guidance and link writes commit together, before notifications.
+    """
+    from sqlalchemy import update
+    from .models import DecisionReview
+    from .work_services import publish_changes
+
+    original = db.query(Decision).filter(Decision.id == decision.id,
+        Decision.workspace_id == decision.workspace_id).populate_existing().with_for_update().one()
+    review = db.query(DecisionReview).filter(DecisionReview.decision_id == original.id,
+        DecisionReview.workspace_id == original.workspace_id).populate_existing().with_for_update().first()
+    if (original.status != "resolved" or not review or not review.finished_at
+            or review.state in ("pending", "running") or review.mode != "decide"
+            or review.effective_verdict not in ("decide", "send_back") or review.correction_decision_id):
+        raise DecisionError("This verdict is not available for overruling")
+    if not answer.strip() or not reason.strip():
+        raise DecisionError("A corrected answer and reason are required")
+    from .decision_judges import allowed_resolutions, question_fingerprint
+    if review.question_fingerprint and review.question_fingerprint != question_fingerprint(original):
+        raise DecisionError("The question has changed since this verdict")
+    if resolution not in allowed_resolutions(original):
+        raise DecisionError("Choose a safe resolution from the original question")
+    outcome = db.get(Outcome, original.outcome_id) if original.outcome_id else None
+    task = db.get(Task, original.task_id) if original.task_id else None
+    if ((original.outcome_id and (not outcome or outcome.workspace_id != original.workspace_id))
+            or (original.task_id and (not task or task.workspace_id != original.workspace_id))
+            or (task and outcome and task.outcome_id != outcome.id)):
+        raise DecisionError("Decision associations do not belong to this workspace")
+    now = utcnow()
+    attribution = {"source": "judge_correction", "supersedes": original.id,
+                   "review_id": review.id, "actor_id": user.id, "reason": reason.strip(),
+                   "corrected_at": now.isoformat() + "Z"}
+    correction = Decision(workspace_id=original.workspace_id, outcome_id=original.outcome_id,
+        task_id=original.task_id, kind=original.kind, title=original.title, body=original.body,
+        options=original.options, metadata_json=original.metadata_json, status="resolved",
+        resolution=resolution, comment=answer.strip(), resolved_by=user.id, resolved_at=now,
+        reusable=True, scope=original.scope, attribution=attribution)
+    db.add(correction)
+    db.flush()
+    claimed = db.execute(update(DecisionReview).where(DecisionReview.id == review.id,
+        DecisionReview.correction_decision_id.is_(None)).values(correction_decision_id=correction.id))
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise DecisionError("This verdict has already been corrected")
+    original.status = "superseded"
+    # Include work waiting on CI or a person, using the scheduler's lifecycle
+    # groups. Posting guidance must not resume it or replay approval transitions.
+    # Positive lists also exclude terminal and unknown states.
+    active_outcome = outcome and outcome.status in (
+        "planning", "running", "attention", "blocked", "needs_input", "awaiting_approval")
+    active_task = task is None or task.status in ACTIVE_TASK | HUMAN_TASK | {"pending"}
+    if active_outcome and active_task:
+        db.add(Message(workspace_id=original.workspace_id, outcome_id=outcome.id,
+            task_id=task.id if task else None, author_id=user.id, author_kind="user",
+            body=f"Correction to decision {original.id}: {answer.strip()}\nReason: {reason.strip()}",
+            attribution=attribution))
+    payload = record(original.workspace_id, "decision_overruled",
+        f"{user.name or user.email} corrected: {original.title}", actor=user.id,
+        outcome_id=original.outcome_id, task_id=original.task_id,
+        data={"decision_id": original.id, "correction_decision_id": correction.id, **attribution},
+        session=db, publish=False)
+    db.commit()
+    publish_changes([payload])
+    from .events import notify
+    notify(original.workspace_id, "decision", correction.id)
+    return {"ok": True, "correction_decision_id": correction.id}

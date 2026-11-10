@@ -337,6 +337,9 @@ export interface DecisionReview {
 }
 
 export interface Decision {
+  actionable?: boolean;
+  supersedes?: string | null;
+  correction?: { id: string; answer: string; resolved_by_name: string; resolved_at: string; attribution: { reason?: string } } | null;
   judge: DecisionReview | null;
   id: string;
   kind: string;

@@ -13,7 +13,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import update
+from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
 from . import definitions
@@ -23,7 +23,7 @@ from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
 from .db import get_db, utcnow
-from .decisions import DecisionError, resolve
+from .decisions import DecisionError, overrule, resolve
 from .events import bus, event_dict, notify, record
 from .fallbacks import available as fallback_credentials
 from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_credential as resolve_token
@@ -33,7 +33,7 @@ from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .model_checks import check_workspace_models
-from .models import (Artifact, Decision, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
+from .models import (Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
@@ -854,7 +854,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
                     {d.resolved_by for d in decisions if d.resolved_by} | ({o.created_by} if o.created_by else set())))}
     messages = db.query(Message).filter(Message.outcome_id == o.id).order_by(Message.created_at).all()
     events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
-    open_count = sum(1 for d in decisions if d.status == "open")
+    open_count = sum(S.actionable(d) for d in decisions)
     return {
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
@@ -992,8 +992,9 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
     _, member = _ws(db, user, workspace_id)
     decisions = db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "open").order_by(
         Decision.created_at).all()
-    outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({d.outcome_id for d in decisions if d.outcome_id}))}
-    tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_({d.task_id for d in decisions if d.task_id}))}
+    decisions = [d for d in decisions if S.actionable(d)]
+    outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id, Outcome.id.in_({d.outcome_id for d in decisions if d.outcome_id}))}
+    tasks = {t.id: t for t in db.query(Task).filter(Task.workspace_id == workspace_id, Task.id.in_({d.task_id for d in decisions if d.task_id}))}
     since = member.last_viewed_at
     recent = []
     if since:
@@ -1049,11 +1050,37 @@ async def resolve_decision(workspace_id: str, decision_id: str, body: Resolution
     return result
 
 
+class Overrule(BaseModel):
+    resolution: str = Field(min_length=1, max_length=60)
+    answer: str = Field(min_length=1, max_length=8000)
+    reason: str = Field(min_length=1, max_length=8000)
+
+
+@router.post("/workspaces/{workspace_id}/decisions/{decision_id}/overrule")
+def overrule_decision(workspace_id: str, decision_id: str, body: Overrule,
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    d = db.get(Decision, decision_id)
+    if d is None or d.workspace_id != workspace_id:
+        raise HTTPException(404, "Decision not found")
+    try:
+        return overrule(db, d, user, body.resolution, body.answer, body.reason)
+    except DecisionError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
 @router.get("/workspaces/{workspace_id}/decisions")
 def decision_library(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    rows = db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status != "open").order_by(
-        Decision.resolved_at.desc()).limit(300).all()
+    rows = db.query(Decision).filter(Decision.workspace_id == workspace_id,
+        (Decision.status != "open") | Decision.review.has(
+            (DecisionReview.workspace_id == workspace_id) & (DecisionReview.finished_at.is_not(None)) &
+            (DecisionReview.effective_verdict == "hold") &
+            DecisionReview.state.notin_(("pending", "running")))).order_by(
+        # Explicit NULL ordering keeps open held reviews ahead of history on
+        # both SQLite and Postgres, before the history limit is applied.
+        case((Decision.resolved_at.is_(None), 0), else_=1),
+        Decision.resolved_at.desc(), Decision.created_at.desc(), Decision.id).limit(300).all()
     names = {u.id: (u.name or u.email) for u in db.query(User).filter(User.id.in_({d.resolved_by for d in rows if d.resolved_by}))}
     return [S.decision(d, {"resolved_by_name": names.get(d.resolved_by or "", "")}) for d in rows]
 
@@ -1208,6 +1235,7 @@ def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = 
 def stats(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
     from .metrics import benchmark, first_attempt_result, workspace_metrics
+    from .decision_judges import judge_metrics
 
     outcomes = [o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id) if not benchmark(o)]
     outcome_ids = {o.id for o in outcomes}
@@ -1248,6 +1276,7 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
                                          if t.repo_id in repos else None) is True for t in merged)
     return {
         "metrics": metrics,
+        "decision_judges": judge_metrics(db, workspace_id),
         "outcomes": by_status,
         "tasks": {"total": len(tasks), "completed": sum(t.status == "completed" for t in tasks), "merged": len(merged),
                   "first_attempt": first_pass, "smoke_failed": sum(t.status == "smoke_failed" for t in tasks)},

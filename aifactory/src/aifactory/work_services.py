@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from . import events
 from .auth import require_member
 from .models import Decision, Message, Outcome, Run, Task, User
+from .serializers import actionable
 
 
 def target(db: Session, user: User, workspace_id: str, outcome_id: str,
@@ -64,5 +65,6 @@ def outcome_rows(db: Session, workspace_id: str, outcome_ids: list[str]) -> tupl
             runs.setdefault(r.outcome_id, []).append(r)
         for d in db.query(Decision).filter(Decision.workspace_id == workspace_id,
                                            Decision.outcome_id.in_(outcome_ids), Decision.status == "open"):
-            decisions[d.outcome_id] = decisions.get(d.outcome_id, 0) + 1
+            if actionable(d):
+                decisions[d.outcome_id] = decisions.get(d.outcome_id, 0) + 1
     return tasks, runs, decisions
