@@ -24,11 +24,11 @@ from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as re
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
+from ..outcome_settings import resolve_settings
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
-                      workspace_settings)
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent)
 
 from .lifecycle import transition
 
@@ -91,8 +91,15 @@ class TaskRunner:
             repo = s.get(Repository, task.repo_id)
             self.repo = Repository(**{c.name: getattr(repo, c.name) for c in Repository.__table__.columns})
         self.ws = self.task.workspace_id
-        self.settings = workspace_settings(self.ws)
+        self._refresh_settings()
         self.cfg = self.repo.config or {}
+
+    def _refresh_settings(self) -> None:
+        # Refresh only between sessions/actions, never restart an active agent or
+        # rewrite durable task worker fields on workstream reassignment.
+        with session_scope() as s:
+            outcome = s.get(Outcome, self.task.outcome_id)
+            self.settings = resolve_settings(s, outcome, repo_id=self.task.repo_id)["effective"]
 
     def update(self, **fields: Any) -> None:
         with session_scope() as s:
@@ -221,6 +228,7 @@ class TaskRunner:
                                     {"value": "take_over", "label": "I'll take it from here"},
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
+            self._refresh_settings()
             budget = self.settings["budgets"].get("outcome_usd")
             spent, known = outcome_cost(self.task.outcome_id)
             if budget and known and spent >= budget and not (self.task.evidence or {}).get("budget_override"):
@@ -229,6 +237,8 @@ class TaskRunner:
                            options=[{"value": "retry", "label": "Continue anyway"}, {"value": "abandon", "label": "Stop"}])
             if self.builder is None:
                 await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
+            self._refresh_settings()
+            self.task.harness = self.settings["harness"]["builder"]
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
@@ -443,6 +453,8 @@ class TaskRunner:
                 if qa_cfg.get("start"):
                     app = await self._start_app(sandbox, qa_cfg)
                     brief = verifier_brief(app)
+                self._refresh_settings()
+                self.task.verifier_harness = self.settings["harness"]["verifier"]
                 run, result, error = await run_agent(SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
@@ -947,12 +959,17 @@ class TaskRunner:
 
     # merge ---------------------------------------------------------------------
     def _merge_needs_approval(self) -> bool:
-        merge_policy = (self.cfg.get("merge") or {}).get("mode") or self.settings["autonomy"].get("merge", "auto")
-        release_cfg = self.cfg.get("release") or {}
-        releases_on_merge = release_cfg.get("mode") == "on_merge"
-        if releases_on_merge and self.settings["autonomy"].get("release") == "approval":
-            return True
-        return merge_policy != "auto"
+        self._refresh_settings()
+        return self.settings["autonomy"]["merge"] != "auto"
+
+    def _require_merge_approval(self) -> None:
+        if self._merge_needs_approval() and not self._approved("approve_merge"):
+            self.update(stage="merge")
+            self.block("approve_merge", f"Approve merge: {self.task.title}",
+                       f"PR #{self.task.pr_number} passed independent verification and CI at "
+                       f"{self.task.head_sha[:10]}. {self.task.pr_url}",
+                       status="awaiting_approval",
+                       options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
 
     def _approved(self, kind: str) -> bool:
         """An approval covers only the candidate that was published before it was given."""
@@ -981,13 +998,7 @@ class TaskRunner:
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()
                 return
-        if self._merge_needs_approval() and not self._approved("approve_merge"):
-            self.update(stage="merge")
-            self.block("approve_merge", f"Approve merge: {self.task.title}",
-                       f"PR #{self.task.pr_number} passed independent verification and CI at "
-                       f"{self.task.head_sha[:10]}. {self.task.pr_url}",
-                       status="awaiting_approval",
-                       options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
+        self._require_merge_approval()
         self.stage("merge", f"Merging PR #{self.task.pr_number}")
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
         refresh_onto: str | None = None
@@ -1014,6 +1025,7 @@ class TaskRunner:
                     try:
                         await self._claim_issues_before_merge(gh, pr)
                         self._guard()
+                        self._require_merge_approval()
                         method = (self.cfg.get("merge") or {}).get("method", "squash")
                         result = await gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
                                                 method=method, title=f"{self.task.title} (#{self.task.pr_number})")

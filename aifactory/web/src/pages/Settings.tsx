@@ -501,7 +501,7 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
             <label className="field"><span>Merge</span>
               <select className="select" value={form.merge_mode} disabled={!admin} onChange={(e) => setForm({ ...form, merge_mode: e.target.value })}>
                 <option value="">Workspace policy ({ws.settings.autonomy.merge === "auto" ? "automatic" : "approval"})</option>
-                <option value="auto">Always automatic</option><option value="approval">Always ask</option>
+                <option value="auto">Automatic when all policies allow</option><option value="approval">Always ask</option>
               </select></label>
             <label className="field"><span>Merge method</span>
               <select className="select" value={form.method} disabled={!admin} onChange={(e) => setForm({ ...form, method: e.target.value })}>

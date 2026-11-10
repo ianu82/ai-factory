@@ -1509,3 +1509,297 @@ def test_no_attachments_leave_shared_session_unchanged(factory, tmp_path, monkey
             assert run.status == "succeeded" and result and not error
 
     asyncio.run(go())
+
+
+def assign_stream(factory, outcome_id, **overrides):
+    from aifactory.models import Workstream
+
+    with session_scope() as s:
+        stream = Workstream(workspace_id=factory["ws"], owner_id=factory["user"], slug="policy",
+                            name="Policy", goal="Safe delivery", **overrides)
+        s.add(stream)
+        s.flush()
+        s.get(Outcome, outcome_id).workstream_id = stream.id
+        return stream.id
+
+
+def test_workstream_workers_use_fresh_independent_sessions(factory, monkeypatch):
+    from aifactory.harness import get_harness
+
+    outcome_id = new_outcome(factory)
+    assign_stream(factory, outcome_id, worker_override="anton")
+    # Exercise the real scripted harness path, recording the selected worker
+    # without needing external worker binaries/credentials.
+    workers = []
+
+    def harness(name):
+        workers.append(name)
+        return get_harness("native")
+
+    monkeypatch.setattr(runtime, "get_harness", harness)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+    assert workers == ["anton"] * 3
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.harness == task.verifier_harness == "anton"
+        runs = s.query(Run).filter_by(outcome_id=outcome_id).all()
+        assert {r.role for r in runs} == {"planner", "builder", "verifier"}
+        assert len({r.id for r in runs}) == 3
+
+
+@pytest.mark.parametrize("gate", ["plan", "merge", "budget"])
+def test_workstream_gates_pause_pipeline(factory, monkeypatch, gate):
+    outcome_id = new_outcome(factory)
+    overrides = {"outcome_budget_override": 0.000001} if gate == "budget" else {f"{gate}_approval_override": "approval"}
+    assign_stream(factory, outcome_id, **overrides)
+    if gate == "budget":
+        monkeypatch.setattr(delivery, "outcome_cost", lambda _: (1.0, True))
+
+    def waiting():
+        with session_scope() as s:
+            return s.query(Decision).filter_by(outcome_id=outcome_id, status="open").count() > 0
+
+    assert drive(waiting)
+    with session_scope() as s:
+        decisions = s.query(Decision).filter_by(outcome_id=outcome_id, status="open").all()
+        assert [d.kind for d in decisions] == [{"plan": "approve_plan", "merge": "approve_merge", "budget": "budget"}[gate]]
+        assert not FakeGitHub.merged
+        if gate != "plan":
+            task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+            assert task.status == ("needs_input" if gate == "budget" else "awaiting_approval")
+        else:
+            assert s.query(Task).filter_by(outcome_id=outcome_id).count() == 0
+
+
+@pytest.mark.parametrize("change", ["workspace", "workstream", "repository", "reassign"])
+def test_plan_policy_is_refreshed_after_agent_session(factory, monkeypatch, change):
+    from aifactory.models import Workstream
+
+    outcome_id = new_outcome(factory)
+    sid = assign_stream(factory, outcome_id)
+    original = planning.run_agent
+
+    async def changed(*args):
+        result = await original(*args)
+        with session_scope() as s:
+            if change == "workspace":
+                ws = s.get(Workspace, factory["ws"])
+                ws.settings = {**ws.settings, "autonomy": {"plan": "approval"}}
+            elif change == "workstream":
+                s.get(Workstream, sid).plan_approval_override = "approval"
+            elif change == "repository":
+                repo = s.get(Repository, factory["repo"])
+                repo.config = {**repo.config, "plan": {"mode": "approval"}}
+            else:
+                s.get(Outcome, outcome_id).workstream_id = None
+                ws = s.get(Workspace, factory["ws"])
+                ws.settings = {**ws.settings, "autonomy": {"plan": "approval"}}
+        return result
+
+    monkeypatch.setattr(planning, "run_agent", changed)
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    with session_scope() as s:
+        assert s.get(Outcome, outcome_id).status == "awaiting_approval"
+        assert s.query(Task).filter_by(outcome_id=outcome_id).count() == 0
+        assert s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_plan", status="open").count() == 1
+
+
+@pytest.mark.parametrize("change", ["workspace", "workstream", "repository", "reassign"])
+def test_merge_policy_is_refreshed_inside_lock_before_github_merge(factory, monkeypatch, change):
+    from aifactory.models import Workstream
+
+    outcome_id = new_outcome(factory)
+    sid = assign_stream(factory, outcome_id)
+    original = FakeGitHub.branch_sha
+
+    async def changed(self, *args):
+        sha = await original(self, *args)
+        with session_scope() as s:
+            if change == "workspace":
+                ws = s.get(Workspace, factory["ws"])
+                ws.settings = {**ws.settings, "autonomy": {"merge": "approval"}}
+            elif change == "workstream":
+                s.get(Workstream, sid).merge_approval_override = "approval"
+            elif change == "repository":
+                repo = s.get(Repository, factory["repo"])
+                repo.config = {**repo.config, "merge": {"mode": "approval"}}
+            else:
+                s.get(Outcome, outcome_id).workstream_id = None
+                ws = s.get(Workspace, factory["ws"])
+                ws.settings = {**ws.settings, "autonomy": {"merge": "approval"}}
+        return sha
+
+    monkeypatch.setattr(FakeGitHub, "branch_sha", changed)
+
+    def waiting():
+        with session_scope() as s:
+            return s.query(Task).filter_by(outcome_id=outcome_id, status="awaiting_approval").count() == 1
+
+    assert drive(waiting)
+    assert not FakeGitHub.merged
+    with session_scope() as s:
+        assert s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_merge", status="open").count() == 1
+
+
+@pytest.mark.parametrize("count", [1, 20])
+def test_scheduler_batches_workstream_priorities(factory, monkeypatch, count):
+    from sqlalchemy import event
+    from aifactory.models import Plan
+    from aifactory.db import init_engine
+
+    urgent = new_outcome(factory)
+    sid = assign_stream(factory, urgent, priority_override=0)
+    with session_scope() as s:
+        s.get(Outcome, urgent).priority = 3
+        for i in range(count):
+            o = Outcome(workspace_id=factory["ws"], number=100 + i, title="Queued", status="running",
+                        workstream_id=sid if i == count - 1 else None, priority=2)
+            s.add(o)
+            s.flush()
+            plan = Plan(outcome_id=o.id, version=1, content={})
+            s.add(plan)
+            s.flush()
+            s.add(Task(workspace_id=factory["ws"], outcome_id=o.id, plan_id=plan.id, repo_id=factory["repo"], key="T1",
+                       title="Task", spec="Test", status="queued"))
+        s.flush()
+        expected_task = s.query(Task).filter_by(outcome_id=o.id).one().id
+    queries = []
+
+    def query(conn, cursor, statement, parameters, context, executemany):
+        queries.append(statement.lower())
+
+    orch = Orchestrator()
+    planned, queued = [], []
+    monkeypatch.setattr(orch, "_spawn_plan", planned.append)
+    monkeypatch.setattr(orch, "_spawn_task", queued.append)
+    engine = init_engine()
+    event.listen(engine, "before_cursor_execute", query)
+    try:
+        orch._schedule()
+    finally:
+        event.remove(engine, "before_cursor_execute", query)
+    assert planned[0] == urgent
+    assert queued[0] == expected_task
+    assert sum("from workstreams" in q for q in queries) == 1
+    assert sum("workspaces.settings" in q for q in queries) == 1
+
+
+def test_release_on_merge_still_requires_candidate_approval(factory):
+    outcome_id = new_outcome(factory)
+    assign_stream(factory, outcome_id, merge_approval_override="auto")
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "merge": {"mode": "auto"}, "release": {"mode": "on_merge"}}
+
+    def waiting():
+        with session_scope() as s:
+            return s.query(Task).filter_by(outcome_id=outcome_id, status="awaiting_approval").count() == 1
+
+    assert drive(waiting)
+    assert not FakeGitHub.merged
+    with session_scope() as s:
+        assert s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_merge", status="open").count() == 1
+
+
+def test_reassignment_changes_next_sessions_not_active_or_terminal_tasks(factory, monkeypatch):
+    from aifactory.harness import get_harness
+    from aifactory.models import Workstream
+
+    outcome_id = new_outcome(factory)
+    sid = assign_stream(factory, outcome_id, worker_override="native")
+    original = delivery.run_agent
+    workers = []
+
+    async def run(spec, cancelled):
+        workers.append((spec.role, spec.harness))
+        if spec.role == "builder":
+            with session_scope() as s:
+                s.get(Workstream, sid).worker_override = "anton"
+                task = s.get(Task, spec.task_id)
+                # Reassignment/policy edits do not mutate an active session's
+                # snapshot or the stored worker of an already materialized task.
+                assert task.harness == "native"
+            assert spec.harness == "native"
+        return await original(spec, cancelled)
+
+    monkeypatch.setattr(delivery, "run_agent", run)
+    monkeypatch.setattr(runtime, "get_harness", lambda _: get_harness("native"))
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+    assert workers == [("builder", "native"), ("verifier", "anton")]
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.harness == task.verifier_harness == "native"
+        s.get(Outcome, outcome_id).workstream_id = None
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.status == "completed"
+        assert task.harness == task.verifier_harness == "native"
+
+
+def test_budget_continuation_survives_current_workstream_limit(factory, monkeypatch):
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    assign_stream(factory, outcome_id, outcome_budget_override=1)
+    with session_scope() as s:
+        s.get(Outcome, outcome_id).status = "running"
+        plan = Plan(outcome_id=outcome_id, status="approved")
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id,
+                    repo_id=factory["repo"], key="T1", title="Greeting", spec="Update greeting", acceptance=[CRITERION],
+                    status="queued", evidence={"budget_override": True})
+        s.add(task)
+    monkeypatch.setattr(delivery, "outcome_cost", lambda _: (100.0, True))
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+
+
+def test_workspace_role_defaults_apply_to_every_new_session(factory, monkeypatch):
+    from aifactory.harness import get_harness
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "harness": {"planner": "anton", "builder": "codex", "verifier": "native"}}
+    workers = []
+
+    def harness(name):
+        workers.append(name)
+        return get_harness("native")
+
+    monkeypatch.setattr(runtime, "get_harness", harness)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+    assert workers == ["anton", "codex", "native"]
+
+
+def test_retry_session_uses_current_workstream_worker(factory, monkeypatch):
+    from aifactory.harness import get_harness
+    from aifactory.models import Workstream
+
+    outcome_id = new_outcome(factory)
+    sid = assign_stream(factory, outcome_id, worker_override="native")
+    original = delivery.run_agent
+    workers = []
+    failed = False
+
+    async def run(spec, cancelled):
+        nonlocal failed
+        workers.append((spec.role, spec.harness))
+        result = await original(spec, cancelled)
+        if spec.role == "verifier" and not failed:
+            failed = True
+            with session_scope() as s:
+                s.get(Workstream, sid).worker_override = "anton"
+            result[1].report.update(verdict="fail", summary="Please retry", findings=[
+                {"severity": "major", "description": "Retry with current settings"}])
+        return result
+
+    monkeypatch.setattr(delivery, "run_agent", run)
+    monkeypatch.setattr(runtime, "get_harness", lambda _: get_harness("native"))
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+    assert workers == [("builder", "native"), ("verifier", "native"), ("builder", "anton"), ("verifier", "anton")]

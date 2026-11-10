@@ -17,7 +17,7 @@ from typing import Any
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..models import Outcome, Task, Workspace
+from ..models import Outcome, Task, Workspace, Workstream
 from ..sandbox import host_capacity
 from .delivery import Stop, TaskRunner
 from .lifecycle import transition
@@ -393,14 +393,25 @@ class Orchestrator:
         with session_scope() as s:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
-            planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
-                        for o in s.query(Outcome).filter(Outcome.status == "planning")]
-            queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
+            planning_rows = s.query(Outcome).filter(Outcome.status == "planning").all()
+            queued_rows = (s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
+                           .filter(Task.status == "queued").all())
+            # One batch for both queues; full policy resolution is intentionally
+            # reserved for execution paths, not N scheduler candidates per tick.
+            stream_ids = {o.workstream_id for o in planning_rows + [o for _, o in queued_rows] if o.workstream_id}
+            priorities = {(w.workspace_id, w.id): w.priority_override for w in s.query(Workstream).filter(
+                Workstream.id.in_(stream_ids), Workstream.priority_override.is_not(None))}
+
+            def priority(o):
+                return priorities.get((o.workspace_id, o.workstream_id), o.priority)
+
+            planning = [Candidate(o.id, o.workspace_id, priority(o), o.created_by, o.created_at)
+                        for o in planning_rows]
+            queued = [Candidate(t.id, t.workspace_id, priority(o), o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
-                      for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Task.status == "queued")]
+                      for t, o in queued_rows]
             planning_by_ws: dict[str, int] = {}
             for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1
