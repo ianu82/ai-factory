@@ -386,10 +386,14 @@ async def test_utc_midnight_resets_exhausted_budget(world, monkeypatch):
         assert store.usage(db, ids[0])["daily_spend"]["usd"] == .1
 
 
-def test_unregistered_application_router():
+def test_application_registers_the_mind_routers():
     from aifactory.app import create_app
+    from aifactory.mind.runtime import EngineRuntime
     app = create_app(start_orchestrator=False)
-    assert not any(getattr(route, "path", "") == "/api/mind/threads" for route in app.routes)
+    paths = {getattr(route, "path", "") for route in app.routes}
+    assert {"/api/mind/threads", "/api/mind/status", "/api/mind/threads/{thread_id}/messages",
+            "/api/mind/threads/{thread_id}/actions/{action_id}/confirm"} <= paths
+    assert isinstance(app.state.mind_runtime, EngineRuntime)
 
 
 @pytest.mark.parametrize("endpoint,payload", [

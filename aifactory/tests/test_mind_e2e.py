@@ -218,6 +218,25 @@ class FakeLedger:
         self.reconciled += 1
 
 
+def test_card_edits_and_confirmations_use_the_workspace_secret_scrub(app_as, people):
+    client, app, _ = app_as
+    app.state.mind_runtime = ProposingRuntime(people)
+    opaque = "opaque-workspace-secret-0001"  # no credential pattern would recognize it
+    with SessionLocal() as db:
+        db.add(Secret(workspace_id=people["first"], kind="github_token", ciphertext=encrypt(opaque)))
+        db.commit()
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    card = next(e["data"]["card"] for e in send(client, thread, "Retry T1?") if e["type"] == "action_card")
+    base = f"/api/mind/threads/{thread}/actions/{card['id']}"
+    edited = client.patch(base, json={"expected_revision": 1, "text": f"Use {opaque} please"})
+    assert edited.status_code == 200, edited.text
+    assert opaque not in edited.text and "[redacted]" in edited.json()["fields"]["text"]
+    with SessionLocal() as db:
+        assert opaque not in json.dumps(db.get(MindAction, card["id"]).fields)
+    confirmed = client.post(f"{base}/confirm", json={"expected_revision": 2})
+    assert confirmed.status_code == 200 and opaque not in confirmed.text
+
+
 def test_the_runtime_adapter_builds_one_turn(people):
     provider = FakeProvider()
     engine = FakeEngine(provider)

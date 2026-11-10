@@ -194,13 +194,35 @@ class ConfirmBody(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+def _private(db: Session, user: User, thread_id: str) -> tuple:
+    """The thread API's own access rule and egress scrub (owner, every scoped workspace still a membership; the
+    current secrets of the person's workspaces), applied to card edits and confirmations too."""
+    from . import store
+    from .api import scrub, secrets_for
+
+    thread = store.owned(db, user.id, thread_id)
+    secrets = secrets_for(db, user.id, thread.workspace_ids)
+    return (lambda value: scrub(value, secrets)), thread
+
+
 @router.patch("/{thread_id}/actions/{action_id}")
 def patch_action(thread_id: str, action_id: str, body: EditBody,
                  user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return edit(Context(db, user.id, thread_id), action_id, body.expected_revision, text=body.text, dismiss=body.dismiss)
+    clean_value, _ = _private(db, user, thread_id)
+    text = clean_value(body.text) if body.text is not None else None
+    return clean_value(edit(Context(db, user.id, thread_id), action_id, body.expected_revision, text=text,
+                            dismiss=body.dismiss))
 
 
 @router.post("/{thread_id}/actions/{action_id}/confirm")
 def confirm_action(thread_id: str, action_id: str, body: ConfirmBody,
                    user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return confirm(Context(db, user.id, thread_id), action_id, body.expected_revision)
+    clean_value, _ = _private(db, user, thread_id)
+    action = db.query(MindAction).filter_by(id=action_id, thread_id=thread_id, owner_id=user.id).one_or_none()
+    if action is not None and action.status == "pending":
+        # A secret saved after the card was proposed is still never posted to shared work.
+        fields = clean_value(action.fields)
+        if fields != action.fields:
+            action.fields = fields
+            db.commit()
+    return clean_value(confirm(Context(db, user.id, thread_id), action_id, body.expected_revision))

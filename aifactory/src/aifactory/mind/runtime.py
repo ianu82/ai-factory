@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from ..db import SessionLocal
 from ..models import MindCharge, Workspace
 from .actions import execution_results
+from .api import scrub, secrets_for
 from .contracts import TurnContext
 from .engine import MindEngine
 from .provider import MindUnavailable, Readiness, _ProviderStop
@@ -103,7 +104,9 @@ class EngineRuntime:
             raise ValueError("A Mind turn needs the person's message last")
         prior = [{"role": m["role"], "content": m["text"]} for m in messages[:-1] if (m.get("text") or "").strip()]
         with SessionLocal() as db:
-            results = execution_results(Context(db, context.user_id, context.thread_id))
+            # Confirmed results go to the provider: the same workspace-secret scrub as every other egress.
+            results = scrub(execution_results(Context(db, context.user_id, context.thread_id)),
+                            secrets_for(db, context.user_id, context.workspace_ids))
             workspaces = [{"id": w.id, "name": w.name} for w in
                           db.query(Workspace).filter(Workspace.id.in_(context.workspace_ids)).order_by(Workspace.name)]
         bridge = LedgerBridge(ledger)
