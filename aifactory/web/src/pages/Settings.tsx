@@ -145,7 +145,8 @@ function Models() {
   const save = useSaveSettings();
   const s = ws.settings;
   const admin = ws.role === "owner" || ws.role === "admin";
-  const models = useQuery({ queryKey: ["models", ws.id], queryFn: () => api<{ provider: string | null; label?: string; models: string[]; error?: string }>(`/api/workspaces/${ws.id}/models`) });
+  // Keyed by the configured provider too, so switching it re-resolves the provider and its catalog.
+  const models = useQuery({ queryKey: ["models", ws.id, s.provider], queryFn: () => api<{ provider: string | null; label?: string; models: string[]; error?: string }>(`/api/workspaces/${ws.id}/models`) });
   const [m, setM] = useState(s.models);
   useEffect(() => setM(s.models), [s.models]);
   const fingerprint = JSON.stringify([ws.id, s.provider, s.models]);
@@ -189,7 +190,7 @@ function Models() {
             <label key={role} className="field">
               <span>{role === "default" ? "Default model" : role === "plan_reviewer" ? "Plan reviewer" : `${role[0].toUpperCase()}${role.slice(1)}`}</span>
               <select className="select" value={m[role] || ""} disabled={!admin} onChange={(e) => { invalidateCheck(); setM({ ...m, [role]: e.target.value || undefined }); }}>
-                {role !== "default" && <option value="">{role !== "plan_reviewer" ? "Use default" : s.provider === "mindshub" ? "Use opus-5-5" : "Use the verifier's model"}</option>}
+                {role !== "default" && <option value="">{role !== "plan_reviewer" ? "Use default" : (models.data?.provider || s.provider) === "mindshub" ? "Use opus-5-5" : "Use the verifier's model"}</option>}
                 {options.map((o) => <option key={o} value={o}>{o}</option>)}
               </select>
               {role === "plan_reviewer" && <span className="hint">Reviews every plan before building starts, unless a person approves plans.</span>}
