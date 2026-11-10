@@ -10,7 +10,7 @@ import { Dot, Empty, GateTrack, Skeleton } from "../ui";
 import type { Task } from "../api";
 import { OutcomeDetail } from "../components/OutcomeDetail";
 import { SetupNotice, useSetupState } from "../components/Setup";
-import { BOARD_COLUMNS, boardColumns } from "../outcomesBoard";
+import { BOARD_COLUMNS, boardColumns, isQueued } from "../outcomesBoard";
 
 const FILTERS: { key: string; label: string; match: (o: Outcome) => boolean }[] = [
   { key: "active", label: "Active", match: (o) => ["planning", "running", "awaiting_approval", "needs_input", "attention", "blocked"].includes(o.status) },
@@ -111,8 +111,7 @@ export function OutcomesPage() {
 }
 
 function OutcomeRow({ o, selected, onSelect, repos }: { o: Outcome; selected: boolean; onSelect: () => void; repos: string[] }) {
-  // Planned but no task has left the queue yet: every task waits for a free slot or for its dependencies.
-  const queued = o.status === "running" && o.progress.total > 0 && o.progress.started === 0;
+  const queued = isQueued(o);
   const s = queued ? { label: "Queued", tone: "idle" as const }
     : OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
   return (
@@ -171,8 +170,7 @@ function Board({ outcomes, selected, onSelect }: { outcomes: Outcome[]; selected
 }
 
 function BoardCard({ o, selected, onSelect }: { o: Outcome; selected: boolean; onSelect: () => void }) {
-  const queued = o.status === "running" && o.progress.total > 0 && o.progress.started === 0;
-  const s = queued ? { label: "Queued", tone: "idle" as const } : OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
+  const s = isQueued(o) ? { label: "Queued", tone: "idle" as const } : OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
   return (
     <li className={`board-card ${selected ? "selected" : ""}`} onClick={onSelect} tabIndex={0} aria-selected={selected}
       onKeyDown={(e) => e.key === "Enter" && onSelect()}>
