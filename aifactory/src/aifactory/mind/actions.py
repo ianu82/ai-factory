@@ -222,9 +222,14 @@ def confirm_action(thread_id: str, action_id: str, body: ConfirmBody,
     clean_value, _ = _private(db, user, thread_id)
     action = db.query(MindAction).filter_by(id=action_id, thread_id=thread_id, owner_id=user.id).one_or_none()
     if action is not None and action.status == "pending":
-        # A secret saved after the card was proposed is still never posted to shared work.
+        # A secret saved after the card was proposed is still never posted to shared work. The rewrite is a
+        # compare-and-swap on the revision the person is confirming, so a concurrent edit is never overwritten
+        # (a changed revision then fails the confirmation's own claim with 409).
         fields = clean_value(action.fields)
         if fields != action.fields:
-            action.fields = fields
+            db.execute(update(MindAction).where(MindAction.id == action.id, MindAction.status == "pending",
+                                                MindAction.revision == body.expected_revision).values(fields=fields),
+                       execution_options={"synchronize_session": False})
             db.commit()
+            db.expire(action)
     return clean_value(confirm(Context(db, user.id, thread_id), action_id, body.expected_revision))
