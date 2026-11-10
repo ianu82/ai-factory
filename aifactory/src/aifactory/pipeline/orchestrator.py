@@ -48,6 +48,9 @@ class Orchestrator:
         self._stopping = False
         self._last_signal_sync = float("-inf")
         self._linear_task: asyncio.Task | None = None
+        from ..operator_relay import Relay
+
+        self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -135,6 +138,7 @@ class Orchestrator:
                 await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
+                await self._relay.maybe_poll()
                 await self._maybe_inventory()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")

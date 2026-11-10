@@ -99,3 +99,29 @@ steps, and exits non-zero on a failure.
      release and then promotes the fix. It never promotes the marked commit again, even though staging ran it.
 - **Merging.** Merge one pull request at a time and confirm `main`'s CI on it before the next. Two individually
   green pull requests can still break `main` together, and staging shows it before production does.
+
+## Operator relays without a restart
+
+Bootstrap `resolve`, `guidance`, `retry` and `cancel` items apply only when production starts, which now happens
+only on a release. To act sooner, post the same items as a command on the control issue the bootstrap names:
+
+```json
+"control": {"repository": "ianu82/ai-factory", "issue": 123, "operators": ["ianu82"]}
+```
+
+A command is an issue comment that starts with `/factory` and holds one fenced `json` block, for example:
+
+    /factory
+    ```json
+    {"resolve": [{"outcome": 39, "task": "T1", "kind": "approve_merge", "resolution": "reject",
+                  "head": "5591799", "comment": "Codex P1: scrub the whole payload once, at the boundary."}],
+     "guidance": [{"outcome": 39, "task": "T1", "body": "..."}],
+     "retry": [{"outcome": 20}]}
+    ```
+
+The Factory polls the issue every 30 seconds, applies the items with the bootstrap's own rules (the `head` guard,
+relays only outside the bootstrap workspace, a live `cancel` never discards started work), and replies with
+what it applied or skipped. Nonces are optional; the comment id supplies them, so each command applies once.
+Only listed operator logins with write access to the repository count, and a command first seen more than a
+day after it was posted is not applied. The Factory uses the GitHub access it already has; no new credential is
+involved. Keep the control issue free of labels that intake reads (`factory`, `factory:auto`).
