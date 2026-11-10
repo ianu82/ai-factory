@@ -174,7 +174,9 @@ export class MindController {
   async checkStatus(workspace: string) {
     const status = this.transport.status;
     if (!status) return;
-    await this.request((s) => status.call(this.transport, workspace, s), (value) => this.update({ status: value }));
+    // A check that fails (offline, timed out, access changed) is a definite answer too: Mind can't answer now.
+    await this.request((s) => status.call(this.transport, workspace, s), (value) => this.update({ status: value }),
+      (message) => this.update({ status: { model: null, available: false, reason: `Couldn't check whether Mind can answer (${message}).`, budget_state: "ok" } }));
   }
   /** Leave the current conversation (a new one starts on the next send). */
   leave() { this.cancel(); this.update({ active: null, messages: [], error: "", steps: [], startedAt: null }); }

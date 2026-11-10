@@ -24,13 +24,14 @@ function blockedReason(status: MindStatus | null): string | null {
   return null;
 }
 
-function Notice({ status, workspaceId }: { status: MindStatus | null; workspaceId: string }) {
+function Notice({ status, workspaceId, onRetry }: { status: MindStatus | null; workspaceId: string; onRetry?: () => void }) {
   const reason = blockedReason(status);
   if (!reason) return null;
   const settings = /key|budget|setting/i.test(reason);
   return <div className="mind-notice" role="status">
     <span>{reason}</span>
-    {settings && <Link to={`/w/${workspaceId}/settings`} className="btn sm ghost">Open Settings</Link>}
+    {settings ? <Link to={`/w/${workspaceId}/settings`} className="btn sm ghost">Open Settings</Link>
+      : onRetry && <button type="button" className="btn sm ghost" onClick={onRetry}>Check again</button>}
   </div>;
 }
 
@@ -69,7 +70,7 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
   return <div className="mind-home">
     <div className="mind-home-column">
       <h1>My Mind</h1>
-      <Notice status={state.status} workspaceId={workspaceId} />
+      <Notice status={state.status} workspaceId={workspaceId} onRetry={() => void controller.checkStatus(workspaceId)} />
       <MindComposer ref={composer} large autoFocus onSend={start} disabled={!!reason || starting || checking}
         disabledReason={starting ? "Starting…" : checking ? "Checking that Mind can answer…" : reason || undefined}
         placeholder="Plan a feature together and hand it to the Factory to build, or ask what’s stuck and why…" />

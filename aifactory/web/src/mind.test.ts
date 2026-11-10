@@ -474,3 +474,15 @@ test("a new conversation opens only when its first message can be sent", async (
   transport.create = async () => ({ ...history(), messages: [] });
   assert.equal(await c.start("billing", "Hello"), "t1");
 });
+
+test("a failed readiness check ends as unavailable with its reason, never checking forever", async () => {
+  const { controller: c, transport } = harness();
+  transport.status = async () => { throw new Error("offline"); };
+  await c.checkStatus("billing");
+  const status = c.getSnapshot().status!;
+  assert.equal(status.available, false);
+  assert.match(status.reason || "", /offline/);
+  transport.status = async () => history().status;
+  await c.checkStatus("billing");
+  assert.equal(c.getSnapshot().status?.available, true);
+});
