@@ -143,8 +143,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                 task.status, task.stage, task.blocked_reason = "queued", "revert", ""
             elif resolution in ACCEPTING:
                 task.blocked_reason = ""
-                if accepted_after_merge(task):
-                    completed.append(complete_accepted(db, task, user.name or user.email))
+                if accepted_after_merge(task) and (event := complete_accepted(db, task, user.name or user.email)):
+                    completed.append(event)
                 if resolution == "fix":
                     from .signals import outcome_from_text
 
@@ -176,6 +176,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         db.commit()
         from .work_services import publish_changes
         publish_changes([*completed, payload])
+        for event in completed:  # normal completion settles the outcome's source issues too
+            orchestrator.settle_later(event["task_id"])
     result: dict[str, Any] = {"ok": True}
     if dropped and task and task.pr_number:
         result["dropped"] = dropped

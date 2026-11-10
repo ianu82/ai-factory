@@ -23,6 +23,7 @@ from . import definitions
 from .db import utcnow
 from .events import notify, record
 from .models import Decision, Event, Outcome, Repository, Run, Signal, Task, User, Workspace
+from .pipeline.lifecycle import failed_after_merge
 from .pipeline.runtime import merged_settings
 from .signals import fingerprint
 
@@ -87,11 +88,8 @@ def _merge_streaks(db: Session, ws: Workspace, repos: dict[str, Repository]) -> 
             continue
         streak = []
         for d, task in rows:  # newest first
-            ev = task.evidence or {}
             # A merge whose post-merge checks failed ends the streak, even after a person accepted the failure.
-            if (d.resolution != "approve" or task.status in ("smoke_failed", "reverted")
-                    or (ev.get("smoke") or {}).get("state") == "failed"
-                    or (ev.get("release") or {}).get("state") == "unhealthy"):
+            if d.resolution != "approve" or task.status in ("smoke_failed", "reverted") or failed_after_merge(task):
                 break
             streak.append((d, task))
         if len(streak) < 5:

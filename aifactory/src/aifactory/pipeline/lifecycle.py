@@ -6,6 +6,7 @@ predicate belongs on the UPDATE, not just on the preceding ORM read.
 from __future__ import annotations
 
 from sqlalchemy import exists, update
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..models import Outcome, Task, Workspace
 
@@ -36,16 +37,32 @@ def accepted_after_merge(task: Task) -> bool:
             and not (task.evidence or {}).get("revert_candidate"))
 
 
-def complete_accepted(session, task: Task, by: str) -> dict:
+def failed_after_merge(task: Task) -> bool:
+    """Whether the task's recorded post-merge smoke or release check failed (it stays on record once accepted)."""
+    ev = task.evidence or {}
+    return (ev.get("smoke") or {}).get("state") == "failed" or (ev.get("release") or {}).get("state") == "unhealthy"
+
+
+def complete_accepted(session, task: Task, by: str) -> dict | None:
     """Complete a merged task whose failed post-merge check a person accepted, so the tasks depending on it start.
-    Returns the unpublished event; the caller publishes it after committing."""
+    The update is guarded like transition(): a task stopped or an outcome cancelled meanwhile is left alone and None
+    is returned. Otherwise returns the unpublished event; the caller publishes it after committing."""
     from ..db import utcnow
     from ..events import record
 
     check = "release check" if task.stage == "release" else "smoke checks"
     summary = f"Merged; {by} accepted the failed post-merge {check}"
-    task.status, task.stage, task.blocked_reason, task.lease_owner = "completed", "done", "", ""
-    task.finished_at = utcnow()
-    task.summary = summary
+    fields = {"status": "completed", "stage": "done", "blocked_reason": "", "lease_owner": "",
+              "finished_at": utcnow(), "summary": summary}
+    result = session.execute(
+        update(Task).where(
+            Task.id == task.id, Task.status == "smoke_failed", Task.stage == task.stage,
+            exists().where(Outcome.id == Task.outcome_id, Outcome.status != "cancelled"),
+        ).values(**fields).execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return None
+    for key, value in fields.items():
+        set_committed_value(task, key, value)
     return record(task.workspace_id, "task_completed", f"{task.key} complete: {summary}", outcome_id=task.outcome_id,
                   task_id=task.id, level="success", session=session, publish=False)
