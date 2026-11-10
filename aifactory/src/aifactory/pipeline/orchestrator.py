@@ -20,7 +20,8 @@ from ..events import notify, record
 from ..models import Decision, Outcome, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, purge_quarantine, quarantine_orphaned_jobs
 from .delivery import Stop, TaskRunner
-from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, failed_after_merge, transition
+from .lifecycle import (ACCEPTED_SUMMARY, ACCEPTING, SETTLE, accepted_after_merge, complete_accepted,
+                        failed_after_merge, transition)
 from .planning import plan_outcome
 from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
 from .scheduling import Candidate, RequesterTurns
@@ -90,7 +91,20 @@ class Orchestrator:
             try:
                 await TaskRunner(task_id, asyncio.Event(), self.repo_lock)._settle_issues()
             except Exception:  # noqa: BLE001 - bookkeeping must never stop the scheduler
-                log.exception("issue settlement failed for %s", task_id)
+                log.exception("issue settlement failed for %s; it is retried at the next startup", task_id)
+                continue
+            with session_scope() as s:
+                task = s.get(Task, task_id)
+                if task is not None and (task.evidence or {}).get(SETTLE):
+                    task.evidence = {k: v for k, v in task.evidence.items() if k != SETTLE}
+
+    def _recover_settlements(self) -> None:
+        """Accepted completions whose issue settlement a restart interrupted are settled on the first tick."""
+        with session_scope() as s:
+            for task in (s.query(Task).filter(Task.status == "completed", Task.summary.like(ACCEPTED_SUMMARY))
+                         .all()):
+                if (task.evidence or {}).get(SETTLE):
+                    self._settle.add(task.id)
 
     def wake(self) -> None:
         try:
@@ -119,6 +133,7 @@ class Orchestrator:
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
         self._complete_accepted()
+        self._recover_settlements()
 
     def _complete_accepted(self) -> None:
         """Repair: acknowledging (or opening a fix for) a failed post-merge check used to leave the merged task

@@ -28,6 +28,9 @@ def transition(session, task: Task, **fields) -> bool:
 
 # A person acknowledging a failed post-merge check, or opening a fix outcome for it, accepts the merged change.
 ACCEPTING = ("acknowledge", "fix")
+# Evidence flag: an accepted completion whose source issues still need settling (TaskRunner._settle_issues).
+SETTLE = "settle_issues_pending"
+ACCEPTED_SUMMARY = "Merged; % accepted the failed post-merge %"  # SQL LIKE pattern for complete_accepted's summary
 
 
 def accepted_after_merge(task: Task) -> bool:
@@ -52,8 +55,9 @@ def complete_accepted(session, task: Task, by: str) -> dict | None:
 
     check = "release check" if task.stage == "release" else "smoke checks"
     summary = f"Merged; {by} accepted the failed post-merge {check}"
+    # The pending issue settlement is stored with the completion, so a restart before it runs doesn't lose it.
     fields = {"status": "completed", "stage": "done", "blocked_reason": "", "lease_owner": "",
-              "finished_at": utcnow(), "summary": summary}
+              "finished_at": utcnow(), "summary": summary, "evidence": {**(task.evidence or {}), SETTLE: True}}
     result = session.execute(
         update(Task).where(
             Task.id == task.id, Task.status == "smoke_failed", Task.stage == task.stage,

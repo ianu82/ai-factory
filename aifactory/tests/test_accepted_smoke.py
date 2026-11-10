@@ -9,7 +9,7 @@ from aifactory.db import session_scope, utcnow
 from aifactory.decisions import resolve
 from aifactory.models import Decision, Event, Outcome, Plan, Task, User
 from aifactory.pipeline.delivery import TaskRunner
-from aifactory.pipeline.lifecycle import complete_accepted
+from aifactory.pipeline.lifecycle import SETTLE, complete_accepted
 from aifactory.pipeline.orchestrator import Orchestrator, orchestrator
 
 from .test_pipeline import factory, new_outcome  # noqa: F401 - workspace, repository and user fixture
@@ -146,9 +146,50 @@ def test_accepted_completion_settles_source_issues(factory, monkeypatch):
     with session_scope() as s:
         resolve(s, s.get(Decision, did), s.get(User, factory["user"]), "acknowledge")
     assert orchestrator._settle == {first}
+    with session_scope() as s:
+        assert s.get(Task, first).evidence[SETTLE]  # stored with the completion
     asyncio.run(orchestrator._settle_accepted())
     assert settled == [first]
     assert not orchestrator._settle
+    with session_scope() as s:
+        assert SETTLE not in s.get(Task, first).evidence
+        assert s.get(Task, first).evidence["smoke"]["state"] == "failed"
+
+
+def test_a_restart_before_settlement_still_settles(factory, monkeypatch):
+    _, first, _, did = merged_with_dependent(factory)
+    with session_scope() as s:
+        resolve(s, s.get(Decision, did), s.get(User, factory["user"]), "acknowledge")
+    orchestrator._settle.clear()  # the process stopped before its next tick
+    restarted = Orchestrator()
+    restarted._recover()
+    assert restarted._settle == {first}
+
+    async def settle(self):
+        pass
+
+    monkeypatch.setattr(TaskRunner, "_settle_issues", settle)
+    asyncio.run(restarted._settle_accepted())
+    again = Orchestrator()
+    again._recover()
+    assert not again._settle  # settled once, never again
+
+
+def test_a_failed_settlement_is_retried_at_the_next_startup(factory, monkeypatch):
+    _, first, _, did = merged_with_dependent(factory)
+
+    async def fail(self):
+        raise RuntimeError("GitHub unreachable")
+
+    monkeypatch.setattr(TaskRunner, "_settle_issues", fail)
+    orchestrator._settle.clear()
+    with session_scope() as s:
+        resolve(s, s.get(Decision, did), s.get(User, factory["user"]), "acknowledge")
+    asyncio.run(orchestrator._settle_accepted())
+    assert not orchestrator._settle  # no retry loop within the process
+    restarted = Orchestrator()
+    restarted._recover()
+    assert restarted._settle == {first}
 
 
 def test_outcome_summary_says_a_failed_check_was_accepted(factory):
