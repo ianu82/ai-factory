@@ -378,10 +378,17 @@ class Releaser:
         if staging.get("ok") and commit and started is not None:
             try:
                 # Smoke the exact tree staging runs now, so an older commit is only ever promoted on a smoke result
-                # from when that commit itself was deployed.
-                self._note_staged(commit, started, smoke_ok=not smoke(self.web, self.cfg.staging_url))
+                # from when that commit itself was deployed. A deploy that starts during the smoke run makes the
+                # result belong to neither commit, so only the start is recorded then.
+                passed = not smoke(self.web, self.cfg.staging_url)
+                self._note_staged(commit, started, smoke_ok=passed if self._still_running(commit, started) else None)
             except (ReleaseError, httpx.HTTPError) as exc:
                 self.step(f"Could not record staging's commit: {exc}")
+
+    def _still_running(self, commit: str, started: datetime | None) -> bool:
+        """Whether staging still runs the same deployment (commit and start) it reported before a smoke run."""
+        again = _health(self.web, self.cfg.staging_url)
+        return bool(again.get("ok")) and again.get("commit") == commit and _time(again.get("started_at")) == started
 
     def _production(self) -> dict[str, Any]:
         """Production's health, asked again over a few minutes while it does not answer: a restart or a slow
@@ -564,8 +571,7 @@ class Releaser:
             return Result("failed", "Staging smoke failed: " + "; ".join(problems), chosen, current)
         self.step("Staging smoke checks passed")
 
-        again = _health(self.web, cfg.staging_url)
-        if not again.get("ok"):
+        if not self._still_running(candidate, started):
             return Result("held", "Staging changed during the check; trying again next run.", chosen, current)
         candidate = chosen
 

@@ -60,6 +60,8 @@ class World:
                        {"name": "postgres", "status": "completed", "conclusion": "success"}]
         self.asset_status = 200
         self.me_status = 401
+        self.smoke_runs = 0
+        self.redeploy_at: tuple[int, dict] | None = None  # (nth smoke run, staging health from then on)
         self.store: list[dict] = []  # every issue: number, title, labels, created_at, state
         self.labels: set[str] = set()
         self.issues: list[dict] = []  # bodies of issues the checker opened
@@ -163,7 +165,10 @@ class World:
             return httpx.Response(self.asset_status, text="x" * 5000)
         if url == f"{STAGING}/api/meta":
             return httpx.Response(200, json={"auth": {"api_key": True}})
-        if url == f"{STAGING}/api/me":
+        if url == f"{STAGING}/api/me":  # the last request of a smoke run
+            self.smoke_runs += 1
+            if self.redeploy_at and self.redeploy_at[0] == self.smoke_runs:
+                self.staging = self.redeploy_at[1]
             return httpx.Response(self.me_status, json={"detail": "Not signed in"})
         return httpx.Response(404)
 
@@ -293,6 +298,20 @@ def test_a_smoke_failure_sticks_until_staging_restarts_the_commit(world):
     world.staging["started_at"] = iso(NOW + timedelta(minutes=1))
     world.run()
     assert world.staged[NEW].endswith("smoke passed")
+
+
+def test_a_deploy_during_the_smoke_run_records_no_smoke_result(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    world.redeploy_at = (1, {"ok": True, "commit": OTHER, "started_at": iso(NOW)})
+    world.run()
+    assert world.staged[NEW] == f"Staging since {iso(NOW - timedelta(minutes=45))}"  # start only, no smoke verdict
+
+
+def test_a_deploy_during_the_promotion_smoke_holds_the_release(world):
+    world.redeploy_at = (2, {"ok": True, "commit": OTHER, "started_at": iso(NOW)})
+    result = world.run()
+    assert result.status == "held" and "changed during the check" in result.detail
+    assert world.patches == []
 
 
 def test_a_restart_of_the_same_commit_resets_its_soak(world):
