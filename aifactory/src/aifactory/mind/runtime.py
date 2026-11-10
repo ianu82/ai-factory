@@ -20,7 +20,7 @@ from .api import scrub, secrets_for
 from .contracts import TurnContext
 from .engine import MindEngine
 from .provider import MindUnavailable, Readiness, _ProviderStop
-from .store import AccountingError
+from .store import AccountingError, memberships
 from .tools import Context
 
 # MindsHub can report a just-finished send's cost a moment late; wait this long before calling usage unknown.
@@ -107,8 +107,10 @@ class EngineRuntime:
             # Confirmed results go to the provider: the same workspace-secret scrub as every other egress.
             results = scrub(execution_results(Context(db, context.user_id, context.thread_id)),
                             secrets_for(db, context.user_id, context.workspace_ids))
-            workspaces = [{"id": w.id, "name": w.name} for w in
-                          db.query(Workspace).filter(Workspace.id.in_(context.workspace_ids)).order_by(Workspace.name)]
+            # The person's current memberships, including workspaces joined after the thread began (a read in one
+            # widens the thread scope, so revoking it later still hides the thread).
+            workspaces = [{"id": w.id, "name": w.name} for w in db.query(Workspace).filter(
+                Workspace.id.in_(memberships(db, context.user_id))).order_by(Workspace.name)]
         bridge = LedgerBridge(ledger)
         ready = await self.provider.readiness(context.billing_workspace_id, bridge, session_id=ledger.session_id)
         if not ready.available:

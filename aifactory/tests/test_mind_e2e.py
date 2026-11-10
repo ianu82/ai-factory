@@ -165,7 +165,9 @@ def test_a_proposed_action_runs_once_only_after_confirmation(app_as, people):
         assert db.query(MindAction).filter_by(id=card["id"]).one().status == "succeeded"
     # The confirmed result is on the saved card after a reload, and the next turn still sees the conversation.
     view = client.get(f"/api/mind/threads/{thread}").json()
-    assert view["messages"][1]["action_cards"][0]["id"] == card["id"]
+    saved = view["messages"][1]["action_cards"][0]
+    assert saved["id"] == card["id"] and saved["status"] == "succeeded"  # as it is now, not as streamed
+    assert saved["result"]["ok"] is True
     events = send(client, thread, "Did it work?", key="m2")
     assert events[-1]["data"] == {"status": "complete"}
     assert any(m["role"] == "assistant" and "retry T1" in m["text"] for m in runtime.histories[-1])
@@ -235,6 +237,10 @@ def test_card_edits_and_confirmations_use_the_workspace_secret_scrub(app_as, peo
         assert opaque not in json.dumps(db.get(MindAction, card["id"]).fields)
     confirmed = client.post(f"{base}/confirm", json={"expected_revision": 2})
     assert confirmed.status_code == 200 and opaque not in confirmed.text
+    # Rejected input is never echoed back, as on the thread API.
+    for bad in ({"expected_revision": 3, "text": "x" * 8001 + opaque}, {"expected_revision": 3, "extra": opaque}):
+        response = client.patch(base, json=bad)
+        assert response.status_code == 422 and opaque not in response.text
 
 
 def test_the_runtime_adapter_builds_one_turn(people):
@@ -246,7 +252,8 @@ def test_the_runtime_adapter_builds_one_turn(people):
                             workspace_ids=[people["first"], people["second"]])
         db.add(thread); db.commit()
         thread_id = thread.id
-    context = TurnContext(people["alice"], thread_id, people["first"], (people["first"], people["second"]))
+    # The thread began before Alice joined the second workspace; the prompt still offers it.
+    context = TurnContext(people["alice"], thread_id, people["first"], (people["first"],))
     history = [{"role": "user", "text": "first"}, {"role": "assistant", "text": ""},  # an interrupted reply
                {"role": "tool", "text": "x"}, {"role": "assistant", "text": "answer"},
                {"role": "user", "text": "next", "context": {"workspace_id": people["first"], "kind": "outcome",

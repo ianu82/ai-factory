@@ -25,7 +25,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from ..auth import current_user, require_member
 from ..db import SessionLocal, get_db, utcnow
-from ..models import MindCharge, MindMessage, MindThread, Secret, User
+from ..models import MindAction, MindCharge, MindMessage, MindThread, Secret, User
 from ..security import decrypt, _SECRET_PATTERNS
 from . import store
 from .contracts import CreateThread, SubmitMessage, TurnContext
@@ -269,8 +269,18 @@ def message_view(row, history=False):
 
 
 def transcript(db, thread, history=False):
+    from .actions import card  # actions imports this module
+
     rows = db.query(MindMessage).filter_by(thread_id=thread.id).order_by(MindMessage.position).all()
-    original = {"thread": thread_view(db, thread), "messages": [message_view(r, history) for r in rows]}
+    messages = [message_view(r, history) for r in rows]
+    # Cards are saved as streamed; edits, dismissals and confirmations change only the action row. Show each
+    # card as it is now, so a reload never offers a stale revision.
+    actions = {a.id: a for a in db.query(MindAction).filter_by(thread_id=thread.id, owner_id=thread.owner_id)}
+    context = Context(db, thread.owner_id, thread.id)
+    for message in messages:
+        message["action_cards"] = [card(actions[c["id"]], context) if isinstance(c, dict) and c.get("id") in actions
+                                   else c for c in message["action_cards"] or []]
+    original = {"thread": thread_view(db, thread), "messages": messages}
     return scrub(jsonable_encoder(original), secrets_for(db, thread.owner_id, thread.workspace_ids))
 
 
