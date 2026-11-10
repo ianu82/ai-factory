@@ -38,10 +38,13 @@ def plan_context(task_id: str) -> list[str]:
         if task is None or not task.plan_id:
             return []
         plan = s.get(Plan, task.plan_id)
-        others = (s.query(Task).filter(Task.plan_id == task.plan_id, Task.id != task.id)
-                  .order_by(Task.key).limit(SIBLINGS).all())
+        siblings = s.query(Task).filter(Task.plan_id == task.plan_id, Task.id != task.id)
+        others = siblings.order_by(Task.key).limit(SIBLINGS).all()
+        unlisted = siblings.count() - len(others)
         repos = dict(s.query(Repository.id, Repository.full_name).filter(Repository.workspace_id == task.workspace_id))
         wanted = set(task.depends_on or [])
+        # Every dependency, including any past the listed siblings.
+        built_on = siblings.filter(Task.key.in_(sorted(wanted))).order_by(Task.key).all() if wanted else []
         lines: list[str] = []
         if plan is not None and plan.summary:
             lines += ["", "## The plan this task belongs to", clip(plan.summary, PLAN_CHARS)]
@@ -50,7 +53,8 @@ def plan_context(task_id: str) -> list[str]:
             for t in others:
                 after = f", after {', '.join(t.depends_on)}" if t.depends_on else ""
                 lines.append(f"- {t.key}: {t.title} [{repos.get(t.repo_id, '?')}] ({t.status}{after})")
-        built_on = [t for t in others if t.key in wanted]
+            if unlisted:
+                lines.append(f"- (and {unlisted} more)")
         if built_on:
             lines += ["", "## Work this task builds on (merged into the base branch before it started)"]
             for t in built_on:

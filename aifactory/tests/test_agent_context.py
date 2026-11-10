@@ -109,6 +109,29 @@ def test_plan_context_lists_other_tasks_and_what_dependencies_merged(factory):
     assert plan_context("0" * 32) == []
 
 
+def test_plan_context_keeps_dependencies_past_the_listed_tasks(factory):
+    from aifactory.pipeline.context import SIBLINGS
+
+    oid = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=oid, version=1, status="approved", summary="A long plan.")
+        s.add(plan)
+        s.flush()
+        common = {"workspace_id": factory["ws"], "outcome_id": oid, "plan_id": plan.id, "repo_id": factory["repo"]}
+        s.add_all([Task(**common, key=f"S{i:02}", title=f"Step {i}", status="completed") for i in range(1, SIBLINGS + 2)])
+        s.add(Task(**common, key="Z1", title="Schema", status="completed", pr_number=9, merge_sha="0123456789abcdef",
+                   evidence={"builder_report": {"summary": "Added the users table."}}))
+        mine = Task(**common, key="M1", title="API", status="queued", depends_on=["Z1"])
+        s.add(mine)
+        s.flush()
+        mine_id = mine.id
+    lines = "\n".join(plan_context(mine_id))
+    assert f"- S{SIBLINGS:02}: Step {SIBLINGS}" in lines and f"S{SIBLINGS + 1:02}" not in lines
+    assert "- Z1: Schema [" not in lines  # past the listed tasks...
+    assert "- (and 2 more)" in lines
+    assert "- Z1: Schema (PR #9, merged as 0123456789). Added the users table." in lines  # ...but still built on
+
+
 def mirror(tmp_path, name, files):
     remote = make_remote(tmp_path / "remotes", f"acme/{name}", files)
     path = _mirror_path(f"acme/{name}")
