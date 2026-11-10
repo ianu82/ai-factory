@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Iterator
@@ -11,6 +12,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
+
+log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -179,7 +182,9 @@ def _migrate_mind_action_scope(engine: Engine) -> None:
                                  table, count=1)
         rebuilt, relaxed = re.subn(r"(\boutcome_id\s+VARCHAR(?:\(\d+\))?)\s+NOT NULL", r"\1", rebuilt, count=1)
         if not (named and relaxed):
-            raise RuntimeError("mind_actions has an unexpected definition; outcome_id cannot be made nullable")
+            # Never stop the app over this: only Mind cards for new outcomes need the nullable column.
+            log.error("mind_actions has an unexpected definition; outcome_id stays NOT NULL")
+            return
         conn.commit()  # end the reads: the pragma below is ignored inside a transaction
         conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
         try:
@@ -193,8 +198,8 @@ def _migrate_mind_action_scope(engine: Engine) -> None:
                 conn.exec_driver_sql(statement)
             conn.commit()
         except Exception:
-            conn.rollback()
-            raise
+            conn.rollback()  # the original table is untouched
+            log.exception("Could not make mind_actions.outcome_id nullable; Mind cannot propose new outcomes")
         finally:
             try:
                 conn.exec_driver_sql("PRAGMA foreign_keys=ON")

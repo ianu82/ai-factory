@@ -175,7 +175,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
 
                     outcome_from_text(db, decision.workspace_id, user, f"Fix: {decision.title}",
                                       f"{decision.body}\n\n{comment}".strip(), [task.repo_id], source="improvement",
-                                      pending_events=pending_events)
+                                      action_id=action_id, pending_events=pending_events)
         elif outcome:
             if resolution == "retry":
                 guidance(comment)

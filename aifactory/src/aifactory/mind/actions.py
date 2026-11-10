@@ -16,6 +16,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -40,6 +41,7 @@ from .tools import Context, ReadTool, citation, clean, current, validate_argumen
 
 # The thread API's route class: a 422 never echoes rejected input (which can hold a pasted secret).
 router = APIRouter(prefix="/mind/threads", route_class=PrivateRoute)
+log = logging.getLogger(__name__)
 
 NEEDS_TEXT = frozenset({"answer", "replan", "reject"})  # options the app's decision card asks a comment for first
 PRIORITY = {0: "Urgent", 1: "High", 2: "Normal", 3: "Low"}  # the app's new-outcome form
@@ -657,7 +659,11 @@ def confirm(context: Context, action_id: str, expected_revision: int, *, finish_
         raise
     publish_changes(payloads)
     if later:
-        done = (finish_on or finish_here)(finish, later, user, action.id)
+        try:
+            done = (finish_on or finish_here)(finish, later, user, action.id)
+        except Exception:  # the confirmed change is committed; say what did not follow rather than fail the request
+            log.exception("Follow-ups of Mind action %s did not run", action.id)
+            done = {"follow_ups_failed": [step for step, *_ in later]}
         if done:
             # What the follow-ups did (a hand-over's draft pull request, pull requests closed) joins the result.
             action.result = clean({**(action.result or {}), **done})

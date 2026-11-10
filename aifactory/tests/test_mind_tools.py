@@ -185,7 +185,14 @@ def test_pull_requests_report_recorded_ci_decisions_and_the_page_snapshot(world,
     assert item["github"]["open_threads"] == 2 and item["github"]["open_thread_authors"] == ["codex"]
     monkeypatch.setitem(pulls._cache, (ws.id, "open"), (time.monotonic(), {**snapshot, "fetched_at": time.time() - 3600}))
     assert "github" not in read_call("pull_requests", {"workspace_id": ws.id}, context)["items"][0]
-    t.merge_sha, t.status = "d" * 40, "completed"
+    t.status = "handed_over"  # its pull request stays open for the person who took it over
+    db.commit()
+    assert read_call("pull_requests", {"workspace_id": ws.id}, context)["items"][0]["task"]["status"] == "handed_over"
+    t.status, t.evidence = "cancelled", {**t.evidence, "pr_closed": True}
+    db.commit()
+    assert read_call("pull_requests", {"workspace_id": ws.id}, context)["items"] == []
+    assert read_call("pull_requests", {"workspace_id": ws.id, "state": "all"}, context)["items"][0]["closed_by_factory"]
+    t.merge_sha, t.status, t.evidence = "d" * 40, "completed", {"ci": {"state": "success"}}
     db.commit()
     assert read_call("pull_requests", {"workspace_id": ws.id}, context)["items"] == []
     assert read_call("pull_requests", {"workspace_id": ws.id, "state": "merged"}, context)["items"][0]["merged"]

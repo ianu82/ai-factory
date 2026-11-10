@@ -296,12 +296,11 @@ FAILED_CHECKS = ("failure", "error", "timed_out", "cancelled")  # as pulls.py co
 
 @register("pull_requests", "Pull requests the Factory opened, as the Factory recorded them: repository, number and "
           "link, task and outcome, head and merge commits, the last recorded CI result with failing checks, smoke, "
-          "and the open decision waiting on it with its options. state: open (default), merged or all. Review "
+          "and the open decision waiting on it with its options. state: open (default: not merged and not closed by "
+          "the Factory, including handed-over work), merged or all. Review "
           "threads and live CI are on GitHub; github holds the app's Pull requests page snapshot when it is recent.",
           {"outcome_id": {"type": "string"}, "state": {"type": "string"}})
 def pull_requests(args, context):
-    from ..pipeline.orchestrator import TERMINAL_TASK
-
     state = args.get("state", "open")
     if state not in ("open", "merged", "all"):
         raise HTTPException(422, "state must be open, merged or all")
@@ -311,7 +310,8 @@ def pull_requests(args, context):
         target(db, current(context), ws, args["outcome_id"])
         query = query.filter(Task.outcome_id == args["outcome_id"])
     if state == "open":
-        query = query.filter(Task.merge_sha == "", Task.status.notin_(sorted(TERMINAL_TASK)))
+        # The pull request's own recorded state, not the task's: a handed-over task's PR stays open for its person.
+        query = query.filter(Task.merge_sha == "", Task.evidence["pr_closed"].as_boolean().is_not(True))
     elif state == "merged":
         query = query.filter(Task.merge_sha != "")
     repos = {r.id: r.full_name for r in scoped(context, args, Repository)}
@@ -328,7 +328,8 @@ def pull_requests(args, context):
         checks = [c for c in ci.get("checks") or [] if isinstance(c, dict)]
         smoke = evidence.get("smoke") if isinstance(evidence.get("smoke"), dict) else {}
         item = {"repository": repos.get(t.repo_id, ""), "number": t.pr_number, "url": t.pr_url,
-                "merged": bool(t.merge_sha), "head_sha": t.head_sha, "merge_sha": t.merge_sha,
+                "merged": bool(t.merge_sha), "closed_by_factory": bool(evidence.get("pr_closed")),
+                "head_sha": t.head_sha, "merge_sha": t.merge_sha,
                 "outcome": {"id": o.id, "number": o.number, "title": o.title, "status": o.status},
                 "task": {"id": t.id, "key": t.key, "title": t.title, "status": t.status, "stage": t.stage,
                          "attempt": t.attempt, "blocked_reason": t.blocked_reason},

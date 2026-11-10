@@ -67,6 +67,18 @@ def scenario(world, name):
             assert db.query(Task).filter_by(outcome_id=o.id, key="T9").one().status == "pending"
         return "resolve_decision", {**base, "decision_id": decision.id, "option": "approve"}, \
             lambda: setattr(decision, "title", "Another plan"), done
+    if name == "fix":
+        decision = Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="unblock", title="Smoke failed",
+                            body="The health check returned 500.",
+                            options=[{"value": "fix", "label": "Create a fix outcome"},
+                                     {"value": "acknowledge", "label": "Acknowledge"}])
+        db.add(decision); db.commit()
+        def done():
+            fix = db.query(Outcome).filter_by(workspace_id=ws.id, number=2).one()
+            assert fix.title == "Fix: Smoke failed" and fix.source == "improvement"  # still an improvement
+            assert fix.created_by == users[0].id and decision.resolution == "fix"
+        return "resolve_decision", {**base, "decision_id": decision.id, "option": "fix"}, \
+            lambda: setattr(decision, "body", "Another failure"), done
     if name == "create":
         def done():
             new = db.query(Outcome).filter_by(workspace_id=ws.id, number=2).one()
@@ -107,8 +119,8 @@ def scenario(world, name):
     return "take_over_task", {**base, "outcome_id": o.id, "task_id": t.id}, lambda: setattr(t, "title", "Renamed"), done
 
 
-SCENARIOS = ["guidance", "answer", "retry", "merge", "request_changes", "plan", "create", "build", "cancel_outcome",
-             "cancel_task", "take_over"]
+SCENARIOS = ["guidance", "answer", "retry", "merge", "request_changes", "plan", "fix", "create", "build",
+             "cancel_outcome", "cancel_task", "take_over"]
 
 
 def shared(db):
@@ -272,6 +284,7 @@ def test_resolution_options_and_judged_decisions(world):
         propose("propose_resolve_decision", {"workspace_id": ws.id, "decision_id": question.id, "option": "answer"}, ctx)
     db.add(DecisionReview(workspace_id=ws.id, decision_id=question.id, state="running"))
     db.commit()
+    db.expire_all()  # as a new request would see it
     with pytest.raises(HTTPException) as exc:  # the app offers no options while a judge reviews it
         propose("propose_resolve_decision", {"workspace_id": ws.id, "decision_id": question.id, "option": "answer",
                                              "text": "Yes"}, ctx)
@@ -536,6 +549,11 @@ def test_object_http_views_keep_real_actor_with_mind_label(client, world):
     new = db.query(Outcome).filter_by(workspace_id=ws.id, number=2).one()
     view = client.get(f"/api/workspaces/{ws.id}/outcomes/{new.id}").json()
     assert view["outcome"]["created_by_name"] == "Alice via Mind" and view["outcome"]["created_by"] == users[0].id
+    _, fix = proposal(world, "fix")  # a fix outcome keeps its improvement source and its Mind attribution
+    confirm(ctx, fix["id"], 1)
+    fixed = db.query(Outcome).filter_by(workspace_id=ws.id, number=3).one()
+    view = client.get(f"/api/workspaces/{ws.id}/outcomes/{fixed.id}").json()
+    assert view["outcome"]["source"] == "improvement" and view["outcome"]["created_by_name"] == "Alice via Mind"
 
 
 @pytest.mark.parametrize("text", ["Please continue", ""])

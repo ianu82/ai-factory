@@ -853,7 +853,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     return {
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
-                   | {"created_by_name": _creator(users.get(o.created_by or "", ""), o)},
+                   | {"created_by_name": _creator(db, users.get(o.created_by or "", ""), o)},
         "repositories": [{"id": rid, "full_name": repos.get(rid, "?")} for rid in o.repo_ids],
         "attachments": [S.artifact(a) for a in db.query(Artifact).filter(
             Artifact.workspace_id == workspace_id, Artifact.outcome_id == o.id, Artifact.kind == "attachment")
@@ -867,8 +867,12 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     }
 
 
-def _creator(name: str, outcome: Outcome) -> str:
-    return f"{name} via Mind" if name and outcome.source == "mind" else name
+def _creator(db: Session, name: str, outcome: Outcome) -> str:
+    """The creator's name, "<person> via Mind" when a confirmed Mind card created the outcome (its creation event
+    carries the card's attribution, whatever the outcome's source: a Mind fix outcome is still an improvement)."""
+    created = (db.query(Event).filter(Event.outcome_id == outcome.id, Event.kind == "outcome_created")
+               .order_by(Event.id).first()) if name else None
+    return f"{name} via Mind" if created is not None and (created.data or {}).get("source") == "mind" else name
 
 
 @router.post("/workspaces/{workspace_id}/outcomes/{outcome_id}/cancel")
