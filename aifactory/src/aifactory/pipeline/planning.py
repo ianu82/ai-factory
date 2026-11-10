@@ -10,10 +10,10 @@ from ..events import notify, record
 from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
 from ..models import Outcome, Plan, Repository, Task
+from ..outcome_settings import resolve_settings
 from ..prompts import PLANNER, plan_prompt
 from ..sandbox import LocalSandbox
-from .runtime import (SessionSpec, guidance_history, open_decision, precedents, run_agent, set_outcome,
-                      workspace_settings)
+from .runtime import (SessionSpec, guidance_history, open_decision, precedents, run_agent, set_outcome)
 
 log = logging.getLogger(__name__)
 
@@ -24,12 +24,12 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         repos = s.query(Repository).filter(Repository.id.in_(outcome.repo_ids or [])).all()
         workspace_id = outcome.workspace_id
         version = len(outcome.plans) + 1
+        settings = resolve_settings(s, outcome)["effective"]
         snapshot = Outcome(**{c.name: getattr(outcome, c.name) for c in Outcome.__table__.columns})
     if not repos:
         set_outcome(outcome_id, status="blocked", blocked_reason="No repositories are selected for this outcome.")
         return
-    settings = workspace_settings(workspace_id)
-    harness_name = snapshot.harness or settings["harness"].get("planner") or "native"
+    harness_name = settings["harness"]["planner"]
     record(workspace_id, "planning_started", f"Planning outcome #{snapshot.number}", outcome_id=outcome_id)
     sandbox = LocalSandbox(f"plan-{outcome_id[:12]}-{version}").create()
     try:
@@ -96,14 +96,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         open_decision(workspace_id, "question", f"Planner needs a decision for #{snapshot.number}", body,
                       outcome_id=outcome_id, options=options)
         return
-    if settings["autonomy"].get("plan") == "auto":
-        approve_plan(plan_id, approved_by=None)
-    else:
-        set_outcome(outcome_id, status="awaiting_approval")
-        open_decision(workspace_id, "approve_plan", f"Approve plan for #{snapshot.number}: {snapshot.title}",
-                      report.get("summary", ""), outcome_id=outcome_id,
-                      options=[{"value": "approve", "label": "Approve"}, {"value": "replan", "label": "Revise"},
-                               {"value": "cancel", "label": "Cancel"}])
+    approve_plan(plan_id, approved_by=None)
 
 
 def approve_plan(plan_id: str, approved_by: str | None) -> None:
@@ -114,22 +107,35 @@ def approve_plan(plan_id: str, approved_by: str | None) -> None:
             return
         outcome = s.get(Outcome, plan.outcome_id)
         workspace_id = outcome.workspace_id
-        settings = workspace_settings(workspace_id)
-        repos = {r.full_name.lower(): r for r in s.query(Repository).filter(Repository.workspace_id == workspace_id)}
-        plan.status = "approved"
-        plan.approved_by = approved_by
-        plan.approved_at = utcnow()
-        builder = outcome.harness or settings["harness"].get("builder") or "native"
-        verifier = outcome.harness or settings["harness"].get("verifier") or builder
-        for item in plan.content.get("tasks", []):
-            repo = repos.get(item["repo"].lower())
-            s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],
-                       title=item["title"][:300], spec=item["spec"], acceptance=list(item.get("acceptance") or []),
-                       repo_id=repo.id, depends_on=list(item.get("depends_on") or []), harness=builder,
-                       verifier_harness=verifier, status="pending"))
-        outcome.status = "running"
-        outcome.blocked_reason = ""
-        outcome_id = outcome.id
+        settings = resolve_settings(s, outcome)["effective"]
+        if approved_by is None and settings["autonomy"]["plan"] != "auto":
+            waiting = (workspace_id, outcome.id, outcome.number, outcome.title, plan.summary)
+        else:
+            waiting = None
+        if not waiting:
+            repos = {r.full_name.lower(): r for r in s.query(Repository).filter(Repository.workspace_id == workspace_id)}
+            plan.status = "approved"
+            plan.approved_by = approved_by
+            plan.approved_at = utcnow()
+            builder = settings["harness"]["builder"]
+            verifier = settings["harness"]["verifier"]
+            for item in plan.content.get("tasks", []):
+                repo = repos.get(item["repo"].lower())
+                s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],
+                           title=item["title"][:300], spec=item["spec"], acceptance=list(item.get("acceptance") or []),
+                           repo_id=repo.id, depends_on=list(item.get("depends_on") or []), harness=builder,
+                           verifier_harness=verifier, status="pending"))
+            outcome.status = "running"
+            outcome.blocked_reason = ""
+            outcome_id = outcome.id
+    if waiting:
+        workspace_id, outcome_id, number, title, summary = waiting
+        set_outcome(outcome_id, status="awaiting_approval")
+        open_decision(workspace_id, "approve_plan", f"Approve plan for #{number}: {title}",
+                      summary, outcome_id=outcome_id,
+                      options=[{"value": "approve", "label": "Approve"}, {"value": "replan", "label": "Revise"},
+                               {"value": "cancel", "label": "Cancel"}])
+        return
     who = "policy (automatic)" if approved_by is None else "a team member"
     record(workspace_id, "plan_approved", f"Plan approved by {who}", outcome_id=outcome_id, level="success",
            actor=approved_by or "policy", data={"plan_id": plan_id})

@@ -1,14 +1,14 @@
 """API journey for the final guided steps and lost-response creation retries."""
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from aifactory import db
-from aifactory.models import Membership, Outcome, Repository, User, Workspace
+from aifactory.models import Membership, Outcome, Plan, Repository, Task, User, Workspace
 from aifactory.pipeline.delivery import TaskRunner
 
 
@@ -48,10 +48,27 @@ def test_guided_final_steps(client, signed_in, plan, merge):
         if key not in ("autonomy", "budgets"):
             assert settings[key] == value
     # Exercise the actual delivery policy, not a copy of its logic.
-    runtime = SimpleNamespace(cfg={"release": {"mode": "on_merge"}}, settings=settings)
-    assert TaskRunner._merge_needs_approval(runtime) is True
-    runtime.cfg = {"release": {"mode": "none"}}
-    assert TaskRunner._merge_needs_approval(runtime) is (merge == "approval")
+    with db.session_scope() as s:
+        probe = Outcome(workspace_id=wid, number=999, title="Policy probe", repo_ids=[rid])
+        s.add(probe)
+        s.flush()
+        plan_row = Plan(outcome_id=probe.id)
+        s.add(plan_row)
+        s.flush()
+        task = Task(workspace_id=wid, outcome_id=probe.id, plan_id=plan_row.id, repo_id=rid, key="T1", title="Probe")
+        s.add(task)
+        s.flush()
+        probe_id, task_id = probe.id, task.id
+    runtime = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    assert runtime._merge_needs_approval() is True
+    with db.session_scope() as s:
+        repo = s.get(Repository, rid)
+        repo.config = {**repo.config, "release": {"mode": "none"}}
+    assert runtime._merge_needs_approval() is (merge == "approval")
+    with db.session_scope() as s:
+        s.query(Task).filter_by(id=task_id).delete()
+        s.query(Plan).filter_by(outcome_id=probe_id).delete()
+        s.query(Outcome).filter_by(id=probe_id).delete()
     for step in ("autonomy", "team"):
         assert client.patch(base + "/onboarding", json={"action": "complete", "step": step, "acknowledged": True}).status_code == 200
     members = client.get(base + "/members").json()

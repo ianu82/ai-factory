@@ -27,6 +27,7 @@ from .events import bus, event_dict, notify, record
 from .fallbacks import available as fallback_credentials
 from .github import GitHub, GitHubError, PERMISSION_LABELS, REQUIRED_PERMISSIONS, resolve_credential as resolve_token
 from .guided import README_TEMPLATE, README_TITLE, README_BRIEF, README_ACCEPTANCE, outcome_guidance
+from .outcome_settings import resolve_settings
 from .harness import capabilities
 from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
@@ -492,6 +493,15 @@ class RepoCommands(BaseModel):
     checks: list[str] | None = None
     qa: RepoQACommands | None = None
     release: RepoReleaseSelection | None = None
+    plan: dict[str, Any] | None = None
+    merge: dict[str, Any] | None = None
+
+    @field_validator("plan", "merge")
+    @classmethod
+    def valid_approval_mode(cls, value):
+        if value is not None and value.get("mode") not in (None, "", "auto", "approval"):
+            raise ValueError("mode must be auto or approval (or unset)")
+        return value
 
     @field_validator("review")
     @classmethod
@@ -552,7 +562,12 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
     for key in ("context", "signal_label"):
         if key in patch:
             cfg[key] = str(patch[key] or "")[:8000]
-    for key in ("merge", "release", "qa", "recovery", "build"):
+    for key in ("plan", "merge"):
+        if key in patch:
+            policy = patch[key]
+            if not isinstance(policy, dict) or policy.get("mode") not in (None, "", "auto", "approval"):
+                raise HTTPException(422, f"{key}.mode must be auto or approval (or unset)")
+    for key in ("plan", "merge", "release", "qa", "recovery", "build"):
         if key in patch and isinstance(patch[key], dict):
             cfg[key] = patch[key]
     for key in ("require_ci", "max_changed_lines"):
@@ -783,6 +798,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
     open_count = sum(1 for d in decisions if d.status == "open")
     return {
+        "settings": resolve_settings(db, o),
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
                    | {"created_by_name": users.get(o.created_by or "", "")},
