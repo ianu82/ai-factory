@@ -716,3 +716,51 @@ def test_handling_held_issue_clears_acceptance_prompt(client, signed_in, monkeyp
         assert db.query(Outcome).count() == int(action == "accept")
         if action == "accept":
             assert db.query(Outcome).one().harness == "codex"
+
+
+def test_delegated_resolve_applies_only_to_the_head_it_was_judged_on(monkeypatch):
+    from aifactory.models import Decision, Plan, Task
+
+    with session_scope() as s:
+        org = Organization(name="Acme")
+        s.add(org)
+        s.flush()
+        ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings={})
+        s.add(ws)
+        s.flush()
+        repo = Repository(workspace_id=ws.id, full_name="acme/app", default_branch="main", config={})
+        s.add(repo)
+        s.flush()
+        o = Outcome(workspace_id=ws.id, number=4, title="Heads", repo_ids=[repo.id], status="attention")
+        s.add(o)
+        s.flush()
+        plan = Plan(outcome_id=o.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        ids = {}
+        for key, head in (("T1", "aaaaaaa1111111"), ("T2", "bbbbbbb2222222")):
+            t = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, key=key, title=key, repo_id=repo.id,
+                     status="awaiting_approval", stage="merge", pr_number=9, head_sha=head)
+            s.add(t)
+            s.flush()
+            s.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="approve_merge",
+                           title=f"Merge {key}", options=[{"value": "approve", "label": "Merge"},
+                                                          {"value": "reject", "label": "Request changes"}]))
+            ids[key] = t.id
+    monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps({
+        "organization": "Acme", "workspace": "Acme", "delegated_by": "ian@mindsdb.com",
+        "resolve": [
+            # Judged on an older revision: the task has since pushed a new head, so this must not merge it.
+            {"outcome": 4, "task": "T1", "kind": "approve_merge", "resolution": "approve", "head": "0123abcd",
+             "nonce": "stale"},
+            {"outcome": 4, "task": "T2", "kind": "approve_merge", "resolution": "approve", "head": "bbbbbbb",
+             "nonce": "current"}]}))
+
+    async def run():
+        return apply_bootstrap()
+
+    asyncio.run(run())
+    with session_scope() as s:
+        assert s.get(Task, ids["T1"]).status == "awaiting_approval"
+        assert s.query(Decision).filter(Decision.task_id == ids["T1"]).one().status == "open"
+        assert s.get(Task, ids["T2"]).status == "queued"
