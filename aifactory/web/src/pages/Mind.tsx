@@ -10,7 +10,7 @@ import { MindComposer, type ComposerHandle } from "../components/mind/MindCompos
 import "../components/mind/Mind.css";
 
 const STARTERS = [
-  "What needs my attention today?",
+  "Let’s plan a feature together",
   "What shipped since yesterday, and what is stuck?",
   "Which pull requests are waiting on me, and why?",
   "Why did the latest failed task fail, and what would fix it?",
@@ -69,11 +69,10 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
   return <div className="mind-home">
     <div className="mind-home-column">
       <h1>My Mind</h1>
-      <p className="mind-home-lede">Ask what is happening across your workspaces, or ask Mind to step in. Anything it would change waits for your approval.</p>
       <Notice status={state.status} workspaceId={workspaceId} />
       <MindComposer ref={composer} large autoFocus onSend={start} disabled={!!reason || starting || checking}
         disabledReason={starting ? "Starting…" : checking ? "Checking that Mind can answer…" : reason || undefined}
-        placeholder="Ask about an outcome, a pull request or a failure, or ask Mind to fix something…" />
+        placeholder="Plan a feature together and hand it to the Factory to build, or ask what’s stuck and why…" />
       <div className="mind-starters">
         {STARTERS.map((s) => <button key={s} type="button" className="mind-starter" disabled={!!reason || starting || checking} onClick={() => void start(s)}>{s}</button>)}
       </div>

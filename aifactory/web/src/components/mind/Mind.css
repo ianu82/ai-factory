@@ -23,8 +23,7 @@
 /* ---------- landing ---------- */
 .mind-home { flex: 1; min-height: 0; overflow: auto; border-top: 1px solid var(--line); }
 .mind-home-column { max-width: 720px; margin: 0 auto; padding: 44px 24px 56px; }
-.mind-home h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 4px; }
-.mind-home-lede { color: var(--muted); margin: 0 0 18px; }
+.mind-home h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 16px; }
 .mind-starters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0 34px; }
 .mind-starter {
   text-align: left; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface);
