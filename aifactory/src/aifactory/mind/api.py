@@ -17,11 +17,9 @@ from uuid import uuid4
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
-from fastapi.routing import APIRoute
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import StreamingResponse
 
 from ..auth import current_user, require_member
 from ..db import SessionLocal, get_db, utcnow
@@ -29,30 +27,9 @@ from ..models import MindAction, MindCharge, MindMessage, MindThread, Secret, Us
 from ..security import decrypt, _SECRET_PATTERNS
 from . import store
 from .contracts import CreateThread, SubmitMessage, TurnContext
+from .routing import PrivateRoute  # noqa: F401 - also re-exported for callers of mind.api
 from .provider import MindUnavailable
 from .tools import Context, Tools
-
-
-class PrivateRoute(APIRoute):
-    """Do not echo rejected inputs (or their field names) on validation errors.
-
-    FastAPI's default 422 includes arbitrary input, even extra fields. Keeping
-    this policy on the router also covers errors before endpoint dependencies
-    run, without relying on application registration or an authenticated actor.
-    """
-
-    def get_route_handler(self):
-        handler = super().get_route_handler()
-
-        async def private_handler(request: Request):
-            try:
-                return await handler(request)
-            except RequestValidationError:
-                # No request-derived data leaves this path. Still use the same
-                # egress helper as every other Mind response.
-                return JSONResponse(status_code=422, content=scrub({"detail": "Invalid Mind request"}))
-
-        return private_handler
 
 
 router = APIRouter(prefix="/mind", route_class=PrivateRoute)

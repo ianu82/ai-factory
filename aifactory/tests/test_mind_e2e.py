@@ -356,3 +356,18 @@ def test_workspace_names_reach_the_model_only_scrubbed(people):
                                                   ledger=FakeLedger()))
     prompt = engine.calls[0]["prompt"]
     assert opaque not in prompt and "Mobile [redacted]" in prompt
+
+
+@pytest.mark.parametrize("module", ["aifactory.mind.actions", "aifactory.mind.api", "aifactory.mind.runtime"])
+def test_each_mind_module_imports_on_its_own(module):
+    """No import cycle: a fresh interpreter can import any Mind module first (tests import actions directly)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
+    result = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, text=True, env=env,
+                            timeout=120)
+    assert result.returncode == 0, result.stderr[-2000:]

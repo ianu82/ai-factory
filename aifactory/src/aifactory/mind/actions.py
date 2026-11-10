@@ -14,7 +14,7 @@ from ..decisions import resolve
 from ..models import Decision, MindAction, MindActionResult, User, Workspace
 from ..security import redact
 from ..work_services import publish_changes, send_guidance, target
-from .api import PrivateRoute
+from .routing import PrivateRoute
 from .tools import Context, ReadTool, citation, clean, current, validate_arguments
 
 KINDS = frozenset({"answer_question", "send_guidance", "retry_task"})
