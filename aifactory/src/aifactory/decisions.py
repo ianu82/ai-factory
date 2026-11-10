@@ -24,6 +24,10 @@ def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
     """Evidence for a task whose attempt counter restarts at 0: attempt numbers are reused, so the epoch moves on
     and earlier records (kept for their review findings) no longer count as this budget's attempts."""
     ev = {k: v for k, v in (evidence or {}).items() if k not in ("attempt_base", "auto_retries")}
+    revalidation = ev.get("revalidation") or {}
+    if revalidation.get("phase") == "rejected":
+        ev["revalidation"] = {**revalidation, "phase": "handled", "human_retry": True}
+        ev["rebase_rebuilds"] = 0
     ev["budget_epoch"] = int(ev.get("budget_epoch", 0)) + 1
     return ev
 

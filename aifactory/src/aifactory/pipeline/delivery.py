@@ -22,7 +22,7 @@ from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
-                      conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
+                      changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
@@ -58,6 +58,10 @@ class TaskRunner:
         self.app_summary: dict[str, Any] | None = None
         self._load()
         self.feedback = self._prior_feedback()
+        self.builder_report = (self.task.evidence or {}).get("builder_report") or {}
+        revalidation = (self.task.evidence or {}).get("revalidation") or {}
+        if revalidation.get("phase") in ("rejected", "handled"):
+            self.feedback += revalidation.get("feedback") or []
 
     def _prior_feedback(self) -> list[str]:
         """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
@@ -167,7 +171,14 @@ class TaskRunner:
             if not self.task.started_at:
                 self.update(started_at=utcnow())
             stage = self.task.stage
-            if stage == "merge":
+            revalidation = (self.task.evidence or {}).get("revalidation") or {}
+            if revalidation.get("phase") not in (None, "complete", "handled"):
+                await self.merge()  # checks for an outside merge before resuming missing gates
+            elif revalidation.get("phase") == "handled" and stage not in ("ci", "merge", "smoke", "release", "done"):
+                await self.deliver(continue_from_branch=True)
+            elif revalidation.get("phase") == "complete" and stage in ("verify", "checks"):
+                await self.ci_then_merge()
+            elif stage == "merge":
                 await self.merge()
             elif stage == "ci_repair":
                 await self._fix_ci(GitHub(resolve_token(self.ws)))
@@ -245,6 +256,7 @@ class TaskRunner:
                 self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
                 continue
             self.builder_report = result.report
+            self.evidence("builder_report", self.builder_report)
             if result.report.get("status") == "blocked":
                 reason = result.report.get("blocked_reason") or result.report.get("summary", "")
                 self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
@@ -571,8 +583,11 @@ class TaskRunner:
                        status="failed", options=[{"value": "retry", "label": "Rebuild again"},
                                                  {"value": "take_over", "label": "I'll take it from here"},
                                                  {"value": "abandon", "label": "Abandon task"}])
-        self.evidence("rebase_rebuilds", rebuilds)
-        self.evidence("attempt_base", self.task.attempt)
+        values = {"rebase_rebuilds": rebuilds, "attempt_base": self.task.attempt}
+        revalidation = (self.task.evidence or {}).get("revalidation") or {}
+        if revalidation.get("phase") == "rejected":
+            values["revalidation"] = {**revalidation, "phase": "handled"}
+        self._set_evidence(values)
         self.event("rebuild_after_base_moved", f"The verified change {why}; rebuilding with a fresh attempt budget "
                    f"({rebuilds} of 2)")
 
@@ -686,7 +701,8 @@ class TaskRunner:
             return "the app did not start"
         bad_pages = [f"{p.get('path')} ({p.get('error') or p.get('status')})"[:300] for p in app.evidence.get("pages", [])
                      if p.get("error") or (p.get("status") or 500) >= 500]
-        bad_probes = [p.get("path") for p in app.evidence.get("probes", []) if not p.get("ok")]
+        bad_probes = [p.get("path") for p in [*app.evidence.get("probes", []),
+                                               *app.evidence.get("change_checks", [])] if not p.get("ok")]
         if bad_pages:
             return f"pages failed to render: {bad_pages}"
         if bad_probes:
@@ -704,12 +720,24 @@ class TaskRunner:
         except GitError as exc:
             self.block("unblock", f"{self.task.key}: could not push the branch", str(exc))
         gh = GitHub(token)
-        body = self._pr_body()
+        body = _factory_block(self._pr_body())
         try:
-            pr = await gh.create_pull(self.repo.full_name, head=self.task.branch, base=self.repo.default_branch,
-                                      title=f"{self.task.title}", body=body)
-            await gh.set_status(self.repo.full_name, head, "success", "Independently verified by MindsHub AI Factory",
-                                self._task_url())
+            if self.task.pr_number:
+                pr = await gh.pull(self.repo.full_name, self.task.pr_number)
+                try:
+                    updated = _replace_factory_block(pr.get("body") or "", body)
+                    await gh.request("PATCH", f"/repos/{self.repo.full_name}/pulls/{self.task.pr_number}",
+                                     json={"body": updated})
+                except (GitHubError, ValueError) as exc:
+                    self.event("revalidation_warning", f"Could not update PR body: {str(exc)[:200]}", level="warn")
+            else:
+                pr = await gh.create_pull(self.repo.full_name, head=self.task.branch, base=self.repo.default_branch,
+                                          title=f"{self.task.title}", body=body)
+            try:
+                await gh.set_status(self.repo.full_name, head, "success", "Independently verified by MindsHub AI Factory",
+                                    self._task_url())
+            except GitHubError as exc:
+                self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
@@ -1044,6 +1072,10 @@ class TaskRunner:
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()
                 return
+        pending = (self.task.evidence or {}).get("revalidation") or {}
+        if pending.get("phase") not in (None, "complete", "handled"):
+            await self._refresh_onto_main(token, gh, pending["new_base"])
+            return
         self._require_merge_approval()
         self.stage("merge", f"Merging PR #{self.task.pr_number}")
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
@@ -1091,46 +1123,119 @@ class TaskRunner:
         await self.smoke()
 
     async def _refresh_onto_main(self, token: str, gh: GitHub, main_sha: str) -> None:
-        """Main moved: rebase the verified change, then re-run checks and CI before merging."""
-        self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
-        try:
-            clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
-                                                onto=self.repo.default_branch, task_id=self.task_id,
-                                                base=self.task.base_sha or "", head=self.task.head_sha or "")
-        except BranchMoved as exc:
-            self.block("unblock", f"{self.task.key}: PR head changed",
-                       f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
-                       "rebased or merged.", status="needs_input")
-        if not clean:
-            # The revision checks out the branch, carries it onto the latest base and leaves only the overlapping
-            # lines for the builder to resolve (see _bring_branch_up_to_date).
-            self._fresh_budget_after_base_moved("conflicts with newer commits")
-            self.update(branch=self.task.branch, stage="build")
+        """Durable gates for the exact rebased candidate; no checks/QA/CI hold repo_lock."""
+        state = dict((self.task.evidence or {}).get("revalidation") or {})
+        if state.get("phase") in (None, "complete", "handled"):
+            old_base, old_head = self.task.base_sha, self.task.head_sha
+            candidate = await changed_paths(self.repo.full_name, token, old_base, old_head)
+            main = await changed_paths(self.repo.full_name, token, old_base, main_sha)
+            mode = (self.cfg.get("merge") or {}).get("reverify", "overlap")
+            overlap = path_overlap(candidate, main)
+            decision = {"mode": mode, "old_base": old_base, "old_head": old_head, "new_base": main_sha,
+                        "candidate_paths": candidate[:20], "main_paths": main[:20],
+                        "candidate_paths_count": len(candidate), "main_paths_count": len(main), **overlap,
+                        "run": mode == "always" or (mode != "never" and overlap["overlap"])}
+            self.artifact("report", "Revalidation changed paths", json.dumps({"candidate": candidate, "main": main}))
+            state = {**decision, "phase": "rebasing"}
+            self.evidence("revalidation", state)
+            self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
+            self.event("reverify_decision", "Rebased candidate: " + ("run" if decision["run"] else "skip")
+                       + " independent verification", **decision)
+        if state["phase"] == "rebasing":
+            def before_push(head: str) -> None:
+                state["expected_head"] = head
+                self.evidence("revalidation", state)
+
+            try:
+                clean, detail = await rebase_branch(
+                    self.repo.full_name, token, branch=self.task.branch, onto=state["new_base"],
+                    task_id=self.task_id, base=state["old_base"], head=state["old_head"],
+                    expected_head=state.get("expected_head", ""), before_push=before_push)
+            except BranchMoved as exc:
+                self.block("unblock", f"{self.task.key}: PR head changed",
+                           f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
+                           "rebased or merged.", status="needs_input")
+            if not clean:
+                state.update(phase="rejected", reason="conflicts with newer commits", feedback=[detail])
+                self.evidence("revalidation", state)
+            else:
+                state.update(phase="checks", head=detail)
+                self.evidence("revalidation", state)
+        if state["phase"] not in ("rejected", "handled"):
+            if self.task.head_sha != state["head"]:
+                # A merge approval belongs to the published candidate, not its branch name.
+                # Persist the new publication before advancing the head, including on resume.
+                self.evidence("published", {"head": state["head"], "at": utcnow().isoformat(),
+                                            "pr": self.task.pr_number})
+            self.update(head_sha=state["head"], base_sha=state["new_base"])
+        if state["phase"] in ("checks", "verify"):
+            sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
+            try:
+                await checkout(sandbox, self.repo.full_name, token, state["head"], self.task.branch)
+                if state["phase"] == "checks":
+                    setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                    self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
+                    state.update(setup=setup, checks=self.checks)
+                    failed = [c for c in setup + self.checks if not c["ok"]]
+                    if failed:
+                        state.update(phase="rejected", reason="fails its checks on top of newer commits",
+                                     feedback=[f"- After rebasing, `{c['command']}` failed:\n{c['tail']}" for c in failed])
+                        self.evidence("attempts", {"n": self.task.attempt, "result": "checks_failed",
+                                                   "checks": _brief(setup + self.checks)})
+                    else:
+                        state["phase"] = "verify" if state["run"] else "passed"
+                    self.evidence("revalidation", state)
+                if state["phase"] == "verify":
+                    self.checks = state.get("checks") or []
+                    patch = await extract_patch(sandbox, state["new_base"])
+                    # Reuse the original harness, isolation, AppRun and evidence path, including
+                    # persisted builder-proposed QA checks after runner reconstruction.
+                    self.stage("verify", "Independent verification of the rebased candidate")
+                    verdict = await self._verify(token, patch, self.task.attempt)
+                    state["verifier"] = self.verifier_report
+                    if verdict is None:
+                        state.update(phase="rejected", reason="failed independent verification after rebase",
+                                     feedback=self.feedback[-8:])
+                    else:
+                        state["phase"] = "passed"
+                    self.evidence("revalidation", state)
+            finally:
+                await sandbox.close()
+        await self._revalidation_body(gh, state)
+        if state["phase"] == "rejected":
+            self.feedback += state.get("feedback") or []
+            # Set the rebuild continuation before marking rejection handled: an interruption
+            # between these writes must never resume merge instead of the requested rebuild.
+            self.update(stage="revise")
+            self._fresh_budget_after_base_moved(state["reason"])
             if self.builder:
                 await self.builder.close()
                 self.builder = None
             await self.deliver(continue_from_branch=True)
             return
-        self.update(head_sha=detail, base_sha=main_sha)
-        sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
+        if state["phase"] == "passed":
+            try:
+                await gh.set_status(self.repo.full_name, state["head"], "success",
+                                    "Revalidated after rebase by MindsHub AI Factory", self._task_url())
+            except GitHubError as exc:
+                self.event("revalidation_warning", f"Could not publish revalidation status: {str(exc)[:200]}", level="warn")
+            self.update(stage="ci")
+            self.evidence("revalidation", {**state, "phase": "complete"})
+            await self.ci_then_merge()
+
+    async def _revalidation_body(self, gh: GitHub, state: dict[str, Any]) -> None:
+        """Auxiliary publication must never prevent rejection feedback or a passing delivery."""
         try:
-            await checkout(sandbox, self.repo.full_name, token, f"refs/heads/{self.task.branch}", self.task.branch)
-            await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-            checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
-        finally:
-            await sandbox.close()
-        if any(not c["ok"] for c in checks):
-            self._fresh_budget_after_base_moved("fails its checks on top of newer commits")
-            self.feedback += [f"- After rebasing onto the latest {self.repo.default_branch}, `{c['command']}` failed:\n"
-                              f"```\n{c['tail']}\n```" for c in checks if not c["ok"]]
-            await self.deliver(continue_from_branch=True)
-            return
-        try:
-            await gh.set_status(self.repo.full_name, detail, "success", "Revalidated after rebase by MindsHub AI Factory",
-                                self._task_url())
-        except GitHubError:
-            pass
-        await self.ci_then_merge()
+            pr = await gh.pull(self.repo.full_name, self.task.pr_number)
+            body = pr.get("body") or ""
+            section = _revalidation_section(state)
+            body = _replace_section(body, section, REVALIDATION_BEGIN, REVALIDATION_END)
+            if len(body) > 55_000:
+                raise ValueError("PR body too large; full revalidation details remain in task evidence")
+            await gh.request("PATCH", f"/repos/{self.repo.full_name}/pulls/{self.task.pr_number}", json={"body": body})
+        except Exception as exc:  # auxiliary formatting and GitHub failures are both best-effort
+            log.warning("revalidation PR update failed for %s: %s", self.task_id, exc)
+            self.event("revalidation_warning", f"Could not update revalidation PR body: {str(exc)[:200]}", level="warn")
 
     # smoke & release -------------------------------------------------------------
     async def smoke(self) -> None:
@@ -1269,6 +1374,57 @@ class TaskRunner:
             log.warning("issue settlement failed for %s: %s", self.task_id, exc)
         self.update(status="completed", stage="done", finished_at=utcnow(), summary=summary, blocked_reason="")
         self.event("task_completed", f"{self.task.key} complete: {summary}", level="success")
+
+
+FACTORY_BEGIN, FACTORY_END = "<!-- factory:begin -->", "<!-- factory:end -->"
+REVALIDATION_BEGIN, REVALIDATION_END = "<!-- factory:revalidation:begin -->", "<!-- factory:revalidation:end -->"
+
+
+def _factory_block(body: str) -> str:
+    return f"{FACTORY_BEGIN}\n{body}\n{FACTORY_END}"
+
+
+def _replace_section(body: str, section: str, begin: str, end: str) -> str:
+    start, stop = body.find(begin), body.find(end)
+    if start >= 0 and stop >= start:
+        return body[:start] + section + body[stop + len(end):]
+    return body + "\n\n" + section
+
+
+def _replace_factory_block(body: str, block: str) -> str:
+    updated = _replace_section(body, block, FACTORY_BEGIN, FACTORY_END)
+    if len(updated) > 55_000:
+        raise ValueError("PR body too large; generated details remain in task evidence")
+    return updated
+
+
+def _revalidation_section(state: dict[str, Any]) -> str:
+    """Bound serialized JSON *before* wrapping: even escaped Unicode must fit a closed fence."""
+    summary = {k: state[k] for k in ("mode", "old_base", "new_base", "run", "overlap", "phase",
+                                     "shared_files_count", "shared_directories_count") if k in state}
+    for key in ("candidate_paths", "main_paths", "shared_files", "matching_pairs"):
+        values = state.get(key) or []
+        summary[key + "_count"] = state.get(key + "_count", len(values))
+        summary[key] = values[:20]
+    for key in ("setup", "checks"):
+        commands = state.get(key) or []
+        failed = [str(c.get("command", ""))[:200] for c in commands if not c.get("ok")]
+        summary[key] = {"count": len(commands), "failed_count": len(failed), "failed": failed[:20]}
+    report = state.get("verifier") or {}
+    summary["verifier"] = {"verdict": report.get("verdict"), "summary": str(report.get("summary", ""))[:500]}
+    # Trim samples until the actual serialized payload fits, not just source characters.
+    samples = [summary[k] for k in ("candidate_paths", "main_paths", "shared_files", "matching_pairs")]
+    samples += [summary[k]["failed"] for k in ("setup", "checks")]
+    payload = json.dumps(summary, indent=2)
+    while len(payload) > 7400 and any(samples):
+        max((sample for sample in samples if sample), key=lambda x: len(json.dumps(x))).pop()
+        payload = json.dumps(summary, indent=2)
+    # All untrusted free text is bounded too, including a Unicode verifier summary.
+    if len(payload) > 7400:
+        summary["verifier"]["summary"] = "See full verifier report in task evidence."
+        payload = json.dumps(summary, indent=2)
+    return (f"{REVALIDATION_BEGIN}\n### Revalidation after base moved\n"
+            f"```json\n{payload}\n```\n{REVALIDATION_END}")
 
 
 def _actionable(attempt: dict[str, Any]) -> bool:

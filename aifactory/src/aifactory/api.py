@@ -73,7 +73,7 @@ def health():
 
 @router.get("/meta")
 def meta():
-    return {"auth": auth_methods(), "harnesses": capabilities(),
+    return {"auth": auth_methods(), "harnesses": capabilities(), "capabilities": {"reverify": True},
             "sandbox": {"isolation": "per-job identity" if isolation_available() else "shared (development)"},
             "version": "2.0.0"}
 
@@ -606,7 +606,14 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
     for key in ("context", "signal_label"):
         if key in patch:
             cfg[key] = str(patch[key] or "")[:8000]
-    for key in ("merge", "release", "qa", "recovery", "build"):
+    if "merge" in patch:
+        if not isinstance(patch["merge"], dict):
+            raise HTTPException(422, "merge must be an object")
+        merge = {**(current.get("merge") or {}), **patch["merge"]}
+        if "reverify" in merge and merge["reverify"] not in ("overlap", "always", "never"):
+            raise HTTPException(422, "merge.reverify must be overlap, always or never")
+        cfg["merge"] = merge
+    for key in ("release", "qa", "recovery", "build"):
         if key in patch and isinstance(patch[key], dict):
             cfg[key] = patch[key]
     for key in ("require_ci", "max_changed_lines"):

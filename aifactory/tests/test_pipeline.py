@@ -1797,3 +1797,378 @@ def test_cancelling_final_merge_waits_for_bounded_transaction(factory):
         assert finished.is_set()
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize(('candidate', 'main', 'overlap'), [
+    (['pkg/a.py'], ['pkg/a.py'], True),
+    (['pkg/a.py'], ['pkg/b.py'], True),
+    (['README.md'], ['settings.json'], True),
+    (['one/a.py'], ['two/b.py'], False),
+])
+def test_reverify_overlap_uses_immediate_parent(candidate, main, overlap):
+    assert gitops.path_overlap(candidate, main)['overlap'] is overlap
+
+
+def test_reverify_overlap_is_bounded_for_large_packages():
+    result = gitops.path_overlap([f'pkg/a{i}.py' for i in range(1000)],
+                                [f'pkg/b{i}.py' for i in range(1000)])
+    assert result['overlap'] and result['shared_directories_count'] == 1
+    assert len(result['matching_pairs']) == 1
+
+
+def _revalidation_candidate(factory, mode=None):
+    _, task_id, number = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.status = 'running'
+        task.attempt = 1
+        task.evidence = {'builder_report': {'summary': 'Persisted builder report', 'runtime_checks': [
+            {'method': 'GET', 'path': '/changed', 'expect_status': 201, 'why': 'change-specific'}]}}
+        repo = s.get(Repository, factory['repo'])
+        repo.config = {**repo.config, 'merge': {} if mode is None else {'reverify': mode}}
+    return task_id, number
+
+
+def _runner(task_id):
+    return delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+
+
+@pytest.mark.parametrize(('mode', 'path', 'run'), [
+    (None, 'other.txt', True), ('overlap', 'other.txt', True),
+    ('overlap', 'elsewhere/new.txt', False), ('always', 'elsewhere/new.txt', True),
+    ('never', 'other.txt', False),
+])
+def test_revalidation_modes_record_decision_in_event_and_actual_pr(factory, monkeypatch, mode, path, run):
+    task_id, number = _revalidation_candidate(factory, mode)
+    seed = factory['remotes'] / 'seed/acme/demo'
+    (seed / path).parent.mkdir(parents=True, exist_ok=True)
+    main = _land_on_main(factory, path, 'new main\n')
+    runner = _runner(task_id)
+    calls = []
+
+    async def verify(self, token, patch, attempt):
+        assert self.builder_report['summary'] == 'Persisted builder report'
+        assert patch.files == ['greet.sh']
+        calls.append('verify')
+        self.verifier_report = {'verdict': 'pass', 'summary': 'ok'}
+        return self.verifier_report
+
+    async def ci(self):
+        calls.append('ci')
+    monkeypatch.setattr(delivery.TaskRunner, '_verify', verify)
+    monkeypatch.setattr(delivery.TaskRunner, 'ci_then_merge', ci)
+    asyncio.run(runner._refresh_onto_main('token', FakeGitHub('t'), main))
+    assert calls == (['verify', 'ci'] if run else ['ci'])
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        state = task.evidence['revalidation']
+        assert state['run'] is run and state['phase'] == 'complete'
+        assert state['checks'][0]['ok']  # never/disjoint still run checks
+        event = s.query(Event).filter_by(task_id=task_id, kind='reverify_decision').one()
+        assert event.data['run'] is run and event.data['main_paths'] == [path]
+    body = FakeGitHub.pulls[number]['body']
+    details = json.loads(body.split('```json\n')[1].split('\n```')[0])
+    assert details['run'] is run and details['main_paths'] == [path]
+    assert details['candidate_paths'] == ['greet.sh'] and body.startswith('b')
+
+
+@pytest.mark.parametrize('failure', ['verifier', 'unicode_checks', 'formatting'])
+def test_revalidation_rejection_rebuilds_with_feedback_even_if_summary_fails(factory, monkeypatch, failure):
+    task_id, number = _revalidation_candidate(factory)
+    main = _land_on_main(factory, 'other.txt', 'new main\n')
+    runner = _runner(task_id)
+    seen = []
+
+    def reject(messages):
+        return {'content': '', 'tool_calls': [call('finish', {
+            'verdict': 'fail', 'summary': 'Add regression coverage',
+            'criteria': [{'criterion': CRITERION, 'status': 'fail', 'evidence': 'no test'}],
+            'findings': [{'severity': 'major', 'description': 'Missing interaction test'}]})]}
+    ScriptedModel.scripts['verifier'] = reject
+
+    async def rebuild(self, continue_from_branch=False):
+        assert continue_from_branch and not FakeGitHub.merged
+        seen.extend(self.feedback)
+    monkeypatch.setattr(delivery.TaskRunner, 'deliver', rebuild)
+    if failure == 'unicode_checks':
+        async def checks(self, sandbox, commands, kind, timeout=1500):
+            return [{'command': 'echo ' + 'é' * 200, 'ok': False, 'exit_code': 1,
+                     'duration': 0, 'tail': 'failure'} for _ in range(200)]
+        monkeypatch.setattr(delivery.TaskRunner, '_run_commands', checks)
+    if failure == 'formatting':
+        def broken(state):
+            raise ValueError('auxiliary formatting failure')
+        monkeypatch.setattr(delivery, '_revalidation_section', broken)
+    asyncio.run(runner._refresh_onto_main('token', FakeGitHub('t'), main))
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.evidence['rebase_rebuilds'] == 1
+        assert task.evidence['revalidation']['phase'] == 'handled'
+        assert task.stage == 'revise'
+        if failure == 'formatting':
+            assert s.query(Event).filter_by(task_id=task_id, kind='revalidation_warning').count()
+    assert seen and not FakeGitHub.merged
+    restored = _runner(task_id)
+    assert restored.feedback
+    if failure == 'unicode_checks':
+        assert len(FakeGitHub.pulls[number]['body']) < 8000
+    else:
+        assert any('Missing interaction test' in f for f in seen)
+
+
+def test_revalidation_summary_bounds_unicode_commands_reports_and_paths():
+    state = {'mode': 'always', 'run': True, 'overlap': True,
+             'setup': [{'command': 'echo ' + 'é' * 200, 'ok': False} for _ in range(200)],
+             'checks': [{'command': 'echo ' + 'é' * 200, 'ok': False} for _ in range(200)],
+             'verifier': {'verdict': 'fail', 'summary': 'é' * 100_000}}
+    for key in ('candidate_paths', 'main_paths', 'shared_files'):
+        state[key] = ['pkg/' + 'é' * 1000 + str(i) for i in range(20)]
+    state['matching_pairs'] = list(zip(state['candidate_paths'], state['main_paths']))
+    section = delivery._revalidation_section(state)
+    assert len(section) < 7900 and section.endswith(delivery.REVALIDATION_END)
+    payload = json.loads(section.split('```json\n')[1].split('\n```')[0])
+    assert payload['checks']['count'] == payload['checks']['failed_count'] == 200
+    assert payload['verifier']['verdict'] == 'fail'
+    assert state['checks'][0]['command'].endswith('é' * 200)  # full evidence unchanged
+
+
+@pytest.mark.parametrize('phase', ['rebasing', 'checks', 'verify', 'rejected'])
+def test_outside_merge_takes_precedence_over_pending_revalidation(factory, monkeypatch, phase):
+    task_id, number = _revalidation_candidate(factory)
+    asyncio.run(FakeGitHub('t').merge('acme/demo', number, sha='', method='squash', title='outside merge'))
+    with session_scope() as s:
+        s.get(Task, task_id).evidence = {'revalidation': {'phase': phase, 'new_base': 'unused'}}
+    runner = _runner(task_id)
+    seen = []
+    async def smoke(self):
+        seen.append('smoke')
+    monkeypatch.setattr(delivery.TaskRunner, 'smoke', smoke)
+    asyncio.run(runner.run())
+    assert seen == ['smoke']
+    assert runner.task.evidence['merge']['outside']
+
+
+def test_revalidation_push_interruption_resumes_verification_and_status_failure_is_auxiliary(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    main = _land_on_main(factory, 'other.txt', 'new main\n')
+    runner = _runner(task_id)
+    original = delivery.rebase_branch
+    async def interrupted(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(delivery, 'rebase_branch', interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner._refresh_onto_main('token', FakeGitHub('t'), main))
+    restored = _runner(task_id)
+    assert restored.task.evidence['revalidation']['phase'] == 'rebasing'
+    assert restored.task.evidence['revalidation']['expected_head']
+    monkeypatch.setattr(delivery, 'rebase_branch', original)
+    seen = []
+    async def ci(self):
+        seen.append('ci')
+    async def status(*args, **kwargs):
+        raise delivery.GitHubError('persistent 5xx', status=503)
+    monkeypatch.setattr(delivery.TaskRunner, 'ci_then_merge', ci)
+    monkeypatch.setattr(FakeGitHub, 'set_status', status)
+    asyncio.run(restored.run())
+    assert seen == ['ci'] and restored.task.evidence['revalidation']['phase'] == 'complete'
+    assert 'verified' in _event_kinds(restored.task.outcome_id)
+    assert 'revalidation_warning' in _event_kinds(restored.task.outcome_id)
+
+
+def test_revalidation_missing_verifier_gate_resumes_original_runtime_path(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    main = _land_on_main(factory, 'other.txt', 'new main\n')
+    original = delivery.TaskRunner._verify
+    async def interrupt(*args):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(delivery.TaskRunner, '_verify', interrupt)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_runner(task_id)._refresh_onto_main('token', FakeGitHub('t'), main))
+    with session_scope() as s:
+        repo = s.get(Repository, factory['repo'])
+        repo.config = {**repo.config, 'qa': {'start': 'unused', 'required': True}}
+    monkeypatch.setattr(delivery.TaskRunner, '_verify', original)
+    seen = []
+    class App:
+        cfg = {'start': 'unused'}
+        base = 'http://localhost:1234'
+        sandbox = None
+        evidence = {'started': True, 'ready_seconds': 0,
+                    'change_checks': [{'method': 'GET', 'path': '/changed', 'ok': False}]}
+        def stop(self):
+            pass
+    async def start(self, sandbox, cfg):
+        assert self.builder_report['runtime_checks'][0]['path'] == '/changed'
+        seen.append('app')
+        return App()
+    async def store(*args):
+        pass
+    async def rebuild(self, continue_from_branch=False):
+        seen.append('rebuild')
+        assert any('Required runtime QA failed' in f for f in self.feedback)
+    monkeypatch.setattr(delivery.TaskRunner, '_start_app', start)
+    monkeypatch.setattr(delivery.TaskRunner, '_store_app_evidence', store)
+    monkeypatch.setattr(delivery.TaskRunner, 'deliver', rebuild)
+    asyncio.run(_runner(task_id).run())
+    assert seen == ['app', 'rebuild'] and not FakeGitHub.merged
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.evidence['rebase_rebuilds'] == 1
+        assert task.evidence['revalidation']['verifier']['verdict'] == 'fail'
+
+
+def test_human_retry_handles_third_revalidation_rejection(factory, monkeypatch):
+    from aifactory.decisions import resolve
+    task_id, _ = _revalidation_candidate(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.evidence = {'rebase_rebuilds': 2, 'revalidation': {
+            'phase': 'rejected', 'new_base': task.base_sha, 'reason': 'failed again', 'feedback': ['fix it']}}
+    runner = _runner(task_id)
+    with pytest.raises(delivery.Stop):
+        runner._fresh_budget_after_base_moved('failed again')
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == 'failed'
+        decision = s.query(Decision).filter_by(task_id=task_id, kind='unblock', status='open').one()
+        resolve(s, decision, s.get(User, factory['user']), 'retry')
+    seen = []
+    async def rebuild(self, continue_from_branch=False):
+        assert continue_from_branch and self.task.evidence['rebase_rebuilds'] == 0
+        seen.append('rebuild')
+    monkeypatch.setattr(delivery.TaskRunner, 'deliver', rebuild)
+    asyncio.run(_runner(task_id).run())
+    assert seen == ['rebuild']
+
+
+def test_republication_preserves_human_and_revalidation_sections(factory, monkeypatch):
+    task_id, number = _revalidation_candidate(factory)
+    body = 'Human note\n' + delivery._factory_block('old generated') + '\nCloses #99\n'
+    body += delivery._revalidation_section({'mode': 'overlap', 'run': True})
+    FakeGitHub.pulls[number]['body'] = body
+    runner = _runner(task_id)
+    async def publish(*args, **kwargs):
+        return runner.task.head_sha
+    monkeypatch.setattr(delivery, 'publish', publish)
+    runner.patch = gitops.Patch(b'patch', ['greet.sh'], 1, 1)
+    asyncio.run(runner._publish('token'))
+    updated = FakeGitHub.pulls[number]['body']
+    assert updated.startswith('Human note\n') and '\nCloses #99\n' in updated
+    assert delivery._revalidation_section({'mode': 'overlap', 'run': True}) in updated
+    assert 'old generated' not in updated and 'Persisted builder report' in updated
+
+
+def test_rebased_rejection_cannot_merge_until_subsequent_scripted_verification_passes(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    main = _land_on_main(factory, 'other.txt', 'new main\n')
+    verified = []
+    feedback_seen = []
+
+    def verifier(messages):
+        if step(messages) == 0:
+            verified.append('reject' if not verified else 'pass')
+            assert not FakeGitHub.merged
+            return {'content': '', 'tool_calls': [call('run', {'command': 'sh test.sh'})]}
+        if verified[-1] == 'reject':
+            return {'content': '', 'tool_calls': [call('finish', {
+                'verdict': 'fail', 'summary': 'Please cover the interaction', 'criteria': [],
+                'findings': [{'severity': 'major', 'description': 'Add interaction coverage'}]})]}
+        return passing_verifier(messages)
+
+    def builder(messages):
+        if step(messages) == 0:
+            feedback_seen.append('Add interaction coverage' in messages[1]['content'])
+            return {'content': '', 'tool_calls': [call('write_file', {
+                'path': 'regression.txt', 'content': 'interaction covered\n'})]}
+        return {'content': '', 'tool_calls': [call('finish', {'status': 'done', 'summary': 'Covered interaction'})]}
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    with pytest.raises(delivery.Stop):  # park the repaired candidate on CI
+        asyncio.run(_runner(task_id)._refresh_onto_main('token', FakeGitHub('t'), main))
+    assert not FakeGitHub.merged
+    def completed():
+        with session_scope() as s:
+            return s.get(Task, task_id).status == 'completed'
+    assert drive(completed)
+    assert verified == ['reject', 'pass'] and feedback_seen == [True]
+    assert FakeGitHub.merged == [1]
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == 'completed' and task.evidence['rebase_rebuilds'] == 1
+
+
+def test_changed_paths_preserves_rename_deletion_and_unusual_names(factory):
+    seed = factory['remotes'] / 'seed/acme/demo'
+    (seed / 'old\tname.txt').write_text('rename me\n')
+    (seed / 'deleted\nname.txt').write_text('delete me\n')
+    git('add', '-A', cwd=seed)
+    git('commit', '-qm', 'unusual paths', cwd=seed)
+    base = git('rev-parse', 'HEAD', cwd=seed)
+    (seed / 'old\tname.txt').rename(seed / 'new\nname.txt')
+    (seed / 'deleted\nname.txt').unlink()
+    git('add', '-A', cwd=seed)
+    git('commit', '-qm', 'rename and delete', cwd=seed)
+    git('push', '-q', str(factory['remotes'] / 'acme/demo.git'), 'main', cwd=seed)
+    head = git('rev-parse', 'HEAD', cwd=seed)
+    paths = asyncio.run(gitops.changed_paths('acme/demo', 'token', base, head))
+    assert set(paths) == {'old\tname.txt', 'new\nname.txt', 'deleted\nname.txt'}
+
+
+def test_rebase_uses_observed_sha_even_if_main_moves_again(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    observed = _land_on_main(factory, 'other.txt', 'observed\n')
+    original = delivery.rebase_branch
+    async def moved(*args, **kwargs):
+        _land_on_main(factory, 'later.txt', 'not yet observed\n')
+        assert kwargs['onto'] == observed
+        return await original(*args, **kwargs)
+    async def ci(self):
+        pass
+    monkeypatch.setattr(delivery, 'rebase_branch', moved)
+    monkeypatch.setattr(delivery.TaskRunner, 'ci_then_merge', ci)
+    runner = _runner(task_id)
+    asyncio.run(runner._refresh_onto_main('token', FakeGitHub('t'), observed))
+    parent = git('rev-parse', runner.task.head_sha + '^', cwd=factory['remotes'] / 'acme/demo.git')
+    assert parent == observed
+    assert runner.task.base_sha == observed
+
+
+def test_revalidation_checks_and_verifier_do_not_hold_repository_lock(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    _land_on_main(factory, 'other.txt', 'new main\n')
+    lock = asyncio.Lock()
+    checks = delivery.TaskRunner._run_commands
+    verify = delivery.TaskRunner._verify
+    seen = []
+    async def checked(self, *args, **kwargs):
+        assert not lock.locked()
+        seen.append('checks')
+        return await checks(self, *args, **kwargs)
+    async def verified(self, *args, **kwargs):
+        assert not lock.locked()
+        seen.append('verify')
+        return await verify(self, *args, **kwargs)
+    async def ci(self):
+        assert not lock.locked()
+        seen.append('ci')
+    monkeypatch.setattr(delivery.TaskRunner, '_run_commands', checked)
+    monkeypatch.setattr(delivery.TaskRunner, '_verify', verified)
+    monkeypatch.setattr(delivery.TaskRunner, 'ci_then_merge', ci)
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: lock)
+    asyncio.run(runner.merge())
+    assert {'checks', 'verify', 'ci'} <= set(seen)
+
+
+def test_patch_paths_use_nul_delimiters(factory):
+    from aifactory.sandbox import LocalSandbox
+    async def go():
+        sandbox = LocalSandbox('unusual-patch').create()
+        try:
+            base = await gitops.checkout(sandbox, 'acme/demo', 'token', 'main', 'paths')
+            (sandbox.work / 'tab\tand\nnewline.txt').write_text('content\n')
+            patch = await gitops.extract_patch(sandbox, base)
+            assert patch.files == ['tab\tand\nnewline.txt']
+            assert patch.additions == 1
+        finally:
+            await sandbox.close()
+    asyncio.run(go())

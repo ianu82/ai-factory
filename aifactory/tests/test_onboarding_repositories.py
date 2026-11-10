@@ -127,14 +127,15 @@ def test_setup_only_override_does_not_accept_start(client, signed_in, github):
     assert "start" not in result["config"]["qa"]
 
 
-def test_patch_replaces_nested_settings_to_allow_clearing(client, signed_in, github):
+def test_patch_merges_merge_policy_but_replaces_other_nested_settings(client, signed_in, github):
     repo = client.post(path(signed_in) + "/repositories", json={"full_name": "acme/app"}).json()
     url = path(signed_in) + "/repositories/" + repo["id"]
     assert client.patch(url, json={"config": {
         "merge": {"mode": "approval"}, "release": {"mode": "on_merge", "health_url": "https://x.test"},
     }}).status_code == 200
     config = client.patch(url, json={"config": {"merge": {}, "release": {}, "qa": {}}}).json()["config"]
-    assert config["merge"] == config["release"] == config["qa"] == {}
+    assert config["merge"] == {"mode": "approval"}
+    assert config["release"] == config["qa"] == {}
     assert config["context"] == DETECTED["context"] and config["smoke"] == DETECTED["smoke"]
 
 
