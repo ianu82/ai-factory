@@ -250,6 +250,8 @@ def test_mindshub_catalog_ids_select_opus_5_5_and_nothing_else():
     ("claude-opus-5", "opus-5-5", False),
     ("claude-opus-5-6", "opus-5-5", False),
     ("opus-5-50", "opus-5-5", False),
+    ("gpt-opus-5-5-fast", "opus-5-5", False),
+    ("claude-opus-5-5.1", "opus-5-5", False),
     ("gpt-sol-6-1", "opus-5-5", False),
     (None, "opus-5-5", False),
 ])

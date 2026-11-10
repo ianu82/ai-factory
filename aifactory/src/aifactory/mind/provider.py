@@ -96,7 +96,6 @@ def saved_credential(workspace_id: str) -> Credential:
 # Claude Opus 5.5 under the names catalogs give it: anthropic/claude-opus-5.5, claude-opus-5-5-20261101, and
 # MindsHub's own opus-5-5. A complete generation only: never "opus", "opus-5", "5.6" or "5.50".
 _OPUS_5_5 = re.compile(r"(?:anthropic/)?(?:claude[-_ ])?opus[-_ ]5[._-]5(?:[-_]\d{8})?", re.IGNORECASE)
-_OPUS_5_5_IN = re.compile(r"opus[-_ ]?5[._-]5(?!\d)", re.IGNORECASE)
 
 
 def select_model(names: list[str]) -> str:
@@ -115,7 +114,8 @@ def same_model(reported: str | None, selected: str) -> bool:
     other model is a substitution."""
     if not reported:
         return False
-    return reported == selected or bool(_OPUS_5_5_IN.search(reported) and _OPUS_5_5_IN.search(selected))
+    # Whole names only: an id that merely contains opus-5-5 (gpt-opus-5-5-fast, claude-opus-5-5.1) is another model.
+    return reported == selected or bool(_OPUS_5_5.fullmatch(reported) and _OPUS_5_5.fullmatch(selected))
 
 
 class _Responses:
