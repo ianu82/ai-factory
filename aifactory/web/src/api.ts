@@ -159,6 +159,7 @@ export interface Meta {
 
 export interface Repo {
   id: string;
+  steward_policy_invalid?: boolean;
   full_name: string;
   default_branch: string;
   description: string;
@@ -175,6 +176,7 @@ export interface Repo {
     release?: { mode?: string; health_url?: string; expect_text?: string };
     require_ci?: boolean;
     require_trusted_issue_author?: boolean;
+    steward?: { mode?: "off" | "propose" | "fix"; fix_minutes?: number };
   };
 }
 

@@ -458,15 +458,22 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
   const [open, setOpen] = useState(false);
   const c = repo.config;
   const [form, setForm] = useState({
+    steward_mode: c.steward?.mode ?? "propose", steward_minutes: String(c.steward?.fix_minutes ?? 60),
     require_trusted_issue_author: c.require_trusted_issue_author !== false,
     setup: lines(c.setup), checks: lines(c.checks), smoke: lines(c.smoke), protected_paths: lines(c.protected_paths),
     context: c.context || "", merge_mode: c.merge?.mode || "", method: c.merge?.method || "squash", reverify: c.merge?.reverify ?? "overlap",
     health_url: c.release?.health_url || "", release_mode: c.release?.mode || "", require_ci: !!c.require_ci,
   });
   const save = async () => {
+    const minutes = Number(form.steward_minutes);
+    if (!Number.isSafeInteger(minutes) || minutes <= 0) {
+      toast("Steward fallback minutes must be a positive integer", true);
+      return;
+    }
     try {
       await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "PATCH", json: { config: {
         setup: unlines(form.setup), checks: unlines(form.checks), smoke: unlines(form.smoke), protected_paths: unlines(form.protected_paths),
+        steward: { mode: form.steward_mode, fix_minutes: minutes },
         context: form.context, require_ci: form.require_ci, require_trusted_issue_author: form.require_trusted_issue_author,
         merge: { ...c.merge, mode: form.merge_mode || undefined, method: form.method, ...(supportsReverify ? { reverify: form.reverify } : {}) },
         release: { ...c.release, mode: form.release_mode || undefined, health_url: form.health_url || undefined },
@@ -529,6 +536,16 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
                 <option value="">Not managed by the Factory</option><option value="on_merge">Deploys when main changes</option>
               </select></label>
             <label className="field"><span>Health check after release</span><input className="input mono" placeholder="https://app.example.com/health" value={form.health_url} disabled={!admin} onChange={(e) => setForm({ ...form, health_url: e.target.value })} /></label>
+          </div>
+          {repo.steward_policy_invalid && <p className="hint" role="alert">Stored steward policy is invalid. Showing Propose with a 60-minute fallback. An admin can save a valid policy to replace it.</p>}
+          <div className="s-grid">
+            <label className="field"><span>Keep main green</span>
+              <select className="select" value={form.steward_mode} disabled={!admin} onChange={(e) => setForm({ ...form, steward_mode: e.target.value as "off" | "propose" | "fix" })}>
+                <option value="off">Off</option><option value="propose">Propose (default)</option><option value="fix">Fix</option>
+              </select><span className="hint">Main means this repository’s default branch ({repo.default_branch}). Off disables the steward; Propose asks for a decision; Fix starts repair work. Fix mode does not bypass approval policies, verification or required CI.</span></label>
+            <label className="field"><span>Revert fallback minutes</span>
+              <input className="input" type="number" min={1} step={1} value={form.steward_minutes} disabled={!admin} onChange={(e) => setForm({ ...form, steward_minutes: e.target.value })} />
+              <span className="hint">In Fix mode, consider reverting a revertible breaking commit if no fix passes checks within this many minutes (default 60).</span></label>
           </div>
           <label className="check"><input type="checkbox" checked={form.require_ci} disabled={!admin} onChange={(e) => setForm({ ...form, require_ci: e.target.checked })} /> Require GitHub CI checks before merging</label>
           <label className="check"><input type="checkbox" checked={form.require_trusted_issue_author} disabled={!admin} onChange={(e) => setForm({ ...form, require_trusted_issue_author: e.target.checked })} /> Require trusted issue authors for automatic work</label>

@@ -627,7 +627,10 @@ def test_only_admins_can_change_issue_author_trust(client, signed_in, role):
                                 json={"config": {"require_trusted_issue_author": value}})
         assert response.status_code == (200 if role in ("owner", "admin") else 403), response.text
         if response.status_code == 200:
-            assert response.json()["config"] == {"context": "keep", "require_trusted_issue_author": value}
+            assert response.json()["config"] == {"context": "keep", "require_trusted_issue_author": value,
+                                                 "steward": {"mode": "propose", "fix_minutes": 60}}
+            with session_scope() as db:
+                assert db.get(Repository, repo_id).config == {"context": "keep", "require_trusted_issue_author": value}
     with session_scope() as db:
         if role in ("member", "viewer"):
             assert db.get(Repository, repo_id).config == {"context": "keep"}

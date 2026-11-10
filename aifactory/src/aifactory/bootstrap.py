@@ -21,6 +21,7 @@ import os
 from .db import session_scope
 from .models import Organization, Repository, Workspace
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+from .steward_policy import validate_steward
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,18 @@ def _changed(applied: dict[str, str], key: str, value) -> bool:
         return False
     applied[key] = digest
     return True
+
+
+def _repo_overrides(name: str, overrides: dict) -> dict:
+    """Skip invalid operator policy without discarding unrelated configuration."""
+    overrides = dict(overrides)
+    if "steward" in overrides:
+        try:
+            overrides["steward"] = validate_steward(overrides["steward"])
+        except ValueError as exc:
+            log.error("Bootstrap ignoring invalid steward policy for %s: %s", name, exc)
+            overrides.pop("steward")
+    return overrides
 
 
 BOOTSTRAP_MARKER = "_bootstrap_workspace"
@@ -109,6 +122,7 @@ def apply_bootstrap() -> str | None:
         pending = []
         for entry in cfg.get("repositories", []):
             name, overrides = (entry, {}) if isinstance(entry, str) else (entry.get("full_name"), entry.get("config") or {})
+            overrides = _repo_overrides(name, overrides)
             branch = None if isinstance(entry, str) else entry.get("default_branch")
             if name in existing:
                 if overrides:
@@ -457,6 +471,7 @@ async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
     from .repo_detect import detect
 
     for name, overrides in names:
+        overrides = _repo_overrides(name, overrides)
         try:
             gh = GitHub(resolve_token(workspace_id))
             info = await gh.repo(name)
