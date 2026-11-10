@@ -54,6 +54,9 @@ class Orchestrator:
             log.info("capacity %s", host_capacity())
             self._recover()
             self._loop_task = asyncio.create_task(self._run(), name="orchestrator")
+            from ..linear_sync import LinearSync
+
+            self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
 
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
@@ -104,10 +107,6 @@ class Orchestrator:
                 await asyncio.to_thread(self._promote)
                 self._schedule()
                 await self._maybe_sync_signals()
-                from ..linear_outbox import Dispatcher
-
-                if self._linear_task is None or self._linear_task.done():
-                    self._linear_task = asyncio.create_task(Dispatcher().dispatch(), name="linear-outbox")
                 await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
@@ -273,11 +272,9 @@ class Orchestrator:
         from ..github import GitHubError, resolve_credential as resolve_token
         from ..models import Repository
         from ..signals import sync_github
-        from ..linear_intake import sync_linear
 
         with session_scope() as s:
             targets = {r.workspace_id for r in s.query(Repository)}
-            targets |= {w.id for w in s.query(Workspace) if (w.settings or {}).get("linear", {}).get("enabled")}
             paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
         for workspace_id in targets - paused:
             if (workspace_settings(workspace_id).get("signals") or {}).get("auto_sync") is False:
@@ -291,15 +288,6 @@ class Orchestrator:
                 log.warning("signal sync skipped for %s: %s", workspace_id, exc)
             except Exception:
                 log.exception("signal sync failed for %s", workspace_id)
-            finally:
-                db.close()
-            db = SessionLocal()
-            try:
-                result = await sync_linear(db, workspace_id)
-                if result.get("accepted"):
-                    self.wake()
-            except Exception:
-                log.exception("Linear intake failed for %s", workspace_id)
             finally:
                 db.close()
 

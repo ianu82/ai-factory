@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from . import linear_config
 from .events import notify, record
 from .linear import LinearError, LinearProvider
-from .models import Event, Outcome, Repository, Signal, Workspace
+from .models import Outcome, Repository, Signal, Workspace
 from .signals import fingerprint, outcome_from_text, upsert_signal
 
 
@@ -39,12 +39,9 @@ def acceptance_from_description(description: str) -> list[str]:
 
 
 def _problem(db: Session, workspace_id: str, category: str) -> None:
-    if not db.query(Event).filter_by(workspace_id=workspace_id, kind="linear_intake_warning").filter(
-            Event.data["category"].as_string() == category).first():
-        message = ("Linear intake skipped: no configured repositories remain connected. Update Linear settings."
-                   if category == "repositories" else f"Linear intake skipped ({category})")
-        record(workspace_id, "linear_intake_warning", message, level="warn",
-               data={"category": category}, session=db)
+    from .linear_outbox import warning
+
+    warning(db, workspace_id, category, kind="linear_intake_warning")
 
 
 def _admit(db: Session, workspace_id: str, issue: dict[str, Any], fetched_config: linear_config.LinearConfig) -> tuple[bool, bool]:
