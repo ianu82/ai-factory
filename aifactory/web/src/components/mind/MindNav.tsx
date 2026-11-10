@@ -39,7 +39,7 @@ export function MindNav({ workspaceId }: { workspaceId: string }) {
           {t.title || "Untitled conversation"}
         </NavLink>
       </li>)}
-      {started.length > SHOWN && <li><NavLink to={`${base}/mind`} end className="mind-nav-thread more">All conversations</NavLink></li>}
+      {started.length > SHOWN && <li><NavLink to={`${base}/mind?all`} end className="mind-nav-thread more">All conversations</NavLink></li>}
     </ul>}
   </div>;
 }

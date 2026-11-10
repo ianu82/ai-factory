@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowDown, Check, Plus } from "lucide-react";
 import type { MindCitation, MindMessage, MindStatus } from "../api";
 import { formatDuration, mindCost, stepLabel } from "../mind";
@@ -8,6 +8,8 @@ import { useMind } from "../components/mind/MindProvider";
 import { AssistantTurn, LiveTurn, SourceLink, UserTurn, citationKey } from "../components/mind/MindTurns";
 import { MindComposer, type ComposerHandle } from "../components/mind/MindComposer";
 import "../components/mind/Mind.css";
+
+const RECENT = 12;
 
 const STARTERS = [
   "Let’s plan a feature together",
@@ -85,7 +87,12 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
     else composer.current?.fill(text); // nothing was sent: keep the person's words
   };
   const checking = !state.status;
-  const recent = state.threads.filter((t) => t.title).slice(0, 12); // a conversation without a first message is not one yet
+  // The sidebar's "All conversations" opens this page with ?all; otherwise the newest RECENT, with the rest one click away.
+  const [params] = useSearchParams();
+  const [showAll, setShowAll] = useState(params.has("all"));
+  useEffect(() => { if (params.has("all")) setShowAll(true); }, [params]);
+  const titled = state.threads.filter((t) => t.title); // a conversation without a first message is not one yet
+  const recent = showAll ? titled : titled.slice(0, RECENT);
   return <div className="mind-home">
     <div className="mind-home-column">
       <h1>My Mind</h1>
@@ -96,14 +103,16 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
       <div className="mind-starters">
         {STARTERS.map((s) => <button key={s} type="button" className="mind-starter" disabled={!!reason || starting || checking} onClick={() => void start(s)}>{s}</button>)}
       </div>
-      {recent.length > 0 && <section className="mind-recent" aria-label="Recent conversations">
-        <h2>Recent</h2>
+      {recent.length > 0 && <section className="mind-recent" aria-label={showAll ? "All conversations" : "Recent conversations"}>
+        <h2>{showAll ? "All conversations" : "Recent"}</h2>
         <ul>{recent.map((t) => <li key={t.id}>
           <Link to={`/w/${t.workspace_id}/mind/${t.id}`}>
             <span className="title">{t.title || "Untitled conversation"}</span>
             <span className="when faint">{when(t.updated_at)}</span>
           </Link>
         </li>)}</ul>
+        {!showAll && titled.length > RECENT && <button type="button" className="btn sm ghost mind-recent-more" onClick={() => setShowAll(true)}>
+          Show all {titled.length} conversations</button>}
       </section>}
     </div>
   </div>;
