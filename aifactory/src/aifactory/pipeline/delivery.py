@@ -57,7 +57,8 @@ class TaskRunner:
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
         self.app_summary: dict[str, Any] | None = None
-        self._instructions: dict[str, list[str]] = {}  # the repository's agent instructions, by base commit
+        # The repository's agent instructions, by base commit and whether they are for the verifier.
+        self._instructions: dict[tuple[str, bool], list[str]] = {}
         self._load()
         self.feedback = self._prior_feedback()
         self.builder_report = (self.task.evidence or {}).get("builder_report") or {}
@@ -65,13 +66,13 @@ class TaskRunner:
         if revalidation.get("phase") in ("rejected", "handled"):
             self.feedback += revalidation.get("feedback") or []
 
-    async def _sections(self) -> list[str]:
+    async def _sections(self, verifier: bool = False) -> list[str]:
         """The plan around this task and the repository's instructions for agents, read at the base commit (never
         from the candidate, which the builder may have changed)."""
-        sha = self.task.base_sha or ""
-        if sha not in self._instructions:
-            self._instructions[sha] = await repo_instructions(self.repo.full_name, sha)
-        return plan_context(self.task_id) + self._instructions[sha]
+        key = (self.task.base_sha or "", verifier)
+        if key not in self._instructions:
+            self._instructions[key] = await repo_instructions(self.repo.full_name, key[0], verifier=verifier)
+        return plan_context(self.task_id) + self._instructions[key]
 
     def _prior_feedback(self) -> list[str]:
         """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
@@ -468,7 +469,7 @@ class TaskRunner:
                 if qa_cfg.get("start"):
                     app = await self._start_app(sandbox, qa_cfg)
                     brief = verifier_brief(app)
-                sections = await self._sections()
+                sections = await self._sections(verifier=True)
                 run, result, error = await run_agent(SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
