@@ -246,27 +246,24 @@ def _overlap(a: set[str], b: set[str]) -> bool:
 
 
 _CONSTRAINT_LABEL = re.compile(r"^\W*C(\d+)\b", re.IGNORECASE)
-_NON_WORD = re.compile(r"[^a-z0-9]+")
+_NON_WORD = re.compile(r"[\W_]+")  # Unicode-aware: letters and digits in any script are kept
 
 
 def _words(text: str) -> str:
-    return " " + _NON_WORD.sub(" ", text.lower()).strip() + " "
+    return " " + _NON_WORD.sub(" ", text.casefold()).strip() + " "
 
 
 def _judges(entry: str, requirement: str) -> bool:
-    """Whether a report entry (normalized) names a requirement: it repeats the requirement's opening words, or it
-    is a long enough quote from it."""
+    """Whether a report entry (normalized) repeats a requirement's full text, as the verifier is told to."""
     want = _words(requirement)
-    if not want.strip():
-        return False
-    return _words(" ".join(want.split()[:12])) in entry or (len(entry.strip()) >= 20 and entry in want)
+    return bool(want.strip()) and want in entry
 
 
 def missing_coverage(acceptance: list[str], constraints: list[str], criteria: list[Any]) -> list[str]:
     """What a passing verifier report left unjudged. Every constraint and every acceptance criterion needs its own
-    report entry: a constraint by its label (C1, C2, … up to the number of constraints) or its text, a criterion
-    by its text (the verifier is told to repeat it). One entry never counts for two requirements. A pass that
-    skips any of them is not evidence."""
+    report entry: a constraint by its label (C1, C2, … up to the number of constraints) or its full text, a
+    criterion by its full text (the verifier is told to repeat it verbatim). One entry never counts for two
+    requirements. A pass that skips any of them is not evidence."""
     reported = [str(c.get("criterion", "")).strip() for c in criteria if isinstance(c, dict)]
     entries = [_words(r) for r in reported]
     labels = [int(m.group(1)) if (m := _CONSTRAINT_LABEL.match(r)) else 0 for r in reported]

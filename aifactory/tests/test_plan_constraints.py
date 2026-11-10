@@ -162,6 +162,19 @@ def test_every_requirement_needs_its_own_report_entry():
     one = [{"criterion": "Works"}, {"criterion": "Uploaded files are stored outside the web root: probed"}]
     assert missing_coverage(["Works"], shared, one) == ["C2"]
     assert missing_coverage(["Works"], shared, [*one, {"criterion": "C2: random names checked"}]) == []
+    # Criteria that differ only near the end need the full text, not a shared opening.
+    limits = ["Uploads are rejected when the request body is larger than the configured limit of 1 MiB",
+              "Uploads are rejected when the request body is larger than the configured limit of 10 MiB per user"]
+    first_twice = [{"criterion": limits[0]}, {"criterion": limits[0]}]
+    assert missing_coverage(limits, [], first_twice) == ["acceptance criterion 2"]
+
+
+def test_coverage_matching_keeps_text_in_any_script():
+    from aifactory.harness.schemas import missing_coverage
+
+    assert missing_coverage(["用户可以登录"], ["Пароль не записывается в журнал"],
+                            [{"criterion": "用户可以登录"}, {"criterion": "Пароль не записывается в журнал"}]) == []
+    assert missing_coverage(["用户可以登录"], [], [{"criterion": "用户可以注销"}]) == ["acceptance criterion 1"]
 
 
 def test_an_acceptance_criterion_that_starts_like_a_label_is_still_a_criterion():
