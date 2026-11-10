@@ -187,6 +187,13 @@ class LinearOperation(Base):
     __table_args__ = (UniqueConstraint("workspace_id", "semantic_key"),)
 
 
+class LinearWarningOperation(Base):
+    __tablename__ = "linear_warning_operations"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Plan(Base):
     __tablename__ = "plans"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)

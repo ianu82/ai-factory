@@ -94,6 +94,8 @@ def test_semantic_comments(work, kind):
         if kind == "decision":
             db.add(Decision(id="semantic-identity", workspace_id=work[0], outcome_id=work[1],
                             kind="question", title="Help"))
+        if kind == "completion":
+            db.get(Outcome, work[1]).status = "completed"
     first = enqueue_comment(*work, kind, "semantic-identity", "Body")
     assert enqueue_comment(*work, kind, "semantic-identity", "Changed event") == first
     assert dispatch(remote) == dispatch(remote) == []
@@ -324,10 +326,11 @@ def test_factory_completion_feedback_key_and_disable(work, configured):
         db.add(Decision(workspace_id=work[0], outcome_id=work[1], kind="question", title="Help"))
         db.add(Run(workspace_id=work[0], outcome_id=work[1], role="builder", harness="native", cost_usd=1.23))
     assert dispatch(remote) == []
-    assert remote.states[work[2]] == "building" and len(remote.comments) == 3
+    assert remote.states[work[2]] == "blocked" and len(remote.comments) == 3
     with session_scope() as db:
         db.add(Secret(workspace_id=work[0], kind="feedback_key", ciphertext=token_hash("feedback")))
         db.query(Task).filter_by(outcome_id=work[1]).one().status = "completed"
+        db.query(Decision).filter_by(outcome_id=work[1]).one().status = "resolved"
     Orchestrator()._promote()
     assert dispatch(remote) == []
     assert remote.states[work[2]] == "done" and len(remote.comments) == 4
@@ -378,7 +381,7 @@ def test_completion_waits_for_final_cost_across_restarts(work, monkeypatch, pric
     assert len(remote.comments) == 1
     body = next(iter(remote.comments.values()))["body"]
     assert body == ("Outcome delivered. Total cost: $5.79" if pricing_arrives
-                    else "Outcome delivered. Cost still being reconciled.")
+                    else "Outcome delivered. Total cost: unknown (cost still being reconciled).")
     now += timedelta(minutes=1)
     assert dispatch(remote) == []
     assert len(remote.comments) == 1

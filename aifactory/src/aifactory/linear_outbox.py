@@ -15,6 +15,7 @@ import json
 from datetime import timedelta
 from uuid import uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import and_, or_, update
 from sqlalchemy.exc import IntegrityError
 
@@ -23,7 +24,7 @@ from .config import get_settings
 from .db import session_scope, utcnow
 from .events import record
 from .linear import LinearError
-from .models import Decision, Event, LinearOperation as Operation, Outcome, Plan, Run, Secret, Signal, Task, Workspace
+from .models import Decision, Event, LinearOperation as Operation, LinearWarningOperation, Outcome, Plan, Run, Secret, Signal, Task, Workspace
 from .security import SecretError, decrypt, redact
 
 
@@ -67,9 +68,34 @@ def _comment(db, workspace_id, outcome_id, issue_id, kind, identity, body):
     payload = {"body": _body(db, workspace_id, body)}
     if kind == "decision":
         payload["decision_id"] = identity
-    return _insert(db, workspace_id=workspace_id, outcome_id=outcome_id, issue_id=issue_id,
+    if kind == "completion":
+        payload["comment_kind"] = kind
+    operation = _insert(db, workspace_id=workspace_id, outcome_id=outcome_id, issue_id=issue_id,
                    semantic_key=_key(issue_id, kind, identity), kind="comment",
                    payload=payload, remote_id=str(uuid4()))
+    if kind == "completion" and operation.status == "superseded" and _completed(db, workspace_id, outcome_id):
+        operation.status, operation.payload = "pending", payload
+        operation.next_attempt, operation.attempts, operation.error = utcnow(), 0, ""
+    return operation
+
+
+def _completed(db, workspace_id, outcome_id):
+    outcome = db.get(Outcome, outcome_id)
+    return (outcome is not None and outcome.status == "completed"
+            and not db.query(Task).filter_by(outcome_id=outcome_id).filter(
+                Task.status != "completed").first()
+            and not db.query(Decision).filter_by(workspace_id=workspace_id, outcome_id=outcome_id,
+                                                status="open").first())
+
+
+def _obsolete_completion(db, comment):
+    if (comment.payload.get("comment_kind") != "completion"
+            and comment.semantic_key != _key(comment.issue_id, "completion", comment.outcome_id)):
+        return False
+    if _completed(db, comment.workspace_id, comment.outcome_id):
+        return False
+    comment.status = "superseded"
+    return True
 
 
 def _obsolete_decision(db, comment):
@@ -105,7 +131,7 @@ def _state(db, workspace_id, outcome_id, issue_id, target):
         {"status": "superseded"}, synchronize_session=False)
     issue.revision += 1
     issue.payload = {"target": target}
-    if issue.error != "rate_limit":
+    if issue.error not in {"rate_limit", "timeout"}:
         issue.next_attempt, issue.attempts = utcnow(), 0
     _insert(db, workspace_id=workspace_id, outcome_id=outcome_id, issue_id=issue_id,
             semantic_key=_key(issue_id, "state", str(issue.revision)), kind="state",
@@ -123,24 +149,29 @@ def _desired(db, issue):
     if not config.enabled:
         return None
     outcome = db.get(Outcome, issue.outcome_id)
-    signal = db.get(Signal, outcome.signal_id) if outcome.signal_id else None
+    signal = db.query(Signal).filter_by(workspace_id=issue.workspace_id, outcome_id=outcome.id,
+                                      source="linear_issue", external_id=issue.issue_id).one_or_none()
     if not signal or signal.source != "linear_issue" or signal.external_id != issue.issue_id:
         return issue.payload.get("target")
     tasks = db.query(Task).filter_by(outcome_id=outcome.id).all()
     statuses = {task.status for task in tasks}
-    stages = {task.stage for task in tasks if task.status not in {"completed", "cancelled", "abandoned"}}
-    if outcome.status == "completed":
-        stage = "done"
-    elif outcome.status in {"attention", "blocked", "failed", "cancelled", "partially_completed",
-                            "needs_input", "awaiting_approval"} or statuses & {
-            "failed", "blocked", "needs_input", "handed_over", "awaiting_approval", "smoke_failed"}:
+    stages = {task.stage for task in tasks if task.status in {"running", "queued", "waiting_ci"}}
+    if outcome.status in {"attention", "blocked", "failed", "cancelled", "partially_completed",
+                          "reverted", "handed_over", "abandoned", "needs_input", "awaiting_approval"} or statuses & {
+            "failed", "blocked", "attention", "needs_input", "handed_over", "awaiting_approval", "smoke_failed",
+            "cancelled", "abandoned", "reverted", "partially_completed"} or db.query(Decision).filter_by(
+                workspace_id=issue.workspace_id, outcome_id=outcome.id, status="open").first():
         stage = "blocked"
-    elif stages & {"ci", "merge", "smoke", "release"}:
-        stage = "merging"
-    elif stages & {"verify", "checks"}:
+    elif outcome.status == "completed" and _completed(db, issue.workspace_id, outcome.id):
+        stage = "done"
+    elif outcome.status == "planning" or not stages:
+        stage = "queued"
+    elif stages - {"verify", "publish", "ci", "merge", "smoke", "release", "done"}:
+        stage = "building"
+    elif stages & {"verify", "publish"}:
         stage = "verifying"
     else:
-        stage = "building" if outcome.status == "running" else "queued"
+        stage = "merging"
     return getattr(config.states, stage)
 
 
@@ -157,9 +188,15 @@ def _capture(db, workspace):
                     for plan in db.query(Plan).filter_by(outcome_id=outcome.id)]
         comments += [("pr", task.id + ":" + task.pr_url, f"Pull request opened: {task.pr_url}")
                      for task in db.query(Task).filter_by(outcome_id=outcome.id) if task.pr_url]
-        comments += [("decision", decision.id, f"A person is needed: {base}/inbox/{decision.id}")
+        for event in db.query(Event).filter_by(workspace_id=workspace.id, outcome_id=outcome.id):
+            data = event.data or {}
+            if event.kind in {"published", "pr_published", "handover_published"} and event.task_id:
+                url = data.get("url") or data.get("pr_url")
+                if url:
+                    comments.append(("pr", event.task_id + ":" + url, f"Pull request opened: {url}"))
+        comments += [("decision", decision.id, f"A person is needed: {base}/outcomes/{outcome.id}#decision-{decision.id}")
                      for decision in db.query(Decision).filter_by(outcome_id=outcome.id, status="open")]
-        if outcome.status == "completed":
+        if _completed(db, workspace.id, outcome.id):
             runs = db.query(Run).filter_by(outcome_id=outcome.id).all()
             body = None
             if all(run.cost_known for run in runs):
@@ -169,7 +206,7 @@ def _capture(db, workspace):
                                semantic_key=_key(signal.external_id, "completion_cost", outcome.id),
                                kind="cost_wait", status="sent")
                 if utcnow() >= wait.created_at + timedelta(hours=1):
-                    body = "Outcome delivered. Cost still being reconciled."
+                    body = "Outcome delivered. Total cost: unknown (cost still being reconciled)."
             if body:
                 comments.append(("completion", outcome.id, body))
         for kind, identity, body in comments:
@@ -177,11 +214,29 @@ def _capture(db, workspace):
 
 
 def _category(exc):
+    if isinstance(exc, ValidationError):
+        return "configuration"
     if isinstance(exc, LinearError) and exc.category in {
             "timeout", "network", "authentication", "rate_limit", "unavailable", "http", "graphql",
             "malformed", "mutation_failed", "not_configured"}:
         return exc.category
     return "internal"
+
+
+def warning(db, workspace_id, category, *, kind="linear_outbox_warning"):
+    workspace = db.get(Workspace, workspace_id)
+    secret = db.query(Secret).filter_by(workspace_id=workspace_id, kind="linear_api_key").one_or_none()
+    revision = _key(json.dumps((workspace.settings or {}).get("linear"), sort_keys=True),
+                    secret.ciphertext if secret else "", str(secret.updated_at) if secret else "")
+    key = _key(workspace_id, "warning", category, revision)
+    try:
+        with db.begin_nested():
+            db.add(LinearWarningOperation(key=key, workspace_id=workspace_id))
+            db.flush()
+            record(workspace_id, kind, f"Linear sync pending ({category})", level="warn",
+                   data={"category": category}, session=db)
+    except IntegrityError:
+        pass
 
 
 def _failure(db, operation, exc):
@@ -190,10 +245,7 @@ def _failure(db, operation, exc):
     operation.attempts += 1
     operation.next_attempt = utcnow() + timedelta(seconds=max(60 if category == "rate_limit" else 30,
                                                             min(900, 30 * 2 ** min(operation.attempts - 1, 5))))
-    if not db.query(Event).filter_by(workspace_id=operation.workspace_id, kind="linear_outbox_warning").filter(
-            Event.data["category"].as_string() == category).first():
-        record(operation.workspace_id, "linear_outbox_warning", f"Linear sync pending ({category})",
-               level="warn", data={"category": category}, session=db)
+    warning(db, operation.workspace_id, category)
     return category
 
 
@@ -248,7 +300,8 @@ class Dispatcher:
                 for comment in comments:
                     try:
                         with session_scope() as db:
-                            if _obsolete_decision(db, db.get(Operation, comment.id)):
+                            current = db.get(Operation, comment.id)
+                            if current.status != "pending" or _obsolete_completion(db, current) or _obsolete_decision(db, current):
                                 continue
                         if comment.remote_id not in existing:
                             await provider.create_comment(issue.issue_id, comment.payload["body"], comment_id=comment.remote_id)
@@ -264,10 +317,11 @@ class Dispatcher:
                 db.query(Operation).filter_by(workspace_id=issue.workspace_id, issue_id=issue.issue_id,
                     status="pending").update({"next_attempt": utcnow() + timedelta(seconds=60)}, synchronize_session=False)
 
-    async def dispatch(self) -> list[str]:
+    async def dispatch(self, workspace_id: str | None = None) -> list[str]:
         errors = []
         with session_scope() as db:
-            workspace_ids = [workspace.id for workspace in db.query(Workspace)]
+            workspace_ids = ([workspace_id] if workspace_id is not None
+                             else [workspace.id for workspace in db.query(Workspace)])
         for workspace_id in workspace_ids:
             claim, claimed = uuid4().hex, []
             workspace_errors = []
@@ -282,12 +336,15 @@ class Dispatcher:
                     candidates = db.query(Operation).filter_by(workspace_id=workspace_id, kind="issue").filter(
                         or_(and_(Operation.payload["target"].as_string().is_not(None),
                                  Operation.next_attempt <= utcnow()), Operation.issue_id.in_(pending)),
-                        or_(Operation.error != "rate_limit", Operation.next_attempt <= utcnow())).order_by(
+                        or_(Operation.error.notin_(["rate_limit", "timeout"]), Operation.next_attempt <= utcnow())).order_by(
                             Operation.next_attempt).limit(50).all()
                     for issue in candidates:
                         changed = db.query(Operation).filter(Operation.id == issue.id, Operation.lease_until <= utcnow()).update(
                             {"claim": claim, "lease_until": utcnow() + timedelta(seconds=120)}, synchronize_session=False)
                         if changed:
+                            for comment in db.query(Operation).filter_by(workspace_id=workspace_id,
+                                    issue_id=issue.issue_id, kind="comment", status="pending"):
+                                _obsolete_completion(db, comment)
                             claimed.append(issue)
                 if not claimed:
                     continue
@@ -310,6 +367,14 @@ class Dispatcher:
                 finally:
                     heartbeat.cancel()
                     await asyncio.gather(heartbeat, return_exceptions=True)
+            except asyncio.CancelledError:
+                with session_scope() as db:
+                    for issue in claimed:
+                        db.query(Operation).filter_by(workspace_id=workspace_id, issue_id=issue.issue_id).filter(
+                            or_(Operation.kind == "issue", Operation.status == "pending")).update(
+                                {"error": "timeout", "next_attempt": utcnow() + timedelta(seconds=30)},
+                                synchronize_session=False)
+                raise
             except Exception as exc:
                 if claimed:
                     with session_scope() as db:
@@ -319,7 +384,10 @@ class Dispatcher:
                             db.query(Operation).filter_by(workspace_id=workspace_id, issue_id=issue.issue_id,
                                 status="pending").update({"next_attempt": current.next_attempt}, synchronize_session=False)
                 else:
-                    errors.append(_category(exc))
+                    category = _category(exc)
+                    errors.append(category)
+                    with session_scope() as db:
+                        warning(db, workspace_id, category)
             finally:
                 errors.extend(workspace_errors)
                 with session_scope() as db:

@@ -333,6 +333,7 @@ def test_disconnect_updates_configuration(configured, client):
 
 def test_periodic_intake_runs_without_github_credentials(configured, monkeypatch):
     from aifactory import linear_config
+    from aifactory.linear_sync import LinearSync
     from aifactory.pipeline.orchestrator import Orchestrator
 
     workspace_id, _ = configured
@@ -340,7 +341,7 @@ def test_periodic_intake_runs_without_github_credentials(configured, monkeypatch
     monkeypatch.setenv("AIFACTORY_SIGNAL_INTERVAL_SECONDS", "180")
     monkeypatch.setattr(linear_config, "provider", lambda workspace_id: endpoint.provider())
     orchestrator = Orchestrator()
-    asyncio.run(orchestrator._maybe_sync_signals())
+    asyncio.run(LinearSync(wake=orchestrator.wake).cycle())
     with session_scope() as db:
         assert db.query(Outcome).filter_by(workspace_id=workspace_id).count() == 1
     assert orchestrator._wake.is_set()
