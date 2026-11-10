@@ -115,6 +115,13 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             task.status = "queued"
         else:
             task.status = "abandoned"
+    elif kind == "budget" and outcome:  # planning stopped at the outcome budget
+        if resolution == "retry":
+            guidance(comment)
+            outcome.status, outcome.blocked_reason = "planning", ""
+        elif resolution == "cancel":
+            outcome.status = "cancelled"
+            orchestrator.cancel_outcome(outcome.id)
     elif kind == "unblock":
         if task:
             if resolution == "retry":

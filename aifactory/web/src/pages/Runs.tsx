@@ -46,7 +46,7 @@ export function RunsPage() {
               {runs.data.map((r) => (
                 <tr key={r.id} onClick={() => navigate(`/w/${ws.id}/outcomes/${r.outcome_id}`)} style={{ cursor: "pointer" }} title={r.error || undefined}>
                   <td style={{ width: 14 }}><Dot tone={RUN_TONE[r.status] || "idle"} title={r.status} /></td>
-                  <td><b style={{ fontWeight: 550 }}>{r.role}</b> <span className="muted">· {HARNESS_LABEL[r.harness]}{r.attempt > 1 ? ` · attempt ${r.attempt}` : ""}</span>
+                  <td><b style={{ fontWeight: 550 }}>{r.role.replace("_", " ")}</b> <span className="muted">· {HARNESS_LABEL[r.harness]}{r.attempt > 1 ? ` · attempt ${r.attempt}` : ""}</span>
                     {r.error && <div className="muted" style={{ fontSize: 12, maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.error}</div>}
                     <RunScores run={r} workspaceId={ws.id} /></td>
                   <td style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>

@@ -10,7 +10,7 @@ FROM node:22-bookworm-slim AS node
 
 FROM python:3.13-slim-bookworm
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ripgrep procps ca-certificates curl build-essential \
+ && apt-get install -y --no-install-recommends git ripgrep procps ca-certificates curl build-essential tini \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
@@ -46,4 +46,8 @@ ENV AIFACTORY_DATA_DIR=/data/aifactory \
     PYTHONUNBUFFERED=1 \
     PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 EXPOSE 8000
+# tini is PID 1 and reaps orphans. Sandbox cleanup kills whole jobs (killpg, pkill -U); asyncio reaps only the
+# command it started, so everything else a job ran would reparent to the server as PID 1 and stay a zombie,
+# counting against the container's 1000-task limit until no job, git call or test thread could start.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["aifactory", "serve"]

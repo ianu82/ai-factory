@@ -478,6 +478,23 @@ def job_cpus(uid: int | None) -> set[int] | None:
     return set(allowed[start:start + width])
 
 
+def process_report(proc: Path = Path("/proc")) -> dict[str, Any]:
+    """Tasks in use against the container's ceiling, and how many are zombies (exited, never reaped). Zombies
+    growing between inventories mean orphans are not being reaped; the image runs tini as PID 1 for that."""
+    info = {key: value for key, value in host_capacity().items() if key in ("pids_current", "pids_max")}
+    zombies = 0
+    for stat in proc.glob("[0-9]*/stat"):
+        try:
+            # Bytes: a job may name its process anything, not necessarily UTF-8. The command name in parentheses
+            # may contain spaces and parentheses, so the state is the first field after the last ")".
+            if stat.read_bytes().rsplit(b")", 1)[1].split()[0] == b"Z":
+                zombies += 1
+        except (OSError, IndexError):
+            continue
+    info["zombies"] = zombies
+    return info
+
+
 def host_capacity() -> dict[str, Any]:
     """What a job can use on this host: CPUs, process and memory ceilings (cgroup v2 / v1 or rlimit)."""
 
