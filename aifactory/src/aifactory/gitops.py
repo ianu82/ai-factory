@@ -91,9 +91,11 @@ async def mirror(full_name: str, token: str | InstallationCredential) -> Path:
         url = remote_url(full_name)
         if not (path / "HEAD").exists():
             path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(path.parent, 0o700)
             tmp = path.with_suffix(".tmp")
             shutil.rmtree(tmp, ignore_errors=True)
             await git("clone", "--bare", url, str(tmp), env=await fresh_git_auth_env(token), timeout=900)
+            os.chmod(tmp, 0o700)
             tmp.rename(path)
         # Jobs copy the mirror while other jobs fetch into it: no background maintenance may touch its files.
         for key, value in (("gc.auto", "0"), ("maintenance.auto", "false"), ("fetch.writeCommitGraph", "false")):
@@ -136,6 +138,25 @@ async def checkout(sandbox: LocalSandbox, full_name: str, token: str | Installat
     if adopt:
         sandbox.adopt_work()
     return base_sha
+
+
+async def benchmark_checkout(sandbox: LocalSandbox, full_name: str, token, base: str, branch: str) -> str:
+    """Export only base history, never later objects, alternates or upstream identity."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", base):
+        raise GitError("Benchmark requires an exact base commit")
+    path = await mirror(full_name, token)
+    dest = sandbox.work
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    clean = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    await git("init", "--quiet", str(dest), env=clean)
+    async with _mirror_lock(path):
+        await git("fetch", "--no-tags", str(path), base, cwd=dest, env=clean)
+    await git("checkout", "-q", "-B", branch, base, cwd=dest, env=clean)
+    # FETCH_HEAD includes the mirror path, so remove it before handing over the tree.
+    (dest / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+    sandbox.adopt_work()
+    return base
 
 
 @dataclass(frozen=True)

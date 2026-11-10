@@ -98,8 +98,12 @@ class Orchestrator:
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
         with session_scope() as s:
-            s.query(Task).filter(Task.status == "waiting_ci").update({Task.lease_owner: ""})
-            for task in s.query(Task).filter(Task.status == "running"):
+            s.query(Task).filter(
+                Task.outcome_id.in_(s.query(Outcome.id).filter(Outcome.source != "benchmark")),
+                Task.status == "waiting_ci").update({Task.lease_owner: ""})
+            for task in s.query(Task).filter(
+                    Task.outcome_id.in_(s.query(Outcome.id).filter(Outcome.source != "benchmark")),
+                    Task.status == "running"):
                 task.status = "queued"
                 task.lease_owner = ""
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
@@ -111,7 +115,9 @@ class Orchestrator:
         smoke_failed, so every task depending on it waited forever. Complete each one whose latest unblock decision
         accepted the failure. Idempotent: a completed task no longer matches."""
         with session_scope() as s:
-            for task in s.query(Task).filter(Task.status == "smoke_failed").all():
+            for task in s.query(Task).filter(
+                    Task.outcome_id.in_(s.query(Outcome.id).filter(Outcome.source != "benchmark")),
+                    Task.status == "smoke_failed").all():
                 if not accepted_after_merge(task):
                     continue
                 latest = (s.query(Decision).filter(Decision.task_id == task.id, Decision.kind == "unblock")
@@ -353,7 +359,7 @@ class Orchestrator:
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""
         with session_scope() as s:
-            outcomes = s.query(Outcome).filter(Outcome.status.in_(["running", "attention"])).all()
+            outcomes = s.query(Outcome).filter(Outcome.source != "benchmark", Outcome.status.in_(["running", "attention"])).all()
             for outcome in outcomes:
                 tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
                 by_key = {t.key: t for t in tasks}
@@ -412,18 +418,18 @@ class Orchestrator:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
-                        for o in s.query(Outcome).filter(Outcome.status == "planning")]
+                        for o in s.query(Outcome).filter(Outcome.source != "benchmark", Outcome.status == "planning")]
             queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Task.status == "queued")]
+                      .filter(Task.status == "queued", Outcome.source != "benchmark")]
             planning_by_ws: dict[str, int] = {}
-            for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
+            for outcome in s.query(Outcome).filter(Outcome.source != "benchmark", Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1
             running_by_ws: dict[str, int] = {}
-            for task in s.query(Task).filter(Task.id.in_(list(self._tasks))):
+            for task in s.query(Task).filter(Task.outcome_id.in_(s.query(Outcome.id).filter(Outcome.source != "benchmark")), Task.id.in_(list(self._tasks))):
                 running_by_ws[task.workspace_id] = running_by_ws.get(task.workspace_id, 0) + 1
 
         def dispatch(candidates, active, counts, global_limit, limit_key, turns, spawn):
@@ -453,7 +459,8 @@ class Orchestrator:
         now = utcnow().isoformat()
         with session_scope() as s:
             due = [t.id for t in s.query(Task).join(Workspace, Task.workspace_id == Workspace.id)
-                   .filter(Task.status == "waiting_ci", Workspace.paused.is_(False))
+                   .filter(Task.status == "waiting_ci", Workspace.paused.is_(False),
+                           Task.outcome_id.in_(s.query(Outcome.id).filter(Outcome.source != "benchmark")))
                    .order_by(Task.updated_at, Task.id)
                    if ((t.evidence or {}).get("ci_wait") or {}).get("next_poll_at", "") <= now
                    and t.id not in self._ci_polls and t.id not in self._tasks][:4 - len(self._ci_polls)]

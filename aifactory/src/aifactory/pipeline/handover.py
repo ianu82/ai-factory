@@ -32,6 +32,8 @@ def mark_handed_over(task_id: str, user: User) -> dict[str, Any]:
         task = s.get(Task, task_id)
         if task is None:
             raise HandoverError("Task not found")
+        if s.get(Outcome, task.outcome_id).source == "benchmark":
+            raise HandoverError("Benchmark work cannot be taken over or published")
         if task.status in NOT_TAKEABLE:
             raise HandoverError(f"{task.key} is already {task.status.replace('_', ' ')}")
         task.status, task.stage = "handed_over", ""
@@ -55,6 +57,10 @@ def mark_handed_over(task_id: str, user: User) -> dict[str, Any]:
 
 async def publish_candidate(task_id: str, info: dict[str, Any]) -> dict[str, Any]:
     """Push the latest unpublished candidate and open a draft PR. Best effort; returns what happened."""
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        if task and s.get(Outcome, task.outcome_id).source == "benchmark":
+            raise HandoverError("Benchmark publication is forbidden")
     ws = info["workspace_id"]
     if info["pr_url"]:
         return {"pr_url": info["pr_url"], "published": False}
@@ -93,6 +99,8 @@ async def close_dropped_pull(task_id: str, who: str, why: str) -> bool:
     with session_scope() as s:
         task = s.get(Task, task_id)
         if task is None or not task.pr_number or (task.evidence or {}).get("pr_closed"):
+            return False
+        if s.get(Outcome, task.outcome_id).source == "benchmark":
             return False
         repo = s.get(Repository, task.repo_id)
         ws, outcome_id, number, full_name = task.workspace_id, task.outcome_id, task.pr_number, repo.full_name

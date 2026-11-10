@@ -28,6 +28,8 @@ def target(db: Session, user: User, workspace_id: str, outcome_id: str,
 def send_guidance(db: Session, user: User, workspace_id: str, outcome_id: str,
                   text: str, task_id: str | None = None, *, action_id: str | None = None):
     target(db, user, workspace_id, outcome_id, task_id, "member")
+    if db.get(Outcome, outcome_id).source == "benchmark":
+        raise HTTPException(409, "Benchmark trials accept only fixed suite inputs; live guidance is forbidden")
     text = text.strip()
     if not text or len(text) > 8000:
         raise HTTPException(422, "Guidance must contain 1–8000 characters")

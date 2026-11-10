@@ -959,6 +959,10 @@ def post_message(workspace_id: str, outcome_id: str, body: MessageBody, user: Us
                  db: Session = Depends(get_db)):
     from .work_services import publish_changes, send_guidance
 
+    _ws(db, user, workspace_id)
+    outcome = db.get(Outcome, outcome_id)
+    if outcome and outcome.workspace_id == workspace_id and outcome.source == "benchmark":
+        raise HTTPException(409, "Benchmark trials accept only fixed suite inputs; live guidance is forbidden")
     m, payload = send_guidance(db, user, workspace_id, outcome_id, body.body, body.task_id)
     db.commit()
     publish_changes([payload])

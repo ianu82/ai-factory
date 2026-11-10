@@ -8,6 +8,7 @@ import os
 
 
 def main(argv: list[str] | None = None) -> None:
+    os.umask(0o077)  # before any control-plane storage is opened
     parser = argparse.ArgumentParser(prog="aifactory")
     sub = parser.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve", help="Run the web app, API and orchestrator")
@@ -24,6 +25,10 @@ def main(argv: list[str] | None = None) -> None:
     history.add_argument("--suite", required=True, metavar="NAME")
     history.add_argument("--output-root", metavar="PATH",
                          help="Export root (default: aifactory/benchmarks in the current source checkout; required outside a checkout)")
+    run = commands.add_parser("run", help="Execute isolated benchmark trials without publishing")
+    for flag in ("workspace", "suite", "harness", "model"):
+        run.add_argument("--" + flag, required=True)
+    run.add_argument("--trials", type=int, required=True)
     release = sub.add_parser("release-check", help="Promote the commit staging runs to the release branch when it is ready")
     release.add_argument("--dry-run", action="store_true", help="Check everything but do not move the release branch")
     args = parser.parse_args(argv)
@@ -32,7 +37,11 @@ def main(argv: list[str] | None = None) -> None:
         from .benchmarks import SuiteError, export_history, load_suite
 
         try:
-            if args.benchmark_command == "load":
+            if args.benchmark_command == "run":
+                import asyncio
+                from .pipeline.benchmarking import run_suite, print_summary
+                print_summary(asyncio.run(run_suite(args.workspace, args.suite, args.harness, args.model, args.trials)))
+            elif args.benchmark_command == "load":
                 suite = load_suite(args.workspace, args.path)
                 print(f"Loaded {suite.name} revision {suite.revision}: {len(suite.tasks)} task(s), {suite.content_hash}")
             else:

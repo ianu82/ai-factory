@@ -10,9 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shlex
+import tempfile
 import time
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -21,11 +24,11 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
-from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
+from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout, benchmark_checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
-from ..sandbox import LocalSandbox, SandboxError
+from ..sandbox import LocalSandbox, SandboxError, isolation_available
 from .qa import AppRun, change_checks, verifier_brief
 from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
                       workspace_settings)
@@ -45,7 +48,9 @@ class Stop(Exception):
 
 
 class TaskRunner:
-    def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock]):
+    def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock], *, benchmark_trial=None):
+        self.benchmark_trial = benchmark_trial
+        self._benchmark_root = None
         self.task_id = task_id
         self.cancelled = cancelled
         self.repo_lock = repo_lock
@@ -95,8 +100,10 @@ class TaskRunner:
             repo = s.get(Repository, task.repo_id)
             self.repo = Repository(**{c.name: getattr(repo, c.name) for c in Repository.__table__.columns})
         self.ws = self.task.workspace_id
-        self.settings = workspace_settings(self.ws)
-        self.cfg = self.repo.config or {}
+        self.settings = (json.loads(json.dumps(self.benchmark_trial.configuration["settings"]))
+                         if self.benchmark_trial else workspace_settings(self.ws))
+        self.cfg = (self.benchmark_trial.configuration["repository"] if self.benchmark_trial else self.repo.config or {})
+        self.prompt_repo = Repository(full_name="benchmark", default_branch="base") if self.benchmark_trial else self.repo
 
     def update(self, **fields: Any) -> None:
         with session_scope() as s:
@@ -142,12 +149,15 @@ class TaskRunner:
         return artifact_id
 
     def stage(self, stage: str, message: str | None = None) -> None:
-        self.update(stage=stage, status="running")
+        self.update(stage=stage, status="benchmark_running" if self.benchmark_trial else "running")
         if message:
             self.event("stage", message, stage=stage)
 
     def block(self, kind: str, title: str, body: str, *, status: str = "blocked",
               options: list[dict[str, Any]] | None = None) -> None:
+        if self.benchmark_trial:
+            self.evidence("benchmark_error", body)
+            raise Stop(body)
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             if not transition(s, task, status=status, blocked_reason=body[:2000], lease_owner=""):
@@ -167,6 +177,8 @@ class TaskRunner:
 
     # entry ---------------------------------------------------------------------
     async def run(self) -> None:
+        if self.outcome.source == "benchmark" and (not self.benchmark_trial or self.task.attempt):
+            raise Stop("Benchmark work cannot be resumed as delivery")
         try:
             if not self.task.started_at:
                 self.update(started_at=utcnow())
@@ -208,7 +220,7 @@ class TaskRunner:
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
-        max_attempts = int(self.settings.get("max_attempts", 3))
+        max_attempts = 1 if self.benchmark_trial else int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
         finished = {a.get("n") for a in self._budget_attempts()}
         if self.task.attempt and self.task.attempt not in finished:
@@ -218,7 +230,7 @@ class TaskRunner:
             self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
-            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
+            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and not self.benchmark_trial and self._auto_retry():
                 attempt = self.task.attempt + 1
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
                 summary = "\n".join(self.feedback[-6:])[:3000]
@@ -244,10 +256,12 @@ class TaskRunner:
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
+                benchmark_trial_id=self.benchmark_trial.id if self.benchmark_trial else None,
+                model_override=self.benchmark_trial.model if self.benchmark_trial else None,
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
-                prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
-                                    precedents(self.ws, self.repo.id),
-                                    guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
+                prompt=build_prompt(self.task, self.outcome, self.prompt_repo, self.feedback[-8:],
+                                    [] if self.benchmark_trial else precedents(self.ws, self.repo.id),
+                                    [] if self.benchmark_trial else guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
             if result is None:
                 if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
                     self.block("unblock", f"{self.task.key}: model provider problem", error,
@@ -260,7 +274,8 @@ class TaskRunner:
             if result.report.get("status") == "blocked":
                 reason = result.report.get("blocked_reason") or result.report.get("summary", "")
                 self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
-                self.update(attempt=attempt - 1)  # a question is not a failed attempt
+                if not self.benchmark_trial:
+                    self.update(attempt=attempt - 1)  # a question is not a failed attempt
                 self.block("question", f"{self.task.key} needs a decision", reason, status="needs_input",
                            options=[{"value": "answer", "label": "Answer and continue"},
                                     {"value": "abandon", "label": "Abandon task"}])
@@ -302,14 +317,31 @@ class TaskRunner:
                                        "diff_artifact_id": diff_id})
             break
 
+        if self.benchmark_trial:
+            return
         await self._publish(token)
         await self.ci_then_merge()
 
+    def _new_sandbox(self, name):
+        if not self.benchmark_trial:
+            return LocalSandbox(name).create()
+        from ..vm import vm_available
+        both_vm = ((self.cfg.get("build") or {}).get("isolation") == "vm"
+                   and ((self.cfg.get("qa") or {}).get("isolation") or (self.settings.get("qa") or {}).get("isolation")) == "vm")
+        if not isolation_available() and not (both_vm and vm_available()[0]):
+            raise SandboxError("benchmark requires an isolated sandbox")
+        if self._benchmark_root is None:
+            self._benchmark_root = Path(tempfile.mkdtemp(prefix="factory-benchmark-"))
+            os.chmod(self._benchmark_root, 0o711)
+        return LocalSandbox(name, root=self._benchmark_root).create()
+
     async def _prepare_builder(self, token: str, from_branch: bool) -> None:
-        self.builder = LocalSandbox(f"task-{self.task_id[:12]}-b{self.task.attempt}").create()
+        self.builder = self._new_sandbox(f"task-{self.task_id[:12]}-b{self.task.attempt}")
         branch = self.task.branch or f"factory/{self.outcome.number}-{self.task.key.lower()}-{self.task_id[:6]}"
         self.stage("prepare", f"Preparing a fresh checkout of {self.repo.full_name}")
-        if from_branch:
+        if self.benchmark_trial:
+            await benchmark_checkout(self.builder, self.repo.full_name, token, self.task.base_sha, branch)
+        elif from_branch:
             await checkout(self.builder, self.repo.full_name, token, f"refs/heads/{branch}", branch)
             await self._bring_branch_up_to_date(branch)
         else:
@@ -326,6 +358,8 @@ class TaskRunner:
             if key and setup and all(c["ok"] for c in setup):
                 await self._save_environment(self.builder, key)
         broken = [c for c in setup if not c["ok"]]
+        if broken and self.benchmark_trial:
+            raise SandboxError("Benchmark setup checks failed")
         if broken:
             self.feedback.append("- Note: repository setup failed before you started:\n" + "\n".join(
                 f"`{c['command']}` → exit {c['exit_code']}\n```\n{c['tail'][-1500:]}\n```" for c in broken))
@@ -460,9 +494,11 @@ class TaskRunner:
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
                     attempt=attempt, writable=False, effective_settings=self.settings,
                     repositories={self.repo.full_name: self.cfg},
-                    prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
-                                         precedents(self.ws, self.repo.id),
-                                         guidance_history(self.task.outcome_id, self.task_id))
+                    benchmark_trial_id=self.benchmark_trial.id if self.benchmark_trial else None,
+                    model_override=self.benchmark_trial.model if self.benchmark_trial else None,
+                    prompt=verify_prompt(self.task, self.prompt_repo, self.task.base_sha, self.builder_report, self.checks,
+                                         [] if self.benchmark_trial else precedents(self.ws, self.repo.id),
+                                         [] if self.benchmark_trial else guidance_history(self.task.outcome_id, self.task_id))
                     + brief), self.cancelled)
                 if app is not None:
                     await self._store_app_evidence(app, attempt, run.id)
@@ -487,6 +523,8 @@ class TaskRunner:
                 if report["verdict"] == "pass":
                     report = {**report, "verdict": "fail",
                               "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
+            if self.benchmark_trial and not benchmark_pass(report, self.task.acceptance):
+                report = {**report, "verdict": "fail"}
             self.verifier_report = report
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))
@@ -512,9 +550,9 @@ class TaskRunner:
 
     async def _verifier_sandbox(self, token: str, patch: Patch, attempt: int, tries: int, qa_cfg: dict[str, Any]):
         """A fresh checkout with the candidate applied: in a Railway VM when QA asks for VM isolation."""
-        local = LocalSandbox(f"task-{self.task_id[:12]}-v{attempt}-{tries}").create()
+        local = self._new_sandbox(f"task-{self.task_id[:12]}-v{attempt}-{tries}")
         try:
-            await checkout(local, self.repo.full_name, token, self.task.base_sha, f"verify-{self.task_id[:8]}")
+            await (benchmark_checkout if self.benchmark_trial else checkout)(local, self.repo.full_name, token, self.task.base_sha, f"verify-{self.task_id[:8]}")
             await apply_in_sandbox(local, patch)
         except BaseException:
             await local.close()
@@ -528,11 +566,14 @@ class TaskRunner:
         if not ok:
             self.event("qa_vm_unavailable", f"VM isolation requested but unavailable ({why}); verifying in a local sandbox",
                        level="warn")
+            if self.benchmark_trial and not isolation_available():
+                await local.close()
+                raise SandboxError("benchmark requires an isolated sandbox")
             return local
         from ..vm import environment_key
 
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
-            if qa_cfg.get("prepared", True) and self.cfg.get("setup") else None
+            if not self.benchmark_trial and qa_cfg.get("prepared", True) and self.cfg.get("setup") else None
         try:
             self.event("qa_vm_starting", "Starting an isolated VM for verification and runtime QA")
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(qa_cfg.get("cpu", 4)),
@@ -540,6 +581,9 @@ class TaskRunner:
         except Exception as exc:
             self.event("qa_vm_unavailable", f"Could not start a QA VM ({str(exc)[:300]}); verifying in a local sandbox",
                        level="warn")
+            if self.benchmark_trial and not isolation_available():
+                await local.close()
+                raise SandboxError("benchmark requires an isolated sandbox")
             return local
         await local.close()
         vm.environment_key = key
@@ -603,15 +647,19 @@ class TaskRunner:
         if not ok:
             self.event("build_vm_unavailable", f"VM isolation requested but unavailable ({why}); building locally",
                        level="warn")
+            if self.benchmark_trial and not isolation_available():
+                raise SandboxError("benchmark requires an isolated sandbox")
             return local
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
-            if self.cfg.get("setup") else None
+            if not self.benchmark_trial and self.cfg.get("setup") else None
         try:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(build_cfg.get("cpu", 4)),
                                                    memory_gb=float(build_cfg.get("memory_gb", 8)))
         except Exception as exc:
             self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); building locally",
                        level="warn")
+            if self.benchmark_trial and not isolation_available():
+                raise SandboxError("benchmark requires an isolated sandbox")
             return local
         await local.close()
         vm.environment_key = key
@@ -644,6 +692,8 @@ class TaskRunner:
                        "setup skipped", level="success", environment=sandbox.prepared)
             return
         results = await self._run_commands(sandbox, setup, "verify_setup", timeout=1200)
+        if self.benchmark_trial and any(not r["ok"] for r in results):
+            raise SandboxError("Benchmark verifier setup checks failed")
         key = getattr(sandbox, "environment_key", None)
         if key and results and all(r["ok"] for r in results):
             await self._save_environment(sandbox, key)
@@ -711,6 +761,8 @@ class TaskRunner:
 
     # publication ---------------------------------------------------------------
     async def _publish(self, token: str) -> None:
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         assert self.patch is not None
         self.stage("publish", "Publishing the verified change")
         message = f"{self.task.title}\n\nFactory outcome #{self.outcome.number}, task {self.task.key}."
@@ -823,6 +875,8 @@ class TaskRunner:
 
     async def _settle_issues(self) -> None:
         """After the outcome's last task: make sure its source issues closed, and say so plainly if they did not."""
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         issues = self._source_issues()
         if not issues or not self._closes_issue():
             return
@@ -866,6 +920,8 @@ class TaskRunner:
                 raise Stop()
 
     async def ci_then_merge(self) -> None:
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         # Token resolution is inside the same guarded path as all later observations.
         candidate = (self.task.evidence or {}).get("revert_candidate")
         wait = (self.task.evidence or {}).get("ci_wait") or {}
@@ -893,6 +949,8 @@ class TaskRunner:
 
     async def poll_ci(self, gh: GitHub | None = None) -> None:
         """One bounded observation. No sleeps, sandbox, merge lock, or delivery slot."""
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         try:
             await asyncio.wait_for(self._poll_ci(gh), timeout=CI_POLL_TIMEOUT_SECONDS)
         except (asyncio.TimeoutError, GitHubError) as exc:
@@ -1058,6 +1116,8 @@ class TaskRunner:
             return not published or row.resolved_at >= datetime.fromisoformat(published)
 
     async def merge(self) -> None:
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         token = resolve_token(self.ws)
         gh = GitHub(token)
         if self.task.pr_number:
@@ -1239,6 +1299,8 @@ class TaskRunner:
 
     # smoke & release -------------------------------------------------------------
     async def smoke(self) -> None:
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         self.stage("smoke", "Running smoke checks on the merged result")
         commands = self.cfg.get("smoke") or self.cfg.get("checks") or []
         if not commands:
@@ -1278,6 +1340,8 @@ class TaskRunner:
 
     async def revert(self) -> None:
         """Bounded recovery: open a revert PR for the merged change, wait for CI, merge it and re-run smoke."""
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         existing = (self.task.evidence or {}).get("revert_candidate")
         if existing:
             await self._wait_ci(continuation="revert", head=existing["head"], pr=existing["pr"])
@@ -1331,6 +1395,8 @@ class TaskRunner:
             _handle_reverted(self.task_id, pr)
 
     async def release(self) -> None:
+        if self.outcome.source == "benchmark":
+            raise Stop("Benchmark publication is forbidden")
         release_cfg = self.cfg.get("release") or {}
         if not release_cfg.get("health_url") and release_cfg.get("mode") != "on_merge":
             await self._complete("Merged and smoke-tested")
@@ -1463,3 +1529,11 @@ def _signal(workspace_id: str, repo_id: str | None, source: str, title: str, bod
             s.add(Signal(workspace_id=workspace_id, repo_id=repo_id, source=source, fingerprint=fingerprint,
                          title=title[:300], body=body[:8000], url=url))
     notify(workspace_id, "signal", fingerprint)
+
+
+def benchmark_pass(report, acceptance):
+    criteria = report.get("criteria") or []
+    return (report.get("verdict") == "pass" and bool(acceptance)
+            and sorted(c.get("criterion", "") for c in criteria) == sorted(acceptance)
+            and all(c.get("status") == "pass" for c in criteria)
+            and not any(f.get("severity") in ("blocker", "major") for f in report.get("findings") or []))
