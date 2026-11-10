@@ -42,16 +42,17 @@ def test_guided_final_steps(client, signed_in, plan, merge):
     response = client.patch(base, json={"settings": {"autonomy": policy, "budgets": budgets}})
     assert response.status_code == 200
     settings = response.json()["settings"]
-    assert settings["autonomy"] == policy
+    assert settings["autonomy"] == {"plan": "approval", "merge": "approval", "release": "approval"}
+    assert settings["learning"]["preset"] == policy
     assert settings["budgets"] == budgets
     for key, value in before.items():
-        if key not in ("autonomy", "budgets"):
+        if key not in ("autonomy", "budgets", "learning"):
             assert settings[key] == value
     # Exercise the actual delivery policy, not a copy of its logic.
-    runtime = SimpleNamespace(cfg={"release": {"mode": "on_merge"}}, settings=settings)
+    runtime = SimpleNamespace(cfg={"release": {"mode": "on_merge"}}, ws=wid)
     assert TaskRunner._merge_needs_approval(runtime) is True
     runtime.cfg = {"release": {"mode": "none"}}
-    assert TaskRunner._merge_needs_approval(runtime) is (merge == "approval")
+    assert TaskRunner._merge_needs_approval(runtime) is True  # learning overrides the desired preset
     for step in ("autonomy", "team"):
         assert client.patch(base + "/onboarding", json={"action": "complete", "step": step, "acknowledged": True}).status_code == 200
     members = client.get(base + "/members").json()

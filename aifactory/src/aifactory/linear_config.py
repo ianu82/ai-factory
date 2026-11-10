@@ -81,6 +81,9 @@ def _sanitize_changes(value: Any, secrets: tuple[str, ...]) -> Any:
 
 
 def save_config(db: Session, workspace: Workspace, config: LinearConfig, actor: str, *, commit: bool = True) -> None:
+    from .onboarding_policy import lock_workspace
+
+    workspace = lock_workspace(db, workspace.id)
     value = config.model_dump()
     if (workspace.settings or {}).get("linear") == value:
         return

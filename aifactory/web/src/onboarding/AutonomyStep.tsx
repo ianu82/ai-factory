@@ -11,14 +11,15 @@ export const AUTONOMY_PRESETS: Record<string, Settings["autonomy"]> = {
 
 export function AutonomyStep({ workspace, readOnly, onComplete, onNavigate }: OnboardingStepProps) {
   const qc = useQueryClient();
+  const savedPolicy = workspace.settings.learning?.preset ?? workspace.settings.autonomy;
   const [choice, setChoice] = useState(() => Object.keys(AUTONOMY_PRESETS).find((name) =>
-    (["plan", "merge", "release"] as const).every((key) => AUTONOMY_PRESETS[name][key] === workspace.settings.autonomy?.[key])) || "Custom/current");
+    (["plan", "merge", "release"] as const).every((key) => AUTONOMY_PRESETS[name][key] === savedPolicy?.[key])) || "Custom/current");
   const [budget, setBudget] = useState(String(workspace.settings.budgets?.outcome_usd ?? ""));
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
   const [error, setError] = useState("");
   const valid = budget.trim() !== "" && Number.isFinite(Number(budget)) && Number(budget) > 0;
-  const policy = AUTONOMY_PRESETS[choice] || workspace.settings.autonomy;
+  const policy = AUTONOMY_PRESETS[choice] || savedPolicy;
   const submit = async () => {
     if (lock.current || readOnly || !valid) return;
     lock.current = true; setBusy(true); setError("");
@@ -40,7 +41,7 @@ export function AutonomyStep({ workspace, readOnly, onComplete, onNavigate }: On
   return <form onSubmit={(e) => { e.preventDefault(); void submit(); }}>
     <fieldset disabled={busy || readOnly}>
       <legend>Approval policy</legend>
-      <p>Choose a preset or keep your current policy. Each value below is saved exactly as shown.</p>
+      <p>Choose your post-learning preset or keep your current selection. Each value below is saved for explicit application later.</p>
       {Object.entries(AUTONOMY_PRESETS).map(([name, values]) => <label className="onboarding-policy" key={name}>
         <input type="radio" name="autonomy" value={name} checked={choice === name} onChange={() => setChoice(name)} />
         <span><strong>{name}</strong><small>plan: {values.plan} · merge: {values.merge} · release: {values.release}</small></span>
@@ -51,6 +52,7 @@ export function AutonomyStep({ workspace, readOnly, onComplete, onNavigate }: On
       <label className="field" htmlFor="outcome-budget">Budget per outcome (USD)<input id="outcome-budget" className="input" type="number" step="any" min="0" required value={budget} aria-invalid={!valid} onChange={(e) => setBudget(e.target.value)} /></label>
       {!valid && <p role="alert">Enter a finite budget greater than zero.</p>}
     </fieldset>
+    <p>While learning, plans and merges require a person’s approval: nothing is planned into work or merged without you. After the first fully completed outcome, Inbox offers an admin the explicit switch to this preset; completion alone never changes policy.</p>
     <p>Release approval applies to repositories with release.mode=on_merge (deploy-on-main), including in Autonomous. Repositories without that mode do not trigger this release gate.</p>
     <p>You can change approvals and budgets later in Settings. Run and token budgets and other settings are kept.</p>
     {error && <p role="alert">{error}</p>}

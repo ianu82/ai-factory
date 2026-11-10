@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { useWs } from "../App";
 import { api } from "../api";
-import { ONBOARDING_STEPS, onboardingQueryKey, patchOnboarding, type OnboardingAction } from "./api";
+import { ONBOARDING_STEPS, onboardingQueryKey, patchOnboarding, type OnboardingAction, type OnboardingState } from "./api";
 import { deferMember, STEP_LABELS, useOnboarding } from "./state";
 import { ModelStep } from "./ModelStep";
 import { GitHubStep } from "./GitHubStep";
@@ -22,6 +22,23 @@ export function Onboarding() {
   const [error, setError] = useState("");
   const heading = useRef<HTMLHeadingElement>(null);
   const admin = ws.role === "owner" || ws.role === "admin";
+  // Start learning before exposing any setup actions, including the first step.
+  // This is an explicit POST on entry, never a side effect of a progress GET.
+  const start = useQuery({
+    queryKey: ["onboarding-start", ws.id],
+    enabled: admin,
+    staleTime: Infinity,
+    gcTime: 0,
+    refetchOnMount: "always",
+    retry: false,
+    queryFn: async () => {
+      const state = await api<OnboardingState>(`/api/workspaces/${ws.id}/onboarding/start`, { method: "POST" });
+      await qc.invalidateQueries({ queryKey: ["me"] });
+      await qc.invalidateQueries({ queryKey: ["learning-policy", ws.id] });
+      return state;
+    },
+  });
+  const starting = admin && !start.isSuccess;
   const step = progress.data?.current_step;
   const index = step ? ONBOARDING_STEPS.indexOf(step) : 0;
   useEffect(() => { heading.current?.focus(); }, [step, admin]);
@@ -58,11 +75,11 @@ export function Onboarding() {
         <div><span className="mono">FACTORY / WORKSPACE SETUP</span><strong>{ws.name}</strong><span className="muted">{ws.org_name} · {ws.role}</span></div>
         <div className="onboarding-header-actions">
           <CopySetupPrompt />
-          <button className="btn" disabled={busy} onClick={leave}>Leave for now</button>
-          <button className="btn ghost" disabled={busy} onClick={signOut}>Sign out</button>
+          <button className="btn" disabled={busy || starting} onClick={leave}>Leave for now</button>
+          <button className="btn ghost" disabled={busy || starting} onClick={signOut}>Sign out</button>
         </div>
         {me.workspaces.length > 1 && <label className="onboarding-workspace">Workspace
-          <select aria-label="Workspace" value={ws.id} disabled={busy} onChange={(e) => navigate(`/w/${e.target.value}/inbox`)}>
+          <select aria-label="Workspace" value={ws.id} disabled={busy || starting} onChange={(e) => navigate(`/w/${e.target.value}/inbox`)}>
             {me.workspaces.map((w) => <option key={w.id} value={w.id}>{w.org_name} / {w.name}</option>)}
           </select>
         </label>}
@@ -73,7 +90,7 @@ export function Onboarding() {
             const done = progress.data?.completed_steps.includes(s);
             return <li key={s}>
               <button aria-current={admin && step === s ? "step" : undefined}
-                disabled={!admin || !progress.data || busy}
+                disabled={!admin || !progress.data || busy || starting}
                 onClick={() => run(() => save({ action: "navigate", step: s }))}>
                 <span className="mono">{i + 1}</span><span>{STEP_LABELS[s]}<small>{done ? "Saved · Revisit" : "Not completed"}</small></span>
               </button>
@@ -81,9 +98,9 @@ export function Onboarding() {
           })}</ol>
           <p className="muted">Progress is saved to this workspace. You can leave and return at any time.</p>
         </nav>
-        <main className="onboarding-main" aria-busy={progress.isLoading || busy}>
+        <main className="onboarding-main" aria-busy={progress.isLoading || busy || starting}>
           <div className="onboarding-content">
-            {progress.isLoading ? <p role="status">Loading saved workspace progress…</p> : progress.data ? admin ? <>
+            {starting ? start.isError ? <><p role="alert">Could not start learning mode: {start.error.message}</p><button className="btn" onClick={() => start.refetch()}>Retry</button></> : <p role="status">Starting learning mode…</p> : progress.isLoading ? <p role="status">Loading saved workspace progress…</p> : progress.data ? admin ? <>
               <p className="mono muted">STEP {index + 1} OF {ONBOARDING_STEPS.length} · {progress.data.completed_steps.length} SAVED</p>
               <h1 ref={heading} tabIndex={-1}>{STEP_LABELS[progress.data.current_step]}</h1>
               <p>{progress.data.completed_steps.includes(progress.data.current_step) ? "This step is saved. You can revisit it without losing progress." : "Set up your workspace one step at a time."}</p>
@@ -112,8 +129,8 @@ export function Onboarding() {
           </div>
           <div className="onboarding-message" aria-live="polite">{error && <p role="alert">{error}</p>}{busy && <span>Saving…</span>}</div>
           <footer className="onboarding-actions">
-            {admin && progress.data ? <>
-              <button className="btn" disabled={busy || index === 0} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index - 1] }))}>Back</button>
+            {admin && progress.data && !starting ? <>
+              <button className="btn" disabled={busy || starting || index === 0} onClick={() => run(() => save({ action: "navigate", step: ONBOARDING_STEPS[index - 1] }))}>Back</button>
 
             </> : <span className="muted">Workspace setup · read-only</span>}
           </footer>

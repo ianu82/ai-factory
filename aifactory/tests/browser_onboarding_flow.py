@@ -48,6 +48,9 @@ def check(base_url):
                         {"id": "one", "name": "Workspace", "org_name": "Acme", "role": "admin", "settings": deepcopy(settings)}]})
                 if path == "/api/meta":
                     return route.fulfill(json={"auth": {"dev": True}, "harnesses": [], "sandbox": {}})
+                if path.endswith("/onboarding/start"):
+                    assert req.method == "POST"
+                    return route.fulfill(json=state)
                 if path.endswith("/onboarding"):
                     if req.method == "PATCH":
                         action = req.post_data_json

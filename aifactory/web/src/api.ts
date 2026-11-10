@@ -105,6 +105,7 @@ export interface CredentialsResponse {
 }
 
 export interface Settings {
+  learning?: { status: "learning" | "applied"; preset: Settings["autonomy"] };
   provider: "mindshub" | "openai";
   decision_judges: DecisionJudgeMode;
   models: { default?: string; planner?: string; builder?: string; verifier?: string; judge?: string };

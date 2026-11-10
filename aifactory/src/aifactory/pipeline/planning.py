@@ -10,10 +10,11 @@ from ..events import notify, record
 from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
 from ..models import Outcome, Plan, Repository, Task
+from ..onboarding_policy import lock_workspace
 from ..prompts import PLANNER, plan_prompt
 from ..sandbox import LocalSandbox
 from .runtime import (SessionSpec, guidance_history, open_decision, precedents, run_agent, set_outcome,
-                      workspace_settings)
+                      merged_settings, workspace_settings)
 
 log = logging.getLogger(__name__)
 
@@ -96,9 +97,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         open_decision(workspace_id, "question", f"Planner needs a decision for #{snapshot.number}", body,
                       outcome_id=outcome_id, options=options)
         return
-    if settings["autonomy"].get("plan") == "auto":
-        approve_plan(plan_id, approved_by=None)
-    else:
+    if not approve_plan(plan_id, approved_by=None):
         set_outcome(outcome_id, status="awaiting_approval")
         open_decision(workspace_id, "approve_plan", f"Approve plan for #{snapshot.number}: {snapshot.title}",
                       report.get("summary", ""), outcome_id=outcome_id,
@@ -106,15 +105,23 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                                {"value": "cancel", "label": "Cancel"}])
 
 
-def approve_plan(plan_id: str, approved_by: str | None) -> None:
-    """Materialize tasks from an approved plan. Idempotent."""
+def approve_plan(plan_id: str, approved_by: str | None) -> bool:
+    """Materialize tasks idempotently; automatic approval holds the settings lock.
+
+    False means a person must approve. The policy check and approval are one
+    transaction so onboarding activation cannot slip between them.
+    """
     with session_scope() as s:
         plan = s.get(Plan, plan_id)
-        if plan.status == "approved":
-            return
         outcome = s.get(Outcome, plan.outcome_id)
         workspace_id = outcome.workspace_id
-        settings = workspace_settings(workspace_id)
+        ws = lock_workspace(s, workspace_id)
+        s.refresh(plan)
+        if plan.status == "approved":
+            return True
+        settings = merged_settings(ws.settings)
+        if approved_by is None and settings["autonomy"].get("plan") != "auto":
+            return False
         repos = {r.full_name.lower(): r for r in s.query(Repository).filter(Repository.workspace_id == workspace_id)}
         plan.status = "approved"
         plan.approved_by = approved_by
@@ -134,3 +141,4 @@ def approve_plan(plan_id: str, approved_by: str | None) -> None:
     record(workspace_id, "plan_approved", f"Plan approved by {who}", outcome_id=outcome_id, level="success",
            actor=approved_by or "policy", data={"plan_id": plan_id})
     notify(workspace_id, "outcome", outcome_id)
+    return True

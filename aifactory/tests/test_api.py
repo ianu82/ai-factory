@@ -19,7 +19,8 @@ def test_sign_in_creates_org_workspace_and_owner(client, signed_in):
     assert len(signed_in["workspaces"]) == 1
     ws = signed_in["workspaces"][0]
     assert ws["role"] == "owner" and ws["org_name"] == "MindsDB"
-    assert ws["settings"]["autonomy"]["merge"] == "auto"
+    assert ws["settings"]["autonomy"] == {"plan": "approval", "merge": "approval", "release": "approval"}
+    assert ws["settings"]["learning"]["preset"] == {"plan": "auto", "merge": "auto", "release": "approval"}
 
 
 def test_second_org_member_joins_existing_workspace_as_member(client, signed_in):
@@ -116,7 +117,7 @@ def test_settings_are_validated(client, signed_in):
     assert r.status_code == 200
     settings = r.json()["settings"]
     assert settings["concurrency"] == 50 and settings["harness"]["builder"] == "native"
-    assert settings["autonomy"]["merge"] == "approval" and settings["autonomy"]["plan"] == "auto"
+    assert settings["autonomy"]["merge"] == "approval" and settings["autonomy"]["plan"] == "approval"
 
 
 @pytest.mark.parametrize("value,expected", [(None, 2), ("6", 6), (0, 1), (-5, 1), (500, 50), ("bad", 2), ([], 2)])
@@ -578,3 +579,21 @@ def test_runs_config_version_filter_is_exact_scoped_and_before_limit(client, sig
     client.cookies.clear()
     client.post("/auth/dev", json={"email": "outsider@example.com", "organization": "Other org"})
     assert client.get(f"/api/workspaces/{ws_id}/runs?config_version=abc123").status_code == 404
+
+
+def test_created_workspace_enters_learning(client, signed_in):
+    org = signed_in["organizations"][0]["id"]
+    response = client.post("/api/workspaces", json={"org_id": org, "name": "New team"})
+    assert response.status_code == 200
+    ws = response.json()
+    assert ws["settings"]["autonomy"]["plan"] == ws["settings"]["autonomy"]["merge"] == "approval"
+    assert ws["settings"]["learning"]["preset"]["merge"] == "auto"
+    assert client.get(f"/api/workspaces/{ws['id']}/onboarding/policy").json()["eligible"] is False
+
+
+@pytest.mark.parametrize("state", [{"status": "applied"}, None, {"preset": {"merge": "auto"}}])
+def test_generic_settings_cannot_modify_learning_lifecycle(client, signed_in, state):
+    ws_id = signed_in["workspaces"][0]["id"]
+    before = client.get(f"/api/workspaces/{ws_id}/onboarding/policy").json()
+    assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"learning": state}}).status_code == 422
+    assert client.get(f"/api/workspaces/{ws_id}/onboarding/policy").json() == before

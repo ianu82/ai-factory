@@ -11,6 +11,8 @@ import { OutcomeDetail } from "../components/OutcomeDetail";
 import { SetupNotice, useSetupState } from "../components/Setup";
 import { RecoveryGuide } from "../components/RecoveryGuide";
 
+import { type LearningPolicy, policyLabel } from "../learningPolicy";
+
 type InboxData = { decisions: Decision[]; since: string | null; changes: (FactoryEvent & { outcome_number?: number; outcome_title?: string })[] };
 
 const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
@@ -40,6 +42,16 @@ export function InboxPage() {
   const [guide, setGuide] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const q = useQuery({ queryKey: ["inbox", ws.id], queryFn: () => api<InboxData>(`/api/workspaces/${ws.id}/inbox`) });
+  const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
+  const applyPreset = async () => {
+    setBusy("preset");
+    try {
+      await api(`/api/workspaces/${ws.id}/onboarding/policy/apply`, { method: "POST" });
+      await Promise.all([qc.invalidateQueries({ queryKey: ["learning-policy", ws.id] }), qc.invalidateQueries({ queryKey: ["me"] })]);
+      toast("Post-learning preset applied");
+    } catch (err) { toast((err as Error).message, true); }
+    finally { setBusy(null); }
+  };
   const marked = useRef(false);
   useEffect(() => {
     // Leaving the inbox counts as having looked; capture "since" first so this visit still shows changes.
@@ -111,6 +123,14 @@ export function InboxPage() {
         <button className={`chip ${order === "priority" ? "on" : ""}`} aria-pressed={order === "priority"} onClick={() => setOrder("priority")}>Priority</button>
         <button className={`chip ${order === "newest" ? "on" : ""}`} aria-pressed={order === "newest"} onClick={() => setOrder("newest")}>Newest</button>
       </div>
+      {policy.data?.eligible && <section className="s-block" aria-label="Post-learning preset">
+        <h2>Your first outcome is delivered</h2>
+        <p>Approvals remain required until an admin explicitly applies the saved preset.</p>
+        {policy.data.changes.length ? <ul>{policy.data.changes.map((change) => <li key={change.policy}>{change.policy}: {policyLabel(change.before)} → {policyLabel(change.after)}</li>)}</ul> : <p>No autonomy settings will change.</p>}
+        <p>Repository and release controls remain in place.</p>
+        {(["plan", "merge", "release"] as const).filter((key) => !policy.data!.changes.some((change) => change.policy === key)).map((key) => <p key={key}>{key}: {policyLabel(policy.data!.before[key])} (unchanged)</p>)}
+        {ws.role === "owner" || ws.role === "admin" ? <button className="btn primary" disabled={busy === "preset"} onClick={applyPreset}>{busy === "preset" ? "Applying…" : "Apply saved preset"}</button> : <p>Ask a workspace admin to apply this preset.</p>}
+      </section>}
       {guide && <RecoveryGuide onClose={() => setGuide(false)} />}
       <div className={`split ${selected ? "with-panel" : ""}`}>
         <div className="list-pane">

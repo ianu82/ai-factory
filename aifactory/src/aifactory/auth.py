@@ -130,9 +130,10 @@ def upsert_identity(db: Session, identity: dict[str, Any]) -> User:
         workspaces = db.query(Workspace).filter(Workspace.org_id == org.id).all()
         if not workspaces:
             from .pipeline.runtime import DEFAULT_SETTINGS
+            from .onboarding_policy import begin
 
             ws = Workspace(org_id=org.id, name=f"{org.name}", slug="default",
-                           mindshub_workspace_id=identity.get("workspace_id"), settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
+                           mindshub_workspace_id=identity.get("workspace_id"), settings=begin(DEFAULT_SETTINGS))
             db.add(ws)
             db.flush()
             workspaces = [ws]

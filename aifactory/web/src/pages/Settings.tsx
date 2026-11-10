@@ -6,6 +6,7 @@ import { api, type Credential, type ModelCheckResult, type Repo, type Settings, 
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { validMindBudget } from "../mind";
+import { type LearningPolicy, policyPatch } from "../learningPolicy";
 import { ago } from "../format";
 import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
@@ -52,7 +53,7 @@ function useSaveSettings() {
   const { ws } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
-  return async (patch: Partial<Settings> | { name?: string; paused?: boolean; description?: string }, isSettings = true) => {
+  return async (patch: Omit<Partial<Settings>, "autonomy"> & { autonomy?: Partial<Settings["autonomy"]> } | { name?: string; paused?: boolean; description?: string }, isSettings = true) => {
     try {
       await api<Workspace>(`/api/workspaces/${ws.id}`, { method: "PATCH", json: isSettings ? { settings: patch } : patch });
       await qc.invalidateQueries({ queryKey: ["me"] });
@@ -83,18 +84,30 @@ function Policies() {
   const [mindBudget, setMindBudget] = useState(String(s.mind?.daily_budget_usd ?? 10));
   const [mindSaving, setMindSaving] = useState(false);
   useEffect(() => setMindBudget(String(s.mind?.daily_budget_usd ?? 10)), [ws.id, s.mind?.daily_budget_usd]);
-  const autonomy = (key: keyof Settings["autonomy"], v: "auto" | "approval") => save({ autonomy: { ...s.autonomy, [key]: v } });
+  const qc = useQueryClient();
+  const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
+  const selected = policy.data?.after ?? s.autonomy;
+  const autonomy = async (key: keyof Settings["autonomy"], v: "auto" | "approval") => {
+    if (!policy.isSuccess) return;
+    const patch = policyPatch(policy.data, key, v);
+    if (!patch) return;
+    await save(patch);
+    await qc.invalidateQueries({ queryKey: ["learning-policy", ws.id] });
+  };
   return (
     <>
       <section className="s-block">
         <h2>When does a person step in?</h2>
         <p>Everything else runs unattended. Every approval is recorded with who gave it.</p>
+        {policy.isPending && <p role="status">Loading saved policy…</p>}
+        {policy.isError && <p role="alert">Could not load saved policy: {policy.error.message} <button className="btn sm" onClick={() => policy.refetch()}>Retry</button></p>}
+        {policy.data?.learning && <p role="status">Learning mode: plans and merges require approval while you learn. These controls save your post-learning preset; they do not remove approvals. After a fully completed outcome, an admin can explicitly apply the preset from Inbox. Repository and release approval controls still apply.</p>}
         <div className="s-line"><div className="l"><b>Plans</b><span>Start building as soon as the planner finishes, or wait for approval.</span></div>
-          <Seg value={s.autonomy.plan} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("plan", v)} disabled={!admin} /></div>
+          <Seg value={selected.plan} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("plan", v)} disabled={!admin || !policy.isSuccess} /></div>
         <div className="s-line"><div className="l"><b>Merges</b><span>Merge verified PRs once CI passes, or ask a person.</span></div>
-          <Seg value={s.autonomy.merge} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin} /></div>
+          <Seg value={selected.merge} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin || !policy.isSuccess} /></div>
         <div className="s-line"><div className="l"><b>Releases</b><span>For repositories that deploy when main changes, require approval before merging.</span></div>
-          <Seg value={s.autonomy.release} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("release", v)} disabled={!admin} /></div>
+          <Seg value={selected.release} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("release", v)} disabled={!admin || !policy.isSuccess} /></div>
       </section>
       <section className="s-block">
         <h2>Mind daily budget</h2>

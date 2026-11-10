@@ -17,7 +17,7 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from . import attachments as A
-from . import insights, linear_config, workstreams
+from . import insights, linear_config, onboarding_policy, workstreams
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
@@ -139,7 +139,7 @@ def create_workspace(body: WorkspaceCreate, user: User = Depends(current_user), 
     while db.query(Workspace).filter(Workspace.org_id == body.org_id, Workspace.slug == slug).first():
         slug, n = f"{base}-{n}", n + 1
     ws = Workspace(org_id=body.org_id, name=body.name, slug=slug, description=body.description,
-                   settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
+                   settings=onboarding_policy.begin(DEFAULT_SETTINGS))
     db.add(ws)
     db.flush()
     db.add(Membership(workspace_id=ws.id, user_id=user.id, role="owner"))
@@ -190,6 +190,7 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
         raise HTTPException(422, "Use the GitHub App connection flow to manage GitHub access")
     if body.settings is not None and "linear" in body.settings:
         raise HTTPException(422, "Use PUT /api/workspaces/{workspace_id}/linear to configure Linear")
+    ws = onboarding_policy.lock_workspace(db, workspace_id)
     changes = {}
     if body.name is not None:
         ws.name = body.name.strip()[:120] or ws.name
@@ -199,6 +200,8 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
         # Keys starting with "_" are the operator bootstrap's own bookkeeping (including the marker that
         # earns server fallback credentials); people can never set or clear them through the API.
         patch = {k: v for k, v in body.settings.items() if not str(k).startswith("_")}
+        if onboarding_policy.KEY in patch:
+            raise HTTPException(422, "Learning lifecycle is managed by the onboarding policy endpoint")
         before = merged_settings(ws.settings)
         updated = {**before, **patch}
         if "review" in patch:
@@ -206,6 +209,13 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
                 updated["review"] = {**before["review"], **validate_review(patch["review"])}
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from None
+        if "autonomy" in patch:
+            autonomy = patch["autonomy"]
+            if not isinstance(autonomy, dict) or any(
+                    k not in onboarding_policy.POLICIES or v not in ("auto", "approval")
+                    for k, v in autonomy.items()):
+                raise HTTPException(422, "Invalid autonomy policy")
+            updated = onboarding_policy.patch_autonomy({**updated, "autonomy": before["autonomy"]}, autonomy)
         ws.settings = _clean_settings(updated)
         changes = {k: ws.settings[k] for k in patch if before.get(k) != ws.settings.get(k)}
     if body.paused is not None:
@@ -216,6 +226,38 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
            data={"changes": changes})
     orchestrator.wake()
     return S.workspace(ws, require_member(db, user, workspace_id).role)
+
+
+@router.get("/workspaces/{workspace_id}/onboarding/policy")
+def get_learning_policy(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id)
+    return onboarding_policy.offer(db, ws)
+
+
+@router.post("/workspaces/{workspace_id}/onboarding/policy/apply")
+def apply_learning_preset(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "admin")
+    ws = onboarding_policy.lock_workspace(db, workspace_id)
+    preview = onboarding_policy.offer(db, ws)
+    if preview["applied"]:
+        return preview
+    if not preview["eligible"]:
+        raise HTTPException(409, "Complete an outcome before applying the preset")
+    old = ws.settings
+    state = old[onboarding_policy.KEY]
+    new = {**old, "autonomy": dict(preview["after"]),
+           onboarding_policy.KEY: {**state, "status": "applied", "applied_by": user.id,
+                                   "applied_at": utcnow().isoformat()}}
+    ws.settings = new
+    record(ws.id, "learning_preset_applied", f"{user.name or user.email} applied the post-learning preset",
+           actor=user.id, data={"before": preview["before"], "after": preview["after"],
+                                "changes": preview["changes"],
+                                "outcome_id": preview["first_completed_outcome_id"]}, session=db, publish=False)
+    db.commit()
+    db.refresh(ws)
+    notify(ws.id, "workspace", ws.id)
+    orchestrator.wake()
+    return onboarding_policy.offer(db, ws)
 
 
 @router.get("/workspaces/{workspace_id}/linear")
