@@ -8,7 +8,7 @@ import { STEP_LABELS, useOnboarding } from "../onboarding/state";
 export function useSetupState() {
   const { ws } = useWs();
   const state = useOnboarding(ws.id);
-  return { loading: state.isLoading, ready: state.data?.ready ?? false, error: state.error, firstOutcome: !!state.data?.first_outcome_id };
+  return { loading: state.isLoading, ready: state.data?.ready ?? false, error: state.error };
 }
 
 export function SetupNotice() {

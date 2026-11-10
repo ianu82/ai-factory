@@ -136,7 +136,7 @@ export function InboxPage() {
         <div className="list-pane">
           {q.isLoading || setup.loading ? <Skeleton rows={4} /> : (
             <>
-              {(!setup.ready || !setup.firstOutcome) && <SetupNotice />}
+              {!setup.ready && <SetupNotice />}
               {groups.map((g) => (
                 <section key={g.key} aria-label={g.label}>
                   <div className="list-section">{g.label} · {g.rows.length}</div>
