@@ -182,8 +182,9 @@ export class MindController {
   async start(workspace: string, content: string): Promise<string | null> {
     if (!content.trim()) return null;
     await this.create(workspace);
-    const active = this.state.active;
-    if (!active) return null;
+    const { active, status } = this.state;
+    // Open the conversation only when its first message can actually be sent.
+    if (!active || !status?.available || status.budget_state !== "ok") return null;
     void this.send(content);
     return active.id;
   }

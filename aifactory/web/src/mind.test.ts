@@ -456,3 +456,14 @@ test("wire unavailable, accounting and budget codes map to explicit blocked stat
     assert.equal(mindUsage(status, { daily_spend, daily_limit, thread_cost: { usd: null, known: false } }).budget_state, state);
   }
 });
+
+test("a new conversation opens only when its first message can be sent", async () => {
+  const { controller: c, transport } = harness();
+  transport.create = async () => ({ ...history(), messages: [], status: { model: null, available: false, reason: "Add a key", budget_state: "ok" } });
+  let sent = false;
+  transport.send = async () => { sent = true; };
+  assert.equal(await c.start("billing", "Hello"), null);
+  assert.equal(sent, false);
+  transport.create = async () => ({ ...history(), messages: [] });
+  assert.equal(await c.start("billing", "Hello"), "t1");
+});

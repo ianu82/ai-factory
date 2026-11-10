@@ -62,17 +62,20 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
     const id = await controller.start(workspaceId, text);
     setStarting(false);
     if (id) navigate(`/w/${workspaceId}/mind/${id}`);
+    else composer.current?.fill(text); // nothing was sent: keep the person's words
   };
+  const checking = !state.status;
   const recent = state.threads.slice(0, 12);
   return <div className="mind-home">
     <div className="mind-home-column">
       <h1>My Mind</h1>
       <p className="mind-home-lede">Ask what is happening across your workspaces, or ask Mind to step in. Anything it would change waits for your approval.</p>
       <Notice status={state.status} workspaceId={workspaceId} />
-      <MindComposer ref={composer} large autoFocus onSend={start} disabled={!!reason || starting} disabledReason={starting ? "Starting…" : reason || undefined}
+      <MindComposer ref={composer} large autoFocus onSend={start} disabled={!!reason || starting || checking}
+        disabledReason={starting ? "Starting…" : checking ? "Checking that Mind can answer…" : reason || undefined}
         placeholder="Ask about an outcome, a pull request or a failure, or ask Mind to fix something…" />
       <div className="mind-starters">
-        {STARTERS.map((s) => <button key={s} type="button" className="mind-starter" disabled={!!reason || starting} onClick={() => void start(s)}>{s}</button>)}
+        {STARTERS.map((s) => <button key={s} type="button" className="mind-starter" disabled={!!reason || starting || checking} onClick={() => void start(s)}>{s}</button>)}
       </div>
       {recent.length > 0 && <section className="mind-recent" aria-label="Recent conversations">
         <h2>Recent</h2>
@@ -96,11 +99,12 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
   const [unseen, setUnseen] = useState(false);
   useEffect(() => {
     if (state.userId && state.active?.id !== threadId) void controller.select(threadId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [controller, state.userId, threadId]);
   useEffect(() => { scroll.current = new MindScroll(); setUnseen(false); }, [threadId]);
   useLayoutEffect(() => { if (pane.current) setUnseen(scroll.current.onOutput(pane.current)); }, [state.messages, state.draft, state.steps]);
-  const loading = state.active?.id !== threadId;
+  // A conversation that could not be opened (deleted, no longer yours, offline) says so instead of loading forever.
+  const failed = state.active?.id !== threadId && !state.busy && !!state.error;
+  const loading = state.active?.id !== threadId && !failed;
   const reason = blockedReason(state.status);
   const actions = { confirm: (c: Parameters<typeof controller.confirm>[0]) => void controller.confirm(c),
                     dismiss: (c: Parameters<typeof controller.dismiss>[0]) => void controller.dismiss(c),
@@ -110,13 +114,16 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
   return <div className="mind-page">
     <div className="mind-main">
       <header className="mind-head">
-        <nav className="mind-crumbs" aria-label="Breadcrumb"><Link to={`/w/${workspaceId}/mind`}>My Mind</Link><span aria-hidden>/</span><span className="current" title={title}>{loading ? "…" : title}</span></nav>
+        <nav className="mind-crumbs" aria-label="Breadcrumb"><Link to={`/w/${workspaceId}/mind`}>My Mind</Link><span aria-hidden>/</span><span className="current" title={title}>{loading || failed ? "…" : title}</span></nav>
         <button type="button" className="btn sm ghost" onClick={() => navigate(`/w/${workspaceId}/mind`)}><Plus /> New conversation</button>
       </header>
       <div className="mind-scroll" ref={pane} role="log" aria-label="Conversation with Mind" aria-busy={state.busy}
         onScroll={(e) => setUnseen(scroll.current.onScroll(e.currentTarget))}>
         <div className="mind-column">
-          {loading ? <div className="mind-loading muted">Loading conversation…</div> : <>
+          {failed ? <div className="mind-loading" role="alert">
+            <p className="mind-error">{state.error}</p>
+            <p className="muted">This conversation could not be opened. <Link to={`/w/${workspaceId}/mind`}>Back to My Mind</Link></p>
+          </div> : loading ? <div className="mind-loading muted">Loading conversation…</div> : <>
             {state.messages.map((m, i) => m.role === "user" ? <UserTurn key={m.id} message={m} />
               : <AssistantTurn key={m.id} message={m} roles={roles} pending={state.pendingCards} busy={state.busy} actions={actions}
                   onRetry={m.failed ? () => { const prompt = previousUser(i); if (prompt) void controller.send(prompt.content); } : undefined} />)}
@@ -130,7 +137,7 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
         <div className="mind-column">
           <Notice status={state.status} workspaceId={workspaceId} />
           <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy}
-            disabled={loading || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
+            disabled={loading || failed || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
         </div>
       </div>
       <div className="sr" aria-live="polite">{state.announcement}</div>
