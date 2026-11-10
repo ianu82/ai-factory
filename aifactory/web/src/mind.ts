@@ -98,6 +98,7 @@ export class MindController {
   private roles: Record<string, Role> = {};
   private routeKey = "";
   private listFailure = ""; // the error a failed thread list left; only a later successful list clears it
+  private listRequest = 0; // only the newest thread-list request updates the list and its error
   constructor(privateTransport: MindTransport) { this.transport = privateTransport; }
   private transport: MindTransport;
   getSnapshot = () => this.state;
@@ -120,27 +121,29 @@ export class MindController {
   }
   setContext(context: MindContext | null) { this.update({ context }); }
   removeContext() { this.update({ context: null }); }
-  private async request<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void, failed?: (message: string) => void) {
+  private async request<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void, failed?: (message: string) => void,
+                           current: () => boolean = () => true) {
     if (!this.state.userId) return;
     const controller = new AbortController(), generation = this.generation;
     this.controllers.add(controller);
     try {
       const result = await work(controller.signal);
-      if (generation === this.generation && !controller.signal.aborted) apply(result);
+      if (generation === this.generation && !controller.signal.aborted && current()) apply(result);
     } catch (error) {
-      if (generation === this.generation && !controller.signal.aborted) {
+      if (generation === this.generation && !controller.signal.aborted && current()) {
         const message = (error as Error).message;
         this.update({ error: message }); failed?.(message);
       }
     } finally { this.controllers.delete(controller); }
   }
   async list() {
+    const request = ++this.listRequest;
     await this.request((s) => this.transport.list(s), (threads) => {
       // Clear only the error an earlier failed list left; a newer error from another action (send, confirm) stays.
       const stale = this.listFailure !== "" && this.state.error === this.listFailure;
       this.listFailure = "";
       this.update(stale ? { threads, error: "" } : { threads });
-    }, (message) => { this.listFailure = message; });
+    }, (message) => { this.listFailure = message; }, () => request === this.listRequest);
   }
   private load(history: MindHistory) {
     this.update({ messages: history.messages, status: history.status, active: history.thread, threads: [history.thread, ...this.state.threads.filter((t) => t.id !== history.thread.id)], busy: false, error: "", draft: "", progress: "" });

@@ -185,6 +185,19 @@ test("a thread list that completes later keeps a newer error from another action
   assert.match(c.getSnapshot().error, /Permission changed/);
   assert.equal(c.getSnapshot().threads.length, 1);
 });
+test("an older thread list that finishes after a newer one failed leaves the newer failure", async () => {
+  const { controller: c, transport } = harness();
+  let release = () => {};
+  transport.list = () => new Promise((resolve) => { release = () => resolve([history().thread]); });
+  const older = c.list();
+  transport.list = async () => { throw new Error("Could not load threads"); };
+  await c.list();
+  assert.match(c.getSnapshot().error, /Could not load threads/);
+  release();
+  await older;
+  assert.match(c.getSnapshot().error, /Could not load threads/);
+  assert.equal(c.getSnapshot().threads.length, 0);
+});
 test("budget validation allows zero/nonnegative finite values, rejects empty/negative/nonfinite", () => {
   for (const value of ["0", "10", "0.001", "100.50"]) assert.equal(validMindBudget(value), true);
   for (const value of ["", " ", "-1", "Infinity", "NaN", "1e999", "bad"]) assert.equal(validMindBudget(value), false);
