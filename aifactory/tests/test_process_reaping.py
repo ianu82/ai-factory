@@ -23,8 +23,10 @@ def test_process_report_counts_zombies(tmp_path):
                       "41": "41 (py) test (x)) Z 7 41", "42": "42 (git) R 7 42"}.items():
         (tmp_path / pid).mkdir()
         (tmp_path / pid / "stat").write_text(stat)
+    (tmp_path / "43").mkdir()
+    (tmp_path / "43" / "stat").write_bytes(b"43 (\xff\xfe job) Z 7 43")  # a job may name its process anything
     (tmp_path / "self").mkdir()  # not a process directory
     (tmp_path / "99").mkdir()  # exited between listing and reading
     report = process_report(tmp_path)
-    assert report["zombies"] == 2
+    assert report["zombies"] == 3
     assert {"pids_current", "pids_max"} <= set(report)

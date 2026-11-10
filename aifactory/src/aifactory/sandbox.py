@@ -485,8 +485,9 @@ def process_report(proc: Path = Path("/proc")) -> dict[str, Any]:
     zombies = 0
     for stat in proc.glob("[0-9]*/stat"):
         try:
-            # The command name in parentheses may contain spaces, so the state is the first field after it.
-            if stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+            # Bytes: a job may name its process anything, not necessarily UTF-8. The command name in parentheses
+            # may contain spaces and parentheses, so the state is the first field after the last ")".
+            if stat.read_bytes().rsplit(b")", 1)[1].split()[0] == b"Z":
                 zombies += 1
         except (OSError, IndexError):
             continue
