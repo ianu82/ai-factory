@@ -139,15 +139,28 @@ def _time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _handled(workspace_id: str, comment_id: int, now: datetime) -> bool:
-    """Whether an earlier poll (perhaps before a restart) already handled this command."""
+def _handled(workspace_id: str, comment_id: int, now: datetime) -> tuple[int, dict] | None:
+    """The record of an earlier poll (perhaps before a restart) that handled this command: (event id, data)."""
     from .db import session_scope
     from .models import Event
 
     cutoff = (now - 2 * MAX_AGE).replace(tzinfo=None)  # older commands are refused by age anyway
     with session_scope() as s:
-        return any((e.data or {}).get("comment_id") == comment_id for e in s.query(Event).filter(
-            Event.workspace_id == workspace_id, Event.kind == EVENT, Event.created_at >= cutoff))
+        for e in s.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == EVENT,
+                                       Event.created_at >= cutoff).order_by(Event.id):
+            if (e.data or {}).get("comment_id") == comment_id:
+                return e.id, dict(e.data or {})
+    return None
+
+
+def _mark_acknowledged(event_id: int) -> None:
+    from .db import session_scope
+    from .models import Event
+
+    with session_scope() as s:
+        event = s.get(Event, event_id)
+        if event is not None:
+            event.data = {**(event.data or {}), "acknowledged": True}
 
 
 def _apply_items(cfg: dict[str, Any], items: dict[str, list], schedule: Callable,
@@ -186,7 +199,8 @@ class Relay:
         self.wake = wake
         self.last_poll = float("-inf")
         self.since: datetime | None = None  # GitHub's `since` (updated at or after) for the next poll
-        self.seen: set[int] = set()  # commands this process handled; the events table covers restarts
+        self.seen: set[int] = set()  # commands this process handled and answered; the events table covers restarts
+        self.unanswered: dict[int, tuple[dict[str, Any], int, list[str]]] = {}  # comment id -> (comment, event, lines)
 
     async def run(self) -> None:
         """Poll on its own schedule: slow maintenance in the scheduler loop must never delay an operator's cancel
@@ -226,18 +240,24 @@ class Relay:
             if len(batch) < 100:
                 break
             page += 1
+        for comment_id, (comment, event_id, lines) in list(self.unanswered.items()):
+            await self._answer(gh, cfg, comment, event_id, lines)  # applied earlier; only the answer failed
         handled = []
         for comment in sorted(comments, key=lambda c: (str(c.get("created_at") or ""), int(c.get("id") or 0))):
             comment_id, body = int(comment.get("id") or 0), str(comment.get("body") or "")
-            if not comment_id or comment_id in self.seen or REPLY_MARKER in body:
+            if not comment_id or comment_id in self.seen or comment_id in self.unanswered or REPLY_MARKER in body:
                 continue
             if not body.lstrip().startswith(COMMAND):
                 continue
-            if await asyncio.to_thread(_handled, cfg["workspace"], comment_id, now):
-                self.seen.add(comment_id)
+            earlier = await asyncio.to_thread(_handled, cfg["workspace"], comment_id, now)
+            if earlier is not None:
+                event_id, data = earlier
+                if data.get("acknowledged"):
+                    self.seen.add(comment_id)
+                else:  # handled before a restart, but its answer never posted
+                    await self._answer(gh, cfg, comment, event_id, list(data.get("results") or []))
                 continue
             await self._handle(gh, cfg, comment, now)
-            self.seen.add(comment_id)
             handled.append(comment_id)
         # Overlap the next window by a minute (clock skew between GitHub and this host); handled ids are skipped.
         self.since = now - timedelta(minutes=1)
@@ -251,20 +271,33 @@ class Relay:
         lines = await self._apply(gh, cfg, comment, login, now)
         applied = any(line.endswith((": applied", ": posted", ": cancelled")) or ": retrying " in line
                       for line in lines)
-        # Recorded before the reply: a crash after it never applies a command twice (nonces also guard each item).
-        await asyncio.to_thread(
+        # Recorded before the answer: a crash after it never applies a command twice (nonces also guard each item).
+        # The record says whether the answer posted, so a failed answer is retried without applying again.
+        payload = await asyncio.to_thread(
             record, cfg["workspace"], EVENT, f"Operator relay from {login or 'unknown'}: " + "; ".join(lines)[:300],
             actor="operator", level="info" if applied else "warn",
             data={"comment_id": comment_id, "author": login, "results": lines,
-                  "delegated_by": cfg["delegated_by"]})
+                  "delegated_by": cfg["delegated_by"], "acknowledged": False})
         if applied:
             self.wake()
+        await self._answer(gh, cfg, comment, int(payload["id"]), lines)
+
+    async def _answer(self, gh, cfg: dict[str, Any], comment: dict[str, Any], event_id: int,
+                      lines: list[str]) -> None:
+        """Post the result lines on the control issue; until that succeeds every poll tries again."""
+        comment_id = int(comment["id"])
+        login = str((comment.get("user") or {}).get("login") or "")
         reply = "\n".join([REPLY_MARKER, f"Factory relay for {comment.get('html_url') or comment_id} "
                                          f"(by {login or 'unknown'}):", *[f"- {line}" for line in lines]])
         try:
             await gh.comment(cfg["repository"], cfg["issue"], reply)
         except Exception as exc:
-            log.warning("operator relay could not answer comment %s: %s", comment_id, exc)
+            log.warning("operator relay could not answer comment %s yet: %s", comment_id, exc)
+            self.unanswered[comment_id] = (comment, event_id, lines)
+            return
+        self.unanswered.pop(comment_id, None)
+        self.seen.add(comment_id)
+        await asyncio.to_thread(_mark_acknowledged, event_id)
 
     async def _apply(self, gh, cfg: dict[str, Any], comment: dict[str, Any], login: str,
                      now: datetime) -> list[str]:

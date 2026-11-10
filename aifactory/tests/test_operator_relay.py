@@ -26,6 +26,7 @@ class FakeGH:
     replies: list[str] = []
     permissions: dict[str, str] = {}
     rate_limited = False
+    comment_fails = 0
     lists = 0
 
     def __init__(self, token):
@@ -46,6 +47,9 @@ class FakeGH:
 
     async def comment(self, full_name, number, body):
         assert (full_name, number) == ("acme/app", 5)
+        if FakeGH.comment_fails:
+            FakeGH.comment_fails -= 1
+            raise github_module.GitHubError("GitHub unreachable", 502)
         FakeGH.replies.append(body)
         FakeGH.comments.append({"id": 9000 + len(FakeGH.replies), "body": body, "user": {"login": "ianu82"},
                                 "created_at": iso(NOW), "updated_at": iso(NOW), "html_url": ""})
@@ -97,7 +101,7 @@ def factory(monkeypatch):
     monkeypatch.setattr(github_module, "GitHub", FakeGH)
     monkeypatch.setattr(github_module, "resolve_credential", lambda workspace_id: "token")
     FakeGH.comments, FakeGH.replies, FakeGH.permissions, FakeGH.lists = [], [], {"ianu82": "admin"}, 0
-    FakeGH.rate_limited = False
+    FakeGH.rate_limited, FakeGH.comment_fails = False, 0
     return ids
 
 
@@ -155,6 +159,32 @@ def test_a_rate_limited_permission_check_retries_instead_of_refusing(factory):
     FakeGH.rate_limited = False
     assert poll(relay) == [14]
     assert decision_state() == ("resolved", "reject")
+
+
+def test_a_failed_answer_is_retried_without_applying_again(factory):
+    FakeGH.comment_fails = 2
+    FakeGH.comments = [command(16, REQUEST_CHANGES)]
+    relay = Relay()
+    assert poll(relay) == [16]  # applied; the answer failed
+    assert decision_state() == ("resolved", "reject") and FakeGH.replies == []
+    FakeGH.comments = []  # later polls no longer list it (GitHub's since window has moved on)
+    poll(relay)  # the second answer attempt fails too
+    poll(relay)
+    assert len(FakeGH.replies) == 1 and "approve_merge reject: applied" in FakeGH.replies[0]
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_relay").one().data["acknowledged"] is True
+        assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
+
+
+def test_an_answer_lost_in_a_restart_is_posted_by_the_next_process(factory):
+    FakeGH.comment_fails = 1
+    FakeGH.comments = [command(17, REQUEST_CHANGES)]
+    assert poll() == [17]
+    assert FakeGH.replies == []
+    assert poll(Relay()) == []  # a new process finds the record: answers it, applies nothing again
+    assert len(FakeGH.replies) == 1
+    with session_scope() as s:
+        assert s.query(Event).filter(Event.kind == "operator_decision").count() == 1
 
 
 def test_a_login_that_is_not_a_collaborator_is_refused(factory):
