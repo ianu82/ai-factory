@@ -619,3 +619,31 @@ class MindActionResult(Base):
     action_id: Mapped[str] = mapped_column(ForeignKey("mind_actions.id"), unique=True)
     content: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DefinitionState(Base):
+    """Workspace-local compare-and-swap head; revisions live in a separate table."""
+
+    __tablename__ = "definition_states"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class DefinitionRevision(Base):
+    """Complete, attributed immutable bundle (including snapshotted team notes)."""
+
+    __tablename__ = "definition_revisions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    bundle: Mapped[dict[str, Any]] = mapped_column(JSON)
+    author: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    restored_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    __table_args__ = (UniqueConstraint("workspace_id", "revision"),)
+
+
+@event.listens_for(DefinitionRevision, "before_update")
+@event.listens_for(DefinitionRevision, "before_delete")
+def _immutable_definition_revision(_mapper, _connection, revision: DefinitionRevision) -> None:
+    raise ValueError("Definition revisions are immutable; save or restore a new revision")

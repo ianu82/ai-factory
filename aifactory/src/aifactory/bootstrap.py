@@ -18,6 +18,7 @@ import json
 import logging
 import os
 
+from . import definitions
 from .db import session_scope
 from .models import Organization, Repository, Workspace
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
@@ -105,7 +106,8 @@ def apply_bootstrap() -> str | None:
         settings["invites"] = {**(settings.get("invites") or {}),
                                **{e.lower(): "owner" for e in cfg.get("admins", [])}}
         ws.settings = settings
-        existing = {r.full_name: r for r in s.query(Repository).filter(Repository.workspace_id == ws.id)}
+        definitions.lock_workspace(s, ws.id)
+        existing = {r.full_name: r for r in definitions.lock_repositories(s, ws.id)}
         pending = []
         for entry in cfg.get("repositories", []):
             name, overrides = (entry, {}) if isinstance(entry, str) else (entry.get("full_name"), entry.get("config") or {})
@@ -118,7 +120,14 @@ def apply_bootstrap() -> str | None:
                         if _changed(applied, key, value):
                             current[key] = value
                     current["_bootstrap"] = applied
-                    existing[name].config = current
+                    try:
+                        # Roll back both context and its applied-value marker on rejection,
+                        # so the operator's intent can be retried after quota is freed.
+                        with s.begin_nested():
+                            existing[name].config = current
+                            definitions.validate_repository_change(s, ws.id)
+                    except definitions.DefinitionError as exc:
+                        log.error("Bootstrap skipped configuration for %s: %s", name, exc)
                 if branch:
                     existing[name].default_branch = branch
             elif name:
@@ -468,9 +477,15 @@ async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
         except GitHubError as exc:
             log.error("Bootstrap could not connect %s: %s", name, exc)
             continue
-        with session_scope() as s:
-            if not s.query(Repository).filter(Repository.workspace_id == workspace_id,
-                                              Repository.full_name == info["full_name"]).first():
-                s.add(Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=branch,
-                                 description=info.get("description") or "", config=config))
+        try:
+            with session_scope() as s:
+                definitions.lock_workspace(s, workspace_id)
+                repositories = definitions.lock_repositories(s, workspace_id)
+                if not any(r.full_name == info["full_name"] for r in repositories):
+                    s.add(Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=branch,
+                                     description=info.get("description") or "", config=config))
+                    definitions.validate_repository_change(s, workspace_id)
+        except definitions.DefinitionError as exc:
+            log.error("Bootstrap could not connect %s: %s", name, exc)
+            continue
         log.info("Bootstrap connected %s", name)
