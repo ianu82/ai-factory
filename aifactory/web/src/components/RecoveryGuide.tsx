@@ -15,7 +15,7 @@ export function RecoveryGuide({ onClose }: { onClose: () => void }) {
             <dt>CI fails on the pull request</dt>
             <dd>The failing job logs go to the next attempt; the branch is rebuilt and CI runs again.</dd>
             <dt>Waiting for CI</dt>
-            <dd>A task marked “Waiting for CI” is parked without occupying a concurrency slot, so other work can start. This parked wait survives restarts; when CI finishes, merge or CI repair resumes ahead of new builds of the same or lower priority. A running task at the CI stage is not parked.</dd>
+            <dd>A task marked “Waiting for CI” is parked without occupying a concurrency slot, so other work can start. This parked wait survives restarts; when CI finishes, merge or CI repair resumes ahead of new builds regardless of priority. A running task at the CI stage is not parked.</dd>
             <dt>Main moved before merging</dt>
             <dd>The branch is rebased and checks rerun. {meta.capabilities?.reverify === true ? "By default, changes on main in the same files or directories trigger fresh independent review, including runtime QA when configured. Repository settings can require this after every rebase or skip it. " : "Post-rebase independent review requires server support; without it, revalidation reruns checks, not independent review or runtime QA. "}Required CI must pass again before merge. Conflicts or failed revalidation feed a bounded rebuild with the findings.</dd>
             <dt>The Factory restarts</dt>

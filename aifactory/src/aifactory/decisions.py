@@ -112,6 +112,16 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     elif kind == "unblock":
         if task:
             if resolution == "retry":
+                wait = (task.evidence or {}).get("ci_wait")
+                if wait and wait.get("timed_out"):
+                    from datetime import timedelta
+                    from .pipeline.runtime import workspace_settings
+
+                    now = utcnow()
+                    wait = {**wait, "timed_out": False, "first_wait_at": now.isoformat(),
+                            "deadline": (now + timedelta(minutes=workspace_settings(task.workspace_id)[
+                                "limits"].get("ci_minutes", 45))).isoformat(), "next_poll_at": now.isoformat()}
+                    task.evidence = {**task.evidence, "ci_wait": wait}
                 if task.status == "failed":
                     task.attempt = 0
                     task.evidence = fresh_budget(task.evidence)

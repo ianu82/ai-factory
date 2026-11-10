@@ -19,14 +19,15 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Outcome, Task, Workspace
 from ..sandbox import host_capacity
-from .delivery import TaskRunner
+from .delivery import Stop, TaskRunner
+from .lifecycle import transition
 from .planning import plan_outcome
-from .runtime import merged_settings, open_decision, workspace_settings
+from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
 from .scheduling import Candidate, RequesterTurns
 
 log = logging.getLogger(__name__)
 
-ACTIVE_TASK = {"queued", "running"}
+ACTIVE_TASK = {"queued", "running", "waiting_ci"}
 DONE_TASK = {"completed"}
 TERMINAL_TASK = {"completed", "abandoned", "cancelled", "reverted", "handed_over"}
 HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_failed"}
@@ -38,6 +39,7 @@ class Orchestrator:
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
         self._planning: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
+        self._ci_polls: dict[str, asyncio.Task] = {}
         self._tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._planning_turns = RequesterTurns()
         self._delivery_turns = RequesterTurns()
@@ -58,8 +60,11 @@ class Orchestrator:
         self._stopping = True
         for job, _cancel in list(self._planning.values()) + list(self._tasks.values()):
             job.cancel()
+        for job in list(self._ci_polls.values()):
+            job.cancel()
         if self._loop_task:
             self._loop_task.cancel()
+        await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
         if self._linear_task:
             self._linear_task.cancel()
             await asyncio.gather(self._linear_task, return_exceptions=True)
@@ -75,14 +80,20 @@ class Orchestrator:
         return self._repo_locks.setdefault(repo_id, asyncio.Lock())
 
     def status(self) -> dict[str, Any]:
-        return {"planning": list(self._planning), "running": list(self._tasks),
+        with session_scope() as s:
+            waiting = [t.id for t in s.query(Task).filter(Task.status == "waiting_ci")]
+            running = [t.id for t in s.query(Task).filter(Task.id.in_(list(self._tasks)),
+                                                        Task.status == "running")]
+        return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
                 "global_limit": get_settings().global_concurrency}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
         with session_scope() as s:
+            s.query(Task).filter(Task.status == "waiting_ci").update({Task.lease_owner: ""})
             for task in s.query(Task).filter(Task.status == "running"):
                 task.status = "queued"
+                task.lease_owner = ""
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
 
@@ -377,6 +388,7 @@ class Orchestrator:
             notify(outcome.workspace_id, "outcome", outcome.id)
 
     def _schedule(self) -> None:
+        self._schedule_ci()
         settings = get_settings()
         with session_scope() as s:
             workspaces = {w.id: w for w in s.query(Workspace)}
@@ -384,7 +396,9 @@ class Orchestrator:
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
                         for o in s.query(Outcome).filter(Outcome.status == "planning")]
             queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
-                                0 if t.started_at is not None or t.stage or t.attempt > 0 else 1)
+                                0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
+                                ci_continuation=bool((t.evidence or {}).get("ci_wait"))
+                                and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
                       .filter(Task.status == "queued")]
             planning_by_ws: dict[str, int] = {}
@@ -411,6 +425,40 @@ class Orchestrator:
                  "planning_concurrency", self._planning_turns, self._spawn_plan)
         dispatch(queued, self._tasks, running_by_ws, settings.global_concurrency,
                  "concurrency", self._delivery_turns, self._spawn_task)
+
+    def _schedule_ci(self) -> None:
+        # A done callback (not only coroutine finally) handles cancellation before
+        # the first coroutine step. Prune here too so callback ordering cannot stall us.
+        self._ci_polls = {tid: job for tid, job in self._ci_polls.items() if not job.done()}
+        if len(self._ci_polls) >= 4:
+            return
+        now = utcnow().isoformat()
+        with session_scope() as s:
+            due = [t.id for t in s.query(Task).join(Workspace, Task.workspace_id == Workspace.id)
+                   .filter(Task.status == "waiting_ci", Workspace.paused.is_(False))
+                   .order_by(Task.updated_at, Task.id)
+                   if ((t.evidence or {}).get("ci_wait") or {}).get("next_poll_at", "") <= now
+                   and t.id not in self._ci_polls and t.id not in self._tasks][:4 - len(self._ci_polls)]
+        for task_id in due:
+            async def poll(tid=task_id):
+                try:
+                    await TaskRunner(tid, asyncio.Event(), self.repo_lock).poll_ci()
+                except (Stop, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    log.exception("CI poll failed for %s", tid)
+                finally:
+                    self.wake()
+
+            job = asyncio.create_task(poll(), name=f"ci-{task_id}")
+            self._ci_polls[task_id] = job
+
+            def done(finished, tid=task_id):
+                if self._ci_polls.get(tid) is finished:
+                    self._ci_polls.pop(tid, None)
+                self.wake()
+
+            job.add_done_callback(done)
 
     def _spawn_plan(self, outcome_id: str) -> None:
         cancel = asyncio.Event()
@@ -442,8 +490,8 @@ class Orchestrator:
         cancel = asyncio.Event()
         with session_scope() as s:
             task = s.get(Task, task_id)
-            task.status = "running"
-            task.lease_owner = self.instance
+            if task.status != "queued" or not transition(s, task, status="running", lease_owner=self.instance):
+                return
             ws, outcome_id = task.workspace_id, task.outcome_id
         notify(ws, "task", task_id, outcome_id=outcome_id)
 
@@ -454,17 +502,26 @@ class Orchestrator:
                 with session_scope() as s:
                     task = s.get(Task, task_id)
                     if task and task.status == "running":
-                        task.status = "cancelled" if cancel.is_set() else "queued"
+                        transition(s, task, status="cancelled" if cancel.is_set() else "queued", lease_owner="")
             except Exception as exc:
                 log.exception("task crashed")
                 try:
                     with session_scope() as s:
                         task = s.get(Task, task_id)
-                        task.status = "blocked"
-                        task.blocked_reason = f"{type(exc).__name__}: {exc}"[:2000]
-                    open_decision(ws, "unblock", "A task stopped unexpectedly", f"{type(exc).__name__}: {exc}"[:2000],
-                                  outcome_id=outcome_id, task_id=task_id,
-                                  options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+                        if task.status not in ("queued", "running") or not transition(
+                                s, task, status="blocked", lease_owner="",
+                                blocked_reason=f"{type(exc).__name__}: {exc}"[:2000]):
+                            return
+                        from ..models import Decision
+
+                        decision = Decision(workspace_id=ws, kind="unblock", title="A task stopped unexpectedly",
+                                            body=f"{type(exc).__name__}: {exc}"[:2000], outcome_id=outcome_id,
+                                            task_id=task_id, options=[{"value": "retry", "label": "Retry"},
+                                                                    {"value": "abandon", "label": "Abandon"}])
+                        s.add(decision)
+                        s.flush()
+                        decision_id, title = decision.id, decision.title
+                    publish_decision(ws, decision_id, "unblock", title, outcome_id=outcome_id, task_id=task_id)
                 except Exception:
                     log.exception("could not record the task crash")
             finally:
@@ -473,8 +530,19 @@ class Orchestrator:
                     task = s.get(Task, task_id)
                     if task and task.status == "running" and not self._stopping:
                         # Never silently loop: a runner that stops without a recorded state needs a look.
-                        task.status = "blocked"
-                        task.blocked_reason = "The task stopped without recording an outcome."
+                        transition(s, task, status="blocked", lease_owner="",
+                                   blocked_reason="The task stopped without recording an outcome.")
+                    if task and task.status == "running":
+                        # A workspace pause stops continuation at the next gate;
+                        # retain the stage for resumption when it is unpaused.
+                        s.query(Task).filter(Task.id == task_id, Task.status == "running",
+                                             Task.stage == task.stage, Task.workspace_id.in_(
+                                                 s.query(Workspace.id).filter(Workspace.paused.is_(True)))).update(
+                            {Task.status: "queued"}, synchronize_session=False)
+                    if task:
+                        # Leases are execution-only, including pause/stop/error exits.
+                        s.query(Task).filter(Task.id == task_id, Task.lease_owner == self.instance).update(
+                            {Task.lease_owner: ""}, synchronize_session=False)
                 notify(ws, "task", task_id, outcome_id=outcome_id)
                 self.wake()
 
@@ -492,6 +560,9 @@ class Orchestrator:
             self.cancel_task(task_id)
 
     def cancel_task(self, task_id: str) -> None:
+        poll = self._ci_polls.get(task_id)
+        if poll:
+            poll.cancel()
         if task_id in self._tasks:
             job, cancel = self._tasks[task_id]
             cancel.set()

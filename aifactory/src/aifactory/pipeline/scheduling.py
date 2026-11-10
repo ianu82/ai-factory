@@ -13,9 +13,11 @@ class Candidate:
     priority: int
     requester: str | None
     created_at: datetime
-    # Within one priority, resumptions (0) precede new delivery work (1). Priority always comes first: work is
-    # started by priority, so urgent new work is never held behind less urgent resumptions.
+    # Within one priority, resumptions (0) precede new delivery work (1).
     dispatch_class: int = 0
+    # CI-only waits have already released their execution slot. Their ready
+    # continuations get the next eligible slot, even ahead of urgent fresh work.
+    ci_continuation: bool = False
 
 
 class RequesterTurns:
@@ -29,6 +31,9 @@ class RequesterTurns:
 
     def choose(self, eligible: list[Candidate]) -> Candidate:
         """Choose without consuming a turn; the caller records only actual dispatches."""
+        continuations = [c for c in eligible if c.ci_continuation]
+        if continuations:
+            eligible = continuations
         rank = min((c.priority, c.dispatch_class) for c in eligible)
         heads: dict[tuple[bool, str], Candidate] = {}
         for candidate in eligible:

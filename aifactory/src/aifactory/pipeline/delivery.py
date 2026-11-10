@@ -13,23 +13,28 @@ import logging
 import re
 import shlex
 import time
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
-from ..github import GitHub, GitHubError, resolve_credential as resolve_token
+from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, run_agent,
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
                       workspace_settings)
 
+from .lifecycle import transition
+
 log = logging.getLogger(__name__)
+
+CI_POLL_TIMEOUT_SECONDS = 90
 
 PROVIDER_PROBLEMS = ("refused the credential", "no credit", "No model provider", "limit reached", "wallet",
                      "No GitHub access", "Bad credentials")
@@ -92,8 +97,9 @@ class TaskRunner:
     def update(self, **fields: Any) -> None:
         with session_scope() as s:
             task = s.get(Task, self.task_id)
+            if (task.status, task.stage) != (self.task.status, self.task.stage) or not transition(s, task, **fields):
+                raise Stop()
             for key, value in fields.items():
-                setattr(task, key, value)
                 setattr(self.task, key, value)
         notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
 
@@ -138,9 +144,21 @@ class TaskRunner:
 
     def block(self, kind: str, title: str, body: str, *, status: str = "blocked",
               options: list[dict[str, Any]] | None = None) -> None:
-        self.update(status=status, blocked_reason=body[:2000])
-        open_decision(self.ws, kind, title, body, outcome_id=self.task.outcome_id, task_id=self.task_id,
-                      options=options or [{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}])
+        with session_scope() as s:
+            task = s.get(Task, self.task_id)
+            if not transition(s, task, status=status, blocked_reason=body[:2000], lease_owner=""):
+                raise Stop()
+            # The decision and state transition commit together; no second transaction
+            # can create a retry decision after a concurrent stop.
+            decision = Decision(workspace_id=self.ws, kind=kind, title=title, body=body,
+                                outcome_id=self.task.outcome_id, task_id=self.task_id,
+                                options=options or [{"value": "retry", "label": "Retry"},
+                                                    {"value": "abandon", "label": "Abandon task"}])
+            s.add(decision)
+            s.flush()
+            decision_id = decision.id
+        publish_decision(self.ws, decision_id, kind, title, outcome_id=self.task.outcome_id, task_id=self.task_id)
+        notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
         raise Stop()
 
     # entry ---------------------------------------------------------------------
@@ -151,6 +169,13 @@ class TaskRunner:
             stage = self.task.stage
             if stage == "merge":
                 await self.merge()
+            elif stage == "ci_repair":
+                await self._fix_ci(GitHub(resolve_token(self.ws)))
+            elif stage == "ci_refresh":
+                await self._refresh_onto_main(resolve_token(self.ws), GitHub(resolve_token(self.ws)),
+                                              self.task.evidence["ci_wait"]["stale_main"])
+            elif stage == "revert_merge":
+                await self._merge_revert()
             elif stage == "ci":
                 await self.ci_then_merge()
             elif stage == "smoke":
@@ -304,6 +329,8 @@ class TaskRunner:
         main = found.output.strip() if found.ok else ""
         if not main or not self.task.base_sha or main == self.task.base_sha:
             return
+        if (self.task.evidence or {}).get("ci", {}).get("state") == "failure":
+            self.event("revalidate", "The base branch moved; rebasing the CI repair before verification")
         author = " ".join(f"-c user.{k}={shlex.quote(v)}" for k, v in
                           (("name", AUTHOR["GIT_AUTHOR_NAME"]), ("email", AUTHOR["GIT_AUTHOR_EMAIL"])))
         # --onto: replay only this task's commits, even if the default branch was rewritten since.
@@ -801,70 +828,118 @@ class TaskRunner:
         return f"{base}/w/{self.ws}/outcomes/{self.task.outcome_id}?task={self.task_id}" if base.startswith("https") else ""
 
     # CI ------------------------------------------------------------------------
-    async def ci_then_merge(self) -> None:
-        token = resolve_token(self.ws)
-        gh = GitHub(token)
-        outcome = await self._wait_ci(gh)
-        if outcome == "failure":
-            await self._fix_ci(gh)
-            return
-        if outcome == "stale":
-            await self._refresh_onto_main(token, gh, self._stale_main)
-            return
-        await self.merge()
+    def _guard(self, status: str | None = None) -> None:
+        """Revalidate after every network/lock wait, before taking another action."""
+        if self.cancelled.is_set():
+            raise Stop()
+        with session_scope() as s:
+            task = s.get(Task, self.task_id)
+            if (status and task.status != status) or not transition(s, task, lease_owner=task.lease_owner):
+                raise Stop()
 
-    async def _wait_ci(self, gh: GitHub) -> str:
-        self.stage("ci", f"Waiting for CI on PR #{self.task.pr_number}")
-        limit = self.settings["limits"].get("ci_minutes", 45) * 60
+    async def ci_then_merge(self) -> None:
+        # Token resolution is inside the same guarded path as all later observations.
+        candidate = (self.task.evidence or {}).get("revert_candidate")
+        wait = (self.task.evidence or {}).get("ci_wait") or {}
+        if candidate and wait.get("continuation") == "revert":
+            await self._wait_ci(continuation="revert", head=candidate["head"], pr=candidate["pr"])
+        else:
+            await self._wait_ci()
+
+    async def _wait_ci(self, gh: GitHub | None = None, *, continuation: str = "delivery",
+                       head: str | None = None, pr: int | None = None) -> None:
+        head, pr = head or self.task.head_sha, pr or self.task.pr_number
+        now = utcnow()
+        wait = (self.task.evidence or {}).get("ci_wait") or {}
+        if (wait.get("head"), wait.get("pr"), wait.get("continuation")) != (head, pr, continuation):
+            wait = {"head": head, "pr": pr, "continuation": continuation,
+                    "first_wait_at": now.isoformat(),
+                    "deadline": (now + timedelta(minutes=self.settings["limits"].get("ci_minutes", 45))).isoformat()}
+        wait = {**wait, "next_poll_at": now.isoformat()}
+        self.update(status="waiting_ci", stage="ci", lease_owner="",
+                    evidence={**(self.task.evidence or {}), "ci_wait": wait})
+        # All observations, including the first one, belong to the bounded poll
+        # pool. Do not await GitHub here: Stop releases the builder sandbox and
+        # execution slot before the scheduler can begin polling this candidate.
+        raise Stop()
+
+    async def poll_ci(self, gh: GitHub | None = None) -> None:
+        """One bounded observation. No sleeps, sandbox, merge lock, or delivery slot."""
+        try:
+            await asyncio.wait_for(self._poll_ci(gh), timeout=CI_POLL_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, GitHubError) as exc:
+            # Every failed observation uses the same lifecycle/deadline gate.
+            # Neither a slow request nor an access error may leave an expired
+            # candidate retrying forever (or reset its durable waiting budget).
+            self._guard("waiting_ci")
+            self._check_ci_deadline(self.task.evidence["ci_wait"])
+            detail = (f"GitHub CI observation timed out after {CI_POLL_TIMEOUT_SECONDS} seconds."
+                      if isinstance(exc, asyncio.TimeoutError) else str(exc))
+            self.block("unblock", f"{self.task.key}: could not check CI", detail)
+
+    def _check_ci_deadline(self, wait: dict[str, Any]) -> None:
+        if utcnow() > datetime.fromisoformat(wait["deadline"]):
+            wait = {**wait, "timed_out": True}
+            self.update(evidence={**self.task.evidence, "ci_wait": wait})
+            self.block("unblock", f"{self.task.key}: CI did not finish",
+                       f"CI on PR #{wait['pr']} was still running after "
+                       f"{self.settings['limits'].get('ci_minutes', 45)} minutes.",
+                       options=[{"value": "retry", "label": "Keep waiting"},
+                                {"value": "abandon", "label": "Abandon"}])
+
+    async def _poll_ci(self, gh: GitHub | None) -> None:
+        self._guard("waiting_ci")
+        gh = gh or GitHub(resolve_token(self.ws))
+        self._guard("waiting_ci")
+        wait = dict(self.task.evidence["ci_wait"])
+        summary = await gh.checks(self.repo.full_name, wait["head"])
+        self._guard("waiting_ci")
+        now = utcnow()
+        elapsed = (now - datetime.fromisoformat(wait["first_wait_at"])).total_seconds()
         grace = int(self.cfg.get("ci_grace_seconds", 150))
-        started = time.monotonic()
-        last_state = None
-        while True:
-            if self.cancelled.is_set():
-                raise asyncio.CancelledError()
-            summary = await gh.checks(self.repo.full_name, self.task.head_sha)
-            if summary.state != last_state:
-                self.event("ci_status", f"CI {summary.state}", level={"success": "success", "failure": "warn"}.get(
-                    summary.state, "info"), state=summary.state, checks=[{k: c[k] for k in ("name", "status", "conclusion", "url")}
-                                                    for c in summary.checks])
-                last_state = summary.state
-            elapsed = time.monotonic() - started
-            if summary.state == "success":
-                self.evidence("ci", {"state": "success", "head": self.task.head_sha,
-                                     "checks": [{k: c[k] for k in ("name", "conclusion", "url")} for c in summary.checks]})
-                return "success"
-            if summary.state == "failure":
-                self._ci_failure = summary
-                self.evidence("ci", {"state": "failure", "head": self.task.head_sha,
-                                     "checks": [{k: c[k] for k in ("name", "conclusion", "url")} for c in summary.checks]})
-                return "failure"
-            if summary.state == "none" and elapsed > grace:
-                required = self.cfg.get("require_ci", False)
-                self.evidence("ci", {"state": "none", "head": self.task.head_sha})
-                if required:
-                    # GitHub runs no pull-request checks while a branch conflicts with its base: rebase first.
-                    main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
-                    if main_sha and main_sha != self.task.base_sha:
-                        self._stale_main = main_sha
-                        return "stale"
+        stage = None
+        if summary.state == "success":
+            stage = "revert_merge" if wait["continuation"] == "revert" else "merge"
+        elif summary.state == "failure":
+            if wait["continuation"] == "revert":
+                self.block("unblock", f"{self.task.key}: the revert failed CI",
+                           f"Revert PR #{wait['pr']} did not pass CI; the original change is still merged.",
+                           status="smoke_failed", options=[{"value": "acknowledge", "label": "Acknowledge"}])
+            stage = "ci_repair"
+        elif summary.state == "none" and elapsed > grace:
+            if self.cfg.get("require_ci", False):
+                main = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard("waiting_ci")
+                if wait["continuation"] == "delivery" and main and main != self.task.base_sha:
+                    wait["stale_main"] = main
+                    stage = "ci_refresh"
+                else:
                     self.block("unblock", f"{self.task.key}: no CI checks reported",
-                               f"PR #{self.task.pr_number} received no CI checks within {grace}s, and this repository "
+                               f"PR #{wait['pr']} received no CI checks within {grace}s, and this repository "
                                "requires CI before merging.")
-                self.event("ci_status", "No CI checks are configured for this repository; relying on Factory checks "
-                           "and independent verification", level="warn")
-                return "none"
-            if elapsed > limit:
-                self.block("unblock", f"{self.task.key}: CI did not finish",
-                           f"CI on PR #{self.task.pr_number} was still running after {limit // 60} minutes.",
-                           options=[{"value": "retry", "label": "Keep waiting"}, {"value": "abandon", "label": "Abandon"}])
-            await asyncio.sleep(15 if elapsed < 300 else 30)
+            else:
+                stage = "revert_merge" if wait["continuation"] == "revert" else "merge"
+        if stage is None:
+            self._check_ci_deadline(wait)
+        changed = summary.state != wait.get("last_state")
+        wait.update(last_state=summary.state, next_poll_at=(now + timedelta(
+            seconds=15 if elapsed < 300 else 30)).isoformat())
+        ci = {"state": summary.state, "head": wait["head"], "checks": summary.checks, "at": now.isoformat()}
+        ev = {**self.task.evidence, "ci_wait": wait, "ci": ci}
+        if summary.state == "failure":
+            ev["failure_facts"] = [*ev.get("failure_facts", []), {"kind": "ci", **ci}]
+        self.update(status="queued" if stage else "waiting_ci", stage=stage or "ci", evidence=ev,
+                    lease_owner="", blocked_reason="")
+        if changed:
+            self.event("ci_status", f"CI {summary.state}", state=summary.state, checks=summary.checks)
 
     async def _fix_ci(self, gh: GitHub) -> None:
-        summary = getattr(self, "_ci_failure", None)
+        summary = CheckSummary("failure", (self.task.evidence or {}).get("ci", {}).get("checks", []))
         details = []
         for check in (summary.failing if summary else [])[:3]:
             tail = await gh.job_log_tail(self.repo.full_name, check)
             details.append(f"- CI check `{check['name']}` failed ({check['url']}):\n```\n{tail[-3500:]}\n```")
+        self._guard()
         self.feedback += details or ["- CI failed on the pull request (no logs available)."]
         self.event("ci_failed", f"CI failed on PR #{self.task.pr_number}; sending the failure back to the builder",
                    level="warn")
@@ -896,6 +971,7 @@ class TaskRunner:
         gh = GitHub(token)
         if self.task.pr_number:
             current = await gh.pull(self.repo.full_name, self.task.pr_number)
+            self._guard()
             if current.get("merged"):  # a person merged it on GitHub: that is the approval
                 who = (current.get("merged_by") or {}).get("login") or "someone"
                 self.update(merge_sha=current.get("merge_commit_sha") or "", status="running", blocked_reason="")
@@ -917,7 +993,9 @@ class TaskRunner:
         refresh_onto: str | None = None
         # Merges into one repository are serialized; CI waits and rebuilds happen outside the lock.
         async with self.repo_lock(self.repo.id):
+            self._guard()
             pr = await gh.pull(self.repo.full_name, self.task.pr_number)
+            self._guard()
             if pr.get("merged"):
                 self.update(merge_sha=pr.get("merge_commit_sha") or "")
             else:
@@ -929,11 +1007,13 @@ class TaskRunner:
                                "The pull request head no longer matches the verified candidate; it was not merged.",
                                status="needs_input")
                 main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard()
                 if revalidate and main_sha != self.task.base_sha:
                     refresh_onto = main_sha
                 else:
                     try:
                         await self._claim_issues_before_merge(gh, pr)
+                        self._guard()
                         method = (self.cfg.get("merge") or {}).get("method", "squash")
                         result = await gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
                                                 method=method, title=f"{self.task.title} (#{self.task.pr_number})")
@@ -1036,6 +1116,10 @@ class TaskRunner:
 
     async def revert(self) -> None:
         """Bounded recovery: open a revert PR for the merged change, wait for CI, merge it and re-run smoke."""
+        existing = (self.task.evidence or {}).get("revert_candidate")
+        if existing:
+            await self._wait_ci(continuation="revert", head=existing["head"], pr=existing["pr"])
+            return
         if not self.task.merge_sha:
             self.block("unblock", f"{self.task.key}: nothing to revert", "No merge commit is recorded for this task.")
         self.stage("revert", f"Reverting {self.task.merge_sha[:8]} from {self.repo.default_branch}")
@@ -1055,29 +1139,34 @@ class TaskRunner:
             self.block("unblock", f"{self.task.key}: could not open a revert", str(exc), status="smoke_failed",
                        options=[{"value": "acknowledge", "label": "Acknowledge"}])
         self.event("revert_opened", f"Opened revert PR #{pr['number']}", level="warn", url=pr["html_url"])
-        deadline = time.monotonic() + self.settings["limits"].get("ci_minutes", 45) * 60
-        state = "pending"
-        while time.monotonic() < deadline:
-            summary = await gh.checks(self.repo.full_name, head)
-            state = summary.state
-            if state in ("success", "failure") or (state == "none" and time.monotonic() > deadline - 2400):
-                break
-            await asyncio.sleep(20)
-        if state == "failure":
-            self.block("unblock", f"{self.task.key}: the revert failed CI",
-                       f"Revert PR #{pr['number']} did not pass CI; the original change is still merged.",
-                       status="smoke_failed", options=[{"value": "acknowledge", "label": "Acknowledge"}])
-        try:
-            result = await gh.merge(self.repo.full_name, pr["number"], sha=head, method="squash",
-                                    title=f"Revert: {self.task.title} (#{pr['number']})")
-        except GitHubError as exc:
-            self.block("unblock", f"{self.task.key}: could not merge the revert", str(exc), status="smoke_failed",
-                       options=[{"value": "acknowledge", "label": "Acknowledge"}])
-        self.evidence("revert", {"pr": pr["number"], "sha": result.get("sha", ""), "ci": state, "at": utcnow().isoformat()})
-        self.update(status="reverted", stage="done", finished_at=utcnow(),
-                    summary=f"Reverted after post-merge smoke failed (revert PR #{pr['number']})")
-        self.event("reverted", f"Reverted via PR #{pr['number']}; {self.repo.default_branch} is back to its previous behaviour",
-                   level="warn", url=pr["html_url"])
+        candidate = {"pr": pr["number"], "head": head, "url": pr["html_url"]}
+        self.evidence("revert_candidate", candidate)
+        await self._wait_ci(gh, continuation="revert", head=head, pr=pr["number"])
+
+    async def _merge_revert(self) -> None:
+        candidate = self.task.evidence["revert_candidate"]
+        gh = GitHub(resolve_token(self.ws))
+        async with self.repo_lock(self.repo.id):
+            self._guard()
+            pr = await gh.pull(self.repo.full_name, candidate["pr"])
+            if not pr.get("merged"):
+                self._guard()
+                if pr.get("state") == "closed" or pr.get("head", {}).get("sha") != candidate["head"]:
+                    self.block("unblock", f"{self.task.key}: revert PR changed",
+                               "The revert PR is closed or no longer matches the CI-tested candidate.",
+                               status="smoke_failed")
+                try:
+                    result = await gh.merge(self.repo.full_name, candidate["pr"], sha=candidate["head"],
+                                            method="squash", title=f"Revert: {self.task.title} (#{candidate['pr']})")
+                except GitHubError as exc:
+                    self.block("unblock", f"{self.task.key}: could not merge the revert", str(exc),
+                               status="smoke_failed", options=[{"value": "acknowledge", "label": "Acknowledge"}])
+                pr = {**pr, "merged": True, "merge_commit_sha": result.get("sha", "")}
+            # No lifecycle guard after an irreversible merge. A concurrent stop
+            # must not erase what already happened on GitHub. No work follows.
+            from ..reconcile import _handle_reverted
+
+            _handle_reverted(self.task_id, pr)
 
     async def release(self) -> None:
         release_cfg = self.cfg.get("release") or {}

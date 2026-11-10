@@ -619,7 +619,7 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
     repo = db.get(Repository, repo_id)
     if repo is None or repo.workspace_id != workspace_id:
         raise HTTPException(404, "Repository not found")
-    if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running"])).first():
+    if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running", "waiting_ci"])).first():
         raise HTTPException(409, "Work is running on this repository")
     MemoryService(workspace_id, repo_id).delete_repository_entries(session=db, actor=user.id)
     workspace = db.get(Workspace, workspace_id)
