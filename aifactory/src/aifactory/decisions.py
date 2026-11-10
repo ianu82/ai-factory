@@ -11,6 +11,7 @@ from .db import utcnow
 from .events import record
 from .models import Decision, Message, Outcome, Plan, Task, User
 from .pipeline.orchestrator import ACTIVE_TASK, HUMAN_TASK, orchestrator
+from .pipeline.lifecycle import ACCEPTING, accepted_after_merge, complete_accepted
 from .pipeline.planning import approve_plan
 
 
@@ -50,6 +51,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     task = db.get(Task, decision.task_id) if decision.task_id else None
     take_over: str | None = None
     dropped: str | None = None
+    completed: list[dict] = []  # events of tasks this decision completed
 
     def guidance(text: str) -> None:
         if text.strip() and outcome:
@@ -135,8 +137,10 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                 take_over = task.id  # finished after this decision is recorded
             elif resolution == "revert":
                 task.status, task.stage, task.blocked_reason = "queued", "revert", ""
-            elif resolution in ("acknowledge", "fix"):
+            elif resolution in ACCEPTING:
                 task.blocked_reason = ""
+                if accepted_after_merge(task):
+                    completed.append(complete_accepted(db, task, user.name or user.email))
                 if resolution == "fix":
                     from .signals import outcome_from_text
 
@@ -156,6 +160,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                            "reusable": decision.reusable, "scope": decision.scope, **(decision.attribution or {})},
                      session=db, publish=False)
     if pending_events is not None:
+        pending_events.extend(completed)
         pending_events.append(payload)
         # Keep this on the object timeline even when retry has no guidance text.
         if action_id and resolution == "retry" and outcome:
@@ -166,7 +171,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     else:
         db.commit()
         from .work_services import publish_changes
-        publish_changes([payload])
+        publish_changes([*completed, payload])
     result: dict[str, Any] = {"ok": True}
     if dropped and task and task.pr_number:
         result["dropped"] = dropped
