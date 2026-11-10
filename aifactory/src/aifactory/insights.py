@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from . import definitions
 from .db import utcnow
 from .events import notify, record
 from .models import Decision, Event, Outcome, Repository, Run, Signal, Task, User, Workspace
@@ -434,6 +435,10 @@ def apply(db: Session, sig: Signal, user: User, *, note: str | None = None) -> s
         ws.settings = settings
         summary = ", ".join(f"{k} → {v}" for k, v in (action.get("set") or {}).items())
     elif kind in ("repo_config", "team_note", "review"):
+        # Proposals can mutate context too. Serialize with definition saves and
+        # disconnects, then refresh repository config before appending to it.
+        definitions.lock_workspace(db, sig.workspace_id)
+        definitions.lock_repositories(db, sig.workspace_id)
         repo = db.get(Repository, action.get("repo_id"))
         if repo is None or repo.workspace_id != sig.workspace_id:
             raise ValueError("The repository for this proposal is no longer connected")
@@ -452,7 +457,11 @@ def apply(db: Session, sig: Signal, user: User, *, note: str | None = None) -> s
             summary = f"{repo.full_name}: added a team note"
         else:
             summary = f"{repo.full_name}: marked for review"
-        repo.config = cfg
+        # Keep a rejected proposal unchanged even for callers that catch the
+        # validation error and continue using this transaction.
+        with db.begin_nested():
+            repo.config = cfg
+            definitions.validate_repository_change(db, sig.workspace_id)
     sig.status = "accepted"
     sig.last_seen_at = utcnow()
     record(sig.workspace_id, "improvement_applied", f"Applied “{sig.title}” ({summary})", actor=user.id,

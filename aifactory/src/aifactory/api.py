@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from . import definitions
 from . import attachments as A
 from . import insights, linear_config, onboarding_policy, workstreams
 from . import serializers as S
@@ -642,8 +643,15 @@ async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depend
         config = _clean_repo_config(config, patch)
     repo = Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=info.get("default_branch") or "main",
                       description=info.get("description") or "", config=config)
-    db.add(repo)
-    db.commit()
+    try:
+        definitions.lock_workspace(db, workspace_id)
+        definitions.lock_repositories(db, workspace_id)
+        db.add(repo)
+        definitions.validate_repository_change(db, workspace_id)
+        db.commit()
+    except definitions.DefinitionError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
     record(workspace_id, "repository_connected", f"Connected {repo.full_name}", actor=user.id,
            data={"detected": config.get("detected", [])})
     return S.repository(repo)
@@ -657,11 +665,18 @@ class RepoUpdate(BaseModel):
 def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = Depends(current_user),
                 db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
+    definitions.lock_workspace(db, workspace_id)
+    definitions.lock_repositories(db, workspace_id)
     repo = db.get(Repository, repo_id)
     if repo is None or repo.workspace_id != workspace_id:
         raise HTTPException(404, "Repository not found")
-    repo.config = _clean_repo_config(repo.config or {}, body.config)
-    db.commit()
+    try:
+        repo.config = _clean_repo_config(repo.config or {}, body.config)
+        definitions.validate_repository_change(db, workspace_id)
+        db.commit()
+    except definitions.DefinitionError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
     record(workspace_id, "repository_configured", f"Updated {repo.full_name} configuration", actor=user.id)
     return S.repository(repo)
 
@@ -674,6 +689,11 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
         raise HTTPException(404, "Repository not found")
     if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running", "waiting_ci"])).first():
         raise HTTPException(409, "Work is running on this repository")
+    try:
+        definitions.guard_disconnect(db, workspace_id, repo_id)
+    except definitions.DefinitionError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from exc
     MemoryService(workspace_id, repo_id).delete_repository_entries(session=db, actor=user.id)
     workspace = db.get(Workspace, workspace_id)
     config = (workspace.settings or {}).get("linear")
