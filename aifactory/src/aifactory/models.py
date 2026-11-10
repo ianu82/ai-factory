@@ -654,3 +654,63 @@ class DefinitionRevision(Base):
 @event.listens_for(DefinitionRevision, "before_delete")
 def _immutable_definition_revision(_mapper, _connection, revision: DefinitionRevision) -> None:
     raise ValueError("Definition revisions are immutable; save or restore a new revision")
+
+
+class MindThread(Base):
+    """Person-owned conversation; never part of the workspace activity journal."""
+    __tablename__ = "mind_threads"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200), default="New conversation")
+    billing_workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    workspace_ids: Mapped[list[str]] = mapped_column(JSON)
+    model_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="idle")
+    active_turn: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class MindMessage(Base):
+    __tablename__ = "mind_messages"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("mind_threads.id"), index=True)
+    role: Mapped[str] = mapped_column(String(12))
+    text: Mapped[str] = mapped_column(Text, default="")
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    citations: Mapped[list] = mapped_column(JSON, default=list)
+    action_cards: Mapped[list] = mapped_column(JSON, default=list)
+    history: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="completed")
+    client_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    turn_id: Mapped[str] = mapped_column(String(32), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (UniqueConstraint("thread_id", "client_message_id"),
+                      UniqueConstraint("thread_id", "position"))
+
+
+class MindAccount(Base):
+    """Database CAS admission, shared by all of a person's threads and processes."""
+    __tablename__ = "mind_accounts"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    claim: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MindCharge(Base):
+    """One admitted request, not one cumulative provider session total.
+
+    A request is assigned to its UTC admission day, including late reconciliation.
+    Session totals are allocated as deltas to the latest pending request.
+    """
+    __tablename__ = "mind_charges"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("mind_threads.id"), nullable=True, index=True)
+    billing_workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    session_id: Mapped[str] = mapped_column(String(100), index=True)
+    usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
