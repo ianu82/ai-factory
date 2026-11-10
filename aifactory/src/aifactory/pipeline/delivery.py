@@ -8,6 +8,7 @@ next attempt; only genuine decisions or provider/access problems reach a person.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -23,7 +24,7 @@ from ..guided import README_TEMPLATE, outcome_guidance
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
-from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
+from ..models import Artifact, Decision, Outcome, Repository, Run, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
 from .qa import AppRun, change_checks, verifier_brief
@@ -36,8 +37,50 @@ log = logging.getLogger(__name__)
 
 CI_POLL_TIMEOUT_SECONDS = 90
 
+# Billing, quota and access problems: a person has to act (top up credits, fix a key), so the task blocks and no
+# attempt is charged. Each harness words them differently: the native client ("MindsHub: no credit remaining"), Codex
+# through the Factory gateway ("wallet_empty", "Provider returned 402: …") and Anton through the OpenAI SDK
+# ("Error code: 402 - …", "insufficient_quota").
 PROVIDER_PROBLEMS = ("refused the credential", "no credit", "No model provider", "limit reached", "wallet",
-                     "No GitHub access", "Bad credentials")
+                     "No GitHub access", "Bad credentials", "credits are used up", "wallet_empty", "insufficient_quota",
+                     "quota exceeded", "billing")
+# HTTP 402 as a status code, never as digits inside a number such as a token count ("1,402,000").
+_PAYMENT_REQUIRED = re.compile(r"(?:\b(?:returned|error code|status(?: code)?|http)\W{0,3}|\()402\b|\b402 payment",
+                               re.IGNORECASE)
+# An attempt's own caps (turns, time, tokens, cost) are not infrastructure: they stay charged.
+RUN_CAPS = ("budget of", "budget_exhausted", "time budget", "Stopped after")
+# The provider or the sandbox was unavailable after the client's own retries: the same attempt is redone later.
+TRANSIENT_PROBLEMS = ("Model request failed", "unreachable", "timed out", "timeout", "connection error",
+                      "connection reset", "connection refused", "stream disconnected", "server disconnected",
+                      "bad gateway", "service unavailable", "gateway timeout", "overloaded", "upstream_error",
+                      "VM bridge", "No sandbox identities", "Sandbox setup failed")
+_SERVER_ERROR = re.compile(r"\b(?:returned|error(?: code)?|status(?: code)?|http)\W{0,3}(?:5\d\d|429)\b",
+                           re.IGNORECASE)
+INFRA_RETRIES = 3  # consecutive automatic retries of an infrastructure failure before a person decides
+INFRA_BACKOFF_SECONDS = (120, 600)  # before the first retry, then before each later one
+_PHASES = {"prepare": "Preparing the sandbox", "build": "The builder session",
+           "checks": "Checking the base commit", "verify": "Independent verification"}
+# Attempt records that do not end an attempt: an infrastructure failure (the same attempt is redone) and checks that
+# fail on the base commit too (the attempt goes on to verification).
+NOT_ATTEMPTS = ("infra", "checks_preexisting")
+# Stages inside the build/verify loop; a task found in one after a restart was interrupted mid-attempt.
+BUILD_STAGES = ("prepare", "build", "checks", "verify", "publish")
+# Check results on clean checkouts of base commits, by (repository, base commit, command), shared by every task.
+_BASE_CHECKS: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def infrastructure_problem(error: str) -> str:
+    """Why a session or sandbox failed when it was not the attempt's doing: "provider" (billing, quota or access; a
+    person acts), "transient" (the provider or the sandbox was unavailable; the attempt is redone later), or "" (the
+    attempt's own failure, including its turn, time, token and cost caps)."""
+    text = (error or "").lower()
+    if any(p.lower() in text for p in PROVIDER_PROBLEMS) or _PAYMENT_REQUIRED.search(text):
+        return "provider"
+    if any(c.lower() in text for c in RUN_CAPS):
+        return ""
+    if any(p.lower() in text for p in TRANSIENT_PROBLEMS) or _SERVER_ERROR.search(text):
+        return "transient"
+    return ""
 
 
 class Stop(Exception):
@@ -56,6 +99,7 @@ class TaskRunner:
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
         self.app_summary: dict[str, Any] | None = None
+        self._ci_repairing = False
         self._load()
         self.feedback = self._prior_feedback()
 
@@ -76,6 +120,7 @@ class TaskRunner:
                 for c in attempt["checks"]:
                     if not c.get("ok"):
                         notes.append(f"- In an earlier attempt, check `{c.get('command')}` failed (exit {c.get('exit_code')})"
+                                     + (" (it fails the same way on the base commit)" if c.get("preexisting") else "")
                                      + (f":\n```\n{c['tail']}\n```" if c.get("tail") else ""))
             elif attempt.get("result") in ("checks_failed", "policy"):
                 notes.append(f"- An earlier attempt failed: {attempt.get('detail') or attempt.get('result')}")
@@ -119,6 +164,8 @@ class TaskRunner:
             for key, value in values.items():
                 if key == "attempts":  # tagged with the budget it belongs to (attempt numbers restart per budget)
                     ev.setdefault("attempts", []).append({**value, "epoch": int(ev.get("budget_epoch", 0))})
+                    if value.get("result") != "infra":  # an attempt that got anywhere ends a run of infra retries
+                        ev.pop("infra_retries", None)
                     continue
                 if key in ("ci", "smoke"):
                     value = {**value, "at": utcnow().isoformat()}
@@ -167,6 +214,15 @@ class TaskRunner:
             if not self.task.started_at:
                 self.update(started_at=utcnow())
             stage = self.task.stage
+            if stage in BUILD_STAGES:  # interrupted mid-attempt: a restart, or requeued after an infrastructure failure
+                if stage in ("verify", "publish") and self._restore_verified_candidate():
+                    token = resolve_token(self.ws)
+                    await self._publish(token)
+                    await self.ci_then_merge()
+                    return
+                # Inside a fix round, the attempt continues that round on the pull request's branch; it must not
+                # rebuild from the default branch.
+                stage = (self.task.evidence or {}).get("fix_round") or stage
             if stage == "merge":
                 await self.merge()
             elif stage == "ci_repair":
@@ -199,8 +255,14 @@ class TaskRunner:
     async def deliver(self, continue_from_branch: bool = False) -> None:
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
+        # Durable, so an attempt interrupted inside this round resumes the same round (see run()).
+        fix_round = ("ci_repair" if self._ci_repairing else "revise") if continue_from_branch else ""
+        if ((self.task.evidence or {}).get("fix_round") or "") != fix_round:
+            self.evidence("fix_round", fix_round)
         finished = {a.get("n") for a in self._budget_attempts()}
-        if self.task.attempt and self.task.attempt not in finished:
+        # Verified, but interrupted before publication and the candidate could not be reloaded (see run()).
+        unpublished = bool(self._unpublished_candidate())
+        if self.task.attempt and (self.task.attempt not in finished or unpublished):
             # Every attempt that ends records its result; one without a record was interrupted (a restart or
             # redeploy), so it is redone rather than counted against the limit.
             self.event("attempt_resumed", f"Attempt {self.task.attempt} was interrupted; running it again")
@@ -228,7 +290,11 @@ class TaskRunner:
                            f"Spent ${spent:.2f}. Raise the budget in Settings or approve continuing.", status="needs_input",
                            options=[{"value": "retry", "label": "Continue anyway"}, {"value": "abandon", "label": "Stop"}])
             if self.builder is None:
-                await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
+                try:
+                    await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
+                except (SandboxError, GitError, OSError) as exc:  # the environment, not the attempt
+                    error = f"Sandbox setup failed: {exc}"
+                    self._infrastructure(attempt, "prepare", error, infrastructure_problem(error))
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
@@ -238,9 +304,9 @@ class TaskRunner:
                                     precedents(self.ws, self.repo.id),
                                     guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
             if result is None:
-                if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
-                    self.block("unblock", f"{self.task.key}: model provider problem", error,
-                               options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+                cause = infrastructure_problem(error)
+                if cause:
+                    self._infrastructure(attempt, "build", error, cause)
                 self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
                 self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
                 continue
@@ -272,8 +338,22 @@ class TaskRunner:
             self.checks = await self._run_commands(self.builder, self.cfg.get("checks") or [], "check")
             failed = [c for c in self.checks if not c["ok"]]
             if failed:
-                self.feedback += [f"- Check `{c['command']}` failed (exit {c['exit_code']}):\n```\n{c['tail']}\n```"
-                                  for c in failed]
+                try:
+                    preexisting = await self._failing_on_base(token, failed)
+                except (SandboxError, GitError, OSError) as exc:  # the base's sandbox, not the attempt
+                    error = f"Sandbox setup failed: {exc}"
+                    self._infrastructure(attempt, "checks", error, infrastructure_problem(error))
+                if preexisting:
+                    self.evidence("attempts", {"n": attempt, "result": "checks_preexisting",
+                                               "checks": _brief(self.checks)})
+                    self.event("checks_preexisting", f"{len(failed)} failing check(s) fail the same way on the base "
+                               f"commit {self.task.base_sha[:8]}: not caused by this change and not counted against "
+                               "the attempt; verification continues", level="warn",
+                               commands=[c["command"] for c in failed])
+                    failed = []
+            if failed:
+                self.feedback += [f"- Check `{c['command']}` failed (exit {c['exit_code']}){c.get('vs_base', '')}:\n"
+                                  f"```\n{c['tail']}\n```" for c in failed]
                 self.evidence("attempts", {"n": attempt, "result": "checks_failed", "checks": _brief(self.checks)})
                 continue
 
@@ -287,7 +367,9 @@ class TaskRunner:
             self.evidence("attempts", {"n": attempt, "result": "verified", "checks": _brief(self.checks),
                                        "verdict": verdict, "app_run": self.app_summary,
                                        "configured_checks": list(self.cfg.get("checks") or []),
-                                       "diff_artifact_id": diff_id})
+                                       "diff_artifact_id": diff_id,
+                                       # A restart before publication reloads exactly this candidate from the diff.
+                                       "patch_sha256": hashlib.sha256(patch.diff).hexdigest()})
             break
 
         await self._publish(token)
@@ -327,20 +409,27 @@ class TaskRunner:
         sb, default = self.builder, self.repo.default_branch
         found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
         main = found.output.strip() if found.ok else ""
-        if not main or not self.task.base_sha or main == self.task.base_sha:
+        # The commit the branch is built on: the recorded base, unless an interrupted revision already recorded a newer
+        # base without pushing the branch onto it (then the branch's fork point with the default branch).
+        base_sha = self.task.base_sha
+        if main and base_sha and not (await sb.exec(f"git merge-base --is-ancestor {shlex.quote(base_sha)} HEAD",
+                                                    timeout=60)).ok:
+            fork = await sb.exec(f"git merge-base HEAD {main}", timeout=60)
+            base_sha = fork.output.strip() if fork.ok else base_sha
+        if not main or not base_sha or main == base_sha:
             return
         if (self.task.evidence or {}).get("ci", {}).get("state") == "failure":
             self.event("revalidate", "The base branch moved; rebasing the CI repair before verification")
         author = " ".join(f"-c user.{k}={shlex.quote(v)}" for k, v in
                           (("name", AUTHOR["GIT_AUTHOR_NAME"]), ("email", AUTHOR["GIT_AUTHOR_EMAIL"])))
         # --onto: replay only this task's commits, even if the default branch was rewritten since.
-        rebased = await sb.exec(f"git {author} rebase -q --onto {main} {shlex.quote(self.task.base_sha)}", timeout=300)
+        rebased = await sb.exec(f"git {author} rebase -q --onto {main} {shlex.quote(base_sha)}", timeout=300)
         if rebased.ok:
             self.update(base_sha=main)
             self.event("rebased", f"Brought {branch} up to date with {default} ({main[:8]}) before revising")
             return
         await sb.exec("git rebase --abort", timeout=60)
-        base = shlex.quote(self.task.base_sha)
+        base = shlex.quote(base_sha)
         earlier = (await sb.exec("git rev-parse HEAD", timeout=60)).output.strip()
         reset = await sb.exec(f"git reset -q --hard {main}", timeout=120)
         if not reset.ok:
@@ -424,6 +513,8 @@ class TaskRunner:
             row = {"command": command, "ok": result.ok, "exit_code": result.exit_code,
                    "duration": round(time.monotonic() - started, 1), "timed_out": result.timed_out,
                    "tail": result.output[-4000:]}
+            if not result.ok:
+                row["failures"] = _failing_tests(result.output)
             results.append(row)
             self.event(f"{kind}_result", f"{'✓' if result.ok else '✗'} {command}",
                        level="success" if result.ok else "warn", command=command, exit_code=result.exit_code,
@@ -433,35 +524,41 @@ class TaskRunner:
 
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
         qa_cfg = self.cfg.get("qa") or {}
+        error = ""
         for tries in range(2):
             sandbox = None
             app: AppRun | None = None
+            result = None
             try:
-                sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
-                await self._prepare(sandbox)
-                brief = ""
-                if qa_cfg.get("start"):
-                    app = await self._start_app(sandbox, qa_cfg)
-                    brief = verifier_brief(app)
-                run, result, error = await run_agent(SessionSpec(
-                    workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
-                    harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
-                    attempt=attempt, writable=False, effective_settings=self.settings,
-                    repositories={self.repo.full_name: self.cfg},
-                    prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
-                                         precedents(self.ws, self.repo.id),
-                                         guidance_history(self.task.outcome_id, self.task_id))
-                    + brief), self.cancelled)
-                if app is not None:
-                    await self._store_app_evidence(app, attempt, run.id)
+                try:
+                    sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
+                    await self._prepare(sandbox)
+                except (SandboxError, GitError, OSError) as exc:  # the environment, not the candidate
+                    error = f"Sandbox setup failed: {exc}"
+                else:
+                    brief = ""
+                    if qa_cfg.get("start"):
+                        app = await self._start_app(sandbox, qa_cfg)
+                        brief = verifier_brief(app)
+                    run, result, error = await run_agent(SessionSpec(
+                        workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
+                        harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
+                        attempt=attempt, writable=False, effective_settings=self.settings,
+                        repositories={self.repo.full_name: self.cfg},
+                        prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
+                                             precedents(self.ws, self.repo.id),
+                                             guidance_history(self.task.outcome_id, self.task_id))
+                        + brief), self.cancelled)
+                    if app is not None:
+                        await self._store_app_evidence(app, attempt, run.id)
             finally:
                 if app is not None:
                     app.stop()
                 if sandbox is not None:
                     await sandbox.close()
             if result is None:
-                if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
-                    self.block("unblock", f"{self.task.key}: model provider problem during verification", error)
+                if infrastructure_problem(error) == "provider":
+                    self._infrastructure(attempt, "verify", error, "provider")
                 self.event("verification_unavailable", f"Verifier session failed: {error[:300]}", level="warn")
                 continue
             report = result.report
@@ -493,6 +590,8 @@ class TaskRunner:
                                        "checks": _brief(self.checks), "app_run": self.app_summary})
             self.event("verification_failed", report.get("summary", "")[:400], level="warn")
             return None
+        if infrastructure_problem(error) == "transient":
+            self._infrastructure(attempt, "verify", error, "transient")
         self.block("unblock", f"{self.task.key}: independent verification could not run",
                    "Two verifier sessions failed to produce a verdict. The candidate remains unverified and was not "
                    "published.")
@@ -538,10 +637,128 @@ class TaskRunner:
 
     def _budget_attempts(self) -> list[dict[str, Any]]:
         """Attempt records of the current budget. Numbers restart at 1 when a person retries or requests changes;
-        records from earlier budgets are kept for their findings but are not this budget's attempts."""
+        records from earlier budgets are kept for their findings but are not this budget's attempts. Records that do
+        not end an attempt (``NOT_ATTEMPTS``) are not attempts either."""
         ev = self.task.evidence or {}
         epoch = int(ev.get("budget_epoch", 0))
-        return [a for a in ev.get("attempts", []) if isinstance(a, dict) and int(a.get("epoch", 0)) == epoch]
+        return [a for a in ev.get("attempts", []) if isinstance(a, dict) and int(a.get("epoch", 0)) == epoch
+                and a.get("result") not in NOT_ATTEMPTS]
+
+    def _infrastructure(self, attempt: int, phase: str, error: str, cause: str) -> None:
+        """The model provider or the sandbox failed, not the attempt, so it is not charged. Billing, quota and access
+        problems (``cause`` "provider") wait for a person. Transient ones requeue the same attempt after a backoff;
+        once ``INFRA_RETRIES`` consecutive retries have failed as well, a person decides."""
+        record = {"n": attempt, "result": "infra", "cause": cause or "transient", "phase": phase, "error": error[:500]}
+        retries = int((self.task.evidence or {}).get("infra_retries", 0))
+        if cause == "provider" or retries >= INFRA_RETRIES:
+            # Cleared with the decision: a person's retry runs at once and starts a new series of automatic retries.
+            self._set_evidence({"attempts": record, "infra_retries": 0, "infra_retry_at": None})
+            self.update(attempt=attempt - 1)
+            if cause == "provider":
+                what = "model provider" if phase in ("build", "verify") else "access"
+                self.block("unblock", f"{self.task.key}: {what} problem"
+                           + (" during verification" if phase == "verify" else ""), error,
+                           options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+            self.block("unblock", f"{self.task.key}: infrastructure problem",
+                       f"{_PHASES[phase]} failed {retries + 1} times in a row for reasons outside the change (the "
+                       "model provider or the sandbox was unavailable). None of these counted as an attempt, and "
+                       f"retrying keeps the task's attempt budget. Last error:\n\n{error[:1500]}",
+                       options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}])
+        delay = INFRA_BACKOFF_SECONDS[min(retries, len(INFRA_BACKOFF_SECONDS) - 1)]
+        self._set_evidence({"attempts": record, "infra_retries": retries + 1,
+                            "infra_retry_at": (utcnow() + timedelta(seconds=delay)).isoformat()})
+        self.event("infra_retry", f"Attempt {attempt}: {_PHASES[phase].lower()} hit an infrastructure problem "
+                   f"({error[:200]}). Not counted as an attempt; retrying in {delay // 60} min "
+                   f"({retries + 1} of {INFRA_RETRIES})", level="warn", phase=phase, delay=delay)
+        self.update(attempt=attempt - 1, status="queued", lease_owner="")
+        raise Stop()
+
+    async def _failing_on_base(self, token: str, failed: list[dict[str, Any]]) -> bool:
+        """Whether every failing check also fails on a clean checkout of the base commit, with no failure of the
+        candidate's own: then the failures predate the change. Each failed check is annotated for the builder's
+        feedback (``vs_base``) and for the verifier and the pull request (``preexisting``)."""
+        base = await self._base_results(token, [c["command"] for c in failed])
+        if base is None:
+            return False
+        for check in failed:
+            theirs = base.get(check["command"]) or {}
+            if _same_failure(check, theirs):
+                check["preexisting"] = True
+                check["vs_base"] = " (it fails the same way on the base commit, so your change did not cause it)"
+            elif theirs.get("ok"):
+                check["vs_base"] = " (it passes on the base commit)"
+            elif check.get("failures"):
+                new = sorted(set(check["failures"]) - set(theirs.get("failures") or ()))
+                if new:
+                    check["vs_base"] = (f" (failing here but not on the base commit: {', '.join(new[:20])}"
+                                        + (f" and {len(new) - 20} more" if len(new) > 20 else "") + ")")
+        return all(c.get("preexisting") for c in failed)
+
+    async def _base_results(self, token: str, commands: list[str]) -> dict[str, dict[str, Any]] | None:
+        """Results of ``commands`` on a clean checkout of the base commit in a fresh sandbox, set up and run the way
+        checks normally run. Kept in memory per (repository, base commit, command), so tasks on the same base do not
+        run them again. None when setup failed on the base: its results would prove nothing."""
+        key = (self.repo.full_name, self.task.base_sha)
+        found = {c: _BASE_CHECKS[(*key, c)] for c in commands if (*key, c) in _BASE_CHECKS}
+        missing = [c for c in dict.fromkeys(commands) if c not in found]
+        if not missing:
+            return found
+        self.event("base_checks", f"Running {len(missing)} failing check(s) on the base commit "
+                   f"{self.task.base_sha[:8]} to see whether they failed before this change", commands=missing)
+        sandbox = LocalSandbox(f"task-{self.task_id[:12]}-base{self.task.attempt}").create()
+        try:
+            await checkout(sandbox, self.repo.full_name, token, self.task.base_sha, f"base-{self.task_id[:8]}")
+            sandbox = await self._isolate_builder(sandbox, "checking the base commit")
+            setup = await self._prepare(sandbox, "base_setup")
+            if any(not r["ok"] for r in setup):
+                self.event("base_checks_unavailable", "Setup failed on the base commit, so its check results prove "
+                           "nothing; the failing checks count against this attempt", level="warn")
+                return None
+            results = await self._run_commands(sandbox, missing, "base_check")
+        finally:
+            await sandbox.close()
+        for row in results:
+            found[row["command"]] = _BASE_CHECKS[(*key, row["command"])] = row
+        while len(_BASE_CHECKS) > 2000:
+            _BASE_CHECKS.pop(next(iter(_BASE_CHECKS)))
+        return found
+
+    def _unpublished_candidate(self) -> dict[str, Any]:
+        """The current attempt's verified record when the task stopped between independent verification and
+        publication: still in those stages, with nothing recorded since. Otherwise {} (a published candidate that
+        failed CI is followed by the repair's records, and its number is an earlier attempt's)."""
+        ev = self.task.evidence or {}
+        epoch = int(ev.get("budget_epoch", 0))
+        records = [a for a in ev.get("attempts", []) if isinstance(a, dict) and int(a.get("epoch", 0)) == epoch]
+        last = records[-1] if records else {}
+        if (self.task.stage in ("verify", "publish") and last.get("result") == "verified"
+                and last.get("n") == self.task.attempt):
+            return last
+        return {}
+
+    def _restore_verified_candidate(self) -> bool:
+        """After a restart between independent verification and publication, reload the candidate exactly as it was
+        verified, so it is published rather than rebuilt in a new, charged attempt. False when it cannot be reloaded
+        byte for byte (a diff stored only in part); the attempt is then redone, uncharged (see deliver())."""
+        last = self._unpublished_candidate()
+        if not last.get("patch_sha256") or not last.get("diff_artifact_id"):
+            return False
+        with session_scope() as s:
+            diff = s.get(Artifact, last["diff_artifact_id"])
+            if diff is None:
+                return False
+            builder = s.get(Run, diff.run_id) if diff.run_id else None
+            raw, data = (diff.content or "").encode(), dict(diff.data or {})
+            report = dict((builder.result if builder else None) or {})
+        if hashlib.sha256(raw).hexdigest() != last["patch_sha256"]:
+            return False
+        self.patch = Patch(diff=raw, files=list(data.get("files") or []), additions=int(data.get("additions") or 0),
+                           deletions=int(data.get("deletions") or 0))
+        self.builder_report, self.verifier_report = report, last.get("verdict") or {}
+        self.checks, self.app_summary = list(last.get("checks") or []), last.get("app_run")
+        self.event("publish_resumed", f"Attempt {self.task.attempt} was verified before the restart; publishing that "
+                   "candidate")
+        return True
 
     def _auto_retry(self) -> bool:
         """Attempts ran out. When the last one failed on concrete, actionable feedback, start a fresh budget with that
@@ -576,9 +793,10 @@ class TaskRunner:
         self.event("rebuild_after_base_moved", f"The verified change {why}; rebuilding with a fresh attempt budget "
                    f"({rebuilds} of 2)")
 
-    async def _isolate_builder(self, local: LocalSandbox):
+    async def _isolate_builder(self, local: LocalSandbox, doing: str = "building"):
         """With ``build.isolation: "vm"`` the builder works in its own Railway VM (checkout uploaded, no Factory
-        credentials inside); otherwise, or when VMs are unavailable, in the local per-job sandbox."""
+        credentials inside); otherwise, or when VMs are unavailable, in the local per-job sandbox. Checks of the base
+        commit run in the same kind of sandbox."""
         build_cfg = self.cfg.get("build") or {}
         if build_cfg.get("isolation") != "vm":
             return local
@@ -586,7 +804,7 @@ class TaskRunner:
 
         ok, why = vm_available()
         if not ok:
-            self.event("build_vm_unavailable", f"VM isolation requested but unavailable ({why}); building locally",
+            self.event("build_vm_unavailable", f"VM isolation requested but unavailable ({why}); {doing} locally",
                        level="warn")
             return local
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
@@ -595,12 +813,13 @@ class TaskRunner:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(build_cfg.get("cpu", 4)),
                                                    memory_gb=float(build_cfg.get("memory_gb", 8)))
         except Exception as exc:
-            self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); building locally",
+            self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); {doing} locally",
                        level="warn")
             return local
         await local.close()
         vm.environment_key = key
-        self.event("build_vm_ready", f"Building in VM {vm.vm_id}" + (" from the prepared environment" if vm.prepared else ""),
+        self.event("build_vm_ready", f"{doing.capitalize()} in VM {vm.vm_id}"
+                   + (" from the prepared environment" if vm.prepared else ""),
                    level="success", vm=vm.vm_id, prepared=vm.prepared)
         return vm
 
@@ -620,18 +839,19 @@ class TaskRunner:
             self.event("environment_prepare_failed", f"Could not save a prepared environment: {str(exc)[:200]}",
                        level="warn")
 
-    async def _prepare(self, sandbox) -> None:
+    async def _prepare(self, sandbox, kind: str = "verify_setup") -> list[dict[str, Any]]:
         """Install dependencies, unless the VM booted from a prepared environment for these exact lockfiles.
-        After a clean install in a VM, save it so the next verification starts ready."""
+        After a clean install in a VM, save it so the next verification starts ready. Returns the setup results."""
         setup = self.cfg.get("setup") or []
         if getattr(sandbox, "prepared", None):
-            self.event("verify_setup_skipped", "Dependencies unchanged since the prepared environment was saved; "
+            self.event(f"{kind}_skipped", "Dependencies unchanged since the prepared environment was saved; "
                        "setup skipped", level="success", environment=sandbox.prepared)
-            return
-        results = await self._run_commands(sandbox, setup, "verify_setup", timeout=1200)
+            return []
+        results = await self._run_commands(sandbox, setup, kind, timeout=1200)
         key = getattr(sandbox, "environment_key", None)
         if key and results and all(r["ok"] for r in results):
             await self._save_environment(sandbox, key)
+        return results
 
     async def _start_app(self, sandbox, qa_cfg: dict[str, Any]) -> AppRun:
         """Boot the candidate in the verifier's sandbox, then let the Factory capture its own evidence first."""
@@ -749,7 +969,9 @@ class TaskRunner:
                              " MindsHub AI Factory")
         if self.checks:
             lines += ["", "### Checks run by the Factory"]
-            lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s)" for c in self.checks]
+            lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s)"
+                      + (" — fails the same way on the base commit; not caused by this change"
+                         if c.get("preexisting") else "") for c in self.checks]
         spent, known = outcome_cost(self.task.outcome_id)
         lines += ["", "---",
                   f"Built by **{self.task.harness}**, independently verified by a fresh **{self.task.verifier_harness}** "
@@ -943,6 +1165,7 @@ class TaskRunner:
         self.feedback += details or ["- CI failed on the pull request (no logs available)."]
         self.event("ci_failed", f"CI failed on PR #{self.task.pr_number}; sending the failure back to the builder",
                    level="warn")
+        self._ci_repairing = True  # a restart inside this round fetches the CI logs again (see run())
         await self.deliver(continue_from_branch=True)
 
     # merge ---------------------------------------------------------------------
@@ -1105,6 +1328,7 @@ class TaskRunner:
             # The revision checks out the branch, carries it onto the latest base and leaves only the overlapping
             # lines for the builder to resolve (see _bring_branch_up_to_date).
             self._fresh_budget_after_base_moved("conflicts with newer commits")
+            self.evidence("fix_round", "revise")  # before the stage: a restart in between resumes on the branch
             self.update(branch=self.task.branch, stage="build")
             if self.builder:
                 await self.builder.close()
@@ -1290,7 +1514,42 @@ def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Check results for the evidence record; failed checks keep their output tail so the failure can be fed back
     to a later attempt even after a restart."""
     return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")}
-            | ({} if c["ok"] else {"tail": str(c.get("tail") or "")[-1500:]}) for c in checks]
+            | ({} if c["ok"] else {"tail": str(c.get("tail") or "")[-1500:]})
+            | ({"preexisting": True} if c.get("preexisting") else {}) for c in checks]
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_PYTEST_FAILURE = re.compile(r"^(FAILED|ERROR) (.+?)(?: - .*)?$", re.MULTILINE)
+_PYTEST_TOTALS = re.compile(r"\b(\d+) (?:failed|errors?)\b")
+
+
+def _failing_tests(output: str) -> list[str] | None:
+    """The FAILED/ERROR node ids of pytest's short test summary, or None when there are none, or when the summary
+    lists fewer than its totals line counts (the output was clipped)."""
+    text = _ANSI.sub("", output or "")
+    ids = []
+    for kind, node in _PYTEST_FAILURE.findall(text):
+        node = node.strip()
+        if "::" in node or node.endswith(".py"):
+            ids.append(f"{kind} {node}")
+    if not ids:
+        return None
+    totals = [line for line in text.splitlines() if re.search(r"\bin [\d.]+s\b", line) and _PYTEST_TOTALS.search(line)]
+    if totals and len(ids) < sum(int(n) for n in _PYTEST_TOTALS.findall(totals[-1])):
+        return None
+    return sorted(set(ids))
+
+
+def _same_failure(candidate: dict[str, Any], base: dict[str, Any] | None) -> bool:
+    """Whether a check failing on the candidate fails on the base commit too, with nothing new: for pytest output no
+    node id the base does not also fail; for other commands the base also exits non-zero (and the candidate does not
+    time out where the base finished)."""
+    if not base or base.get("ok", True) or (candidate.get("timed_out") and not base.get("timed_out")):
+        return False
+    new, old = candidate.get("failures"), base.get("failures")
+    if new is None:
+        return old is None  # nothing to compare on either side: the command exits non-zero on the base as well
+    return set(new) <= set(old or ())
 
 
 def _signal(workspace_id: str, repo_id: str | None, source: str, title: str, body: str, url: str) -> None:

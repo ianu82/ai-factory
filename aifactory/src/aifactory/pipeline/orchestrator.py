@@ -398,6 +398,7 @@ class Orchestrator:
     def _schedule(self) -> None:
         self._schedule_ci()
         settings = get_settings()
+        now = utcnow().isoformat()
         with session_scope() as s:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
@@ -408,7 +409,9 @@ class Orchestrator:
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Task.status == "queued")]
+                      .filter(Task.status == "queued")
+                      # A task requeued after an infrastructure failure waits out its backoff.
+                      if ((t.evidence or {}).get("infra_retry_at") or "") <= now]
             planning_by_ws: dict[str, int] = {}
             for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1
