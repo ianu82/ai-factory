@@ -533,3 +533,32 @@ def test_a_streamed_private_key_is_never_released_in_part(world, closed):
     assert "B" * 20 not in text and "[redacted]" in text and text.startswith("Here it is: ")
     if closed:
         assert text.endswith("That was a key.")
+
+
+def test_a_credential_split_between_a_key_and_its_value_is_redacted():
+    secret = "opaqueFirstHalfopaqueSecondHalf"
+    clean = api.scrub({"card": {"opaqueFirstHalf": "opaqueSecondHalf", "other": "safe"}}, (secret,))
+    assert "opaqueFirstHalf" not in json.dumps(clean) and "opaqueSecondHalf" not in json.dumps(clean)
+    assert clean["card"]["other"] == "safe"
+    # Two redacted keys stay two entries.
+    both = api.scrub({"opaqueFirstHalf": "opaqueSecondHalf", "xopaqueFirstHalf": "opaqueSecondHalf"}, (secret,))
+    assert len(both) == 2 and "opaqueFirstHalf" not in json.dumps(both)
+    # Field names of the wire format are never rewritten, even inside a credential's span.
+    events = [{"type": "token", "data": {"text": "opaqueFirst"}}, {"type": "token", "data": {"text": "HalfopaqueSecondHalf"}}]
+    assert api.scrub_events(events, (secret,)) == [{"type": "token", "data": {"text": "[redacted]"}},
+                                                    {"type": "token", "data": {"text": "[redacted]"}}]
+
+
+def test_context_from_a_newly_joined_workspace_widens_the_thread_scope(world):
+    client, _, _, ids = world
+    thread = create(world)
+    with SessionLocal() as db:
+        db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        db.commit()
+    context = {"workspace_id": ids[3], "kind": "inbox", "id": ids[3], "label": "Inbox"}
+    assert events(send(world, thread, context=context))[-1]["data"] == {"status": "complete"}
+    with SessionLocal() as db:
+        assert ids[3] in db.get(MindThread, thread).workspace_ids
+        db.query(Membership).filter_by(user_id=ids[0], workspace_id=ids[3]).delete()
+        db.commit()
+    assert client.get(f"/api/mind/threads/{thread}").status_code == 404
