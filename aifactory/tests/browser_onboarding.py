@@ -61,6 +61,10 @@ def check(base_url: str) -> None:
                         ]})
                     if path == "/api/meta":
                         return route.fulfill(json={"auth": {"dev": True}, "harnesses": [], "sandbox": {}, "version": "test"})
+                    if path.endswith("/onboarding/start"):
+                        assert request.method == "POST"
+                        assert role in ("owner", "admin")
+                        return route.fulfill(json=states[path.split("/")[3]])
                     if path.endswith("/onboarding"):
                         wid = path.split("/")[3]
                         if request.method == "PATCH":

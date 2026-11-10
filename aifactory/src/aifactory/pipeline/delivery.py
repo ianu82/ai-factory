@@ -946,13 +946,76 @@ class TaskRunner:
         await self.deliver(continue_from_branch=True)
 
     # merge ---------------------------------------------------------------------
-    def _merge_needs_approval(self) -> bool:
-        merge_policy = (self.cfg.get("merge") or {}).get("mode") or self.settings["autonomy"].get("merge", "auto")
+    def _merge_needs_approval(self, settings: dict[str, Any] | None = None) -> bool:
+        from ..onboarding_policy import active
+
+        settings = workspace_settings(self.ws) if settings is None else settings
+        if active(settings):
+            return True
+        merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
         release_cfg = self.cfg.get("release") or {}
         releases_on_merge = release_cfg.get("mode") == "on_merge"
-        if releases_on_merge and self.settings["autonomy"].get("release") == "approval":
+        if releases_on_merge and settings["autonomy"].get("release") == "approval":
             return True
         return merge_policy != "auto"
+
+    def _require_merge_approval(self) -> None:
+        if self._merge_needs_approval() and not self._approved("approve_merge"):
+            self._open_merge_approval()
+
+    def _open_merge_approval(self) -> None:
+        self.update(stage="merge")
+        self.block("approve_merge", f"Approve merge: {self.task.title}",
+                   f"PR #{self.task.pr_number} passed independent verification and CI at "
+                   f"{self.task.head_sha[:10]}. {self.task.pr_url}",
+                   status="awaiting_approval",
+                   options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
+
+    async def _serialized_merge(self, gh: GitHub, method: str) -> dict[str, Any]:
+        # The synchronous DB lock may wait for another merge or settings writer.
+        # Keep that wait off the event loop so the lock owner can finish its I/O.
+        merge = asyncio.create_task(asyncio.to_thread(self._merge_under_workspace_lock, gh, method))
+        try:
+            result = await asyncio.shield(merge)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled. Keep the caller's repository lock
+            # until this bounded transaction exits, even during shutdown.
+            try:
+                await merge
+            finally:
+                raise
+        if result is None:
+            # Open the decision only after releasing the lock: block/update use
+            # their own transactions, which would otherwise deadlock on SQLite.
+            self._open_merge_approval()
+        return result
+
+    def _merge_under_workspace_lock(self, gh: GitHub, method: str) -> dict[str, Any] | None:
+        from ..onboarding_policy import lock_workspace
+        from .runtime import merged_settings
+
+        with session_scope() as s:
+            ws = lock_workspace(s, self.ws)
+            task = s.get(Task, self.task_id)
+            if self.cancelled.is_set() or not transition(s, task, lease_owner=task.lease_owner):
+                raise Stop()
+            if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
+                return None
+
+            async def merge():
+                return await asyncio.wait_for(
+                    gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
+                             method=method, title=f"{self.task.title} (#{self.task.pr_number})"),
+                    timeout=60,
+                )
+
+            try:
+                # Hold the same workspace lock as onboarding/start and all
+                # settings writers through the external side effect, not just
+                # the policy read. The network wait is explicitly bounded.
+                return asyncio.run(merge())
+            except asyncio.TimeoutError as exc:
+                raise GitHubError("GitHub merge timed out after 60 seconds; check the PR before retrying.") from exc
 
     def _approved(self, kind: str) -> bool:
         """An approval covers only the candidate that was published before it was given."""
@@ -981,13 +1044,7 @@ class TaskRunner:
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()
                 return
-        if self._merge_needs_approval() and not self._approved("approve_merge"):
-            self.update(stage="merge")
-            self.block("approve_merge", f"Approve merge: {self.task.title}",
-                       f"PR #{self.task.pr_number} passed independent verification and CI at "
-                       f"{self.task.head_sha[:10]}. {self.task.pr_url}",
-                       status="awaiting_approval",
-                       options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
+        self._require_merge_approval()
         self.stage("merge", f"Merging PR #{self.task.pr_number}")
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
         refresh_onto: str | None = None
@@ -1015,8 +1072,7 @@ class TaskRunner:
                         await self._claim_issues_before_merge(gh, pr)
                         self._guard()
                         method = (self.cfg.get("merge") or {}).get("method", "squash")
-                        result = await gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
-                                                method=method, title=f"{self.task.title} (#{self.task.pr_number})")
+                        result = await self._serialized_merge(gh, method)
                         self.update(merge_sha=result.get("sha", ""))
                     except GitHubError as exc:
                         if exc.status in (405, 409) and main_sha != self.task.base_sha:

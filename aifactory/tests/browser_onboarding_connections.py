@@ -51,6 +51,9 @@ def check(base_url):
                     return route.fulfill(json={"user": {"id": "u", "name": "Owner"}, "workspaces": [{"id": "one", "role": "owner", "name": "Test workspace", "org_name": "Acme", "settings": deepcopy(settings)}]})
                 if path == "/api/meta":
                     return route.fulfill(json={"auth": {"dev": True}, "harnesses": [], "sandbox": {}})
+                if path.endswith("/onboarding/start"):
+                    assert req.method == "POST"
+                    return route.fulfill(json=state)
                 if path.endswith("/onboarding"):
                     if req.method == "PATCH":
                         body = req.post_data_json
@@ -176,6 +179,9 @@ def check_provider_recovery(base_url):
                         {"id": "one", "role": "owner", "name": "Recovery", "org_name": "Acme", "settings": deepcopy(settings)}]})
                 if path == "/api/meta":
                     return route.fulfill(json={"auth": {"dev": True}, "harnesses": [], "sandbox": {}})
+                if path.endswith("/onboarding/start"):
+                    assert req.method == "POST"
+                    return route.fulfill(json=state)
                 if path.endswith("/onboarding"):
                     if req.method == "PATCH":
                         body = req.post_data_json

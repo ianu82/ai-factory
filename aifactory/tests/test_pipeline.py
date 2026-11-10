@@ -74,6 +74,7 @@ def factory(tmp_path, monkeypatch):
         org = Organization(name="Acme")
         s.add(org)
         s.flush()
+        # These scenarios exercise an established operational workspace, not first-run learning.
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
         settings["limits"]["ci_minutes"] = 1
         ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings=settings)
@@ -1507,5 +1508,292 @@ def test_no_attachments_leave_shared_session_unchanged(factory, tmp_path, monkey
             run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "anton",
                                                             "original prompt", "system", sb), asyncio.Event())
             assert run.status == "succeeded" and result and not error
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("transition", ["snapshot", "lock", "pull", "branch", "claim"])
+def test_learning_is_rechecked_immediately_before_merge(factory, monkeypatch, transition):
+    from aifactory.models import Plan
+    from aifactory.onboarding_policy import begin
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "merge": {"mode": "auto"}}
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id,
+                    key="T1", title="Verified change", spec="s", acceptance=["c"], repo_id=repo.id,
+                    status="running", stage="merge", pr_number=1, head_sha="head", base_sha="base")
+        s.add(task)
+        s.flush()
+        task_id = task.id
+
+    def start_learning():
+        with session_scope() as s:
+            ws = s.get(Workspace, factory["ws"])
+            ws.settings = begin(ws.settings)
+
+    calls = []
+    class GitHub:
+        def __init__(self, token):
+            self.pulls = 0
+
+        async def pull(self, *args):
+            self.pulls += 1
+            if transition == "pull" and self.pulls == 2:
+                start_learning()
+            return {"state": "open", "head": {"sha": "head"}}
+
+        async def branch_sha(self, *args):
+            if transition == "branch":
+                start_learning()
+            return "base"
+
+        async def merge(self, *args, **kwargs):
+            calls.append(kwargs)
+            return {"sha": "merged"}
+
+    class Lock:
+        async def __aenter__(self):
+            if transition == "lock":
+                start_learning()
+        async def __aexit__(self, *args):
+            pass
+
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: Lock())
+    assert runner.settings["autonomy"]["merge"] == "auto"
+    async def claim(*args):
+        if transition == "claim":
+            start_learning()
+    monkeypatch.setattr(runner, "_claim_issues_before_merge", claim)
+    monkeypatch.setattr(delivery, "GitHub", GitHub)
+    if transition == "snapshot":
+        start_learning()
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner.merge())
+    assert calls == []
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "awaiting_approval"
+        assert s.query(Decision).filter_by(task_id=task_id, kind="approve_merge", status="open").count() == 1
+
+
+def test_plan_approval_uses_policy_after_planner_returns(factory):
+    from aifactory.onboarding_policy import begin
+
+    def planner(messages):
+        result = planner_script(messages)
+        if step(messages) > 0:
+            with session_scope() as s:
+                ws = s.get(Workspace, factory["ws"])
+                ws.settings = begin(ws.settings)
+        return result
+
+    ScriptedModel.scripts["planner"] = planner
+    outcome_id = new_outcome(factory)
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    with session_scope() as s:
+        assert s.get(Outcome, outcome_id).status == "awaiting_approval"
+        assert s.query(Task).filter_by(outcome_id=outcome_id).count() == 0
+        assert s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_plan", status="open").count() == 1
+
+
+@pytest.mark.parametrize("repo_config", [
+    {"merge": {"mode": "approval"}},
+    {"merge": {"mode": "auto"}, "release": {"mode": "on_merge"}},
+])
+def test_applied_preset_does_not_bypass_stricter_repository_controls(factory, repo_config):
+    from types import SimpleNamespace
+    from aifactory.onboarding_policy import begin
+
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        settings = begin(ws.settings)
+        settings["learning"] = {**settings["learning"], "status": "applied"}
+        settings["autonomy"] = settings["learning"]["preset"]
+        ws.settings = settings
+    runner = SimpleNamespace(ws=factory["ws"], cfg=repo_config)
+    assert delivery.TaskRunner._merge_needs_approval(runner) is True
+
+
+def test_learning_activation_at_plan_approval_boundary_requires_a_person(factory, monkeypatch):
+    """Even a previous auto-policy read cannot authorize the later approval."""
+    from aifactory.onboarding_policy import begin, lock_workspace
+    from aifactory.pipeline.runtime import workspace_settings
+
+    outcome_id = new_outcome(factory)
+    calls = []
+
+    def activate_before_lock(s, workspace_id):
+        assert workspace_settings(workspace_id)["autonomy"]["plan"] == "auto"
+        with session_scope() as current:
+            ws = lock_workspace(current, workspace_id)
+            ws.settings = begin(ws.settings)
+        calls.append(workspace_id)
+        return lock_workspace(s, workspace_id)
+
+    monkeypatch.setattr(planning, "lock_workspace", activate_before_lock)
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    assert calls == [factory["ws"]]
+    with session_scope() as s:
+        assert s.get(Outcome, outcome_id).status == "awaiting_approval"
+        assert s.query(Task).filter_by(outcome_id=outcome_id).count() == 0
+        assert s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_plan", status="open").count() == 1
+
+
+def merge_gate_runner(factory):
+    """An already-running automatic task; onboarding may start after this snapshot."""
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id,
+                    key="T1", title="Verified change", spec="s", repo_id=factory["repo"],
+                    status="running", stage="merge", pr_number=1, head_sha="head", base_sha="base")
+        s.add(task)
+        s.flush()
+        task_id = task.id
+    return delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+
+
+def test_onboarding_activation_waits_for_final_merge_transaction(factory):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event as ThreadEvent
+
+    from sqlalchemy import event
+    from aifactory import db
+    from aifactory.onboarding import start_onboarding
+
+    runner = merge_gate_runner(factory)
+    merging, release, attempting, activated = (ThreadEvent() for _ in range(4))
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            merging.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            assert not activated.is_set()
+            return {"sha": "merged"}
+
+    def activate():
+        with session_scope() as s:
+            start_onboarding(factory["ws"], s.get(User, factory["user"]), s)
+        activated.set()
+
+    def observe_lock(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE workspaces") and merging.is_set():
+            attempting.set()
+
+    with session_scope() as s:
+        engine = s.get_bind()
+    event.listen(engine, "before_cursor_execute", observe_lock)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            async def go():
+                merge = asyncio.create_task(runner._serialized_merge(GitHub(), "squash"))
+                activation = None
+                try:
+                    assert await asyncio.to_thread(merging.wait, 5)
+                    activation = pool.submit(activate)
+                    assert await asyncio.to_thread(attempting.wait, 5)
+                    # The UPDATE has reached the DB, but /start must not commit
+                    # learning while GitHub's merge is still in flight.
+                    assert not await asyncio.to_thread(activated.wait, 0.2)
+                finally:
+                    release.set()
+                    result = await merge
+                assert result == {"sha": "merged"}
+                if activation:
+                    await asyncio.wrap_future(activation)
+            asyncio.run(go())
+    finally:
+        release.set()
+        event.remove(engine, "before_cursor_execute", observe_lock)
+    assert activated.is_set()
+    with session_scope() as s:
+        assert s.get(Workspace, factory["ws"]).settings["learning"]["status"] == "learning"
+
+
+def test_learning_committed_before_final_merge_lock_opens_approval(factory, monkeypatch):
+    from aifactory import onboarding_policy
+
+    runner = merge_gate_runner(factory)
+    original_lock = onboarding_policy.lock_workspace
+
+    def activate_before_gate(s, workspace_id):
+        with session_scope() as current:
+            ws = original_lock(current, workspace_id)
+            ws.settings = onboarding_policy.begin(ws.settings)
+        return original_lock(s, workspace_id)
+
+    monkeypatch.setattr(onboarding_policy, "lock_workspace", activate_before_gate)
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            pytest.fail("Learning must prevent the merge side effect")
+
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner._serialized_merge(GitHub(), "squash"))
+    with session_scope() as s:
+        assert s.get(Task, runner.task_id).status == "awaiting_approval"
+        assert s.query(Decision).filter_by(task_id=runner.task_id, kind="approve_merge", status="open").count() == 1
+
+
+def test_final_merge_timeout_releases_workspace_lock(factory, monkeypatch):
+    from aifactory.onboarding_policy import begin, lock_workspace
+
+    runner = merge_gate_runner(factory)
+    wait_for = asyncio.wait_for
+    timeouts = []
+
+    async def short_timeout(awaitable, *, timeout):
+        timeouts.append(timeout)
+        return await wait_for(awaitable, timeout=0.01)
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            await asyncio.sleep(10)
+
+    monkeypatch.setattr(delivery.asyncio, "wait_for", short_timeout)
+    with pytest.raises(delivery.GitHubError, match="merge timed out"):
+        asyncio.run(runner._serialized_merge(GitHub(), "squash"))
+    assert timeouts == [60]
+    # A failed network request must not strand the onboarding lock.
+    with session_scope() as s:
+        ws = lock_workspace(s, factory["ws"])
+        ws.settings = begin(ws.settings)
+
+
+def test_cancelling_final_merge_waits_for_bounded_transaction(factory):
+    from threading import Event as ThreadEvent
+
+    runner = merge_gate_runner(factory)
+    merging, release, finished = (ThreadEvent() for _ in range(3))
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            merging.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            finished.set()
+            return {"sha": "merged"}
+
+    async def go():
+        merge = asyncio.create_task(runner._serialized_merge(GitHub(), "squash"))
+        try:
+            assert await asyncio.to_thread(merging.wait, 5)
+            merge.cancel()
+            await asyncio.sleep(0.05)
+            assert not merge.done(), "Caller must retain its repository lock until the merge exits"
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await merge
+        assert finished.is_set()
 
     asyncio.run(go())

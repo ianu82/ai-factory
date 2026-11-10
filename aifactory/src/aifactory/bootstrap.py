@@ -90,6 +90,9 @@ def apply_bootstrap() -> str | None:
                                settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
                 s.add(ws)
                 s.flush()
+        from .onboarding_policy import lock_workspace
+
+        ws = lock_workspace(s, ws.id)
         set_bootstrap_workspace(ws.id)
         settings = merged_settings(ws.settings)
         overrides = cfg.get("settings") or {}

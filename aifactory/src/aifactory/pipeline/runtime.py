@@ -55,7 +55,9 @@ def merged_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         out.setdefault(key, value)
     for key in ("concurrency", "planning_concurrency"):
         out[key] = concurrency_limit(out[key], DEFAULT_SETTINGS[key])
-    return out
+    from ..onboarding_policy import effective
+
+    return effective(out)
 
 
 def workspace_settings(workspace_id: str) -> dict[str, Any]:

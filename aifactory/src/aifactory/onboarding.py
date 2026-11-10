@@ -133,6 +133,21 @@ def get_onboarding(workspace_id: str, user: User = Depends(current_user), db: Se
     return snapshot(db, _workspace(db, user, workspace_id))
 
 
+@router.post("/start", response_model=OnboardingState)
+def start_onboarding(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Explicit entry transition; snapshots remain side-effect free."""
+    from .onboarding_policy import begin, completed, lock_workspace
+
+    _workspace(db, user, workspace_id, "admin")
+    ws = lock_workspace(db, workspace_id)
+    if completed(db, ws.id) is None:
+        settings = begin(ws.settings)
+        if settings != ws.settings:
+            ws.settings = settings
+            db.commit()
+    return snapshot(db, ws)
+
+
 @router.patch("", response_model=OnboardingState)
 async def update_onboarding(workspace_id: str, request: Request, user: User = Depends(current_user),
                             db: Session = Depends(get_db)):
@@ -142,8 +157,11 @@ async def update_onboarding(workspace_id: str, request: Request, user: User = De
     except (ValidationError, ValueError):
         # Do not echo rejected arbitrary JSON: it might contain a pasted secret.
         raise HTTPException(422, "Invalid onboarding action") from None
+    from .onboarding_policy import begin, completed, lock_workspace
+
+    ws = lock_workspace(db, workspace_id)
     before = snapshot(db, ws)
-    # Replace the JSON value, never mutate it in place or touch workspace settings.
+    # Replace progress JSON; policy initialization below also uses copy-on-write.
     state = before.model_dump(include={"current_step", "deferred", "first_outcome_id"})
     state["completed_steps"] = [s for s in before.completed_steps if s in ("autonomy", "team")]
     if isinstance(body, Navigate):
@@ -167,6 +185,8 @@ async def update_onboarding(workspace_id: str, request: Request, user: User = De
                 raise HTTPException(422, "Prerequisites are derived from workspace configuration")
             if body.step not in before.completed_steps:
                 raise HTTPException(409, "Complete and validate this prerequisite first")
+    if completed(db, ws.id) is None:
+        ws.settings = begin(ws.settings)
     ws.onboarding = state
     db.commit()
     return snapshot(db, ws)

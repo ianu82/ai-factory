@@ -419,12 +419,18 @@ def apply(db: Session, sig: Signal, user: User, *, note: str | None = None) -> s
     ws = db.get(Workspace, sig.workspace_id)
     summary = ""
     if kind == "settings":
+        from .onboarding_policy import KEY, lock_workspace, patch_autonomy
+
+        ws = lock_workspace(db, sig.workspace_id)
         settings = dict(ws.settings or {})
         for path, value in (action.get("set") or {}).items():
             section, _, leaf = path.partition(".")
-            if section.startswith("_"):  # the operator bootstrap's bookkeeping is never a proposal target
+            if section == KEY or section.startswith("_"):  # the operator bootstrap's bookkeeping is never a proposal target
                 continue
-            settings[section] = {**(settings.get(section) or {}), leaf: value} if leaf else value
+            if section == "autonomy":
+                settings = patch_autonomy(merged_settings(settings), {leaf: value} if leaf else value)
+            else:
+                settings[section] = {**(settings.get(section) or {}), leaf: value} if leaf else value
         ws.settings = settings
         summary = ", ".join(f"{k} → {v}" for k, v in (action.get("set") or {}).items())
     elif kind in ("repo_config", "team_note", "review"):

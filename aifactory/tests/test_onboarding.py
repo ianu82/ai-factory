@@ -438,3 +438,254 @@ def test_guided_template_retry_preserves_admission_marker(client, signed_in):
         assert s.get(Outcome, outcome_id).source == "user"
     assert client.get(f"{path}/{outcome_id}").json()["guidance"] == {
         "template": "readme-contributing", "repo_id": repo_id}
+
+
+def policy_url(signed_in):
+    return url(signed_in) + "/policy"
+
+
+def test_learning_preserves_requested_preset_and_unrelated_settings(client, signed_in):
+    from aifactory.onboarding_policy import begin
+    from aifactory.pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    # Existing operational defaults are deliberately unchanged.
+    assert merged_settings({})["autonomy"] == DEFAULT_SETTINGS["autonomy"]
+    original = {"autonomy": {"plan": "auto", "merge": "approval", "release": "approval"}, "custom": {"x": [1]}}
+    with db.session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        ws.settings = original
+    assert client.patch(url(signed_in), json={"action": "navigate", "step": "autonomy"}).status_code == 200
+    with db.session_scope() as s:
+        settings = s.get(Workspace, ws_id).settings
+        assert settings == begin(original)
+        assert settings["custom"] == {"x": [1]}
+        assert settings["learning"]["preset"] == original["autonomy"]
+    response = client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"autonomy": {"release": "auto"}}})
+    assert response.status_code == 200
+    saved = client.get("/api/me").json()["workspaces"][0]["settings"]
+    assert saved["autonomy"] == {"plan": "approval", "merge": "approval", "release": "auto"}
+    assert saved["learning"]["preset"] == {"plan": "auto", "merge": "approval", "release": "auto"}
+    assert saved["custom"] == {"x": [1]}
+    assert original["autonomy"]["release"] == "approval"  # copy-on-write
+
+
+@pytest.mark.parametrize("status", ["planning", "partially_completed", "cancelled", "merged", "handed_over", "completed"])
+def test_offer_requires_full_outcome_completion(client, signed_in, status):
+    path = policy_url(signed_in)
+    assert client.get(path).json()["eligible"] is False
+    assert client.post(path + "/apply").status_code == 409
+    with db.session_scope() as s:
+        s.add(Outcome(workspace_id=signed_in["workspaces"][0]["id"], number=1, title="Delivery", status=status))
+    preview = client.get(path).json()
+    assert preview["eligible"] is (status == "completed")
+    assert bool(preview["first_completed_outcome_id"]) is (status == "completed")
+    assert preview["before"]["plan"] == preview["before"]["merge"] == "approval"
+    assert client.post(path + "/apply").status_code == (200 if status == "completed" else 409)
+
+
+def test_apply_is_explicit_idempotent_and_audited(client, signed_in):
+    from aifactory.models import Event
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    path = policy_url(signed_in)
+    with db.session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=1, title="Delivered", status="completed"))
+        s.add(Repository(workspace_id=ws_id, full_name="acme/strict",
+                         config={"merge": {"mode": "approval"}, "release": {"mode": "approval"}}))
+    preview = client.get(path).json()
+    assert preview["changes"] == [{"policy": key, "before": "approval", "after": "auto"} for key in ("plan", "merge")]
+    assert client.get("/api/me").json()["workspaces"][0]["settings"]["autonomy"] == preview["before"]
+    result = client.post(path + "/apply")
+    assert result.status_code == 200, result.text
+    assert result.json()["applied"] is True and result.json()["eligible"] is False
+    assert client.post(path + "/apply").json() == result.json()
+    with db.session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        assert ws.settings["autonomy"] == preview["after"]
+        assert ws.settings["autonomy"]["release"] == "approval"
+        assert s.query(Repository).filter_by(workspace_id=ws_id).one().config == {
+            "merge": {"mode": "approval"}, "release": {"mode": "approval"}}
+        event = s.query(Event).filter_by(workspace_id=ws_id, kind="learning_preset_applied").one()
+        assert event.actor == signed_in["user"]["id"]
+        assert event.data["before"] == preview["before"] and event.data["after"] == preview["after"]
+    # Reopening onboarding never reinstates learning after explicit application.
+    assert client.patch(url(signed_in), json={"action": "navigate", "step": "team"}).status_code == 200
+    assert client.get(path).json()["applied"] is True
+
+
+def test_concurrent_preset_apply_is_idempotent_and_audited_once(client, signed_in):
+    """Run on SQLite and via AIFACTORY_TEST_DATABASE_URL on PostgreSQL (JSON, not JSONB)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from aifactory.models import Event
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=1, title="Delivered", status="completed"))
+    path = policy_url(signed_in)
+    preview = client.get(path).json()
+    barrier = Barrier(2)
+
+    def apply():
+        barrier.wait(timeout=10)
+        return client.post(path + "/apply")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: apply(), range(2)))
+    for response in responses:
+        assert response.status_code == 200, response.text
+        assert response.json()["applied"] is True
+    assert responses[0].json() == responses[1].json()
+    with db.session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        assert ws.settings["autonomy"] == preview["after"]
+        events = s.query(Event).filter_by(workspace_id=ws_id, kind="learning_preset_applied").all()
+        assert len(events) == 1
+        assert events[0].actor == signed_in["user"]["id"]
+        assert events[0].data["changes"] == preview["changes"]
+
+
+@pytest.mark.parametrize("role", ["owner", "admin", "member", "viewer"])
+def test_learning_policy_authorization(client, signed_in, role):
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws_id, user_id=signed_in["user"]["id"]).one().role = role
+        s.add(Outcome(workspace_id=ws_id, number=1, title="Done", status="completed"))
+        ws = s.get(Workspace, ws_id)
+        other = Workspace(org_id=ws.org_id, name="Other", slug="other")
+        s.add(other)
+        s.flush()
+        other_path = f"/api/workspaces/{other.id}/onboarding/policy"
+    assert client.get(policy_url(signed_in)).status_code == 200
+    assert client.post(policy_url(signed_in) + "/apply").status_code == (200 if role in ("owner", "admin") else 403)
+    assert client.get(other_path).status_code == 404
+    assert client.post(other_path + "/apply").status_code == 404
+
+
+def test_completed_operational_workspace_does_not_reenter_learning(client, signed_in):
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.get(Workspace, ws_id).settings = {"autonomy": {"plan": "auto", "merge": "auto"}}
+        s.add(Outcome(workspace_id=ws_id, number=1, title="Done", status="completed"))
+    assert client.patch(url(signed_in), json={"action": "navigate", "step": "team"}).status_code == 200
+    assert client.get(policy_url(signed_in)).json()["learning"] is False
+    assert client.get(policy_url(signed_in)).json()["eligible"] is False
+
+
+def test_policy_edits_after_apply_show_current_operational_policy(client, signed_in):
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=1, title="Done", status="completed"))
+    path = policy_url(signed_in)
+    assert client.post(path + "/apply").status_code == 200
+    assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"autonomy": {"merge": "approval"}}}).status_code == 200
+    policy = client.get(path).json()
+    assert policy["after"] == policy["before"] == {"plan": "auto", "merge": "approval", "release": "approval"}
+    assert policy["changes"] == []
+    assert client.post(path + "/apply").json() == policy  # no reapplication of the old preset
+
+
+def test_start_onboarding_enforces_learning_before_any_step_and_is_idempotent(client, signed_in):
+    from aifactory.onboarding_policy import begin
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    original = {"autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
+                "custom": {"keep": [1, 2]}}
+    with db.session_scope() as s:
+        s.get(Workspace, ws_id).settings = original
+    # Merely reading progress must not change policy.
+    assert client.get(url(signed_in)).status_code == 200
+    with db.session_scope() as s:
+        assert s.get(Workspace, ws_id).settings == original
+    path = url(signed_in) + "/start"
+    first = client.post(path)
+    assert first.status_code == 200
+    assert first.json()["current_step"] == "models"
+    with db.session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        assert ws.settings == begin(original)
+        assert ws.settings["autonomy"]["plan"] == ws.settings["autonomy"]["merge"] == "approval"
+        assert ws.settings["learning"]["preset"] == original["autonomy"]
+        assert ws.onboarding is None
+    assert client.post(path).json() == first.json()
+    with db.session_scope() as s:
+        assert s.get(Workspace, ws_id).settings == begin(original)
+
+
+@pytest.mark.parametrize("role", ["owner", "admin", "member", "viewer"])
+def test_start_onboarding_is_admin_only_and_workspace_scoped(client, signed_in, role):
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws_id, user_id=signed_in["user"]["id"]).one().role = role
+        ws = s.get(Workspace, ws_id)
+        other = Workspace(org_id=ws.org_id, name="Private", slug="private")
+        s.add(other)
+        s.flush()
+        other_id = other.id
+    assert client.post(url(signed_in) + "/start").status_code == (200 if role in ("owner", "admin") else 403)
+    assert client.post(f"/api/workspaces/{other_id}/onboarding/start").status_code == 404
+
+
+def test_stale_settings_patch_cannot_erase_concurrent_onboarding_start(client, signed_in, monkeypatch):
+    """The request read its workspace before /start committed learning."""
+    from aifactory import api
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.get(Workspace, ws_id).settings = {
+            "autonomy": {"plan": "auto", "merge": "auto"}, "custom": {"keep": True}}
+    original = api._ws
+
+    def stale_workspace(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert "learning" not in result[0].settings
+        assert client.post(url(signed_in) + "/start").status_code == 200
+        # The first request's ORM identity map still has the old JSON.
+        assert "learning" not in result[0].settings
+        return result
+
+    monkeypatch.setattr(api, "_ws", stale_workspace)
+    response = client.patch(f"/api/workspaces/{ws_id}", json={
+        "settings": {"autonomy": {"release": "auto"}, "concurrency": 5}})
+    assert response.status_code == 200, response.text
+    with db.session_scope() as s:
+        settings = s.get(Workspace, ws_id).settings
+        assert settings["learning"]["status"] == "learning"
+        assert settings["learning"]["preset"] == {"plan": "auto", "merge": "auto", "release": "auto"}
+        assert settings["autonomy"] == {"plan": "approval", "merge": "approval", "release": "auto"}
+        assert settings["custom"] == {"keep": True}
+        assert settings["concurrency"] == 5
+
+
+@pytest.mark.parametrize("writer", ["linear", "insights"])
+def test_other_settings_writers_refresh_stale_workspace_after_learning_starts(client, signed_in, writer):
+    from aifactory import insights, linear_config
+    from aifactory.models import Signal, User
+    from aifactory.onboarding_policy import begin
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        s.get(Workspace, ws_id).settings = {"autonomy": {"plan": "auto", "merge": "auto"}, "custom": "keep"}
+    with db.session_scope() as stale:
+        ws = stale.get(Workspace, ws_id)
+        with db.session_scope() as current:
+            current.get(Workspace, ws_id).settings = begin(ws.settings)
+        if writer == "linear":
+            linear_config.save_config(stale, ws, linear_config.LinearConfig(intake_label="custom"),
+                                      signed_in["user"]["id"], commit=False)
+        else:
+            sig = Signal(workspace_id=ws_id, source="improvement", fingerprint="test", title="Limits",
+                         data={"action": {"type": "settings", "set": {"concurrency": 5}}})
+            stale.add(sig)
+            insights.apply(stale, sig, stale.get(User, signed_in["user"]["id"]))
+    with db.session_scope() as s:
+        settings = s.get(Workspace, ws_id).settings
+        assert settings["learning"]["status"] == "learning"
+        assert settings["autonomy"]["plan"] == settings["autonomy"]["merge"] == "approval"
+        assert settings["custom"] == "keep"
+        if writer == "linear":
+            assert settings["linear"]["intake_label"] == "custom"
+        else:
+            assert settings["concurrency"] == 5
