@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -156,15 +157,29 @@ class WorkspaceUpdate(BaseModel):
     paused: bool | None = None
 
 
+def _mind_settings(value: Any) -> dict[str, Any]:
+    """Mind's daily budget: a finite, nonnegative number of US dollars (0 turns Mind off)."""
+    if value is None:
+        return dict(DEFAULT_SETTINGS["mind"])
+    if not isinstance(value, dict) or set(value) - {"daily_budget_usd"}:
+        raise HTTPException(422, "mind accepts only daily_budget_usd")
+    budget = value.get("daily_budget_usd", DEFAULT_SETTINGS["mind"]["daily_budget_usd"])
+    if type(budget) not in (int, float) or not math.isfinite(budget) or budget < 0:
+        raise HTTPException(422, "mind.daily_budget_usd must be a finite, nonnegative number")
+    return {"daily_budget_usd": float(budget)}
+
+
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         review = review_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+    mind = _mind_settings(raw.get("mind"))
     merged = merged_settings(raw)
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
+    merged["mind"] = mind
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):

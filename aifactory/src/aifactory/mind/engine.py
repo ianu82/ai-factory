@@ -88,7 +88,7 @@ class MindEngine:
 
     async def run(self, *, workspace_id: str, prompt: str, history: list[dict],
                   tools: Tools, ledger: Ledger, emit: Callable[[dict], Awaitable[None]],
-                  readiness: Readiness) -> EngineResult:
+                  readiness: Readiness, session_id: str | None = None) -> EngineResult:
         """Emit actual native text deltas and ordered steps; never replay final text.
 
         History is T1's sanitized persistence projection, not SDK history or raw
@@ -106,7 +106,8 @@ class MindEngine:
                for m in history):
             raise ValueError("Mind requires sanitized user/assistant text history")
         history = [{"role": m["role"], "content": redact(m["content"])} for m in history]
-        session_id = "mind-" + uuid4().hex
+        # The caller's session id lets its ledger reconcile MindsHub's cumulative cost for this exact turn.
+        session_id = session_id or "mind-" + uuid4().hex
         provider = await self.provider.open(workspace_id, readiness, session_id, ledger)
         history = [{"role": m["role"], "content": provider.sanitize(m["content"])} for m in history]
         prompt = provider.sanitize(prompt)
