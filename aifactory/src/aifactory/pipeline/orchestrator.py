@@ -353,7 +353,8 @@ class Orchestrator:
                 provider = resolve_provider(workspace_id)
                 names = await ModelClient(provider).list_models()
                 models = workspace_models(workspace_settings(workspace_id))
-                wanted = {provider.model_override} if provider.model_override else {models.planner, models.builder, models.verifier}
+                wanted = ({provider.model_override} if provider.model_override else
+                          {models.planner, models.plan_reviewer, models.builder, models.verifier})
                 missing = sorted(m for m in wanted if m and m not in names)
                 log.info("readiness %s provider=%s models=%d configured=%s missing=%s", workspace_id[:6],
                          provider.provider, len(names), sorted(wanted), missing or "none")
