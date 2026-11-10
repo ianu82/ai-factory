@@ -617,3 +617,19 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
 .onboarding-content .input, .onboarding-content .select, .onboarding-content .textarea { max-width: 100%; }
 .onboarding-examples, .onboarding-recovery { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
 .onboarding-examples .btn { white-space: normal; text-align: left; overflow-wrap: anywhere; }
+
+/* Guided outcome evidence is readable at panel and mobile widths. */
+.guided-outcome { overflow-wrap: anywhere; min-width: 0; }
+.guided-outcome h3 { margin-top: 16px; }
+.guided-stage { border: 1px solid var(--line); border-radius: var(--r); margin-top: 12px; padding: 12px; min-width: 0; }
+.guided-stage h4 { margin: 0 0 8px; display: flex; align-items: flex-start; gap: 6px; flex-wrap: wrap; }
+.guided-stage p { margin: 8px 0; font-size: 12.5px; }
+.guided-stage a { display: block; margin: 6px 0; color: var(--teal); text-decoration: underline; overflow-wrap: anywhere; }
+.guided-task + .guided-task { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+.guided-task strong { display: flex; align-items: flex-start; gap: 6px; }
+.guided-task .mark, .guided-stage h4 .mark { flex-shrink: 0; }
+.task-body { min-width: 0; overflow-wrap: anywhere; }
+.task-body > div, .task-body .kv { min-width: 0; }
+.task-body .chip { max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.task-body pre.log { max-width: 100%; overflow-wrap: anywhere; }
+[id^="task-"], [id^="event-"], #guided-plan { scroll-margin-top: 160px; }

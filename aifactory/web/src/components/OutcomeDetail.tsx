@@ -7,6 +7,7 @@ import { useWs } from "../App";
 import { ago, clock, HARNESS_LABEL, money } from "../format";
 import { Prose, Skeleton, Status, useToast } from "../ui";
 import { DecisionCard } from "./DecisionCard";
+import { GuidedOutcome, type EvidenceTarget } from "./GuidedOutcome";
 import { TaskCard } from "./TaskCard";
 import { LinearIssueLink } from "./LinearIssueLink";
 
@@ -15,7 +16,7 @@ import { OutcomeAttachments } from "./Attachments";
 const QUIET = new Set(["agent_thought", "agent_tool"]);
 
 export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcomeId: string; onClose: () => void; focusDecisionId?: string }) {
-  const { ws } = useWs();
+  const { ws, me } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
   const q = useQuery({
@@ -23,7 +24,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
     queryFn: () => api<Detail>(`/api/workspaces/${ws.id}/outcomes/${outcomeId}`),
     refetchInterval: (query) => (["completed", "cancelled"].includes(query.state.data?.outcome.status || "") ? false : 15_000),
   });
-  const [guided, setGuided] = useState(true);
+  const [evidenceTarget, setEvidenceTarget] = useState<EvidenceTarget>();
   const [showAll, setShowAll] = useState(false);
   const { hash } = useLocation();
   const targetDecisionId = hash.startsWith("#decision-") ? hash.slice("#decision-".length) : focusDecisionId;
@@ -71,21 +72,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
         </div>
       </header>
 
-      {q.data.guidance && <section className="p-sec" aria-label="Guided outcome">
-        <button className="btn sm" onClick={() => setGuided(!guided)}>{guided ? "Dismiss guide" : "Reopen guide"}</button>
-        {guided && <>
-          <h3>Your guided README outcome · {outcome.status}</h3>
-          <p>Only the selected repository’s root README may change. Inspect the CONTRIBUTING section for accurate instructions and preservation of unrelated content.</p>
-          <ol>
-            <li><a href="#guided-plan">Planning & plan review</a>: Factory reads repository facts and proposes tasks. Check scope; approve only when the plan is README-only.</li>
-            <li><a href="#guided-tasks">Building & checks</a>: the worker prepares a candidate. Open the task for its diff and command results; no action unless a decision asks you.</li>
-            <li><a href="#guided-tasks">Independent verification</a>: a separate reviewer checks the criteria. Read its verdict and evidence, not just the summary.</li>
-            <li><a href="#guided-tasks">Pull request & CI</a>: open the task’s PR link to inspect the exact README diff and GitHub checks.</li>
-            <li><a href="#guided-decisions">Merge or approval</a>: review any open decision below. Approval policies still apply; this guide does not grant permission to merge.</li>
-            <li><a href="#guided-activity">Smoke</a>: after merge, inspect smoke results in task evidence and activity. Completed means Factory finished its configured gates.</li>
-          </ol>
-        </>}
-      </section>}
+      <GuidedOutcome key={`${ws.id}:${outcome.id}:${me.user.id}`} detail={q.data} onOpen={setEvidenceTarget} />
 
       <div id="guided-decisions" />
       {open.length > 0 && (
@@ -105,7 +92,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
             {outcome.status === "planning" ? "The planner is reading the repositories and drafting tasks…" : "No tasks yet."}
           </div>
         ) : (
-          tasks.map((t) => <TaskCard key={t.id} task={t} runs={runs.filter((r) => r.task_id === t.id)} defaultOpen={tasks.length === 1} />)
+          tasks.map((t) => <TaskCard key={t.id} task={t} runs={runs.filter((r) => r.task_id === t.id)} defaultOpen={tasks.length === 1} openTarget={evidenceTarget?.taskId === t.id ? evidenceTarget : undefined} />)
         )}
       </section>
 
@@ -122,7 +109,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
 
       {plan && (
         <section className="p-sec">
-          <h3 id="guided-plan">Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : "approved by policy") : plan.status}</span></h3>
+          <h3 id="guided-plan" tabIndex={-1}>Plan v{plan.version} <span className="r faint">{plan.status === "approved" ? (plan.approved_by ? "approved by a team member" : "approved by policy") : plan.status}</span></h3>
           <Prose text={plan.summary} />
           {(plan.content.risks || []).length > 0 && (
             <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--muted)", fontSize: 12.5 }}>
@@ -131,6 +118,12 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
           )}
         </section>
       )}
+
+      <section className="p-sec" id="guided-planning-runs" tabIndex={-1} aria-label="Planner sessions">
+        <h3>Planner sessions</h3>
+        {runs.filter((r) => r.role === "planner").map((r) => <p key={r.id}>Session {r.id} · {r.status} · {r.model}{r.error ? ` · ${r.error}` : ""}</p>)}
+        {!runs.some((r) => r.role === "planner") && <p className="muted">No planner session available.</p>}
+      </section>
 
       <Conversation outcomeId={outcome.id} messages={messages} active={active} />
 
@@ -151,7 +144,7 @@ function TimelineItem({ e }: { e: FactoryEvent }) {
   const cmd = e.kind === "agent_command";
   const url = e.data?.url as string | undefined;
   return (
-    <li>
+    <li id={`event-${e.id}`} tabIndex={-1}>
       <span className="time" title={new Date(e.created_at).toLocaleString()}>{clock(e.created_at)}</span>
       <span className={`tick ${e.level}`} />
       <span className={`msg ${cmd ? "cmd" : ""}`}>

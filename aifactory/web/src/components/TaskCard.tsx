@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, ExternalLink, GitPullRequest } from "lucide-react";
 import { api, type Artifact, type Run, type Task } from "../api";
 import { useWs } from "../App";
 import { duration, HARNESS_LABEL, money, tokens } from "../format";
 import { DiffView, GateTrack, Mark, Prose, Status, useToast } from "../ui";
+
+import { currentAttempt, currentCandidateEvidence, taskFacts, type EvidenceTarget } from "./GuidedOutcome";
 
 const STAGE_TEXT: Record<string, string> = {
   prepare: "Preparing a fresh checkout", build: "Building", revise: "Revising", checks: "Running checks",
@@ -16,11 +18,12 @@ const STAGE_TEXT: Record<string, string> = {
   release: "Watching the release", revert: "Reverting the merge", done: "Done",
 };
 
-export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs: Run[]; defaultOpen?: boolean }) {
+export function TaskCard({ task, runs, defaultOpen = false, openTarget }: { task: Task; runs: Run[]; defaultOpen?: boolean; openTarget?: EvidenceTarget }) {
   const [open, setOpen] = useState(defaultOpen);
+  useEffect(() => { if (openTarget) setOpen(true); }, [openTarget]);
   const label = task.status === "running" ? STAGE_TEXT[task.stage] || "Running" : undefined;
   return (
-    <div className="task">
+    <div className="task" id={`task-${task.id}`}>
       <div className="task-head" onClick={() => setOpen(!open)} role="button" tabIndex={0} aria-expanded={open}
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setOpen(!open))}>
         <span className="key">{task.key}</span>
@@ -48,12 +51,12 @@ export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs
           <div className="prose clamp" style={{ marginTop: 8, fontSize: 12.5, color: "var(--bad)" }}>{task.blocked_reason}</div>
         )}
       </div>
-      {open && <TaskBody task={task} runs={runs} />}
+      {open && <TaskBody task={task} runs={runs} openTarget={openTarget} />}
     </div>
   );
 }
 
-function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
+function TaskBody({ task, runs, openTarget }: { task: Task; runs: Run[]; openTarget?: EvidenceTarget }) {
   const { ws } = useWs();
   const artifacts = useQuery({
     queryKey: ["outcome", ws.id, "artifacts", task.id, task.updated_at],
@@ -61,24 +64,49 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
   });
   const [view, setView] = useState<Artifact | null>(null);
   const attempts = task.evidence.attempts || [];
-  const lastVerdict = [...attempts].reverse().find((a) => a.verdict)?.verdict;
+  const verification = taskFacts(task).verification;
+  const candidate = currentCandidateEvidence(task);
+  const lastVerdict = ["Passed", "Failed / unverified"].includes(verification.state) ? candidate.verdict : undefined;
   const byCriterion = new Map((lastVerdict?.criteria || []).map((c) => [c.criterion, c]));
   const diffs = (artifacts.data || []).filter((a) => a.kind === "diff");
   const reports = (artifacts.data || []).filter((a) => ["check", "smoke", "report", "setup", "log"].includes(a.kind));
   const shots = (artifacts.data || []).filter((a) => a.kind === "screenshot");
   const lastShots = shots.filter((a) => a.data.attempt === shots[shots.length - 1]?.data.attempt).slice(-8);
-  const appRun = [...attempts].reverse().find((a) => a.app_run)?.app_run;
+  const appRun = currentAttempt(task)?.app_run;
 
   const open = async (a: Artifact) => {
     if (view?.id === a.id) return setView(null);
-    setView(await api<Artifact>(`/api/workspaces/${ws.id}/artifacts/${a.id}`));
+    setArtifactError("");
+    try { setView(await api<Artifact>(`/api/workspaces/${ws.id}/artifacts/${a.id}`)); }
+    catch (err) { setArtifactError((err as Error).message); }
   };
+
+  const [artifactError, setArtifactError] = useState("");
+  useEffect(() => {
+    if (!openTarget) return;
+    const el = document.getElementById(`task-${task.id}-${openTarget.section}`);
+    el?.scrollIntoView({ block: "center" });
+    el?.focus({ preventScroll: true });
+  }, [openTarget, task.id]);
+  useEffect(() => { setView(null); }, [openTarget, task.attempt, task.evidence.budget_epoch, task.head_sha]);
+  useEffect(() => {
+    if (!openTarget || !artifacts.data) return;
+    const kind = openTarget.section === "build" ? "diff" : openTarget.section === "verification" ? "report" : "";
+    const currentRuns = new Set(runs.filter((r) => r.attempt === task.attempt && r.started_at >= (task.started_at || task.created_at)).map((r) => r.id));
+    const candidate = artifacts.data.findLast((a) => a.kind === kind && !!a.run_id && currentRuns.has(a.run_id));
+    if (!candidate) return;
+    let cancelled = false;
+    api<Artifact>(`/api/workspaces/${ws.id}/artifacts/${candidate.id}`).then((a) => { if (!cancelled) setView(a); })
+      .catch((err) => { if (!cancelled) setArtifactError((err as Error).message); });
+    return () => { cancelled = true; };
+  }, [openTarget, artifacts.data, runs, task.attempt, task.created_at, task.started_at, ws.id]);
+  const anchor = (section: string) => ({ id: `task-${task.id}-${section}`, tabIndex: -1 });
 
   return (
     <div className="task-body">
-      <div>
+      <div {...anchor("verification")}>
         <div className="muted" style={{ fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
-          Acceptance {lastVerdict ? `· verified by ${HARNESS_LABEL[task.verifier_harness]}` : "· not yet verified"}
+          Acceptance {lastVerdict ? `· ${verification.state.toLowerCase()} by ${HARNESS_LABEL[task.verifier_harness]}` : "· not yet verified"}
         </div>
         <ul className="crit">
           {task.acceptance.map((c) => {
@@ -122,27 +150,33 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
       <dl className="kv">
         <dt>Built by</dt><dd>{HARNESS_LABEL[task.harness]} · verified by a fresh {HARNESS_LABEL[task.verifier_harness]} session</dd>
         {task.branch && <><dt>Branch</dt><dd className="mono">{task.branch}</dd></>}
+        <dt {...anchor("ci")}>CI evidence</dt><dd>Head: {task.evidence.ci?.head || "unavailable"}{!task.evidence.ci && " · Not configured / unavailable"}</dd>
         {task.evidence.ci && (
           <>
             <dt>CI</dt>
             <dd>
-              {task.status === "waiting_ci" ? "pending" : task.evidence.ci.state === "none" ? "No CI checks reported for this repository" : task.evidence.ci.state}
+              {taskFacts(task).ci.state}
               {(task.evidence.ci.checks || []).map((c) => (
-                <div key={c.name} className="checkline"><Mark status={task.status === "waiting_ci" ? "none" : c.conclusion === "success" ? "pass" : c.conclusion ? "fail" : "none"} />
+                <div key={c.name} className="checkline"><Mark status={taskFacts(task).ci.state === "Passed" ? "pass" : c.conclusion && c.conclusion !== "success" ? "fail" : "none"} />
                   {c.url ? <a className="linkish" href={c.url} target="_blank" rel="noreferrer">{c.name} <ExternalLink /></a> : c.name}</div>
               ))}
             </dd>
           </>
         )}
+        <dt {...anchor("merge")}>Merge evidence</dt><dd>{task.merge_sha || "Pending / unavailable"}</dd>
         {task.merge_sha && <><dt>Merged</dt><dd className="mono">{task.merge_sha.slice(0, 10)}</dd></>}
+        <dt {...anchor("smoke")}>Smoke evidence</dt><dd>{task.evidence.smoke?.state || "Not configured / unavailable"}
+          {task.evidence.smoke?.ref && <div>Merge reference: {task.evidence.smoke.ref}</div>}
+          {task.evidence.smoke?.checks?.map((c, i) => <div key={i}>{c.ok ? "Passed" : "Failed"}: {c.command}</div>)}
+        </dd>
         {task.evidence.smoke && <><dt>Smoke</dt><dd>{task.evidence.smoke.state.replace("_", " ")}</dd></>}
         {task.evidence.release && <><dt>Release</dt><dd>{task.evidence.release.note || task.evidence.release.state}{task.evidence.release.url ? ` · ${task.evidence.release.url}` : ""}</dd></>}
-        <dt>Sessions</dt>
+        <dt {...anchor("build")}>Sessions / build</dt>
         <dd>
           {runs.length === 0 ? "None yet" : runs.map((r) => (
-            <div key={r.id} className="checkline">
+            <div key={r.id} id={`run-${r.id}`} className="checkline">
               <Mark status={r.status === "succeeded" ? "pass" : r.status === "running" ? "none" : "fail"} />
-              <span>{r.role} · {HARNESS_LABEL[r.harness]} · <span className="mono">{r.model}</span></span>
+              <span>Session {r.id} · attempt {r.attempt} · {r.role} · {HARNESS_LABEL[r.harness]} · <span className="mono">{r.model}</span></span>
               <span className="muted num">{tokens(r.input_tokens + r.output_tokens)} tok · {money(r.cost_usd, r.cost_known)} · {duration(r.started_at, r.finished_at)}</span>
             </div>
           ))}
@@ -175,28 +209,40 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
         </div>
       )}
 
+      {view && <div aria-label="Opened evidence" tabIndex={-1} ref={(el) => { if (el && openTarget) el.scrollIntoView({ block: "center" }); }}>
+        <h4>{view.name}</h4>
+        {view.kind === "diff" ? <DiffView text={view.content || ""} /> : <pre className="log">{view.content || "(empty)"}</pre>}
+      </div>}
+      <div {...anchor("checks")}>
+        <h4>Current command results</h4>
+        {candidate.checks?.length ? candidate.checks.map((c, i) => <p key={i}>{c.ok ? "Passed" : "Failed"}: {c.command} · exit {c.exit_code}</p>) : <p>Pending / unavailable — no current check results.</p>}
+      </div>
+      <div>
+        <p className="muted">Artifacts are historical evidence; compare session and date with the current attempt. Missing logs or reports are unavailable, not passed.</p>
+        {artifacts.isLoading && <p>Loading artifacts…</p>}
+        {artifacts.error && <p role="alert">Could not load artifacts: {(artifacts.error as Error).message}</p>}
+        {artifactError && <p role="alert">{artifactError}</p>}
+        {!artifacts.isLoading && !artifacts.data?.length && <p>No artifacts available yet.</p>}
+      </div>
       {(diffs.length > 0 || reports.length > 0) && (
         <div>
           <div className="muted" style={{ fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>Evidence</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {diffs.slice(-1).map((a) => (
+            {diffs.map((a) => (
               <button key={a.id} className={`chip ${view?.id === a.id ? "on" : ""}`} onClick={() => open(a)}>
-                Diff <span className="n">+{a.data.additions} −{a.data.deletions}</span>
+                {a.name} <span className="n">+{a.data.additions} −{a.data.deletions}</span>
               </button>
             ))}
-            {reports.slice(-12).map((a) => (
+            {reports.map((a) => (
               <button key={a.id} className={`chip ${view?.id === a.id ? "on" : ""}`} onClick={() => open(a)} title={a.name}>
-                {a.data.ok === false ? "✗ " : a.data.ok ? "✓ " : ""}{a.kind === "report" ? "QA report" : a.name.slice(0, 28)}
+                {a.data.ok === false ? "✗ " : a.data.ok ? "✓ " : ""}{a.name}
               </button>
             ))}
           </div>
-          {view && (
-            <div style={{ marginTop: 10 }}>
-              {view.kind === "diff" ? <DiffView text={view.content || ""} /> : <pre className="log">{view.content || "(empty)"}</pre>}
-            </div>
-          )}
         </div>
       )}
+      {view && <p className="muted">Artifact: {view.name} · session {view.run_id || "unavailable"} · {view.created_at}</p>}
+      {candidate.verdict && <details><summary>Current verifier report</summary><pre className="log">{JSON.stringify(candidate.verdict, null, 2)}</pre></details>}
       <TakeOver task={task} />
     </div>
   );

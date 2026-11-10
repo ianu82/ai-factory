@@ -208,6 +208,8 @@ export interface Outcome {
 
 export interface Attempt {
   n: number;
+  epoch?: number;
+  diff_artifact_id?: string;
   result: string;
   checks?: { command: string; ok: boolean; exit_code: number; duration: number }[];
   verdict?: VerifierReport;
@@ -254,9 +256,11 @@ export interface Task {
   blocked_reason: string;
   evidence: {
     attempts?: Attempt[];
-    ci?: { state: string; checks?: { name: string; conclusion: string; url: string }[] };
+    budget_epoch?: number;
+    revalidation?: { phase: string; head?: string; run?: boolean; verifier?: VerifierReport; checks?: Attempt["checks"] };
+    ci?: { state: string; head?: string; checks?: { name: string; conclusion: string; url: string }[] };
     merge?: { sha: string; pr: number; at: string };
-    smoke?: { state: string; checks?: { command: string; ok: boolean }[] };
+    smoke?: { state: string; ref?: string; checks?: { command: string; ok: boolean }[] };
     release?: { state: string; url?: string; note?: string };
   };
   cost_usd: number;
