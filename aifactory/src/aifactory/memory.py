@@ -9,13 +9,14 @@ roles belongs to the caller (the HTTP API uses _ws).
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 
-from sqlalchemy import or_
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.orm import Session
 
-from .db import session_scope
+from .db import session_scope, utcnow
 from .events import record
 from .models import MemoryEntry, Outcome, Repository, Run, Task, Workspace
 
@@ -97,6 +98,100 @@ class MemoryService:
             db.flush()
             self._journal(db, run, entry, "saved", "factory")
             return entry
+
+    def _lock(self, db: Session) -> None:
+        # Same portable workspace row lock as outcome numbering. On SQLite an
+        # UPDATE also acquires the writer lock, unlike SELECT FOR UPDATE.
+        db.execute(update(Workspace).where(Workspace.id == self.workspace_id).values(
+            outcome_seq=Workspace.outcome_seq))
+
+    def _exact(self, db: Session, kinds: tuple[str, ...] | None = None):
+        query = db.query(MemoryEntry).filter(
+            MemoryEntry.workspace_id == self.workspace_id, MemoryEntry.repo_id == self.repo_id)
+        return query.filter(MemoryEntry.kind.in_(kinds)) if kinds is not None else query
+
+    def context_entries(self, *, kinds: tuple[str, ...], limit: int = 200,
+                        topic: str | None = None, scratchpad: bool | None = None,
+                        exclude_scratchpad_when: bool = False) -> list[MemoryEntry]:
+        """Fresh, category-bounded SDK reads, collapsing historical duplicate Engrams."""
+        if not 1 <= limit <= 200:
+            raise ValueError("Memory pagination out of range")
+        with session_scope() as db:
+            self._scope(db)
+            # Deduplicate before the cap, using one bounded query rather than
+            # loading legacy duplicates into Python or issuing one query per row.
+            query = self._exact(db, kinds)
+            if topic is not None:
+                query = query.filter(MemoryEntry.topic == topic)
+            is_scratchpad = or_(func.lower(MemoryEntry.text).contains("scratchpad"),
+                                func.lower(MemoryEntry.topic).contains("scratchpad"))
+            if scratchpad is not None:
+                query = query.filter(is_scratchpad if scratchpad else ~is_scratchpad)
+            if exclude_scratchpad_when:
+                query = query.filter(~and_(MemoryEntry.kind == "when", is_scratchpad))
+            ranked = query.with_entities(
+                MemoryEntry.id.label("entry_id"),
+                func.row_number().over(partition_by=MemoryEntry.text, order_by=(
+                    MemoryEntry.updated_at.desc(), MemoryEntry.id.desc())).label("rank")
+            ).subquery()
+            return (db.query(MemoryEntry).join(ranked, MemoryEntry.id == ranked.c.entry_id)
+                    .filter(ranked.c.rank == 1)
+                    .order_by(MemoryEntry.updated_at.desc(), MemoryEntry.id.desc())
+                    .limit(limit).all())
+
+    def encode(self, *, text: str, kind: str, topic: str = "", source: str = "llm",
+               confidence: float | None = None) -> MemoryEntry:
+        """Idempotent encoding in an exact scope, serialized across processes."""
+        if (not isinstance(text, str) or not text.strip() or len(text) > 16_000
+                or kind not in ("always", "never", "when", "lesson", "profile")
+                or not isinstance(topic, str) or len(topic) > 200
+                or not isinstance(source, str) or len(source) > 2_000):
+            raise ValueError("Invalid memory entry")
+        if confidence is not None and (not math.isfinite(confidence) or not 0 <= confidence <= 1):
+            raise ValueError("Memory confidence must be between 0 and 1")
+        with session_scope() as db:
+            self._lock(db)  # lock BEFORE any read/dedupe lookup
+            run = self._scope(db)
+            if run is None:
+                raise MemoryScopeError("A source run is required")
+            entries = self._exact(db).filter(MemoryEntry.text == text).order_by(
+                MemoryEntry.updated_at.desc(), MemoryEntry.id.desc()).all()
+            entry = entries[0] if entries else MemoryEntry(
+                workspace_id=self.workspace_id, repo_id=self.repo_id, text=text)
+            for duplicate in entries[1:]:
+                self._delete(db, duplicate, "anton")
+            entry.run_id, entry.kind, entry.topic = run.id, kind, topic
+            entry.source, entry.confidence, entry.updated_at = source, confidence, utcnow()
+            db.add(entry)
+            db.flush()
+            self._journal(db, run, entry, "saved", "anton")
+            return entry
+
+    def mutate_engram(self, engram_id: str | None = None, *, kinds: tuple[str, ...] | None = None,
+                      text: str | None = None) -> None:
+        """Delete every represented row (or update once), with no read cap."""
+        if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > 16_000):
+            raise ValueError("Invalid memory text")
+        with session_scope() as db:
+            self._lock(db)
+            run = self._scope(db)
+            if run is None:
+                raise MemoryScopeError("A source run is required")
+            query = self._exact(db, kinds).order_by(MemoryEntry.updated_at.desc(), MemoryEntry.id.desc())
+            matched = [e for e in query if engram_id is None or
+                       hashlib.sha256(e.text.encode()).hexdigest() == engram_id]
+            if not matched:
+                return
+            if text is not None:
+                # Also merge a pre-existing target-text row: one Engram, one row.
+                target_ids = {e.id for e in matched}
+                matched.extend(e for e in self._exact(db).filter(MemoryEntry.text == text)
+                               if e.id not in target_ids)
+                kept, matched = matched[0], matched[1:]
+                kept.text, kept.run_id, kept.updated_at = text, run.id, utcnow()
+                self._journal(db, run, kept, "updated", "anton")
+            for entry in matched:
+                self._delete(db, entry, "anton")
 
     def delete(self, entry_id: str, *, actor: str = "factory") -> bool:
         with session_scope() as db:

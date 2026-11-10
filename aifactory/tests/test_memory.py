@@ -241,3 +241,125 @@ def test_repository_memory_cleanup_is_transactional():
         assert s.query(Event).filter(Event.kind == "memory_deleted").count() == 0
         with pytest.raises(MemoryScopeError):
             MemoryService(ws).delete_repository_entries(session=s)
+
+
+def test_atomic_concurrent_encoding_and_legacy_duplicate():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from sqlalchemy import event
+
+    from aifactory.models import MemoryEntry
+
+    ws, repos, runs, _, _ = seed()
+    service = MemoryService(ws, repos[0], runs[1])
+    barrier = Barrier(2)
+    locks = []
+
+    def observe(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE workspaces SET outcome_seq="):
+            locks.append(statement)
+
+    def encode():
+        barrier.wait()
+        return service.encode(text="concurrent", kind="lesson").id
+
+    event.listen(db.engine(), "before_cursor_execute", observe)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ids = list(pool.map(lambda _: encode(), range(2)))
+    finally:
+        event.remove(db.engine(), "before_cursor_execute", observe)
+    assert len(locks) == 2
+    assert len(set(ids)) == 1
+    assert len(service.list()) == 1
+    legacy = service.create(text="concurrent", kind="lesson")
+    with session_scope() as s:
+        assert s.query(MemoryEntry).count() == 2
+    assert len(service.context_entries(kinds=("lesson",))) == 1
+    assert service.context_entries(kinds=("lesson",))[0].id == legacy.id
+
+
+def test_category_caps_recency_duplicate_mutation_and_clear():
+    import hashlib
+
+    from aifactory.models import MemoryEntry
+
+    ws, repos, runs, _, _ = seed()
+    service = MemoryService(ws, repos[0], runs[1])
+    profile = service.encode(text="Role: reviewer", kind="profile")
+    rule = service.encode(text="check boundaries", kind="always")
+    oldest = service.encode(text="oldest", kind="lesson")
+    # Bulk fixtures intentionally bypass encode to cover legacy rows as well.
+    with session_scope() as s:
+        s.add_all(MemoryEntry(workspace_id=ws, repo_id=repos[0], run_id=runs[1],
+                              kind="lesson", text=f"lesson {i}") for i in range(205))
+    assert len(service.context_entries(kinds=("lesson",))) == 200
+    assert service.context_entries(kinds=("profile",))[0].id == profile.id
+    assert service.context_entries(kinds=("always", "never", "when"))[0].id == rule.id
+    service.mutate_engram(hashlib.sha256(oldest.text.encode()).hexdigest(), text="updated oldest")
+    assert service.context_entries(kinds=("lesson",))[0].text == "updated oldest"
+    first = service.encode(text="duplicate", kind="lesson")
+    assert service.encode(text="duplicate", kind="lesson").id == first.id
+    service.create(text="duplicate")
+    service.mutate_engram(hashlib.sha256(b"duplicate").hexdigest(), text="merged")
+    assert [e.text for e in service.list() if e.text in ("duplicate", "merged")] == ["merged"]
+    service.create(text="merged")
+    service.mutate_engram(hashlib.sha256(b"merged").hexdigest())
+    assert not any(e.text == "merged" for e in service.list())
+    shared = MemoryService(ws, run_id=runs[0]).create(text="keep workspace")
+    foreign = MemoryService(ws, repos[1], runs[0]).create(text="keep other repo")
+    service.mutate_engram()
+    assert service.context_entries(kinds=("lesson", "profile", "always")) == []
+    assert {e.id for e in MemoryService(ws).list()} == {shared.id, foreign.id}
+
+
+def test_encoding_validates_exact_scope_and_attributes_new_run():
+    ws, repos, runs, outcome, _ = seed()
+    other_ws, other_repos, other_runs, _, _ = seed()
+    initial = MemoryService(ws, repos[0], runs[1]).encode(text="same", kind="lesson")
+    with session_scope() as s:
+        later = Run(workspace_id=ws, outcome_id=outcome, role="planner", harness="native")
+        s.add(later)
+        s.flush()
+        later_id = later.id
+    updated = MemoryService(ws, repos[0], later_id).encode(text="same", kind="lesson")
+    assert updated.id == initial.id
+    assert updated.run_id == later_id
+    assert MemoryService(ws, run_id=later_id).list()[0].id == initial.id
+    for service in (MemoryService(other_ws, repos[0], other_runs[0]),
+                    MemoryService(ws, other_repos[0], runs[0]),
+                    MemoryService(ws, repos[1], runs[1]), MemoryService(ws, repos[0])):
+        with pytest.raises(MemoryScopeError):
+            service.encode(text="forged", kind="lesson")
+        with pytest.raises(MemoryScopeError):
+            service.mutate_engram()
+    # Exact context scopes do not include workspace or other repository entries.
+    MemoryService(ws, run_id=runs[0]).encode(text="workspace", kind="lesson")
+    MemoryService(ws, repos[1], runs[0]).encode(text="other repo", kind="lesson")
+    assert [e.text for e in MemoryService(ws, repos[0]).context_entries(kinds=("lesson",))] == ["same"]
+    assert [e.text for e in MemoryService(ws).context_entries(kinds=("lesson",))] == ["workspace"]
+    assert MemoryService(other_ws).context_entries(kinds=("lesson",)) == []
+
+
+def test_context_filters_apply_before_cap():
+    from aifactory.models import MemoryEntry
+
+    ws, repos, runs, _, _ = seed()
+    service = MemoryService(ws, repos[0], runs[1])
+    ordinary = service.encode(text="ordinary lesson", kind="lesson", topic="older-topic")
+    scratch = service.encode(text="older wisdom", kind="lesson", topic="Scratchpad")
+    rule = service.encode(text="ordinary rule", kind="when")
+    with session_scope() as s:
+        s.add_all(MemoryEntry(workspace_id=ws, repo_id=repos[0], run_id=runs[1],
+                              kind=kind, text=f"Scratchpad {kind} {i}", topic="newer-topic")
+                  for kind in ("lesson", "when") for i in range(200))
+    assert service.context_entries(kinds=("lesson",), topic="older-topic")[0].id == ordinary.id
+    assert [e.id for e in service.context_entries(kinds=("lesson",), scratchpad=False)] == [ordinary.id]
+    assert [e.id for e in service.context_entries(kinds=("when",), exclude_scratchpad_when=True)] == [rule.id]
+    # Inverse filtering also precedes the cap: newer ordinary lessons cannot
+    # crowd older scratchpad wisdom out of the specialized read.
+    with session_scope() as s:
+        s.add_all(MemoryEntry(workspace_id=ws, repo_id=repos[0], run_id=runs[1],
+                              kind="lesson", text=f"ordinary {i}") for i in range(200))
+    assert service.context_entries(kinds=("lesson",), scratchpad=True, topic="Scratchpad")[0].id == scratch.id
