@@ -228,7 +228,10 @@ def test_api_rejects_invalid_review_policies(client, signed_in, invalid):
     assert r.status_code == 422, r.text
     # Rejected writes must not change either persisted config.
     assert client.get("/api/me").json()["workspaces"][0]["settings"]["review"] == DEFAULT_REVIEW
-    assert client.get(base + "/repositories").json()[0]["config"] == {}
+    assert client.get(base + "/repositories").json()[0]["config"] == {
+        "steward": {"mode": "propose", "fix_minutes": 60}}
+    with session_scope() as s:
+        assert s.get(Repository, repo_id).config == {}
 
 
 @pytest.mark.parametrize("invalid", INVALID)

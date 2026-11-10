@@ -38,8 +38,18 @@ def workstream(w: Workstream) -> dict[str, Any]:
 
 
 def repository(r: Repository) -> dict[str, Any]:
+    from .steward_policy import steward_policy
+
+    config = r.config if isinstance(r.config, dict) else {}
+    policy_invalid = not isinstance(r.config, (dict, type(None)))
+    try:
+        policy = steward_policy(config)
+    except ValueError:
+        policy = steward_policy()
+        policy_invalid = True
     return {"id": r.id, "full_name": r.full_name, "default_branch": r.default_branch, "description": r.description,
-            "config": r.config or {}, "created_at": ts(r.created_at)}
+            "config": {**config, "steward": policy}, "steward_policy_invalid": policy_invalid,
+            "created_at": ts(r.created_at)}
 
 
 def run(r: Run) -> dict[str, Any]:

@@ -41,6 +41,7 @@ from .repo_detect import detect
 from .sandbox import isolation_available
 from .security import decrypt, encrypt, mask, redact
 from .signals import outcome_from_text, sync_github, upsert_signal
+from .steward_policy import steward_policy, validate_steward
 
 router = APIRouter(prefix="/api")
 SECRET_KINDS = {"mindshub_api_key", "openai_api_key", "github_token", "linear_api_key"}
@@ -541,6 +542,16 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
         if type(patch["require_trusted_issue_author"]) is not bool:
             raise HTTPException(422, "require_trusted_issue_author must be a boolean")
         cfg["require_trusted_issue_author"] = patch["require_trusted_issue_author"]
+    if "steward" in patch:
+        try:
+            update = validate_steward(patch["steward"])
+            try:
+                policy = steward_policy(current)
+            except ValueError:
+                policy = steward_policy()  # Allow an admin to replace an invalid stored policy.
+            cfg["steward"] = {**policy, **update}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
     if "review" in patch:
         try:
             cfg["review"] = {**(current.get("review") or {}), **validate_review(patch["review"])}
