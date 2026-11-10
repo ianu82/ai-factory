@@ -1,6 +1,6 @@
 """Review policy, normalized GitHub findings and the durable review evidence contract.
 
-No database tables are needed: callers persist ``new_review_evidence()`` under
+Delivery feedback callers persist ``new_review_evidence()`` under
 ``task.evidence['review']`` (assign a new evidence dict when updating JSON).
 GitHub collection errors must propagate; an unavailable snapshot is not an empty one.
 """
@@ -15,11 +15,14 @@ DEFAULT_REVIEW = {"address": "unresolved", "reviewers": "all", "ignore": [],
 FACTORY_REPLY_MARKER = "<!-- ai-factory:review-reply -->"
 
 
-def validate_review(raw: Any) -> dict[str, Any]:
-    """Validate a partial policy without coercion or filling inherited fields."""
+def validate_review(raw: Any, *, repository: bool = False) -> dict[str, Any]:
+    """Validate a partial policy without coercion; intake opt-ins are repository-only."""
     if not isinstance(raw, dict):
         raise ValueError("review must be an object")
-    if raw.keys() - DEFAULT_REVIEW.keys():
+    for key in ("mode", "allow_untrusted_local"):
+        if key in raw and not repository:
+            raise ValueError(f"review.{key} is only allowed in repository config")
+    if raw.keys() - (DEFAULT_REVIEW.keys() | {"mode", "allow_untrusted_local"}):
         raise ValueError("Unknown review policy field")
     for key, choices in (("address", ("unresolved", "changes_requested", "off")),
                          ("reviewers", ("people", "bots", "all"))):
@@ -32,6 +35,10 @@ def validate_review(raw: Any) -> dict[str, Any]:
     for key in ("wait_seconds", "max_rounds"):
         if key in raw and (type(raw[key]) is not int or raw[key] < 0):
             raise ValueError(f"review.{key} must be a nonnegative integer")
+    if "mode" in raw and raw["mode"] not in ("off", "all", "labelled"):
+        raise ValueError("review.mode must be one of off, all, labelled")
+    if "allow_untrusted_local" in raw and type(raw["allow_untrusted_local"]) is not bool:
+        raise ValueError("review.allow_untrusted_local must be a boolean")
     result = deepcopy(raw)
     if "ignore" in result:
         result["ignore"] = [login.strip() for login in result["ignore"]]
@@ -40,8 +47,10 @@ def validate_review(raw: Any) -> dict[str, Any]:
 
 def review_policy(workspace: dict | None = None, repository: dict | None = None) -> dict[str, Any]:
     """Resolve settings/config objects, overriding individual fields, not sections."""
-    return {**deepcopy(DEFAULT_REVIEW), **validate_review((workspace or {}).get("review", {})),
-            **validate_review((repository or {}).get("review", {}))}
+    policy = {**deepcopy(DEFAULT_REVIEW), **validate_review((workspace or {}).get("review", {})),
+              **validate_review((repository or {}).get("review", {}), repository=True)}
+    # PR intake opt-ins are repository-local, not delivery feedback behavior.
+    return {key: policy[key] for key in DEFAULT_REVIEW}
 
 
 class Finding(TypedDict):
