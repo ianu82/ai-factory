@@ -361,7 +361,7 @@ class Orchestrator:
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""
         with session_scope() as s:
-            outcomes = s.query(Outcome).filter(Outcome.status.in_(["running", "attention"])).all()
+            outcomes = s.query(Outcome).filter(Outcome.source != "review", Outcome.status.in_(["running", "attention"])).all()
             for outcome in outcomes:
                 tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
                 by_key = {t.key: t for t in tasks}
@@ -420,13 +420,13 @@ class Orchestrator:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
-                        for o in s.query(Outcome).filter(Outcome.status == "planning")]
+                        for o in s.query(Outcome).filter(Outcome.source != "review", Outcome.status == "planning")]
             queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Task.status == "queued")]
+                      .filter(Outcome.source != "review", Task.status == "queued")]
             planning_by_ws: dict[str, int] = {}
             for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1

@@ -22,6 +22,8 @@ log = logging.getLogger(__name__)
 async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
     with session_scope() as s:
         outcome = s.get(Outcome, outcome_id)
+        if outcome.source == "review":
+            raise ValueError("Review outcomes cannot be planned")
         repos = s.query(Repository).filter(Repository.id.in_(outcome.repo_ids or [])).all()
         workspace_id = outcome.workspace_id
         version = len(outcome.plans) + 1
@@ -114,6 +116,8 @@ def approve_plan(plan_id: str, approved_by: str | None) -> bool:
     with session_scope() as s:
         plan = s.get(Plan, plan_id)
         outcome = s.get(Outcome, plan.outcome_id)
+        if outcome.source == "review":
+            raise ValueError("Review outcomes cannot be planned")
         workspace_id = outcome.workspace_id
         ws = lock_workspace(s, workspace_id)
         s.refresh(plan)
