@@ -18,6 +18,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .config import get_settings
 from .github import fresh_git_auth_env
@@ -168,19 +169,47 @@ class Patch:
         return self.additions + self.deletions
 
 
+async def changed_paths(full_name: str, token: str | InstallationCredential, base: str, head: str) -> list[str]:
+    """NUL-delimited, rename-free diff: include deleted paths and both sides of a rename."""
+    path = await mirror(full_name, token)
+    names = await git("diff", "--name-only", "--no-renames", "-z", base, head, "--", cwd=path)
+    return sorted(set(names.split("\0")) - {""})
+
+
+def path_overlap(candidate: list[str], main: list[str]) -> dict:
+    """Linear-size set operations, never a Cartesian product (even within one package)."""
+    candidates, intervening = set(candidate), set(main)
+    shared = candidates & intervening
+    candidate_dirs = {name.rpartition("/")[0] for name in candidates}
+    main_dirs = {name.rpartition("/")[0] for name in intervening}
+    directories = candidate_dirs & main_dirs
+    # One representative pair per shared directory, at most 20 pairs in evidence.
+    sample_dirs = sorted(directories)[:20]
+    left, right = {}, {}
+    for paths, representatives in ((sorted(candidates), left), (sorted(intervening), right)):
+        for name in paths:
+            directory = name.rpartition("/")[0]
+            if directory in sample_dirs:
+                representatives.setdefault(directory, name)
+    return {"overlap": bool(shared or directories), "shared_files_count": len(shared),
+            "shared_directories_count": len(directories), "shared_files": sorted(shared)[:20],
+            "matching_pairs": [[left[d], right[d]] for d in sample_dirs]}
+
+
 async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     """Everything the job changed relative to the base commit (committed or not)."""
     out_file = f"{SCRATCH}/candidate.patch"
     # Keep publication rename-free so excluded scratch paths cannot leak as
     # rename sources. Policy size statistics still recognize ordinary renames.
     stats_file = f"{SCRATCH}/candidate.numstat"
+    names_file = f"{SCRATCH}/candidate.paths"
     # File data goes through backend-neutral reads (exec output is clipped).
     paths = "-- . ':(top,exclude).factory' ':(top,exclude).factory/**'"
     script = (
         f"set -e; mkdir -p {SCRATCH}; git add -A >/dev/null; "
         f"git -c core.quotepath=off diff --cached --binary --no-renames --no-color {base_sha} {paths} > {out_file}; "
         f"git diff --cached --numstat -z --find-renames {base_sha} {paths} > {stats_file}; "
-        f"git -c core.quotepath=off diff --cached --numstat --no-renames {base_sha} {paths}"
+        f"git diff --cached --name-only -z --no-renames {base_sha} {paths} > {names_file}"
     )
     result = await sandbox.exec(script, timeout=180)
     if not result.ok:
@@ -188,11 +217,9 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     from .sandbox import read_bytes
 
     diff = await read_bytes(sandbox, out_file)
-    files, adds, dels = [], 0, 0
-    for line in result.output.splitlines():
-        parts = line.split("\t")
-        if len(parts) == 3:
-            files.append(parts[2])
+    files = [name.decode("utf-8", "surrogateescape")
+             for name in (await read_bytes(sandbox, names_file)).split(b"\0") if name]
+    adds, dels = 0, 0
     stats = iter((await read_bytes(sandbox, stats_file)).split(b"\0"))
     for record in stats:
         if not record:
@@ -256,7 +283,8 @@ class BranchMoved(GitError):
 
 
 async def rebase_branch(full_name: str, token: str | InstallationCredential, *, branch: str, onto: str, task_id: str,
-                        base: str = "", head: str = "") -> tuple[bool, str]:
+                        base: str = "", head: str = "", expected_head: str = "",
+                        before_push: Callable[[str], None] | None = None) -> tuple[bool, str]:
     """Rebase a published branch onto the latest base. Returns (clean, new_head_or_conflict_detail).
 
     With ``base`` (the commit the branch was built on) only the branch's own commits are replayed, so commits
@@ -270,11 +298,14 @@ async def rebase_branch(full_name: str, token: str | InstallationCredential, *, 
         await git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=staging, env=await fresh_git_auth_env(token))
         if head:
             current = (await git("rev-parse", f"origin/{branch}", cwd=staging)).strip()
+            if expected_head and current == expected_head:
+                return True, current  # push completed before the caller recorded its result
             if current != head:
                 raise BranchMoved(f"{branch} is at {current[:10]}, not the verified {head[:10]}")
         await git("checkout", "-q", "-B", branch, f"origin/{branch}", cwd=staging)
         try:
-            await git("rebase", "-q", *(["--onto", f"origin/{onto}", base] if base else [f"origin/{onto}"]),
+            target = onto if re.fullmatch(r"[0-9a-f]{40,64}", onto) else f"origin/{onto}"
+            await git("rebase", "-q", *(["--onto", target, base] if base else [target]),
                       cwd=staging, env=AUTHOR)
         except GitError as exc:
             await git("rebase", "--abort", cwd=staging)
@@ -282,6 +313,8 @@ async def rebase_branch(full_name: str, token: str | InstallationCredential, *, 
         await git("remote", "set-url", "origin", remote_url(full_name), cwd=staging)
         lease = f"--force-with-lease=refs/heads/{branch}:{head}" if head else "--force-with-lease"
         new_head = (await git("rev-parse", "HEAD", cwd=staging)).strip()
+        if before_push:
+            before_push(new_head)  # durable intent before the external side effect
         await git("push", lease, "origin", f"HEAD:refs/heads/{branch}", cwd=staging, env=await fresh_git_auth_env(token))
         return True, new_head
     finally:

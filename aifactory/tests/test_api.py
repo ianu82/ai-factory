@@ -597,3 +597,26 @@ def test_generic_settings_cannot_modify_learning_lifecycle(client, signed_in, st
     before = client.get(f"/api/workspaces/{ws_id}/onboarding/policy").json()
     assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"learning": state}}).status_code == 422
     assert client.get(f"/api/workspaces/{ws_id}/onboarding/policy").json() == before
+
+
+def test_partial_merge_settings_preserve_all_keys_and_advertise_capability(client, signed_in):
+    from aifactory.models import Repository
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    merge = {"mode": "approval", "method": "merge", "revalidate": False, "future_key": "preserved"}
+    with session_scope() as db:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app", config={"merge": merge})
+        db.add(repo)
+        db.flush()
+        repo_id = repo.id
+    path = f"/api/workspaces/{ws_id}/repositories/{repo_id}"
+    response = client.patch(path, json={"config": {"merge": {"reverify": "always"}}})
+    assert response.status_code == 200
+    expected = {**merge, "reverify": "always"}
+    assert response.json()["config"]["merge"] == expected
+    # Same payload shape as the Settings form, including retained merge keys.
+    response = client.patch(path, json={"config": {"context": "New notes", "merge": expected}})
+    assert response.status_code == 200 and response.json()["config"]["merge"] == expected
+    response = client.patch(path, json={"config": {"merge": {"reverify": "invalid"}}})
+    assert response.status_code == 422
+    assert client.get("/api/meta").json()["capabilities"]["reverify"] is True
