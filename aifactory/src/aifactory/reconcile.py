@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import logging
 
-from .db import session_scope
+from sqlalchemy import or_
+
+from .db import session_scope, utcnow
 from .events import notify, record
 from .github import GitHub, GitHubError, resolve_credential as resolve_token
 from .models import Decision, Repository, Task
@@ -23,15 +25,22 @@ async def reconcile_pull_requests() -> int:
     """Returns how many tasks changed."""
     with session_scope() as s:
         rows = []
-        for task in s.query(Task).filter(Task.status.in_(WAITING), Task.pr_number.isnot(None), Task.merge_sha == ""):
-            if (task.evidence or {}).get("pr_closed"):
+        for task in s.query(Task).filter(or_(
+                Task.status.in_(WAITING),
+                Task.stage.in_(("revert", "ci", "revert_merge")),
+                Task.status.in_(("cancelled", "handed_over", "abandoned")))):
+            candidate = (task.evidence or {}).get("revert_candidate")
+            is_revert = bool(candidate and not (task.evidence or {}).get("revert"))
+            if not is_revert and (not _still_waiting(task, task.pr_number)
+                                  or not task.pr_number or (task.evidence or {}).get("pr_closed")):
                 continue
             repo = s.get(Repository, task.repo_id)
             if repo:
-                rows.append((task.id, task.workspace_id, repo.full_name, task.pr_number))
+                rows.append((task.id, task.workspace_id, repo.full_name,
+                             candidate["pr"] if is_revert else task.pr_number, is_revert))
     changed = 0
     clients: dict[str, GitHub] = {}
-    for task_id, ws, full_name, number in rows:
+    for task_id, ws, full_name, number, is_revert in rows:
         try:
             gh = clients.get(ws) or clients.setdefault(ws, GitHub(resolve_token(ws)))
             pr = await gh.pull(full_name, number)
@@ -39,8 +48,8 @@ async def reconcile_pull_requests() -> int:
             log.debug("reconcile skipped %s#%s: %s", full_name, number, exc)
             continue
         if pr.get("merged"):
-            changed += _handle_merged(task_id, pr)
-        elif pr.get("state") == "closed":
+            changed += _handle_reverted(task_id, pr) if is_revert else _handle_merged(task_id, pr)
+        elif not is_revert and pr.get("state") == "closed":
             changed += _handle_closed(task_id, pr)
     if changed:
         from .pipeline.orchestrator import orchestrator
@@ -96,4 +105,37 @@ def _handle_closed(task_id: str, pr: dict) -> bool:
                   outcome_id=outcome_id, task_id=task_id,
                   options=[{"value": "retry", "label": "Rebuild and open a new PR"},
                            {"value": "abandon", "label": "Abandon task"}])
+    return True
+
+
+def _handle_reverted(task_id: str, pr: dict) -> bool:
+    """Record an irreversible GitHub result, even if delivery was stopped meanwhile.
+
+    This is bookkeeping, not permission to resume work. Evidence, terminal state,
+    decision settlement and the audit event commit together, once per candidate.
+    """
+    if not pr.get("merged"):
+        return False
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.id == task_id).with_for_update().one_or_none()
+        candidate = (task.evidence or {}).get("revert_candidate") if task else None
+        if (not candidate or candidate["pr"] != pr.get("number")
+                or candidate["head"] != (pr.get("head") or {}).get("sha")
+                or (task.evidence or {}).get("revert")):
+            return False
+        now = utcnow()
+        task.evidence = {**task.evidence, "revert": {
+            "pr": candidate["pr"], "sha": pr.get("merge_commit_sha", ""),
+            "ci": (task.evidence.get("ci") or {}).get("state", "unknown"), "at": now.isoformat()}}
+        task.status, task.stage, task.finished_at = "reverted", "done", now
+        task.lease_owner, task.blocked_reason = "", ""
+        task.summary = f"Reverted after post-merge smoke failed (revert PR #{candidate['pr']})"
+        _supersede(s, task_id, f"Revert PR #{candidate['pr']} was merged on GitHub")
+        record(task.workspace_id, "reverted", f"Reverted via PR #{candidate['pr']}",
+               outcome_id=task.outcome_id, task_id=task_id, level="warn",
+               data={"url": candidate.get("url", "")}, session=s)
+        ws, outcome_id = task.workspace_id, task.outcome_id
+    notify(ws, "task", task_id, outcome_id=outcome_id)
+    notify(ws, "decision", task_id)
+    notify(ws, "outcome", outcome_id)
     return True

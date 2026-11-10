@@ -198,3 +198,9 @@ def test_open_pull_requests_are_paginated_and_truncation_is_said(client, signed_
     monkeypatch.setattr(pulls, "MAX_PAGES", 1)
     body = client.get(f"/api/workspaces/{ws_id}/pulls?refresh=true").json()
     assert len(body["items"]) == 100 and "acme/app" in body["notes"][0]
+
+
+def test_parked_pr_without_checks_is_still_watched():
+    row = {"factory": {"status": "waiting_ci", "stage": "ci"},
+           "ci": {"state": "none", "total": 0}, "detail": {"mergeable_state": "clean"}}
+    assert pulls.classify(row) == ("checks", "The Factory is watching CI")

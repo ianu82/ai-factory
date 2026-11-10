@@ -230,6 +230,30 @@ def test_priority_first_then_resumptions_without_exceeding_caps(queue, monkeypat
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("stage", ["merge", "ci_repair", "ci_refresh", "revert_merge"])
+def test_ready_ci_continuation_precedes_urgent_fresh_work(queue, monkeypatch, stage):
+    set_limit(monkeypatch, "delivery", 1)
+    fresh = queue("delivery", priority=0, age=-100)
+    continuation = queue("delivery", priority=3, stage=stage)
+    with session_scope() as s:
+        s.get(Task, continuation).evidence = {"ci_wait": {"continuation": "delivery"}}
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [continuation]
+            await jobs.tick()
+            assert len(jobs.orch._tasks) == 1
+            await jobs.complete(continuation)
+            await jobs.tick()
+            assert jobs.started == [continuation, fresh]
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
 def test_oldest_and_id_tie_breakers_for_both_queues(queue, monkeypatch):
     async def go(phase):
         set_limit(monkeypatch, phase, 1)

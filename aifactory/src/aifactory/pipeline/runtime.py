@@ -301,10 +301,16 @@ def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcom
             s.add(decision)
             s.flush()
             decision_id = decision.id
+    publish_decision(workspace_id, decision_id, kind, title, outcome_id=outcome_id, task_id=task_id)
+    return decision_id
+
+
+def publish_decision(workspace_id: str, decision_id: str, kind: str, title: str, *,
+                     outcome_id: str | None = None, task_id: str | None = None) -> None:
+    """Announce a decision only after its transaction has committed."""
     record(workspace_id, "decision_requested", title, outcome_id=outcome_id, task_id=task_id, level="warn",
            data={"decision_id": decision_id, "kind": kind})
     notify(workspace_id, "decision", decision_id)
-    return decision_id
 
 
 def set_outcome(outcome_id: str, **fields: Any) -> None:

@@ -131,7 +131,7 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
         return "draft", "Draft"
     if factory.get("status") in HUMAN_TASK:
         return "attention", factory.get("blocked_reason") or "Waiting on a decision in AI Factory"
-    if factory.get("status") in ("queued", "running") and factory.get("stage") not in SHIPPING_STAGES:
+    if factory.get("status") in ("queued", "running", "waiting_ci") and factory.get("stage") not in SHIPPING_STAGES:
         return "checks", "The Factory is revising this"
     if ci.get("state") == "failure":
         names = ", ".join(ci.get("failing") or []) or "a check"
@@ -152,7 +152,7 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
         return "attention", "GitHub is blocking the merge (branch protection or required review)"
     if factory.get("status") == "awaiting_approval":
         return "ready", "Checks passed; merge needs approval in AI Factory"
-    if factory.get("status") in ("running", "queued") and factory.get("stage") in ("ci", "merge", "publish"):
+    if factory.get("status") in ("running", "queued", "waiting_ci") and factory.get("stage") in ("ci", "merge", "publish"):
         return "checks", "The Factory is merging this" if factory.get("stage") == "merge" else "The Factory is watching CI"
     return "ready", "Checks passed" if ci.get("state") == "success" else "No checks reported"
 
