@@ -2178,3 +2178,32 @@ def test_a_restart_before_publication_publishes_the_verified_candidate(factory, 
     assert builds == (1 if recoverable else 2)
     kinds = _event_kinds(outcome_id)
     assert ("publish_resumed" in kinds) is recoverable and ("attempt_resumed" in kinds) is not recoverable
+
+
+@pytest.mark.parametrize("result, failing, ends", [
+    ("checks_preexisting", "verify", False),  # checks also failing on base: the verifier has not recovered
+    ("checks_failed", "verify", False),
+    ("verification_failed", "verify", True),
+    ("verified", "verify", True),
+    ("checks_preexisting", "build", True),  # the builder ran again and reached the checks
+    ("builder_failed", "prepare", True),
+    ("infra", None, False),
+    ("attempt_resumed", "build", False),
+])
+def test_only_completing_the_failed_phase_ends_a_run_of_infrastructure_retries(result, failing, ends):
+    assert delivery.recovered_from_infra(result, failing) is ends
+
+
+def test_base_check_results_are_cached_per_workspace_and_configuration():
+    from types import SimpleNamespace
+
+    def key(ws, cfg):
+        runner = delivery.TaskRunner.__new__(delivery.TaskRunner)
+        runner.ws, runner.cfg = ws, cfg
+        runner.repo, runner.task = SimpleNamespace(full_name="acme/demo"), SimpleNamespace(base_sha="b" * 40)
+        return runner._base_key()
+
+    assert key("ws1", {"setup": ["npm ci"]}) == key("ws1", {"setup": ["npm ci"]})
+    assert key("ws1", {"setup": ["npm ci"]}) != key("ws1", {"setup": ["pip install -e ."]})
+    assert key("ws1", {"setup": ["npm ci"]}) != key("ws2", {"setup": ["npm ci"]})
+    assert key("ws1", {"build": {"isolation": "vm"}}) != key("ws1", {})

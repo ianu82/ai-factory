@@ -63,10 +63,26 @@ _PHASES = {"prepare": "Preparing the sandbox", "build": "The builder session",
 # Attempt records that do not end an attempt: an infrastructure failure (the same attempt is redone) and checks that
 # fail on the base commit too (the attempt goes on to verification).
 NOT_ATTEMPTS = ("infra", "checks_preexisting")
+# How far an attempt got: a record ends a run of infrastructure retries only when it shows that the phase which
+# failed (or a later one) has since completed.
+_PHASE_ORDER = {"prepare": 0, "build": 1, "checks": 2, "verify": 3}
+_COMPLETED_PHASE = {"builder_failed": "build", "builder_blocked": "build", "policy": "checks",
+                    "checks_failed": "checks", "checks_preexisting": "checks", "verification_failed": "verify",
+                    "verified": "verify"}
+
+
+def recovered_from_infra(result: str, failing_phase: str | None) -> bool:
+    """Whether an attempt record ends a run of infrastructure retries: it must show that the phase which failed
+    (or a later one) has since completed. Records from earlier phases, such as checks that also fail on the base
+    while the verifier keeps failing, leave the count alone, so retries stay bounded."""
+    done = _COMPLETED_PHASE.get(result)
+    if result == "infra" or done is None:
+        return False
+    return failing_phase is None or _PHASE_ORDER[done] >= _PHASE_ORDER.get(failing_phase, 0)
 # Stages inside the build/verify loop; a task found in one after a restart was interrupted mid-attempt.
 BUILD_STAGES = ("prepare", "build", "checks", "verify", "publish")
 # Check results on clean checkouts of base commits, by (repository, base commit, command), shared by every task.
-_BASE_CHECKS: dict[tuple[str, str, str], dict[str, Any]] = {}
+_BASE_CHECKS: dict[tuple[str, ...], dict[str, Any]] = {}
 
 
 def infrastructure_problem(error: str) -> str:
@@ -164,8 +180,9 @@ class TaskRunner:
             for key, value in values.items():
                 if key == "attempts":  # tagged with the budget it belongs to (attempt numbers restart per budget)
                     ev.setdefault("attempts", []).append({**value, "epoch": int(ev.get("budget_epoch", 0))})
-                    if value.get("result") != "infra":  # an attempt that got anywhere ends a run of infra retries
-                        ev.pop("infra_retries", None)
+                    if recovered_from_infra(str(value.get("result")), ev.get("infra_phase")):
+                        ev.pop("infra_retries", None)  # the phase that failed has since completed
+                        ev.pop("infra_phase", None)
                     continue
                 if key in ("ci", "smoke"):
                     value = {**value, "at": utcnow().isoformat()}
@@ -652,7 +669,7 @@ class TaskRunner:
         retries = int((self.task.evidence or {}).get("infra_retries", 0))
         if cause == "provider" or retries >= INFRA_RETRIES:
             # Cleared with the decision: a person's retry runs at once and starts a new series of automatic retries.
-            self._set_evidence({"attempts": record, "infra_retries": 0, "infra_retry_at": None})
+            self._set_evidence({"attempts": record, "infra_retries": 0, "infra_retry_at": None, "infra_phase": None})
             self.update(attempt=attempt - 1)
             if cause == "provider":
                 what = "model provider" if phase in ("build", "verify") else "access"
@@ -665,7 +682,7 @@ class TaskRunner:
                        f"retrying keeps the task's attempt budget. Last error:\n\n{error[:1500]}",
                        options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}])
         delay = INFRA_BACKOFF_SECONDS[min(retries, len(INFRA_BACKOFF_SECONDS) - 1)]
-        self._set_evidence({"attempts": record, "infra_retries": retries + 1,
+        self._set_evidence({"attempts": record, "infra_retries": retries + 1, "infra_phase": phase,
                             "infra_retry_at": (utcnow() + timedelta(seconds=delay)).isoformat()})
         self.event("infra_retry", f"Attempt {attempt}: {_PHASES[phase].lower()} hit an infrastructure problem "
                    f"({error[:200]}). Not counted as an attempt; retrying in {delay // 60} min "
@@ -694,11 +711,19 @@ class TaskRunner:
                                         + (f" and {len(new) - 20} more" if len(new) > 20 else "") + ")")
         return all(c.get("preexisting") for c in failed)
 
+    def _base_key(self) -> tuple[str, ...]:
+        """Base-check results depend on how the repository is set up and isolated, which differs between workspaces
+        and can change: workspace and configuration are part of the key, so a foreign or stale base failure is
+        never reused to excuse a candidate."""
+        config = hashlib.sha256(json.dumps({k: self.cfg.get(k) for k in ("setup", "checks", "build", "qa", "env")},
+                                           sort_keys=True, default=str).encode()).hexdigest()[:16]
+        return (self.ws, self.repo.full_name, self.task.base_sha, config)
+
     async def _base_results(self, token: str, commands: list[str]) -> dict[str, dict[str, Any]] | None:
         """Results of ``commands`` on a clean checkout of the base commit in a fresh sandbox, set up and run the way
         checks normally run. Kept in memory per (repository, base commit, command), so tasks on the same base do not
         run them again. None when setup failed on the base: its results would prove nothing."""
-        key = (self.repo.full_name, self.task.base_sha)
+        key = self._base_key()
         found = {c: _BASE_CHECKS[(*key, c)] for c in commands if (*key, c) in _BASE_CHECKS}
         missing = [c for c in dict.fromkeys(commands) if c not in found]
         if not missing:
