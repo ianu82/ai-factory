@@ -138,6 +138,55 @@ async def checkout(sandbox: LocalSandbox, full_name: str, token: str | Installat
     return base_sha
 
 
+@dataclass(frozen=True)
+class PullCandidate:
+    head_sha: str
+    base_sha: str
+    merge_base_sha: str
+
+
+async def checkout_pull(sandbox: LocalSandbox, full_name: str, token: str | InstallationCredential, *,
+                        number: int, head_sha: str, base_ref: str, adopt: bool = True) -> PullCandidate:
+    """Prepare exactly the captured PR head, using only the base repository's PR ref.
+
+    No repository commands, hooks, filters or setup run in the control plane.
+    Authentication is scoped to fetch; neither the clone nor its config receives it.
+    Fetch, verification, resolution and copying share the mirror lock, so a concurrent
+    review cannot replace the ref between verification and cloning.
+    """
+    if type(number) is not int or number < 1 or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
+        raise GitError("Invalid pull request number or captured SHA")
+    head_sha = head_sha.lower()
+    # Ignore host/system Git configuration (including filters and templates) when
+    # materializing untrusted trees. The freshly cloned config is Factory-owned.
+    clean_env = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    base = base_ref if re.fullmatch(r"[0-9a-fA-F]{40}", base_ref) else f"refs/heads/{base_ref}"
+    if base.startswith("refs/heads/"):
+        await git("check-ref-format", base, env=clean_env)
+    path = await mirror(full_name, token)
+    dest = sandbox.work
+    async with _mirror_lock(path):
+        ref = f"refs/pull/{number}/head"
+        await git("fetch", "--no-tags", remote_url(full_name), f"+{ref}:{ref}", cwd=path,
+                  env={**clean_env, **(await fresh_git_auth_env(token))}, timeout=900)
+        actual = (await git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=path, env=clean_env)).strip()
+        if actual != head_sha:
+            raise BranchMoved("Pull request head moved since it was captured")
+        base_sha = (await git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}",
+                              cwd=path, env=clean_env)).strip()
+        merge_base = (await git("merge-base", base_sha, head_sha, cwd=path, env=clean_env)).strip()
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await git("-c", "init.templateDir=", "clone", "--no-checkout", "--no-hardlinks", "--quiet",
+                  str(path), str(dest), env=clean_env, timeout=900)
+    await git("checkout", "--detach", head_sha, cwd=dest, env=clean_env)
+    await git("remote", "set-url", "origin", remote_url(full_name), cwd=dest, env=clean_env)
+    if adopt:
+        sandbox.adopt_work()
+    return PullCandidate(head_sha, base_sha, merge_base)
+
+
 async def apply_in_sandbox(sandbox: LocalSandbox, patch: "Patch") -> None:
     """Apply a candidate patch inside a sandbox checkout (as the sandbox identity)."""
     if patch.empty:

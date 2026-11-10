@@ -651,8 +651,9 @@ def test_issue_author_trust_requires_a_json_boolean(client, signed_in, value):
     ({"permission": "write"}, "write"), ({"permission": "admin"}, "admin"),
     ({"permission": "push"}, "push"), ({"permission": "read"}, "read"),
     ({"permission": "triage"}, "triage"), ({}, None), ([], None),
-    ({"user": {"permissions": {"push": True}}}, "push"),
-    ({"user": {"permissions": {"admin": True}}}, "admin"),
+    # Missing top-level permission is not proof of access, even with nested flags.
+    ({"user": {"permissions": {"push": True}}}, None),
+    ({"user": {"permissions": {"admin": True}}}, None),
     ({"user": {"permissions": {"push": "true"}}}, None),
 ])
 def test_github_author_permission_lookup(monkeypatch, payload, expected):
