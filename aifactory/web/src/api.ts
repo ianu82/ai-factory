@@ -238,6 +238,8 @@ export interface Task {
   title: string;
   spec: string;
   acceptance: string[];
+  constraints?: string[];
+  files?: string[];
   repo: string;
   depends_on: string[];
   harness: string;

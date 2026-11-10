@@ -19,9 +19,18 @@ PLANNER_REPORT: dict[str, Any] = {
                     "repo": {"type": "string", "description": "owner/name of the repository this task changes."},
                     "spec": {"type": "string", "description": "Precise implementation guidance: files, approach, edge cases, tests to add."},
                     "acceptance": {"type": "array", "items": {"type": "string"}, "description": "Verifiable acceptance criteria."},
+                    "constraints": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Security and robustness rules this change must keep, each concrete and checkable "
+                                       "by a test or probe: untrusted input, secrets, isolation (fail closed), bounds, "
+                                       "concurrency and restarts, failure behaviour, and prior decisions that settle the "
+                                       "design.",
+                    },
+                    "files": {"type": "array", "items": {"type": "string"},
+                              "description": "Paths (or globs) of the files this task will change."},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["key", "title", "repo", "spec", "acceptance", "depends_on"],
+                "required": ["key", "title", "repo", "spec", "acceptance", "constraints", "files", "depends_on"],
             },
         },
         "questions": {
@@ -34,7 +43,8 @@ PLANNER_REPORT: dict[str, Any] = {
                 "required": ["question", "why"],
             },
         },
-        "risks": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"},
+                  "description": "Assumptions you made and the residual risks of this plan."},
     },
     "required": ["summary", "tasks", "questions"],
 }
@@ -123,6 +133,12 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
             for field in ("key", "title", "repo", "spec", "acceptance"):
                 if not task.get(field):
                     return None, f"tasks[{i}] is missing {field}."
+            for field in ("constraints", "files"):
+                values = task.get(field)
+                if not isinstance(values, list) or not values or not all(isinstance(v, str) and v.strip() for v in values):
+                    return None, (f"tasks[{i}] needs {field}: a non-empty list of strings. "
+                                  + ("Write the concrete security and robustness rules this change must keep."
+                                     if field == "constraints" else "List the files this task will change."))
             task.setdefault("depends_on", [])
             if task["key"] in keys:
                 return None, f"Duplicate task key {task['key']}."
@@ -133,6 +149,8 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
                 return None, f"Task {task['key']} depends on unknown tasks {unknown}."
         if _has_cycle(tasks):
             return None, "Task dependencies contain a cycle."
+        report.setdefault("risks", [])
+        _sequence_shared_files(tasks)
     if role == "verifier":
         if report.get("verdict") not in ("pass", "fail"):
             return None, "verdict must be pass or fail."
@@ -164,3 +182,34 @@ def _has_cycle(tasks: list[dict[str, Any]]) -> bool:
         return False
 
     return any(visit(k) for k in graph)
+
+
+def _ancestors(tasks: list[dict[str, Any]], key: str) -> set[str]:
+    graph = {t["key"]: list(t.get("depends_on") or []) for t in tasks}
+    seen: set[str] = set()
+    stack = list(graph.get(key, []))
+    while stack:
+        node = stack.pop()
+        if node not in seen:
+            seen.add(node)
+            stack.extend(graph.get(node, []))
+    return seen
+
+
+def _sequence_shared_files(tasks: list[dict[str, Any]]) -> None:
+    """Tasks in one repository that change the same file run one after the other.
+
+    Parallel edits to one file conflict when the first merges, and the rebuild repeats the work. A later task
+    (in plan order) gains a dependency on an earlier one it overlaps, unless one already depends on the other.
+    """
+    for i, later in enumerate(tasks):
+        mine = {f.strip().lstrip("./") for f in later.get("files") or []}
+        for earlier in tasks[:i]:
+            if earlier.get("repo", "").lower() != later.get("repo", "").lower():
+                continue
+            theirs = {f.strip().lstrip("./") for f in earlier.get("files") or []}
+            if not mine & theirs:
+                continue
+            if earlier["key"] in _ancestors(tasks, later["key"]) or later["key"] in _ancestors(tasks, earlier["key"]):
+                continue
+            later["depends_on"] = [*later.get("depends_on", []), earlier["key"]]

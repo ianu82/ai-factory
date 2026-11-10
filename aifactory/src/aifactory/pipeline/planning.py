@@ -41,7 +41,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                            subdir=repo.full_name.replace("/", "__"), adopt=False)
         sandbox.adopt_work()
         decisions = precedents(workspace_id)
-        prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id))
+        prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id, all_tasks=True))
         run, result, error = await run_agent(SessionSpec(
             workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
             prompt=prompt, system=PLANNER, sandbox=sandbox, effective_settings=settings,
@@ -132,6 +132,7 @@ def approve_plan(plan_id: str, approved_by: str | None) -> bool:
             repo = repos.get(item["repo"].lower())
             s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],
                        title=item["title"][:300], spec=item["spec"], acceptance=list(item.get("acceptance") or []),
+                       constraints=list(item.get("constraints") or []), files=list(item.get("files") or []),
                        repo_id=repo.id, depends_on=list(item.get("depends_on") or []), harness=builder,
                        verifier_harness=verifier, status="pending"))
         outcome.status = "running"

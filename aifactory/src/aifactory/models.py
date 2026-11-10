@@ -220,6 +220,9 @@ class Task(Base):
     title: Mapped[str] = mapped_column(String(300))
     spec: Mapped[str] = mapped_column(Text, default="")
     acceptance: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Security and robustness rules from the plan (verified like criteria) and the files the task will change.
+    constraints: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    files: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
     depends_on: Mapped[list[str]] = mapped_column(JSON, default=list)
     harness: Mapped[str] = mapped_column(String(20), default="native")

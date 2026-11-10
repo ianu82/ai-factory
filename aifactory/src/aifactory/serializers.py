@@ -63,7 +63,8 @@ def run(r: Run) -> dict[str, Any]:
 def task(t: Task, runs: list[Run] | None = None, repo_name: str = "") -> dict[str, Any]:
     runs = runs or []
     return {"id": t.id, "outcome_id": t.outcome_id, "key": t.key, "title": t.title, "spec": t.spec,
-            "acceptance": t.acceptance, "repo_id": t.repo_id, "repo": repo_name, "depends_on": t.depends_on,
+            "acceptance": t.acceptance, "constraints": t.constraints or [], "files": t.files or [],
+            "repo_id": t.repo_id, "repo": repo_name, "depends_on": t.depends_on,
             "harness": t.harness, "verifier_harness": t.verifier_harness, "status": t.status, "stage": t.stage,
             "attempt": t.attempt, "branch": t.branch, "base_sha": t.base_sha, "head_sha": t.head_sha,
             "pr_number": t.pr_number, "pr_url": t.pr_url, "merge_sha": t.merge_sha, "summary": t.summary,

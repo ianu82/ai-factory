@@ -25,7 +25,8 @@ def test_redact_removes_credentials():
 
 
 def test_planner_report_rejects_cycles_and_unknown_deps():
-    task = {"key": "T1", "title": "x", "repo": "a/b", "spec": "s", "acceptance": ["a"], "depends_on": ["T2"]}
+    task = {"key": "T1", "title": "x", "repo": "a/b", "spec": "s", "acceptance": ["a"], "constraints": ["c"],
+            "files": ["x.py"], "depends_on": ["T2"]}
     ok, err = validate_report("planner", {"summary": "s", "tasks": [task], "questions": []})
     assert ok is None and "unknown" in err
     t2 = dict(task, key="T2", depends_on=["T1"])
