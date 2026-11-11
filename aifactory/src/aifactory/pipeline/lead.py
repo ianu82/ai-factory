@@ -29,7 +29,7 @@ from ..events import notify, record
 from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider,
                          workspace_models)
 from ..models import Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User, Workspace
-from .runtime import outcome_cost, workspace_settings
+from .runtime import outcome_committed, outcome_cost, workspace_settings
 
 log = logging.getLogger(__name__)
 
@@ -198,12 +198,20 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
         paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
         outcomes = s.query(Outcome).filter(Outcome.status.notin_(FINISHED), Outcome.source != "review").all()
         cache: dict[str, dict[str, Any]] = {}
+        budgets: dict[str, Any] = {}
         for o in outcomes:
             if o.id in running or o.workspace_id in paused:
                 continue
             if o.workspace_id not in cache:
-                cache[o.workspace_id] = settings_for(workspace_settings(o.workspace_id))
+                settings = workspace_settings(o.workspace_id)
+                cache[o.workspace_id] = settings_for(settings)
+                budgets[o.workspace_id] = _limit((settings.get("budgets") or {}).get("outcome_usd"))
             if not cache[o.workspace_id]["enabled"]:
+                continue
+            limit = budgets[o.workspace_id]
+            if limit is not None and outcome_committed(o.id)[0] >= limit:
+                # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
+                # and trying every 15 minutes would only fill the activity with failed runs.
                 continue
             runs = s.query(Run).filter(Run.outcome_id == o.id, Run.role == "lead")
             last = runs.order_by(Run.started_at.desc()).first()
