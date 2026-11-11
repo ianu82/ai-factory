@@ -11,6 +11,9 @@ export const PARTY_FILTERS: { key: string; label: string }[] = [
   { key: "builders", label: "Builders" },
   { key: "verifier", label: "Verifier" },
   { key: "ci", label: "CI" },
+  { key: "judges", label: "Judges" },
+  { key: "supervisor", label: "Supervisor" },
+  { key: "merge_manager", label: "Merge Manager" },
   { key: "factory", label: "Factory" },
 ];
 
