@@ -362,7 +362,11 @@ class TaskRunner:
         if not main:
             return
         recorded = self.task.base_sha or ""
-        published = str(((self.task.evidence or {}).get("published") or {}).get("base") or "")
+        record = (self.task.evidence or {}).get("published") or {}
+        tip = await sb.exec("git rev-parse HEAD", timeout=60)
+        # A publication record describes one pushed head. A stop between a push and its record leaves the record
+        # describing the publication before it, so its base counts only while its head is still the branch's head.
+        published = str(record.get("base") or "") if tip.ok and record.get("head") == tip.output.strip() else ""
         # The base recorded when the branch was last published is the branch's real base, so it is trusted first.
         # The task's recorded base can belong to an attempt that was never published: a restart begins the attempt
         # again from the latest code and records that base, while the branch still sits on another one. Trusting
@@ -816,9 +820,11 @@ class TaskRunner:
                 self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
-        self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
+        # Record the publication before advancing the head, as revalidation does: a stop between the two must not
+        # leave the task at this head with a record of the publication before it.
         self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
                                     "pr": pr["number"]})
+        self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:

@@ -392,6 +392,33 @@ def test_a_revision_starts_from_the_branchs_real_base_when_the_recorded_one_was_
     assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
 
 
+def test_a_publication_record_for_an_earlier_head_is_not_trusted_for_the_base(factory):
+    """A stop between a push and its record leaves the record describing the publication before it: another head,
+    on an older base the branch still contains. Trusting that base would count main's commits since then as the
+    task's own change, so the record's base counts only while its head is the branch's head."""
+    _land_on_main(factory, "earlier.txt", "on main before the task started\n")
+    bare = factory["remotes"] / "acme/demo.git"
+
+    def move():
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            record = task.evidence["published"]
+            assert record["base"] == task.base_sha
+            older = git("rev-parse", f"{record['base']}~1", cwd=bare)
+            task.evidence = {**task.evidence, "published": {**record, "head": "0" * 40, "base": older}}
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    kinds = _event_kinds(outcome_id)
+    assert "branch_base_corrected" not in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=bare).split()
+    assert {"greet.sh", "other.txt", "earlier.txt"} <= set(tree)
+
+
 def test_a_revision_trusts_the_published_base_over_a_recorded_one_the_branch_also_contains(factory):
     """An unpublished retry can record a rewound main: an older commit that the published branch also contains.
     The base recorded at publishing still marks where the task's own commits begin, so the commit main dropped is
