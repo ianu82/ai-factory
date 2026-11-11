@@ -363,6 +363,28 @@ def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
     assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
 
 
+def test_a_revision_starts_from_the_branchs_real_base_when_the_recorded_one_was_never_published(factory):
+    """A restart begins an attempt again from the latest main and records that base, but the attempt is never
+    published: the branch still sits on its older base. The revision must still be brought up to date, or main's
+    newer commits count as the task's own change."""
+    def move():
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            task.base_sha = main  # what the unpublished fresh attempt recorded
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    kinds = _event_kinds(outcome_id)
+    assert "branch_base_corrected" in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
 def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_overlap(factory):
     told, saw_markers, rejected = [], [], []
 
