@@ -321,8 +321,8 @@ async def status(workspace_id: str, user: User = Depends(current_user), db: Sess
         else:
             result = await readiness(runtime, workspace_id, ledger)
             await ledger.reconcile()
-            if result.get("status") == "ready":
-                result = {**result, "accounting": "pending" if unsettled() else "settled"}
+            # Ready or not: a probe that ran (and was charged) may still be settling.
+            result = {**result, "accounting": "pending" if unsettled() else "settled"}
     except store.AccountingError as exc:
         result = {"status": "unavailable", "model_id": None, "reason": str(exc)}
         if exc.code in ("accounting_pending", "accounting_busy"):

@@ -363,6 +363,18 @@ def test_status_stays_pending_while_another_request_holds_the_accounting_claim(w
     assert client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()["accounting"] == "pending"
 
 
+async def test_status_reports_pending_after_an_unavailable_probe_whose_cost_is_unknown(world):
+    client, runtime, _, ids = world
+    runtime.total = None  # the provider cannot report the probe's cost yet
+    async def probe(workspace_id, ledger):
+        await ledger.before_call()
+        await ledger.after_call(None)
+        return {"status": "unavailable", "model_id": None, "reason": "model_absent"}
+    runtime.readiness = probe
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("unavailable", "pending")
+
+
 def test_charged_failed_readiness_and_zero_budget(world):
     client, runtime, _, ids = world
     async def probe(workspace_id, ledger):

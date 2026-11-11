@@ -496,6 +496,19 @@ test("wire unavailable, accounting and budget codes map to explicit blocked stat
   }
 });
 
+test("a successful status check clears only the error a failed one left", async () => {
+  const { controller: c, transport } = harness();
+  let fail = true;
+  transport.status = async () => { if (fail) throw new Error("offline"); return { model: "m", available: true, budget_state: "ok" }; };
+  await c.checkStatus("billing");
+  assert.match(c.state.error, /offline/);
+  assert.equal(c.state.status?.available, false);
+  fail = false;
+  await c.checkStatus("billing");
+  assert.equal(c.state.error, "");
+  assert.equal(c.state.status?.available, true);
+});
+
 test("a new conversation opens only when its first message can be sent", async () => {
   const { controller: c, transport } = harness();
   transport.create = async () => ({ ...history(), messages: [], status: { model: null, available: false, reason: "Add a key", budget_state: "ok" } });
