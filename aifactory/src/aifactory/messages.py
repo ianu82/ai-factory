@@ -93,7 +93,7 @@ def _const(value: dict[str, Any]) -> Callable[[Event, Context], dict[str, Any]]:
 
 
 Ends = tuple[dict[str, Any], dict[str, Any], str]
-Rule = Callable[[Event, Context], Ends]
+Rule = Callable[[Event, Context], Ends | None]  # None: this event is activity after all
 
 
 def fixed(sender: Callable[[Event, Context], dict[str, Any]], receiver: Callable[[Event, Context], dict[str, Any]],
@@ -113,21 +113,21 @@ def _plan_proposed(event: Event, ctx: Context) -> Ends:
     return PLANNER, PLAN_REVIEWER, "request"
 
 
-def _plan_approved(event: Event, ctx: Context) -> Ends:
-    # A reviewer's approval is recorded by policy, with the reviewer named only in the message; a person's (or their
-    # Mind's) approval answers the Factory, which asked for it.
-    if "plan reviewer" in (event.message or ""):
-        return PLAN_REVIEWER, PLANNER, "answer"
-    return _who(event, ctx), FACTORY, "answer"
+def _plan_reviewed(event: Event, ctx: Context) -> Ends | None:
+    # A review that never ran (over budget, could not start, no result) is recorded with verdict "error": no reviewer
+    # answered.
+    if (event.data or {}).get("verdict") == "error":
+        return None
+    return PLAN_REVIEWER, PLANNER, "answer"
 
 
-# Recorded events that are messages between parties. Everything else in the journal stays activity. An operator's
-# relayed decision is its decision_resolved event (recorded as the operator's system user); the operator_decision
-# event recorded beside it is the relay's receipt, so it stays activity rather than a second answer.
+# Recorded events that are messages between parties. Everything else in the journal stays activity, including the
+# transitions recorded beside an answer: plan_approved follows the reviewer's plan_reviewed, a person's
+# decision_resolved, or a plan handed over through a Mind; operator_decision is the receipt for a relayed
+# decision_resolved (recorded as the operator's system user).
 RULES: dict[str, Rule] = {
     "plan_proposed": _plan_proposed,
-    "plan_reviewed": fixed(_const(PLAN_REVIEWER), _const(PLANNER), "answer"),
-    "plan_approved": _plan_approved,
+    "plan_reviewed": _plan_reviewed,
     "decision_requested": fixed(_task_party("factory", "Factory"), _const(PEOPLE), "request"),
     "decision_resolved": fixed(_who, _const(FACTORY), "answer"),
     "decision_overruled": fixed(_who, _const(FACTORY), "answer"),
@@ -167,7 +167,10 @@ def project(event: Event, ctx: Context) -> dict[str, Any] | None:
             return None
         sender, receiver, intent = declared
     elif event.kind in RULES:
-        sender, receiver, intent = RULES[event.kind](event, ctx)
+        ends = RULES[event.kind](event, ctx)
+        if ends is None:
+            return None
+        sender, receiver, intent = ends
     else:
         return None
     task = ctx.tasks.get(event.task_id or "")

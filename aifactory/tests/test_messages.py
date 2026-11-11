@@ -68,10 +68,25 @@ def test_a_plan_worked_out_with_a_mind_is_handed_to_the_factory(client, signed_i
            data={"plan_id": "p", "source": "mind", "action_id": "a1"})
     record(ws, "plan_approved", "Plan approved by Ian via Mind", outcome_id=outcome, actor=user,
            data={"plan_id": "p", "source": "mind", "action_id": "a1"})
-    record(ws, "plan_approved", "Plan approved by the plan reviewer (opus-5-5)", outcome_id=outcome, actor="policy")
     said = [(m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
-    assert said == [("Plan reviewer", "Planner", "answer"), ("Ian's Mind", "Factory", "answer"),
-                    ("Ian's Mind", "Factory", "handoff")]
+    assert said == [("Ian's Mind", "Factory", "handoff")]  # the approval is part of the hand-off
+
+
+def test_each_plan_review_or_approval_is_one_answer(client, signed_in):
+    ws, user, outcome, _ = world(signed_in)
+    # A review that never ran is not an answer from the reviewer.
+    record(ws, "plan_reviewed", "Plan v1 not reviewed by the plan reviewer: over budget", outcome_id=outcome,
+           data={"verdict": "error"})
+    # An automated approval: the review, then the transition it causes.
+    record(ws, "plan_reviewed", "Plan v2 approved by the plan reviewer: covers the outcome", outcome_id=outcome,
+           data={"verdict": "approve"})
+    record(ws, "plan_approved", "Plan approved by the plan reviewer (opus-5-5)", outcome_id=outcome, actor="policy")
+    # A person's approval: the transition, then their decision.
+    record(ws, "plan_approved", "Plan approved by ian", outcome_id=outcome, actor=user, data={"plan_id": "p"})
+    record(ws, "decision_resolved", "ian: approve — Approve plan v3", outcome_id=outcome, actor=user,
+           data={"decision_id": "d1", "resolution": "approve"})
+    said = [(m["kind"], m["from"]["role"], m["to"]["role"]) for m in messages(client, ws)["items"]]
+    assert said == [("decision_resolved", "person", "factory"), ("plan_reviewed", "plan_reviewer", "planner")]
 
 
 def test_an_operator_decision_is_one_answer_from_the_operator(client, signed_in):
