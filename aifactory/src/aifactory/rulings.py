@@ -97,6 +97,11 @@ def create_ruling(workspace_id: str, body: RulingIn, user: User = Depends(curren
         text = text or message.body
         outcome_id, task_id = outcome_id or message.outcome_id, task_id or message.task_id
         source = {"message_id": message.id}
+        existing = next((d for d in active(db, workspace_id)
+                         if d.kind == KIND and (d.attribution or {}).get("message_id") == message.id), None)
+        if existing is not None:  # promoting the same guidance again returns the rule it already became
+            names = {existing.resolved_by: ""} if existing.resolved_by else {}
+            return view(existing, names)
     if outcome_id:
         o = db.get(Outcome, outcome_id)
         if o is None or o.workspace_id != workspace_id:

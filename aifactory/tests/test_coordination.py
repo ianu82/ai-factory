@@ -197,3 +197,16 @@ def test_a_missing_side_of_an_overlap_is_recorded_on_the_next_sweep(world):
         s.query(Event).filter(Event.outcome_id == other_outcome, Event.kind == "work_overlap").delete()
     assert coordination.sync(world["ws"]) == 1
     assert len(overlap_events(other_outcome)) == 1 and len(overlap_events(world["outcome"])) == 1
+
+
+def test_promoting_the_same_guidance_twice_makes_one_rule(world, client):
+    with db.session_scope() as s:
+        m = Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
+                    author_kind="user", body="Keep PRs under 400 lines.")
+        s.add(m)
+        s.flush()
+        mid = m.id
+    first = client.post(f"/api/workspaces/{world['ws']}/rulings", json={"message_id": mid}).json()["id"]
+    second = client.post(f"/api/workspaces/{world['ws']}/rulings", json={"message_id": mid}).json()["id"]
+    assert first == second
+    assert len(client.get(f"/api/workspaces/{world['ws']}/rulings").json()["rulings"]) == 1
