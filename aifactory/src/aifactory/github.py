@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,9 +26,11 @@ API = "https://api.github.com"
 # Keep this contract in sync with delivery, signals, handover and pulls. Both web
 # token recipes consume this list through the credentials API.
 REQUIRED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "write",
-                        "statuses": "write", "checks": "read", "actions": "read", "metadata": "read"}
+                        "statuses": "write", "checks": "read", "actions": "read",
+                        "deployments": "read", "metadata": "read"}
 PERMISSION_LABELS = {"contents": "Contents", "pull_requests": "Pull requests", "issues": "Issues",
-                     "statuses": "Commit statuses", "checks": "Checks", "actions": "Actions", "metadata": "Metadata"}
+                     "statuses": "Commit statuses", "checks": "Checks", "actions": "Actions",
+                     "deployments": "Deployments", "metadata": "Metadata"}
 PERMISSION_INSTRUCTION = ("Create a fine-grained token for the correct resource owner and selected repositories with "
                           + "; ".join(f"{PERMISSION_LABELS[name]}: {'Read and write' if level == 'write' else 'Read-only'}"
                                       for name, level in REQUIRED_PERMISSIONS.items())
@@ -47,9 +50,10 @@ def _rate_limited(response: httpx.Response) -> bool:
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None, *, rate_limited: bool = False):
         super().__init__(message)
         self.status = status
+        self.rate_limited = rate_limited
 
 
 def resolve_credential(workspace_id: str) -> str | InstallationCredential:
@@ -137,30 +141,31 @@ class GitHub:
         return self._headers_for(self.token)
 
     async def request(self, method: str, path: str, *, json: Any = None, params: dict | None = None,
-                      ok: tuple[int, ...] = (200, 201, 204), retries: int = 3) -> Any:
+                      ok: tuple[int, ...] = (200, 201, 204), retries: int = 3, timeout: float = 30.0) -> Any:
         url = path if path.startswith("http") else API + path
         last: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.request(method, url, headers=await self._fresh_headers(), json=json, params=params)
                 if response.status_code in ok:
                     if response.status_code == 204 or not response.content:
                         return {}
                     return response.json()
+                rate_limited = _rate_limited(response)
                 if self.installation_bound:
-                    if response.status_code in (401, 403, 404):
+                    if response.status_code in (401, 403, 404) and not rate_limited:
                         self.token.invalidate()
-                    # Never echo provider messages for installation credentials.
+                    # Keep only structured rate-limit evidence, never provider messages.
                     raise GitHubError(f"GitHub App {method} request failed ({response.status_code}). Manage GitHub access.",
-                                      response.status_code)
+                                      response.status_code, rate_limited=rate_limited)
                 message = _message(response)
-                retryable = response.status_code >= 500 or (
-                    response.status_code in (403, 429) and ("rate limit" in message.lower() or "secondary" in message.lower())
-                )
+                retryable = response.status_code >= 500 or rate_limited
                 if not retryable or method not in ("GET", "HEAD") and response.status_code < 500:
-                    raise GitHubError(f"GitHub {method} {path} failed ({response.status_code}): {message}", response.status_code)
-                last = GitHubError(f"GitHub {method} {path} failed ({response.status_code}): {message}", response.status_code)
+                    raise GitHubError(f"GitHub {method} {path} failed ({response.status_code}): {message}", response.status_code,
+                                      rate_limited=rate_limited)
+                last = GitHubError(f"GitHub {method} {path} failed ({response.status_code}): {message}", response.status_code,
+                                   rate_limited=rate_limited)
             except httpx.TransportError as exc:
                 last = GitHubError(f"GitHub unreachable: {type(exc).__name__}")
             if attempt < retries:
@@ -239,7 +244,7 @@ class GitHub:
                 # /issues also accepts Pull requests:read, so never proves Issues.
                 branch = repo_data.get("default_branch")
                 probes = {"checks": f"commits/{branch}/check-runs" if isinstance(branch, str) and branch else None,
-                          "actions": "actions/runs"}
+                          "actions": "actions/runs", "deployments": "deployments"}
                 from urllib.parse import quote
 
                 for entry in permissions:
@@ -255,6 +260,9 @@ class GitHub:
                         return result("github_invalid", "invalid", **metadata)
                     if response.status_code >= 500:
                         return transient("service_error")
+                    if entry["permission"] == "deployments" and response.status_code in (403, 404):
+                        entry.update(state="missing", evidence="not_verified")
+                        return result("github_permissions_missing", "invalid", **metadata)
                     if response.status_code == 200 and private:
                         entry.update(state="present", evidence="private_repository_probe", instruction="")
                 return result("github_permissions_unverified", "valid", **metadata)
@@ -363,6 +371,37 @@ class GitHub:
     async def comment(self, full_name: str, number: int, body: str, *, retries: int = 3) -> None:
         await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body},
                            retries=retries)
+
+    async def _deployment_pages(self, path: str, *, params: dict | None = None,
+                                deadline: float, clock=time.monotonic) -> list[dict[str, Any]]:
+        """Bound pagination and each read by the caller's monotonic budget.
+
+        No retries here: discovery polls again within its overall deadline.
+        Never follow URLs supplied by deployment payloads or Link headers.
+        """
+        rows: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise TimeoutError
+            batch = await asyncio.wait_for(self.request(
+                "GET", path, params={**(params or {}), "per_page": 100, "page": page},
+                retries=0, timeout=min(30.0, remaining)), timeout=remaining)
+            if not isinstance(batch, list) or any(not isinstance(row, dict) for row in batch):
+                raise GitHubError("Malformed GitHub deployment response")
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+        raise GitHubError("GitHub deployment pagination limit exceeded")
+
+    async def deployments(self, full_name: str, sha: str, *, deadline: float, clock=time.monotonic) -> list[dict[str, Any]]:
+        return await self._deployment_pages(f"/repos/{full_name}/deployments", params={"sha": sha},
+                                            deadline=deadline, clock=clock)
+
+    async def deployment_statuses(self, full_name: str, deployment_id: int, *,
+                                  deadline: float, clock=time.monotonic) -> list[dict[str, Any]]:
+        return await self._deployment_pages(f"/repos/{full_name}/deployments/{deployment_id}/statuses",
+                                            deadline=deadline, clock=clock)
 
     async def _review_pages(self, path: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []

@@ -474,6 +474,34 @@ def _approve_and_finish(factory, outcome_id):
         assert finished, (task.status, task.blocked_reason, " ".join(_event_kinds(outcome_id)))
 
 
+def _approve_merge_after_main_moves(factory, move, approval="patch"):
+    """Merge needs approval; while the request waits, ``move()`` moves main; then a person approves the merge.
+    Returns (outcome, the head that was approved)."""
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {"plan": "auto", "merge": "approval", "release": "auto"},
+                       "merge": {"approval": approval}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    move()
+    db = SessionLocal()
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]), "approve")
+    db.close()
+    with session_scope() as s:
+        return outcome_id, s.query(Task).filter(Task.outcome_id == outcome_id).one().head_sha
+
+
+def _merge_candidate(outcome_id):
+    """(status, head, evidence, how many merge approvals were asked for) of the outcome's only task."""
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        asked = s.query(Decision).filter(Decision.task_id == task.id, Decision.kind == "approve_merge").count()
+        return task.status, task.head_sha, dict(task.evidence or {}), asked
+
+
 def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
     outcome_id, main = _request_changes_after_main_moves(
         factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"))
@@ -602,6 +630,102 @@ def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_o
     bare = factory["remotes"] / "acme/demo.git"
     assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
     assert "land greet.sh" in git("log", "--format=%s", "main", cwd=bare)
+
+
+def test_a_merge_approval_covers_the_same_patch_rebased_onto_newer_main(factory):
+    from aifactory.db import utcnow
+
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"))
+    approved = _merge_candidate(outcome_id)[2]["approved"]
+    assert approved["head"] == approved_head and re.fullmatch(r"[0-9a-f]{40,64}", approved["patch_id"])
+    FakeGitHub.check_state = "pending"  # CI on the rebased head has not finished
+
+    def waiting_for_ci_on_the_rebased_head():
+        status, head, evidence, _ = _merge_candidate(outcome_id)
+        ci = evidence.get("ci") or {}
+        return (status == "waiting_ci" and head != approved_head
+                and (ci.get("head"), ci.get("state")) == (head, "pending"))
+
+    assert drive(waiting_for_ci_on_the_rebased_head, timeout=120), " ".join(_event_kinds(outcome_id))
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    # The approval went with the patch to the rebased head, said once; nothing merges before CI passes there.
+    assert FakeGitHub.merged == [] and asked == 1
+    assert evidence["approved"] == {**approved, "head": head}
+    assert (evidence["published"]["head"], evidence["published"]["patch_id"]) == (head, approved["patch_id"])
+    with session_scope() as s:
+        carried = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "approval_carried").one()
+        assert (carried.data["approved_head"], carried.data["head"]) == (approved_head, head)
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        task.evidence = {**task.evidence, "ci_wait": {**task.evidence["ci_wait"], "next_poll_at": utcnow().isoformat()}}
+    FakeGitHub.check_state = "success"
+    assert drive(lambda: outcome_status(outcome_id) == "completed", timeout=120), " ".join(_event_kinds(outcome_id))
+    _, merged_head, evidence, asked = _merge_candidate(outcome_id)
+    assert FakeGitHub.merged == [1] and asked == 1 and merged_head == head
+    assert (evidence["ci"]["head"], evidence["ci"]["state"]) == (head, "success")
+    with session_scope() as s:
+        events = s.query(Event).filter(Event.outcome_id == outcome_id,
+                                       Event.kind.in_(["approval_carried", "ci_status", "merged"])).order_by(Event.id)
+        story = [(e.kind, (e.data or {}).get("state")) for e in events]
+    assert story == [("ci_status", "success"), ("approval_carried", None), ("ci_status", "pending"),
+                     ("ci_status", "success"), ("merged", None)]
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
+def test_with_merge_approval_by_head_a_rebased_candidate_is_approved_again(factory):
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"), approval="head")
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    assert FakeGitHub.merged == [] and asked == 2 and head != approved_head
+    assert "approval_carried" not in _event_kinds(outcome_id)
+    # The patch is the one that was approved: only the setting asks again.
+    assert evidence["approved"]["head"] == approved_head
+    assert evidence["approved"]["patch_id"] and evidence["approved"]["patch_id"] == evidence["published"]["patch_id"]
+    _approve_and_finish(factory, outcome_id)
+    assert FakeGitHub.merged == [1]
+
+
+def test_a_merge_approval_does_not_cover_a_patch_changed_to_resolve_a_conflict(factory):
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "greet.sh", "echo 'Hi'\n"))
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    kinds = _event_kinds(outcome_id)
+    assert FakeGitHub.merged == [] and asked == 2 and head != approved_head
+    assert "rebuild_after_base_moved" in kinds and "approval_carried" not in kinds, " ".join(kinds)
+    # The builder settled the conflict, so what would merge is no longer the patch that was approved.
+    approved, published = evidence["approved"]["patch_id"], evidence["published"]["patch_id"]
+    assert approved and published and approved != published
+    _approve_and_finish(factory, outcome_id)
+    assert git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git") == "echo 'Hello, Factory!'"
+
+
+def test_changes_requested_after_a_merge_approval_end_it_even_for_the_same_patch(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    # Approval by head asks again after the rebase, which gives the person a second request to answer.
+    outcome_id, _ = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"), approval="head")
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    with session_scope() as s:  # from here the same patch would stay approved: only the later answer can end it
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "merge": {"approval": "patch"}}
+    db = SessionLocal()
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]), "reject",
+            comment="Please also keep the script POSIX-only.")
+    db.close()
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    _, _, evidence, asked = _merge_candidate(outcome_id)
+    kinds = _event_kinds(outcome_id)
+    assert FakeGitHub.merged == [] and asked == 3 and "approval_carried" not in kinds, " ".join(kinds)
+    # The revision published the patch that was approved at first; the request for changes is what counts.
+    assert evidence["approved"]["patch_id"] and evidence["approved"]["patch_id"] == evidence["published"]["patch_id"]
+    _approve_and_finish(factory, outcome_id)
+    assert FakeGitHub.merged == [1]
 
 
 def test_a_binary_conflict_is_never_settled_silently_in_mains_favour(factory):
@@ -1213,6 +1337,112 @@ def test_merge_approval_does_not_cover_a_later_candidate(factory):
     with session_scope() as s:
         s.get(Task, task_id).evidence = {"published": {"head": "old", "at": (approved_at - timedelta(minutes=5)).isoformat()}}
     assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge") is True
+
+
+def _task_published_again_after_its_approval(factory, approved, published_patch, kind="approve_merge"):
+    """A task whose ``kind`` decision was approved and whose candidate was published again five minutes later.
+    ``approved`` goes into the record that approval left (None: it left none); ``published_patch`` is the new
+    head's patch id (None: none recorded). Returns (task id, when the approval was given)."""
+    from datetime import timedelta
+
+    from aifactory.db import utcnow
+    from aifactory.models import Plan
+
+    outcome_id, given = new_outcome(factory), utcnow()
+    evidence = {"published": {"head": "new", "at": (given + timedelta(minutes=5)).isoformat()}}
+    if published_patch is not None:
+        evidence["published"]["patch_id"] = published_patch
+    if approved is not None:
+        evidence["approved"] = {"head": "old", "at": given.isoformat(), **approved}
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="queued", stage="merge", evidence=evidence)
+        s.add(task)
+        s.flush()
+        s.add(Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind=kind,
+                       title="Approve", status="resolved", resolution="approve", resolved_at=given))
+        return task.id, given
+
+
+@pytest.mark.parametrize("kind,approved,published_patch,holds", [
+    ("approve_merge", {"patch_id": "a" * 40}, "a" * 40, True),  # the same patch at a later head
+    ("approve_merge", {"patch_id": "a" * 40}, "b" * 40, False),  # the patch changed
+    ("approve_merge", {"patch_id": "a" * 40}, "", False),  # the new head's patch could not be read
+    ("approve_merge", {"patch_id": ""}, "", False),  # neither could be read: nothing says they are the same
+    ("approve_merge", {"patch_id": "a" * 40, "at": "not a time"}, "a" * 40, False),
+    ("approve_merge", {"patch_id": "a" * 40, "at": "2000-01-01T00:00:00"}, "a" * 40, False),  # an older approval's
+    ("approve_merge", None, "a" * 40, False),  # approved before approvals left a record
+    ("approve_merge", None, None, False),  # approved and published before patches were recorded: as before
+    ("approve_release", {"patch_id": "a" * 40}, "a" * 40, False),  # only a merge approval carries over
+])
+def test_a_merge_approval_covers_a_later_head_only_with_the_same_patch(factory, kind, approved, published_patch,
+                                                                       holds):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    task_id, _ = _task_published_again_after_its_approval(factory, approved, published_patch, kind)
+    assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved(kind) is holds
+
+
+@pytest.mark.parametrize("workspace,repository,holds", [
+    ("patch", None, True), (None, None, True), ("head", None, False), ("anything else", None, False),
+    ("head", "patch", True), ("patch", "head", False),  # the repository's own setting wins
+])
+def test_merge_approval_setting_decides_whether_the_same_patch_stays_approved(factory, workspace, repository, holds):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    with session_scope() as s:
+        ws, repo = s.get(Workspace, factory["ws"]), s.get(Repository, factory["repo"])
+        settings = {k: v for k, v in ws.settings.items() if k != "merge"}  # None: saved before the setting existed
+        ws.settings = {**settings, "merge": {"approval": workspace}} if workspace else settings
+        if repository:
+            repo.config = {**repo.config, "merge": {"approval": repository}}
+    task_id, _ = _task_published_again_after_its_approval(factory, {"patch_id": "a" * 40}, "a" * 40)
+    assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge") is holds
+
+
+def test_a_later_request_for_changes_ends_a_carried_merge_approval(factory):
+    from datetime import timedelta
+
+    from aifactory.pipeline.delivery import TaskRunner
+
+    task_id, given = _task_published_again_after_its_approval(factory, {"patch_id": "a" * 40}, "a" * 40)
+    runner = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    assert runner._approved("approve_merge") is True
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        s.add(Decision(workspace_id=task.workspace_id, outcome_id=task.outcome_id, task_id=task_id,
+                       kind="approve_merge", title="Approve", status="resolved", resolution="reject",
+                       resolved_at=given + timedelta(minutes=6)))
+    assert runner._approved("approve_merge") is False  # the latest decision is the one that counts
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_approving_a_merge_records_the_head_and_patch_that_were_approved(factory, recorded):
+    from aifactory.db import SessionLocal, utcnow
+    from aifactory.decisions import resolve
+
+    _, task_id, number = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        head = task.head_sha
+        published = {"head": head, "base": task.base_sha, "at": utcnow().isoformat(), "pr": number,
+                     "patch_id": "a" * 40}
+        if recorded:
+            task.evidence = {"published": published}
+        decision_id = s.query(Decision).filter(Decision.task_id == task_id).one().id
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "approve")
+    db.close()
+    with session_scope() as s:
+        task, decision = s.get(Task, task_id), s.get(Decision, decision_id)
+        assert (task.status, task.stage) == ("queued", "merge")
+        # A candidate published before patches were recorded is approved all the same, with nothing to carry it by.
+        assert task.evidence["approved"] == {"head": head, "patch_id": "a" * 40 if recorded else "",
+                                             "at": decision.resolved_at.isoformat()}
+        assert task.evidence.get("published") == (published if recorded else None)
 
 
 def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
@@ -3836,6 +4066,45 @@ def test_patch_paths_use_nul_delimiters(factory):
             patch = await gitops.extract_patch(sandbox, base)
             assert patch.files == ['tab\tand\nnewline.txt']
             assert patch.additions == 1
+        finally:
+            await sandbox.close()
+    asyncio.run(go())
+
+
+def test_a_patch_id_names_the_change_whatever_base_it_sits_on(factory):
+    from aifactory.sandbox import LocalSandbox
+    seed, bare = factory['remotes'] / 'seed' / 'acme' / 'demo', factory['remotes'] / 'acme/demo.git'
+
+    def branch(name, greeting):
+        git('checkout', '-q', '-B', name, 'main', cwd=seed)
+        (seed / 'greet.sh').write_text(greeting)
+        git('commit', '-qam', name, cwd=seed)
+        git('push', '-q', str(bare), name, cwd=seed)
+        head = git('rev-parse', 'HEAD', cwd=seed)
+        git('checkout', '-q', 'main', cwd=seed)
+        return head
+
+    old_main = git('rev-parse', 'main', cwd=seed)
+    first = branch('first', "echo 'Hello, Factory!'\n")
+    new_main = _land_on_main(factory, 'other.txt', 'landed meanwhile\n')
+    rebased = branch('rebased', "echo 'Hello, Factory!'\n")
+    edited = branch('edited', "echo 'Hello, world!'\n")
+    indented = branch('indented', "  echo 'Hello, Factory!'\n")
+
+    async def go():
+        sandbox = LocalSandbox('patch-ids').create()
+        try:
+            await gitops.checkout(sandbox, 'acme/demo', 'token', 'main', 'ids')
+            change = await gitops.patch_id(sandbox, old_main, first)
+            assert re.fullmatch(r'[0-9a-f]{40,64}', change)
+            # The same change on the newer base, and the first branch measured from a main that moved under it.
+            assert await gitops.patch_id(sandbox, new_main, rebased) == change
+            assert await gitops.patch_id(sandbox, new_main, first) == change
+            assert await gitops.patch_id(sandbox, new_main, edited) not in ('', change)
+            assert await gitops.patch_id(sandbox, new_main, indented) not in ('', change)  # whitespace is a change
+            assert await gitops.patch_id(sandbox, new_main, new_main) == ''  # nothing changed
+            assert await gitops.patch_id(sandbox, old_main, 'f' * 40) == ''  # no such commit
+            assert await gitops.patch_id(sandbox, '', first) == ''
         finally:
             await sandbox.close()
     asyncio.run(go())

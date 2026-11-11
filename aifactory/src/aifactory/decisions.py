@@ -120,6 +120,11 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     elif kind == "approve_merge" and task:
         if resolution == "approve":
             task.status, task.stage = "queued", "merge"
+            published = (task.evidence or {}).get("published") or {}
+            # What was approved: the same patch at a later head keeps this approval (TaskRunner._approved).
+            task.evidence = {**(task.evidence or {}), "approved": {
+                "head": published.get("head") or task.head_sha or "", "patch_id": published.get("patch_id") or "",
+                "at": decision.resolved_at.isoformat()}}
         elif resolution == "reject":
             guidance(comment or "A reviewer requested changes before merging.")
             task.status, task.stage, task.attempt = "queued", "revise", 0

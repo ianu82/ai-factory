@@ -25,7 +25,7 @@ from .models import Workspace
 
 INSTALLATION_SETTING = "github_app_installation_id"
 APP_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "write",
-                   "checks": "read", "actions": "read", "metadata": "read"}
+                   "checks": "read", "actions": "read", "deployments": "read", "metadata": "read"}
 EXPIRY_SKEW = 60
 _cache: dict[tuple[str, str], tuple[str, float]] = {}
 _lock = threading.Lock()

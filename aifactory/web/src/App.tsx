@@ -168,10 +168,11 @@ function Sidebar() {
   const setupTitle = setupSteps.length ? `Left to do: ${setupSteps.map((s) => STEP_LABELS[s] || s).join(", ")}` : "Finish setting up this workspace";
   const inbox = useQuery({
     queryKey: ["inbox", ws.id],
-    queryFn: () => api<{ decisions: unknown[] }>(`/api/workspaces/${ws.id}/inbox`),
+    queryFn: () => api<{ decisions: unknown[]; alerts?: unknown[] }>(`/api/workspaces/${ws.id}/inbox`),
     refetchInterval: 30_000,
   });
   const pulls = usePulls("open");
+  const needsYou = (inbox.data?.decisions.length || 0) + (inbox.data?.alerts?.length || 0);
   const pullsNeedingYou = (pulls.data?.counts.ready || 0) + (pulls.data?.counts.attention || 0);
   const [switching, setSwitching] = useState(false);
   const base = `/w/${ws.id}`;
@@ -210,7 +211,7 @@ function Sidebar() {
       <button className="capture" onClick={openCapture}><Plus size={15} /> New outcome <kbd>C</kbd></button>
       <MindNav workspaceId={ws.id} />
       <NavLink to={`${base}/inbox`} className="nav-item"><InboxIcon /> Inbox
-        {!!inbox.data?.decisions.length && <span className="count" aria-label={`${inbox.data.decisions.length} need you`}>{inbox.data.decisions.length}</span>}
+        {!!needsYou && <span className="count" aria-label={`${needsYou} need you`}>{needsYou}</span>}
       </NavLink>
       <NavLink to={`${base}/outcomes`} className="nav-item"><Target /> Outcomes</NavLink>
       <NavLink to={`${base}/pulls`} className="nav-item"><GitPullRequest /> Pull requests

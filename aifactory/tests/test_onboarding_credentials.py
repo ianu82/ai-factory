@@ -136,7 +136,7 @@ RATE_LIMITS = [(429, {}, ""), (403, {"Retry-After": "60", "X-RateLimit-Remaining
                (403, {}, "API rate limit exceeded"), (403, {}, "abuse detection")]
 
 
-@pytest.mark.parametrize("stage", ["/user", "/repos/acme/app", "/repos/acme/app/commits/main/check-runs", "/repos/acme/app/actions/runs"])
+@pytest.mark.parametrize("stage", ["/user", "/repos/acme/app", "/repos/acme/app/commits/main/check-runs", "/repos/acme/app/actions/runs", "/repos/acme/app/deployments"])
 @pytest.mark.parametrize("status,headers,message", RATE_LIMITS)
 async def test_primary_and_secondary_limits_are_not_permission_evidence(monkeypatch, stage, status, headers, message):
     transport(monkeypatch, lambda r: response(status, {"message": message + TOKEN}, headers) if r.url.path == stage
@@ -390,7 +390,7 @@ def test_permission_contract_and_both_web_recipes(client, signed_in):
     from pathlib import Path
 
     expected = {"contents": "write", "pull_requests": "write", "issues": "write", "statuses": "write",
-                "checks": "read", "actions": "read", "metadata": "read"}
+                "checks": "read", "actions": "read", "deployments": "read", "metadata": "read"}
     assert REQUIRED_PERMISSIONS == expected
     ws = signed_in["workspaces"][0]["id"]
     recipe = client.get(f"/api/workspaces/{ws}/credentials").json()["github_permissions"]

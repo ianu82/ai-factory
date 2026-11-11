@@ -26,6 +26,7 @@ from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
+from ..gitops import patch_id
 from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
 from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, headline, new_review_evidence,
@@ -1222,12 +1223,39 @@ class TaskRunner:
                 self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
+        change_id = await self._patch_id(token, self.task.base_sha, head)
         # Record the publication before advancing the head, as revalidation does: a stop between the two must not
         # leave the task at this head with a record of the publication before it.
         self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
-                                    "pr": pr["number"]})
+                                    "pr": pr["number"], "patch_id": change_id})
+        self._carry_approval()
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
+
+    async def _patch_id(self, token: str, base: str, head: str) -> str:
+        """What the published ``head`` changes (gitops.patch_id), read in a throwaway checkout. "" when it cannot be
+        read: the candidate is published all the same and an earlier merge approval does not carry over to it."""
+        sandbox = LocalSandbox(f"task-{self.task_id[:12]}-p")
+        try:
+            sandbox.create()
+            await checkout(sandbox, self.repo.full_name, token, head, self.task.branch)
+            return await patch_id(sandbox, base, head)
+        except (GitError, GitHubError, SandboxError, OSError) as exc:
+            log.warning("patch id unavailable for %s at %s: %s", self.task_id, head[:10], exc)
+            return ""
+        finally:
+            await sandbox.close()
+
+    def _carry_approval(self) -> None:
+        """After a head is published: when the merge approval given for an earlier head still holds for it (the
+        same patch, see ``_approved``), say so once and remember the head it was carried to."""
+        evidence = self.task.evidence or {}
+        approved, head = evidence.get("approved") or {}, (evidence.get("published") or {}).get("head")
+        if not approved or approved.get("head") == head or not self._approved("approve_merge"):
+            return
+        self.evidence("approved", {**approved, "head": head})
+        self.event("approval_carried", f"The merge approval for {str(approved.get('head'))[:10]} still holds at "
+                   f"{head[:10]}: the change itself is the same", approved_head=approved.get("head"), head=head)
 
     def _pr_body(self) -> str:
         lines = [self.builder_report.get("summary", "").strip() or self.task.title, "", "### Acceptance criteria"]
@@ -1862,16 +1890,29 @@ class TaskRunner:
                 raise GitHubError("GitHub merge timed out after 60 seconds; check the PR before retrying.") from exc
 
     def _approved(self, kind: str) -> bool:
-        """An approval covers only the candidate that was published before it was given."""
-        from datetime import datetime
-
+        """An approval covers the candidate that was published before it was given. A merge approval also covers
+        the same patch published again later, at a new head on a newer base, unless ``merge.approval`` is "head".
+        Read only: the merge consults it again while it holds the workspace lock."""
         with session_scope() as s:
             row = (s.query(Decision).filter(Decision.task_id == self.task_id, Decision.kind == kind,
                                             Decision.status == "resolved").order_by(Decision.resolved_at.desc()).first())
             if not (row and row.resolution == "approve" and row.resolved_at):
                 return False
-            published = (self.task.evidence or {}).get("published", {}).get("at")
-            return not published or row.resolved_at >= datetime.fromisoformat(published)
+            given = row.resolved_at
+        evidence = self.task.evidence or {}
+        published, approved = evidence.get("published") or {}, evidence.get("approved") or {}
+        if not published.get("at") or given >= datetime.fromisoformat(published["at"]):
+            return True
+        if kind != "approve_merge" or not approved.get("patch_id") or approved["patch_id"] != published.get("patch_id"):
+            return False
+        try:
+            # The record is the latest approval's own: a correction that overruled a rejection wrote none.
+            own = datetime.fromisoformat(approved.get("at") or "") >= given
+        except (TypeError, ValueError):
+            return False
+        mode = (self.cfg.get("merge") or {}).get("approval") or (workspace_settings(self.ws).get("merge") or {}).get(
+            "approval")
+        return own and mode == "patch"
 
     async def merge(self) -> None:
         token = resolve_token(self.ws)
@@ -1992,10 +2033,13 @@ class TaskRunner:
                 self.evidence("revalidation", state)
         if state["phase"] not in ("rejected", "handled"):
             if self.task.head_sha != state["head"]:
+                change_id = await self._patch_id(token, state["new_base"], state["head"])
                 # A merge approval belongs to the published candidate, not its branch name.
                 # Persist the new publication before advancing the head, including on resume.
                 self.evidence("published", {"head": state["head"], "base": state["new_base"],
-                                            "at": utcnow().isoformat(), "pr": self.task.pr_number})
+                                            "at": utcnow().isoformat(), "pr": self.task.pr_number,
+                                            "patch_id": change_id})
+                self._carry_approval()
             self.update(head_sha=state["head"], base_sha=state["new_base"])
         if state["phase"] in ("checks", "verify"):
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()

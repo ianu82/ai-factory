@@ -139,6 +139,7 @@ export function useLive(workspaceId: string | undefined): LiveState {
           touch("outcome", "outcomes");
           if (data.entity === "workspace") { touch("learning-policy"); qc.invalidateQueries({ queryKey: ["me"] }); }
           if (data.entity === "decision") touch("inbox", "decisions");
+          if (data.entity === "alert") touch("inbox");
           if (data.entity === "run") touch("runs");
           if (data.entity === "signal") touch("signals");
         }
