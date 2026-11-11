@@ -2085,6 +2085,10 @@ def test_failing_tests_are_compared_with_the_base_commit():
     assert not delivery._same_failure(other(), {**other(), "failures": [network]})  # only the base printed test names
     assert not delivery._same_failure(other(), {"ok": True})
     assert not delivery._same_failure(other(timed_out=True), other(timed_out=False))
+    # Out of time on the base as well: too slow for the limit whatever the change does. What each run had printed
+    # by then differs, so it is not compared; a failing test only the candidate printed still counts.
+    assert delivery._same_failure(other(124, timed_out=True), other(124, signature="def", timed_out=True))
+    assert not delivery._same_failure({**other(124, timed_out=True), "failures": [network]}, other(124, timed_out=True))
     assert not delivery._same_failure(other(), None)
 
 
@@ -2151,6 +2155,8 @@ def test_check_failures_that_also_fail_on_the_base_commit_are_not_charged(factor
         assert task.attempt == 2
         assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
             "sh test.sh": None, "sh env_check.sh": True}
+        assert [[c.get("cause") for c in a["checks"]] for a in records] == [[None, "real"], [None, "preexisting"],
+                                                                            [None, "preexisting"]]
         base_runs = s.query(Event).filter(Event.task_id == task.id, Event.kind == "base_check_result").count()
     assert base_runs == 1  # the second attempt reused the base commit's result
     # The builder learns which failure is its own; the verifier is told which ones predate the change.
@@ -2196,6 +2202,150 @@ def test_a_failure_without_test_names_is_preexisting_only_when_the_base_prints_t
         assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
             "sh test.sh": None, "sh lint.sh": True}
     assert "it fails on the base commit too, but not with the same output" in prompts[1]
+
+
+# Prints which run of it this is in its sandbox. With flaky.txt in the checkout only its first run fails, with
+# broken.txt every run fails, and with slow.txt it does not finish in time.
+COUNTED_CHECK = ('echo run >> "$TMPDIR/runs"\n'
+                 'n=$(grep -c run "$TMPDIR/runs")\n'
+                 'echo "run $n"\n'
+                 'if [ -f flaky.txt ] && [ "$n" = 1 ]; then echo "connection reset by peer"; exit 1; fi\n'
+                 'if [ -f broken.txt ]; then echo "broken.txt must not exist"; exit 3; fi\n'
+                 'if [ -f slow.txt ]; then sleep 30; fi\n')
+
+
+def _counted_check(factory, leave, prompts, briefs):
+    """Add COUNTED_CHECK to the repository's checks. The builder's first attempt leaves the file ``leave`` in the
+    checkout beside its change, and its second removes it."""
+    _land_on_main(factory, "counted.sh", COUNTED_CHECK)
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": ["sh test.sh", "sh counted.sh"]}
+
+    def builder(messages):
+        if step(messages) == 0:
+            prompts.append(messages[1]["content"])
+            if len(prompts) == 1:
+                return {"content": "", "tool_calls": [
+                    call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}),
+                    call("write_file", {"path": leave, "content": "x\n"}, 1)]}
+            return {"content": "", "tool_calls": [call("run", {"command": f"rm -f {leave}"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    def verifier(messages):
+        if step(messages) == 0:
+            briefs.append(messages[1]["content"])
+        return passing_verifier(messages)
+
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+
+
+def _counted(record):
+    return next(c for c in record["checks"] if c["command"] == "sh counted.sh")
+
+
+def _three_second_checks(monkeypatch):
+    """Give a check three seconds, on the candidate and on the base commit, instead of twenty-five minutes."""
+    run_commands = delivery.TaskRunner._run_commands
+
+    async def shortened(self, sandbox, commands, kind, timeout=1500):
+        return await run_commands(self, sandbox, commands, kind, 3 if kind in ("check", "base_check") else timeout)
+
+    monkeypatch.setattr(delivery.TaskRunner, "_run_commands", shortened)
+
+
+def test_a_check_that_passes_when_run_again_is_flaky_and_does_not_use_an_attempt(factory):
+    prompts, briefs = [], []
+    _counted_check(factory, "flaky.txt", prompts, briefs)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "verified")]
+        assert task.attempt == 1
+        check = _counted(records[0])
+        assert check["ok"] and check["cause"] == "flaky"
+        assert check["first_failure"].split("\n")[:2] == ["run 1", "connection reset by peer"]
+        events = [(e.kind, e.level) for e in s.query(Event).filter(Event.task_id == task.id).order_by(Event.id)
+                  if e.data.get("command") == "sh counted.sh"]
+        body = FakeGitHub.pulls[task.pr_number]["body"]
+    # One warning that it took a second run, and one result, a pass: nothing that counts failed checks sees a failure,
+    # and the base commit is not consulted.
+    assert events == [("check_flaky", "warn"), ("check_result", "success")]
+    assert not {"base_checks", "base_check_result", "checks_preexisting"} & set(_event_kinds(outcome_id))
+    assert len(briefs) == 1 and "`sh counted.sh` → passed on a second run" in briefs[0]
+    assert "`sh counted.sh`" in body and "failed on its first run, passed on a second" in body
+
+
+def test_a_check_that_fails_twice_is_real_and_uses_the_attempt(factory):
+    prompts, briefs = [], []
+    _counted_check(factory, "broken.txt", prompts, briefs)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "verified")]
+        assert task.attempt == 2
+        check = _counted(records[0])
+        assert not check["ok"] and check["cause"] == "real"
+        assert check["tail"].split("\n")[:2] == ["run 2", "broken.txt must not exist"]  # the second run's output
+        assert "cause" not in _counted(records[1])
+    assert "check_flaky" not in _event_kinds(outcome_id)
+    assert "Check `sh counted.sh` failed (exit 3) on two runs in a row (it passes on the base commit)" in prompts[1]
+    # The builder is told how long a check may take, and that its own commands may take as long.
+    limit = delivery.COMMAND_TIMEOUT
+    assert f"Each may take up to {limit // 60} minutes ({limit} seconds)" in prompts[0]
+    assert len(briefs) == 1 and "`sh counted.sh` → passed" in briefs[0] and "second run" not in briefs[0]
+
+
+def test_a_check_that_times_out_is_not_run_again_and_reads_as_a_timeout(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "slow.txt", prompts, briefs)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "verified")]
+        check = _counted(records[0])
+        assert (check["cause"], check["timed_out"], check["limit"], check["exit_code"]) == ("timeout", True, 3, 124)
+        assert check["tail"].strip() == "run 1"  # a second run would have printed "run 2"
+        messages = [e.message for e in s.query(Event).filter(Event.task_id == task.id, Event.kind == "check_result",
+                                                             Event.level == "warn")]
+    assert len(messages) == 1 and "sh counted.sh — timed out after" in messages[0]
+    assert "Check `sh counted.sh` timed out after " in prompts[1]
+    assert "s (the limit is 3s) (it passes on the base commit)" in prompts[1]
+    assert "exit 124" not in prompts[1]
+
+
+def test_a_check_that_times_out_on_the_base_commit_too_is_preexisting(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "slow.txt", prompts, briefs)
+    _land_on_main(factory, "slow.txt", "x\n")  # the check was too slow for the limit before the change
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_preexisting"), (1, "verified")]
+        assert task.attempt == 1
+        check = _counted(records[-1])
+        assert (check["cause"], check["timed_out"], check.get("preexisting")) == ("preexisting", True, True)
+        body = FakeGitHub.pulls[task.pr_number]["body"]
+    assert len(prompts) == 1 and len(briefs) == 1
+    assert "`sh counted.sh` → FAILED (timed out after " in briefs[0]
+    assert "; the limit is 3s) (pre-existing, see below)" in briefs[0]
+    assert "- `sh counted.sh`: times out on the base commit too" in briefs[0]
+    assert "(the limit is 3s); it times out on the base commit too, so not caused by this change" in body
 
 
 def _slow_builder(messages):

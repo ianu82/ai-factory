@@ -25,6 +25,9 @@ HEAD_BYTES = 6_000
 TAIL_BYTES = 24_000
 DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 SCRATCH = ".factory"
+# The longest one configured check, or one command an agent runs with its `run` tool, may take. One number for
+# both, so a builder can run what the gate will run and is told the limit that applies.
+COMMAND_TIMEOUT = 1500
 
 
 class SandboxError(RuntimeError):

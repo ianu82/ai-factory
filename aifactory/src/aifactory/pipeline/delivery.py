@@ -28,7 +28,7 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Run, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
-from ..sandbox import LocalSandbox, SandboxError
+from ..sandbox import COMMAND_TIMEOUT, LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
@@ -404,7 +404,7 @@ class TaskRunner:
                                commands=[c["command"] for c in failed])
                     failed = []
             if failed:
-                self.feedback += [f"- Check `{c['command']}` failed (exit {c['exit_code']}){c.get('vs_base', '')}:\n"
+                self.feedback += [f"- Check `{c['command']}` {_how_failed(c)}{c.get('vs_base', '')}:\n"
                                   f"```\n{c['tail']}\n```" for c in failed]
                 self.evidence("attempts", {"n": attempt, "result": "checks_failed", "checks": _brief(self.checks)})
                 continue
@@ -450,7 +450,7 @@ class TaskRunner:
         broken = [c for c in setup if not c["ok"]]
         if broken:
             self.feedback.append("- Note: repository setup failed before you started:\n" + "\n".join(
-                f"`{c['command']}` → exit {c['exit_code']}\n```\n{c['tail'][-1500:]}\n```" for c in broken))
+                f"`{c['command']}` {_how_failed(c)}\n```\n{c['tail'][-1500:]}\n```" for c in broken))
 
     async def _bring_branch_up_to_date(self, branch: str) -> None:
         """Revise on top of today's base branch. GitHub runs no pull-request checks while a branch conflicts, so a
@@ -606,23 +606,47 @@ class TaskRunner:
             yield
 
     async def _run_commands(self, sandbox: LocalSandbox, commands: list[str], kind: str,
-                            timeout: float = 1500) -> list[dict[str, Any]]:
+                            timeout: float = COMMAND_TIMEOUT) -> list[dict[str, Any]]:
+        """Run each command and record how it ended. A failed row says why in ``cause``: "timeout", or "real" until
+        the comparison with the base commit finds it "preexisting". A candidate's check (``kind == "check"``) that
+        fails without timing out runs once more in the same sandbox, inside the caller's check slot: if it passes
+        then, it counts as passed, labelled "flaky", and keeps the first run's output in ``first_failure``. A
+        timeout is not run again: a second wait of the same length teaches nothing."""
         results = []
         for command in commands:
-            started = time.monotonic()
-            result = await sandbox.exec(command, timeout=timeout)
-            row = {"command": command, "ok": result.ok, "exit_code": result.exit_code,
-                   "duration": round(time.monotonic() - started, 1), "timed_out": result.timed_out,
-                   "tail": result.output[-4000:]}
-            if not result.ok:
-                row["failures"] = _failing_tests(result.output)
-                row["signature"] = _output_signature(result.output, sandbox)
+            row, output = await self._run_command(sandbox, command, timeout)
+            if kind == "check" and not row["ok"] and not row["timed_out"]:
+                first, first_output = row, output
+                row, output = await self._run_command(sandbox, command, timeout)
+                if row["ok"]:
+                    row |= {"cause": "flaky", "first_failure": first["tail"]}
+                    self.event("check_flaky", f"`{command}` failed (exit {first['exit_code']}), then passed when run "
+                               "again in the same sandbox: counted as passed", level="warn", command=command,
+                               exit_code=first["exit_code"], duration=first["duration"])
+                    self.artifact(kind, f"first run (failed): {command}"[:300], first_output, ok=False,
+                                  exit_code=first["exit_code"])
+                else:
+                    row["runs"] = 2
             results.append(row)
-            self.event(f"{kind}_result", f"{'✓' if result.ok else '✗'} {command}",
-                       level="success" if result.ok else "warn", command=command, exit_code=result.exit_code,
-                       duration=row["duration"])
-            self.artifact(kind, command, result.output, ok=result.ok, exit_code=result.exit_code)
+            note = (f" — {_how_failed(row)}" if row["timed_out"] else
+                    " — on a second run" if row.get("cause") == "flaky" else "")
+            self.event(f"{kind}_result", f"{'✓' if row['ok'] else '✗'} {command}{note}",
+                       level="success" if row["ok"] else "warn", command=command, exit_code=row["exit_code"],
+                       duration=row["duration"], **({"cause": row["cause"]} if row.get("cause") else {}))
+            self.artifact(kind, command, output, ok=row["ok"], exit_code=row["exit_code"])
         return results
+
+    async def _run_command(self, sandbox: LocalSandbox, command: str, timeout: float) -> tuple[dict[str, Any], str]:
+        started = time.monotonic()
+        result = await sandbox.exec(command, timeout=timeout)
+        row = {"command": command, "ok": result.ok, "exit_code": result.exit_code,
+               "duration": round(time.monotonic() - started, 1), "timed_out": result.timed_out,
+               "tail": result.output[-4000:]}
+        if not result.ok:
+            row["failures"] = _failing_tests(result.output)
+            row["signature"] = _output_signature(result.output, sandbox)
+            row |= {"cause": "timeout", "limit": timeout} if result.timed_out else {"cause": "real"}
+        return row, result.output
 
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
         qa_cfg = self.cfg.get("qa") or {}
@@ -802,8 +826,10 @@ class TaskRunner:
         for check in failed:
             theirs = base.get(check["command"]) or {}
             if _same_failure(check, theirs):
-                check["preexisting"] = True
-                check["vs_base"] = " (it fails the same way on the base commit, so your change did not cause it)"
+                check["preexisting"], check["cause"] = True, "preexisting"
+                check["vs_base"] = (" (it times out on the base commit too, so your change did not cause it)"
+                                    if check.get("timed_out") else
+                                    " (it fails the same way on the base commit, so your change did not cause it)")
             elif theirs.get("ok"):
                 check["vs_base"] = " (it passes on the base commit)"
             elif check.get("failures") and theirs.get("failures"):
@@ -1119,9 +1145,8 @@ class TaskRunner:
                              " MindsHub AI Factory")
         if self.checks:
             lines += ["", "### Checks run by the Factory"]
-            lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s)"
-                      + (" — fails the same way on the base commit; not caused by this change"
-                         if c.get("preexisting") else "") for c in self.checks]
+            lines += [f"- {'✅' if c['ok'] else '❌'} `{c['command']}` ({c['duration']}s){_check_note(c)}"
+                      for c in self.checks]
         spent, known = outcome_cost(self.task.outcome_id)
         lines += ["", "---",
                   f"Built by **{self.task.harness}**, independently verified by a fresh **{self.task.verifier_harness}** "
@@ -1538,7 +1563,8 @@ class TaskRunner:
                     failed = [c for c in setup + self.checks if not c["ok"]]
                     if failed:
                         state.update(phase="rejected", reason="fails its checks on top of newer commits",
-                                     feedback=[f"- After rebasing, `{c['command']}` failed:\n{c['tail']}" for c in failed])
+                                     feedback=[f"- After rebasing, `{c['command']}` {_how_failed(c)}:\n{c['tail']}"
+                                               for c in failed])
                         self.evidence("attempts", {"n": self.task.attempt, "result": "checks_failed",
                                                    "checks": _brief(setup + self.checks)})
                     else:
@@ -1809,10 +1835,32 @@ def _actionable(attempt: dict[str, Any]) -> bool:
 
 def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Check results for the evidence record; failed checks keep their output tail so the failure can be fed back
-    to a later attempt even after a restart."""
+    to a later attempt even after a restart. ``cause`` says what kind of failure it was: "timeout" (with the
+    ``limit``), "flaky" (passed on a second run; the first run's tail is ``first_failure``), "preexisting" or "real"."""
     return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")}
+            | {k: c[k] for k in ("cause", "timed_out", "limit") if c.get(k)}
             | ({} if c["ok"] else {"tail": str(c.get("tail") or "")[-1500:]})
+            | ({"first_failure": str(c["first_failure"])[-1500:]} if c.get("first_failure") else {})
             | ({"preexisting": True} if c.get("preexisting") else {}) for c in checks]
+
+
+def _how_failed(check: dict[str, Any]) -> str:
+    """How a failed command ended, in words: a timeout is a timeout, not "exit 124"."""
+    if check.get("timed_out"):
+        limit = check.get("limit")
+        return (f"timed out after {float(check.get('duration') or 0):.0f}s"
+                + (f" (the limit is {float(limit):.0f}s)" if limit else ""))
+    return f"failed (exit {check.get('exit_code')})" + (" on two runs in a row" if check.get("runs") == 2 else "")
+
+
+def _check_note(check: dict[str, Any]) -> str:
+    """What the pull request says about a check beyond pass or fail."""
+    if check.get("cause") == "flaky":
+        return " — failed on its first run, passed on a second"
+    if check.get("timed_out"):
+        return f" — {_how_failed(check)}" + ("; it times out on the base commit too, so not caused by this change"
+                                             if check.get("preexisting") else "")
+    return " — fails the same way on the base commit; not caused by this change" if check.get("preexisting") else ""
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -1861,9 +1909,14 @@ def _same_failure(candidate: dict[str, Any], base: dict[str, Any] | None) -> boo
     output: no node id that the base does not fail too. Other output has no test names to compare, and "the base
     exits non-zero as well" is not enough (a build can fail on the base for one reason and on the candidate for
     another), so both runs must end with the same exit code and print the same thing (``_output_signature``).
+    A check that runs out of time on the candidate and on the base is too slow for the limit whatever the change
+    does, unless the candidate printed failing tests the base did not; one that runs out of time on the candidate
+    only is the candidate's failure.
     Anything else is inconclusive, and the failure counts against the attempt."""
-    if not base or base.get("ok", True) or (candidate.get("timed_out") and not base.get("timed_out")):
+    if not base or base.get("ok", True):
         return False
+    if candidate.get("timed_out"):
+        return bool(base.get("timed_out")) and set(candidate.get("failures") or []) <= set(base.get("failures") or [])
     new, old = candidate.get("failures"), base.get("failures")
     if new is None or old is None:
         return (new is None and old is None and candidate.get("exit_code") == base.get("exit_code")

@@ -9,12 +9,16 @@ import shlex
 import time
 from typing import Any
 
-from ..sandbox import SandboxError
+from ..sandbox import COMMAND_TIMEOUT, SandboxError
 from ..sandbox import read_text as sb_read_text
 from ..sandbox import write_text as sb_write_text
 from .base import HarnessSession
 
 MAX_TOOL_OUTPUT = 30_000
+RUN_DEFAULT_TIMEOUT = 300
+RUN_TIMEOUT_HELP = (f"Seconds before the command is stopped. Default {RUN_DEFAULT_TIMEOUT}, max {COMMAND_TIMEOUT} "
+                    f"({COMMAND_TIMEOUT // 60} minutes, the limit for one of the repository's checks); less when your "
+                    "session is about to run out of time.")
 
 
 def _fn(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -38,7 +42,7 @@ READ_TOOLS = [
     _fn("search", "Search file contents with a regular expression (ripgrep syntax). Returns file:line matches.",
         {"pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, ["pattern"]),
     _fn("run", "Run a shell command in the repository root (bash). Use for builds, tests, git inspection.",
-        {"command": {"type": "string"}, "timeout_seconds": {"type": "integer", "description": "Default 300, max 1800."}},
+        {"command": {"type": "string"}, "timeout_seconds": {"type": "integer", "description": RUN_TIMEOUT_HELP}},
         ["command"]),
 ]
 
@@ -110,13 +114,15 @@ class ToolBox:
                 session.on_progress("tool", f"Searched for {args['pattern'][:80]}", {"tool": name})
                 return clip(result.output or "(no matches)")
             if name == "run":
-                timeout = max(10, min(int(args.get("timeout_seconds") or 300), 1800, int(session.command_timeout),
-                                      int(max(30, session.remaining() - 60))))
+                timeout = max(10, min(int(args.get("timeout_seconds") or RUN_DEFAULT_TIMEOUT), COMMAND_TIMEOUT,
+                                      int(session.command_timeout), int(max(30, session.remaining() - 60))))
                 command = str(args["command"])
                 session.on_progress("command", command[:300], {"tool": name})
                 started = time.monotonic()
                 result = await sandbox.exec(command, timeout=timeout)
-                session.on_progress("command_result", f"exit {result.exit_code} in {time.monotonic() - started:.0f}s",
+                took = f"{time.monotonic() - started:.0f}s"
+                session.on_progress("command_result", f"timed out after {took} (limit {timeout}s)" if result.timed_out
+                                    else f"exit {result.exit_code} in {took}",
                                     {"command": command[:300], "exit_code": result.exit_code, "timed_out": result.timed_out})
                 return clip(result.for_model())
             if name == "write_file" and session.writable:
