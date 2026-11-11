@@ -2276,6 +2276,7 @@ def test_failing_tests_are_compared_with_the_base_commit():
     assert not delivery._same_failure(slow(), other(124, timed_out=True))
     assert not delivery._same_failure(slow(failures=[network]), slow())
     assert delivery._progress("\x1b[32mrun 1\x1b[0m\n") == 5 and delivery._progress("") == 0
+    assert delivery._progress("kept" * 7_000, 5_000_000) == 5_000_000  # cut output: the count of all that was printed
     assert not delivery._same_failure(other(), None)
     # A check that failed on two runs is excused only when both runs match the base: what the first run alone failed
     # is still the candidate's, however the second run ended.
@@ -2290,6 +2291,26 @@ def test_failing_tests_are_compared_with_the_base_commit():
     assert not delivery._same_run(other(), other(exit_code=2))
     assert not delivery._same_run(other(), other(timed_out=True))
     assert not delivery._same_run({"failures": [network]}, {"failures": None})
+
+
+def test_a_timed_out_check_s_progress_counts_all_it_printed_when_the_output_kept_was_cut():
+    from types import SimpleNamespace
+
+    from aifactory.sandbox import ExecResult
+
+    def row(total_bytes, truncated=True):
+        async def run(command, timeout):  # what a sandbox returns for a command stopped at the limit
+            return ExecResult(command=command, exit_code=124, output="y\n" * 15_000, duration=3.0, timed_out=True,
+                              truncated=truncated, total_bytes=total_bytes)
+
+        return asyncio.run(delivery.TaskRunner._run_command(None, SimpleNamespace(exec=run), "sh loop.sh", 3))[0]
+
+    # The same 30,000 characters were kept of each run; what tells them apart is how much each printed in all.
+    base, loop = row(40_000), row(4_000_000)
+    assert (base["progress"], loop["progress"]) == (40_000, 4_000_000)
+    assert not delivery._same_failure(loop, base)  # a hundred times the output: the change may make it loop
+    assert delivery._same_failure(row(50_000), base)
+    assert row(30_000, truncated=False)["progress"] == 29_999  # nothing was cut: what was printed, stripped
 
 
 def test_a_failure_signature_ignores_what_differs_between_two_runs_of_the_same_failure():

@@ -687,8 +687,9 @@ class TaskRunner:
         if not result.ok:
             row["failures"] = _failing_tests(result.output)
             row["signature"] = _output_signature(result.output, sandbox)
-            row |= ({"cause": "timeout", "limit": timeout, "progress": _progress(result.output)} if result.timed_out
-                    else {"cause": "real"})
+            printed = result.total_bytes if result.truncated else 0  # the output kept was cut; the count was not
+            row |= ({"cause": "timeout", "limit": timeout, "progress": _progress(result.output, printed)}
+                    if result.timed_out else {"cause": "real"})
         return row, result.output
 
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
@@ -1991,9 +1992,12 @@ def _output_signature(output: str, sandbox: Any = None) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:32] if text else ""
 
 
-def _progress(output: str) -> int:
-    """How far a command had got when it was stopped at the time limit: how much it had printed, colours removed."""
-    return len(_ANSI.sub("", output or "").strip())
+def _progress(output: str, total_bytes: int = 0) -> int:
+    """How far a command had got when it was stopped at the time limit: how much it had printed, colours removed.
+    A sandbox keeps only the start and the end of long output, so what is left is about as long whether the command
+    printed a little more than that or gigabytes. ``total_bytes`` is the sandbox's count of everything printed, given
+    when the output was cut, and is then the measure."""
+    return max(len(_ANSI.sub("", output or "").strip()), total_bytes)
 
 
 def _as_far(candidate: dict[str, Any], base: dict[str, Any]) -> bool:
