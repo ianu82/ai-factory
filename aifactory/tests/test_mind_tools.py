@@ -60,10 +60,11 @@ def test_read_family_authorization_and_redaction(world, name, person):
         for _, _, t, *_ in work:
             t.pr_number, t.pr_url = 12, "https://github.com/org/repo/pull/12"
         db.commit()
-    for i, (ws, o, *_) in enumerate(work):
-        args = {"workspace_id": ws.id}
-        if name == "outcome_detail":
-            args["outcome_id"] = o.id
+    def scope(ws, o, t):  # the object a detail read needs, in that workspace
+        return {"outcome_id": o.id} if name == "outcome_detail" else (
+            {"outcome_id": o.id, "task_id": t.id} if name == "task_detail" else {})
+    for i, (ws, o, t, *_) in enumerate(work):
+        args = {"workspace_id": ws.id, **scope(ws, o, t)}
         if i == 2:
             with pytest.raises(HTTPException) as exc:
                 read_call(name, args, context)
@@ -76,7 +77,7 @@ def test_read_family_authorization_and_redaction(world, name, person):
     member = db.query(Membership).filter_by(user_id=users[person].id, workspace_id=work[0][0].id).one()
     db.delete(member); db.commit()
     with pytest.raises(HTTPException):
-        read_call(name, {"workspace_id": work[0][0].id, **({"outcome_id": work[0][1].id} if name == "outcome_detail" else {})}, context)
+        read_call(name, {"workspace_id": work[0][0].id, **scope(*work[0][:3])}, context)
 
 
 def test_production_transcripts_bounded_cursor_and_progress(world):
