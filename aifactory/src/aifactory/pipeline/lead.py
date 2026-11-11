@@ -23,6 +23,8 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func, or_
+
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
 from ..events import notify, record
@@ -44,9 +46,15 @@ COOLDOWN = timedelta(seconds=60)  # its own actions can open the next decision: 
 RETRY_AFTER = timedelta(minutes=15)  # after a failed run (model unavailable, budget, timeout), before trying again
 STALE = timedelta(minutes=30)  # a run still marked running after this was cut off by a restart
 DAILY_RUNS = 24
+# Progress the Lead tells people about in the outcome's conversation, at most every NARRATE_EVERY when nothing
+# else needs it: a finished run's update covers everything since its last one.
+MILESTONES = ("plan_approved", "published", "verification_failed", "ci_failed", "merged", "task_completed",
+              "smoke_failed", "revert_opened", "released", "outcome_completed")
+NARRATE_EVERY = timedelta(minutes=10)
+JUST_FINISHED = timedelta(hours=1)  # a finished outcome's Lead still reports how it ended
 FIRST_LOOK = timedelta(days=1)  # posts older than this predate the Lead: its first run reads them, not wakes for them
 MAX_MINUTES = 15
-PER_RUN = {"resolve_decision": 5, "post_guidance": 3, "note_for_people": 5}
+PER_RUN = {"resolve_decision": 5, "post_guidance": 3, "note_for_people": 5, "post_update": 2}
 RESULT_CHARS = 40_000
 MAX_OUTPUT = 8000  # tokens a Lead request may write
 MIN_OUTPUT = 512  # below this a request can't do anything useful: the run stops instead
@@ -122,6 +130,10 @@ You were woken because something on your outcome needs judgement. Read the outco
   over), or when you are not confident, leave a note for people (note_for_people) with what you found and the
   option you recommend. People read it in the outcome and the Inbox.
 - When a person has posted on the outcome, reply with note_for_people. Answer their question directly.
+- Keep the outcome's conversation current. When you first join an outcome, when progress woke you, and when the
+  outcome has ended, post one short
+  update with post_update: what happened since your last update and what it means, then what happens next. People
+  see each agent step under your update, so don't list them; say what they add up to. Two to four sentences.
 Finish with a short summary of what you did and what is still waiting, then call finish.
 
 Rules:
@@ -169,6 +181,25 @@ def recover() -> int:
         return len(stale)
 
 
+def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
+    """The Lead's latest note on each decision: what it found and recommends, shown where people decide."""
+    from ..serializers import ts
+
+    outcome_ids = {d.outcome_id for d in decisions if d.outcome_id}
+    wanted = {d.id for d in decisions}
+    notes: dict[str, dict[str, Any]] = {}
+    if not outcome_ids:
+        return notes
+    rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
+        .order_by(Message.created_at.desc(), Message.id.desc())
+    for m in rows:
+        decision_id = (m.attribution or {}).get("decision_id")
+        if decision_id in wanted and decision_id not in notes:
+            notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at),
+                                  "run_id": (m.attribution or {}).get("run_id")}
+    return notes
+
+
 # waking ----------------------------------------------------------------------------------------------------------
 
 def _marks(db, outcome_id: str) -> dict[str, str]:
@@ -196,7 +227,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
     woken: list[dict[str, Any]] = []
     with session_scope() as s:
         paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
-        outcomes = s.query(Outcome).filter(Outcome.status.notin_(FINISHED), Outcome.source != "review").all()
+        # Cancelled outcomes have no completed_at: when they ended is their last update.
+        ended = func.coalesce(Outcome.completed_at, Outcome.updated_at)
+        outcomes = s.query(Outcome).filter(or_(Outcome.status.notin_(FINISHED), ended > now - JUST_FINISHED),
+                                           Outcome.source != "review").all()
         cache: dict[str, dict[str, Any]] = {}
         budgets: dict[str, Any] = {}
         for o in outcomes:
@@ -220,16 +254,38 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             # Only a run that finished has seen what it was woken for: a failed one leaves it waiting.
             done = runs.filter(Run.status == "succeeded").order_by(Run.started_at.desc()).first()
             seen = ((done.config_snapshot or {}).get("seen") if done else None) or {}
-            marks = _marks(s, o.id)
+            finished = o.status in FINISHED  # only how it ended is left to report
+            marks = {} if finished else _marks(s, o.id)
             known = seen.get("decisions") or {}
             changed = [d for d, mark in marks.items() if known.get(d) != mark]
             since = _parse(seen.get("posts_until")) if done is not None else now - FIRST_LOOK
-            posts = _people_posts(s, o.id, since)
+            posts = [] if finished else _people_posts(s, o.id, since)
+            progress = [] if finished else _progress(s, o.id, seen.get("event_id"), now)
+            # Durable markers, so a run that didn't post the update is retried: an introduction until the Lead has
+            # posted one on this outcome, and the ending until a run that succeeded started after it.
+            introduced = s.query(Message.id).filter(Message.outcome_id == o.id, Message.author_kind == "lead").first()
+            joined = not finished and introduced is None and o.created_at > now - FIRST_LOOK
+            ended_at = o.completed_at or o.updated_at
+            # Reported only by an update posted after it ended: a run that merely started afterwards may not have.
+            # Reported only by a closing update: one a run woken for the ending posted. A progress update that
+            # happened to land after the end was written before it and doesn't say how the outcome ended.
+            reported = ended_at is not None and any(
+                (m.attribution or {}).get("closing") for m in s.query(Message).filter(
+                    Message.outcome_id == o.id, Message.author_kind == "lead", Message.created_at >= ended_at))
+            ending = finished and not reported
+            if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
+                progress = []  # batch progress into one update
             reasons = []
             if changed:
                 reasons.append(f"{len(changed)} decision{'s' if len(changed) != 1 else ''} waiting on someone")
             if posts:
                 reasons.append(f"{len(posts)} new post{'s' if len(posts) != 1 else ''} from people")
+            if progress:
+                reasons.append(f"{len(progress)} step{'s' if len(progress) != 1 else ''} of progress to report")
+            if joined:
+                reasons.append("you've just joined this outcome")
+            if ending:
+                reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
@@ -239,7 +295,11 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 continue
             until = posts[-1].created_at.isoformat() if posts else seen.get("posts_until")
             woken.append({"workspace_id": o.workspace_id, "outcome_id": o.id, "reasons": reasons,
-                          "decisions": changed, "seen": {"decisions": marks, "posts_until": until}})
+                          "decisions": changed, "seen": {"decisions": marks, "posts_until": until,
+                                                         "event_id": max(progress) if progress else seen.get("event_id"),
+                                                         # Progress, joining and ending each need a posted update.
+                                                         "update_due": bool(progress or joined or ending),
+                                                         "closing": ending}})
     return woken
 
 
@@ -249,6 +309,13 @@ def continued_past_budget(db, outcome_id: str) -> bool:
     on the outcome's budget doesn't stop its Lead; each Lead run is still held to its own cap."""
     return db.query(Decision.id).filter(Decision.outcome_id == outcome_id, Decision.kind == "budget",
                                         Decision.status == "resolved", Decision.resolution == "retry").first() is not None
+
+
+def _progress(db, outcome_id: str, after: Any, now: datetime) -> list[int]:
+    """Milestone events the Lead hasn't reported yet: after its last finished run's mark, or from the last day."""
+    query = db.query(Event.id).filter(Event.outcome_id == outcome_id, Event.kind.in_(MILESTONES))
+    query = query.filter(Event.id > after) if isinstance(after, int) else query.filter(Event.created_at > now - FIRST_LOOK)
+    return [row.id for row in query.order_by(Event.id)]
 
 
 def _parse(value: Any) -> datetime | None:
@@ -344,6 +411,8 @@ TOOLS = [
     _fn("post_guidance", "Post guidance the outcome's agents follow in their next steps, on the whole outcome or "
         "on one task.", {"text": TEXT, "task": {"type": "string", "description": "A task key or id (optional)."}},
         ("text",)),
+    _fn("post_update", "Post an update to the outcome's conversation: what happened since your last update, what it "
+        "means and what happens next. People read it in the outcome.", {"text": TEXT}, ("text",)),
     _fn("note_for_people", "Leave people a note on the outcome: what you found and what you recommend, about a "
         "decision you may not make, or a reply to a person's post.",
         {"text": TEXT, "decision_id": {"type": "string", "description": "The decision it is about (optional)."}},
@@ -360,6 +429,7 @@ class Tools:
         self.ws, self.outcome_id, self.run_id = workspace_id, outcome_id, run_id
         self.used: dict[str, int] = {}
         self.actions: list[dict[str, Any]] = []
+        self.closing = False  # woken to report how the outcome ended: its update is the closing report
 
     @property
     def source(self) -> dict[str, str]:
@@ -465,6 +535,21 @@ class Tools:
         self.actions.append({"tool": "post_guidance", "task": task})
         return "Posted. The agents receive it in their next steps."
 
+    def _post_update(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return "An update needs text."
+        with session_scope() as s:
+            actor = lead_user(s).id
+            data = {**self.source, "kind": "update", **({"closing": True} if self.closing else {})}
+            s.add(Message(workspace_id=self.ws, outcome_id=self.outcome_id, author_id=actor, author_kind="lead",
+                          body=text[:4000], attribution=data))
+        record(self.ws, "lead_update", f"Lead: {text[:300]}", outcome_id=self.outcome_id, run_id=self.run_id,
+               actor=actor, data=data)
+        notify(self.ws, "outcome", self.outcome_id)
+        self.actions.append({"tool": "post_update"})
+        return "Posted to the outcome's conversation."
+
     def _note_for_people(self, text: str, decision_id: str | None = None) -> str:
         text = (text or "").strip()
         if not text:
@@ -547,6 +632,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
     notify(workspace_id, "run", run_id)
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings)
     tools = Tools(workspace_id, outcome_id, run_id)
+    tools.closing = bool(seen.get("closing"))
     client = provider = None
     started = False
     status, error, summary = "failed", "", ""
@@ -579,6 +665,9 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         async with asyncio.timeout(minutes * 60):
             summary = await _loop(client, model, ledger, tools, settings, cfg["turns"], number, reasons, outcome_id,
                                   budget)
+        if seen.get("update_due") and not any(a["tool"] == "post_update" for a in tools.actions):
+            # Woken to report: a run that didn't fails, so the next run (after RETRY_AFTER) reports it.
+            raise LeadFailed("The Lead didn't post the update it was woken to give")
         status = "succeeded"
     except asyncio.CancelledError:
         status, error = "cancelled", "Stopped"

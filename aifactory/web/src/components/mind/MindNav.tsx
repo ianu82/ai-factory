@@ -36,7 +36,8 @@ export function MindNav({ workspaceId }: { workspaceId: string }) {
     {threads.length > 0 && <ul className="mind-nav-threads">
       {threads.map((t) => <li key={t.id}>
         <NavLink to={`/w/${t.workspace_id}/mind/${t.id}`} className={({ isActive }) => `mind-nav-thread${isActive ? " active" : ""}`} title={t.title}>
-          {t.title || "Untitled conversation"}
+          <span className="mind-nav-title">{t.title || "Untitled conversation"}</span>
+          {t.outcome && <span className="ref mind-nav-badge">#{t.outcome.number}</span>}
         </NavLink>
       </li>)}
       {started.length > SHOWN && <li><NavLink to={`${base}/mind?all`} end className="mind-nav-thread more">All conversations</NavLink></li>}
