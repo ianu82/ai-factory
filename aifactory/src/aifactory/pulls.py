@@ -55,6 +55,7 @@ def _factory_links(workspace_id: str) -> dict[tuple[str, int], dict[str, Any]]:
             links[(repos.get(task.repo_id, ""), task.pr_number)] = {
                 "outcome_id": task.outcome_id, "outcome_number": outcome.number if outcome else None,
                 "task_id": task.id, "task_key": task.key, "status": task.status, "stage": task.stage,
+                "review_count": ((task.evidence or {}).get("review") or {}).get("count", 0),
                 "blocked_reason": (task.blocked_reason or "")[:300], "decision_id": decisions.get(task.id)}
         return links
 
@@ -129,6 +130,8 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
     factory, ci, detail = row.get("factory") or {}, row.get("ci") or {}, row.get("detail") or {}
     if row.get("draft"):
         return "draft", "Draft"
+    if factory.get("review_count"):
+        return "attention", f"Review comments to address ({factory['review_count']})"
     if factory.get("status") in HUMAN_TASK:
         return "attention", factory.get("blocked_reason") or "Waiting on a decision in AI Factory"
     if factory.get("status") in ("queued", "running", "waiting_ci") and factory.get("stage") not in SHIPPING_STAGES:

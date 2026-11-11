@@ -8,7 +8,7 @@ GitHub collection errors must propagate; an unavailable snapshot is not an empty
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 DEFAULT_REVIEW = {"address": "unresolved", "reviewers": "all", "ignore": [],
                   "wait_seconds": 120, "max_rounds": 2}
@@ -84,6 +84,8 @@ class FindingProgress(TypedDict):
     reply_id: str | None
     replied_at: str | None
     resolved_at: str | None  # only set after successful GitHub resolution
+    observed_resolved: NotRequired[bool]  # last complete watcher snapshot
+    observed_resolution: NotRequired[str | None]  # resolution acknowledged by that snapshot
 
 
 class ReviewEvidence(TypedDict):

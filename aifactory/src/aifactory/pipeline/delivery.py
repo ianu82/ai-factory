@@ -35,6 +35,7 @@ from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost
                       workspace_settings)
 
 from .lifecycle import transition
+from ..task_evidence import locked_task, merge_evidence
 
 log = logging.getLogger(__name__)
 
@@ -115,10 +116,21 @@ class TaskRunner:
         self.cfg = self.repo.config or {}
 
     def update(self, **fields: Any) -> None:
+        patch = fields.pop("evidence", None)
+        if not fields:
+            if patch is not None:
+                self._set_evidence(patch)
+            return
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             if (task.status, task.stage) != (self.task.status, self.task.stage) or not transition(s, task, **fields):
                 raise Stop()
+            if patch is not None:
+                # The conditional lifecycle UPDATE takes the write lock without
+                # weakening cancellation. Refresh JSON only after it succeeds.
+                s.refresh(task)
+                task = locked_task(s, self.task_id)
+                fields["evidence"] = merge_evidence(task, patch)
             for key, value in fields.items():
                 setattr(self.task, key, value)
         notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
@@ -133,7 +145,7 @@ class TaskRunner:
     def _set_evidence(self, values: dict[str, Any]) -> None:
         """Record evidence keys in one transaction ("attempts" appends)."""
         with session_scope() as s:
-            task = s.get(Task, self.task_id)
+            task = locked_task(s, self.task_id)
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
             ev = json.loads(json.dumps(task.evidence or {}))
             for key, value in values.items():
@@ -145,6 +157,10 @@ class TaskRunner:
                 if key in ("ci", "smoke") and value.get("state") in ("failure", "failed"):
                     ev.setdefault("failure_facts", []).append({"kind": key, **value,
                                                               "attempt": task.attempt, "at": utcnow().isoformat()})
+                if key == "review":
+                    # Round/reply writers need not know the observer's per-PR
+                    # cursors; keep unrelated review keys from the locked row.
+                    value = {**ev.get("review", {}), **value}
                 ev[key] = value
             task.evidence = ev
             self.task.evidence = ev
@@ -930,7 +946,7 @@ class TaskRunner:
                     "deadline": (now + timedelta(minutes=self.settings["limits"].get("ci_minutes", 45))).isoformat()}
         wait = {**wait, "next_poll_at": now.isoformat()}
         self.update(status="waiting_ci", stage="ci", lease_owner="",
-                    evidence={**(self.task.evidence or {}), "ci_wait": wait})
+                    evidence={"ci_wait": wait})
         # All observations, including the first one, belong to the bounded poll
         # pool. Do not await GitHub here: Stop releases the builder sandbox and
         # execution slot before the scheduler can begin polling this candidate.
@@ -953,7 +969,7 @@ class TaskRunner:
     def _check_ci_deadline(self, wait: dict[str, Any]) -> None:
         if utcnow() > datetime.fromisoformat(wait["deadline"]):
             wait = {**wait, "timed_out": True}
-            self.update(evidence={**self.task.evidence, "ci_wait": wait})
+            self.evidence("ci_wait", wait)
             self.block("unblock", f"{self.task.key}: CI did not finish",
                        f"CI on PR #{wait['pr']} was still running after "
                        f"{self.settings['limits'].get('ci_minutes', 45)} minutes.",
@@ -998,9 +1014,9 @@ class TaskRunner:
         wait.update(last_state=summary.state, next_poll_at=(now + timedelta(
             seconds=15 if elapsed < 300 else 30)).isoformat())
         ci = {"state": summary.state, "head": wait["head"], "checks": summary.checks, "at": now.isoformat()}
-        ev = {**self.task.evidence, "ci_wait": wait, "ci": ci}
+        ev = {"ci_wait": wait, "ci": ci}
         if summary.state == "failure":
-            ev["failure_facts"] = [*ev.get("failure_facts", []), {"kind": "ci", **ci}]
+            ev["failure_facts"] = [{"kind": "ci", **ci}]
         self.update(status="queued" if stage else "waiting_ci", stage=stage or "ci", evidence=ev,
                     lease_owner="", blocked_reason="")
         if changed:
