@@ -237,6 +237,15 @@ async def workspace_pulls(workspace_id: str, state: str = "open", refresh: bool 
     return result
 
 
+def cached(workspace_id: str, max_age: float = 900) -> dict[str, Any] | None:
+    """The newest open-PR listing this process fetched for the Pull requests page, if recent; never calls GitHub."""
+    hits = [hit[1] for state in ("open", "all") if (hit := _cache.get((workspace_id, state)))]
+    newest = max(hits, key=lambda result: result.get("fetched_at") or 0, default=None)
+    if newest is None or time.time() - (newest.get("fetched_at") or 0) > max_age:
+        return None
+    return newest
+
+
 def _ts(value: str | None) -> float:
     from datetime import datetime
 

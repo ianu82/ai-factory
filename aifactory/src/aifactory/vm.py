@@ -21,6 +21,7 @@ import shlex
 import shutil
 import tarfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -94,6 +95,70 @@ async def prune_environments(keep_for: str, keep: int = 2) -> list[str]:
         except Exception as exc:  # pragma: no cover - best effort
             log.warning("could not delete checkpoint %s: %s", c.get("key"), exc)
     return deleted
+
+
+# Every VM this process created and has not destroyed. Anything else active in the environment that is older than
+# the grace period is an orphan: a job interrupted by a restart, a destroy that failed, or a lost handle. Railway's
+# idle timeout did not reclaim them: on 11 Nov, 100 orphans from the previous two days filled the plan's cap, every
+# VM start failed, and every build, verification and check ran on the control-plane host instead.
+_LIVE: set[str] = set()
+ORPHAN_GRACE = timedelta(minutes=10)  # a VM being created right now is not registered yet
+SANDBOX_CAP = int(os.environ.get("AIFACTORY_VM_CAP", "100"))  # Railway's per-environment limit on the plan
+CAP_ERROR = "Too many running sandboxes"
+TERMINAL = {"FAILED", "DESTROYED", "DESTROYING"}
+SWEEP_DESTROYS = 8  # destroys in flight at once: 100 orphans take seconds, not 100 sequential calls
+_sweeping: asyncio.Lock | None = None  # one sweep at a time (periodic and cap-triggered)
+
+
+def _sweep_lock() -> asyncio.Lock:
+    global _sweeping
+    if _sweeping is None:
+        _sweeping = asyncio.Lock()
+    return _sweeping
+
+
+def _created(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def sweep_orphans(now: datetime | None = None) -> dict[str, Any]:
+    """Destroy this environment's active sandboxes that no job in this process holds and that are older than the
+    grace period. Returns counts for the inventory; never raises (an unreachable API only skips this sweep)."""
+    ok, why = vm_available()
+    if not ok:
+        return {"skipped": why}
+    async with _sweep_lock():
+        bridge = VMBridge.get()
+        try:
+            items = (await bridge.call("sandboxes", {}, timeout=120)).get("items") or []
+        except Exception as exc:
+            log.warning("VM sweep could not list sandboxes: %s", exc)
+            return {"skipped": "list failed"}
+        now = now or datetime.now(timezone.utc)
+        active = [s for s in items if s.get("status") not in TERMINAL]
+        orphans = []
+        for s in active:
+            created = _created(s.get("createdAt"))
+            if s["id"] not in _LIVE and created is not None and now - created >= ORPHAN_GRACE:
+                orphans.append(s["id"])
+        limit = asyncio.Semaphore(SWEEP_DESTROYS)
+
+        async def destroy(vm_id: str) -> bool:
+            async with limit:
+                try:
+                    await bridge.call("forget", {"id": vm_id}, timeout=120)
+                    return True
+                except Exception as exc:
+                    log.warning("VM sweep could not destroy %s: %s", vm_id, exc)
+                    return False
+
+        destroyed = sum(await asyncio.gather(*(destroy(vm_id) for vm_id in orphans)))
+    if destroyed:
+        log.warning("VM sweep destroyed %d orphaned sandbox(es)", destroyed)
+    return {"active": len(active) - destroyed, "owned": len(_LIVE), "destroyed": destroyed, "cap": SANDBOX_CAP}
 
 
 def vm_work_root() -> str:
@@ -248,7 +313,19 @@ class RailwayVMSandbox:
             args["checkpoint"] = checkpoint
         else:
             args["template"] = template or QA_TEMPLATE
-        info = await bridge.call("create", args, timeout=timeout)
+        try:
+            info = await bridge.call("create", args, timeout=timeout)
+        except Exception as exc:
+            if CAP_ERROR not in str(exc):
+                raise
+            # The environment is full: reclaim orphans and try once more, rather than quietly running on the host.
+            log.error("Railway sandbox cap reached; sweeping orphaned VMs before one retry")
+            # Retry after any sweep that could list the environment: when several creations hit the cap at once,
+            # their sweeps queue on one lock and the first frees capacity for all of them.
+            if "skipped" in await sweep_orphans():
+                raise
+            info = await bridge.call("create", args, timeout=timeout)
+        _LIVE.add(info["id"])
         return cls(info["id"], bridge, info.get("region"))
 
     async def checkpoint(self, name: str, timeout: float = 600) -> None:
@@ -468,8 +545,10 @@ class RailwayVMSandbox:
         self._closed = True
         try:
             await self.bridge.call("destroy", {"id": self.vm_id}, timeout=120)
-        except Exception as exc:  # recorded; Railway's idle timeout is the backstop
+        except Exception as exc:  # recorded; the orphan sweep reclaims it (Railway's idle timeout did not)
             log.warning("VM %s destroy failed: %s", self.vm_id, exc)
+        finally:
+            _LIVE.discard(self.vm_id)
 
     async def kill_all(self) -> None:
         for proc in self._procs:

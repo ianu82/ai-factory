@@ -21,6 +21,11 @@ def set_bootstrap_workspace(workspace_id: str | None) -> None:
     _bootstrap_workspace_id = workspace_id or None
 
 
+def bootstrap_workspace() -> str | None:
+    """The workspace the current bootstrap manages (None before startup applied it, or without a bootstrap)."""
+    return _bootstrap_workspace_id
+
+
 def allowed(workspace_id: str | None) -> bool:
     return bool(workspace_id) and workspace_id == _bootstrap_workspace_id
 

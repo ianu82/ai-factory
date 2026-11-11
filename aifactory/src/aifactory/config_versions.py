@@ -138,7 +138,7 @@ def configuration_version(*, role: str, system: str, harness: str, provider: Pro
     effective = merged_settings(settings)
     # Resolve selections first: other roles' choices and unused pricing are not behaviour inputs.
     selected = {k: v for k, v in effective.items() if k not in {
-        "models", "harness", "provider", "pricing", "theme", "presentation",
+        "models", "harness", "provider", "pricing", "theme", "presentation", "mind",
     } and k.lower() not in CREDENTIAL_FIELDS}
     selected["limits"] = {k: v for k, v in effective["limits"].items()
                           if not k.endswith("_turns") or k == f"{role}_turns"}

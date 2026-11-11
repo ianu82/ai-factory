@@ -1,4 +1,4 @@
-import type { MindCard, MindContext, MindEvent, MindHistory, MindMessage, MindStatus, MindThread, Role } from "./api";
+import type { MindCard, MindContext, MindEvent, MindHistory, MindMessage, MindStatus, MindStep, MindThread, Role } from "./api";
 
 /** Incremental UTF-8/SSE decoder; handles CR, LF, CRLF and multiline data. */
 export async function readMindSSE(response: Response, signal: AbortSignal, receive: (event: MindEvent) => void): Promise<void> {
@@ -7,6 +7,9 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "", data: string[] = [], eventName = "", terminal = false;
+  // An error frame is reported at once but does not end the read: the server still sends usage and done, and the
+  // caller needs them to reload the saved turn. The error is thrown once the stream is complete.
+  let failure: MindEvent | null = null;
   const abort = () => { void reader.cancel().catch(() => {}); };
   signal.addEventListener("abort", abort, { once: true });
   const dispatch = () => {
@@ -21,7 +24,7 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
     eventName = "";
     if (!event || typeof event.type !== "string") throw new Error("Invalid Mind stream event");
     receive(event);
-    if (event.type === "error") { terminal = true; throw new Error(event.message || "Mind request failed"); }
+    if (event.type === "error") failure = failure || event;
     if (event.type === "done") terminal = true;
   };
   const line = (value: string) => {
@@ -54,6 +57,7 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
       drain(done);
       if (done) break;
     }
+    if (failure) throw new Error((failure as { message?: string }).message || "Mind request failed");
     if (!terminal) throw new Error("Mind stream ended before completion. Reload history before retrying.");
   } finally {
     signal.removeEventListener("abort", abort);
@@ -66,6 +70,8 @@ export interface MindTransport {
   list(signal: AbortSignal): Promise<MindThread[]>;
   create(workspace: string, signal: AbortSignal): Promise<MindHistory>;
   history(thread: string, signal: AbortSignal): Promise<MindHistory>;
+  /** Whether Mind can answer for this workspace now (no thread needed). */
+  status?(workspace: string, signal: AbortSignal): Promise<MindStatus>;
   send(thread: string, body: { content: string; context: MindContext | null }, signal: AbortSignal, receive: (event: MindEvent) => void): Promise<void>;
   revise(thread: string, card: MindCard, fields: Record<string, string>, signal: AbortSignal): Promise<MindCard>;
   dismiss(thread: string, card: MindCard, signal: AbortSignal): Promise<MindCard>;
@@ -75,8 +81,10 @@ export interface MindState {
   userId: string | null; open: boolean; threads: MindThread[]; active: MindThread | null;
   messages: MindMessage[]; status: MindStatus | null; context: MindContext | null;
   busy: boolean; pendingCards: string[]; draft: string; progress: string; error: string; announcement: string; announcementId: number;
+  /** The current (or last) turn's steps and when it started, for the live "Working for" line and the rail. */
+  steps: MindStep[]; startedAt: number | null;
 }
-const initial = (userId: string | null): MindState => ({ userId, open: false, threads: [], active: null, messages: [], status: null, context: null, busy: false, pendingCards: [], draft: "", progress: "", error: "", announcement: "", announcementId: 0 });
+const initial = (userId: string | null): MindState => ({ userId, open: false, threads: [], active: null, messages: [], status: null, context: null, busy: false, pendingCards: [], draft: "", progress: "", error: "", announcement: "", announcementId: 0, steps: [], startedAt: null });
 export const mindPrivateKey = (userId: string) => ["mind", userId] as const;
 export function canConfirm(card: MindCard, roles: Record<string, Role>, pending: string[] = []): boolean {
   const role = roles[card.workspace_id];
@@ -97,6 +105,8 @@ export class MindController {
   private generation = 0;
   private roles: Record<string, Role> = {};
   private routeKey = "";
+  private listFailure = ""; // the error a failed thread list left; only a later successful list clears it
+  private listRequest = 0; // only the newest thread-list request updates the list and its error
   constructor(privateTransport: MindTransport) { this.transport = privateTransport; }
   private transport: MindTransport;
   getSnapshot = () => this.state;
@@ -105,7 +115,7 @@ export class MindController {
   setIdentity(userId: string | null, roles: Record<string, Role> = {}) {
     this.roles = roles;
     if (userId === this.state.userId) return;
-    this.cancel(); this.routeKey = ""; this.state = initial(userId); this.update({});
+    this.cancel(); this.routeKey = ""; this.listFailure = ""; this.state = initial(userId); this.update({});
   }
   cancel() {
     this.generation++;
@@ -119,18 +129,30 @@ export class MindController {
   }
   setContext(context: MindContext | null) { this.update({ context }); }
   removeContext() { this.update({ context: null }); }
-  private async request<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void) {
+  private async request<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void, failed?: (message: string) => void,
+                           current: () => boolean = () => true) {
     if (!this.state.userId) return;
     const controller = new AbortController(), generation = this.generation;
     this.controllers.add(controller);
     try {
       const result = await work(controller.signal);
-      if (generation === this.generation && !controller.signal.aborted) apply(result);
+      if (generation === this.generation && !controller.signal.aborted && current()) apply(result);
     } catch (error) {
-      if (generation === this.generation && !controller.signal.aborted) this.update({ error: (error as Error).message });
+      if (generation === this.generation && !controller.signal.aborted && current()) {
+        const message = (error as Error).message;
+        this.update({ error: message }); failed?.(message);
+      }
     } finally { this.controllers.delete(controller); }
   }
-  async list() { await this.request((s) => this.transport.list(s), (threads) => this.update({ threads })); }
+  async list() {
+    const request = ++this.listRequest;
+    await this.request((s) => this.transport.list(s), (threads) => {
+      // Clear only the error an earlier failed list left; a newer error from another action (send, confirm) stays.
+      const stale = this.listFailure !== "" && this.state.error === this.listFailure;
+      this.listFailure = "";
+      this.update(stale ? { threads, error: "" } : { threads });
+    }, (message) => { this.listFailure = message; }, () => request === this.listRequest);
+  }
   private load(history: MindHistory) {
     this.update({ messages: history.messages, status: history.status, active: history.thread, threads: [history.thread, ...this.state.threads.filter((t) => t.id !== history.thread.id)], busy: false, error: "", draft: "", progress: "" });
   }
@@ -148,24 +170,69 @@ export class MindController {
     await this.request((s) => this.transport.history(thread, s), (h) => this.load(h));
     if (generation === this.generation) this.update({ busy: false });
   }
+  /** Load whether Mind can answer for a workspace, before any conversation exists. */
+  /** The error a failed status check left, so a later successful check clears it (and nothing else). */
+  private statusError = "";
+  async checkStatus(workspace: string) {
+    const status = this.transport.status;
+    if (!status) return;
+    // A check that fails (offline, timed out, access changed) is a definite answer too: Mind can't answer now.
+    await this.request((s) => status.call(this.transport, workspace, s), (value) => {
+      const stale = !!this.statusError && this.state.error === this.statusError;
+      this.statusError = "";
+      this.update({ status: value, ...(stale ? { error: "" } : {}) });
+    }, (message) => {
+      this.statusError = message;
+      this.update({ status: { model: null, available: false, reason: `Couldn't check whether Mind can answer (${message}).`, budget_state: "ok" } });
+    });
+  }
+  /** Leave the current conversation (a new one starts on the next send). */
+  leave() { this.cancel(); this.update({ active: null, messages: [], error: "", steps: [], startedAt: null }); }
+  /** A new conversation that opens with the person's first message. Returns the new thread's id. */
+  async start(workspace: string, content: string): Promise<string | null> {
+    if (!content.trim()) return null;
+    // Check first, so a refused first message never leaves an empty conversation behind.
+    await this.checkStatus(workspace);
+    const ready = this.state.status;
+    if (this.transport.status && (!ready?.available || ready.budget_state !== "ok")) return null;
+    await this.create(workspace);
+    const { active, status } = this.state;
+    // Open the conversation only when its first message can actually be sent.
+    if (!active || !status?.available || status.budget_state !== "ok") return null;
+    void this.send(content);
+    return active.id;
+  }
   async reload() { if (this.state.active) await this.select(this.state.active.id); else await this.list(); }
   async send(content: string) {
     const { active, context, status, busy } = this.state;
     if (!content.trim() || !active || busy || !status?.available || status.budget_state !== "ok") return;
-    this.update({ busy: true, draft: "", progress: "Thinking…", error: "", messages: [...this.state.messages, { id: `local-${Date.now()}`, role: "user", content: content.trim() }] });
+    const startedAt = Date.now();
+    this.update({ busy: true, draft: "", progress: "Thinking…", error: "", steps: [], startedAt, messages: [...this.state.messages, { id: `local-${startedAt}`, role: "user", content: content.trim() }] });
     const generation = this.generation;
     await this.request((signal) => this.transport.send(active.id, { content: content.trim(), context }, signal, (event) => {
       if (generation !== this.generation || signal.aborted) return;
       switch (event.type) {
         case "text_delta": this.update({ draft: this.state.draft + event.text }); break;
-        case "tool_start": this.update({ progress: `Reading ${event.name}…` }); break;
-        case "tool_result": this.update({ progress: `Read ${event.name}` }); break;
+        case "tool_start": this.update({ progress: stepLabel(event.name, false), steps: [...this.state.steps, { name: event.name, done: false }] }); break;
+        case "tool_result": {
+          const steps = [...this.state.steps];
+          const open = steps.findIndex((s) => s.name === event.name && !s.done);
+          const done = { name: event.name, done: true, citations: event.citations?.length || 0 };
+          if (open >= 0) steps[open] = done; else steps.push(done);
+          this.update({ progress: stepLabel(event.name, true), steps }); break;
+        }
         case "status": this.update({ status: event.status }); break;
         case "action_card": {
           // A proposal is inert. Only confirm() can call the action endpoint.
           this.update({ messages: [...this.state.messages, { id: `card-${event.card.id}`, role: "assistant", content: "", cards: [event.card] }] }); break;
         }
-        case "done": this.update({ active: event.thread, status: event.status, messages: [...this.state.messages.filter((m) => !m.id.startsWith("card-")), event.message], draft: "", announcement: `Mind: ${event.message.content}`, announcementId: this.state.announcementId + 1 }); break;
+        case "done": {
+          // The saved reply, with the steps and duration this browser watched.
+          const message = { ...event.message, steps: this.state.steps.length ? this.state.steps : event.message.steps, durationMs: Date.now() - startedAt };
+          const kept = this.state.status;
+          const status = event.status ?? (kept && event.budget ? { ...kept, budget_state: event.budget } : kept);
+          this.update({ active: event.thread, status, messages: [...this.state.messages.filter((m) => !m.id.startsWith("card-")), message], draft: "", announcement: `Mind: ${event.message.content}`, announcementId: this.state.announcementId + 1 }); break;
+        }
         case "error": this.update({ error: event.message, ...(event.reason === "budget_exceeded" || event.reason === "pending_accounting" ? { status: { ...this.state.status!, budget_state: event.reason } } : {}) }); break;
       }
     }), () => {});
@@ -212,6 +279,37 @@ export function mindSuggestions(context: MindContext | null): string[] {
 }
 /** Only trusted in-app route shapes become router links. No protocol-relative URLs. */
 export function mindLink(url: string): "internal" | "external" | null {
-  if (/^\/w\/[^/?#]+\/(?:inbox|outcomes|runs|pulls|signals|decisions|settings)(?:[/?#]|$)/.test(url) && !/[\\\u0000-\u0020]/.test(url)) return "internal";
+  if (/^\/w\/[^/?#]+\/(?:inbox|outcomes|runs|pulls|signals|decisions|settings|mind)(?:[/?#]|$)/.test(url) && !/[\\\u0000-\u0020]/.test(url)) return "internal";
   try { const parsed = new URL(url); return parsed.protocol === "https:" || parsed.protocol === "http:" ? "external" : null; } catch { return null; }
+}
+
+/** What a Factory tool does, in the words a person uses. Unknown tools keep their own name. */
+const STEP_LABELS: Record<string, [string, string]> = {
+  overview: ["Checking the workspace overview", "Checked the workspace overview"],
+  list_outcomes: ["Looking through outcomes", "Looked through outcomes"],
+  list_tasks: ["Looking through tasks", "Looked through tasks"],
+  outcome_detail: ["Reading an outcome", "Read an outcome"],
+  task_detail: ["Reading a task", "Read a task"],
+  open_decisions: ["Checking open decisions", "Checked open decisions"],
+  runs: ["Reading recent runs", "Read recent runs"],
+  recent_events: ["Reading recent activity", "Read recent activity"],
+  pull_requests: ["Checking pull requests", "Checked pull requests"],
+  propose_send_guidance: ["Drafting guidance for your approval", "Drafted guidance for your approval"],
+  propose_answer_question: ["Drafting an answer for your approval", "Drafted an answer for your approval"],
+  propose_retry_task: ["Preparing a retry for your approval", "Prepared a retry for your approval"],
+  propose_resolve_decision: ["Preparing a decision for your approval", "Prepared a decision for your approval"],
+  propose_create_outcome: ["Drafting a new outcome for your approval", "Drafted a new outcome for your approval"],
+};
+export function stepLabel(name: string, done: boolean): string {
+  const known = STEP_LABELS[name];
+  if (known) return known[done ? 1 : 0];
+  const words = name.replace(/^propose_/, "").replace(/_/g, " ");
+  return name.startsWith("propose_") ? `${done ? "Prepared" : "Preparing"} ${words} for your approval` : `${done ? "Used" : "Using"} ${words}`;
+}
+export function formatDuration(ms: number | null | undefined): string | null {
+  if (ms == null || ms < 0) return null;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }

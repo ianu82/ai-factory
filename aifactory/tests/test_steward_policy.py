@@ -11,6 +11,8 @@ from aifactory.steward_policy import steward_policy, validate_steward
 
 
 DEFAULT = {"mode": "propose", "fix_minutes": 60}
+# Serialized repository config also shows the PR-review opt-in defaults (never written).
+REVIEW_DEFAULT = {"mode": "off", "allow_untrusted_local": False}
 INVALID = [
     None, False, [], "fix", 1,
     {"fix_minute": 30}, {"mode": "fix", "fix_minutes": 30, "extra": True},
@@ -81,15 +83,16 @@ def test_admin_round_trip_all_modes_and_partial_updates(client, repository, role
         policy = {"mode": mode, "fix_minutes": minutes}
         response = client.patch(f"{base}/{repo_id}", json={"config": {"steward": policy}})
         assert response.status_code == 200, response.text
-        assert response.json()["config"] == {**unrelated, "steward": policy}
+        assert response.json()["config"] == {**unrelated, "steward": policy, "review": REVIEW_DEFAULT}
         assert client.get(base).json()[0]["config"] == response.json()["config"]
-        assert snapshot(repo_id)[0] == response.json()["config"]
+        assert snapshot(repo_id)[0] == {**unrelated, "steward": policy}
     response = client.patch(f"{base}/{repo_id}", json={"config": {"steward": {"mode": "off"}}})
     assert response.json()["config"]["steward"] == {"mode": "off", "fix_minutes": 120}
     response = client.patch(f"{base}/{repo_id}", json={"config": {"steward": {"fix_minutes": 2}}})
     assert response.json()["config"]["steward"] == {"mode": "off", "fix_minutes": 2}
     response = client.patch(f"{base}/{repo_id}", json={"config": {"context": "notes"}})
-    assert response.json()["config"] == {**unrelated, "steward": {"mode": "off", "fix_minutes": 2}, "context": "notes"}
+    assert response.json()["config"] == {**unrelated, "steward": {"mode": "off", "fix_minutes": 2}, "context": "notes",
+                                         "review": REVIEW_DEFAULT}
 
 
 @pytest.mark.parametrize("invalid", INVALID)
@@ -116,7 +119,7 @@ def test_unknown_policy_field_is_named_and_patch_is_atomic(client, repository, u
     assert response.status_code == 422, response.text
     assert unknown in response.json()["detail"]
     assert snapshot(repo_id) == before
-    assert client.get(f"/api/workspaces/{ws}/repositories").json()[0]["config"] == before[0]
+    assert client.get(f"/api/workspaces/{ws}/repositories").json()[0]["config"] == {**before[0], "review": REVIEW_DEFAULT}
 
 
 @pytest.mark.parametrize("role", ["member", "viewer"])
@@ -159,7 +162,7 @@ def test_invalid_stored_policy_lists_with_defaults_and_can_be_replaced(client, r
     repos = {r["id"]: r for r in response.json()}
     assert len(repos) == 2
     assert repos[repo_id]["steward_policy_invalid"] is True
-    assert repos[repo_id]["config"] == {"context": "keep", "steward": DEFAULT}
+    assert repos[repo_id]["config"] == {"context": "keep", "steward": DEFAULT, "review": REVIEW_DEFAULT}
     healthy = next(r for r in repos.values() if r["id"] != repo_id)
     assert healthy["steward_policy_invalid"] is False
     assert snapshot(repo_id)[0] == stored  # Reading never rewrites operator data.
@@ -171,7 +174,8 @@ def test_invalid_stored_policy_lists_with_defaults_and_can_be_replaced(client, r
     response = client.patch(f"{base}/{repo_id}", json={"config": {"steward": {"mode": "off"}}})
     assert response.status_code == 200, response.text
     assert response.json()["steward_policy_invalid"] is False
-    assert response.json()["config"] == {"context": "updated", "steward": {**DEFAULT, "mode": "off"}}
+    assert response.json()["config"] == {"context": "updated", "steward": {**DEFAULT, "mode": "off"},
+                                         "review": REVIEW_DEFAULT}
 
 
 @pytest.mark.parametrize("policy", [

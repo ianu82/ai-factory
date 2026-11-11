@@ -45,6 +45,20 @@ async def test_provider_operations_and_variables():
     fake.data = {"commentCreate": {"success": True, "comment": {"id": "c", "body": "hello"}}}
     assert (await provider.create_comment("i", "hello"))["id"] == "c"
     assert fake.requests[-1][1]["variables"] == {"input": {"issueId": "i", "body": "hello"}}
+    fake.data = {"issue": {"id": "uuid", "identifier": "ENG-5", "url": "https://linear.app/i"}}
+    assert (await provider.issue("ENG-5"))["id"] == "uuid"
+    assert fake.requests[-1][1]["variables"] == {"id": "ENG-5"}
+    author = {"id": "u", "name": "Ian", "email": "ian@example.com", "active": True, "guest": False, "app": False}
+    fake.data = {"issue": {"comments": connection([{"id": "c", "body": "/factory", "createdAt": "2026-11-10T19:30:00.000Z",
+                                                    "url": "https://linear.app/c", "user": author}])}}
+    [comment] = await provider.comments_since("uuid", "2026-11-10T19:00:00.000Z")
+    assert comment["user"]["email"] == "ian@example.com"
+    query = fake.requests[-1][1]
+    assert query["variables"]["filter"] == {"createdAt": {"gte": "2026-11-10T19:00:00.000Z"}}
+    assert "user { id name email active guest app }" in query["query"]
+    fake.data = {"issue": {"comments": connection([{"id": "r", "body": "Factory relay for ..."}])}}
+    assert [c["id"] for c in await provider.comments_by_id("uuid", ["r", "s"])] == ["r"]
+    assert fake.requests[-1][1]["variables"]["filter"] == {"id": {"in": ["r", "s"]}}
 
 
 @pytest.mark.parametrize("mode,category", [

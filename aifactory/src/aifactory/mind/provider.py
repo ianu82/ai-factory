@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -26,8 +27,16 @@ from ..security import decrypt, redact
 
 
 class Ledger(Protocol):
+    """check() before each paid send; add() after it. A ledger may also define admit(), called once per send
+    right before the request goes out (inside provider admission), instead of a second check(). admit() and
+    add() may be coroutines, so a durable ledger can claim and release its lease around each send."""
     def check(self) -> None: ...
     def add(self, model: str, usage: tuple[int, int] | None) -> None: ...
+
+
+async def _ledger_step(result) -> None:
+    if inspect.isawaitable(result):
+        await result
 
 
 REASONS = {
@@ -84,16 +93,29 @@ def saved_credential(workspace_id: str) -> Credential:
         raise MindUnavailable() from None
 
 
+# Claude Opus 5.5 under the names catalogs give it: anthropic/claude-opus-5.5, claude-opus-5-5-20261101, and
+# MindsHub's own opus-5-5. A complete generation only: never "opus", "opus-5", "5.6" or "5.50".
+_OPUS_5_5 = re.compile(r"(?:anthropic/)?(?:claude[-_ ])?opus[-_ ]5[._-]5(?:[-_]\d{8})?", re.IGNORECASE)
+
+
 def select_model(names: list[str]) -> str:
-    # Match a complete generation, not "5", "5.6", "5.50", or a display-name
-    # claim attached to an unrelated id. Return the actual catalog id unchanged.
-    pattern = r"(?:anthropic/)?claude[-_ ]opus[-_ ]5[._-]5(?:[-_]\d{8})?"
-    matches = {name for name in names if re.fullmatch(pattern, name, re.IGNORECASE)}
+    # Return the actual catalog id unchanged.
+    matches = {name for name in names if _OPUS_5_5.fullmatch(name)}
     if not matches:
         raise MindUnavailable("model_absent")
     if len(matches) != 1:
         raise MindUnavailable("ambiguous_catalog")
     return matches.pop()
+
+
+def same_model(reported: str | None, selected: str) -> bool:
+    """Whether the model a response names is the one Mind asked for. A provider can report the selected
+    generation under another of its names (MindsHub serves opus-5-5 and may answer as claude-opus-5-5-…); any
+    other model is a substitution."""
+    if not reported:
+        return False
+    # Whole names only: an id that merely contains opus-5-5 (gpt-opus-5-5-fast, claude-opus-5-5.1) is another model.
+    return reported == selected or bool(_OPUS_5_5.fullmatch(reported) and _OPUS_5_5.fullmatch(selected))
 
 
 class _Responses:
@@ -119,7 +141,7 @@ class _Responses:
             terminal = False
             try:
                 async with admission(self.config, self.session_id):
-                    self.ledger.check()
+                    await _ledger_step(getattr(self.ledger, "admit", self.ledger.check)())
                     self.calls += 1
                     sent = True
                     try:
@@ -134,11 +156,11 @@ class _Responses:
                         if response is not None:
                             usage = _usage(response) or usage
                             identity = getattr(response, "model", None)
-                            if identity and identity != self.model:
+                            if identity and not same_model(identity, self.model):
                                 raise MindUnavailable("model_substitution")
                         if kind in ("response.completed", "response.incomplete"):
                             terminal = True
-                            if getattr(response, "model", None) != self.model:
+                            if not same_model(getattr(response, "model", None), self.model):
                                 raise MindUnavailable("model_substitution")
                         if kind in ("response.failed", "error"):
                             raise MindUnavailable()
@@ -157,7 +179,7 @@ class _Responses:
                         await stream.close()
                 finally:
                     if sent:
-                        self.ledger.add(self.model, usage)
+                        await _ledger_step(self.ledger.add(self.model, usage))
         return events()
 
 
@@ -270,8 +292,8 @@ class MindProvider:
         self.ttl, self.timeout = min(ttl, 60), min(timeout, 30)
         self._ready: dict[tuple, tuple[float, Readiness]] = {}
 
-    async def readiness(self, workspace_id: str, ledger: Ledger) -> Readiness:
-        session_id = "mind-ready-" + uuid4().hex
+    async def readiness(self, workspace_id: str, ledger: Ledger, session_id: str | None = None) -> Readiness:
+        session_id = session_id or "mind-ready-" + uuid4().hex
         credential = None
         model = None
         cache_hit = False
@@ -339,7 +361,7 @@ class MindProvider:
                 async for event in events:
                     if isinstance(event, StreamComplete):
                         response = event.response
-            if response is None or response.model != model:
+            if response is None or not same_model(response.model, model):
                 raise MindUnavailable("model_substitution")
             return response
 

@@ -130,10 +130,11 @@ def _plan_streak(db: Session, ws: Workspace) -> list[Proposal]:
     approvers = _names(db, {d.resolved_by for d in streak if d.resolved_by})
     return [Proposal(
         rule="plan_autonomy", key=ws.id,
-        title="Start delivery as soon as a plan is ready",
+        title="Let the plan reviewer approve plans",
         body=(f"The last {len(streak)} plans were approved exactly as proposed (by {', '.join(approvers) or 'your team'})."
-              " Planner questions that need a person still stop and ask; only the routine approval goes away."),
-        action={"type": "settings", "set": {"autonomy.plan": "auto"}, "label": "Approve plans automatically"},
+              " The plan reviewer checks each plan against the request and the code, sends weak plans back to the"
+              " planner, and still brings you any plan it cannot approve. Planner questions still come to you."),
+        action={"type": "settings", "set": {"autonomy.plan": "auto"}, "label": "Let the plan reviewer approve"},
         evidence=[{"label": d.title, "detail": f"approved {d.resolved_at:%b %d}", "outcome_id": d.outcome_id}
                   for d in streak[:8]],
         basis=str(len(streak) // 5))]

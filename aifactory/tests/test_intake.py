@@ -628,7 +628,8 @@ def test_only_admins_can_change_issue_author_trust(client, signed_in, role):
         assert response.status_code == (200 if role in ("owner", "admin") else 403), response.text
         if response.status_code == 200:
             assert response.json()["config"] == {"context": "keep", "require_trusted_issue_author": value,
-                                                 "steward": {"mode": "propose", "fix_minutes": 60}}
+                                                 "steward": {"mode": "propose", "fix_minutes": 60},
+                                                 "review": {"mode": "off", "allow_untrusted_local": False}}
             with session_scope() as db:
                 assert db.get(Repository, repo_id).config == {"context": "keep", "require_trusted_issue_author": value}
     with session_scope() as db:
@@ -651,8 +652,9 @@ def test_issue_author_trust_requires_a_json_boolean(client, signed_in, value):
     ({"permission": "write"}, "write"), ({"permission": "admin"}, "admin"),
     ({"permission": "push"}, "push"), ({"permission": "read"}, "read"),
     ({"permission": "triage"}, "triage"), ({}, None), ([], None),
-    ({"user": {"permissions": {"push": True}}}, "push"),
-    ({"user": {"permissions": {"admin": True}}}, "admin"),
+    # Missing top-level permission is not proof of access, even with nested flags.
+    ({"user": {"permissions": {"push": True}}}, None),
+    ({"user": {"permissions": {"admin": True}}}, None),
     ({"user": {"permissions": {"push": "true"}}}, None),
 ])
 def test_github_author_permission_lookup(monkeypatch, payload, expected):

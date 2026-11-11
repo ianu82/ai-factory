@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -73,7 +74,7 @@ def health():
 
 @router.get("/meta")
 def meta():
-    return {"auth": auth_methods(), "harnesses": capabilities(),
+    return {"auth": auth_methods(), "harnesses": capabilities(), "capabilities": {"reverify": True},
             "sandbox": {"isolation": "per-job identity" if isolation_available() else "shared (development)"},
             "version": "2.0.0"}
 
@@ -156,15 +157,50 @@ class WorkspaceUpdate(BaseModel):
     paused: bool | None = None
 
 
+def _mind_settings(value: Any) -> dict[str, Any]:
+    """Mind's daily budget: a finite, nonnegative number of US dollars (0 turns Mind off)."""
+    if value is None:
+        return dict(DEFAULT_SETTINGS["mind"])
+    if not isinstance(value, dict) or set(value) - {"daily_budget_usd"}:
+        raise HTTPException(422, "mind accepts only daily_budget_usd")
+    budget = value.get("daily_budget_usd", DEFAULT_SETTINGS["mind"]["daily_budget_usd"])
+    if type(budget) not in (int, float) or not math.isfinite(budget) or budget < 0:
+        raise HTTPException(422, "mind.daily_budget_usd must be a finite, nonnegative number")
+    return {"daily_budget_usd": float(budget)}
+
+
+def _lead_settings(value: Any) -> dict[str, Any]:
+    """The Lead: on or off, its spend per run in US dollars and its turns per run."""
+    default = DEFAULT_SETTINGS["lead"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "lead accepts only enabled, run_usd and turns")
+    enabled = value.get("enabled", default["enabled"])
+    usd = value.get("run_usd", default["run_usd"])
+    turns = value.get("turns", default["turns"])
+    if type(enabled) is not bool:
+        raise HTTPException(422, "lead.enabled must be true or false")
+    if type(usd) not in (int, float) or not math.isfinite(usd) or not 0 <= usd <= 20:
+        raise HTTPException(422, "lead.run_usd must be a number from 0 to 20")
+    if type(turns) is not int or not 2 <= turns <= 80:  # one to act, and the last for the summary
+        raise HTTPException(422, "lead.turns must be a whole number from 2 to 80")
+    return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
+
+
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         review = review_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    merged = merged_settings(raw)
+    mind = _mind_settings(raw.get("mind"))
+    lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
+    merged = merged_settings({**raw, "lead": lead})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
+    merged["mind"] = mind
+    merged["lead"] = lead
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -540,7 +576,7 @@ class RepoCommands(BaseModel):
     @field_validator("review")
     @classmethod
     def valid_review(cls, value):
-        return validate_review(value)
+        return validate_review(value, repository=True)
 
 
 class RepoConnect(BaseModel):
@@ -597,7 +633,8 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
             raise HTTPException(422, str(exc)) from None
     if "review" in patch:
         try:
-            cfg["review"] = {**(current.get("review") or {}), **validate_review(patch["review"])}
+            cfg["review"] = {"mode": "off", "allow_untrusted_local": False,
+                             **(current.get("review") or {}), **validate_review(patch["review"], repository=True)}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
     for key in ("setup", "checks", "smoke", "protected_paths"):
@@ -606,7 +643,14 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
     for key in ("context", "signal_label"):
         if key in patch:
             cfg[key] = str(patch[key] or "")[:8000]
-    for key in ("merge", "release", "qa", "recovery", "build"):
+    if "merge" in patch:
+        if not isinstance(patch["merge"], dict):
+            raise HTTPException(422, "merge must be an object")
+        merge = {**(current.get("merge") or {}), **patch["merge"]}
+        if "reverify" in merge and merge["reverify"] not in ("overlap", "always", "never"):
+            raise HTTPException(422, "merge.reverify must be overlap, always or never")
+        cfg["merge"] = merge
+    for key in ("release", "qa", "recovery", "build"):
         if key in patch and isinstance(patch[key], dict):
             cfg[key] = patch[key]
     for key in ("require_ci", "max_changed_lines"):
@@ -800,39 +844,12 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
             result = S.outcome(existing, tasks.get(existing.id, []), runs.get(existing.id, []), decisions.get(existing.id, 0))
             db.commit()
             return result
-    repos = db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.id.in_(body.repo_ids)).all()
-    if len(repos) != len(set(body.repo_ids)):
-        raise HTTPException(400, "Unknown repository")
-    if body.template and (len(body.repo_ids) != 1 or body.attachment_ids):
-        raise HTTPException(400, "The README example requires exactly one repository and no attachments")
-    if body.harness and body.harness not in ("native", "codex", "anton"):
-        raise HTTPException(400, "Unknown harness")
-    try:
-        uploads = A.validate_staged(db, workspace_id, user.id, body.attachment_ids)
-    except LookupError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    # Claim before creating any outcome/events. The conditional UPDATE serializes
-    # competing submissions on both SQLite and Postgres; a loser rolls back all claims.
-    claim_id = new_id()
-    claimed = A.staged_query(db, workspace_id, user.id).filter(Artifact.id.in_(body.attachment_ids)).update(
-        {Artifact.outcome_id: claim_id}, synchronize_session=False)
-    if claimed != len(uploads):
-        db.rollback()
-        raise HTTPException(409, "Attachment is no longer available")
-    outcome = outcome_from_text(db, workspace_id, user, README_TITLE if body.template else body.title,
-                                README_BRIEF if body.template else body.brief, [r.id for r in repos],
-                                acceptance=README_ACCEPTANCE if body.template else body.acceptance,
-                                harness=body.harness, priority=max(0, min(body.priority, 3)), signal_id=marker,
-                                guidance={"template": README_TEMPLATE, "repo_id": repos[0].id} if body.template else None)
-    if uploads:
-        db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.outcome_id == claim_id).update(
-            {Artifact.outcome_id: outcome.id}, synchronize_session=False)
-        record(workspace_id, "attachments_added", f"{user.name or user.email} added {len(uploads)} attachments",
-               outcome_id=outcome.id, actor=user.id,
-               data={"ids": [a.id for a in uploads], "names": [a.name for a in uploads], "count": len(uploads)}, session=db)
-    A.cleanup_staged(db)
+    from .work_services import create_outcome as create
+
+    # The same service creates a confirmed Mind card's outcome.
+    outcome = create(db, user, workspace_id, title=body.title, brief=body.brief, repo_ids=body.repo_ids,
+                     acceptance=body.acceptance, harness=body.harness, priority=body.priority,
+                     attachment_ids=body.attachment_ids, template=body.template, signal_id=marker)
     db.commit()
     orchestrator.wake()
     return S.outcome(outcome, [], [])
@@ -858,7 +875,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     return {
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
-                   | {"created_by_name": users.get(o.created_by or "", "")},
+                   | {"created_by_name": _creator(db, users.get(o.created_by or "", ""), o)},
         "repositories": [{"id": rid, "full_name": repos.get(rid, "?")} for rid in o.repo_ids],
         "attachments": [S.artifact(a) for a in db.query(Artifact).filter(
             Artifact.workspace_id == workspace_id, Artifact.outcome_id == o.id, Artifact.kind == "attachment")
@@ -872,52 +889,37 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     }
 
 
+def _creator(db: Session, name: str, outcome: Outcome) -> str:
+    """The creator's name, "<person> via Mind" when a confirmed Mind card created the outcome (its creation event
+    carries the card's attribution, whatever the outcome's source: a Mind fix outcome is still an improvement)."""
+    created = (db.query(Event).filter(Event.outcome_id == outcome.id, Event.kind == "outcome_created")
+               .order_by(Event.id).first()) if name else None
+    return f"{name} via Mind" if created is not None and (created.data or {}).get("source") == "mind" else name
+
+
 @router.post("/workspaces/{workspace_id}/outcomes/{outcome_id}/cancel")
 async def cancel_outcome(workspace_id: str, outcome_id: str, user: User = Depends(current_user),
                          db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "member")
-    o = db.get(Outcome, outcome_id)
-    if o is None or o.workspace_id != workspace_id:
-        raise HTTPException(404, "Outcome not found")
-    o.status = "cancelled"
-    with_prs = []
-    for t in db.query(Task).filter(Task.outcome_id == o.id, Task.status.notin_(["completed", "abandoned"])):
-        t.status = "cancelled"
-        if t.pr_number:
-            with_prs.append(t.id)
-    for d in db.query(Decision).filter(Decision.outcome_id == o.id, Decision.status == "open"):
-        d.status = "superseded"
-    db.commit()
-    orchestrator.cancel_outcome(o.id)
-    record(workspace_id, "outcome_cancelled", f"{user.name or user.email} cancelled #{o.number}", outcome_id=o.id,
-           actor=user.id, level="warn")
-    notify(workspace_id, "outcome", o.id)
-    if with_prs:
-        from .pipeline.handover import close_dropped_pull
+    # Shared with Mind's cancel card: cancel and supersede, commit, publish, then stop the work and close its PRs.
+    from .work_services import cancel_outcome as cancel, finish, publish_changes
 
-        for task_id in with_prs:
-            await close_dropped_pull(task_id, user.name or user.email, "Cancelled")
+    _ws(db, user, workspace_id, "member")
+    payload, later = cancel(db, user, workspace_id, outcome_id)
+    db.commit()
+    publish_changes([payload])
+    await finish(later, user)
     return {"ok": True}
 
 
 @router.post("/workspaces/{workspace_id}/tasks/{task_id}/cancel")
 async def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    _ws(db, user, workspace_id, "member")
-    t = db.get(Task, task_id)
-    if t is None or t.workspace_id != workspace_id:
-        raise HTTPException(404, "Task not found")
-    if t.status not in ("completed",):
-        t.status = "cancelled"
-    db.commit()
-    orchestrator.cancel_task(task_id)
-    record(workspace_id, "task_cancelled", f"{user.name or user.email} stopped {t.key}", outcome_id=t.outcome_id,
-           task_id=t.id, actor=user.id, level="warn")
-    notify(workspace_id, "task", t.id, outcome_id=t.outcome_id)
-    orchestrator.wake()
-    if t.status == "cancelled" and t.pr_number:
-        from .pipeline.handover import close_dropped_pull
+    from .work_services import cancel_task as cancel, finish, publish_changes
 
-        await close_dropped_pull(t.id, user.name or user.email, "Cancelled")
+    _ws(db, user, workspace_id, "member")
+    payload, later = cancel(db, user, workspace_id, task_id)
+    db.commit()
+    publish_changes([payload])
+    await finish(later, user)
     return {"ok": True}
 
 
@@ -1234,7 +1236,7 @@ def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = 
 @router.get("/workspaces/{workspace_id}/stats")
 def stats(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    from .metrics import benchmark, first_attempt_result, workspace_metrics
+    from .metrics import benchmark, first_attempt_result, human_message, workspace_metrics
     from .decision_judges import judge_metrics
 
     outcomes = [o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id) if not benchmark(o)]
@@ -1284,8 +1286,8 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
                  "per_completed_task": round(total_cost / max(1, sum(t.status == "completed" for t in tasks)), 2)},
         "tokens": sum(r.input_tokens + r.output_tokens for r in runs) + score_tokens,
         "human": {"decisions": len(decisions), "open": sum(d.status == "open" for d in decisions),
-                  "interventions": db.query(Message).filter(Message.workspace_id == workspace_id,
-                                                            Message.author_kind == "user").count()},
+                  "interventions": sum(human_message(m) for m in db.query(Message).filter(
+                      Message.workspace_id == workspace_id, Message.author_kind == "user"))},
         "harnesses": {h: {"runs": sum(r.harness == h for r in runs),
                           "succeeded": sum(r.harness == h and r.status == "succeeded" for r in runs)}
                       for h in ("native", "codex", "anton")},

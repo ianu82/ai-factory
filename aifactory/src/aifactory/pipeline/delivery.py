@@ -14,6 +14,7 @@ import logging
 import re
 import shlex
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -21,14 +22,18 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
+from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
-                      conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
+                      changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Run, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
+from .check_slots import check_slot
+from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, outcome_cost, precedents,
+                      publish_decision, run_agent,
                       workspace_settings)
 
 from .lifecycle import transition
@@ -116,8 +121,22 @@ class TaskRunner:
         self.checks: list[dict[str, Any]] = []
         self.app_summary: dict[str, Any] | None = None
         self._ci_repairing = False
+        # The repository's agent instructions, by base commit and whether they are for the verifier.
+        self._instructions: dict[tuple[str, bool], list[str]] = {}
         self._load()
         self.feedback = self._prior_feedback()
+        self.builder_report = (self.task.evidence or {}).get("builder_report") or {}
+        revalidation = (self.task.evidence or {}).get("revalidation") or {}
+        if revalidation.get("phase") in ("rejected", "handled"):
+            self.feedback += revalidation.get("feedback") or []
+
+    async def _sections(self, verifier: bool = False) -> list[str]:
+        """The plan around this task and the repository's instructions for agents, read at the base commit (never
+        from the candidate, which the builder may have changed)."""
+        key = (self.task.base_sha or "", verifier)
+        if key not in self._instructions:
+            self._instructions[key] = await repo_instructions(self.repo.full_name, key[0], verifier=verifier)
+        return plan_context(self.task_id) + self._instructions[key]
 
     def _prior_feedback(self) -> list[str]:
         """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
@@ -126,10 +145,10 @@ class TaskRunner:
             verdict = attempt.get("verdict") or {}
             if attempt.get("result") == "verification_failed" and verdict:
                 notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
-                for c in verdict.get("criteria") or []:
+                for c in _objects(verdict.get("criteria")):
                     if c.get("status") != "pass":
                         notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
-                for f in verdict.get("findings") or []:
+                for f in _objects(verdict.get("findings")):
                     if f.get("severity") in ("blocker", "major"):
                         notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
             elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks") or []):
@@ -148,6 +167,8 @@ class TaskRunner:
             task = s.get(Task, self.task_id)
             self.task = Task(**{c.name: getattr(task, c.name) for c in Task.__table__.columns})
             outcome = s.get(Outcome, task.outcome_id)
+            if outcome.source == "review":
+                raise ValueError("Review outcomes cannot enter task delivery")
             self.outcome = Outcome(**{c.name: getattr(outcome, c.name) for c in Outcome.__table__.columns})
             repo = s.get(Repository, task.repo_id)
             self.repo = Repository(**{c.name: getattr(repo, c.name) for c in Repository.__table__.columns})
@@ -231,6 +252,13 @@ class TaskRunner:
             if not self.task.started_at:
                 self.update(started_at=utcnow())
             stage = self.task.stage
+            phase = ((self.task.evidence or {}).get("revalidation") or {}).get("phase")
+            if phase not in (None, "complete", "handled"):
+                await self.merge()  # checks for an outside merge before resuming missing gates
+                return
+            if phase == "complete" and stage in ("verify", "checks"):
+                await self.ci_then_merge()
+                return
             if stage in BUILD_STAGES:  # interrupted mid-attempt: a restart, or requeued after an infrastructure failure
                 if stage in ("verify", "publish") and self._restore_verified_candidate():
                     token = resolve_token(self.ws)
@@ -238,8 +266,8 @@ class TaskRunner:
                     await self.ci_then_merge()
                     return
                 # Inside a fix round, the attempt continues that round on the pull request's branch; it must not
-                # rebuild from the default branch.
-                stage = (self.task.evidence or {}).get("fix_round") or stage
+                # rebuild from the default branch. The rebuild after a rejected revalidation is such a round too.
+                stage = (self.task.evidence or {}).get("fix_round") or ("revise" if phase == "handled" else stage)
             if stage == "merge":
                 await self.merge()
             elif stage == "ci_repair":
@@ -270,6 +298,7 @@ class TaskRunner:
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
+        merge_manager.leave(self)  # a rebuild re-enters the merge queue at the back when it is ready again
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
         # Durable, so an attempt interrupted inside this round resumes the same round (see run()).
@@ -301,7 +330,7 @@ class TaskRunner:
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")
-            spent, known = outcome_cost(self.task.outcome_id)
+            spent, known = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
             if budget and known and spent >= budget and not (self.task.evidence or {}).get("budget_override"):
                 self.block("budget", f"Outcome #{self.outcome.number} reached its ${budget:.0f} budget",
                            f"Spent ${spent:.2f}. Raise the budget in Settings or approve continuing.", status="needs_input",
@@ -313,13 +342,14 @@ class TaskRunner:
                     error = f"Sandbox setup failed: {exc}"
                     self._infrastructure(attempt, "prepare", error, infrastructure_problem(error))
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
+            sections = await self._sections()
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
                 prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
                                     precedents(self.ws, self.repo.id),
-                                    guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
+                                    guidance_history(self.task.outcome_id, self.task_id), sections)), self.cancelled)
             if result is None:
                 cause = infrastructure_problem(error)
                 if cause:
@@ -328,6 +358,7 @@ class TaskRunner:
                 self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
                 continue
             self.builder_report = result.report
+            self.evidence("builder_report", self.builder_report)
             if result.report.get("status") == "blocked":
                 reason = result.report.get("blocked_reason") or result.report.get("summary", "")
                 self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
@@ -352,7 +383,9 @@ class TaskRunner:
             self.patch = patch
             diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
                           files=patch.files, additions=patch.additions, deletions=patch.deletions)
-            self.checks = await self._run_commands(self.builder, self.cfg.get("checks") or [], "check")
+            commands = self.cfg.get("checks") or []
+            async with self._check_slot(self.builder, bool(commands)):
+                self.checks = await self._run_commands(self.builder, commands, "check")
             failed = [c for c in self.checks if not c["ok"]]
             if failed:
                 try:
@@ -426,27 +459,53 @@ class TaskRunner:
         sb, default = self.builder, self.repo.default_branch
         found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
         main = found.output.strip() if found.ok else ""
-        # The commit the branch is built on: the recorded base, unless an interrupted revision already recorded a newer
-        # base without pushing the branch onto it (then the branch's fork point with the default branch).
-        base_sha = self.task.base_sha
-        if main and base_sha and not (await sb.exec(f"git merge-base --is-ancestor {shlex.quote(base_sha)} HEAD",
-                                                    timeout=60)).ok:
-            fork = await sb.exec(f"git merge-base HEAD {main}", timeout=60)
-            base_sha = fork.output.strip() if fork.ok else base_sha
-        if not main or not base_sha or main == base_sha:
+        if not main:
+            return
+        recorded = self.task.base_sha or ""
+        record = (self.task.evidence or {}).get("published") or {}
+        tip = await sb.exec("git rev-parse HEAD", timeout=60)
+        # A publication record describes one pushed head. A stop between a push and its record leaves the record
+        # describing the publication before it, so its base counts only while its head is still the branch's head.
+        published = str(record.get("base") or "") if tip.ok and record.get("head") == tip.output.strip() else ""
+        # The base recorded when the branch was last published is the branch's real base, so it is trusted first.
+        # The task's recorded base can belong to an attempt that was never published: a restart begins the attempt
+        # again from the latest code and records that base, while the branch still sits on another one. Trusting
+        # it would skip this rebase when it is newer than the branch, and when it is an older commit the branch
+        # also contains, every commit between the two would count as this task's change (republishing commits
+        # removed from a rewound main, for one). Branches published before the base was recorded fall back to the
+        # recorded base when the branch contains it, then to where the branch meets it (a later commit of the same
+        # history), then main.
+        actual = ""
+        for known in (published, recorded):
+            if known and not actual and (await sb.exec(
+                    f"git merge-base --is-ancestor {shlex.quote(known)} HEAD", timeout=60)).ok:
+                actual = known
+        for other in (recorded, main):
+            if actual or not other:
+                continue
+            merged = await sb.exec(f"git merge-base HEAD {shlex.quote(other)}", timeout=60)
+            actual = merged.output.strip() if merged.ok else ""
+        if not actual:
+            return
+        if actual != recorded:
+            self.event("branch_base_corrected", f"{branch} sits on {actual[:8]}, not the recorded base "
+                       f"{recorded[:8] or '(none)'}; bringing it up to date from there", level="warn",
+                       recorded=recorded, actual=actual)
+            self.update(base_sha=actual)
+        if main == self.task.base_sha:
             return
         if (self.task.evidence or {}).get("ci", {}).get("state") == "failure":
             self.event("revalidate", "The base branch moved; rebasing the CI repair before verification")
         author = " ".join(f"-c user.{k}={shlex.quote(v)}" for k, v in
                           (("name", AUTHOR["GIT_AUTHOR_NAME"]), ("email", AUTHOR["GIT_AUTHOR_EMAIL"])))
         # --onto: replay only this task's commits, even if the default branch was rewritten since.
-        rebased = await sb.exec(f"git {author} rebase -q --onto {main} {shlex.quote(base_sha)}", timeout=300)
+        rebased = await sb.exec(f"git {author} rebase -q --onto {main} {shlex.quote(self.task.base_sha)}", timeout=300)
         if rebased.ok:
             self.update(base_sha=main)
             self.event("rebased", f"Brought {branch} up to date with {default} ({main[:8]}) before revising")
             return
         await sb.exec("git rebase --abort", timeout=60)
-        base = shlex.quote(base_sha)
+        base = shlex.quote(self.task.base_sha)
         earlier = (await sb.exec("git rev-parse HEAD", timeout=60)).output.strip()
         reset = await sb.exec(f"git reset -q --hard {main}", timeout=120)
         if not reset.ok:
@@ -521,6 +580,29 @@ class TaskRunner:
             return "- The diff is larger than 5 MB. Remove generated or binary files from the change."
         return ""
 
+    @asynccontextmanager
+    async def _check_slot(self, sandbox, needed: bool = True):
+        """Hold a host check slot while the repository's checks run in a local sandbox (see check_slots), saying so
+        when every slot is taken. Waiting spends none of a command's timeout. Checks in a VM run off this host and
+        take no slot."""
+        if not needed or getattr(sandbox, "kind", "local") != "local":
+            yield
+            return
+        started = time.monotonic()
+        waited = False
+
+        def waiting(running: int, queued: int) -> None:
+            nonlocal waited
+            waited = True
+            self.event("check_slot_wait", f"Waiting for a check slot: {running} running on this server, {queued} waiting",
+                       running=running, waiting=queued)
+
+        async with check_slot(on_wait=waiting):
+            if waited:
+                seconds = round(time.monotonic() - started, 1)
+                self.event("check_slot", f"Got a check slot after waiting {seconds:.0f}s", waited=seconds)
+            yield
+
     async def _run_commands(self, sandbox: LocalSandbox, commands: list[str], kind: str,
                             timeout: float = 1500) -> list[dict[str, Any]]:
         results = []
@@ -557,6 +639,7 @@ class TaskRunner:
                     if qa_cfg.get("start"):
                         app = await self._start_app(sandbox, qa_cfg)
                         brief = verifier_brief(app)
+                    sections = await self._sections(verifier=True)
                     run, result, error = await run_agent(SessionSpec(
                         workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                         harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
@@ -564,7 +647,8 @@ class TaskRunner:
                         repositories={self.repo.full_name: self.cfg},
                         prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
                                              precedents(self.ws, self.repo.id),
-                                             guidance_history(self.task.outcome_id, self.task_id))
+                                             guidance_history(self.task.outcome_id, self.task_id),
+                                             outcome=self.outcome, sections=sections)
                         + brief), self.cancelled)
                     if app is not None:
                         await self._store_app_evidence(app, attempt, run.id)
@@ -596,11 +680,13 @@ class TaskRunner:
                 self.event("verified", f"Independent verification passed: {report.get('summary', '')[:300]}",
                            level="success")
                 return report
-            failing = [c for c in report.get("criteria", []) if c.get("status") != "pass"]
-            findings = [f for f in report.get("findings", []) if f.get("severity") in ("blocker", "major")]
+            failing = [c for c in _objects(report.get("criteria")) if c.get("status") != "pass"]
+            findings = [f for f in _objects(report.get("findings")) if f.get("severity") in ("blocker", "major")]
             self.feedback.append("- Independent review FAILED. " + report.get("summary", "")[:1500])
-            self.feedback += [f"  - Criterion not met: {c['criterion']} — {c.get('evidence', '')[:600]}" for c in failing]
-            self.feedback += [f"  - {f['severity']}: {f['description'][:600]} {f.get('location', '')}" for f in findings]
+            self.feedback += [f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:600]}"
+                              for c in failing]
+            self.feedback += [f"  - {f['severity']}: {str(f.get('description', ''))[:600]} {f.get('location', '')}"
+                              for f in findings]
             if runtime_problem and app is not None and app.evidence.get("log_tail"):
                 self.feedback.append(f"  - App log when it failed:\n```\n{app.evidence['log_tail'][-1500:]}\n```")
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
@@ -813,8 +899,11 @@ class TaskRunner:
                        status="failed", options=[{"value": "retry", "label": "Rebuild again"},
                                                  {"value": "take_over", "label": "I'll take it from here"},
                                                  {"value": "abandon", "label": "Abandon task"}])
-        self.evidence("rebase_rebuilds", rebuilds)
-        self.evidence("attempt_base", self.task.attempt)
+        values = {"rebase_rebuilds": rebuilds, "attempt_base": self.task.attempt}
+        revalidation = (self.task.evidence or {}).get("revalidation") or {}
+        if revalidation.get("phase") == "rejected":
+            values["revalidation"] = {**revalidation, "phase": "handled"}
+        self._set_evidence(values)
         self.event("rebuild_after_base_moved", f"The verified change {why}; rebuilding with a fresh attempt budget "
                    f"({rebuilds} of 2)")
 
@@ -931,7 +1020,8 @@ class TaskRunner:
             return "the app did not start"
         bad_pages = [f"{p.get('path')} ({p.get('error') or p.get('status')})"[:300] for p in app.evidence.get("pages", [])
                      if p.get("error") or (p.get("status") or 500) >= 500]
-        bad_probes = [p.get("path") for p in app.evidence.get("probes", []) if not p.get("ok")]
+        bad_probes = [p.get("path") for p in [*app.evidence.get("probes", []),
+                                               *app.evidence.get("change_checks", [])] if not p.get("ok")]
         if bad_pages:
             return f"pages failed to render: {bad_pages}"
         if bad_probes:
@@ -949,21 +1039,36 @@ class TaskRunner:
         except GitError as exc:
             self.block("unblock", f"{self.task.key}: could not push the branch", str(exc))
         gh = GitHub(token)
-        body = self._pr_body()
+        body = _factory_block(self._pr_body())
         try:
-            pr = await gh.create_pull(self.repo.full_name, head=self.task.branch, base=self.repo.default_branch,
-                                      title=f"{self.task.title}", body=body)
-            await gh.set_status(self.repo.full_name, head, "success", "Independently verified by MindsHub AI Factory",
-                                self._task_url())
+            if self.task.pr_number:
+                pr = await gh.pull(self.repo.full_name, self.task.pr_number)
+                try:
+                    updated = _replace_factory_block(pr.get("body") or "", body)
+                    await gh.request("PATCH", f"/repos/{self.repo.full_name}/pulls/{self.task.pr_number}",
+                                     json={"body": updated})
+                except (GitHubError, ValueError) as exc:
+                    self.event("revalidation_warning", f"Could not update PR body: {str(exc)[:200]}", level="warn")
+            else:
+                pr = await gh.create_pull(self.repo.full_name, head=self.task.branch, base=self.repo.default_branch,
+                                          title=f"{self.task.title}", body=body)
+            try:
+                await gh.set_status(self.repo.full_name, head, "success", "Independently verified by MindsHub AI Factory",
+                                    self._task_url())
+            except GitHubError as exc:
+                self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
+        # Record the publication before advancing the head, as revalidation does: a stop between the two must not
+        # leave the task at this head with a record of the publication before it.
+        self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
+                                    "pr": pr["number"]})
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
-        self.evidence("published", {"head": head, "at": utcnow().isoformat(), "pr": pr["number"]})
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:
         lines = [self.builder_report.get("summary", "").strip() or self.task.title, "", "### Acceptance criteria"]
-        by = {c.get("criterion"): c for c in self.verifier_report.get("criteria", [])}
+        by = {c.get("criterion"): c for c in _objects(self.verifier_report.get("criteria"))}
         for criterion in self.task.acceptance:
             c = by.get(criterion) or next((v for k, v in by.items() if k and criterion[:40] in k), {})
             mark = {"pass": "✅", "fail": "❌"}.get(c.get("status", ""), "◻️")
@@ -1292,9 +1397,26 @@ class TaskRunner:
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()
                 return
+        pending = (self.task.evidence or {}).get("revalidation") or {}
+        if pending.get("phase") not in (None, "complete", "handled"):
+            await self._refresh_onto_main(token, gh, pending["new_base"])
+            return
         self._require_merge_approval()
-        self.stage("merge", f"Merging PR #{self.task.pr_number}")
+        # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
+        await merge_manager.take_turn(self, gh)
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
+        github_queue = await merge_manager.github_queue_state(gh, self)
+        if github_queue is not None:
+            if revalidate and not github_queue["entry"] and not (self.task.evidence or {}).get(
+                    merge_manager.KEY, {}).get("github"):
+                # Enqueue only a head verified against the current main; otherwise rebase and revalidate first.
+                main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard()
+                if main_sha != self.task.base_sha:
+                    await self._refresh_onto_main(token, gh, main_sha)
+                    return
+            await merge_manager.merge_via_github_queue(self, gh, github_queue)
+        self.stage("merge", f"Merging PR #{self.task.pr_number}")
         refresh_onto: str | None = None
         # Merges into one repository are serialized; CI waits and rebuilds happen outside the lock.
         async with self.repo_lock(self.repo.id):
@@ -1339,47 +1461,120 @@ class TaskRunner:
         await self.smoke()
 
     async def _refresh_onto_main(self, token: str, gh: GitHub, main_sha: str) -> None:
-        """Main moved: rebase the verified change, then re-run checks and CI before merging."""
-        self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
-        try:
-            clean, detail = await rebase_branch(self.repo.full_name, token, branch=self.task.branch,
-                                                onto=self.repo.default_branch, task_id=self.task_id,
-                                                base=self.task.base_sha or "", head=self.task.head_sha or "")
-        except BranchMoved as exc:
-            self.block("unblock", f"{self.task.key}: PR head changed",
-                       f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
-                       "rebased or merged.", status="needs_input")
-        if not clean:
-            # The revision checks out the branch, carries it onto the latest base and leaves only the overlapping
-            # lines for the builder to resolve (see _bring_branch_up_to_date).
-            self._fresh_budget_after_base_moved("conflicts with newer commits")
-            self.evidence("fix_round", "revise")  # before the stage: a restart in between resumes on the branch
-            self.update(branch=self.task.branch, stage="build")
+        """Durable gates for the exact rebased candidate; no checks/QA/CI hold repo_lock."""
+        state = dict((self.task.evidence or {}).get("revalidation") or {})
+        if state.get("phase") in (None, "complete", "handled"):
+            old_base, old_head = self.task.base_sha, self.task.head_sha
+            candidate = await changed_paths(self.repo.full_name, token, old_base, old_head)
+            main = await changed_paths(self.repo.full_name, token, old_base, main_sha)
+            mode = (self.cfg.get("merge") or {}).get("reverify", "overlap")
+            overlap = path_overlap(candidate, main)
+            decision = {"mode": mode, "old_base": old_base, "old_head": old_head, "new_base": main_sha,
+                        "candidate_paths": candidate[:20], "main_paths": main[:20],
+                        "candidate_paths_count": len(candidate), "main_paths_count": len(main), **overlap,
+                        "run": mode == "always" or (mode != "never" and overlap["overlap"])}
+            self.artifact("report", "Revalidation changed paths", json.dumps({"candidate": candidate, "main": main}))
+            state = {**decision, "phase": "rebasing"}
+            self.evidence("revalidation", state)
+            self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
+            self.event("reverify_decision", "Rebased candidate: " + ("run" if decision["run"] else "skip")
+                       + " independent verification", **decision)
+        if state["phase"] == "rebasing":
+            def before_push(head: str) -> None:
+                state["expected_head"] = head
+                self.evidence("revalidation", state)
+
+            try:
+                clean, detail = await rebase_branch(
+                    self.repo.full_name, token, branch=self.task.branch, onto=state["new_base"],
+                    task_id=self.task_id, base=state["old_base"], head=state["old_head"],
+                    expected_head=state.get("expected_head", ""), before_push=before_push)
+            except BranchMoved as exc:
+                self.block("unblock", f"{self.task.key}: PR head changed",
+                           f"The pull request branch no longer matches the verified candidate ({exc}); it was not "
+                           "rebased or merged.", status="needs_input")
+            if not clean:
+                state.update(phase="rejected", reason="conflicts with newer commits", feedback=[detail])
+                self.evidence("revalidation", state)
+            else:
+                state.update(phase="checks", head=detail)
+                self.evidence("revalidation", state)
+        if state["phase"] not in ("rejected", "handled"):
+            if self.task.head_sha != state["head"]:
+                # A merge approval belongs to the published candidate, not its branch name.
+                # Persist the new publication before advancing the head, including on resume.
+                self.evidence("published", {"head": state["head"], "base": state["new_base"],
+                                            "at": utcnow().isoformat(), "pr": self.task.pr_number})
+            self.update(head_sha=state["head"], base_sha=state["new_base"])
+        if state["phase"] in ("checks", "verify"):
+            sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
+            try:
+                await checkout(sandbox, self.repo.full_name, token, state["head"], self.task.branch)
+                if state["phase"] == "checks":
+                    async with self._check_slot(sandbox, bool(self.cfg.get("setup") or self.cfg.get("checks"))):
+                        setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                        self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
+                    state.update(setup=setup, checks=self.checks)
+                    failed = [c for c in setup + self.checks if not c["ok"]]
+                    if failed:
+                        state.update(phase="rejected", reason="fails its checks on top of newer commits",
+                                     feedback=[f"- After rebasing, `{c['command']}` failed:\n{c['tail']}" for c in failed])
+                        self.evidence("attempts", {"n": self.task.attempt, "result": "checks_failed",
+                                                   "checks": _brief(setup + self.checks)})
+                    else:
+                        state["phase"] = "verify" if state["run"] else "passed"
+                    self.evidence("revalidation", state)
+                if state["phase"] == "verify":
+                    self.checks = state.get("checks") or []
+                    patch = await extract_patch(sandbox, state["new_base"])
+                    # Reuse the original harness, isolation, AppRun and evidence path, including
+                    # persisted builder-proposed QA checks after runner reconstruction.
+                    self.stage("verify", "Independent verification of the rebased candidate")
+                    verdict = await self._verify(token, patch, self.task.attempt)
+                    state["verifier"] = self.verifier_report
+                    if verdict is None:
+                        state.update(phase="rejected", reason="failed independent verification after rebase",
+                                     feedback=self.feedback[-8:])
+                    else:
+                        state["phase"] = "passed"
+                    self.evidence("revalidation", state)
+            finally:
+                await sandbox.close()
+        await self._revalidation_body(gh, state)
+        if state["phase"] == "rejected":
+            self.feedback += state.get("feedback") or []
+            # Set the rebuild continuation before marking rejection handled: an interruption
+            # between these writes must never resume merge instead of the requested rebuild.
+            self.update(stage="revise")
+            self._fresh_budget_after_base_moved(state["reason"])
             if self.builder:
                 await self.builder.close()
                 self.builder = None
             await self.deliver(continue_from_branch=True)
             return
-        self.update(head_sha=detail, base_sha=main_sha)
-        sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
+        if state["phase"] == "passed":
+            try:
+                await gh.set_status(self.repo.full_name, state["head"], "success",
+                                    "Revalidated after rebase by MindsHub AI Factory", self._task_url())
+            except GitHubError as exc:
+                self.event("revalidation_warning", f"Could not publish revalidation status: {str(exc)[:200]}", level="warn")
+            self.update(stage="ci")
+            self.evidence("revalidation", {**state, "phase": "complete"})
+            await self.ci_then_merge()
+
+    async def _revalidation_body(self, gh: GitHub, state: dict[str, Any]) -> None:
+        """Auxiliary publication must never prevent rejection feedback or a passing delivery."""
         try:
-            await checkout(sandbox, self.repo.full_name, token, f"refs/heads/{self.task.branch}", self.task.branch)
-            await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-            checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
-        finally:
-            await sandbox.close()
-        if any(not c["ok"] for c in checks):
-            self._fresh_budget_after_base_moved("fails its checks on top of newer commits")
-            self.feedback += [f"- After rebasing onto the latest {self.repo.default_branch}, `{c['command']}` failed:\n"
-                              f"```\n{c['tail']}\n```" for c in checks if not c["ok"]]
-            await self.deliver(continue_from_branch=True)
-            return
-        try:
-            await gh.set_status(self.repo.full_name, detail, "success", "Revalidated after rebase by MindsHub AI Factory",
-                                self._task_url())
-        except GitHubError:
-            pass
-        await self.ci_then_merge()
+            pr = await gh.pull(self.repo.full_name, self.task.pr_number)
+            body = pr.get("body") or ""
+            section = _revalidation_section(state)
+            body = _replace_section(body, section, REVALIDATION_BEGIN, REVALIDATION_END)
+            if len(body) > 55_000:
+                raise ValueError("PR body too large; full revalidation details remain in task evidence")
+            await gh.request("PATCH", f"/repos/{self.repo.full_name}/pulls/{self.task.pr_number}", json={"body": body})
+        except Exception as exc:  # auxiliary formatting and GitHub failures are both best-effort
+            log.warning("revalidation PR update failed for %s: %s", self.task_id, exc)
+            self.event("revalidation_warning", f"Could not update revalidation PR body: {str(exc)[:200]}", level="warn")
 
     # smoke & release -------------------------------------------------------------
     async def smoke(self) -> None:
@@ -1396,8 +1591,9 @@ class TaskRunner:
             gh = GitHub(token)
             ref = self.task.merge_sha or await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
             await checkout(sandbox, self.repo.full_name, token, ref, f"smoke-{self.task_id[:8]}")
-            await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-            results = await self._run_commands(sandbox, commands, "smoke")
+            async with self._check_slot(sandbox):
+                await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                results = await self._run_commands(sandbox, commands, "smoke")
         finally:
             await sandbox.close()
         ok = all(r["ok"] for r in results)
@@ -1520,6 +1716,62 @@ class TaskRunner:
         self.event("task_completed", f"{self.task.key} complete: {summary}", level="success")
 
 
+FACTORY_BEGIN, FACTORY_END = "<!-- factory:begin -->", "<!-- factory:end -->"
+REVALIDATION_BEGIN, REVALIDATION_END = "<!-- factory:revalidation:begin -->", "<!-- factory:revalidation:end -->"
+
+
+def _factory_block(body: str) -> str:
+    return f"{FACTORY_BEGIN}\n{body}\n{FACTORY_END}"
+
+
+def _replace_section(body: str, section: str, begin: str, end: str) -> str:
+    start, stop = body.find(begin), body.find(end)
+    if start >= 0 and stop >= start:
+        return body[:start] + section + body[stop + len(end):]
+    return body + "\n\n" + section
+
+
+def _replace_factory_block(body: str, block: str) -> str:
+    updated = _replace_section(body, block, FACTORY_BEGIN, FACTORY_END)
+    if len(updated) > 55_000:
+        raise ValueError("PR body too large; generated details remain in task evidence")
+    return updated
+
+
+def _revalidation_section(state: dict[str, Any]) -> str:
+    """Bound serialized JSON *before* wrapping: even escaped Unicode must fit a closed fence."""
+    summary = {k: state[k] for k in ("mode", "old_base", "new_base", "run", "overlap", "phase",
+                                     "shared_files_count", "shared_directories_count") if k in state}
+    for key in ("candidate_paths", "main_paths", "shared_files", "matching_pairs"):
+        values = state.get(key) or []
+        summary[key + "_count"] = state.get(key + "_count", len(values))
+        summary[key] = values[:20]
+    for key in ("setup", "checks"):
+        commands = state.get(key) or []
+        failed = [str(c.get("command", ""))[:200] for c in commands if not c.get("ok")]
+        summary[key] = {"count": len(commands), "failed_count": len(failed), "failed": failed[:20]}
+    report = state.get("verifier") or {}
+    summary["verifier"] = {"verdict": report.get("verdict"), "summary": str(report.get("summary", ""))[:500]}
+    # Trim samples until the actual serialized payload fits, not just source characters.
+    samples = [summary[k] for k in ("candidate_paths", "main_paths", "shared_files", "matching_pairs")]
+    samples += [summary[k]["failed"] for k in ("setup", "checks")]
+    payload = json.dumps(summary, indent=2)
+    while len(payload) > 7400 and any(samples):
+        max((sample for sample in samples if sample), key=lambda x: len(json.dumps(x))).pop()
+        payload = json.dumps(summary, indent=2)
+    # All untrusted free text is bounded too, including a Unicode verifier summary.
+    if len(payload) > 7400:
+        summary["verifier"]["summary"] = "See full verifier report in task evidence."
+        payload = json.dumps(summary, indent=2)
+    return (f"{REVALIDATION_BEGIN}\n### Revalidation after base moved\n"
+            f"```json\n{payload}\n```\n{REVALIDATION_END}")
+
+
+def _objects(items: Any) -> list[dict[str, Any]]:
+    """The objects in a model-written list (a verifier's criteria or findings); anything else in it is skipped."""
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
 def _actionable(attempt: dict[str, Any]) -> bool:
     """Whether an attempt's record gives the next attempt something concrete to fix."""
     result = attempt.get("result")
@@ -1530,8 +1782,8 @@ def _actionable(attempt: dict[str, Any]) -> bool:
     if result == "verification_failed":
         verdict = attempt.get("verdict") or {}  # optional report fields may be null
         # Exactly what the feedback relays to the next attempt: unmet criteria and blocker/major findings.
-        return (any(c.get("status") != "pass" for c in verdict.get("criteria") or [])
-                or any(f.get("severity") in ("blocker", "major") for f in verdict.get("findings") or []))
+        return (any(c.get("status") != "pass" for c in _objects(verdict.get("criteria")))
+                or any(f.get("severity") in ("blocker", "major") for f in _objects(verdict.get("findings"))))
     return False
 
 

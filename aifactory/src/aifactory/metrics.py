@@ -15,6 +15,11 @@ from sqlalchemy.orm import Session
 from .models import Artifact, Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User
 
 AUTOMATED_ACTORS = {None, "", "factory", "policy", "system", "scheduler"}
+
+
+def human_message(m) -> bool:
+    """A person's post. The Lead posts guidance as a user message so agents receive it, but it is the Factory's."""
+    return m.author_kind == "user" and (m.attribution or {}).get("source") != "lead"
 APPROVALS = {"approve_plan", "approve_merge", "approve_release"}
 # Neither failures nor passes: "infra" (the model provider or the sandbox failed; the same attempt is redone) and
 # "checks_preexisting" (the configured checks fail on the base commit too; the attempt goes on to verification).
@@ -213,7 +218,7 @@ def workspace_metrics(db: Session, workspace_id: str) -> dict:
         approvals = {d.id for d in ds if approval(d)}
         plan_approvers = {d.resolved_by for d in ds if d.id in approvals and d.kind == "approve_plan"}
         assisted = any(not approval(d) for d in ds)
-        assisted |= any(m.author_kind == "user" and within(m.created_at, o) for m in outcome_messages[o.id])
+        assisted |= any(human_message(m) and within(m.created_at, o) for m in outcome_messages[o.id])
         unknown_external_merge = False
         for t in outcome_tasks[o.id]:
             merge = (t.evidence or {}).get("merge") or {}

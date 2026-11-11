@@ -13,7 +13,9 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -110,6 +112,10 @@ class Repository(Base):
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
+    # Delete review identities/evidence on disconnect, retaining outcomes and runs
+    # as the cumulative cost history, just like other outcome attribution.
+    reviews: Mapped[list["PullReview"]] = relationship(cascade="all, delete-orphan")
+
     __table_args__ = (UniqueConstraint("workspace_id", "full_name"),)
 
 
@@ -149,7 +155,7 @@ class Outcome(Base):
     harness: Mapped[str | None] = mapped_column(String(20), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="planning", index=True)
     priority: Mapped[int] = mapped_column(Integer, default=2)  # 0 urgent .. 3 low
-    source: Mapped[str] = mapped_column(String(40), default="user")  # user|signal|improvement
+    source: Mapped[str] = mapped_column(String(40), default="user")  # user|signal|improvement|review
     signal_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     summary: Mapped[str] = mapped_column(Text, default="")
     blocked_reason: Mapped[str] = mapped_column(Text, default="")
@@ -192,6 +198,56 @@ class LinearWarningOperation(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# Stable states for one review of one immutable PR head.
+REVIEW_STATUSES = ("queued", "running", "passed", "failed", "blocked", "superseded")
+
+
+class PullReview(Base):
+    """One PR identity and its cumulative, review-only budgeting outcome."""
+
+    __tablename__ = "pull_reviews"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    pr_number: Mapped[int] = mapped_column(Integer)
+    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"), unique=True)
+    head_sha: Mapped[str] = mapped_column(String(64), default="")
+    comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    outcome: Mapped[Outcome] = relationship()
+    attempts: Mapped[list["ReviewAttempt"]] = relationship(
+        back_populates="review", order_by="ReviewAttempt.created_at", cascade="all, delete-orphan")
+
+    __table_args__ = (UniqueConstraint("repo_id", "pr_number"),)
+
+
+class ReviewAttempt(Base):
+    """Durable verdict and evidence for a PR head; retries reuse this record."""
+
+    __tablename__ = "review_attempts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    review_id: Mapped[str] = mapped_column(ForeignKey("pull_reviews.id"), index=True)
+    head_sha: Mapped[str] = mapped_column(String(64))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    verdict: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    review: Mapped[PullReview] = relationship(back_populates="attempts")
+
+    __table_args__ = (
+        UniqueConstraint("review_id", "head_sha"),
+        CheckConstraint("status IN ('queued', 'running', 'passed', 'failed', 'blocked', 'superseded')",
+                        name="ck_review_attempt_status"),
+    )
 
 
 class Plan(Base):
@@ -599,13 +655,16 @@ class GateVerdict(Base):
 
 
 class MindAction(Base):
-    """Private confirmation ledger; target and kind are immutable after proposal."""
+    """Private confirmation ledger; target and kind are immutable after proposal.
+
+    A card for workspace-level work (a new outcome) has no outcome until it is confirmed (db.py relaxes older
+    tables)."""
     __tablename__ = "mind_actions"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     thread_id: Mapped[str] = mapped_column(String(32), index=True)
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
-    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"))
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     decision_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     kind: Mapped[str] = mapped_column(String(30))
@@ -613,6 +672,9 @@ class MindAction(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # A digest of the target's state at proposal, which a confirmation must still match. It lives outside the
+    # scrubbed JSON: redaction (which can span neighbouring values) must never alter it. Null on older cards.
+    digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -654,3 +716,63 @@ class DefinitionRevision(Base):
 @event.listens_for(DefinitionRevision, "before_delete")
 def _immutable_definition_revision(_mapper, _connection, revision: DefinitionRevision) -> None:
     raise ValueError("Definition revisions are immutable; save or restore a new revision")
+
+
+class MindThread(Base):
+    """Person-owned conversation; never part of the workspace activity journal."""
+    __tablename__ = "mind_threads"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200), default="New conversation")
+    billing_workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    workspace_ids: Mapped[list[str]] = mapped_column(JSON)
+    model_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="idle")
+    active_turn: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class MindMessage(Base):
+    __tablename__ = "mind_messages"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("mind_threads.id"), index=True)
+    role: Mapped[str] = mapped_column(String(12))
+    text: Mapped[str] = mapped_column(Text, default="")
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    citations: Mapped[list] = mapped_column(JSON, default=list)
+    action_cards: Mapped[list] = mapped_column(JSON, default=list)
+    history: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="completed")
+    client_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    turn_id: Mapped[str] = mapped_column(String(32), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (UniqueConstraint("thread_id", "client_message_id"),
+                      UniqueConstraint("thread_id", "position"))
+
+
+class MindAccount(Base):
+    """Database CAS admission, shared by all of a person's threads and processes."""
+    __tablename__ = "mind_accounts"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    claim: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MindCharge(Base):
+    """One admitted request, not one cumulative provider session total.
+
+    A request is assigned to its UTC admission day, including late reconciliation.
+    Session totals are allocated as deltas to the latest pending request.
+    """
+    __tablename__ = "mind_charges"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("mind_threads.id"), nullable=True, index=True)
+    billing_workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    session_id: Mapped[str] = mapped_column(String(100), index=True)
+    usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
