@@ -155,6 +155,9 @@ def test_anton_tool_results_warn_near_the_time_limit_and_only_finish_runs_past_i
     if seconds_left == 300:  # under ten minutes: the tool ran, and its result says how much is left
         assert (sb.work / "hello.txt").read_text() == "hi from anton\n"
         assert "Budget: about 4 min and 79 turns are left in this session. Wrap up" in outputs[0]
+        # read_image returns an image and a line of text, not a string: the notice is added to its text.
+        assert "Loaded .factory/screen.jpg" in outputs[1]
+        assert "turns are left in this session. Wrap up" in outputs[1]
     else:  # under 90 seconds: nothing but finish runs
         assert not (sb.work / "hello.txt").exists()
         assert all("so this tool did not run. Call finish now" in output for output in outputs)

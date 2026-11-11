@@ -73,6 +73,19 @@ async def _create_admitted_response(config, run_id, create, provider, body):
     return await create(provider, body)
 
 
+def _with_note(output: Any, note: str) -> Any:
+    """A tool result with a note added to what the agent reads. An Anton tool returns text, or a ToolOutcome whose
+    content is text or a list of content blocks (read_image returns the image and a line of text)."""
+    if isinstance(output, str):
+        return f"{output}\n\n{note}"
+    content = getattr(output, "content", None)
+    if isinstance(content, str):
+        return replace(output, content=f"{content}\n\n{note}")
+    if isinstance(content, list):
+        return replace(output, content=[*content, {"type": "text", "text": note}])
+    return output
+
+
 class AntonHarness:
     name = "anton"
     label = "Anton"
@@ -157,7 +170,7 @@ class AntonHarness:
                             "report of what is done and what is not.")
                 output = await run(chat, arguments)
                 warning = budget_warning(session, state["calls"])
-                return f"{output}\n\n{warning}" if warning and isinstance(output, str) else output
+                return _with_note(output, warning) if warning else output
             return replace(tool, handler=handler)
 
         def no_runtime(**_kwargs):
