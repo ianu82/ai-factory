@@ -296,3 +296,20 @@ def test_explicit_github_mode_never_falls_back_on_a_lookup_failure(factory):
     r.cfg = {**r.cfg, "merge": {"queue": "github"}}
     with pytest.raises(Stop):
         asyncio.run(merge_manager.github_queue_state(Broken("token"), r))
+
+
+def test_a_task_handed_to_github_stays_parked_when_lookup_fails_or_it_just_merged(factory):
+    class Broken(QueueGitHub):
+        async def graphql(self, query, variables):
+            raise RuntimeError("boom")
+
+    tid = merge_task(factory, key="T1")
+    with session_scope() as s:
+        s.get(Task, tid).evidence = {"merge_queue": {"entered_at": utcnow().isoformat(), "github": True}}
+    with pytest.raises(Stop):
+        asyncio.run(merge_manager.github_queue_state(Broken("token"), runner(tid)))
+    r = runner(tid)
+    with pytest.raises(Stop):
+        asyncio.run(merge_manager.merge_via_github_queue(r, QueueGitHub("token"),
+                                                         {"pr_id": "PR1", "merged": True, "entry": None}))
+    assert state(tid)[0] == "queued"

@@ -200,7 +200,8 @@ async def github_queue_state(gh, runner) -> dict[str, Any] | None:
         data = await gh.graphql(QUEUE_QUERY, {"owner": owner, "name": name, "branch": runner.repo.default_branch,
                                               "number": runner.task.pr_number})
     except Exception:
-        if mode == "github":  # explicitly GitHub's queue: never fall back to a direct merge on a lookup failure
+        if mode == "github" or _entry(runner.task).get("github"):
+            # Explicit GitHub mode, or already handed to GitHub: never fall back to a direct merge on a lookup failure.
             _park(runner, _entry(runner.task), retry_after=GITHUB_QUEUE_RETRY)
         return None
     repo = (data.get("data") or data).get("repository") or {}
@@ -213,7 +214,8 @@ async def github_queue_state(gh, runner) -> dict[str, Any] | None:
 async def merge_via_github_queue(runner, gh, state: dict[str, Any]) -> None:
     """Add the turn holder to GitHub's merge queue, or keep waiting on it. Always parks (raises Stop)."""
     entry = _entry(runner.task)
-    if state["entry"]:
+    if state["entry"] or state["merged"]:
+        # Still queued, or GitHub merged it just now: the next pass sees the merge and completes the task.
         _park(runner, {**entry, "github": True, "paused": ""}, retry_after=GITHUB_QUEUE_RETRY)
     if entry.get("github"):
         # It was in GitHub's queue and is neither queued nor merged: GitHub removed it (failed checks or a conflict).
