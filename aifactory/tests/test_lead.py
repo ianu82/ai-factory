@@ -8,7 +8,8 @@ import pytest
 
 from aifactory import db
 from aifactory.inference import ProviderConfig
-from aifactory.models import Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User, Workspace
+from aifactory.models import (Decision, DecisionReview, Event, Message, Outcome, Plan, Repository, Run, Task, User,
+                              Workspace)
 from aifactory.pipeline import lead
 from tests.fakes import ScriptedModel, call, step
 
@@ -74,6 +75,16 @@ def test_waiting_decisions_and_peoples_posts_wake_the_lead(world):
         s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
                       author_kind="user", body="Why is T1 stuck?"))
     assert woken()[world["outcome"]]["reasons"] == ["1 new post from people"]
+
+
+def test_a_decision_under_judge_review_reaches_the_lead_only_once_the_judge_holds_it(world):
+    with db.session_scope() as s:
+        s.add(DecisionReview(workspace_id=world["ws"], decision_id=world["question"], state="pending"))
+    assert woken()[world["outcome"]]["decisions"] == [world["merge"]]  # the judge goes first
+    with db.session_scope() as s:
+        review = s.query(DecisionReview).one()
+        review.state, review.finished_at, review.report = "finished", db.utcnow(), {"verdict": "hold"}
+    assert set(woken()[world["outcome"]]["decisions"]) == {world["question"], world["merge"]}
 
 
 def test_the_lead_waits_its_turn(world):
