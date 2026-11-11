@@ -1445,6 +1445,50 @@ def test_a_start_leaves_open_the_sessions_of_a_task_another_instance_is_running(
         assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}] * 2
 
 
+def test_a_start_closes_a_requeued_tasks_sessions_before_another_server_can_claim_it(factory, monkeypatch):
+    """A start requeues a dead owner's task and closes the sessions it left open in one transaction. Closing them
+    after the requeue was committed left a gap: another server claims the task, and from then on the dead owner's
+    session looked like one that server is running, so it stayed open with its cost counted as known."""
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    other, until = "other-host-1-abc123", clock[0] + timedelta(seconds=60)
+    dead = leased_task(factory, lease_owner="gone-host-1-abc123", lease_expires_at=clock[0] - timedelta(seconds=1))
+
+    def session(s, task_id, started_at):
+        task = s.get(Task, task_id)
+        run = Run(workspace_id=task.workspace_id, outcome_id=task.outcome_id, task_id=task_id, harness="native",
+                  role="builder", started_at=started_at)
+        s.add(run)
+        s.flush()
+        return run.id
+
+    with session_scope() as s:
+        lost = session(s, dead, clock[0] - timedelta(minutes=5))
+    orch = Orchestrator()
+    reclaim, started = orch._reclaim, []
+
+    def reclaim_then_another_server_claims(**kwargs):
+        requeued = reclaim(**kwargs)
+        with session_scope() as s:
+            for task_id in requeued:
+                task = s.get(Task, task_id)
+                task.status, task.lease_owner, task.lease_expires_at = "running", other, until
+                started.append(session(s, task_id, clock[0]))
+        return requeued
+
+    monkeypatch.setattr(orch, "_reclaim", reclaim_then_another_server_claims)
+    orch._recover()
+    assert lease(dead) == ("running", other, until)
+    with session_scope() as s:
+        assert (s.get(Run, lost).status, s.get(Run, lost).cost_known) == ("interrupted", False)
+        assert [s.get(Run, run_id).status for run_id in started] == ["running"]  # the other server's own session
+        assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}]
+
+
 def test_the_heartbeat_extends_only_the_leases_of_tasks_this_instance_is_running(factory, monkeypatch):
     from datetime import datetime, timedelta
 

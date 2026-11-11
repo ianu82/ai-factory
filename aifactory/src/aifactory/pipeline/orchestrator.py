@@ -153,21 +153,21 @@ class Orchestrator:
         with session_scope() as s:
             s.query(Task).filter(Task.status == "waiting_ci").update(
                 {Task.lease_owner: "", Task.lease_expires_at: None})
-        self._reclaim()
-        self._close_interrupted_runs()
+        self._reclaim(start=True)
         from .lead import recover as recover_leads
 
         recover_leads()
         self._complete_accepted()
 
-    def _reclaim(self, close_runs: bool = False) -> list[str]:
+    def _reclaim(self, start: bool = False) -> list[str]:
         """Requeue the running tasks nobody holds: no owner, no expiry (rows from before leases had one) or a lease
         that ran out. A live lease is another instance's work. A task this instance runs is its own to finish, even
         when its heartbeat fell behind. Returns the ids of the tasks it requeued.
 
-        `close_runs`: their owner died mid-session, so close the sessions it left open, in the transaction that
-        requeues the tasks: once that is committed another server may claim one and start a session of its own. A
-        start closes every session nobody is running right after this, so it does not ask."""
+        Their owner died mid-session, so the sessions it left open are closed in the transaction that requeues the
+        tasks: once that is committed another server may claim one and start a session of its own, and a later look
+        could not tell the dead owner's session from that one. `start`: this server is starting, so the same
+        transaction closes every other session nobody is running too (a planning session has no task to requeue)."""
         from sqlalchemy import or_
 
         now = utcnow()
@@ -190,7 +190,9 @@ class Orchestrator:
                 record(task.workspace_id, "resumed",
                        f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
-            if close_runs and reclaimed:
+            if start:
+                self._close_interrupted_runs(session=s)
+            elif reclaimed:
                 self._close_interrupted_runs(reclaimed, session=s)
         return reclaimed
 
@@ -201,7 +203,7 @@ class Orchestrator:
         if time.monotonic() - getattr(self, "_last_reclaim", float("-inf")) < HEARTBEAT_SECONDS:
             return
         self._last_reclaim = time.monotonic()
-        self._reclaim(close_runs=True)  # the start-up pass left a live owner's sessions open for it
+        self._reclaim()  # this also closes the sessions a start left open for an owner that was still alive
 
     def _lease_end(self):
         from datetime import timedelta
@@ -235,8 +237,9 @@ class Orchestrator:
 
         At a start (`tasks` is None) that is every open session except those of a task another instance holds with a
         live lease: that session is running now, on the other server. They are closed when their task is reclaimed,
-        if its owner dies without closing them (`tasks`: the ids being requeued; `session`: the transaction that
-        requeues them, so a session another server starts after claiming one is never among them)."""
+        if its owner dies without closing them (`tasks`: the ids being requeued). `session`: the transaction that
+        requeues tasks, at a start as well, so a session another server starts after claiming one is never among
+        them and the dead owner's sessions are never taken for that server's."""
         from contextlib import nullcontext
 
         from sqlalchemy import func, or_, select
