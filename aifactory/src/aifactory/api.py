@@ -1044,8 +1044,9 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
     from .pipeline.lead import notes_for
 
     lead_notes = notes_for(db, decisions)
+    # Every open alert: one per live condition, so the list is bounded by what is wrong, and the count must be true.
     alerts = db.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.status == "open") \
-        .order_by(Alert.opened_at.desc()).limit(50).all()
+        .order_by(Alert.opened_at.desc()).all()
     about = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({a.outcome_id for a in alerts if a.outcome_id}))}
     alert_tasks = {t.id: t.key for t in db.query(Task).filter(Task.id.in_({a.task_id for a in alerts if a.task_id}))}
     return {

@@ -25,7 +25,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
 )
-from sqlalchemy import event, inspect
+from sqlalchemy import event, inspect, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base, utcnow
@@ -445,13 +445,21 @@ class Decision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+ALERT_LIVE = text("status IN ('watching', 'open', 'dismissed')")
+
+
 class Alert(Base):
     """Stuck work or a repeated failure that people should know about (pipeline/watch.py). One row per condition
     while it lasts: watching (its Lead was woken; not shown yet), open (shown in the Inbox), dismissed by a person,
     or cleared once the condition went away. A condition that returns later is a new row."""
 
     __tablename__ = "alerts"
-    __table_args__ = (Index("ix_alerts_workspace_status", "workspace_id", "status"),)
+    __table_args__ = (
+        Index("ix_alerts_workspace_status", "workspace_id", "status"),
+        # One live alert per condition, even while two schedulers run the watch at once (during a deploy).
+        Index("ux_alerts_live_key", "workspace_id", "key", unique=True, postgresql_where=ALERT_LIVE,
+              sqlite_where=ALERT_LIVE),
+    )
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workspace_id: Mapped[str] = mapped_column(String(32))
     outcome_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)

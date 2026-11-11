@@ -26,7 +26,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 
 from ..db import session_scope, utcnow
 from ..events import notify, record
@@ -49,13 +50,18 @@ DECISIONS = {"approve_merge": "Merge approval", "approve_plan": "Plan approval",
 WAITING = {"needs_input": "waiting for an answer", "awaiting_approval": "waiting for approval", "blocked": "blocked",
            "failed": "failed", "smoke_failed": "failed its post-merge check"}
 DROPPED = ("abandoned", "cancelled")
-# Not the work moving: the watch's own records, the Lead's posts and guidance, and session starts and ends (sessions
-# are read from runs, where the Lead's are left out).
-NOT_ACTIVITY = ("lead_watch", "alert_raised", "alert_dismissed", "lead_note", "lead_update", "guidance",
-                "run_started", "run_finished")
+# Not the work moving: the watch's own records, the Lead's posts, and session starts and ends (sessions are read
+# from runs, where the Lead's are left out). The Lead's guidance is left out in _last_activity: it carries the Lead's
+# run, and a person's guidance, which does count, carries none.
+NOT_ACTIVITY = ("lead_watch", "alert_raised", "alert_dismissed", "lead_note", "lead_update", "run_started",
+                "run_finished")
 # A task out of attempts is the task's own failure, not the pipeline's; the failure classes of review item L2 will
 # tell them apart properly.
 OWN_FAILURE = re.compile(r"did not pass after", re.I)
+# A session a restart ended didn't fail: the next start picks the work up again.
+RESTARTED = re.compile(r"^\s*Interrupted by a restart", re.I)
+# Unblock titles that name no cause: the decision's body carries it.
+NO_CAUSE = re.compile(r"^(A task stopped unexpectedly|infrastructure problem)$", re.I)
 
 
 def alert_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -103,9 +109,9 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
     for d in decisions:
         if d.outcome_id and d.outcome_id not in outcomes:
             continue  # its outcome ended: nothing to chase
-        if actionable(d) and now - d.created_at >= after:
+        if actionable(d) and now - handed_off(d) >= after:
             add(f"overdue:{d.id}", "overdue", f"{DECISIONS.get(d.kind, 'Decision')} has waited over {_span(after)}",
-                d.title, d.created_at, outcome_id=d.outcome_id, task_id=d.task_id, decision_id=d.id)
+                d.title, handed_off(d), outcome_id=d.outcome_id, task_id=d.task_id, decision_id=d.id)
 
     asked_tasks = {d.task_id for d in decisions if d.task_id}  # any open decision, even one a judge is reviewing
     asked_outcomes = {d.outcome_id for d in decisions if d.outcome_id}
@@ -120,7 +126,9 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
     by_outcome: dict[str, list[Task]] = {}
     for t in tasks:
         by_outcome.setdefault(t.outcome_id, []).append(t)
-    busy = s.query(Run.id).filter(Run.workspace_id == workspace_id, Run.status == "running").first() is not None
+    # Agent sessions only: a Lead the watch woke is running because the work is quiet, not a sign it is moving.
+    busy = s.query(Run.id).filter(Run.workspace_id == workspace_id, Run.status == "running",
+                                  Run.role != "lead").first() is not None
     # A provider hold stops all work on purpose, and is itself a decision waiting on a person (an overdue alert once
     # it has waited): every outcome going quiet under it isn't news.
     held = workspace_id in held_workspaces(s)
@@ -150,11 +158,19 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
     return found
 
 
+def handed_off(d: Decision) -> datetime:
+    """When a decision reached people: when it opened or, when a judge reviewed it first, when that review finished.
+    Time with the judge isn't time a person kept it waiting."""
+    finished = d.review.finished_at if d.review is not None else None
+    return max(d.created_at, finished) if finished else d.created_at
+
+
 def _last_activity(s, outcome_id: str) -> datetime | None:
     """When the work on an outcome last moved: an event other than NOT_ACTIVITY, or an agent session (not the
     Lead's) starting or ending."""
-    event = s.query(func.max(Event.created_at)).filter(Event.outcome_id == outcome_id,
-                                                       Event.kind.notin_(NOT_ACTIVITY)).scalar()
+    event = s.query(func.max(Event.created_at)).filter(
+        Event.outcome_id == outcome_id, Event.kind.notin_(NOT_ACTIVITY),
+        or_(Event.kind != "guidance", Event.run_id.is_(None))).scalar()
     run = s.query(func.max(func.coalesce(Run.finished_at, Run.started_at))).filter(
         Run.outcome_id == outcome_id, Run.role != "lead").scalar()
     return max((at for at in (event, run) if at is not None), default=None)
@@ -179,11 +195,15 @@ def _failures(s, workspace_id: str, now: datetime) -> dict[str, dict[str, Any]]:
 
     failed_at = func.coalesce(Run.finished_at, Run.started_at)  # a run fails when it ends; older rows lack an end
     for run in s.query(Run).filter(Run.workspace_id == workspace_id, Run.status == "failed", failed_at > since):
-        add(run.error, run.task_id, run.outcome_id, run.finished_at or run.started_at)
+        if not RESTARTED.match(run.error or ""):
+            add(run.error, run.task_id, run.outcome_id, run.finished_at or run.started_at)
     for d in s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == "unblock",
                                       Decision.created_at > since):
-        if not OWN_FAILURE.search(d.title or ""):
-            add(d.title, d.task_id, d.outcome_id, d.created_at)
+        if OWN_FAILURE.search(d.title or ""):
+            continue
+        title = reason_of(d.title)
+        add(f"{title}: {reason_of(d.body)}" if NO_CAUSE.match(title) else title, d.task_id, d.outcome_id,
+            d.created_at)
     return seen
 
 
@@ -209,8 +229,11 @@ def _apply(s, workspace_id: str, found: dict[str, dict[str, Any]], lead_on: bool
                           task_id=spec["task_id"], decision_id=spec["decision_id"], title=spec["title"],
                           body=spec["body"], since=spec["since"], data=spec["data"],
                           status="watching" if stuck else "open", created_at=now)
-            s.add(alert)
-            s.flush()
+            try:
+                with s.begin_nested():  # the index allows one live alert per condition
+                    s.add(alert)
+            except IntegrityError:
+                continue  # another scheduler raised it since this pass looked; it carries on from there
             counts["raised"] += 1
             if stuck and lead_on and spec["outcome_id"]:
                 # The Lead's wake rules read this event: its next run looks into why, and says so to people.
