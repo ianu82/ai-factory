@@ -358,6 +358,9 @@ def test_status_stays_pending_while_another_request_holds_the_accounting_claim(w
     status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
     assert (status["status"], status["accounting"]) == ("unavailable", "pending")
     assert "settling" in status["reason"]
+    # The field name is protocol, not content: a saved secret that happens to equal it never renames it.
+    save_secret(ids[2], "accounting")
+    assert client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()["accounting"] == "pending"
 
 
 def test_charged_failed_readiness_and_zero_budget(world):
