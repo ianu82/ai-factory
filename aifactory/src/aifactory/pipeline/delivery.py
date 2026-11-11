@@ -32,9 +32,8 @@ from ..sandbox import LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, outcome_cost, precedents,
-                      publish_decision, run_agent,
-                      workspace_settings)
+from .runtime import (SessionSpec, budget_extension, guidance_history, open_decision, outcome_committed,
+                      outcome_cost, precedents, publish_decision, run_agent, workspace_settings)
 
 from .lifecycle import transition
 
@@ -332,11 +331,28 @@ class TaskRunner:
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")
-            spent, known = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
-            if budget and known and spent >= budget and not (self.task.evidence or {}).get("budget_override"):
-                self.block("budget", f"Outcome #{self.outcome.number} reached its ${budget:.0f} budget",
-                           f"Spent ${spent:.2f}. Raise the budget in Settings or approve continuing.", status="needs_input",
-                           options=[{"value": "retry", "label": "Continue anyway"}, {"value": "abandon", "label": "Stop"}])
+            # Spending whose cost is known is a lower bound, so reaching the budget with it alone is conclusive.
+            spent, _ = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
+            extra = budget_extension(self.settings)
+            if (self.task.evidence or {}).get("budget_override"):
+                # Continuing used to lift the limit for good. Such a task gets one allowance from here instead.
+                with session_scope() as s:
+                    task = s.get(Task, self.task_id)
+                    ev = {k: v for k, v in (task.evidence or {}).items() if k != "budget_override"}
+                    task.evidence = self.task.evidence = {**ev, "budget_allowance_usd": round(spent + extra, 2)}
+            # Continuing past the budget allows spending up to an amount (decisions.resolve), not without limit.
+            limit = max(budget or 0, (self.task.evidence or {}).get("budget_allowance_usd") or 0)
+            if budget and spent >= limit:
+                more = f"{extra:.2f}".removesuffix(".00")
+                extended = limit > budget
+                reached = f"the ${limit:.2f} it was allowed to spend" if extended else f"its ${budget:.0f} budget"
+                self.block("budget", f"Outcome #{self.outcome.number} reached {reached}",
+                           f"Spent ${spent:.2f}; the limit was ${limit:.2f}"
+                           + (f" (the ${budget:.0f} budget, extended when it last continued)" if extended else "")
+                           + f". Raise the budget in Settings, or continue with ${more} more than is spent now.",
+                           status="needs_input",
+                           options=[{"value": "retry", "label": f"Continue with ${more} more"},
+                                    {"value": "abandon", "label": "Stop"}])
             if self.builder is None:
                 try:
                     await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
@@ -356,9 +372,31 @@ class TaskRunner:
                 cause = infrastructure_problem(error)
                 if cause:
                     self._infrastructure(attempt, "build", error, cause)
-                self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
-                self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
-                continue
+                # A session stopped by its own cap (time, turns, tokens, cost) may have left the work done, so its
+                # tree is checked as it stands: unless it is empty or the candidate this runner already judged.
+                left = None
+                if any(cap.lower() in error.lower() for cap in RUN_CAPS):
+                    try:
+                        left = await extract_patch(self.builder, self.task.base_sha)
+                    except SandboxError:
+                        pass
+                if left is None or left.empty or (self.patch is not None and left.diff == self.patch.diff):
+                    self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
+                    self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
+                    continue
+                from ..harness import HarnessResult
+
+                self.feedback.append(f"- The previous builder session reached its limit before it reported "
+                                     f"({error[:300]}). The factory checked the change as that session left it. Work "
+                                     "in small complete steps and finish with your report before the limit.")
+                self.event("builder_unreported", f"The builder session reached its limit before it reported "
+                           f"({error[:200]}); checking the {len(left.files)} file(s) it changed as they stand",
+                           level="warn", error=error[:300], files=len(left.files))
+                # A stand-in for the report, shown to the verifier and on the pull request in place of a summary.
+                result = HarnessResult(turns=run.turns or 0, report={"status": "unreported", "summary": (
+                    f"The builder session reached its limit before it reported ({error[:200]}), so there is no "
+                    "builder summary. This change is the working tree as that session left it; the Factory checks "
+                    "and verifies it as it stood.")})
             self.builder_report = result.report
             self.evidence("builder_report", self.builder_report)
             if result.report.get("status") == "blocked":
@@ -880,7 +918,10 @@ class TaskRunner:
                 return False
             builder = s.get(Run, diff.run_id) if diff.run_id else None
             raw, data = (diff.content or "").encode(), dict(diff.data or {})
-            report = dict((builder.result if builder else None) or {})
+            # A builder stopped by its cap has no result on its run: the stand-in for its report is kept with the
+            # task, like every builder report, and no builder has run since this candidate was verified.
+            report = dict((builder.result if builder else None) or (self.task.evidence or {}).get("builder_report")
+                          or {})
         if hashlib.sha256(raw).hexdigest() != last["patch_sha256"]:
             return False
         self.patch = Patch(diff=raw, files=list(data.get("files") or []), additions=int(data.get("additions") or 0),
