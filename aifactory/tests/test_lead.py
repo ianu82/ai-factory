@@ -248,7 +248,8 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
         resolved = s.query(Event).filter_by(kind="decision_resolved").one()
         assert resolved.data["source"] == "lead" and resolved.data["run_id"] == row.id
         note = next(m for m in s.query(Message).filter_by(author_kind="lead") if (m.attribution or {}).get("decision_id"))
-        assert note.attribution == {"source": "lead", "run_id": row.id, "decision_id": world["merge"]}
+        assert note.attribution == {"source": "lead", "run_id": row.id, "decision_id": world["merge"],
+                                    "question": lead.question_mark(s, merge)}  # the question it answered
         kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == world["outcome"]).order_by(Event.id)]
         assert kinds[0] == "run_started" and kinds[-1] == "run_finished"
         assert "decision_resolved" in kinds and "lead_note" in kinds
@@ -751,3 +752,146 @@ def test_a_spent_outcome_that_just_finished_still_posts_its_closing_update(world
     model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
     row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["the outcome has ended"], {}))
     assert row.status == "succeeded"  # within the Lead's own run cap
+
+
+HEAD = "abcdef1234567890abcdef1234567890abcdef12"
+
+
+def merge_ready(world, head=HEAD):
+    with db.session_scope() as s:
+        t = s.get(Task, world["task"])
+        t.pr_number, t.head_sha, t.status = 12, head, "awaiting_approval"
+
+
+def test_review_line_says_what_review_reports_for_the_commit():
+    state = {"head": HEAD, "checked": True, "reviewed": False, "open": [], "changes_requested_by": []}
+    assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: not in yet."
+    assert lead.review_line({**state, "checked": False}, 12).endswith("couldn't be read from GitHub, so it isn't known to be clean.")
+    assert lead.review_line({**state, "reviewed": True}, 12) == "Review of PR #12 at abcdef1: reviewed, no open findings."
+    found = [{"severity": "P1"}, {"severity": "P2"}]
+    assert lead.review_line({**state, "reviewed": True, "open": found, "changes_requested_by": ["ian"]}, 12) == (
+        "Review of PR #12 at abcdef1: 2 open review findings, 1 of them P0/P1; changes requested by ian.")
+    assert not lead.settled(state) and lead.settled({**state, "reviewed": True})
+
+
+def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
+    from aifactory import github
+
+    calls = []
+
+    class FakeGitHub:
+        def __init__(self, _token):
+            pass
+
+        async def request(self, method, path, *, json=None, params=None, **_kw):
+            calls.append(path)
+            if path.endswith("/reviews"):
+                return [{"commit_id": "an-older-commit", "state": "COMMENTED", "user": {"login": lead.CODEX}}]
+            if "/issues/" in path:
+                return [{"user": {"login": lead.CODEX}, "body": f"Codex Review\\n**Reviewed commit:** `{HEAD[:10]}`"}]
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                {"isResolved": False, "isOutdated": False, "path": "a.py", "line": 3, "comments": {"nodes": [
+                    {"author": {"login": lead.CODEX}, "body": "**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"}]}},
+                {"isResolved": True, "isOutdated": False, "path": "b.py", "line": 1, "comments": {"nodes": [{"body": "P1 Badge"}]}},
+                {"isResolved": False, "isOutdated": True, "path": "c.py", "line": 1, "comments": {"nodes": [{"body": "P0 Badge"}]}},
+            ]}}}}}
+
+    monkeypatch.setattr(github, "GitHub", FakeGitHub)
+    monkeypatch.setattr(github, "resolve_credential", lambda ws: "token")
+    state = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
+    assert state["checked"] and state["reviewed"]  # Codex's receipt names this commit
+    assert [(f["severity"], f["path"], f["text"]) for f in state["open"]] == [("P1", "a.py", "Fix the lock")]
+    assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: 1 open review finding, 1 of them P0/P1."
+
+    class Broken(FakeGitHub):
+        async def request(self, *a, **k):
+            raise github.GitHubError("rate limited", status=403)
+
+    monkeypatch.setattr(github, "GitHub", Broken)
+    assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["checked"] is False  # unknown, never clean
+
+
+def unreviewed(*_args):
+    async def state(ws, repo, number, head):
+        return {"head": head, "checked": True, "reviewed": False, "open": [], "changes_requested_by": []}
+    return state
+
+
+def test_a_merge_note_starts_with_the_review_of_its_commit(world, model, monkeypatch):
+    merge_ready(world)
+    monkeypatch.setattr(lead, "review_state", unreviewed())
+    first = []
+
+    def script(messages):
+        if step(messages) == 0:
+            first.append(messages[1]["content"])
+            return {"content": "", "tool_calls": [call("note_for_people", {
+                "decision_id": world["merge"], "text": "I recommend merging."}), call("finish", {"summary": "Noted"}, 1)]}
+        return {"content": "", "tool_calls": [call("finish", {"summary": "Noted"})]}
+
+    model.scripts = {"lead": script}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded", row.error
+    assert "merge_reviews" in first[0] and "not in yet" in first[0]  # the Lead sees it before it writes
+    with db.session_scope() as s:
+        note = s.query(Message).filter_by(author_kind="lead").one()
+        assert note.body.startswith("Review of PR #12 at abcdef1: not in yet.\n\nI recommend merging.")
+    assert row.result["reviews"][world["merge"]]["settled"] is False and row.result["reviews"][world["merge"]]["head"] == HEAD
+
+
+def test_a_push_or_a_pending_review_wakes_the_lead_again(world):
+    merge_ready(world)
+    seen = woken()[world["outcome"]]["seen"]
+    with db.session_scope() as s:
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="succeeded", started_at=db.utcnow() - timedelta(minutes=5), config_snapshot={"seen": seen},
+                  result={"reviews": {world["merge"]: {"head": HEAD, "settled": False}}}))
+    assert world["outcome"] not in woken()  # looked at five minutes ago
+    with db.session_scope() as s:
+        s.query(Run).one().started_at = db.utcnow() - timedelta(minutes=11)
+    assert woken()[world["outcome"]]["reasons"] == ["review of a merge approval may be in now"]
+    with db.session_scope() as s:
+        s.query(Run).one().result = {"reviews": {world["merge"]: {"head": HEAD, "settled": True}}}
+    assert world["outcome"] not in woken()  # reviewed: nothing to look at again
+    merge_ready(world, head="f" * 40)  # a new commit is up for merging
+    assert woken()[world["outcome"]]["decisions"] == [world["merge"]]
+
+
+def test_continuing_past_the_budget_wakes_the_lead(world):
+    seen = woken()[world["outcome"]]["seen"]
+    lead_run(world, seen, ago=timedelta(minutes=5))
+    assert world["outcome"] not in woken()
+    with db.session_scope() as s:
+        s.add(Decision(workspace_id=world["ws"], outcome_id=world["outcome"], kind="budget", title="Budget",
+                       status="resolved", resolution="retry", resolved_by=world["uid"], resolved_at=db.utcnow(),
+                       options=[{"value": "retry"}]))
+    assert woken()[world["outcome"]]["reasons"] == ["a person let this outcome continue past its budget"]
+
+
+def test_a_stale_lead_reservation_doesnt_block_a_new_run(world, model):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": 2}}
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="running", started_at=db.utcnow() - timedelta(minutes=45),
+                  config_snapshot={"budget_reserved": 2.0}))  # cut off, inside 2 x run_minutes but past STALE
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and row.config_snapshot["budget_reserved"] == 2.0
+
+
+def test_a_note_shows_only_against_the_question_it_answered(world, client):
+    def shown():
+        inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+        return inbox[world["merge"]]["lead_note"]
+
+    merge_ready(world)
+    lead.Tools(world["ws"], world["outcome"], "run-1").call(
+        "note_for_people", {"decision_id": world["merge"], "text": "CI and review are clean on this commit."})
+    assert shown()["text"] == "CI and review are clean on this commit."
+    merge_ready(world, head="f" * 40)  # a new commit is up for merging: that note was about the old one
+    assert shown() is None
+    merge_ready(world)
+    with db.session_scope() as s:  # the question itself is rewritten in place
+        s.get(Decision, world["merge"]).body = "Merge PR #12 now that the base moved?"
+    assert shown() is None

@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -56,6 +57,19 @@ FIRST_LOOK = timedelta(days=1)  # posts older than this predate the Lead: its fi
 MAX_MINUTES = 15
 PER_RUN = {"resolve_decision": 5, "post_guidance": 3, "note_for_people": 5, "post_update": 2}
 RESULT_CHARS = 40_000
+# Merge approvals: what review says about the exact commit up for merging, read from GitHub on every run.
+REVIEW_RECHECK = timedelta(minutes=10)  # while that commit's review isn't in, look again this often
+CODEX = "chatgpt-codex-connector[bot]"
+SEVERITY = re.compile(r"\b(P[0-3]) Badge")
+BLOCKING = ("P0", "P1")
+THREADS = """query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    reviewThreads(first: 100, after: $after) {
+      nodes { isResolved isOutdated path line comments(first: 1) { nodes { author { login } body } } }
+      pageInfo { hasNextPage endCursor }
+    }
+  } }
+}"""
 MAX_OUTPUT = 8000  # tokens a Lead request may write
 MIN_OUTPUT = 512  # below this a request can't do anything useful: the run stops instead
 UNPRICED_OUTPUT = 4000  # without a price, a smaller reply bounds what one request can spend
@@ -125,6 +139,11 @@ You were woken because something on your outcome needs judgement. Read the outco
 - Acknowledge (resolve_decision with "acknowledge") only when a failure is understood and accepting it is right.
 - Request changes on a pull request (resolve_decision with "reject" on a merge approval) when review findings,
   failed checks or the verifier's report show it isn't ready. Say exactly what must change.
+- Merge approvals: merge_reviews in the record says what review reports for the exact commit up for merging, read
+  from GitHub now. Never recommend merging while that commit's review isn't in, while it couldn't be read, or
+  while P0 or P1 findings are open: request changes citing the open P0/P1 findings, or say what is outstanding.
+  List any lower-severity findings still open. Your notes on a merge approval start with that review line
+  automatically.
 - Post guidance (post_guidance) when the agents need direction that isn't tied to a decision.
 - For anything you may not do (approving a plan, a merge or a release, budgets, cancelling, abandoning, taking
   over), or when you are not confident, leave a note for people (note_for_people) with what you found and the
@@ -190,14 +209,22 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
     notes: dict[str, dict[str, Any]] = {}
     if not outcome_ids:
         return notes
+    current = {d.id: question_mark(db, d) for d in decisions}
     rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
         .order_by(Message.created_at.desc(), Message.id.desc())
     for m in rows:
-        decision_id = (m.attribution or {}).get("decision_id")
-        if decision_id in wanted and decision_id not in notes:
-            notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at),
-                                  "run_id": (m.attribution or {}).get("run_id")}
-    return notes
+        attribution = m.attribution or {}
+        decision_id = attribution.get("decision_id")
+        if decision_id not in wanted or decision_id in notes:
+            continue
+        # A note answers the question as it was when written: once the question or the commit up for merging
+        # changes, it is advice for something else and isn't shown. (Notes from before marks were recorded carry
+        # none and still show.)
+        if attribution.get("question") not in (None, current[decision_id]):
+            notes[decision_id] = None
+            continue
+        notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at), "run_id": attribution.get("run_id")}
+    return {d: note for d, note in notes.items() if note is not None}
 
 
 # waking ----------------------------------------------------------------------------------------------------------
@@ -209,8 +236,18 @@ def _marks(db, outcome_id: str) -> dict[str, str]:
     people with its recommendation. One path, in that order."""
     from ..serializers import actionable
 
-    return {d.id: question_fingerprint(d)[:16] for d in db.query(Decision).filter(
+    return {d.id: question_mark(db, d) for d in db.query(Decision).filter(
         Decision.outcome_id == outcome_id, Decision.status == "open") if actionable(d)}
+
+
+def question_mark(db, d: Decision) -> str:
+    """What a decision asks, as a short fingerprint: its question, and for a merge approval the commit up for merging.
+    A changed mark is a new question: it wakes the Lead, and the Lead's notes on the old one no longer apply."""
+    mark = question_fingerprint(d)[:16]
+    if d.kind == "approve_merge" and d.task_id:
+        task = db.get(Task, d.task_id)
+        mark += ":" + ((task.head_sha or "")[:12] if task else "")
+    return mark
 
 
 def _people_posts(db, outcome_id: str, since: datetime | None) -> list[Message]:
@@ -286,6 +323,13 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append("you've just joined this outcome")
             if ending:
                 reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
+            if done is not None and _reviews_due(s, done, marks, now):
+                reasons.append("review of a merge approval may be in now")
+            continued = None if finished else s.query(func.max(Decision.resolved_at)).filter(
+                Decision.outcome_id == o.id, Decision.kind == "budget", Decision.status == "resolved",
+                Decision.resolution == "retry").scalar()
+            if continued is not None and (done is None or done.started_at < continued):
+                reasons.append("a person let this outcome continue past its budget")
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
@@ -317,6 +361,92 @@ def _progress(db, outcome_id: str, after: Any, now: datetime) -> list[int]:
     query = db.query(Event.id).filter(Event.outcome_id == outcome_id, Event.kind.in_(MILESTONES))
     query = query.filter(Event.id > after) if isinstance(after, int) else query.filter(Event.created_at > now - FIRST_LOOK)
     return [row.id for row in query.order_by(Event.id)]
+
+
+def _reviews_due(db, done: Run, marks: dict[str, str], now: datetime) -> bool:
+    """A merge approval whose commit the last finished run found unreviewed (or couldn't read) is looked at again
+    every REVIEW_RECHECK, while the decision is open and the commit unchanged: the review arrives later."""
+    if now - done.started_at < REVIEW_RECHECK:
+        return False
+    for decision_id, seen in ((done.result or {}).get("reviews") or {}).items():
+        if decision_id not in marks or not isinstance(seen, dict) or seen.get("settled"):
+            continue
+        decision = db.get(Decision, decision_id)
+        task = db.get(Task, decision.task_id) if decision and decision.task_id else None
+        if task is not None and (task.head_sha or "") == seen.get("head"):
+            return True
+    return False
+
+
+async def review_state(workspace_id: str, repo: str, number: int, head: str) -> dict[str, Any]:
+    """What review says about this exact commit of a pull request, read from GitHub: whether a reviewer has
+    reported on it, who requests changes, and the review threads still open on the code (neither resolved nor
+    outdated), with their severity. Unreadable means unknown, never clean."""
+    from ..github import GitHub, GitHubError, resolve_credential
+
+    state: dict[str, Any] = {"head": head, "checked": False, "reviewed": False, "open": [],
+                             "changes_requested_by": []}
+    try:
+        gh = GitHub(resolve_credential(workspace_id))
+        latest: dict[str, str] = {}
+        for review in await gh.request("GET", f"/repos/{repo}/pulls/{number}/reviews", params={"per_page": 100}):
+            if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+                state["reviewed"] = True
+            if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                latest[(review.get("user") or {}).get("login", "")] = review["state"]
+        state["changes_requested_by"] = sorted(u for u, st in latest.items() if st == "CHANGES_REQUESTED" and u)
+        for page in range(1, 4):  # Codex reports each commit it reviewed in a PR comment naming it
+            comments = await gh.request("GET", f"/repos/{repo}/issues/{number}/comments",
+                                        params={"per_page": 100, "page": page})
+            if any((c.get("user") or {}).get("login") == CODEX and head[:10] in (c.get("body") or "")
+                   for c in comments):
+                state["reviewed"] = True
+            if len(comments) < 100:
+                break
+        owner, _, name = repo.partition("/")
+        after = None
+        for _ in range(5):
+            data = await gh.request("POST", "/graphql", json={"query": THREADS, "variables": {
+                "owner": owner, "name": name, "number": number, "after": after}})
+            threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for t in threads["nodes"]:
+                if t.get("isResolved") or t.get("isOutdated"):
+                    continue
+                first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
+                body = first.get("body") or ""
+                found = SEVERITY.search(body)
+                state["open"].append({"severity": found.group(1) if found else "", "path": t.get("path") or "",
+                                      "line": t.get("line"), "by": ((first.get("author") or {}).get("login") or ""),
+                                      "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
+            if not (threads.get("pageInfo") or {}).get("hasNextPage"):
+                state["checked"] = True
+                break
+            after = threads["pageInfo"].get("endCursor")
+    except (GitHubError, KeyError, TypeError, ValueError) as exc:
+        log.warning("review state of %s#%s unreadable: %s", repo, number, exc)
+        state["checked"] = False
+    return state
+
+
+def review_line(state: dict[str, Any], number: int) -> str:
+    """One line people read above every Lead note on a merge approval, whatever the note says."""
+    at = f"PR #{number} at {state['head'][:7]}"
+    if not state.get("checked"):
+        return f"Review of {at}: couldn't be read from GitHub, so it isn't known to be clean."
+    if not state.get("reviewed"):
+        return f"Review of {at}: not in yet."
+    blocking = [f for f in state["open"] if f["severity"] in BLOCKING]
+    parts = []
+    if state["open"]:
+        parts.append(f"{len(state['open'])} open review finding{'s' if len(state['open']) != 1 else ''}"
+                     + (f", {len(blocking)} of them P0/P1" if blocking else ""))
+    if state.get("changes_requested_by"):
+        parts.append("changes requested by " + ", ".join(state["changes_requested_by"]))
+    return f"Review of {at}: " + ("; ".join(parts) if parts else "reviewed, no open findings") + "."
+
+
+def settled(state: dict[str, Any]) -> bool:
+    return bool(state.get("checked") and state.get("reviewed"))
 
 
 def _parse(value: Any) -> datetime | None:
@@ -431,6 +561,23 @@ class Tools:
         self.used: dict[str, int] = {}
         self.actions: list[dict[str, Any]] = []
         self.closing = False  # woken to report how the outcome ended: its update is the closing report
+        self.reviews: dict[str, dict[str, Any]] = {}  # merge approval id -> review state of its commit (lines below)
+        self.lines: dict[str, str] = {}
+
+    async def read_reviews(self) -> None:
+        """Review states for this outcome's open merge approvals, from GitHub, before the Lead reads its record."""
+        with session_scope() as s:
+            wanted = []
+            for d in s.query(Decision).filter(Decision.outcome_id == self.outcome_id, Decision.status == "open",
+                                              Decision.kind == "approve_merge", Decision.task_id.isnot(None)):
+                task = s.get(Task, d.task_id)
+                repo = s.get(Repository, task.repo_id) if task else None
+                if task is not None and repo is not None and task.pr_number and task.head_sha:
+                    wanted.append((d.id, repo.full_name, task.pr_number, task.head_sha))
+        for decision_id, repo, number, head in wanted[:5]:
+            state = await review_state(self.ws, repo, number, head)
+            self.reviews[decision_id] = state
+            self.lines[decision_id] = review_line(state, number)
 
     @property
     def source(self) -> dict[str, str]:
@@ -452,7 +599,12 @@ class Tools:
             return f"Invalid arguments for {name}."
 
     def _outcome_record(self) -> str:
-        return _bounded(outcome_record(self.outcome_id))
+        record = outcome_record(self.outcome_id)
+        if self.reviews:
+            record["merge_reviews"] = {d: {"line": self.lines[d], "open_findings": state["open"][:15],
+                                           "changes_requested_by": state["changes_requested_by"]}
+                                       for d, state in self.reviews.items()}
+        return _bounded(record)
 
     def _task_detail(self, task: str) -> str:
         from .. import serializers as S
@@ -555,12 +707,16 @@ class Tools:
         text = (text or "").strip()
         if not text:
             return "A note needs text."
+        if decision_id in self.lines:  # people see what review says about the commit, whatever the note says
+            text = f"{self.lines[decision_id]}\n\n{text}"
         with session_scope() as s:
-            if decision_id and s.query(Decision).filter(Decision.id == decision_id,
-                                                        Decision.outcome_id == self.outcome_id).first() is None:
+            decision = s.query(Decision).filter(Decision.id == decision_id,
+                                                Decision.outcome_id == self.outcome_id).first() if decision_id else None
+            if decision_id and decision is None:
                 return "No decision with that id on your outcome."
             actor = lead_user(s).id
-            data = {**self.source, **({"decision_id": decision_id} if decision_id else {})}
+            data = {**self.source, **({"decision_id": decision_id, "question": question_mark(s, decision)}
+                                      if decision is not None else {})}
             s.add(Message(workspace_id=self.ws, outcome_id=self.outcome_id, author_id=actor, author_kind="lead",
                           body=text[:4000], attribution=data))
         record(self.ws, "lead_note", f"Lead: {text[:300]}", outcome_id=self.outcome_id, run_id=self.run_id,
@@ -602,6 +758,8 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
             held = 0.0
             for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,
                                              Run.started_at > utcnow() - alive):
+                if other.role == "lead" and other.started_at <= utcnow() - STALE:
+                    continue  # a Lead run this old was cut off: outcome_committed() doesn't count it either
                 snapshot = other.config_snapshot or {}
                 limit = _limit(snapshot.get("budget_reserved"))
                 limit = limit if limit is not None else _limit((snapshot.get("limits") or {}).get("run_usd"))
@@ -704,7 +862,10 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.cost_usd = round(measured if measured is not None else max([ledger.cost_usd, *reading]), 6)
             # A request that failed before its usage was recorded may still be billed: unknown unless measured.
             row.cost_known = measured is not None or (ledger.cost_known and not reading and attempts == ledger.calls)
-            row.result = {"summary": summary, "actions": tools.actions}
+            row.result = {"summary": summary, "actions": tools.actions,
+                          # What review said about each merge approval's commit: an unsettled one is looked at again.
+                          "reviews": {d: {"head": st["head"], "settled": settled(st), "line": tools.lines[d]}
+                                      for d, st in tools.reviews.items()}}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
         message = f"Lead of #{number}: {summary[:300]}" if status == "succeeded" else f"Lead of #{number} {status}: {error}"
@@ -719,6 +880,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
 
 async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings: dict[str, Any], turns: int,
                 number: int, reasons: list[str], outcome_id: str, budget: _Budget) -> str:
+    await tools.read_reviews()
     record_now = await asyncio.to_thread(tools._outcome_record)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM},
