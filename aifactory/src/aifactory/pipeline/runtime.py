@@ -27,6 +27,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "review": DEFAULT_REVIEW,
     "provider": "mindshub",
     "decision_judges": "decide",
+    # One agent per outcome, responsible for delivering it (pipeline/lead.py).
+    "lead": {"enabled": True, "run_usd": 2.0, "turns": 30},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,

@@ -169,6 +169,25 @@ def _mind_settings(value: Any) -> dict[str, Any]:
     return {"daily_budget_usd": float(budget)}
 
 
+def _lead_settings(value: Any) -> dict[str, Any]:
+    """The Lead: on or off, its spend per run in US dollars and its turns per run."""
+    default = DEFAULT_SETTINGS["lead"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "lead accepts only enabled, run_usd and turns")
+    enabled = value.get("enabled", default["enabled"])
+    usd = value.get("run_usd", default["run_usd"])
+    turns = value.get("turns", default["turns"])
+    if type(enabled) is not bool:
+        raise HTTPException(422, "lead.enabled must be true or false")
+    if type(usd) not in (int, float) or not math.isfinite(usd) or not 0 <= usd <= 20:
+        raise HTTPException(422, "lead.run_usd must be a number from 0 to 20")
+    if type(turns) is not int or not 1 <= turns <= 80:
+        raise HTTPException(422, "lead.turns must be a whole number from 1 to 80")
+    return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
+
+
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         review = review_policy(raw)
@@ -180,6 +199,7 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
     merged["mind"] = mind
+    merged["lead"] = _lead_settings(raw.get("lead"))
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
