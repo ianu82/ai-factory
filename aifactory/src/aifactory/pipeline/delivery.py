@@ -1251,12 +1251,14 @@ class TaskRunner:
 
     # CI ------------------------------------------------------------------------
     def _guard(self, status: str | None = None) -> None:
-        """Revalidate after every network/lock wait, before taking another action."""
+        """Revalidate after every network/lock wait, before taking another action. What follows a guard is a push, a
+        comment or a merge, so a runner whose task another instance took stops here as well."""
         if self.cancelled.is_set():
             raise Stop()
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if (status and task.status != status) or not transition(s, task, lease_owner=task.lease_owner):
+            if (status and task.status != status) or not transition(
+                    s, task, owner=self.owner, lease_owner=task.lease_owner):
                 raise Stop()
 
     async def ci_then_merge(self) -> None:
@@ -1420,7 +1422,8 @@ class TaskRunner:
         with session_scope() as s:
             ws = lock_workspace(s, self.ws)
             task = s.get(Task, self.task_id)
-            if self.cancelled.is_set() or not transition(s, task, lease_owner=task.lease_owner):
+            # The last check before the merge, which cannot be taken back: the task must still be this runner's.
+            if self.cancelled.is_set() or not transition(s, task, owner=self.owner, lease_owner=task.lease_owner):
                 raise Stop()
             if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
                 return None

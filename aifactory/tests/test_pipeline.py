@@ -1212,6 +1212,50 @@ def test_recovery_requeues_only_the_running_tasks_nobody_holds(factory, monkeypa
     assert f"reclaimed T1 from instance {other}: its lease ran out 30s ago" in [r.getMessage() for r in caplog.records]
 
 
+def test_a_start_leaves_open_the_sessions_of_a_task_another_instance_is_running(factory, monkeypatch):
+    """Two servers on one database, or a deploy whose old and new process overlap: the session of a task the other
+    one holds is running now. Closing it as interrupted would end its record early and mark its cost unknown. It is
+    closed when the task is reclaimed, if its owner dies without closing it."""
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(scheduler, "HEARTBEAT_SECONDS", 0)  # every look below is an interval after the last
+    other, until = "other-host-1-abc123", clock[0] + timedelta(seconds=60)
+    held = leased_task(factory, lease_owner=other, lease_expires_at=until)
+    dead = leased_task(factory, lease_owner=other, lease_expires_at=clock[0] - timedelta(seconds=1))
+
+    def session(task_id):
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            run = Run(workspace_id=task.workspace_id, outcome_id=task.outcome_id, task_id=task_id, harness="native",
+                      role="builder", started_at=clock[0] - timedelta(minutes=5))
+            s.add(run)
+            s.flush()
+            return run.id
+
+    def state(run_id):
+        with session_scope() as s:
+            run = s.get(Run, run_id)
+            return run.status, run.cost_known
+
+    live, lost = session(held), session(dead)
+    orch = Orchestrator()
+    orch._recover()
+    assert (state(live), state(lost)) == (("running", True), ("interrupted", False))
+    assert lease(held) == ("running", other, until)
+
+    orch._maybe_reclaim()  # the lease is still live
+    assert state(live) == ("running", True)
+    clock[0] = until + timedelta(seconds=1)  # its owner died without closing anything
+    orch._maybe_reclaim()
+    assert (lease(held), state(live)) == (("queued", "", None), ("interrupted", False))
+    with session_scope() as s:
+        assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}] * 2
+
+
 def test_the_heartbeat_extends_only_the_leases_of_tasks_this_instance_is_running(factory, monkeypatch):
     from datetime import datetime, timedelta
 
@@ -1306,6 +1350,40 @@ def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
     with pytest.raises(delivery.Stop):  # block() always ends the runner; this time what it wrote is there
         runner.block("unblock", "Blocked", "needs a look")
     assert row() == ("blocked", "released", "needs a look", {"note": "released"}, "", 1)
+
+
+def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
+    """The guard before every push and comment, and the last check before the merge itself, ask who holds the task.
+    A runner that stalled past its lease and woke after another instance started the task must not merge the pull
+    request: its new owner may be revising it."""
+    first, second = Orchestrator(), Orchestrator()
+    runner = merge_gate_runner(factory)
+    runner.owner = first.instance
+    merged = []
+
+    class GitHub:
+        async def merge(self, repo, number, **kwargs):
+            merged.append((number, kwargs["sha"]))
+            return {"sha": "merged"}
+
+    def hold(owner):
+        with session_scope() as s:
+            s.get(Task, runner.task_id).lease_owner = owner
+
+    hold(second.instance)
+    for stale in (runner._guard, lambda: runner._guard("running"),
+                  lambda: runner._merge_under_workspace_lock(GitHub(), "squash")):
+        with pytest.raises(delivery.Stop):
+            stale()
+    assert merged == []
+    assert lease(runner.task_id)[:2] == ("running", second.instance)  # a refused guard changes nothing
+
+    for owner in (first.instance, ""):  # its own task, or a lease released on purpose
+        hold(owner)
+        runner._guard()
+        assert runner._merge_under_workspace_lock(GitHub(), "squash") == {"sha": "merged"}
+        assert lease(runner.task_id)[:2] == ("running", owner)
+    assert merged == [(1, "head")] * 2
 
 
 def test_a_transition_without_an_owner_does_not_ask_who_holds_the_lease(factory):

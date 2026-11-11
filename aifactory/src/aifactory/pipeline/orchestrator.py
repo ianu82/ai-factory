@@ -159,13 +159,14 @@ class Orchestrator:
         recover_leads()
         self._complete_accepted()
 
-    def _reclaim(self) -> None:
+    def _reclaim(self) -> list[str]:
         """Requeue the running tasks nobody holds: no owner, no expiry (rows from before leases had one) or a lease
         that ran out. A live lease is another instance's work. A task this instance runs is its own to finish, even
-        when its heartbeat fell behind."""
+        when its heartbeat fell behind. Returns the ids of the tasks it requeued."""
         from sqlalchemy import or_
 
         now = utcnow()
+        reclaimed: list[str] = []
         free = or_(Task.lease_owner == "", Task.lease_expires_at.is_(None), Task.lease_expires_at < now)
         with session_scope() as s:
             for task in s.query(Task).filter(Task.status == "running", free).all():
@@ -177,12 +178,14 @@ class Orchestrator:
                         {Task.status: "queued", Task.lease_owner: "", Task.lease_expires_at: None},
                         synchronize_session=False):
                     continue
+                reclaimed.append(task.id)
                 if owner and owner != self.instance and expired:
                     log.info("reclaimed %s from instance %s: its lease ran out %.0fs ago", task.key, owner,
                              (now - expired).total_seconds())
                 record(task.workspace_id, "resumed",
                        f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
+        return reclaimed
 
     def _maybe_reclaim(self) -> None:
         """A task whose owner died without releasing it is picked up once its lease has run out."""
@@ -191,7 +194,9 @@ class Orchestrator:
         if time.monotonic() - getattr(self, "_last_reclaim", float("-inf")) < HEARTBEAT_SECONDS:
             return
         self._last_reclaim = time.monotonic()
-        self._reclaim()
+        reclaimed = self._reclaim()
+        if reclaimed:  # their owner died mid-session; the start-up pass left those sessions open for it
+            self._close_interrupted_runs(reclaimed)
 
     def _lease_end(self):
         from datetime import timedelta
@@ -219,14 +224,24 @@ class Orchestrator:
             except Exception:  # a failed beat is retried at the next one; two may be missed before the lease runs out
                 log.exception("lease heartbeat failed")
 
-    def _close_interrupted_runs(self) -> None:
+    def _close_interrupted_runs(self, tasks: list[str] | None = None) -> None:
         """A killed process never reaches run_agent's finally, so its sessions would stay "running" for good.
-        Close them as interrupted, which is not a verdict on the work. Lead sessions are closed by lead.recover()."""
-        from sqlalchemy import func, select
+        Close them as interrupted, which is not a verdict on the work. Lead sessions are closed by lead.recover().
+
+        At a start (`tasks` is None) that is every open session except those of a task another instance holds with a
+        live lease: that session is running now, on the other server. They are closed when their task is reclaimed
+        (`tasks`: the ids just requeued), if its owner dies without closing them."""
+        from sqlalchemy import func, or_, select
 
         from ..models import Event, Run
 
         open_runs = (Run.status == "running", Run.role != "lead")
+        if tasks is not None:
+            open_runs += (Run.task_id.in_(tasks),)
+        else:
+            held = select(Task.id).where(Task.status == "running", Task.lease_owner.notin_(("", self.instance)),
+                                         Task.lease_expires_at > utcnow())
+            open_runs += (or_(Run.task_id.is_(None), Run.task_id.notin_(held)),)
         with session_scope() as s:
             # Events are indexed by outcome, not by run; a session's events carry both.
             last_event = dict(s.query(Event.run_id, func.max(Event.created_at)).filter(
