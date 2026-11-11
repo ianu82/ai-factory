@@ -112,16 +112,19 @@ def sync(workspace_id: str | None = None) -> int:
             found = overlaps(s, ws)
             if not found:
                 continue
-            seen = {(e.data or {}).get("key") for e in s.query(Event).filter(Event.workspace_id == ws,
-                                                                               Event.kind == "work_overlap")}
+            # Per outcome: if recording one side fails, the next sweep still records it.
+            seen = {((e.data or {}).get("key"), e.outcome_id) for e in s.query(Event).filter(
+                Event.workspace_id == ws, Event.kind == "work_overlap")}
             outcomes = {x.id: x for x in s.query(Outcome).filter(Outcome.workspace_id == ws)}
             for item in found:
-                if item["key"] in seen:
-                    continue
                 a, b = item["tasks"]
+                if (item["key"], a.outcome_id) in seen and (item["key"], b.outcome_id) in seen:
+                    continue
                 files = item["files"]
                 shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
                 for mine, other in ((a, b), (b, a)):
+                    if (item["key"], mine.outcome_id) in seen:
+                        continue
                     o = outcomes.get(other.outcome_id)
                     pending.append((ws, mine.outcome_id, mine.id, f"{mine.key} and {other.key} of outcome #{o.number if o else '?'} "
                                     f"both change {shown}", {"key": item["key"], "files": files[:MAX_FILES],

@@ -174,3 +174,26 @@ def test_every_ruling_is_given_beyond_the_precedent_limit(world, client):
     for i in range(10):  # more than 20 in all: the Lead still gets every ruling
         client.post(f"/api/workspaces/{world['ws']}/rulings", json={"text": f"Rule {15 + i}"})
     assert len(lead.outcome_record(world["outcome"])["team_rules"]) == 25
+
+
+def test_ordinary_precedents_survive_many_rulings(world, client):
+    with db.session_scope() as s:
+        d = Decision(workspace_id=world["ws"], outcome_id=world["outcome"], kind="question", title="Old answer",
+                     status="resolved", resolution="answer", comment="Use Postgres", reusable=True, scope="workspace",
+                     resolved_at=db.utcnow() - timedelta(days=30))
+        s.add(d)
+        s.flush()
+        old = d.id
+    for i in range(50):
+        client.post(f"/api/workspaces/{world['ws']}/rulings", json={"text": f"Rule {i}"})
+    assert old in {d.id for d in precedents(world["ws"], world["repo"])}
+
+
+def test_a_missing_side_of_an_overlap_is_recorded_on_the_next_sweep(world):
+    diff(world, ["app/search.py"])
+    other_outcome, _ = second_outcome(world)
+    coordination.sync(world["ws"])
+    with db.session_scope() as s:
+        s.query(Event).filter(Event.outcome_id == other_outcome, Event.kind == "work_overlap").delete()
+    assert coordination.sync(world["ws"]) == 1
+    assert len(overlap_events(other_outcome)) == 1 and len(overlap_events(world["outcome"])) == 1
