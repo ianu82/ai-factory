@@ -32,9 +32,8 @@ from ..sandbox import LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, outcome_cost, precedents,
-                      publish_decision, run_agent,
-                      workspace_settings)
+from .runtime import (SessionSpec, budget_extension, guidance_history, open_decision, outcome_committed,
+                      outcome_cost, precedents, publish_decision, run_agent, workspace_settings)
 
 from .lifecycle import transition
 
@@ -332,11 +331,28 @@ class TaskRunner:
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")
-            spent, known = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
-            if budget and known and spent >= budget and not (self.task.evidence or {}).get("budget_override"):
-                self.block("budget", f"Outcome #{self.outcome.number} reached its ${budget:.0f} budget",
-                           f"Spent ${spent:.2f}. Raise the budget in Settings or approve continuing.", status="needs_input",
-                           options=[{"value": "retry", "label": "Continue anyway"}, {"value": "abandon", "label": "Stop"}])
+            # Spending whose cost is known is a lower bound, so reaching the budget with it alone is conclusive.
+            spent, _ = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
+            extra = budget_extension(self.settings)
+            if (self.task.evidence or {}).get("budget_override"):
+                # Continuing used to lift the limit for good. Such a task gets one allowance from here instead.
+                with session_scope() as s:
+                    task = s.get(Task, self.task_id)
+                    ev = {k: v for k, v in (task.evidence or {}).items() if k != "budget_override"}
+                    task.evidence = self.task.evidence = {**ev, "budget_allowance_usd": round(spent + extra, 2)}
+            # Continuing past the budget allows spending up to an amount (decisions.resolve), not without limit.
+            limit = max(budget or 0, (self.task.evidence or {}).get("budget_allowance_usd") or 0)
+            if budget and spent >= limit:
+                more = f"{extra:.2f}".removesuffix(".00")
+                extended = limit > budget
+                reached = f"the ${limit:.2f} it was allowed to spend" if extended else f"its ${budget:.0f} budget"
+                self.block("budget", f"Outcome #{self.outcome.number} reached {reached}",
+                           f"Spent ${spent:.2f}; the limit was ${limit:.2f}"
+                           + (f" (the ${budget:.0f} budget, extended when it last continued)" if extended else "")
+                           + f". Raise the budget in Settings, or continue with ${more} more than is spent now.",
+                           status="needs_input",
+                           options=[{"value": "retry", "label": f"Continue with ${more} more"},
+                                    {"value": "abandon", "label": "Stop"}])
             if self.builder is None:
                 try:
                     await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
