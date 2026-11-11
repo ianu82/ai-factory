@@ -2512,6 +2512,33 @@ def test_a_restart_before_publication_publishes_the_verified_candidate(factory, 
     assert ("publish_resumed" in kinds) is recoverable and ("attempt_resumed" in kinds) is not recoverable
 
 
+def test_a_restart_before_publication_still_says_the_builder_never_reported(factory, monkeypatch):
+    # The stand-in for the missing report is not on the builder's run (a failed run has no result). It is reloaded
+    # from the task, so the pull request published after the restart says there is no builder summary and why.
+    error = "Anton exceeded its time budget"
+    original = delivery.publish
+    interrupted = []
+
+    async def publish_after_a_restart(*args, **kwargs):
+        if not interrupted:
+            interrupted.append(True)
+            raise asyncio.CancelledError()  # the server stops while the verified candidate is being pushed
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(delivery, "publish", publish_after_a_restart)
+    ScriptedModel.scripts.update(builder=_cut_off(error), verifier=passing_verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    assert interrupted and "publish_resumed" in _event_kinds(outcome_id)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert [(a["n"], a["result"]) for a in task.evidence["attempts"]] == [(1, "verified")]
+        run = s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").one()  # the builder ran once
+        assert run.status == "failed" and not run.result
+    assert f"The builder session reached its limit before it reported ({error})" in FakeGitHub.pulls[1]["body"]
+
+
 @pytest.mark.parametrize("result, failing, ends", [
     ("checks_preexisting", "verify", False),  # checks also failing on base: the verifier has not recovered
     ("checks_failed", "verify", False),

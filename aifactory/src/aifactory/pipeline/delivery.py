@@ -902,7 +902,10 @@ class TaskRunner:
                 return False
             builder = s.get(Run, diff.run_id) if diff.run_id else None
             raw, data = (diff.content or "").encode(), dict(diff.data or {})
-            report = dict((builder.result if builder else None) or {})
+            # A builder stopped by its cap has no result on its run: the stand-in for its report is kept with the
+            # task, like every builder report, and no builder has run since this candidate was verified.
+            report = dict((builder.result if builder else None) or (self.task.evidence or {}).get("builder_report")
+                          or {})
         if hashlib.sha256(raw).hexdigest() != last["patch_sha256"]:
             return False
         self.patch = Patch(diff=raw, files=list(data.get("files") or []), additions=int(data.get("additions") or 0),
