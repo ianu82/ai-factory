@@ -445,6 +445,32 @@ class Decision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class Alert(Base):
+    """Stuck work or a repeated failure that people should know about (pipeline/watch.py). One row per condition
+    while it lasts: watching (its Lead was woken; not shown yet), open (shown in the Inbox), dismissed by a person,
+    or cleared once the condition went away. A condition that returns later is a new row."""
+
+    __tablename__ = "alerts"
+    __table_args__ = (Index("ix_alerts_workspace_status", "workspace_id", "status"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(String(32))
+    outcome_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20))  # overdue|unasked|stalled|quiet|repeated
+    key: Mapped[str] = mapped_column(String(120))  # the condition: one live row per key
+    title: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="open")  # watching|open|dismissed|cleared
+    since: Mapped[datetime] = mapped_column(DateTime, default=utcnow)  # when the condition began, as far as known
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    dismissed_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class DecisionReview(Base):
     """One durable judge processing slot per question; reports stay structured JSON.
 

@@ -139,6 +139,10 @@ You were woken because something on your outcome needs judgement. Read the outco
   over), or when you are not confident, leave a note for people (note_for_people) with what you found and the
   option you recommend. People read it in the outcome and the Inbox.
 - When a person has posted on the outcome, reply with note_for_people. Answer their question directly.
+- When the watch woke you because work is stuck (a task waiting with no decision to answer, an outcome where nothing
+  moves, or no activity for a long time), find out why from the record. If a decision lets you unstick it, do;
+  otherwise leave a note for people: what is stuck, the likely cause and what a person should do. If it stays
+  stuck, people also get an alert in the app.
 - Keep the outcome's conversation current. When you first join an outcome, when progress woke you, and when the
   outcome has ended, post one short
   update with post_update: what happened since your last update and what it means, then what happens next. People
@@ -285,6 +289,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 (m.attribution or {}).get("closing") for m in s.query(Message).filter(
                     Message.outcome_id == o.id, Message.author_kind == "lead", Message.created_at >= ended_at))
             ending = finished and not reported
+            # The watch found work stuck on this outcome since the Lead last looked (pipeline/watch.py).
+            stuck = [] if finished else [e.message for e in s.query(Event).filter(
+                Event.outcome_id == o.id, Event.kind == "lead_watch",
+                Event.created_at > (done.started_at if done is not None else now - FIRST_LOOK))]
             if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
                 progress = []  # batch progress into one update
             reasons = []
@@ -298,6 +306,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append("you've just joined this outcome")
             if ending:
                 reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
+            if stuck:
+                reasons.append("the watch found work stuck: " + "; ".join(m.removeprefix("Watch: ") for m in stuck[:3]))
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
