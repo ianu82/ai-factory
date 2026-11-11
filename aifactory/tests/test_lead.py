@@ -780,9 +780,13 @@ class FakeGitHub:
     reviews_data: list = []
     comments_data: list = []
     threads_data: list = []
+    live_head = HEAD  # the PR's head on GitHub now
 
     def __init__(self, _token):
         pass
+
+    async def pull(self, repo, number):
+        return {"head": {"sha": FakeGitHub.live_head}}
 
     async def reviews(self, repo, number):
         return FakeGitHub.reviews_data
@@ -794,9 +798,10 @@ class FakeGitHub:
         return FakeGitHub.threads_data
 
 
-def thread(body, *, resolved=False, outdated=False, line=3, path="a.py"):
+def thread(body, *, resolved=False, outdated=False, line=3, path="a.py", review="COMMENTED"):
     return {"id": f"t-{path}-{line}", "isResolved": resolved, "isOutdated": outdated, "path": path, "line": line,
-            "comments": {"nodes": [{"author": {"login": lead.CODEX}, "body": body}]}}
+            "comments": {"nodes": [{"author": {"login": lead.CODEX}, "body": body,
+                                    "pullRequestReview": {"state": review}}]}}
 
 
 def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
@@ -809,12 +814,20 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     FakeGitHub.threads_data = [thread("**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"),
                                thread("P1 Badge", resolved=True, path="b.py"),
                                thread("P0 Badge", outdated=True, path="c.py"),
-                               thread("P1 Badge  Don't ship this file", line=None, path="d.py")]  # a file comment
+                               thread("P1 Badge  Don't ship this file", line=None, path="d.py"),  # a file comment
+                               thread("P1 Badge  Withdrawn", path="e.py", review="DISMISSED")]  # its review dismissed
     state = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
     assert state["checked"] and state["reviewed"]  # Codex's receipt names this commit
     assert [(f["severity"], f["path"]) for f in state["open"]] == [("P1", "a.py"), ("P1", "d.py")]
     assert state["open"][0]["text"] == "Fix the lock"
     assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: 2 open review findings, 2 of them P0/P1."
+
+    monkeypatch.setattr(FakeGitHub, "live_head", "f" * 40)  # pushed to directly: the task keeps the commit it published
+    moved = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
+    assert moved["checked"] and not lead.settled(moved)
+    assert lead.review_line(moved, 12).startswith("Review of PR #12 at abcdef1: the PR has moved on to fffffff")
+    assert lead.review_fingerprint(moved) != lead.review_fingerprint(state)  # the watcher withdraws earlier notes
+    monkeypatch.setattr(FakeGitHub, "live_head", HEAD)
 
     class Partial(FakeGitHub):
         async def review_threads(self, repo, number):  # the helper refuses partial GraphQL data

@@ -134,8 +134,8 @@ You were woken because something on your outcome needs judgement. Read the outco
   failed checks or the verifier's report show it isn't ready. Say exactly what must change.
 - Merge approvals: merge_reviews in the record says what review reports for the exact commit up for merging, read
   from GitHub now. Never recommend merging while that commit's review isn't in, while it couldn't be read, while
-  a reviewer requests changes, or while P0 or P1 findings are open: request changes citing the open P0/P1 findings
-  or the change request, or say what is outstanding.
+  the PR has moved on to another commit, while a reviewer requests changes, or while P0 or P1 findings are open:
+  request changes citing the open P0/P1 findings or the change request, or say what is outstanding.
   List any lower-severity findings still open. Your notes on a merge approval start with that review line
   automatically.
 - Post guidance (post_guidance) when the agents need direction that isn't tied to a decision.
@@ -442,6 +442,12 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
     try:
         # The client's helpers read every page and refuse partial GraphQL data: a partial read is never clean.
         gh = GitHub(resolve_credential(workspace_id))
+        # The PR as it is now: a commit pushed straight to it isn't what the Factory put up for merging, and nothing
+        # else here would notice (the task keeps the commit it published).
+        live = ((await gh.pull(repo, number)).get("head") or {}).get("sha")
+        if not isinstance(live, str) or not live:
+            raise ValueError("pull request has no head commit")
+        state["live_head"] = live
         latest: dict[str, str] = {}
         for review in await gh.reviews(repo, number):
             if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
@@ -458,6 +464,8 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
             if t.get("isResolved") or t.get("isOutdated") is True:
                 continue
             first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
+            if ((first.get("pullRequestReview") or {}).get("state") or "").upper() == "DISMISSED":
+                continue  # a dismissed review's findings aren't active, as in review.normalize_feedback
             body = first.get("body") or ""
             found = SEVERITY.search(body)
             state["open"].append({"id": t.get("id") or "", "severity": found.group(1) if found else "",
@@ -476,6 +484,9 @@ def review_line(state: dict[str, Any], number: int) -> str:
     at = f"PR #{number} at {state['head'][:7]}"
     if not state.get("checked"):
         return f"Review of {at}: couldn't be read from GitHub, so it isn't known to be clean."
+    if moved_on(state):
+        return (f"Review of {at}: the PR has moved on to {state['live_head'][:7]}, which isn't the commit up for "
+                "merging, so this review doesn't cover the PR as it is.")
     if not state.get("reviewed"):
         return f"Review of {at}: not in yet."
     blocking = [f for f in state["open"] if f["severity"] in BLOCKING]
@@ -494,12 +505,17 @@ def review_fingerprint(state: dict[str, Any]) -> str:
     findings = sorted((f.get("id") or "", f.get("severity") or "", f.get("text") or "") for f in state.get("open", []))
     body = json.dumps({"head": state.get("head"), "checked": bool(state.get("checked")),
                        "reviewed": bool(state.get("reviewed")), "changes": sorted(state.get("changes_requested_by", [])),
-                       "open": findings}, sort_keys=True)
+                       "open": findings, "moved_to": state["live_head"] if moved_on(state) else None}, sort_keys=True)
     return hashlib.sha256(body.encode()).hexdigest()[:16]
 
 
 def settled(state: dict[str, Any]) -> bool:
-    return bool(state.get("checked") and state.get("reviewed"))
+    return bool(state.get("checked") and state.get("reviewed")) and not moved_on(state)
+
+
+def moved_on(state: dict[str, Any]) -> bool:
+    """Whether the PR's head on GitHub is no longer the commit up for merging (someone pushed to it directly)."""
+    return bool(state.get("live_head")) and state["live_head"] != state.get("head")
 
 
 def _parse(value: Any) -> datetime | None:
