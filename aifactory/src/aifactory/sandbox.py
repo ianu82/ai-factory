@@ -495,13 +495,17 @@ def process_report(proc: Path = Path("/proc")) -> dict[str, Any]:
     return info
 
 
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
 def host_capacity() -> dict[str, Any]:
     """What a job can use on this host: CPUs, process and memory ceilings (cgroup v2 / v1 or rlimit)."""
+    root = CGROUP_ROOT
 
-    def first(*paths: str) -> str | None:
+    def first(*paths: Path) -> str | None:
         for path in paths:
             try:
-                return Path(path).read_text().strip()
+                return path.read_text().strip()
             except OSError:
                 continue
         return None
@@ -514,14 +518,19 @@ def host_capacity() -> dict[str, Any]:
         info["nproc_rlimit"] = None if soft == resource.RLIM_INFINITY else soft
     except (ImportError, AttributeError, ValueError):
         pass
-    info["pids_max"] = first("/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max")
-    info["pids_current"] = first("/sys/fs/cgroup/pids.current", "/sys/fs/cgroup/pids/pids.current")
-    memory = first("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    info["pids_max"] = first(root / "pids.max", root / "pids" / "pids.max")
+    info["pids_current"] = first(root / "pids.current", root / "pids" / "pids.current")
+    memory = first(root / "memory.max", root / "memory" / "memory.limit_in_bytes")
     if memory and memory.isdigit():
         memory = f"{int(memory) / 2**30:.1f}GiB"
     info["memory_max"] = memory
-    cpu = first("/sys/fs/cgroup/cpu.max")
-    if cpu and cpu.split()[0].isdigit():
-        quota, period = cpu.split()[:2]
+    cpu = first(root / "cpu.max")
+    if cpu is not None:  # v2: "<quota> <period>", or "max <period>" for none
+        quota, period = (cpu.split() + ["", ""])[:2]
+    else:  # v1: the cpu controller's CFS quota (-1 for none), mounted alone or with cpuacct
+        controllers = [root / name for name in ("cpu", "cpu,cpuacct", "cpuacct,cpu")]
+        quota = first(*(c / "cpu.cfs_quota_us" for c in controllers)) or ""
+        period = first(*(c / "cpu.cfs_period_us" for c in controllers)) or ""
+    if quota.isdigit() and period.isdigit() and int(quota) > 0 and int(period) > 0:
         info["cpu_quota"] = round(int(quota) / int(period), 1)
     return info

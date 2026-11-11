@@ -19,6 +19,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Decision, Outcome, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
+from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
 from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
@@ -57,7 +58,7 @@ class Orchestrator:
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
         if self._loop_task is None:
-            log.info("capacity %s", host_capacity())
+            log.info("capacity %s check_slots=%d", host_capacity(), check_slot_count())
             trash = quarantine_orphaned_jobs()
             if trash is not None:
                 log.info("moved job directories left by the previous run aside: %s", trash.name)
@@ -105,7 +106,7 @@ class Orchestrator:
             running = [t.id for t in s.query(Task).filter(Task.id.in_(list(self._tasks)),
                                                         Task.status == "running")]
         return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
-                "global_limit": get_settings().global_concurrency}
+                "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage()}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
