@@ -58,9 +58,11 @@ def view(d: Decision, names: dict[str, str]) -> dict[str, Any]:
 
 def active(db: Session, workspace_id: str) -> list[Decision]:
     """Every precedent in force: rulings and reusable decision answers, newest first."""
-    return (db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "resolved",
+    base = (db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "resolved",
                                       Decision.reusable.is_(True), Decision.scope.in_(SCOPES))
-            .order_by(Decision.resolved_at.desc(), Decision.id).limit(200).all())
+            .order_by(Decision.resolved_at.desc(), Decision.id))
+    # Every ruling (rules are never crowded out); other precedents are examples, so the newest 200 suffice.
+    return base.filter(Decision.kind == KIND).all() + base.filter(Decision.kind != KIND).limit(200).all()
 
 
 # API ------------------------------------------------------------------------------------------------------------
