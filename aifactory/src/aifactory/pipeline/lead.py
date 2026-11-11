@@ -602,19 +602,36 @@ class Tools:
         self.lines: dict[str, str] = {}
 
     async def read_reviews(self) -> None:
-        """Review states for this outcome's open merge approvals, from GitHub, before the Lead reads its record."""
+        """Review states for this outcome's open merge approvals, from GitHub, before the Lead reads its record.
+        A commit pushed while GitHub was being read is read again, once; a later one is caught by _unseen_commit."""
+        for _ in range(2):
+            for decision_id, repo, number, head in self._unread():
+                state = await review_state(self.ws, repo, number, head)
+                self.reviews[decision_id] = state
+                self.lines[decision_id] = review_line(state, number)
+
+    def _unread(self) -> list[tuple[str, str, int, str]]:
+        """Open merge approvals whose current commit has no review read this run."""
         with session_scope() as s:
             wanted = []
             for d in s.query(Decision).filter(Decision.outcome_id == self.outcome_id, Decision.status == "open",
                                               Decision.kind == "approve_merge", Decision.task_id.isnot(None)):
                 task = s.get(Task, d.task_id)
                 repo = s.get(Repository, task.repo_id) if task else None
-                if task is not None and repo is not None and task.pr_number and task.head_sha:
+                if task is not None and repo is not None and task.pr_number and task.head_sha \
+                        and (self.reviews.get(d.id) or {}).get("head") != task.head_sha:
                     wanted.append((d.id, repo.full_name, task.pr_number, task.head_sha))
-        for decision_id, repo, number, head in wanted:
-            state = await review_state(self.ws, repo, number, head)
-            self.reviews[decision_id] = state
-            self.lines[decision_id] = review_line(state, number)
+            return wanted
+
+    def _unseen_commit(self, decision: Decision, task: Task | None) -> str | None:
+        """Why the Lead may not advise or act on a merge approval now: its commit isn't the one whose review this run
+        read (pushed during the run, or after the approval opened). The new commit wakes the Lead again."""
+        if decision.kind != "approve_merge" or task is None or not task.head_sha:
+            return None
+        if (self.reviews.get(decision.id) or {}).get("head") == task.head_sha:
+            return None
+        return ("This PR has a commit you haven't read the review of, so anything you say or do about it now would be "
+                "about the wrong commit. Leave it this run: the new commit wakes you again.")
 
     @property
     def source(self) -> dict[str, str]:
@@ -691,6 +708,9 @@ class Tools:
                 return "This decision is still being reviewed. Leave it for now."
             if option in NEEDS_TEXT and not comment:
                 return f"A comment is required for {option}: say exactly what the agents should do."
+            unseen = self._unseen_commit(decision, locked)
+            if unseen:
+                return unseen
             task = db.get(Task, decision.task_id) if decision.task_id else None
             if option == "retry" and task is not None and task.stage in MERGING_STAGES:
                 return ("Retrying here would resume a merge, release or revert. Leave a note for people with your "
@@ -751,6 +771,10 @@ class Tools:
                                                 Decision.outcome_id == self.outcome_id).first() if decision_id else None
             if decision_id and decision is None:
                 return "No decision with that id on your outcome."
+            unseen = self._unseen_commit(decision, s.get(Task, decision.task_id) if decision.task_id else None) \
+                if decision is not None else None
+            if unseen:
+                return unseen
             actor = lead_user(s).id
             data = {**self.source, **({"decision_id": decision_id, "question": question_mark(s, decision)}
                                       if decision is not None else {})}

@@ -850,6 +850,29 @@ def test_a_merge_note_starts_with_the_review_of_its_commit(world, model, monkeyp
     assert row.result["reviews"][world["merge"]]["settled"] is False and row.result["reviews"][world["merge"]]["head"] == HEAD
 
 
+def test_the_lead_says_nothing_about_a_commit_it_hasnt_read_the_review_of(world, monkeypatch):
+    merge_ready(world)
+    reads = []
+
+    async def review(ws, repo, number, head):
+        reads.append(head)
+        if len(reads) == 1:
+            merge_ready(world, head="f" * 40)  # pushed while GitHub was being read
+        return {"head": head, "checked": True, "reviewed": True, "open": [], "changes_requested_by": []}
+
+    monkeypatch.setattr(lead, "review_state", review)
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    assert reads == [HEAD, "f" * 40] and tools.reviews[world["merge"]]["head"] == "f" * 40  # read again, for the new one
+    merge_ready(world, head="e" * 40)  # pushed during the run
+    for name, args in (("note_for_people", {"text": "Clean. Merge it."}),
+                       ("resolve_decision", {"option": "reject", "comment": "Fix the lock."})):
+        assert "haven't read the review of" in tools.call(name, {"decision_id": world["merge"], **args})
+    with db.session_scope() as s:
+        assert s.query(Message).filter_by(author_kind="lead").count() == 0
+        assert s.get(Decision, world["merge"]).status == "open"
+
+
 def test_a_push_wakes_the_lead_again(world):
     merge_ready(world)
     seen = woken()[world["outcome"]]["seen"]
@@ -925,15 +948,17 @@ def test_a_stale_lead_reservation_doesnt_block_a_new_run(world, model):
     assert row.status == "succeeded" and row.config_snapshot["budget_reserved"] == 2.0
 
 
-def test_a_note_shows_only_against_the_question_it_answered(world, client):
+def test_a_note_shows_only_against_the_question_it_answered(world, client, monkeypatch):
     def shown():
         inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
         return inbox[world["merge"]]["lead_note"]
 
     merge_ready(world)
-    lead.Tools(world["ws"], world["outcome"], "run-1").call(
-        "note_for_people", {"decision_id": world["merge"], "text": "CI and review are clean on this commit."})
-    assert shown()["text"] == "CI and review are clean on this commit."
+    monkeypatch.setattr(lead, "review_state", unreviewed())
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "CI and review are clean on this commit."})
+    assert shown()["text"].endswith("\n\nCI and review are clean on this commit.")
     merge_ready(world, head="f" * 40)  # a new commit is up for merging: that note was about the old one
     assert shown() is None
     merge_ready(world)
