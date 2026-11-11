@@ -133,10 +133,12 @@ def test_the_same_failure_across_outcomes_is_one_alert(world, client):
         other = Outcome(workspace_id=world["ws"], number=8, title="Other", status="running")
         s.add(other)
         s.flush()
-        for outcome_id, error in ((world["outcome"], "VM refused: slot 12 busy (id abc1234def)\nTraceback..."),
-                                  (other.id, "VM refused: slot 7 busy (id 99ffee0011)")):
+        for outcome_id, error, started, finished in (
+                (world["outcome"], "VM refused: slot 12 busy (id abc1234def)\nTraceback...", now(), None),
+                (other.id, "VM refused: slot 7 busy (id 99ffee0011)", now() - timedelta(hours=30),
+                 now() - timedelta(hours=1))):  # it started before the day began but failed within it
             s.add(Run(workspace_id=world["ws"], outcome_id=outcome_id, role="builder", harness="native",
-                      status="failed", error=error))
+                      status="failed", error=error, started_at=started, finished_at=finished))
             s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", status="resolved",
                            title="T1 did not pass after 3 attempts", options=[]))  # the task's own failure
     assert watch.run()["shown"] == 1

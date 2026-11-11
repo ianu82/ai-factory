@@ -172,8 +172,9 @@ def _failures(s, workspace_id: str, now: datetime) -> dict[str, dict[str, Any]]:
             entry["outcomes"].add(outcome_id)
         entry["first"] = min(entry["first"], at)
 
-    for run in s.query(Run).filter(Run.workspace_id == workspace_id, Run.status == "failed", Run.started_at > since):
-        add(run.error, run.task_id, run.outcome_id, run.started_at)
+    failed_at = func.coalesce(Run.finished_at, Run.started_at)  # a run fails when it ends; older rows lack an end
+    for run in s.query(Run).filter(Run.workspace_id == workspace_id, Run.status == "failed", failed_at > since):
+        add(run.error, run.task_id, run.outcome_id, run.finished_at or run.started_at)
     for d in s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == "unblock",
                                       Decision.created_at > since):
         if not OWN_FAILURE.search(d.title or ""):
