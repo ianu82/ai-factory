@@ -50,8 +50,8 @@ class HarnessSession:
     image_inputs: list[dict[str, str]] = field(default_factory=list)
     # Host-supplied, workspace-scoped opt-ins. Tools fail closed when absent.
     tool_policy: dict[str, Any] = field(default_factory=dict)
-    # How many acceptance criteria the task has: a verifier's report needs a result for each (see validate_report).
-    expected_criteria: int | None = None
+    # The task's acceptance criteria: a verifier's report needs a result of its own for each (see validate_report).
+    expected_criteria: list[str] | None = None
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()

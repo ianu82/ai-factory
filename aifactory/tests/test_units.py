@@ -56,19 +56,56 @@ def test_only_an_unmet_criterion_or_a_blocker_fails_a_verdict():
     assert ok is None and "cannot include blocker findings" in err
 
 
-def test_a_verifier_report_needs_a_result_for_every_criterion_when_the_count_is_known():
+def test_a_verifier_report_needs_a_result_for_every_criterion_when_the_criteria_are_known():
     report = {"verdict": "pass", "summary": "s", "criteria": [{"criterion": "c", "status": "pass", "evidence": "e"}]}
-    ok, err = validate_report("verifier", report, expected_criteria=3)
+    three = ["c", "d", "e"]
+    ok, err = validate_report("verifier", report, expected_criteria=three)
     assert ok is None and "results for 1 of the task's 3 acceptance criteria (2 missing)" in err
+    assert "Not covered: 2. d; 3. e. Report on every criterion once" in err
     failing = {**report, "verdict": "fail", "criteria": [{"criterion": "c", "status": "fail", "evidence": "e"}]}
-    assert validate_report("verifier", failing, expected_criteria=3)[0] is None  # a failing report too
-    # Callers that do not know the count, a task without criteria, and other roles behave as before.
+    assert validate_report("verifier", failing, expected_criteria=three)[0] is None  # a failing report too
+    # Callers that do not know the criteria, a task without criteria, and other roles behave as before.
     assert validate_report("verifier", report) == (report, "")
     assert validate_report("verifier", report, expected_criteria=None) == (report, "")
-    assert validate_report("verifier", report, expected_criteria=0) == (report, "")
-    assert validate_report("verifier", report, expected_criteria=1) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=[]) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=["c"]) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=["c", " "]) == (report, "")  # a blank is no criterion
     built = {"status": "done", "summary": "s"}
-    assert validate_report("builder", built, expected_criteria=3) == (built, "")
+    assert validate_report("builder", built, expected_criteria=three) == (built, "")
+
+
+def test_each_result_in_a_verifier_report_counts_for_one_criterion_only():
+    def report(*texts):
+        return {"verdict": "pass", "summary": "s",
+                "criteria": [{"criterion": text, "status": "pass", "evidence": "e"} for text in texts]}
+
+    listing, empty = "The page lists every open order", "The page shows a message when there are no orders"
+    wanted = [listing, empty]
+    # The right number of results, but one criterion twice, or a text that is not a criterion of the task.
+    for texts in ((listing, listing), (listing, "The code is tidy"), (listing, "")):
+        ok, err = validate_report("verifier", report(*texts), expected_criteria=wanted)
+        assert ok is None and "results for 1 of the task's 2 acceptance criteria (1 missing)" in err, texts
+        assert f"Not covered: 2. {empty}. Report on every criterion once" in err, texts
+    ok, err = validate_report("verifier", report("Looks fine", "Tests pass"), expected_criteria=wanted)
+    assert ok is None and "results for 0 of the task's 2 acceptance criteria (2 missing)" in err
+    # A result that is recognisably the criterion counts: in any order; with its list number, other case and
+    # spacing or a full stop; reworded a little; cut short; named by its number alone; beside the reviewer's own.
+    for texts in ((empty, listing),
+                  ("1. the page lists every open order.", "2.  The page shows a message  when there are no orders"),
+                  ("The page lists all open orders", empty),
+                  (listing, "The page shows a message when there are"),
+                  ("Criterion 1", "2"),
+                  (listing, empty, "No regressions in the existing tests")):
+        accepted = report(*texts)
+        assert validate_report("verifier", accepted, expected_criteria=wanted) == (accepted, ""), texts
+    # Two criteria that differ in a single letter are still two criteria.
+    files = ["a.txt exists", "b.txt exists"]
+    assert validate_report("verifier", report("a.txt exists", "a.txt exists"), expected_criteria=files)[0] is None
+    assert validate_report("verifier", report(*files), expected_criteria=files)[0] is not None
+    # A task that lists one criterion twice needs two results for it.
+    twice = ["It works", "It works"]
+    assert validate_report("verifier", report(*twice), expected_criteria=twice)[0] is not None
+    assert validate_report("verifier", report("It works"), expected_criteria=twice)[0] is None
 
 
 def test_verifier_reports_need_lists_of_objects():

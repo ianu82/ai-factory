@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 
 import pytest
@@ -46,12 +47,29 @@ def good_builder(messages):
                                                           "tests": ["sh test.sh: passed"]})]}
 
 
+def prompt_criteria(messages):
+    """The acceptance criteria a verifier's prompt lists, in order."""
+    lines = iter(messages[1]["content"].splitlines())
+    for line in lines:
+        if line.startswith("## Acceptance criteria"):
+            break
+    listed = []
+    for line in lines:
+        numbered = re.match(r"\d+\. (.*)", line)
+        if not numbered:
+            break
+        listed.append(numbered.group(1))
+    return listed
+
+
 def passing_verifier(messages):
+    """Looks, then passes every criterion the prompt lists (a report needs a result for each of the task's)."""
     if step(messages) == 0:
         return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh && git diff --stat HEAD"})]}
     return {"content": "", "tool_calls": [call("finish", {
-        "verdict": "pass", "summary": "Greeting verified.",
-        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}], "findings": []})]}
+        "verdict": "pass", "summary": "Greeting verified.", "findings": [],
+        "criteria": [{"criterion": criterion, "status": "pass", "evidence": "sh test.sh exit 0"}
+                     for criterion in prompt_criteria(messages) or [CRITERION]]})]}
 
 
 @pytest.fixture
@@ -264,20 +282,22 @@ def test_a_verifier_report_missing_a_criterion_is_corrected_in_the_same_session(
     replies = []
 
     def verifier(messages):
-        if step(messages) < 2:
-            return passing_verifier(messages)  # looks, then reports on one of the task's two criteria
+        if step(messages) == 0:
+            return passing_verifier(messages)  # looks first
         replies[:] = [m["content"] for m in messages if m["role"] == "tool" and "Report not accepted" in m["content"]]
+        # First two results, both for the same criterion: the right number, but the second criterion has none.
+        reported = (CRITERION, second) if replies else (CRITERION, CRITERION)
         return {"content": "", "tool_calls": [call("finish", {
             "verdict": "pass", "summary": "Greeting verified.", "findings": [],
-            "criteria": [{"criterion": c, "status": "pass", "evidence": "sh test.sh exit 0"}
-                         for c in (CRITERION, second)]})]}
+            "criteria": [{"criterion": c, "status": "pass", "evidence": "sh test.sh exit 0"} for c in reported]})]}
 
     ScriptedModel.scripts.update(planner=planner, verifier=verifier)
     outcome_id = new_outcome(factory)
     assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
     assert outcome_status(outcome_id) == "completed"
     assert len(replies) == 1 and replies[0].startswith(
-        "Report not accepted: The report has results for 1 of the task's 2 acceptance criteria (1 missing).")
+        "Report not accepted: The report has results for 1 of the task's 2 acceptance criteria (1 missing). "
+        "Not covered: 2. test.sh passes. Report on every criterion once")
     with session_scope() as s:  # one verifier session: it corrected its report instead of failing
         assert s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "verifier").count() == 1
 

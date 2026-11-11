@@ -168,7 +168,7 @@ class SessionSpec:
     effective_settings: Mapping[str, Any] | None = None
     model_override: str | None = None
     repositories: Mapping[str, Any] | None = None
-    expected_criteria: int | None = None  # the task's acceptance criteria, for a verifier (see validate_report)
+    expected_criteria: list[str] | None = None  # the task's acceptance criteria, for a verifier's report
 
     def __post_init__(self) -> None:
         # Own a recursively immutable snapshot, not a reference to mutable workspace/repo JSON.

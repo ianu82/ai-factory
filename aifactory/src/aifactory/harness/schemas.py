@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from difflib import SequenceMatcher
+from typing import Any, Sequence
 
 PLANNER_REPORT: dict[str, Any] = {
     "type": "object",
@@ -125,10 +127,63 @@ SCHEMAS = {"planner": PLANNER_REPORT, "builder": BUILDER_REPORT, "verifier": VER
            "plan_reviewer": PLAN_REVIEW_REPORT}
 
 
+CRITERION_MATCH = 0.8  # how alike a reported criterion and one of the task's must be to count as the same one
+
+
+def _criterion_key(text: Any) -> str:
+    """A criterion's text reduced to what identifies it: case, spacing, a list number and quoting are ignored."""
+    key = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    key = re.sub(r"^(?:criterion )?\(?#?\d{1,3}[.):] ", "", key)
+    return key.strip(" \"'`*.…")
+
+
+def _criterion_number(text: Any) -> int:
+    """The list number when a reported criterion only refers to it ("2", "Criterion 2"); otherwise 0."""
+    plain = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    found = re.fullmatch(r"(?:(?:criterion|ac) ?)?#?(\d{1,3})[.):]?", plain)
+    return int(found.group(1)) if found else 0
+
+
+def _likeness(a: str, b: str) -> float:
+    shorter, longer = sorted((a, b), key=len)
+    if len(shorter) >= 24 and shorter in longer:
+        return 1.0  # a criterion cut short, or quoted inside a longer sentence
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def uncovered_criteria(expected: Sequence[str], criteria: list[dict[str, Any]]) -> list[tuple[int, str]]:
+    """The task's acceptance criteria (list number, text) that a verifier's report has no result for. Each reported
+    result counts for one criterion: the one whose text it gives exactly, names by its list number, or rewords
+    recognisably. A repeated result, or one that gives another criterion's text, does not cover a second one."""
+    wanted = {n: key for n, text in enumerate(expected, 1) if (key := _criterion_key(text))}
+    texts = [c.get("criterion") for c in criteria]
+    keys = [_criterion_key(text) for text in texts]
+    free = list(range(len(criteria)))
+    missing = dict(wanted)
+    for n, key in wanted.items():  # the criterion's own text
+        hit = next((i for i in free if keys[i] == key), None)
+        if hit is not None:
+            free.remove(hit)
+            del missing[n]
+    for i in list(free):  # its list number alone
+        n = _criterion_number(texts[i])
+        if n in missing:
+            free.remove(i)
+            del missing[n]
+    known = set(wanted.values())
+    loose = [i for i in free if keys[i] and keys[i] not in known and not _criterion_number(texts[i])]
+    for n, key in list(missing.items()):  # a recognisable rewording
+        best = max(loose, key=lambda i: _likeness(key, keys[i]), default=None)
+        if best is not None and _likeness(key, keys[best]) >= CRITERION_MATCH:
+            loose.remove(best)
+            del missing[n]
+    return [(n, " ".join(str(expected[n - 1]).split())) for n in missing]
+
+
 def validate_report(role: str, report: Any,
-                    expected_criteria: int | None = None) -> tuple[dict[str, Any] | None, str]:
-    """Light, forgiving validation: returns (normalized_report, error). ``expected_criteria`` is how many acceptance
-    criteria the task has, when the caller knows: a verifier's report needs a result for each."""
+                    expected_criteria: Sequence[str] | None = None) -> tuple[dict[str, Any] | None, str]:
+    """Light, forgiving validation: returns (normalized_report, error). ``expected_criteria`` are the task's
+    acceptance criteria, when the caller knows them: a verifier's report needs a result of its own for each."""
     if not isinstance(report, dict):
         return None, "The report must be a JSON object."
     schema = SCHEMAS[role]
@@ -167,10 +222,15 @@ def validate_report(role: str, report: Any,
         if not isinstance(report.get("findings") or [], list) or any(
                 not isinstance(f, dict) for f in report.get("findings") or []):
             return None, "findings must be a list of objects."
-        if expected_criteria and len(criteria) < expected_criteria:
-            return None, (f"The report has results for {len(criteria)} of the task's {expected_criteria} acceptance "
-                          f"criteria ({expected_criteria - len(criteria)} missing). Report on every criterion, "
-                          "verbatim, with a status and evidence; use unverified for one you could not check.")
+        if uncovered := uncovered_criteria(expected_criteria or [], criteria):
+            total = sum(1 for text in expected_criteria or [] if _criterion_key(text))
+            listed = "; ".join(f"{n}. {text[:200]}" for n, text in uncovered[:5])
+            more = f" (and {len(uncovered) - 5} more)" if len(uncovered) > 5 else ""
+            return None, (f"The report has results for {total - len(uncovered)} of the task's {total} acceptance "
+                          f"criteria ({len(uncovered)} missing). Not covered: {listed}{more}. Report on every "
+                          "criterion once, with its text copied exactly, a status and evidence; a result that "
+                          "repeats or replaces a criterion does not count for another one. Use unverified for one "
+                          "you could not check.")
         unmet = any(c.get("status") != "pass" for c in criteria)
         blocker = any(f.get("severity") == "blocker" for f in report.get("findings") or [])
         if report["verdict"] == "pass" and unmet:
