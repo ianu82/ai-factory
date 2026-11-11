@@ -15,9 +15,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The suite runs as three shards on three runners (tests/conftest.py picks each test's shard from a hash of its
+  # name). One runner took 11 minutes here and 12 to 14 for Postgres; every revision of every pull request waited
+  # for that. The web build runs once, in the first shard.
   test:
+    name: test-${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     defaults:
       run:
         working-directory: aifactory
@@ -46,14 +54,23 @@ jobs:
           .venv/bin/python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.chromium.launch().close(); p.stop()" \
             || { echo "Chromium did not start; installing its system libraries with apt"; .venv/bin/python -m playwright install-deps chromium; }
       - name: Web type-check and build
+        if: matrix.shard == 1
         run: cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npm test && npx vite build
       - name: Tests (pipeline end-to-end, gateway, Native/Anton/Codex harnesses)
+        env:
+          AIFACTORY_TEST_SHARD: ${{ matrix.shard }}/3
         run: .venv/bin/python -m pytest -q
 
   postgres:
+    name: postgres-${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # The Postgres suite takes ~11 min plus ~4 min of setup; 15 min started cancelling PRs (#302, #321).
-    timeout-minutes: 30
+    # Unsharded, the Postgres suite took 11 to 14 min; a 15 min limit cancelled PRs (#302, #321). Each shard has
+    # its own runner and its own Postgres service, so the shards never share a database.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     defaults:
       run:
         working-directory: aifactory
@@ -90,4 +107,5 @@ jobs:
       - name: Tests against Postgres
         env:
           AIFACTORY_TEST_DATABASE_URL: postgresql://factory:factory@127.0.0.1:5432/factory_test
+          AIFACTORY_TEST_SHARD: ${{ matrix.shard }}/3
         run: .venv/bin/python -m pytest -q -p no:warnings --durations=15 --ignore=tests/test_codex_harness.py --ignore=tests/test_anton_harness.py
