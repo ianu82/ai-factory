@@ -116,9 +116,20 @@ def test_a_takeover_reads_once_as_the_factory_handing_the_task_over(client, sign
     # Through a Mind: the hand-over alone.
     record(ws, "task_handed_over", "ian via Mind took over T1; the Factory stopped working on it", outcome_id=outcome,
            task_id=task, actor=user, data={"source": "mind", "action_id": "a1"})
+    with SessionLocal() as db:
+        db.get(Task, task).status = "handed_over"
+        db.commit()
     said = [(m["kind"], m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
     assert said == [("task_handed_over", "Factory · T1", "Ian", "handoff"),
                     ("task_handed_over", "Factory · T1", "Ian", "handoff")]
+
+
+def test_a_takeover_that_could_not_complete_keeps_its_answer(client, signed_in):
+    ws, user, outcome, task = world(signed_in)  # the task finished first, so no hand-over was recorded
+    record(ws, "decision_resolved", "Ian: take_over — T1 did not pass", outcome_id=outcome, task_id=task, actor=user,
+           data={"decision_id": "d1", "resolution": "take_over"})
+    said = [(m["kind"], m["from"]["label"], m["to"]["label"]) for m in messages(client, ws)["items"]]
+    assert said == [("decision_resolved", "Ian", "Factory")]
 
 
 def test_filters_by_party_intent_and_outcome(client, signed_in):

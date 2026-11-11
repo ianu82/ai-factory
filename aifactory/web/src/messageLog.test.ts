@@ -55,3 +55,14 @@ test("yesterday is the previous calendar date, even the day after a clock change
     if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone;
   }
 });
+
+test("the same date in different years stays two days, and an older year shows its year", () => {
+  const now = new Date(2026, 10, 11, 12, 0);
+  const thisYear = new Date(2026, 9, 3, 9, 0).toISOString();
+  const lastYear = new Date(2025, 9, 3, 9, 0).toISOString();
+  assert.notEqual(dayLabel(thisYear, now), dayLabel(lastYear, now));
+  assert.match(dayLabel(lastYear, now), /2025/);
+  const groups = byDay([message(2, thisYear), message(1, lastYear)], now);
+  assert.equal(groups.length, 2);
+  assert.notEqual(groups[0].key, groups[1].key);
+});

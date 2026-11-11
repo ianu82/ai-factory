@@ -44,23 +44,32 @@ function startOfDay(date: Date): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
 }
 
-/** "Today", "Yesterday", or a short date, in the reader's own time zone. */
+/** "Today", "Yesterday", or a short date (with the year when it is not this year), in the reader's time zone. */
 export function dayLabel(iso: string, now = new Date()): string {
-  const day = startOfDay(new Date(iso));
+  const date = new Date(iso);
+  const day = startOfDay(date);
   if (day === startOfDay(now)) return "Today";
   // The previous calendar date, not 24 hours back: a day with a clock change is 23 or 25 hours long.
   if (day === startOfDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) return "Yesterday";
-  return new Date(iso).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+  return date.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short",
+    ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }) });
 }
 
-/** Messages (newest first) grouped under their day, keeping order. */
-export function byDay(messages: AgentMessage[], now = new Date()): { day: string; messages: AgentMessage[] }[] {
-  const groups: { day: string; messages: AgentMessage[] }[] = [];
+/** The reader's local calendar date, as the identity of a day group. */
+function dayKey(iso: string): string {
+  const date = new Date(iso);
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+/** Messages (newest first) grouped under their calendar day, keeping order. */
+export function byDay(messages: AgentMessage[], now = new Date()):
+  { key: string; day: string; messages: AgentMessage[] }[] {
+  const groups: { key: string; day: string; messages: AgentMessage[] }[] = [];
   for (const message of messages) {
-    const day = dayLabel(message.at, now);
+    const key = dayKey(message.at);
     const last = groups[groups.length - 1];
-    if (last && last.day === day) last.messages.push(message);
-    else groups.push({ day, messages: [message] });
+    if (last && last.key === key) last.messages.push(message);
+    else groups.push({ key, day: dayLabel(message.at, now), messages: [message] });
   }
   return groups;
 }

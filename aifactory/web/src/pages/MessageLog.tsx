@@ -78,7 +78,7 @@ export function MessageLogPage() {
         ) : (
           <>
             {days.map((group) => (
-              <section key={group.day} aria-label={group.day}>
+              <section key={group.key} aria-label={group.day}>
                 <h2 className="list-section">{group.day}</h2>
                 <ol className="rows msg-rows">
                   {group.messages.map((m) => <MessageRow key={m.id} m={m} workspaceId={ws.id} onOutcome={(id) => choose("outcome", id)} />)}

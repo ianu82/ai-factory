@@ -125,8 +125,10 @@ def _plan_reviewed(event: Event, ctx: Context) -> Ends | None:
 
 def _decision_resolved(event: Event, ctx: Context) -> Ends | None:
     # Taking a task over reads once, as the Factory handing the task to the person (task_handed_over), which every
-    # takeover records: from a decision, the task's page or a Mind.
-    if (event.data or {}).get("resolution") == "take_over":
+    # completed takeover records: from a decision, the task's page or a Mind. A takeover that could not complete
+    # (the task had already finished) records no hand-over, so its answer stays.
+    task = ctx.tasks.get(event.task_id or "")
+    if (event.data or {}).get("resolution") == "take_over" and task is not None and task.status == "handed_over":
         return None
     return _who(event, ctx), FACTORY, "answer"
 
