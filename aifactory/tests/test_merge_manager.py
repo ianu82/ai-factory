@@ -296,3 +296,44 @@ def test_explicit_github_mode_never_falls_back_on_a_lookup_failure(factory):
     r.cfg = {**r.cfg, "merge": {"queue": "github"}}
     with pytest.raises(Stop):
         asyncio.run(merge_manager.github_queue_state(Broken("token"), r))
+
+
+def test_red_main_starts_one_urgent_repair_and_waits_for_it(factory, monkeypatch):
+    async def failing_checks(self, full_name, sha):
+        from aifactory.github import CheckSummary
+
+        return CheckSummary("failure", [{"name": "tests", "status": "completed", "conclusion": "failure"}])
+
+    monkeypatch.setattr(FakeGitHub, "checks", failing_checks)
+    tid = merge_task(factory, key="T1")
+    for _ in range(2):  # retries after the back-off never start a second repair
+        requeue(tid)
+        with pytest.raises(Stop):
+            take(tid)
+    with session_scope() as s:
+        repairs = s.query(Outcome).filter(Outcome.priority == 0, Outcome.source == "signal").all()
+        assert len(repairs) == 1 and "Fix failing" in repairs[0].title
+        signal = s.query(Signal).filter(Signal.outcome_id == repairs[0].id).one()
+        assert signal.source == "ci_failure" and signal.status == "accepted"
+        repairs[0].status = "completed"
+    # Main goes red again later: a new repair starts.
+    requeue(tid)
+    with pytest.raises(Stop):
+        take(tid)
+    with session_scope() as s:
+        assert s.query(Outcome).filter(Outcome.priority == 0, Outcome.source == "signal").count() == 2
+
+
+def test_auto_repair_can_be_turned_off(factory, monkeypatch):
+    async def failing_checks(self, full_name, sha):
+        from aifactory.github import CheckSummary
+
+        return CheckSummary("failure", [{"name": "tests", "status": "completed", "conclusion": "failure"}])
+
+    monkeypatch.setattr(FakeGitHub, "checks", failing_checks)
+    r = runner(merge_task(factory, key="T1"))
+    r.cfg = {**r.cfg, "merge": {"auto_repair": False}}
+    with pytest.raises(Stop):
+        asyncio.run(merge_manager.take_turn(r, FakeGitHub("token")))
+    with session_scope() as s:
+        assert s.query(Outcome).filter(Outcome.priority == 0).count() == 0
