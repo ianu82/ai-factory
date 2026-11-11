@@ -107,10 +107,12 @@ def _person_acted(event: Event, ctx: Context) -> bool:
 
 def _plan_proposed(event: Event, ctx: Context) -> Ends:
     # A plan worked out with a person (adopt_plan, through their Mind) is handed to the Factory to build: no planner
-    # or plan reviewer took part.
+    # or plan reviewer took part. The Planner's own plan is proposed to the Factory: whether the plan reviewer, a
+    # person or policy then decides depends on the workspace's autonomy and the plan, and that answer is its own
+    # message (plan_reviewed, decision_requested and decision_resolved).
     if _person_acted(event, ctx):
         return _who(event, ctx), FACTORY, "handoff"
-    return PLANNER, PLAN_REVIEWER, "request"
+    return PLANNER, FACTORY, "propose"
 
 
 def _plan_reviewed(event: Event, ctx: Context) -> Ends | None:

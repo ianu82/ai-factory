@@ -51,7 +51,7 @@ def test_recorded_events_read_as_messages_between_parties(client, signed_in):
         ("Ian", "Factory", "answer"),
         ("Ian's Mind", "Builders", "inform"),
         ("Verifier · T1", "Builder · T1", "answer"),
-        ("Planner", "Plan reviewer", "request"),
+        ("Planner", "Factory", "propose"),
     ]
     mind = items[3]
     assert mind["from"] == {"role": "mind", "label": "Ian's Mind", "for": "Ian"}

@@ -16,6 +16,7 @@ export const PARTY_FILTERS: { key: string; label: string }[] = [
 export const INTENT_FILTERS: { key: string; label: string }[] = [
   { key: "", label: "All" },
   { key: "request", label: "Requests" },
+  { key: "propose", label: "Proposals" },
   { key: "answer", label: "Answers" },
   { key: "inform", label: "Updates" },
   { key: "handoff", label: "Hand-offs" },
