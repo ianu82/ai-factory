@@ -350,6 +350,16 @@ async def test_status_reports_pending_accounting_until_the_charge_settles(world)
     assert (status["status"], status["accounting"]) == ("ready", "settled")
 
 
+def test_status_stays_pending_while_another_request_holds_the_accounting_claim(world, monkeypatch):
+    client, _, _, ids = world
+    async def busy(self):
+        raise store.AccountingError("accounting_busy")
+    monkeypatch.setattr(store.TurnLedger, "reconcile", busy)
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("unavailable", "pending")
+    assert "settling" in status["reason"]
+
+
 def test_charged_failed_readiness_and_zero_budget(world):
     client, runtime, _, ids = world
     async def probe(workspace_id, ledger):

@@ -325,6 +325,9 @@ async def status(workspace_id: str, user: User = Depends(current_user), db: Sess
                 result = {**result, "accounting": "pending" if unsettled() else "settled"}
     except store.AccountingError as exc:
         result = {"status": "unavailable", "model_id": None, "reason": str(exc)}
+        if exc.code in ("accounting_pending", "accounting_busy"):
+            # Settling, here or in another tab: still pending, so the page keeps checking (as the stream maps it).
+            result = {**result, "reason": SETTLING, "accounting": "pending"}
     except Exception:
         result = {"status": "unavailable", "model_id": None, "reason": "Mind is unavailable."}
     finally:
