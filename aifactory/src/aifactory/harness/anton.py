@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -20,6 +21,7 @@ from ..inference_limits import admission
 from .anton_tools import replace_session_tools
 from .anton_web import sandbox_web_tools
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
+from .native import budget_warning
 from .schemas import validate_report
 from .tools import ToolBox, finish_tool, tool_specs
 
@@ -144,6 +146,20 @@ class AntonHarness:
             state["report"] = report
             raise _ReportReady()
 
+        def budgeted(tool):
+            """Anton takes no message mid-turn, so tool results carry the budget: a warning near the limits (as the
+            native harness sends) and, past them, a refusal: only finish still runs."""
+            run = tool.handler
+
+            async def handler(chat, arguments):
+                if state["calls"] > session.max_turns or session.remaining() < 90:
+                    return ("You are out of turns or time, so this tool did not run. Call finish now with an honest "
+                            "report of what is done and what is not.")
+                output = await run(chat, arguments)
+                warning = budget_warning(session, state["calls"])
+                return f"{output}\n\n{warning}" if warning and isinstance(output, str) else output
+            return replace(tool, handler=handler)
+
         def no_runtime(**_kwargs):
             raise _Stop()
 
@@ -152,6 +168,7 @@ class AntonHarness:
                          finish_handler if t["function"]["name"] == "finish" else make_handler(t["function"]["name"]))
                  for t in specs]
         tools = replace_session_tools(tools, session.sandbox) + sandbox_web_tools(session)
+        tools = [t if t.name == "finish" else budgeted(t) for t in tools]
 
         class SandboxChatSession(ChatSession):
             def _build_core_tools(chat):

@@ -235,6 +235,14 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         )
         context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
         session.prompt += context
+        if spec.role == "builder":  # the one role whose unreported work is still checked (TaskRunner.deliver)
+            budget = f"{limits.get('run_minutes', 60):g} minutes"
+            if spec.harness != "codex":  # the Codex CLI has no turn limit
+                budget += f" and {turns} turns (each reply of yours, with its tool calls, is one turn)"
+            session.prompt += (
+                f"\n\n## Your budget\nThis session has {budget}. If a limit is reached before you finish, the "
+                "factory checks whatever is in the working tree as it stands. So work in small complete steps, keep "
+                "the tree in a working state, and finish with an honest report before the limit.")
         result = await harness.run(session)
     except asyncio.CancelledError:
         status, error = "cancelled", "Cancelled"
