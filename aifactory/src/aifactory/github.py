@@ -360,8 +360,9 @@ class GitHub:
     async def pull(self, full_name: str, number: int) -> dict[str, Any]:
         return await self.request("GET", f"/repos/{full_name}/pulls/{number}")
 
-    async def comment(self, full_name: str, number: int, body: str) -> None:
-        await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body})
+    async def comment(self, full_name: str, number: int, body: str, *, retries: int = 3) -> None:
+        await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body},
+                           retries=retries)
 
     async def _review_pages(self, path: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []

@@ -33,14 +33,16 @@ export const GATES = [
 const STAGE_INDEX: Record<string, number> = {
   ci_repair: 0, revalidate: 0, revalidate_prepare: 0, revalidate_setup: 0, revalidate_checks: 1,
   revalidate_verify: 2, reverify: 2, revalidate_publish: 3,
-  "": 0, prepare: 0, build: 0, revise: 0, checks: 1, verify: 2, publish: 3, ci: 4, merge: 5, smoke: 6, release: 7, done: 7,
+  "": 0, prepare: 0, build: 0, revise: 0, checks: 1, verify: 2, publish: 3, ci: 4, review: 5, merge: 5, smoke: 6,
+  release: 7, done: 7,
 };
 
 export type GateState = "done" | "active" | "human" | "bad" | "skip" | "todo";
 
 /** Derive each delivery gate's state from a task's durable stage, status and evidence. */
 export function gateStates(task: Task): GateState[] {
-  const idx = task.status === "waiting_ci" ? 4 : STAGE_INDEX[task.stage] ?? 0;
+  // A parked task waits for CI on its head, then (stage "review", CI passed) for the pull request's reviewers.
+  const idx = task.status === "waiting_ci" ? (task.stage === "review" ? 5 : 4) : STAGE_INDEX[task.stage] ?? 0;
   const ev = task.evidence || {};
   return GATES.map((g, i) => {
     if (g.key === "ci" && ev.ci?.state === "none" && idx > 4) return "skip";
@@ -58,13 +60,14 @@ export function gateStates(task: Task): GateState[] {
 
 export function GateTrack({ task, large = false }: { task: Task; large?: boolean }) {
   const states = gateStates(task);
-  const waiting = task.status === "waiting_ci";
-  const label = `${waiting ? "Waiting for CI. " : ""}${GATES.map((g, i) => `${g.label}: ${states[i]}`).join(", ")}`;
+  const parked = task.status === "waiting_ci";
+  const waiting = !parked ? "" : task.stage === "review" ? "Waiting for review" : "Waiting for CI";
+  const label = `${waiting ? `${waiting}. ` : ""}${GATES.map((g, i) => `${g.label}: ${states[i]}`).join(", ")}`;
   if (!large) {
     return (
       <span className="gates" role="img" aria-label={label} title={label}>
         {states.map((s, i) => <span key={i} className={`gate ${s === "todo" ? "" : s}`} />)}
-        {waiting && <span className="muted" style={{ fontSize: 11, whiteSpace: "nowrap" }}>Waiting for CI</span>}
+        {waiting && <span className="muted" style={{ fontSize: 11, whiteSpace: "nowrap" }}>{waiting}</span>}
       </span>
     );
   }

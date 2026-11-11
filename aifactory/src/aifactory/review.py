@@ -98,8 +98,11 @@ class ReviewEvidence(TypedDict, total=False):
     started_at: str
     deadline: str
     next_poll_at: str
-    requested: dict[str, Any]  # {head, state: intent | posted, at}: the request comment, once per head
-    # {head, patch_id, state: reviewed | unavailable, reason, reviewers, open: [open_findings()], more, ask, at}
+    # {head, state: first | intent | posted, at}: the request comment, once per head after the pull request's first
+    requested: dict[str, Any]
+    # {head, patch_id, state: reviewed | unavailable, reason: timeout | unreadable, waited_seconds, reviewers,
+    #  open: [open_findings()], more, counts: {severity: n}, ask: limit | open | unreviewed, of, at}. ``ask``: a
+    # person decides the merge; ``of``: the reviewed head this one carries the same change as.
     result: dict[str, Any]
     # {n, head, findings: [ids], replies: {id: {replied, resolved}}, tries}: the revision in progress, kept until
     # its answers are posted on the threads
@@ -197,6 +200,12 @@ def open_findings(findings: list[Finding], policy: dict, answered: dict[str, dic
             "blocking": not answer and blocking(f["severity"], policy["block_on"]),
             "answer": {"action": answer.get("action"), "note": answer.get("note") or ""} if answer else None})
     return sorted(found, key=lambda f: (not f["blocking"], SEVERITIES.index(f["severity"])))
+
+
+def headline(body: str, limit: int = 120) -> str:
+    """A finding's first words for a one-line listing, without the badge markup Codex opens with."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)|</?sub>", "", body or "").replace("**", "")
+    return " ".join(text.split())[:limit]
 
 
 def reply_text(action: str, note: str, head: str) -> str:

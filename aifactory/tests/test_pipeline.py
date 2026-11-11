@@ -83,6 +83,9 @@ def factory(tmp_path, monkeypatch):
     FakeGitHub.pulls = {}
     FakeGitHub.merged = []
     FakeGitHub.check_state = "success"
+    FakeGitHub.comments, FakeGitHub.failures, FakeGitHub.reviewer = [], {}, None
+    FakeGitHub.reviews, FakeGitHub.threads, FakeGitHub.issue_comments = [], [], []
+    FakeGitHub.replies, FakeGitHub.resolved = [], []
     monkeypatch.setattr(delivery, "GitHub", FakeGitHub)
     monkeypatch.setattr(delivery, "resolve_token", lambda ws: "token")
     monkeypatch.setattr(planning, "resolve_token", lambda ws: "token")
@@ -96,6 +99,8 @@ def factory(tmp_path, monkeypatch):
         # These scenarios exercise an established operational workspace, not first-run learning.
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
         settings["limits"]["ci_minutes"] = 1
+        # No scenario waits for pull request reviews unless it turns them on (see review_on in test_ci_parking.py).
+        settings["review"]["address"] = "off"
         ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings=settings)
         user = User(email="dev@acme.test", name="Dev")
         s.add_all([ws, user])
