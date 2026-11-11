@@ -26,6 +26,7 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
+from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
 from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
                       workspace_settings)
@@ -56,12 +57,22 @@ class TaskRunner:
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
         self.app_summary: dict[str, Any] | None = None
+        # The repository's agent instructions, by base commit and whether they are for the verifier.
+        self._instructions: dict[tuple[str, bool], list[str]] = {}
         self._load()
         self.feedback = self._prior_feedback()
         self.builder_report = (self.task.evidence or {}).get("builder_report") or {}
         revalidation = (self.task.evidence or {}).get("revalidation") or {}
         if revalidation.get("phase") in ("rejected", "handled"):
             self.feedback += revalidation.get("feedback") or []
+
+    async def _sections(self, verifier: bool = False) -> list[str]:
+        """The plan around this task and the repository's instructions for agents, read at the base commit (never
+        from the candidate, which the builder may have changed)."""
+        key = (self.task.base_sha or "", verifier)
+        if key not in self._instructions:
+            self._instructions[key] = await repo_instructions(self.repo.full_name, key[0], verifier=verifier)
+        return plan_context(self.task_id) + self._instructions[key]
 
     def _prior_feedback(self) -> list[str]:
         """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
@@ -243,13 +254,14 @@ class TaskRunner:
             if self.builder is None:
                 await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
+            sections = await self._sections()
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
                 prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
                                     precedents(self.ws, self.repo.id),
-                                    guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
+                                    guidance_history(self.task.outcome_id, self.task_id), sections)), self.cancelled)
             if result is None:
                 if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
                     self.block("unblock", f"{self.task.key}: model provider problem", error,
@@ -457,6 +469,7 @@ class TaskRunner:
                 if qa_cfg.get("start"):
                     app = await self._start_app(sandbox, qa_cfg)
                     brief = verifier_brief(app)
+                sections = await self._sections(verifier=True)
                 run, result, error = await run_agent(SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
@@ -464,7 +477,8 @@ class TaskRunner:
                     repositories={self.repo.full_name: self.cfg},
                     prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
                                          precedents(self.ws, self.repo.id),
-                                         guidance_history(self.task.outcome_id, self.task_id))
+                                         guidance_history(self.task.outcome_id, self.task_id),
+                                         outcome=self.outcome, sections=sections)
                     + brief), self.cancelled)
                 if app is not None:
                     await self._store_app_evidence(app, attempt, run.id)
