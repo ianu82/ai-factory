@@ -756,8 +756,10 @@ class TaskRunner:
 
     def _infrastructure(self, attempt: int, phase: str, error: str, cause: str) -> None:
         """The model provider or the sandbox failed, not the attempt, so it is not charged. Billing, quota and access
-        problems (``cause`` "provider") wait for a person. Transient ones requeue the same attempt after a backoff;
-        once ``INFRA_RETRIES`` consecutive retries have failed as well, a person decides."""
+        problems (``cause`` "provider") wait for a person: a model session the provider refused holds the whole
+        workspace under one decision and the task waits in the queue; an access problem while setting up a sandbox
+        blocks this task. Transient ones requeue the same attempt after a backoff; once ``INFRA_RETRIES`` consecutive
+        retries have failed as well, a person decides."""
         record = {"n": attempt, "result": "infra", "cause": cause or "transient", "phase": phase, "error": error[:500]}
         ev = self.task.evidence or {}
         retries = int(ev.get("infra_retries", 0))
@@ -772,11 +774,22 @@ class TaskRunner:
         if cause == "provider" or retries >= INFRA_RETRIES:
             # Cleared with the decision: a person's retry runs at once and starts a new series of automatic retries.
             self._set_evidence({"attempts": record, "infra_retries": 0, "infra_retry_at": None, "infra_phase": None})
+            if cause == "provider" and phase in ("build", "verify") and not error.startswith("Sandbox setup failed"):
+                # Every model session of the workspace is refused the same way, so there is one hold and one decision
+                # for all of them, not one per task. The hold opens first: the scheduler must not start the task
+                # again before it exists.
+                from .holds import open_provider_hold
+
+                what = _PHASES[phase].lower()
+                open_provider_hold(self.ws, error, f"{self.task.key} of outcome #{self.outcome.number}, {what}")
+                self.event("provider_hold", f"Attempt {attempt}: the model provider refused {what} ({error[:200]}). "
+                           "Not counted as an attempt; the task waits in the queue until the provider hold in the "
+                           "inbox is resumed", level="warn", phase=phase)
+                self.update(attempt=resume_at, status="queued", lease_owner="")
+                raise Stop()
             self.update(attempt=resume_at)
             if cause == "provider":
-                what = "model provider" if phase in ("build", "verify") else "access"
-                self.block("unblock", f"{self.task.key}: {what} problem"
-                           + (" during verification" if phase == "verify" else ""), error,
+                self.block("unblock", f"{self.task.key}: access problem", error,
                            options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
             self.block("unblock", f"{self.task.key}: infrastructure problem",
                        f"{_PHASES[phase]} failed {retries + 1} times in a row for reasons outside the change (the "
