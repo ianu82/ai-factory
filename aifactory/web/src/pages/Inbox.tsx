@@ -20,6 +20,7 @@ const ALERT_KIND: Record<Alert["kind"], string> = {
   overdue: "Waiting", unasked: "Stuck", stalled: "Stalled", quiet: "Quiet", repeated: "Repeated failure",
 };
 const GROUPS: { key: string; label: string; kinds: string[] }[] = [
+  { key: "hold", label: "Work on hold", kinds: ["provider_hold"] },
   { key: "merge", label: "Merge approvals", kinds: ["approve_merge", "approve_release"] },
   { key: "plan", label: "Plans to approve", kinds: ["approve_plan"] },
   { key: "question", label: "Questions", kinds: ["question"] },
@@ -196,7 +197,7 @@ export function InboxPage() {
                       return (
                         <li key={d.id} className={`row ib-row ${d.id === decisionId ? "selected" : ""}`} tabIndex={0} aria-selected={d.id === decisionId}
                           onClick={() => select(d)} onKeyDown={(e) => onRowKey(e, d)}>
-                          <Dot tone={d.kind === "unblock" || d.kind === "budget" ? "bad" : "human"} />
+                          <Dot tone={["unblock", "budget", "provider_hold"].includes(d.kind) ? "bad" : "human"} />
                           <div style={{ minWidth: 0 }}>
                             <div className="title">
                               <span className="ib-kind">{DECISION_KIND[d.kind] || d.kind}</span>{d.title.replace(/^Approve merge: /, "").replace(/^Approve plan for #\d+: /, "")}

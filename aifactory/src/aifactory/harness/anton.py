@@ -153,7 +153,7 @@ class AntonHarness:
             return handler
 
         async def finish_handler(_session, arguments):
-            report, error = validate_report(session.role, arguments)
+            report, error = validate_report(session.role, arguments, session.expected_criteria)
             if report is None:
                 return f"Report not accepted: {error} Fix it and call finish again."
             state["report"] = report
