@@ -34,7 +34,7 @@ from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .model_checks import check_workspace_models
-from .models import (Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
+from .models import (Alert, Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
@@ -188,6 +188,26 @@ def _lead_settings(value: Any) -> dict[str, Any]:
     return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
 
 
+def _alert_settings(value: Any) -> dict[str, Any]:
+    """Alerts: how long a decision may wait before it alerts, and the outside channels. Slack and email aren't
+    available yet, so they can only be off: alerts show in the app's Inbox."""
+    default = DEFAULT_SETTINGS["alerts"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "alerts accepts only after_minutes, slack and email")
+    after = value.get("after_minutes", default["after_minutes"])
+    if type(after) is not int or not 15 <= after <= 1440:
+        raise HTTPException(422, "alerts.after_minutes must be a whole number from 15 to 1440")
+    for channel, name in (("slack", "Slack"), ("email", "Email")):
+        on = value.get(channel, False)
+        if type(on) is not bool:
+            raise HTTPException(422, f"alerts.{channel} must be true or false")
+        if on:
+            raise HTTPException(422, f"{name} alerts aren't available yet: alerts show in the Inbox")
+    return {"after_minutes": after, "slack": False, "email": False}
+
+
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         review = review_policy(raw)
@@ -195,12 +215,14 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from None
     mind = _mind_settings(raw.get("mind"))
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
-    merged = merged_settings({**raw, "lead": lead})
+    alerts = _alert_settings(raw.get("alerts"))
+    merged = merged_settings({**raw, "lead": lead, "alerts": alerts})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
     merged["mind"] = mind
     merged["lead"] = lead
+    merged["alerts"] = alerts
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -1022,7 +1044,16 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
     from .pipeline.lead import notes_for
 
     lead_notes = notes_for(db, decisions)
+    alerts = db.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.status == "open") \
+        .order_by(Alert.opened_at.desc()).limit(50).all()
+    about = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({a.outcome_id for a in alerts if a.outcome_id}))}
+    alert_tasks = {t.id: t.key for t in db.query(Task).filter(Task.id.in_({a.task_id for a in alerts if a.task_id}))}
     return {
+        "alerts": [{"id": a.id, "kind": a.kind, "title": a.title, "body": a.body, "since": S.ts(a.since),
+                    "opened_at": S.ts(a.opened_at), "outcome_id": a.outcome_id, "decision_id": a.decision_id,
+                    "outcome_number": about[a.outcome_id].number if a.outcome_id in about else None,
+                    "outcome_title": about[a.outcome_id].title if a.outcome_id in about else "",
+                    "task_key": alert_tasks.get(a.task_id)} for a in alerts],
         "decisions": [S.decision(d, {
             "outcome_number": outcomes[d.outcome_id].number if d.outcome_id in outcomes else None,
             "outcome_title": outcomes[d.outcome_id].title if d.outcome_id in outcomes else "",
@@ -1037,6 +1068,23 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
                                        "outcome_title": change_outcomes[e.outcome_id].title}
                                       if e.outcome_id in change_outcomes else {}) for e in recent],
     }
+
+
+@router.post("/workspaces/{workspace_id}/alerts/{alert_id}/dismiss")
+def dismiss_alert(workspace_id: str, alert_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Hide an alert while its condition lasts. If the condition clears and comes back, that is a new alert."""
+    _ws(db, user, workspace_id, "member")
+    alert = db.get(Alert, alert_id)
+    if alert is None or alert.workspace_id != workspace_id:
+        raise HTTPException(404, "Alert not found")
+    if alert.status == "open":
+        alert.status, alert.dismissed_by, alert.dismissed_at = "dismissed", user.id, utcnow()
+        record(workspace_id, "alert_dismissed", f"{user.name or user.email} dismissed an alert: {alert.title}",
+               outcome_id=alert.outcome_id, task_id=alert.task_id, actor=user.id,
+               data={"alert_id": alert.id, "kind": alert.kind}, session=db)
+        db.commit()
+        notify(workspace_id, "alert", workspace_id)
+    return {"status": alert.status}
 
 
 class Resolution(BaseModel):
