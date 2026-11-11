@@ -132,6 +132,17 @@ def test_a_takeover_that_could_not_complete_keeps_its_answer(client, signed_in):
     assert said == [("decision_resolved", "Ian", "Factory")]
 
 
+def test_a_decision_answered_in_words_shows_the_answer(client, signed_in):
+    ws, user, outcome, task = world(signed_in)
+    # The event's message names the decision (its question); what the person said is in the comment.
+    record(ws, "decision_resolved", "Ian: answer — Which cache should T1 use?", outcome_id=outcome, task_id=task,
+           actor=user, data={"decision_id": "d1", "resolution": "answer", "comment": "  The shared Redis client. "})
+    record(ws, "decision_resolved", "Ian: retry — T1 did not pass", outcome_id=outcome, task_id=task, actor=user,
+           data={"decision_id": "d2", "resolution": "retry", "comment": ""})
+    said = [m["says"] for m in messages(client, ws)["items"]]
+    assert said == ["Ian: retry — T1 did not pass", "answer: The shared Redis client."]
+
+
 def test_the_lead_speaks_as_the_lead(client, signed_in):
     ws, _, outcome, task = world(signed_in)
     with SessionLocal() as db:

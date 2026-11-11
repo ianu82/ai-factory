@@ -201,6 +201,18 @@ def _declared(event: Event) -> tuple[dict[str, Any], dict[str, Any], str] | None
     return (ends[0], ends[1], intent) if intent in INTENTS else None
 
 
+def _says(event: Event) -> str:
+    """What was said. A decision's event message names who resolved which decision (the question's title), so an
+    answer given in words reads as those words; one given without any keeps the event's message."""
+    data = event.data or {}
+    comment = data.get("comment")
+    if event.kind == "decision_resolved" and isinstance(comment, str) and comment.strip():
+        resolution = data.get("resolution")
+        prefix = f"{resolution}: " if isinstance(resolution, str) and resolution else ""
+        return (prefix + comment.strip())[:SAYS]
+    return (event.message or "")[:SAYS]
+
+
 def project(event: Event, ctx: Context) -> dict[str, Any] | None:
     """One journal event as a message, or None when it is not one."""
     if event.kind == MESSAGE_KIND:
@@ -217,7 +229,7 @@ def project(event: Event, ctx: Context) -> dict[str, Any] | None:
         return None
     task = ctx.tasks.get(event.task_id or "")
     return {"id": event.id, "at": ts(event.created_at), "kind": event.kind, "level": event.level,
-            "from": sender, "to": receiver, "intent": intent, "says": (event.message or "")[:SAYS],
+            "from": sender, "to": receiver, "intent": intent, "says": _says(event),
             "about": {"outcome_id": event.outcome_id, "task": {"id": task.id, "key": task.key} if task else None,
                       "pr": task.pr_number if task and task.pr_number else None}}
 
