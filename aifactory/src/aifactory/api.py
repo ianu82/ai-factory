@@ -1305,6 +1305,22 @@ def events(workspace_id: str, after: int = 0, limit: int = 200, user: User = Dep
     return [event_dict(e) for e in query.order_by(Event.id.desc()).limit(min(limit, 1000))][::-1]
 
 
+@router.get("/workspaces/{workspace_id}/messages")
+def list_messages(workspace_id: str, before: int | None = None, limit: int = 50, party: str | None = None,
+                  intent: str | None = None, outcome_id: str | None = None, user: User = Depends(current_user),
+                  db: Session = Depends(get_db)):
+    """The Message Log: who told whom what, newest first (see messages.py)."""
+    from . import messages
+
+    _ws(db, user, workspace_id)
+    if party is not None and party not in messages.GROUPS:
+        raise HTTPException(422, f"party must be one of {', '.join(messages.GROUPS)}")
+    if intent is not None and intent not in messages.INTENTS:
+        raise HTTPException(422, f"intent must be one of {', '.join(messages.INTENTS)}")
+    return messages.log(db, workspace_id, before=before, limit=limit, group=party, intent=intent,
+                        outcome_id=outcome_id)
+
+
 @router.get("/workspaces/{workspace_id}/signals")
 def list_signals(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)

@@ -554,3 +554,14 @@ export interface MindWireUsage {
   thread_cost: { usd: number | null; known: boolean };
   daily_spend: number | null; daily_limit: number;
 }
+
+/** The Message Log (messages.py): who told whom what, about which object. */
+export interface MessageParty { role: string; label: string; for?: string }
+export interface AgentMessage {
+  id: number; at: string; kind: string; level: string;
+  from: MessageParty; to: MessageParty;
+  intent: "request" | "answer" | "propose" | "inform" | "handoff";
+  says: string;
+  about: { outcome: { id: string; number: number; title: string } | null; task: { id: string; key: string } | null; pr: number | null };
+}
+export interface MessagePage { items: AgentMessage[]; next_cursor: number | null }
