@@ -71,7 +71,8 @@ def run(r: Run) -> dict[str, Any]:
     return {"id": r.id, "task_id": r.task_id, "outcome_id": r.outcome_id, "role": r.role, "harness": r.harness,
             "config_version": r.config_version, "provider": r.provider, "model": r.model, "attempt": r.attempt, "status": r.status, "turns": r.turns,
             "input_tokens": r.input_tokens, "output_tokens": r.output_tokens, "cost_usd": r.cost_usd,
-            "cost_known": r.cost_known, "error": r.error, "result": r.result, "started_at": ts(r.started_at),
+            "cost_known": r.cost_known, "error": r.error, "result": r.result,
+            "summary": (r.result or {}).get("summary"), "started_at": ts(r.started_at),
             "finished_at": ts(r.finished_at), "judged_at": ts(r.finished_at)}
 
 
@@ -193,9 +194,34 @@ def artifact(a: Artifact, content: bool = False) -> dict[str, Any]:
     return row
 
 
-def signal(s: Signal) -> dict[str, Any]:
+def triage_verdict(v, overrides=()) -> dict[str, Any]:
+    return {"id": v.id, "revision_id": v.revision_id, "run_id": v.run_id,
+            "goal_kind": v.goal_kind, "goal_id": v.goal_id, "goal_snapshot": v.goal_snapshot,
+            "verdict": v.verdict, "reasons": v.reasons, "confidence": v.confidence,
+            "payload": v.payload, "application_state": v.application_state,
+            "application_result": v.application_result, "created_at": ts(v.created_at),
+            "overrides": [{"id": o.id, "actor_id": o.actor_id, "verdict": o.verdict,
+                           "reason": o.reason, "payload": o.payload, "created_at": ts(o.created_at)}
+                          for o in overrides]}
+
+
+def signals(db: Session, rows: list[Signal]) -> list[dict[str, Any]]:
+    """Bulk-load verdicts and overrides, never query inside the per-row view."""
+    from .triage_store import latest_verdicts, override_history
+
+    verdicts = {}
+    for workspace_id in {s.workspace_id for s in rows}:
+        verdicts.update(latest_verdicts(db, workspace_id,
+                        [s.id for s in rows if s.workspace_id == workspace_id]))
+    overrides = override_history(db, [v.id for v in verdicts.values()])
+    return [signal(s, triage_verdict(verdicts[s.id], overrides.get(verdicts[s.id].id, []))
+                   if s.id in verdicts else None) for s in rows]
+
+
+def signal(s: Signal, latest_triage_verdict: dict | None = None) -> dict[str, Any]:
     return {"id": s.id, "source": s.source, "title": s.title, "body": s.body, "url": s.url, "count": s.count,
             "status": s.status, "outcome_id": s.outcome_id, "repo_id": s.repo_id, "data": s.data or {},
+            "latest_triage_verdict": latest_triage_verdict,
             "first_seen_at": ts(s.first_seen_at), "last_seen_at": ts(s.last_seen_at)}
 
 

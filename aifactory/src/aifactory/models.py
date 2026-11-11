@@ -359,19 +359,19 @@ class BenchmarkTrial(Base):
 
 
 class Run(Base):
-    """One agent session (planner, builder, verifier) and what it cost."""
+    """One agent session (planner, builder, verifier, triage) and what it cost."""
 
     __tablename__ = "runs"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
-    outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"), index=True)
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True, index=True)
     task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
     benchmark_trial_id: Mapped[str | None] = mapped_column(
         ForeignKey("benchmark_trials.id", name="fk_runs_benchmark_trial_id"), nullable=True, index=True,
     )
     config_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     config_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    role: Mapped[str] = mapped_column(String(20))  # planner|builder|verifier
+    role: Mapped[str] = mapped_column(String(20))  # planner|builder|verifier|triage
     harness: Mapped[str] = mapped_column(String(20))
     provider: Mapped[str] = mapped_column(String(20), default="")
     model: Mapped[str] = mapped_column(String(100), default="")
@@ -776,3 +776,97 @@ class MindCharge(Base):
     usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     settled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class TriageState(Base):
+    """One schedule and fenced lease per workspace (not settings on legacy rows)."""
+    __tablename__ = "triage_states"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    scan_after_id: Mapped[str] = mapped_column(String(32), default="")
+    active_window_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_token: Mapped[str] = mapped_column(String(32), default="")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class SignalRevision(Base):
+    """Immutable normalized material content; repetition reuses this identity."""
+    __tablename__ = "signal_revisions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    signal_id: Mapped[str] = mapped_column(ForeignKey("signals.id"), index=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (UniqueConstraint("workspace_id", "signal_id", "content_hash"),)
+
+
+@event.listens_for(SignalRevision, "before_update")
+def _immutable_signal_revision(_mapper, _connection, target):
+    if any(inspect(target).attrs[key].history.has_changes() for key in
+           ("workspace_id", "signal_id", "content_hash", "snapshot")):
+        raise ValueError("signal revisions are immutable")
+
+
+class TriageWindow(Base):
+    __tablename__ = "triage_windows"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), unique=True)
+    revision_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    lease_token: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TriageVerdict(Base):
+    __tablename__ = "triage_verdicts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    signal_id: Mapped[str] = mapped_column(ForeignKey("signals.id"), index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("signal_revisions.id"))
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    goal_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    goal_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    goal_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    verdict: Mapped[str] = mapped_column(String(20))
+    reasons: Mapped[list] = mapped_column(JSON, default=list)
+    confidence: Mapped[float] = mapped_column(Float)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # draft, target or question
+    application_state: Mapped[str] = mapped_column(String(20), default="pending")
+    application_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "signal_id", "revision_id"),
+        CheckConstraint("verdict IN ('propose', 'attach', 'duplicate', 'ignore', 'ask')"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1"),
+    )
+
+
+class TriageProposal(Base):
+    """One proposal/admission identity per signal, across all content revisions.
+
+    Admission must lock this row and persist outcome_id in the same transaction
+    that creates the outcome. Multiple signals may link to the same outcome.
+    """
+    __tablename__ = "triage_proposals"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    signal_id: Mapped[str] = mapped_column(ForeignKey("signals.id"), unique=True)
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TriageOverride(Base):
+    """Append-only attributed precedent; never overwrite the original verdict."""
+    __tablename__ = "triage_overrides"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    verdict_id: Mapped[str] = mapped_column(ForeignKey("triage_verdicts.id"), index=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    verdict: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

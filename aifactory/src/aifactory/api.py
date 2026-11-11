@@ -1287,8 +1287,8 @@ def events(workspace_id: str, after: int = 0, limit: int = 200, user: User = Dep
 @router.get("/workspaces/{workspace_id}/signals")
 def list_signals(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    return [S.signal(s) for s in db.query(Signal).filter(Signal.workspace_id == workspace_id).order_by(
-        Signal.last_seen_at.desc()).limit(300)]
+    return S.signals(db, db.query(Signal).filter(Signal.workspace_id == workspace_id).order_by(
+        Signal.last_seen_at.desc()).limit(300).all())
 
 
 @router.post("/workspaces/{workspace_id}/signals/sync")
@@ -1403,13 +1403,13 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         raise HTTPException(404, "Signal not found")
     if sig.source == "linear_issue":
         if body.action == "accept" and sig.outcome_id:
-            return S.signal(sig)
+            return S.signals(db, [sig])[0]
         raise HTTPException(409, "Linear signals are managed by configured Linear intake")
     if body.action == "ignore":
         sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
         sig.status = "ignored"
         db.commit()
-        return S.signal(sig)
+        return S.signals(db, [sig])[0]
     if body.action != "accept":
         raise HTTPException(400, "Unknown action")
     if sig.source == "improvement":
@@ -1420,11 +1420,11 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
             raise HTTPException(400, str(exc))
         db.commit()
         notify(workspace_id, "signal", sig.id)
-        return S.signal(sig)
+        return S.signals(db, [sig])[0]
     sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
     if sig.outcome_id:
         db.commit()
-        return S.signal(sig)  # accepting again must not create duplicate work
+        return S.signals(db, [sig])[0]  # accepting again must not create duplicate work
     worker = (sig.data or {}).get("worker") if sig.source == "github_issue" else None
     if worker not in ("native", "codex", "anton"):
         worker = None
@@ -1436,7 +1436,7 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
     sig.status, sig.outcome_id = "accepted", outcome.id
     db.commit()
     orchestrator.wake()
-    return S.signal(sig)
+    return S.signals(db, [sig])[0]
 
 
 # --- live updates -----------------------------------------------------------------------

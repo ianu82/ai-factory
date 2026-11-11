@@ -92,6 +92,7 @@ def init_engine(url: str | None = None) -> Engine:
     _migrate_benchmark_trial_link(_engine)
     _migrate_workstream_link(_engine)
     _migrate_mind_action_scope(_engine)
+    _migrate_triage_run_scope(_engine)
     harden_data_dir()
     return _engine
 
@@ -213,6 +214,63 @@ def _migrate_mind_action_scope(engine: Engine) -> None:
                 conn.commit()
             finally:
                 conn.invalidate()  # this connection never returns to the pool with altered pragmas
+
+
+def _migrate_triage_run_scope(engine: Engine) -> None:
+    """Targeted, idempotent runs.outcome_id relaxation, preserving stored DDL.
+
+    SQLite's rebuild keeps all columns, foreign keys, indexes and triggers,
+    including ones not known to this version of the application. Referencing
+    tables are untouched. Unlike optional UI migrations, failure is fatal.
+    """
+    import re
+    from sqlalchemy import inspect
+
+    column = next(c for c in inspect(engine).get_columns("runs") if c["name"] == "outcome_id")
+    if column["nullable"]:
+        return
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE runs ALTER COLUMN outcome_id DROP NOT NULL")
+        return
+    if engine.dialect.name != "sqlite":
+        raise RuntimeError("unsupported triage schema migration")
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.commit()
+        try:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            ddl = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'").scalar_one()
+            # Another startup may have completed the upgrade while we waited.
+            if not next(c for c in inspect(conn).get_columns("runs") if c["name"] == "outcome_id")["nullable"]:
+                objects = list(conn.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master WHERE tbl_name='runs' "
+                    "AND type IN ('index', 'trigger') AND sql IS NOT NULL"))
+                ddl, named = re.subn(r'^CREATE TABLE\s+"?runs"?(?=[\s(])',
+                                    'CREATE TABLE runs_triage_rebuild', ddl, count=1, flags=re.I)
+                ddl, relaxed = re.subn(r'("?outcome_id"?\s+\w+(?:\(\d+\))?)\s+NOT NULL',
+                                      r'\1', ddl, count=1, flags=re.I)
+                if not named or not relaxed:
+                    raise RuntimeError("unexpected runs DDL; refusing lossy migration")
+                conn.exec_driver_sql(ddl)
+                columns = ", ".join('"' + c["name"].replace('"', '""') + '"'
+                                    for c in inspect(conn).get_columns("runs"))
+                conn.exec_driver_sql(f"INSERT INTO runs_triage_rebuild ({columns}) SELECT {columns} FROM runs")
+                conn.exec_driver_sql("DROP TABLE runs")
+                conn.exec_driver_sql("ALTER TABLE runs_triage_rebuild RENAME TO runs")
+                for (statement,) in objects:
+                    conn.exec_driver_sql(statement)
+                if conn.exec_driver_sql("PRAGMA foreign_key_check(runs)").first():
+                    raise RuntimeError("runs foreign keys invalid after migration")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+            conn.commit()
+            conn.invalidate()
 
 
 def harden_data_dir() -> None:
