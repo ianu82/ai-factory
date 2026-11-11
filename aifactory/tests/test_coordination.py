@@ -210,3 +210,10 @@ def test_promoting_the_same_guidance_twice_makes_one_rule(world, client):
     second = client.post(f"/api/workspaces/{world['ws']}/rulings", json={"message_id": mid}).json()["id"]
     assert first == second
     assert len(client.get(f"/api/workspaces/{world['ws']}/rulings").json()["rulings"]) == 1
+
+
+def test_planning_gets_only_rulings_for_the_outcomes_repositories(world, client):
+    rid = client.post(f"/api/workspaces/{world['ws']}/rulings",
+                      json={"text": "Repo rule", "scope": "repository", "task_id": world["task"]}).json()["id"]
+    assert rid in {d.id for d in precedents(world["ws"], repo_ids=[world["repo"]])}
+    assert rid not in {d.id for d in precedents(world["ws"], repo_ids=["another-repo"])}
