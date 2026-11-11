@@ -786,7 +786,7 @@ class FakeGitHub:
         pass
 
     async def pull(self, repo, number):
-        return {"head": {"sha": FakeGitHub.live_head}}
+        return {"head": {"sha": FakeGitHub.live_head}, "user": {"login": "factory-bot"}}
 
     async def reviews(self, repo, number):
         return FakeGitHub.reviews_data
@@ -842,6 +842,13 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     monkeypatch.setattr(github, "GitHub", PushedDuring)
     assert not lead.settled(asyncio.run(lead.review_state("ws", "team/app", 12, HEAD)))
     monkeypatch.setattr(github, "GitHub", FakeGitHub)
+
+    # The PR's own author commenting on their commit isn't a review of it.
+    monkeypatch.setattr(FakeGitHub, "reviews_data", [{"commit_id": HEAD, "state": "COMMENTED",
+                                                      "user": {"login": "factory-bot"}}])
+    monkeypatch.setattr(FakeGitHub, "comments_data", [])
+    monkeypatch.setattr(FakeGitHub, "threads_data", [])
+    assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["reviewed"] is False
 
     class Partial(FakeGitHub):
         async def review_threads(self, repo, number):  # the helper refuses partial GraphQL data
@@ -1035,3 +1042,34 @@ def test_a_note_from_before_marks_shows_on_a_question_but_not_on_a_merge(world, 
     inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
     assert inbox[world["question"]]["lead_note"]["text"] == "Use the durable queue."
     assert inbox[world["merge"]]["lead_note"] is None  # the commit it was about may not be the one up for merging
+
+
+def test_the_lead_reads_review_again_before_it_writes_about_a_merge(world, model, monkeypatch):
+    merge_ready(world)
+    reads = []
+
+    async def state(ws, repo, number, head):  # clean when the run starts; a P1 lands while the model thinks
+        reads.append(head)
+        found = [] if len(reads) == 1 else [{"id": "t1", "severity": "P1", "path": "a.py", "line": 3,
+                                              "by": lead.CODEX, "text": "Fix the lock"}]
+        return {"head": head, "live_head": head, "checked": True, "reviewed": True, "open": found,
+                "changes_requested_by": []}
+
+    monkeypatch.setattr(lead, "review_state", state)
+    told = []
+
+    def script(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("note_for_people", {
+                "decision_id": world["merge"], "text": "Review is clean. I recommend merging."})]}
+        told.append(messages[-1]["content"])
+        return {"content": "", "tool_calls": [call("finish", {"summary": "Held"})]}
+
+    model.scripts = {"lead": script}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded", row.error
+    assert told[0].startswith("Review of this merge approval changed while you were working. Now: Review of PR #12")
+    assert "1 of them P0/P1" in told[0]
+    with db.session_scope() as s:  # nothing was said about the merge
+        assert not [m for m in s.query(Message).filter_by(author_kind="lead")
+                    if (m.attribution or {}).get("decision_id") == world["merge"]]

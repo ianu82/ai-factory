@@ -466,10 +466,13 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
         gh = GitHub(resolve_credential(workspace_id))
         # The PR as it is now: a commit pushed straight to it isn't what the Factory put up for merging, and nothing
         # else here would notice (the task keeps the commit it published).
-        state["live_head"] = await _pr_head(gh, repo, number)
+        pr = await gh.pull(repo, number)
+        state["live_head"] = _head_of(pr)
+        author = (pr.get("user") or {}).get("login")  # whoever opened the PR doesn't review it
         latest: dict[str, str] = {}
         for review in await gh.reviews(repo, number):
-            if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+            if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED") \
+                    and (review.get("user") or {}).get("login") != author:
                 state["reviewed"] = True
             if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                 latest[(review.get("user") or {}).get("login", "")] = review["state"]
@@ -494,7 +497,7 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
                                   "line": t.get("line"), "by": author,
                                   "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
         # And again after: a commit pushed while review was being read makes this a snapshot of the old one.
-        state["live_head"] = await _pr_head(gh, repo, number)
+        state["live_head"] = _head_of(await gh.pull(repo, number))
         state["checked"] = True
     except Exception as exc:  # anything at all (a credential that no longer decrypts, a timeout): unknown, never clean
         log.warning("review state of %s#%s unreadable: %r", repo, number, exc)
@@ -502,8 +505,8 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
     return state
 
 
-async def _pr_head(gh, repo: str, number: int) -> str:
-    sha = ((await gh.pull(repo, number)).get("head") or {}).get("sha")
+def _head_of(pr: dict[str, Any]) -> str:
+    sha = (pr.get("head") or {}).get("sha")
     if not isinstance(sha, str) or not sha:
         raise ValueError("pull request has no head commit")
     return sha
@@ -678,6 +681,7 @@ class Tools:
         self.reviews: dict[str, dict[str, Any]] = {}  # merge approval id -> review state of its commit (lines below)
         self.lines: dict[str, str] = {}
         self.read_at: dict[str, datetime] = {}  # when each review was read: a later change makes the note stale
+        self.prs: dict[str, tuple[str, int]] = {}  # merge approval id -> its repository and PR number
 
     async def read_reviews(self) -> None:
         """Review states for this outcome's open merge approvals, from GitHub, before the Lead reads its record.
@@ -686,8 +690,25 @@ class Tools:
             for decision_id, repo, number, head in self._unread():
                 self.read_at[decision_id] = utcnow()  # before the read: a change recorded during it counts as later
                 state = await review_state(self.ws, repo, number, head)
-                self.reviews[decision_id] = state
+                self.reviews[decision_id], self.prs[decision_id] = state, (repo, number)
                 self.lines[decision_id] = review_line(state, number)
+
+    async def recheck(self, name: str, args: Any) -> str | None:
+        """Right before the Lead writes about a merge approval (a note, or requesting changes): read its review again.
+        The model may have thought for minutes, and a commit pushed straight to the PR or a new finding in that time
+        makes what it is about to say about something else. Returns why it can't go ahead, or None."""
+        decision_id = args.get("decision_id") if isinstance(args, dict) else None
+        if name not in ("note_for_people", "resolve_decision") or decision_id not in self.prs:
+            return None
+        before = self.reviews[decision_id]
+        repo, number = self.prs[decision_id]
+        self.read_at[decision_id] = utcnow()
+        state = await review_state(self.ws, repo, number, before["head"])
+        self.reviews[decision_id], self.lines[decision_id] = state, review_line(state, number)
+        if review_fingerprint(state) == review_fingerprint(before):
+            return None
+        return (f"Review of this merge approval changed while you were working. Now: {self.lines[decision_id]} "
+                "Read it again (outcome_record, merge_reviews) before you say or do anything about this merge.")
 
     def _unread(self) -> list[tuple[str, str, int, str]]:
         """Open merge approvals whose current commit has no review read this run."""
@@ -1071,6 +1092,9 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
                 return (summary if isinstance(summary, str) and summary.strip() else "Finished").strip()[:2000]
             # A resolution runs on this loop, as the operator relay's do: resolve() wakes the orchestrator and can
             # touch this loop's work. Everything else is reading or writing rows: a worker thread keeps the loop free.
-            output = tools.call(name, args) if name == "resolve_decision" else await asyncio.to_thread(tools.call, name, args)
+            output = await tools.recheck(name, args)
+            if output is None:
+                output = tools.call(name, args) if name == "resolve_decision" \
+                    else await asyncio.to_thread(tools.call, name, args)
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": output})
     return "Out of turns"
