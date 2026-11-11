@@ -363,6 +363,92 @@ def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
     assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
 
 
+def test_a_revision_starts_from_the_branchs_real_base_when_the_recorded_one_was_never_published(factory):
+    """A restart begins an attempt again from the latest main and records that base, but the attempt is never
+    published: the branch still sits on its older base. The revision must still be brought up to date, or main's
+    newer commits count as the task's own change."""
+    published = {}
+
+    def move():
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            published["base"] = task.evidence["published"]["base"]
+            assert published["base"] == task.base_sha  # publishing records the branch's base
+            task.base_sha = main  # what the unpublished fresh attempt recorded
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    kinds = _event_kinds(outcome_id)
+    assert "branch_base_corrected" in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        corrected = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "branch_base_corrected").one()
+        assert corrected.data["actual"] == published["base"]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
+def test_a_publication_record_for_an_earlier_head_is_not_trusted_for_the_base(factory):
+    """A stop between a push and its record leaves the record describing the publication before it: another head,
+    on an older base the branch still contains. Trusting that base would count main's commits since then as the
+    task's own change, so the record's base counts only while its head is the branch's head."""
+    _land_on_main(factory, "earlier.txt", "on main before the task started\n")
+    bare = factory["remotes"] / "acme/demo.git"
+
+    def move():
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            record = task.evidence["published"]
+            assert record["base"] == task.base_sha
+            older = git("rev-parse", f"{record['base']}~1", cwd=bare)
+            task.evidence = {**task.evidence, "published": {**record, "head": "0" * 40, "base": older}}
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    kinds = _event_kinds(outcome_id)
+    assert "branch_base_corrected" not in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=bare).split()
+    assert {"greet.sh", "other.txt", "earlier.txt"} <= set(tree)
+
+
+def test_a_revision_trusts_the_published_base_over_a_recorded_one_the_branch_also_contains(factory):
+    """An unpublished retry can record a rewound main: an older commit that the published branch also contains.
+    The base recorded at publishing still marks where the task's own commits begin, so the commit main dropped is
+    not republished as the task's change."""
+    _land_on_main(factory, "dropme.txt", "removed by a force-push later\n")
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    published = {}
+
+    def rewind_main():  # drop the dropme.txt commit; the unpublished retry then records the rewound main
+        git("reset", "-q", "--hard", "HEAD~1", cwd=seed)
+        git("push", "-q", "-f", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+        main = git("rev-parse", "HEAD", cwd=seed)
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            published["base"] = task.evidence["published"]["base"]
+            assert published["base"] != main
+            task.base_sha = main
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, rewind_main)
+    with session_scope() as s:
+        corrected = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "branch_base_corrected").one()
+        assert corrected.data["actual"] == published["base"] and corrected.data["recorded"] == main
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
+    assert "greet.sh" in tree and "dropme.txt" not in tree
+
+
 def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_overlap(factory):
     told, saw_markers, rejected = [], [], []
 

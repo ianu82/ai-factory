@@ -160,11 +160,14 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
         if report.get("verdict") not in ("pass", "fail"):
             return None, "verdict must be pass or fail."
         criteria = report.get("criteria") or []
-        if report["verdict"] == "pass" and any(c.get("status") != "pass" for c in criteria if isinstance(c, dict)):
+        if not isinstance(criteria, list) or any(not isinstance(c, dict) for c in criteria):
+            return None, "criteria must be a list of objects, each with criterion, status and evidence."
+        if not isinstance(report.get("findings") or [], list) or any(
+                not isinstance(f, dict) for f in report.get("findings") or []):
+            return None, "findings must be a list of objects."
+        if report["verdict"] == "pass" and any(c.get("status") != "pass" for c in criteria):
             return None, "A pass verdict requires every criterion to pass. Use fail (or verify further)."
-        if report["verdict"] == "pass" and any(
-            isinstance(f, dict) and f.get("severity") == "blocker" for f in report.get("findings") or []
-        ):
+        if report["verdict"] == "pass" and any(f.get("severity") == "blocker" for f in report.get("findings") or []):
             return None, "A pass verdict cannot include blocker findings."
     if role == "builder" and report.get("status") not in ("done", "blocked"):
         return None, "status must be done or blocked."

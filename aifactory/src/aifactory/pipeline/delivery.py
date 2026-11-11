@@ -84,10 +84,10 @@ class TaskRunner:
             verdict = attempt.get("verdict") or {}
             if attempt.get("result") == "verification_failed" and verdict:
                 notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
-                for c in verdict.get("criteria") or []:
+                for c in _objects(verdict.get("criteria")):
                     if c.get("status") != "pass":
                         notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
-                for f in verdict.get("findings") or []:
+                for f in _objects(verdict.get("findings")):
                     if f.get("severity") in ("blocker", "major"):
                         notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
             elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks") or []):
@@ -359,7 +359,40 @@ class TaskRunner:
         sb, default = self.builder, self.repo.default_branch
         found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
         main = found.output.strip() if found.ok else ""
-        if not main or not self.task.base_sha or main == self.task.base_sha:
+        if not main:
+            return
+        recorded = self.task.base_sha or ""
+        record = (self.task.evidence or {}).get("published") or {}
+        tip = await sb.exec("git rev-parse HEAD", timeout=60)
+        # A publication record describes one pushed head. A stop between a push and its record leaves the record
+        # describing the publication before it, so its base counts only while its head is still the branch's head.
+        published = str(record.get("base") or "") if tip.ok and record.get("head") == tip.output.strip() else ""
+        # The base recorded when the branch was last published is the branch's real base, so it is trusted first.
+        # The task's recorded base can belong to an attempt that was never published: a restart begins the attempt
+        # again from the latest code and records that base, while the branch still sits on another one. Trusting
+        # it would skip this rebase when it is newer than the branch, and when it is an older commit the branch
+        # also contains, every commit between the two would count as this task's change (republishing commits
+        # removed from a rewound main, for one). Branches published before the base was recorded fall back to the
+        # recorded base when the branch contains it, then to where the branch meets it (a later commit of the same
+        # history), then main.
+        actual = ""
+        for known in (published, recorded):
+            if known and not actual and (await sb.exec(
+                    f"git merge-base --is-ancestor {shlex.quote(known)} HEAD", timeout=60)).ok:
+                actual = known
+        for other in (recorded, main):
+            if actual or not other:
+                continue
+            merged = await sb.exec(f"git merge-base HEAD {shlex.quote(other)}", timeout=60)
+            actual = merged.output.strip() if merged.ok else ""
+        if not actual:
+            return
+        if actual != recorded:
+            self.event("branch_base_corrected", f"{branch} sits on {actual[:8]}, not the recorded base "
+                       f"{recorded[:8] or '(none)'}; bringing it up to date from there", level="warn",
+                       recorded=recorded, actual=actual)
+            self.update(base_sha=actual)
+        if main == self.task.base_sha:
             return
         if (self.task.evidence or {}).get("ci", {}).get("state") == "failure":
             self.event("revalidate", "The base branch moved; rebasing the CI repair before verification")
@@ -539,11 +572,13 @@ class TaskRunner:
                 self.event("verified", f"Independent verification passed: {report.get('summary', '')[:300]}",
                            level="success")
                 return report
-            failing = [c for c in report.get("criteria", []) if c.get("status") != "pass"]
-            findings = [f for f in report.get("findings", []) if f.get("severity") in ("blocker", "major")]
+            failing = [c for c in _objects(report.get("criteria")) if c.get("status") != "pass"]
+            findings = [f for f in _objects(report.get("findings")) if f.get("severity") in ("blocker", "major")]
             self.feedback.append("- Independent review FAILED. " + report.get("summary", "")[:1500])
-            self.feedback += [f"  - Criterion not met: {c['criterion']} — {c.get('evidence', '')[:600]}" for c in failing]
-            self.feedback += [f"  - {f['severity']}: {f['description'][:600]} {f.get('location', '')}" for f in findings]
+            self.feedback += [f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:600]}"
+                              for c in failing]
+            self.feedback += [f"  - {f['severity']}: {str(f.get('description', ''))[:600]} {f.get('location', '')}"
+                              for f in findings]
             if runtime_problem and app is not None and app.evidence.get("log_tail"):
                 self.feedback.append(f"  - App log when it failed:\n```\n{app.evidence['log_tail'][-1500:]}\n```")
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
@@ -785,13 +820,16 @@ class TaskRunner:
                 self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
+        # Record the publication before advancing the head, as revalidation does: a stop between the two must not
+        # leave the task at this head with a record of the publication before it.
+        self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
+                                    "pr": pr["number"]})
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
-        self.evidence("published", {"head": head, "at": utcnow().isoformat(), "pr": pr["number"]})
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:
         lines = [self.builder_report.get("summary", "").strip() or self.task.title, "", "### Acceptance criteria"]
-        by = {c.get("criterion"): c for c in self.verifier_report.get("criteria", [])}
+        by = {c.get("criterion"): c for c in _objects(self.verifier_report.get("criteria"))}
         for criterion in self.task.acceptance:
             c = by.get(criterion) or next((v for k, v in by.items() if k and criterion[:40] in k), {})
             mark = {"pass": "✅", "fail": "❌"}.get(c.get("status", ""), "◻️")
@@ -1223,8 +1261,8 @@ class TaskRunner:
             if self.task.head_sha != state["head"]:
                 # A merge approval belongs to the published candidate, not its branch name.
                 # Persist the new publication before advancing the head, including on resume.
-                self.evidence("published", {"head": state["head"], "at": utcnow().isoformat(),
-                                            "pr": self.task.pr_number})
+                self.evidence("published", {"head": state["head"], "base": state["new_base"],
+                                            "at": utcnow().isoformat(), "pr": self.task.pr_number})
             self.update(head_sha=state["head"], base_sha=state["new_base"])
         if state["phase"] in ("checks", "verify"):
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
@@ -1487,6 +1525,11 @@ def _revalidation_section(state: dict[str, Any]) -> str:
             f"```json\n{payload}\n```\n{REVALIDATION_END}")
 
 
+def _objects(items: Any) -> list[dict[str, Any]]:
+    """The objects in a model-written list (a verifier's criteria or findings); anything else in it is skipped."""
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
 def _actionable(attempt: dict[str, Any]) -> bool:
     """Whether an attempt's record gives the next attempt something concrete to fix."""
     result = attempt.get("result")
@@ -1497,8 +1540,8 @@ def _actionable(attempt: dict[str, Any]) -> bool:
     if result == "verification_failed":
         verdict = attempt.get("verdict") or {}  # optional report fields may be null
         # Exactly what the feedback relays to the next attempt: unmet criteria and blocker/major findings.
-        return (any(c.get("status") != "pass" for c in verdict.get("criteria") or [])
-                or any(f.get("severity") in ("blocker", "major") for f in verdict.get("findings") or []))
+        return (any(c.get("status") != "pass" for c in _objects(verdict.get("criteria")))
+                or any(f.get("severity") in ("blocker", "major") for f in _objects(verdict.get("findings"))))
     return False
 
 
