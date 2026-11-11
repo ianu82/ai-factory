@@ -14,6 +14,7 @@ import logging
 import os
 from typing import Any
 
+from .. import merge_manager
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
@@ -465,6 +466,9 @@ class Orchestrator:
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
                       .filter(Outcome.source != "review", Task.status == "queued")]
+            # The merge manager hands out one merge turn per repository; the rest wait without a slot.
+            held = merge_manager.held_back(s)
+            queued = [c for c in queued if c.id not in held]
             planning_by_ws: dict[str, int] = {}
             for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1

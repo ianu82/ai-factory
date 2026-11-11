@@ -21,6 +21,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
+from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
@@ -223,6 +224,7 @@ class TaskRunner:
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
+        merge_manager.leave(self)  # a rebuild re-enters the merge queue at the back when it is ready again
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
         finished = {a.get("n") for a in self._budget_attempts()}
@@ -1120,8 +1122,21 @@ class TaskRunner:
             await self._refresh_onto_main(token, gh, pending["new_base"])
             return
         self._require_merge_approval()
-        self.stage("merge", f"Merging PR #{self.task.pr_number}")
+        # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
+        await merge_manager.take_turn(self, gh)
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
+        github_queue = await merge_manager.github_queue_state(gh, self)
+        if github_queue is not None:
+            if revalidate and not github_queue["entry"] and not (self.task.evidence or {}).get(
+                    merge_manager.KEY, {}).get("github"):
+                # Enqueue only a head verified against the current main; otherwise rebase and revalidate first.
+                main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard()
+                if main_sha != self.task.base_sha:
+                    await self._refresh_onto_main(token, gh, main_sha)
+                    return
+            await merge_manager.merge_via_github_queue(self, gh, github_queue)
+        self.stage("merge", f"Merging PR #{self.task.pr_number}")
         refresh_onto: str | None = None
         # Merges into one repository are serialized; CI waits and rebuilds happen outside the lock.
         async with self.repo_lock(self.repo.id):
