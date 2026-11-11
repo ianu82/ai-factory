@@ -486,6 +486,8 @@ test("wire unavailable, accounting and budget codes map to explicit blocked stat
   assert.equal(status.reason, "Missing saved key");
   assert.equal(mindStatus({ status: "ready", model_id: "opus-5-5", accounting: "pending" }).budget_state, "pending_accounting");
   assert.equal(mindStatus({ status: "ready", model_id: "opus-5-5", accounting: "settled" }).budget_state, "ok");
+  // Still settling after the readiness cache expired: blocked, and still pending so the page keeps checking.
+  assert.equal(mindStatus({ status: "unavailable", model_id: null, reason: "Mind is settling", accounting: "pending" }).budget_state, "pending_accounting");
   assert.equal(mindBudget("budget_exceeded"), "budget_exceeded");
   assert.equal(mindBudget("accounting_busy"), "pending_accounting");
   assert.equal(mindBudget("accounting_pending"), "pending_accounting");

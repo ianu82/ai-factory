@@ -126,7 +126,10 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
   const scroll = useRef(new MindScroll());
   const [unseen, setUnseen] = useState(false);
   useEffect(() => {
-    if (state.userId && state.active?.id !== threadId) void controller.select(threadId);
+    if (!state.userId) return;
+    if (state.active?.id !== threadId) void controller.select(threadId);
+    // Back on a conversation that is already open (from Settings, say): a key or budget may have changed since.
+    else void controller.checkStatus(state.active.workspace_id);
   }, [controller, state.userId, threadId]);
   useEffect(() => { scroll.current = new MindScroll(); setUnseen(false); }, [threadId]);
   useLayoutEffect(() => { if (pane.current) setUnseen(scroll.current.onOutput(pane.current)); }, [state.messages, state.draft, state.steps]);

@@ -299,20 +299,30 @@ def get_thread(thread_id: str, user: User = Depends(current_user), db: Session =
     return transcript(db, row)
 
 
+SETTLING = "Mind is settling the cost of the last reply. Try again in a moment."
+
+
 @router.get("/status")
 async def status(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
                  runtime=Depends(get_runtime)):
     require_member(db, user, workspace_id)
     ledger = store.TurnLedger(user.id, workspace_id, runtime=runtime)
+
+    def unsettled() -> bool:
+        # A fresh session sees what reconcile just committed (this request's session may hold an older snapshot).
+        with SessionLocal() as session:
+            return session.query(MindCharge).filter_by(user_id=user.id, settled=False).first() is not None
+
     try:
-        result = await readiness(runtime, workspace_id, ledger)
+        # Settle first: a send, and an uncached readiness probe's own admission, refuse while a charge is unsettled.
         await ledger.reconcile()
-        if result.get("status") == "ready":
-            # A send refuses while any of the person's charges is unsettled, so "ready" says whether one is. A fresh
-            # session sees what reconcile just committed (this request's session may hold an older snapshot).
-            with SessionLocal() as session:
-                pending = session.query(MindCharge).filter_by(user_id=user.id, settled=False).first() is not None
-            result = {**result, "accounting": "pending" if pending else "settled"}
+        if unsettled():
+            result = {"status": "unavailable", "model_id": None, "reason": SETTLING, "accounting": "pending"}
+        else:
+            result = await readiness(runtime, workspace_id, ledger)
+            await ledger.reconcile()
+            if result.get("status") == "ready":
+                result = {**result, "accounting": "pending" if unsettled() else "settled"}
     except store.AccountingError as exc:
         result = {"status": "unavailable", "model_id": None, "reason": str(exc)}
     except Exception:

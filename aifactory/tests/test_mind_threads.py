@@ -335,7 +335,16 @@ async def test_status_reports_pending_accounting_until_the_charge_settles(world)
     await ledger.before_call()
     await ledger.after_call(None)
     status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
-    assert (status["status"], status["accounting"]) == ("ready", "pending")
+    assert (status["status"], status["accounting"]) == ("unavailable", "pending")
+    assert "settling" in status["reason"]
+    # Readiness is not probed while a charge is pending (a probe's own admission would refuse and misreport it).
+    probes = []
+    async def probe(workspace_id, ledger):
+        probes.append(workspace_id)
+        return {"status": "ready", "model_id": "scripted"}
+    runtime.readiness = probe
+    client.get("/api/mind/status", params={"workspace_id": ids[2]})
+    assert probes == []
     runtime.total = .5  # reconciliation can settle it now
     status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
     assert (status["status"], status["accounting"]) == ("ready", "settled")
