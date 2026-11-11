@@ -519,3 +519,23 @@ def test_a_spent_outcome_does_not_wake_its_lead(world):
         w = s.get(Workspace, world["ws"])
         w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": 5}}
     assert world["outcome"] in woken()  # a raised budget wakes it again
+
+
+def test_a_person_letting_a_spent_outcome_continue_lets_its_lead_work(world, model):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": 1}}
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
+                  status="succeeded", cost_usd=1.5, cost_known=True))
+        s.add(Decision(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="budget",
+                       title="Outcome #7 reached its $1 budget", status="resolved", resolution="abandon",
+                       resolved_by=world["uid"], options=[{"value": "retry"}, {"value": "abandon"}]))
+    assert world["outcome"] not in woken()  # stopping isn't permission to continue
+    with db.session_scope() as s:
+        s.add(Decision(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="budget",
+                       title="Outcome #7 reached its $1 budget", status="resolved", resolution="retry",
+                       resolved_by=world["uid"], options=[{"value": "retry"}, {"value": "abandon"}]))
+    assert world["outcome"] in woken()  # "Continue anyway": the budget no longer stops its Lead
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and row.config_snapshot["budget_reserved"] == 2.0  # only its own cap applies
