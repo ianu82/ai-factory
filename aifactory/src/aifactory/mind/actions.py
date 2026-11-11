@@ -634,12 +634,35 @@ def edit(context: Context, action_id: str, expected_revision: int, *, text: str 
         spec = kind_of(action)
         if spec.text == "none":
             raise HTTPException(422, "This card has no editable text")
-        spec.check(context, ask_of(action))  # still the person's to change, and still eligible
         # Only the text is editable; the target and every other field stay as proposed.
         fields = {**(action.fields or {}), "text": text_of(action.kind, ask_of(action).params, text)}
+        # The card first, then its target, as confirm() locks them (the reverse order can deadlock on PostgreSQL);
+        # a target that refuses (no longer the person's, no longer eligible) rolls the claim back.
         claim(context, action, expected_revision, fields=fields, revision=expected_revision + 1)
+        try:
+            spec.check(context, ask_of(action))
+        except Exception:
+            context.db.rollback()
+            raise
     context.db.commit()
     return card(action, context)
+
+
+FOLLOW_UPS = {"stop_outcome": "stopping the outcome's planner and jobs", "stop_task": "stopping the task's job",
+              "publish_candidate": "opening the hand-over's draft pull request", "close_pull": "closing a pull request"}
+
+
+def incomplete(later: list[tuple], done: dict) -> list[str]:
+    """What the card said would happen but did not, so it reads as partly done rather than completed."""
+    failed = list(done.get("follow_ups_failed") or [])
+    notes = [FOLLOW_UPS.get(step, step) for step in failed]
+    if (done.get("handover") or {}).get("error"):
+        notes.append(f"{FOLLOW_UPS['publish_candidate']} ({done['handover']['error']})")
+    # A pull request GitHub refused to close is not an exception, only a smaller count.
+    refused = sum(step == "close_pull" for step, *_ in later) - failed.count("close_pull") - done.get("pull_requests_closed", 0)
+    if refused > 0:
+        notes.append(f"closing {refused} pull request{'s' if refused > 1 else ''} (GitHub refused)")
+    return notes
 
 
 def finish_here(fn, *args):
@@ -679,8 +702,10 @@ def confirm(context: Context, action_id: str, expected_revision: int, *, finish_
             log.exception("Follow-ups of Mind action %s did not run", action.id)
             done = {"follow_ups_failed": [step for step, *_ in later]}
         if done:
-            # What the follow-ups did (a hand-over's draft pull request, pull requests closed) joins the result.
-            action.result = clean({**(action.result or {}), **done})
+            # What the follow-ups did (a hand-over's draft pull request, pull requests closed) joins the result, and
+            # anything that did not follow marks it partial, so the card never claims more than happened.
+            notes = incomplete(later, done)
+            action.result = clean({**(action.result or {}), **done, **({"partial": True, "incomplete": notes} if notes else {})})
             row = db.query(MindActionResult).filter_by(action_id=action.id).one_or_none()
             if row is not None:
                 row.content = action.result

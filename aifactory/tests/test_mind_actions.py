@@ -304,6 +304,28 @@ def test_take_over_and_cancel_finish_after_the_commit(world, monkeypatch):
     assert execution_results(ctx)[-1]["handover"] == {"published": False}
 
 
+def test_a_follow_up_that_did_not_happen_marks_the_result_partial(world, monkeypatch):
+    from aifactory.mind import actions
+    from aifactory.pipeline import orchestrator as orchestration
+    monkeypatch.setattr(orchestration.orchestrator, "cancel_task", lambda task_id: None)
+    async def finish(later, user, action_id):
+        return {"handover": {"published": False, "error": "push refused"}, "follow_ups_failed": ["stop_task"]}
+    monkeypatch.setattr(actions, "finish", finish)
+    ctx, card = proposal(world, "take_over")
+    result = confirm(ctx, card["id"], 1)["result"]
+    assert result["ok"] is True and result["partial"] is True
+    assert result["incomplete"] == ["stopping the task's job", "opening the hand-over's draft pull request (push refused)"]
+
+
+def test_incomplete_counts_pull_requests_github_refused_to_close():
+    from aifactory.mind.actions import incomplete
+    later = [("stop_task", "t"), ("close_pull", "a", None), ("close_pull", "b", None)]
+    assert incomplete(later, {"pull_requests_closed": 2}) == []
+    assert incomplete(later, {"pull_requests_closed": 1}) == ["closing 1 pull request (GitHub refused)"]
+    assert incomplete(later, {"follow_ups_failed": ["close_pull"], "pull_requests_closed": 1}) == ["closing a pull request"]
+    assert incomplete([("publish_candidate", "t", {})], {"handover": {"published": False}}) == []  # nothing to push
+
+
 def test_dismiss_typed_yes_and_unsupported_tools(world):
     ctx, card = proposal(world)
     tools = Tools(ctx)

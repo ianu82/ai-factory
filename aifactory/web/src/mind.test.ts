@@ -442,6 +442,9 @@ test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts"
   const confirmed = await t.confirm("thread", action, signal);
   assert.equal(confirmed.status, "confirmed");
   assert.match(confirmed.result!.text, /Completed: Send guidance/);
+  const { mindCard } = await import("./mindHttp.ts");
+  const partial = mindCard({ ...wireCard, status: "succeeded", result: { ok: true, partial: true, incomplete: ["closing 1 pull request (GitHub refused)"] } });
+  assert.equal(partial.result!.text, "Partly done. Did not happen: closing 1 pull request (GitHub refused).");
 });
 
 test("a failed turn reloads its saved reply without another paid readiness check, and keeps its budget failure", async () => {

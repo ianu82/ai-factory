@@ -537,7 +537,7 @@ export interface MindWireCard {
   workspace: { id: string; name: string };
   object: MindWireCitation; fields: Record<string, string>; effect: string;
   status: "pending" | "dismissed" | "executing" | "succeeded" | "stale";
-  result?: { ok: boolean; reason?: string; [key: string]: unknown };
+  result?: { ok: boolean; reason?: string; partial?: boolean; incomplete?: unknown; [key: string]: unknown };
 }
 export interface MindWireThread {
   id: string; title: string; billing_workspace_id: string; model_id: string | null;
