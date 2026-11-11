@@ -192,7 +192,7 @@ async def take_turn(runner, gh) -> None:
     _write(runner, entry)
 
 
-FINISHED = ("completed", "cancelled")
+FINISHED = ("completed", "partially_completed", "cancelled")
 
 
 def ensure_repair(runner, failing: list[str]) -> str | None:
