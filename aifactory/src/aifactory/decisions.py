@@ -33,7 +33,8 @@ def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
 
 def resolve(db: Session, decision: Decision, user: User, resolution: str, comment: str = "",
             reusable: bool = False, scope: str = "item", *, action_id: str | None = None,
-            pending_events: list[dict] | None = None, after: list[tuple] | None = None) -> dict[str, Any]:
+            pending_events: list[dict] | None = None, after: list[tuple] | None = None,
+            verified_revert: dict | None = None) -> dict[str, Any]:
     """Apply a person's resolution. The app's endpoint commits and publishes here. A confirmed Mind card
     (action_id) keeps everything in its own transaction instead: plan approval and hand-over join it, events wait
     in pending_events, and what must follow the commit (stopping planners and jobs, publishing a hand-over's
@@ -45,6 +46,17 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     valid = {o.get("value") for o in decision.options or []} | {"dismiss"}
     if resolution not in valid:
         raise DecisionError(f"Choose one of: {', '.join(sorted(v for v in valid if v))}")
+    if decision.kind == "approve_revert" and resolution == "revert_merged":
+        from .models import Repository
+
+        task = db.get(Task, decision.task_id)
+        candidate = (task.evidence or {}).get("revert_candidate") if task else None
+        repo = db.get(Repository, task.repo_id) if task else None
+        if (not verified_revert or not candidate or not repo or not verified_revert.get("merged")
+                or verified_revert.get("number") != candidate["pr"]
+                or (verified_revert.get("head") or {}).get("sha") != candidate["head"]
+                or (verified_revert.get("base") or {}).get("ref") != repo.default_branch):
+            raise DecisionError("Verify the recorded revert head merged into the default branch on GitHub first")
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
     decision.resolution = resolution
     decision.comment = comment.strip()[:8000]
@@ -114,14 +126,31 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         elif resolution == "abandon":
             task.status = "abandoned"
             dropped = task.id
-    elif kind == "approve_merge" and task:
+    elif kind == "approve_revert" and task:
         if resolution == "approve":
+            task.status, task.stage, task.blocked_reason = "queued", "revert_merge", ""
+        elif resolution == "acknowledge" and task.status == "smoke_failed" and task.merge_sha:
+            # This card offers a choice, not a failed recovery attempt: accepting
+            # the original merged change must release its dependents. Preserve
+            # the revert candidate for audit/reconciliation; never claim it merged.
+            completed.append(complete_accepted(db, task, user.name or user.email))
+        elif resolution == "revert_merged":
+            task.status, task.stage, task.blocked_reason = "reverted", "done", ""
+            task.finished_at = utcnow()
+            task.evidence = {**task.evidence, "revert": {
+                "pr": verified_revert["number"], "sha": verified_revert.get("merge_commit_sha", ""),
+                "at": utcnow().isoformat()}}
+    elif kind in ("approve_merge", "merge_on_github") and task:
+        if resolution in ("approve", "merged"):
             task.status, task.stage = "queued", "merge"
         elif resolution == "reject":
             guidance(comment or "A reviewer requested changes before merging.")
             task.status, task.stage, task.attempt = "queued", "revise", 0
             # A requested revision is a fresh budget: earlier rounds' offsets and automatic retries do not carry over.
             task.evidence = fresh_budget(task.evidence)
+        elif resolution == "abandon":
+            task.status = "abandoned"
+            dropped = task.id
     elif kind == "budget" and task:
         if resolution == "retry":
             ev = dict(task.evidence or {})

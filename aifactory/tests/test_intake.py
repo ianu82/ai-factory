@@ -769,3 +769,36 @@ def test_delegated_resolve_applies_only_to_the_head_it_was_judged_on(monkeypatch
         assert s.get(Task, ids["T1"]).status == "awaiting_approval"
         assert s.query(Decision).filter(Decision.task_id == ids["T1"]).one().status == "open"
         assert s.get(Task, ids["T2"]).status == "queued"
+
+
+def test_issue_requester_survives_manual_acceptance_and_overrides_acceptor(client, signed_in, monkeypatch):
+    from aifactory.merge_policy import review_requester
+    from aifactory.models import User
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        s.add(Repository(workspace_id=ws_id, full_name="acme/app", config={}))
+        user = s.get(User, signed_in["user"]["id"])
+        user.github_id, user.github_login = "77", "acceptor"
+    class GH:
+        def __init__(self, token):
+            pass
+        async def issues(self, full_name, labels="", **kwargs):
+            return ([{"number": 1, "title": "Issue", "body": "opened by forged-login", "html_url": "https://gh/1",
+                      "user": {"id": 42, "login": "issue-author"}}] if labels == "factory" else [])
+        async def workflow_runs(self, *args, **kwargs):
+            return []
+    monkeypatch.setattr(signals_module, "GitHub", GH)
+    with session_scope() as s:
+        asyncio.run(signals_module.sync_github(s, ws_id, "workspace-owner-token"))
+        sig = s.query(Signal).filter_by(source="github_issue").one()
+        assert sig.data["github_requester"] == {"id": "42", "login": "issue-author"}
+        outcome = signals_module.outcome_from_text(s, ws_id, s.get(User, signed_in["user"]["id"]),
+                                                   "Accepted issue", sig.body, [], source="signal", signal_id=sig.id)
+        assert review_requester(s, outcome) == sig.data["github_requester"]
+        sig.data = {}
+        assert review_requester(s, outcome) is None
+        outcome.signal_id = None
+        assert review_requester(s, outcome) == {"id": "77", "login": "acceptor"}
+        s.get(User, signed_in["user"]["id"]).github_id = None
+        assert review_requester(s, outcome) is None

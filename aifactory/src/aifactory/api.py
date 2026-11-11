@@ -38,6 +38,7 @@ from .models import (Artifact, Decision, DecisionReview, Event, Membership, Mess
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+from .merge_policy import MERGE_POLICIES, reroute_policy_waits
 from .review import review_policy, validate_review
 from .repo_detect import detect
 from .sandbox import isolation_available
@@ -186,7 +187,7 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         if merged["harness"].get(role) not in ("native", "codex", "anton"):
             merged["harness"][role] = "native"
     for key in ("plan", "merge", "release"):
-        if merged["autonomy"].get(key) not in ("auto", "approval"):
+        if merged["autonomy"].get(key) not in (MERGE_POLICIES if key == "merge" else ("auto", "approval")):
             merged["autonomy"][key] = DEFAULT_SETTINGS["autonomy"][key]
     if merged.get("provider") not in PROVIDERS:
         merged["provider"] = "mindshub"
@@ -229,12 +230,13 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
         if "autonomy" in patch:
             autonomy = patch["autonomy"]
             if not isinstance(autonomy, dict) or any(
-                    k not in onboarding_policy.POLICIES or v not in ("auto", "approval")
+                    k not in onboarding_policy.POLICIES or v not in (MERGE_POLICIES if k == "merge" else ("auto", "approval"))
                     for k, v in autonomy.items()):
                 raise HTTPException(422, "Invalid autonomy policy")
             updated = onboarding_policy.patch_autonomy({**updated, "autonomy": before["autonomy"]}, autonomy)
         ws.settings = _clean_settings(updated)
         changes = {k: ws.settings[k] for k in patch if before.get(k) != ws.settings.get(k)}
+    reroute_policy_waits(db, workspace_id)
     if body.paused is not None:
         ws.paused = body.paused
         changes["paused"] = body.paused
@@ -266,6 +268,7 @@ def apply_learning_preset(workspace_id: str, user: User = Depends(current_user),
            onboarding_policy.KEY: {**state, "status": "applied", "applied_by": user.id,
                                    "applied_at": utcnow().isoformat()}}
     ws.settings = new
+    reroute_policy_waits(db, workspace_id)
     record(ws.id, "learning_preset_applied", f"{user.name or user.email} applied the post-learning preset",
            actor=user.id, data={"before": preview["before"], "after": preview["after"],
                                 "changes": preview["changes"],
@@ -626,6 +629,8 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
         if not isinstance(patch["merge"], dict):
             raise HTTPException(422, "merge must be an object")
         merge = {**(current.get("merge") or {}), **patch["merge"]}
+        if merge.get("mode") not in (None, "", *MERGE_POLICIES):
+            raise HTTPException(422, "merge.mode must be auto, approval, github or empty (inherit)")
         if "reverify" in merge and merge["reverify"] not in ("overlap", "always", "never"):
             raise HTTPException(422, "merge.reverify must be overlap, always or never")
         cfg["merge"] = merge
@@ -696,11 +701,13 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     try:
         repo.config = _clean_repo_config(repo.config or {}, body.config)
         definitions.validate_repository_change(db, workspace_id)
+        reroute_policy_waits(db, workspace_id, repo_id)
         db.commit()
     except definitions.DefinitionError as exc:
         db.rollback()
         raise HTTPException(422, str(exc)) from exc
     record(workspace_id, "repository_configured", f"Updated {repo.full_name} configuration", actor=user.id)
+    orchestrator.wake()
     return S.repository(repo)
 
 
@@ -1014,8 +1021,31 @@ async def resolve_decision(workspace_id: str, decision_id: str, body: Resolution
     d = db.get(Decision, decision_id)
     if d is None or d.workspace_id != workspace_id:
         raise HTTPException(404, "Decision not found")
+    verified_revert = None
+    if d.kind == "approve_revert" and body.resolution == "revert_merged":
+        task = db.get(Task, d.task_id)
+        repo = db.get(Repository, task.repo_id)
+        candidate = (task.evidence or {}).get("revert_candidate")
+        if not candidate:
+            raise HTTPException(400, "No revert PR is recorded")
+        try:
+            verified_revert = await GitHub(resolve_token(workspace_id)).pull(repo.full_name, candidate["pr"])
+        except Exception:
+            raise HTTPException(400, "Could not verify the revert on GitHub") from None
+        reason = None
+        if not verified_revert.get("merged"):
+            reason = "The revert PR is not merged yet."
+        elif (verified_revert.get("head") or {}).get("sha") != candidate["head"]:
+            reason = "The revert changed after it was opened; recovery cannot be confirmed."
+        elif (verified_revert.get("base") or {}).get("ref") != repo.default_branch:
+            reason = "The revert was merged elsewhere, not into the repository default branch."
+        if reason:
+            d.body = reason
+            db.commit()
+            raise HTTPException(409, reason)
     try:
-        result = resolve(db, d, user, body.resolution, body.comment, body.reusable, body.scope)
+        result = resolve(db, d, user, body.resolution, body.comment, body.reusable, body.scope,
+                         verified_revert=verified_revert)
     except DecisionError as exc:
         raise HTTPException(400, str(exc))
     info = result.pop("handover", None)

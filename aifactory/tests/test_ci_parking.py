@@ -781,7 +781,7 @@ def test_completed_revert_survives_concurrent_stop(factory, monkeypatch, stop, w
     tid = prepare_revert(factory)
     FakeGitHub.check_state = "success"
     asyncio.run(runner(tid).poll_ci())
-    original_merge, original_pull = FakeGitHub.merge, FakeGitHub.pull
+    original_pull = FakeGitHub.pull
 
     def halt():
         with session_scope() as s:
@@ -790,8 +790,13 @@ def test_completed_revert_survives_concurrent_stop(factory, monkeypatch, stop, w
             else:
                 s.get(Task, tid).status = stop
 
-    async def merge(*args, **kwargs):
-        result = await original_merge(*args, **kwargs)
+    original_locked_merge = delivery.TaskRunner._revert_under_workspace_lock
+
+    def merge(*args, **kwargs):
+        # Policy writes and merge calls now serialize. Simulate the stop after
+        # the irreversible call releases its settings transaction, but before
+        # the runner records recovery (the same bookkeeping race).
+        result = original_locked_merge(*args, **kwargs)
         halt()
         return result
 
@@ -805,7 +810,7 @@ def test_completed_revert_survives_concurrent_stop(factory, monkeypatch, stop, w
         asyncio.run(FakeGitHub("t").merge("acme/demo", 2, sha=ci_head, method="squash", title="revert"))
         monkeypatch.setattr(FakeGitHub, "pull", pull)
     else:
-        monkeypatch.setattr(FakeGitHub, "merge", merge)
+        monkeypatch.setattr(delivery.TaskRunner, "_revert_under_workspace_lock", merge)
     asyncio.run(runner(tid).run())
     status, stage, ev, lease = snapshot(tid)
     assert (status, stage, lease) == ("reverted", "done", "")

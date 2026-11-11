@@ -49,6 +49,8 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(200), default="")
     mindshub_user_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    github_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    github_login: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_system: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

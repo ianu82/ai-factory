@@ -319,3 +319,48 @@ async def logout(request: Request, response: Response, db: Session = Depends(get
         logout_url = (f"{settings.oidc_issuer}/protocol/openid-connect/logout?"
                       + urlencode({"client_id": settings.oidc_client_id, "post_logout_redirect_uri": settings.public_url + "/signin"}))
     return {"ok": True, "logout_url": logout_url}
+
+
+@router.put("/auth/github")
+async def link_github(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Prove only the signed-in user's identity. Never retain the personal token.
+
+    Parse this small secret payload manually: validation error JSON must not echo
+    a token (including one submitted in an unexpected field).
+    """
+    from .github import GitHub
+    from .merge_policy import github_identity
+    from .serializers import user as serialize_user
+
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > 8192:
+            raise HTTPException(413, "GitHub link request is too large")
+        raw.extend(chunk)
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise HTTPException(400, "Supply a personal GitHub token") from None
+    token = body.get("token") if isinstance(body, dict) else None
+    if (not isinstance(body, dict) or set(body) != {"token"} or not isinstance(token, str)
+            or not token.strip() or len(token) > 4096 or any(c.isspace() for c in token)):
+        raise HTTPException(400, "Supply only a personal GitHub token")
+    try:
+        identity = github_identity(await GitHub(token).user())
+    except Exception:
+        # Provider exception text may contain credentials. Do not log or return it.
+        raise HTTPException(400, "Could not verify the GitHub identity. Check your personal token.") from None
+    if not identity:
+        raise HTTPException(400, "GitHub did not return a valid identity")
+    user.github_id, user.github_login = identity["id"], identity["login"]
+    db.commit()
+    return serialize_user(user)
+
+
+@router.delete("/auth/github")
+def unlink_github(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .serializers import user as serialize_user
+
+    user.github_id, user.github_login = None, None
+    db.commit()
+    return serialize_user(user)

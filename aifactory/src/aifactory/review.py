@@ -204,3 +204,15 @@ def normalize_feedback(*, reviews: list[dict], threads: list[dict], comments: li
                 item = finding(comment, "issue_comment")
                 found[item["id"]] = item
     return list(found.values())
+
+
+async def github_wait_review_feedback(gh, full_name: str, number: int, policy: dict,
+                                      evidence: dict) -> dict:
+    """Waiting-state integration hook for outcome #19's delivery review loop.
+
+    Collection exists on main, but the revision/reply delivery loop does not yet.
+    Preserve its shared ledger and expose the complete pending snapshot, including
+    an empty one. Errors propagate without replacing the previous evidence.
+    """
+    pending = await gh.review_feedback(full_name, number, policy)
+    return {**evidence, "review": {**new_review_evidence(), **evidence.get("review", {}), "pending": pending}}

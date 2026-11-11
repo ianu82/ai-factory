@@ -15,7 +15,8 @@ from sqlalchemy import or_
 from .db import session_scope, utcnow
 from .events import notify, record
 from .github import GitHub, GitHubError, resolve_credential as resolve_token
-from .models import Decision, Repository, Task
+from .models import Decision, Repository, Task, Workspace
+from .merge_policy import effective_merge_policy, reroute_policy_waits
 
 log = logging.getLogger(__name__)
 WAITING = ("awaiting_approval", "needs_input", "failed", "blocked")
@@ -51,11 +52,43 @@ async def reconcile_pull_requests() -> int:
             changed += _handle_reverted(task_id, pr) if is_revert else _handle_merged(task_id, pr)
         elif not is_revert and pr.get("state") == "closed":
             changed += _handle_closed(task_id, pr)
+        elif not is_revert:
+            await _review_github_wait(gh, task_id, full_name, number)
+    with session_scope() as s:
+        from .onboarding_policy import lock_workspace
+
+        for ws in s.query(Workspace):
+            lock_workspace(s, ws.id)
+            changed += reroute_policy_waits(s, ws.id)
     if changed:
         from .pipeline.orchestrator import orchestrator
 
         orchestrator.wake()
     return changed
+
+
+async def _review_github_wait(gh: GitHub, task_id: str, full_name: str, number: int) -> None:
+    from .review import github_wait_review_feedback, review_policy
+    from .pipeline.runtime import merged_settings
+
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        if not _still_waiting(task, number):
+            return
+        repo = s.get(Repository, task.repo_id)
+        settings = merged_settings(s.get(Workspace, task.workspace_id).settings)
+        if effective_merge_policy(settings, repo.config) != "github":
+            return
+        policy = review_policy(settings, repo.config)
+        evidence = dict(task.evidence or {})
+    try:
+        updated = await github_wait_review_feedback(gh, full_name, number, policy, evidence)
+    except GitHubError:
+        return  # No successful snapshot: keep the previous pending feedback.
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        if _still_waiting(task, number) and (task.evidence or {}) == evidence:
+            task.evidence = updated
 
 
 def _supersede(s, task_id: str, why: str) -> None:
@@ -122,6 +155,9 @@ def _handle_reverted(task_id: str, pr: dict) -> bool:
         if (not candidate or candidate["pr"] != pr.get("number")
                 or candidate["head"] != (pr.get("head") or {}).get("sha")
                 or (task.evidence or {}).get("revert")):
+            return False
+        repo = s.get(Repository, task.repo_id)
+        if (pr.get("base") or {}).get("ref") != repo.default_branch:
             return False
         now = utcnow()
         task.evidence = {**task.evidence, "revert": {

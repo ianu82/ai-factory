@@ -2,11 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
-import { api, type Credential, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
+import { api, type Credential, type Me, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { validMindBudget } from "../mind";
-import { type LearningPolicy, policyPatch } from "../learningPolicy";
+import { type LearningPolicy, policyPatch, policyLabel } from "../learningPolicy";
 import { ago } from "../format";
 import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
@@ -49,6 +49,42 @@ export function SettingsPage() {
   );
 }
 
+function MergeExplanations() {
+  return <span>
+    <span style={{ display: "block" }}>Automatic — The Factory merges once checks, verification and CI pass.</span>
+    <span style={{ display: "block" }}>Approve first — A person approves in the Factory, then the Factory merges.</span>
+    <span style={{ display: "block" }}>People merge on GitHub — People merge in GitHub; the Factory never merges.</span>
+  </span>;
+}
+
+function PersonalGitHub() {
+  const { me } = useWs();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const save = async (unlink = false) => {
+    setBusy(true);
+    const personalToken = token;
+    setToken("");
+    try {
+      await api<Me["user"]>("/auth/github", { method: unlink ? "DELETE" : "PUT", ...(unlink ? {} : { json: { token: personalToken } }) });
+      await qc.invalidateQueries({ queryKey: ["me"] });
+      toast(unlink ? "GitHub account unlinked" : "GitHub identity verified");
+    } catch (err) { toast((err as Error).message, true); }
+    finally { setBusy(false); }
+  };
+  return <section className="s-block">
+    <h2>Your GitHub account</h2>
+    <p>Link your own account so the Factory can request your review. The token is used once to verify your identity and is never saved. This does not change workspace credentials.</p>
+    {me.user.github ? <div className="s-line"><span>Linked as @{me.user.github.login}</span><button className="btn sm" disabled={busy} onClick={() => save(true)}>Unlink my account</button></div> :
+      <form onSubmit={(e) => { e.preventDefault(); if (token.trim() && !busy) void save(); }}>
+        <label className="field"><span>Personal GitHub token</span><input className="input" type="password" autoComplete="off" value={token} maxLength={4096} onChange={(e) => setToken(e.target.value)} disabled={busy} /></label>
+        <button className="btn sm" disabled={busy || !token.trim()}>Verify and link my account</button>
+      </form>}
+  </section>;
+}
+
 function useSaveSettings() {
   const { ws } = useWs();
   const qc = useQueryClient();
@@ -87,7 +123,7 @@ function Policies() {
   const qc = useQueryClient();
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const selected = policy.data?.after ?? s.autonomy;
-  const autonomy = async (key: keyof Settings["autonomy"], v: "auto" | "approval") => {
+  const autonomy = async <K extends keyof Settings["autonomy"],>(key: K, v: Settings["autonomy"][K]) => {
     if (!policy.isSuccess) return;
     const patch = policyPatch(policy.data, key, v);
     if (!patch) return;
@@ -96,6 +132,7 @@ function Policies() {
   };
   return (
     <>
+      <PersonalGitHub />
       <section className="s-block">
         <h2>When does a person step in?</h2>
         <p>Everything else runs unattended. Every approval is recorded with who gave it.</p>
@@ -104,8 +141,8 @@ function Policies() {
         {policy.data?.learning && <p role="status">Learning mode: plans and merges require approval while you learn. These controls save your post-learning preset; they do not remove approvals. After a fully completed outcome, an admin can explicitly apply the preset from Inbox. Repository and release approval controls still apply.</p>}
         <div className="s-line"><div className="l"><b>Plans</b><span>Who approves each plan before building starts. The plan reviewer (set under Models) checks it against the request and the code, sends weak plans back to the planner, and brings you any plan it cannot approve.</span></div>
           <Seg value={selected.plan} options={[["auto", "Plan reviewer"], ["approval", "A person"]]} onChange={(v) => autonomy("plan", v)} disabled={!admin || !policy.isSuccess} /></div>
-        <div className="s-line"><div className="l"><b>Merges</b><span>Merge verified PRs once CI passes, or ask a person.</span></div>
-          <Seg value={selected.merge} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin || !policy.isSuccess} /></div>
+        <div className="s-line"><div className="l"><b>Merges</b><MergeExplanations /></div>
+          <Seg value={selected.merge} options={[["auto", "Automatic"], ["approval", "Approve first"], ["github", "People merge on GitHub"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin || !policy.isSuccess} /></div>
         <div className="s-line"><div className="l"><b>Releases</b><span>For repositories that deploy when main changes, require approval before merging.</span></div>
           <Seg value={selected.release} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("release", v)} disabled={!admin || !policy.isSuccess} /></div>
       </section>
@@ -522,9 +559,9 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
           <div className="s-grid">
             <label className="field"><span>Merge</span>
               <select className="select" value={form.merge_mode} disabled={!admin} onChange={(e) => setForm({ ...form, merge_mode: e.target.value })}>
-                <option value="">Workspace policy ({ws.settings.autonomy.merge === "auto" ? "automatic" : "approval"})</option>
-                <option value="auto">Always automatic</option><option value="approval">Always ask</option>
-              </select></label>
+                <option value="">Workspace policy ({policyLabel(ws.settings.autonomy.merge)})</option>
+                <option value="auto">Automatic</option><option value="approval">Approve first</option><option value="github">People merge on GitHub</option>
+              </select><MergeExplanations /></label>
             <label className="field"><span>Merge method</span>
               <select className="select" value={form.method} disabled={!admin} onChange={(e) => setForm({ ...form, method: e.target.value })}>
                 <option value="squash">Squash</option><option value="merge">Merge commit</option><option value="rebase">Rebase</option>

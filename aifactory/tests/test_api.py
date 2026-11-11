@@ -806,3 +806,133 @@ def test_review_intake_controls_are_deferred_until_intake_exists():
     assert "Review pull requests" not in settings
     assert "allow_untrusted_local" not in settings
     assert "review_mode" not in settings
+
+
+@pytest.mark.parametrize("mode", ["auto", "approval", "github"])
+def test_three_merge_policies_round_trip_and_inherit(client, signed_in, mode):
+    from aifactory.merge_policy import effective_merge_policy
+    from aifactory.models import Repository
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        ws.settings = {**ws.settings, "learning": {"status": "applied"}}
+        repo = Repository(workspace_id=ws_id, full_name="acme/policy", config={})
+        s.add(repo)
+        s.flush()
+        repo_id = repo.id
+    r = client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"autonomy": {"merge": mode}}})
+    assert r.status_code == 200, r.text
+    assert r.json()["settings"]["autonomy"]["merge"] == mode
+    assert effective_merge_policy(r.json()["settings"], {}) == mode
+    path = f"/api/workspaces/{ws_id}/repositories/{repo_id}"
+    r = client.patch(path, json={"config": {"merge": {"mode": mode, "method": "rebase", "revalidate": False, "reverify": "always"}}})
+    assert r.status_code == 200, r.text
+    config = r.json()["config"]
+    assert config["merge"] == {"mode": mode, "method": "rebase", "revalidate": False, "reverify": "always"}
+    assert effective_merge_policy({"autonomy": {"merge": "approval"}}, config) == mode
+    for inherited in ("", None):
+        r = client.patch(path, json={"config": {"merge": {"mode": inherited}}})
+        assert r.status_code == 200
+        assert r.json()["config"]["merge"]["method"] == "rebase"
+        assert effective_merge_policy({"autonomy": {"merge": mode}}, r.json()["config"]) == mode
+    for invalid in ("human", 1, [], {}):
+        assert client.patch(path, json={"config": {"merge": {"mode": invalid}}}).status_code == 422
+
+
+@pytest.mark.parametrize("key,value", [("plan", "github"), ("release", "github"), ("merge", "human")])
+def test_invalid_autonomy_policy_rejected(client, signed_in, key, value):
+    ws_id = signed_in["workspaces"][0]["id"]
+    assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"autonomy": {key: value}}}).status_code == 422
+
+
+def test_github_self_link_verifies_identity_and_never_retains_token(client, signed_in, monkeypatch, caplog):
+    from aifactory.github import GitHub, GitHubError
+    from aifactory.models import Event, User
+
+    token = "ghp_personal_not_for_storage"
+    async def identity(self):
+        return {"id": 12345, "login": "proved-owner", "token": token}
+    monkeypatch.setattr(GitHub, "user", identity)
+    r = client.put("/auth/github", json={"token": token, "login": "someone-else"})
+    assert r.status_code == 400 and token not in r.text
+    r = client.put("/auth/github", json={"token": token})
+    assert r.status_code == 200, r.text
+    assert r.json()["github"] == {"id": "12345", "login": "proved-owner"}
+    assert client.get("/api/me").json()["user"]["github"] == r.json()["github"]
+    assert token not in r.text
+    with session_scope() as s:
+        user = s.get(User, signed_in["user"]["id"])
+        assert user.github_id == "12345"
+        assert token not in repr({c.name: getattr(user, c.name) for c in User.__table__.columns})
+        assert not s.query(Secret).count()
+        assert token not in repr([(e.message, e.data) for e in s.query(Event)])
+    async def rejected(self):
+        raise GitHubError(f"Provider echo: {token}")
+    monkeypatch.setattr(GitHub, "user", rejected)
+    r = client.put("/auth/github", json={"token": token})
+    assert r.status_code == 400 and token not in r.text
+    assert token not in caplog.text
+    assert client.delete("/auth/github").json()["github"] is None
+    client.post("/auth/logout")
+    assert client.put("/auth/github", json={"token": token}).status_code == 401
+    assert client.delete("/auth/github").status_code == 401
+
+
+def test_github_link_is_personal_not_admin_only(client, signed_in, monkeypatch):
+    from aifactory.github import GitHub
+    from aifactory.models import User
+
+    owner_id = signed_in["user"]["id"]
+    with session_scope() as s:
+        owner = s.get(User, owner_id)
+        owner.github_id, owner.github_login = "55", "original-owner"
+    client.post("/auth/logout")
+    client.post("/auth/dev", json={"email": "member@example.com", "organization": "MindsDB"})
+    async def identity(self):
+        return {"id": 99, "login": "member"}
+    monkeypatch.setattr(GitHub, "user", identity)
+    assert client.put("/auth/github", json={"token": "personal"}).status_code == 200
+    assert client.delete("/auth/github").status_code == 200
+    with session_scope() as s:
+        assert s.get(User, owner_id).github_id == "55"
+    ws_id = signed_in["workspaces"][0]["id"]
+    from aifactory.models import Membership
+    with session_scope() as s:
+        member = s.query(User).filter_by(email="member@example.com").one()
+        s.query(Membership).filter_by(user_id=member.id, workspace_id=ws_id).one().role = "member"
+    assert client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"autonomy": {"merge": "github"}}}).status_code == 403
+
+
+@pytest.mark.parametrize("identity", [{"login": "unproved"}, {"id": 0, "login": "no"}, {"id": 1, "login": "bad login"}])
+def test_github_link_rejects_incomplete_provider_identity(client, signed_in, monkeypatch, identity):
+    from aifactory.github import GitHub
+    async def user(self):
+        return identity
+    monkeypatch.setattr(GitHub, "user", user)
+    assert client.put("/auth/github", json={"token": "personal"}).status_code == 400
+    assert client.get("/api/me").json()["user"]["github"] is None
+
+
+def test_github_link_bounds_and_sanitizes_all_invalid_payloads(client, signed_in):
+    marker = "never-echo-this-token"
+    for body in ({"token": {"nested": marker}}, {"login": marker}, [marker], {"token": ""}):
+        response = client.put("/auth/github", json=body)
+        assert response.status_code == 400 and marker not in response.text
+    response = client.put("/auth/github", content=marker * 1000)
+    assert response.status_code == 413 and marker not in response.text
+
+
+def test_github_policy_is_preserved_as_learning_preset(client, signed_in):
+    ws_id = signed_in["workspaces"][0]["id"]
+    base = f"/api/workspaces/{ws_id}"
+    r = client.patch(base, json={"settings": {"autonomy": {"merge": "github"}}})
+    assert r.status_code == 200
+    assert r.json()["settings"]["autonomy"]["merge"] == "approval"
+    assert r.json()["settings"]["learning"]["preset"]["merge"] == "github"
+    from aifactory.models import Outcome
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=1, title="Learned", status="completed"))
+    r = client.post(f"{base}/onboarding/policy/apply")
+    assert r.status_code == 200 and r.json()["after"]["merge"] == "github"
+    assert client.get("/api/me").json()["workspaces"][0]["settings"]["autonomy"]["merge"] == "github"

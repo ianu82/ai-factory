@@ -25,6 +25,7 @@ from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
+from ..merge_policy import effective_merge_policy, review_requester
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
@@ -170,11 +171,14 @@ class TaskRunner:
                 raise Stop()
             # The decision and state transition commit together; no second transaction
             # can create a retry decision after a concurrent stop.
-            decision = Decision(workspace_id=self.ws, kind=kind, title=title, body=body,
-                                outcome_id=self.task.outcome_id, task_id=self.task_id,
-                                options=options or [{"value": "retry", "label": "Retry"},
-                                                    {"value": "abandon", "label": "Abandon task"}])
-            s.add(decision)
+            decision = (s.query(Decision).filter_by(task_id=self.task_id, kind=kind, status="open").first()
+                        if kind in ("merge_on_github", "approve_revert") else None)
+            if decision is None:
+                decision = Decision(workspace_id=self.ws, kind=kind, title=title, body=body,
+                                    outcome_id=self.task.outcome_id, task_id=self.task_id,
+                                    options=options or [{"value": "retry", "label": "Retry"},
+                                                        {"value": "abandon", "label": "Abandon task"}])
+                s.add(decision)
             s.flush()
             decision_id = decision.id
         publish_decision(self.ws, decision_id, kind, title, outcome_id=self.task.outcome_id, task_id=self.task_id)
@@ -1019,22 +1023,56 @@ class TaskRunner:
         await self.deliver(continue_from_branch=True)
 
     # merge ---------------------------------------------------------------------
-    def _merge_needs_approval(self, settings: dict[str, Any] | None = None) -> bool:
+    def _merge_needs_approval(self, settings: dict[str, Any] | None = None, config: dict | None = None,
+                              policy: str | None = None) -> bool:
         from ..onboarding_policy import active
 
         settings = workspace_settings(self.ws) if settings is None else settings
         if active(settings):
             return True
-        merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
-        release_cfg = self.cfg.get("release") or {}
+        config = self.cfg if config is None else config
+        merge_policy = policy if policy is not None else effective_merge_policy(settings, config)
+        release_cfg = config.get("release") or {}
         releases_on_merge = release_cfg.get("mode") == "on_merge"
         if releases_on_merge and settings["autonomy"].get("release") == "approval":
             return True
         return merge_policy != "auto"
 
     def _require_merge_approval(self) -> None:
-        if self._merge_needs_approval() and not self._approved("approve_merge"):
+        with session_scope() as s:
+            from .runtime import merged_settings
+            from ..models import Workspace
+
+            settings = merged_settings(s.get(Workspace, self.ws).settings)
+            config = s.get(Repository, self.repo.id).config or {}
+            policy = effective_merge_policy(settings, config)
+        if policy == "github":
+            self._open_github_merge_wait()
+        if self._merge_needs_approval(settings, config, policy) and not self._approved("approve_merge"):
             self._open_merge_approval()
+
+    def _open_github_merge_wait(self) -> None:
+        with session_scope() as s:
+            requester = review_requester(s, s.get(Outcome, self.task.outcome_id))
+        who = f"@{requester['login']}: " if requester else ""
+        self.update(stage="merge")
+        self.block("merge_on_github", f"Ready to merge on GitHub: {self.task.title}",
+                   f"{who}merge PR #{self.task.pr_number} on GitHub. The Factory never merges under "
+                   f"People merge on GitHub. {self.task.pr_url}", status="awaiting_approval",
+                   options=[{"value": "merged", "label": "I merged it"},
+                            {"value": "reject", "label": "Request changes"},
+                            {"value": "abandon", "label": "Abandon"}])
+
+    def _open_revert_approval(self, policy: str) -> None:
+        candidate = self.task.evidence["revert_candidate"]
+        options = ([{"value": "revert_merged", "label": "Revert merged"}] if policy == "github" else
+                   [{"value": "approve", "label": "Merge revert"}])
+        self.block("approve_revert", f"Revert PR #{candidate['pr']}",
+                   f"{'Merge this revert on GitHub; the Factory never merges it.' if policy == 'github' else 'Approve the Factory merging this revert.'} "
+                   f"{candidate.get('url', '')}\n\n"
+                   "Acknowledge accepts the original merged change without reverting it, completes the task, "
+                   "and allows dependent tasks to start. The revert PR is left unchanged.", status="smoke_failed",
+                   options=[*options, {"value": "acknowledge", "label": "Acknowledge"}])
 
     def _open_merge_approval(self) -> None:
         self.update(stage="merge")
@@ -1057,6 +1095,8 @@ class TaskRunner:
                 await merge
             finally:
                 raise
+        if result and result.get("policy_wait") == "github":
+            self._open_github_merge_wait()
         if result is None:
             # Open the decision only after releasing the lock: block/update use
             # their own transactions, which would otherwise deadlock on SQLite.
@@ -1072,7 +1112,13 @@ class TaskRunner:
             task = s.get(Task, self.task_id)
             if self.cancelled.is_set() or not transition(s, task, lease_owner=task.lease_owner):
                 raise Stop()
-            if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
+            settings = merged_settings(ws.settings)
+            config = s.get(Repository, self.repo.id).config or {}
+            # One snapshot per routing attempt: never fall through between reads.
+            policy = effective_merge_policy(settings, config)
+            if policy == "github":
+                return {"policy_wait": "github"}
+            if self._merge_needs_approval(settings, config, policy) and not self._approved("approve_merge"):
                 return None
 
             async def merge():
@@ -1102,6 +1148,21 @@ class TaskRunner:
             published = (self.task.evidence or {}).get("published", {}).get("at")
             return not published or row.resolved_at >= datetime.fromisoformat(published)
 
+    def _validate_outside_merge(self, pr: dict[str, Any]) -> None:
+        """A human merge is approval only for the verified candidate and target.
+
+        Do not run smoke or claim completion for a force-pushed or retargeted PR.
+        This check also covers a merge observed after waiting for the repo lock.
+        """
+        if not self.task.head_sha or (pr.get("head") or {}).get("sha") != self.task.head_sha:
+            self.block("unblock", f"{self.task.key}: merged PR head changed",
+                       "The PR was merged on GitHub, but its head does not match the verified candidate. "
+                       "Completion cannot be confirmed; inspect the merged change.", status="needs_input")
+        if (pr.get("base") or {}).get("ref") != self.repo.default_branch:
+            self.block("unblock", f"{self.task.key}: PR merged elsewhere",
+                       "The PR was merged on GitHub into a different or unknown target branch, not the "
+                       "repository default branch. Completion cannot be confirmed.", status="needs_input")
+
     async def merge(self) -> None:
         token = resolve_token(self.ws)
         gh = GitHub(token)
@@ -1109,6 +1170,7 @@ class TaskRunner:
             current = await gh.pull(self.repo.full_name, self.task.pr_number)
             self._guard()
             if current.get("merged"):  # a person merged it on GitHub: that is the approval
+                self._validate_outside_merge(current)
                 who = (current.get("merged_by") or {}).get("login") or "someone"
                 self.update(merge_sha=current.get("merge_commit_sha") or "", status="running", blocked_reason="")
                 self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "by": who,
@@ -1144,6 +1206,7 @@ class TaskRunner:
             pr = await gh.pull(self.repo.full_name, self.task.pr_number)
             self._guard()
             if pr.get("merged"):
+                self._validate_outside_merge(pr)
                 self.update(merge_sha=pr.get("merge_commit_sha") or "")
             else:
                 if pr.get("state") == "closed":
@@ -1377,18 +1440,52 @@ class TaskRunner:
                     self.block("unblock", f"{self.task.key}: revert PR changed",
                                "The revert PR is closed or no longer matches the CI-tested candidate.",
                                status="smoke_failed")
+                operation = asyncio.create_task(asyncio.to_thread(self._revert_under_workspace_lock, gh, candidate))
                 try:
-                    result = await gh.merge(self.repo.full_name, candidate["pr"], sha=candidate["head"],
-                                            method="squash", title=f"Revert: {self.task.title} (#{candidate['pr']})")
+                    result = await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    try:
+                        await operation
+                    finally:
+                        raise
                 except GitHubError as exc:
                     self.block("unblock", f"{self.task.key}: could not merge the revert", str(exc),
                                status="smoke_failed", options=[{"value": "acknowledge", "label": "Acknowledge"}])
+                if result.get("policy_wait"):
+                    self._open_revert_approval(result["policy_wait"])
                 pr = {**pr, "merged": True, "merge_commit_sha": result.get("sha", "")}
             # No lifecycle guard after an irreversible merge. A concurrent stop
             # must not erase what already happened on GitHub. No work follows.
             from ..reconcile import _handle_reverted
 
             _handle_reverted(self.task_id, pr)
+
+    def _revert_under_workspace_lock(self, gh: GitHub, candidate: dict) -> dict:
+        from ..onboarding_policy import lock_workspace
+        from .runtime import merged_settings
+
+        with session_scope() as s:
+            ws = lock_workspace(s, self.ws)
+            task = s.get(Task, self.task_id)
+            if self.cancelled.is_set() or not transition(s, task, lease_owner=task.lease_owner):
+                raise Stop()
+            settings = merged_settings(ws.settings)
+            config = s.get(Repository, self.repo.id).config or {}
+            policy = effective_merge_policy(settings, config)
+            if policy == "github" or (self._merge_needs_approval(settings, config, policy)
+                                      and not self._approved("approve_revert")):
+                return {"policy_wait": policy}
+
+            async def merge():
+                return await asyncio.wait_for(gh.merge(
+                    self.repo.full_name, candidate["pr"], sha=candidate["head"], method="squash",
+                    title=f"Revert: {self.task.title} (#{candidate['pr']})"), timeout=60)
+
+            # Same serialization as ordinary merges, retained through the side effect.
+            try:
+                return asyncio.run(merge())
+            except asyncio.TimeoutError as exc:
+                raise GitHubError("GitHub revert merge timed out; check the PR before retrying.") from exc
 
     async def release(self) -> None:
         release_cfg = self.cfg.get("release") or {}

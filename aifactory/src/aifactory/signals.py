@@ -101,6 +101,10 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                 sig, new = upsert_signal(db, workspace_id, source="github_issue", title=issue["title"],
                                          body=issue.get("body") or "", url=issue["html_url"],
                                          external_id=f"{repo.full_name}#{issue['number']}", repo_id=repo.id)
+                from .merge_policy import github_identity
+
+                identity = github_identity(issue.get("user"))
+                sig.data = {**(sig.data or {}), "github_requester": identity}
                 created += new
                 updated += not new
                 db.commit()  # never hold the database write lock across network calls

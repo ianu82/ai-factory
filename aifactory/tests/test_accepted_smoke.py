@@ -91,6 +91,38 @@ def test_acknowledging_a_failed_revert_leaves_the_task_with_a_person(factory):
     assert state(second)[0] == "pending"
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+def test_acknowledging_revert_choice_accepts_original_merge_and_unblocks_dependents(factory, deferred):
+    candidate = {"pr": 8, "head": "def", "url": "https://github.com/acme/demo/pull/8"}
+    _, first, second, did = merged_with_dependent(
+        factory, stage="revert_merge", evidence={"smoke": {"state": "failed"}, "revert_candidate": candidate})
+    pending, after = [], []
+    with session_scope() as s:
+        decision = s.get(Decision, did)
+        decision.kind = "approve_revert"
+        decision.options = [{"value": "revert_merged", "label": "Revert merged"},
+                            {"value": "acknowledge", "label": "Acknowledge"}]
+        resolve(s, decision, s.get(User, factory["user"]), "acknowledge",
+                **({"action_id": "confirmation", "pending_events": pending, "after": after} if deferred else {}))
+        assert (s.get(Task, first).status, s.get(Task, first).stage) == ("completed", "done")
+        if deferred:
+            assert [event["kind"] for event in pending] == ["task_completed", "decision_resolved"]
+            assert not after  # No merge, PR closure or other external effect.
+    assert state(first) == ("completed", "done")
+    with session_scope() as s:
+        task = s.get(Task, first)
+        assert task.finished_at and not task.blocked_reason and not task.lease_owner
+        assert task.evidence == {"smoke": {"state": "failed"}, "revert_candidate": candidate}
+        assert "accepted the failed post-merge smoke checks" in task.summary
+        assert s.get(Decision, did).resolution == "acknowledge"
+    assert completions(first) == 1
+    orch = Orchestrator()
+    orch._recover()
+    orch._promote()
+    assert completions(first) == 1
+    assert state(second)[0] == "queued"
+
+
 def test_startup_completes_tasks_accepted_before_this_fix(factory):
     _, first, second, _ = merged_with_dependent(factory, decision_status="resolved", resolution="acknowledge",
                                                 resolved_by=factory["user"])

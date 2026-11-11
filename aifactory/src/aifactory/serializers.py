@@ -17,7 +17,8 @@ def ts(value: datetime | None) -> str | None:
 
 
 def user(u: User) -> dict[str, Any]:
-    return {"id": u.id, "email": u.email, "name": u.name}
+    return {"id": u.id, "email": u.email, "name": u.name, "github":
+            {"id": u.github_id, "login": u.github_login} if u.github_id and u.github_login else None}
 
 
 def workspace(w: Workspace, role: str | None = None, org_name: str = "") -> dict[str, Any]:

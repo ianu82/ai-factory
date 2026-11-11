@@ -114,7 +114,7 @@ export interface Settings {
   planning_concurrency?: number;
   max_attempts: number;
   auto_retry_rounds?: number;
-  autonomy: { plan: "auto" | "approval"; merge: "auto" | "approval"; release: "auto" | "approval" };
+  autonomy: { plan: "auto" | "approval"; merge: "auto" | "approval" | "github"; release: "auto" | "approval" };
   budgets: { run_usd: number; outcome_usd: number; run_tokens: number };
   limits: Record<string, number>;
   reasoning_effort?: string;
@@ -144,7 +144,7 @@ export interface Workspace {
 }
 
 export interface Me {
-  user: { id: string; email: string | null; name: string };
+  user: { id: string; email: string | null; name: string; github: { id: string; login: string } | null };
   workspaces: Workspace[];
   organizations: { id: string; name: string }[];
 }
