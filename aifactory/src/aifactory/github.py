@@ -18,7 +18,7 @@ import httpx
 from .db import session_scope
 from .models import Secret
 from .github_app import InstallationCredential, installation_id
-from .security import decrypt
+from .security import decrypt, redact
 
 API = "https://api.github.com"
 
@@ -601,8 +601,30 @@ class GitHub:
             retries=0,
         )
 
-    async def job_log_tail(self, full_name: str, check: dict[str, Any], limit: int = 6000) -> str:
+    async def job_log_tail(self, full_name: str, check: dict[str, Any], limit: int = 6000,
+                           *, redact_extra: tuple[str, ...] | None = None) -> str:
         """Best-effort failing-job log tail for GitHub Actions check runs."""
+        if redact_extra is not None:
+            # Steward egress: never cut a credential before scrubbing it. Refuse
+            # oversized downloads rather than returning an unsafe partial token.
+            fallback = redact(check.get("summary", ""), redact_extra)[-limit:]
+            if check.get("kind") != "check_run":
+                return fallback
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    async with client.stream("GET", f"{API}/repos/{full_name}/actions/jobs/{check['id']}/logs",
+                                             headers=await self._fresh_headers()) as response:
+                        if response.status_code != 200:
+                            return fallback
+                        body = bytearray()
+                        cap = 1_000_000
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            body.extend(chunk[:cap + 1 - len(body)])
+                            if len(body) > cap:
+                                return fallback
+                        return redact(body.decode("utf-8", errors="replace"), redact_extra)[-limit:]
+            except httpx.TransportError:
+                return fallback
         if check.get("kind") != "check_run":
             return check.get("summary", "")
         try:
