@@ -534,6 +534,8 @@ class Orchestrator:
                  "concurrency", self._delivery_turns, self._spawn_task)
 
     def _schedule_ci(self) -> None:
+        from .reviews import watches_reviews
+
         # A done callback (not only coroutine finally) handles cancellation before
         # the first coroutine step. Prune here too so callback ordering cannot stall us.
         self._ci_polls = {tid: job for tid, job in self._ci_polls.items() if not job.done()}
@@ -546,10 +548,19 @@ class Orchestrator:
                    .order_by(Task.updated_at, Task.id)
                    if ((t.evidence or {}).get("ci_wait") or {}).get("next_poll_at", "") <= now
                    and t.id not in self._ci_polls and t.id not in self._tasks][:4 - len(self._ci_polls)]
+            approval_due = [t.id for t in s.query(Task).join(Workspace, Task.workspace_id == Workspace.id)
+                            .filter(Task.status == "awaiting_approval", Workspace.paused.is_(False))
+                            if watches_reviews(t) and t.id not in self._ci_polls and t.id not in self._tasks
+                            and ((t.evidence or {}).get("review") or {}).get("next_watch_at", "") <= now]
+            due += approval_due[:max(0, 4 - len(self._ci_polls) - len(due))]
         for task_id in due:
             async def poll(tid=task_id):
                 try:
-                    await TaskRunner(tid, asyncio.Event(), self.repo_lock).poll_ci()
+                    runner = TaskRunner(tid, asyncio.Event(), self.repo_lock)
+                    if watches_reviews(runner.task):
+                        await asyncio.wait_for(runner.watch_review(), timeout=90)
+                    else:
+                        await runner.poll_ci()
                 except (Stop, asyncio.CancelledError):
                     pass
                 except Exception:

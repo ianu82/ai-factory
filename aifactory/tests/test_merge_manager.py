@@ -271,6 +271,9 @@ def test_github_queue_rebases_a_stale_head_before_enqueueing(factory, monkeypatc
     with session_scope() as s:
         s.get(Task, tid).base_sha = "stale"
     r = runner(tid)
+    # This regression exercises GitHub-owned queueing. With review gating on,
+    # delivery deliberately keeps merge ownership for its final locked snapshot.
+    r.cfg["review"] = {"address": "off"}
     asyncio.run(r.merge())
     assert refreshed and QueueGitHub.enqueued == []
 

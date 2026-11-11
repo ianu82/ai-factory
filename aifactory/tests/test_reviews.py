@@ -13,6 +13,11 @@ from aifactory.review import (DEFAULT_REVIEW, FACTORY_REPLY_MARKER, new_review_e
                               normalize_feedback, review_policy)
 
 
+@pytest.fixture(autouse=True)
+def writer_permissions(monkeypatch):
+    monkeypatch.setattr(GitHub, "repository_author_permission", AsyncMock(return_value="write"))
+
+
 def user(login="reviewer", kind="User"):
     return {"login": login, "type": kind}
 
@@ -297,3 +302,24 @@ def test_review_patch_preserves_operator_settings_protection(client, signed_in):
         assert settings["_operator_marker"] == "keep"
         assert "_forged" not in settings
         assert settings["review"] == {**DEFAULT_REVIEW, "wait_seconds": 0}
+
+
+@pytest.mark.parametrize("endorsement", [None, "reply", "reaction"])
+def test_outsider_requires_writer_endorsement_cached_permissions(monkeypatch, endorsement):
+    gh = GitHub("secret")
+    permission = AsyncMock(side_effect=lambda repo, login: "write" if login == "maintainer" else "read")
+    monkeypatch.setattr(gh, "repository_author_permission", permission)
+    gh.user = AsyncMock(return_value=user("FactoryAccount"))
+    gh.pull = AsyncMock(return_value={"user": user("PRAuthor")})
+    gh.reviews = AsyncMock(return_value=[review()])
+    replies = [inline(), inline(11)]
+    if endorsement == "reply":
+        replies.append({**inline(12, login="maintainer"), "replyTo": {"databaseId": 10}})
+    gh.review_threads = AsyncMock(return_value=[thread(*replies)])
+    gh.issue_comments = AsyncMock(return_value=[])
+    gh._review_pages = AsyncMock(return_value=[{"content": "+1", "user": user("maintainer")}] if endorsement == "reaction" else [])
+    found = asyncio.run(gh.review_feedback("owner/repo", 7, {}))
+    assert bool(found) == bool(endorsement)
+    if endorsement:
+        assert {"comment:10", "comment:11"} <= {f["id"] for f in found}
+    assert sum(c.args[1] == "reviewer" for c in permission.call_args_list) == 1

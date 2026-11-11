@@ -28,6 +28,8 @@ def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
     if revalidation.get("phase") == "rejected":
         ev["revalidation"] = {**revalidation, "phase": "handled", "human_retry": True}
         ev["rebase_rebuilds"] = 0
+    if ev.get("review"):
+        ev["review"] = {**ev["review"], "success_credits": 0, "credited_attempt": None}
     ev["budget_epoch"] = int(ev.get("budget_epoch", 0)) + 1
     return ev
 
@@ -124,6 +126,35 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             task.status, task.stage, task.attempt = "queued", "revise", 0
             # A requested revision is a fresh budget: earlier rounds' offsets and automatic retries do not carry over.
             task.evidence = fresh_budget(task.evidence)
+    elif kind == "review_limit" and task:
+        from copy import deepcopy
+        state = deepcopy((task.evidence or {}).get("review") or {})
+        if resolution == "address_again":
+            state["extra_rounds"] = state.get("extra_rounds", 0) + 1
+            task.status, task.stage, task.blocked_reason = "queued", "merge", ""
+        elif resolution == "merge_anyway":
+            displayed = state.get("decision") or {}
+            head = displayed.get("head")
+            if head == task.head_sha:
+                waivers = state.setdefault("waivers", {})
+                waivers[head] = list(dict.fromkeys([*waivers.get(head, []), *displayed.get("versions", [])]))
+            task.status, task.stage, task.blocked_reason = "queued", "merge", ""
+        elif resolution == "take_over" and after is None:
+            take_over = task.id
+        elif resolution == "take_over":
+            from .pipeline.handover import HandoverError, mark_handed_over
+
+            try:
+                info = mark_handed_over(task.id, user, action_id=action_id, session=db,
+                                        pending_events=pending_events)
+            except HandoverError as exc:
+                raise DecisionError(str(exc)) from None
+            after.extend([("stop_task", task.id, task.workspace_id, task.outcome_id),
+                          ("publish_candidate", task.id, info)])
+        elif resolution == "abandon":
+            task.status = "abandoned"
+            dropped = task.id
+        task.evidence = {**(task.evidence or {}), "review": state}
     elif kind == "budget" and task:
         if resolution == "retry":
             ev = dict(task.evidence or {})

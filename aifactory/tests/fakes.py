@@ -125,6 +125,9 @@ class FakeGitHub:
             pr["head"]["sha"] = await self.branch_sha(full_name, pr["head"]["ref"])
         return pr
 
+    async def review_feedback(self, *args, **kwargs):
+        return []
+
     async def set_status(self, *args, **kwargs):
         return None
 

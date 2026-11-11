@@ -50,6 +50,12 @@ BUILDER_REPORT: dict[str, Any] = {
             "items": {"type": "object", "properties": {"criterion": {"type": "string"}, "how": {"type": "string"}},
                       "required": ["criterion", "how"]},
         },
+        "review_responses": {
+            "type": "array", "description": "Explicit acknowledgements keyed by GitHub finding ID.",
+            "items": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "status": {"type": "string", "enum": ["addressed", "disputed", "answered", "needs_change"]},
+                "reason": {"type": "string"}}, "required": ["id", "status", "reason"]}},
         "blocked_reason": {"type": "string"},
         "runtime_checks": {
             "type": "array",
