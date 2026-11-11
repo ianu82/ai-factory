@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from itertools import islice
@@ -112,6 +113,9 @@ class ReadTool:
 
 
 COMMON = {"workspace_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": MAX_ITEMS}}
+# People name work by its number and key, as the app shows it; tools take either that or the id.
+OUTCOME_REF = {"type": "string", "description": "The outcome's id, or its number as people write it: #53 or 53."}
+TASK_REF = {"type": "string", "description": "The task's id, or its key within the outcome: T1, or #53 T1."}
 REGISTRY: dict[str, ReadTool] = {}
 
 
@@ -134,6 +138,52 @@ def validate_links(context, args, row):
         target(context.db, current(context), args["workspace_id"], row.outcome_id, row.task_id if hasattr(row, "task_id") else None)
     elif getattr(row, "task_id", None):
         raise HTTPException(404, "Invalid object relationship")
+
+
+_NUMBER = re.compile(r"#?\s*(\d{1,9})")
+_TASK_LABEL = re.compile(r"#?\s*(\d{1,9})\s+(\S{1,20})")  # "#53 T1": how the app and Mind's cards name a task
+
+
+def resolve_refs(context: Context, args: dict) -> dict:
+    """The arguments with the outcome and task as people name them (#53, 53, T1, #53 T1) replaced by their ids,
+    which the Factory's own checks take. Numbers and keys resolve only within the call's workspace, for its members.
+    A reference that matches nothing stays as written, so the check that follows refuses it like any unknown id."""
+    outcome_ref, task_ref = args.get("outcome_id"), args.get("task_id")
+    if not (outcome_ref or task_ref):
+        return args
+    db, ws = context.db, args["workspace_id"]
+    require_member(db, current(context), ws)
+    label = _TASK_LABEL.fullmatch(task_ref.strip()) if task_ref else None
+    outcome = _find_outcome(db, ws, outcome_ref or (label[1] if label else None))
+    if outcome is None:
+        return args
+    resolved = {**args, "outcome_id": outcome.id}
+    if label and int(label[1]) == outcome.number:
+        task_ref = label[2]
+    if task_ref and (task := _find_task(db, ws, outcome.id, task_ref.strip())) is not None:
+        resolved["task_id"] = task.id
+    return resolved
+
+
+def _find_outcome(db: Session, workspace_id: str, ref: str | None) -> Outcome | None:
+    if not ref:
+        return None
+    ref = ref.strip()
+    outcome = db.query(Outcome).filter_by(id=ref, workspace_id=workspace_id).one_or_none()
+    if outcome is None and (number := _NUMBER.fullmatch(ref)):
+        outcome = db.query(Outcome).filter_by(workspace_id=workspace_id, number=int(number[1])).one_or_none()
+    return outcome
+
+
+def _find_task(db: Session, workspace_id: str, outcome_id: str, ref: str) -> Task | None:
+    task = db.query(Task).filter_by(id=ref, workspace_id=workspace_id, outcome_id=outcome_id).one_or_none()
+    if task is not None:
+        return task
+    keyed = db.query(Task).filter(Task.workspace_id == workspace_id, Task.outcome_id == outcome_id,
+                                  func.lower(Task.key) == ref.lower()).limit(2).all()
+    if len(keyed) > 1:
+        raise HTTPException(422, "More than one task in this outcome has that key: use the task's id from list_tasks")
+    return keyed[0] if keyed else None
 
 
 def page(query, args, serializer, cite):
@@ -191,7 +241,7 @@ def list_outcomes(args, context):
 
 
 @register("list_tasks", "List or search tasks, optionally within an outcome: status, stage, PR and cost. "
-          "task_detail has one task's spec, evidence and runs.", {**SEARCH, "outcome_id": {"type": "string"}})
+          "task_detail has one task's spec, evidence and runs.", {**SEARCH, "outcome_id": OUTCOME_REF})
 def list_tasks(args, context):
     return tasks_page(args, context, full=False)
 
@@ -214,7 +264,7 @@ def tasks_page(args, context, *, full: bool):
 
 @register("task_detail", "One task's full record: spec, acceptance criteria, evidence (attempts, CI, smoke, "
           "failures), runs and cost. Needs the task's outcome_id and task_id.",
-          {"outcome_id": {"type": "string"}, "task_id": {"type": "string"}}, ("outcome_id", "task_id"))
+          {"outcome_id": OUTCOME_REF, "task_id": TASK_REF}, ("outcome_id", "task_id"))
 def task_detail(args, context):
     _, t = target(context.db, current(context), args["workspace_id"], args["outcome_id"], args["task_id"])
     validate_links(context, args, t)
@@ -225,7 +275,7 @@ def task_detail(args, context):
 
 @register("outcome_detail", "Outcome plans, task evidence, PR links, recorded CI, its decisions (newest first), the "
           "guidance people posted (newest first) and delivery metrics (not live GitHub).",
-          {"outcome_id": {"type": "string"}}, ("outcome_id",))
+          {"outcome_id": OUTCOME_REF}, ("outcome_id",))
 def outcome_detail(args, context):
     o, _ = target(context.db, current(context), args["workspace_id"], args["outcome_id"])
     tasks = tasks_page({**args}, context, full=True)
@@ -251,7 +301,7 @@ def outcome_detail(args, context):
 
 @register("open_decisions", "Open questions, blockers and approvals waiting on a person, each with the options "
           "(value and label) propose_resolve_decision can choose and what it is about (outcome, task, PR). "
-          "actionable is false while a decision judge is still reviewing it.", {"outcome_id": {"type": "string"}})
+          "actionable is false while a decision judge is still reviewing it.", {"outcome_id": OUTCOME_REF})
 def open_decisions(args, context):
     query = scoped(context, args, Decision).filter_by(status="open")
     if args.get("outcome_id"):
@@ -271,7 +321,7 @@ def open_decisions(args, context):
 
 
 @register("runs", "Runs with bounded redacted excerpts from the runtime agent event journal and known/unknown costs.",
-          {"outcome_id": {"type": "string"}, "task_id": {"type": "string"}, "run_id": {"type": "string"}})
+          {"outcome_id": OUTCOME_REF, "task_id": TASK_REF, "run_id": {"type": "string"}})
 def runs(args, context):
     query = scoped(context, args, Run)
     if args.get("task_id") and not args.get("outcome_id"):
@@ -346,7 +396,7 @@ FAILED_CHECKS = ("failure", "error", "timed_out", "cancelled")  # as pulls.py co
           "and the open decision waiting on it with its options. state: open (default: not merged and not closed by "
           "the Factory, including handed-over work), merged or all. Review "
           "threads and live CI are on GitHub; github holds the app's Pull requests page snapshot when it is recent.",
-          {"outcome_id": {"type": "string"}, "state": {"type": "string"}})
+          {"outcome_id": OUTCOME_REF, "state": {"type": "string"}})
 def pull_requests(args, context):
     state = args.get("state", "open")
     if state not in ("open", "merged", "all"):
@@ -441,7 +491,7 @@ def read_call(name: str, args: dict, context: Context) -> dict:
         raise HTTPException(422, "Unknown read tool")
     validate_arguments(tool.schema, args)
     require_member(context.db, current(context), args["workspace_id"])
-    raw = tool.handler({"limit": 20, **args}, context)
+    raw = tool.handler({"limit": 20, **resolve_refs(context, args)}, context)
     state = [False]
     result = clean(raw, state)
     size = lambda value: len(json.dumps(value, ensure_ascii=False, default=str))

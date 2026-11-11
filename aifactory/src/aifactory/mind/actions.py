@@ -37,7 +37,8 @@ from ..security import redact
 from ..serializers import actionable
 from ..work_services import cancel_outcome, cancel_task, create_outcome, finish, publish_changes, send_guidance, target
 from .routing import PrivateRoute
-from .tools import Context, ReadTool, citation, clean, current, validate_arguments
+from .tools import (OUTCOME_REF, TASK_REF, Context, ReadTool, citation, clean, current, resolve_refs,
+                    validate_arguments)
 
 # The thread API's route class: a 422 never echoes rejected input (which can hold a pasted secret).
 router = APIRouter(prefix="/mind/threads", route_class=PrivateRoute)
@@ -482,7 +483,7 @@ KINDS: dict[str, Kind] = {
     "send_guidance": Kind(
         "Propose posting the person's guidance (text) on an outcome, or on one of its tasks with task_id; the "
         "Factory's agents follow it in their next steps." + NO_EXECUTION,
-        {"outcome_id": STRING, "task_id": STRING, "text": TEXT}, ("outcome_id", "text"), "required",
+        {"outcome_id": OUTCOME_REF, "task_id": TASK_REF, "text": TEXT}, ("outcome_id", "text"), "required",
         no_params, check_guidance, lambda args, t: {"text": text_of("send_guidance", {}, args["text"])},
         guidance_effect, work_object, run_guidance),
     "create_outcome": Kind(
@@ -515,16 +516,16 @@ KINDS: dict[str, Kind] = {
     "cancel_outcome": Kind(
         "Propose cancelling an outcome: the Factory stops its planner and jobs, cancels its unfinished tasks, "
         "supersedes its open decisions and closes the cancelled tasks' pull requests." + NO_EXECUTION,
-        {"outcome_id": STRING}, ("outcome_id",), "none", no_params, check_outcome_cancel, lambda args, t: {},
+        {"outcome_id": OUTCOME_REF}, ("outcome_id",), "none", no_params, check_outcome_cancel, lambda args, t: {},
         outcome_cancel_effect, work_object, run_outcome_cancel),
     "cancel_task": Kind(
         "Propose stopping one task: it is cancelled, its job stops and its pull request is closed." + NO_EXECUTION,
-        {"outcome_id": STRING, "task_id": STRING}, ("outcome_id", "task_id"), "none", no_params, check_open_task,
+        {"outcome_id": OUTCOME_REF, "task_id": TASK_REF}, ("outcome_id", "task_id"), "none", no_params, check_open_task,
         lambda args, t: {}, task_cancel_effect, work_object, run_task_cancel),
     "take_over_task": Kind(
         "Propose handing a task over to the person: the Factory stops working on it; its latest candidate is "
         "pushed and opened as a draft pull request when it has none." + NO_EXECUTION,
-        {"outcome_id": STRING, "task_id": STRING}, ("outcome_id", "task_id"), "none", no_params, check_open_task,
+        {"outcome_id": OUTCOME_REF, "task_id": TASK_REF}, ("outcome_id", "task_id"), "none", no_params, check_open_task,
         lambda args, t: {}, take_over_effect, work_object, run_take_over),
 }
 
@@ -581,6 +582,7 @@ def propose(name: str, args: dict, context: Context) -> dict:
     validate_arguments(tool.schema, args)
     if not context.thread_id or len(context.thread_id) > 32:
         raise HTTPException(422, "An owner-validated thread context is required")
+    args = resolve_refs(context, args)
     kind = name.removeprefix("propose_")
     spec = KINDS[kind]
     checked = spec.check(context, Ask(args["workspace_id"], args.get("outcome_id"), args.get("task_id"),

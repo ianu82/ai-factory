@@ -308,6 +308,38 @@ def test_reads_name_what_proposals_need(world):
     assert detail["messages"][0]["body"] == "Prefer the cache" and detail["messages"][0]["author"] == "Bob"
 
 
+def test_reads_take_outcome_numbers_and_task_keys(world):
+    # People name work as the app shows it (#53, T1); Mind passes that on instead of looking the ids up first.
+    db, users, work = world
+    ws, o, t, *_, run, _ = work[0]
+    context = Context(db, users[0].id)
+    for ref in ("#1", "1", " # 1 ", o.id):  # workspace 1 has an outcome #1 too: only this workspace's counts
+        detail = read_call("outcome_detail", {"workspace_id": ws.id, "outcome_id": ref}, context)
+        assert detail["citations"][0]["id"] == o.id
+    for outcome_ref, task_ref in (("#1", "T1"), ("1", "t1"), (o.id, "T1"), ("#1", t.id), ("#1", "#1 T1")):
+        task = read_call("task_detail", {"workspace_id": ws.id, "outcome_id": outcome_ref, "task_id": task_ref}, context)
+        assert task["items"][0]["id"] == t.id
+    runs = read_call("runs", {"workspace_id": ws.id, "task_id": "#1 T1"}, context)  # the label names the outcome
+    assert [r["id"] for r in runs["items"]] == [run.id]
+    for workspace_id, outcome_ref, task_ref, status in [
+            (ws.id, "#2", "T1", 404),  # no outcome #2 here
+            (ws.id, work[1][1].id, "T1", 404),  # another workspace's outcome
+            (ws.id, "#1", "T9", 404),  # no such key in #1
+            (ws.id, "#1", "#2 T1", 404),  # a label for another outcome
+            (work[2][0].id, "#1", "T1", 404)]:  # a workspace the person is not in
+        with pytest.raises(HTTPException) as exc:
+            read_call("task_detail", {"workspace_id": workspace_id, "outcome_id": outcome_ref, "task_id": task_ref},
+                      context)
+        assert exc.value.status_code == status
+    db.add(Task(workspace_id=ws.id, outcome_id=o.id, plan_id=t.plan_id, repo_id=t.repo_id, key="t1", title="Again"))
+    db.commit()
+    with pytest.raises(HTTPException) as exc:  # two tasks with that key: never a guess
+        read_call("task_detail", {"workspace_id": ws.id, "outcome_id": "#1", "task_id": "T1"}, context)
+    assert exc.value.status_code == 422 and "list_tasks" in exc.value.detail
+    task = read_call("task_detail", {"workspace_id": ws.id, "outcome_id": "#1", "task_id": t.id}, context)
+    assert task["items"][0]["id"] == t.id
+
+
 def test_nested_tool_arguments_are_bounded_and_closed():
     from aifactory.mind.tools import validate_arguments
     schema = {"type": "object", "properties": {"workspace_id": {"type": "string"}, "tasks": {"type": "array", "maxItems": 2,
