@@ -364,6 +364,42 @@ export interface Decision {
   pr_url?: string;
   pr_number?: number | null;
   priority?: number;
+  lead_note?: { text: string; created_at: string; run_id?: string | null } | null;
+}
+
+/** An outcome as a conversation (GET …/outcomes/{id}/conversation). */
+export interface ConversationStep {
+  at: string;
+  who: string;
+  text: string;
+  level: string;
+  event: string;
+  run_id?: string | null;
+  url?: string;
+  cost_usd?: number;
+}
+
+interface StepGroup {
+  steps: ConversationStep[];
+  steps_omitted: number;
+}
+
+export type ConversationItem =
+  | { kind: "request"; at: string; title: string; brief: string; acceptance: string[]; from: string; by: string }
+  | ({ kind: "lead"; id: string; at: string; text: string; task_key: string | null; update: boolean; decision_id: string | null } & StepGroup)
+  | { kind: "lead_guidance"; id: string; at: string; text: string; task_key: string | null; delivered: boolean }
+  | { kind: "person"; id: string; at: string; text: string; task_key: string | null; author: string; operator: boolean; delivered: boolean }
+  | { kind: "factory"; id: string; at: string; text: string; task_key: string | null }
+  | { kind: "decision"; at: string; decision: Decision }
+  | ({ kind: "working"; at: string } & StepGroup);
+
+export interface Conversation {
+  items: ConversationItem[];
+  /** The outcome's status now: a Mind conversation's copy of it is as old as the thread's last load. */
+  status: string;
+  /** Set when a Mind conversation became this outcome; thread_id only for that conversation's owner. */
+  started_in_mind: { thread_id: string | null } | null;
+  lead: { model: string | null; running: boolean; last_active: string | null; cost_usd: number; cost_known: boolean };
 }
 
 export interface FactoryEvent {
@@ -511,9 +547,12 @@ export interface MindMessage {
   /** The turn's steps; durationMs only when this browser timed the turn. */
   steps?: MindStep[]; durationMs?: number; failed?: boolean;
 }
+/** The outcome a Mind conversation became when its owner confirmed a card that created one. */
+export interface MindOutcomeLink { id: string; number: number; title: string; status: string; workspace_id: string }
 export interface MindThread {
   id: string; title: string; workspace_id: string;
   cost_usd: number | null; cost_known: boolean; updated_at?: string;
+  outcome?: MindOutcomeLink | null;
 }
 export interface MindStatus {
   model: string | null; available: boolean; reason?: string;
@@ -542,6 +581,7 @@ export interface MindWireCard {
 export interface MindWireThread {
   id: string; title: string; billing_workspace_id: string; model_id: string | null;
   status: string; cost: { usd: number | null; known: boolean }; updated_at?: string;
+  outcome?: MindOutcomeLink | null;
 }
 export interface MindWireMessage {
   id: string; role: "user" | "assistant"; text: string;

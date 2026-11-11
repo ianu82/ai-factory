@@ -3,7 +3,7 @@ import type { readMindSSE, MindTransport } from "./mind";
 
 // A thread keeps the database's default title until its first message names it: that one is not listed yet.
 const UNTITLED = "New conversation";
-export const mindThread = (t: MindWireThread): MindThread => ({ id: t.id, title: t.title === UNTITLED ? "" : t.title, workspace_id: t.billing_workspace_id, cost_usd: t.cost.usd, cost_known: t.cost.known, updated_at: t.updated_at });
+export const mindThread = (t: MindWireThread): MindThread => ({ id: t.id, title: t.title === UNTITLED ? "" : t.title, workspace_id: t.billing_workspace_id, cost_usd: t.cost.usd, cost_known: t.cost.known, updated_at: t.updated_at, outcome: t.outcome ?? null });
 const citations = (items: { label: string; href: string }[] = []): MindCitation[] => items.map((item) => ({ label: item.label, url: item.href }));
 /** What the card says happened: never "Completed" when a follow-up (closing a PR, opening a draft) did not happen. */
 function resultText(c: MindWireCard): string {
