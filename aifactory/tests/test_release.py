@@ -51,12 +51,20 @@ class World:
         self.staging = {"ok": True, "commit": NEW, "started_at": iso(NOW - timedelta(minutes=45))}
         self.staging_down_for = 0
         self.files = ["aifactory/src/aifactory/api.py"]
+        self.line = [NEW]  # commits from the release (exclusive) to staging's commit, oldest first
+        self.staged: dict[str, str] = {}  # factory/staging descriptions recorded on commits
+        self.commit_checks: dict[str, list[dict]] = {}
         self.status = "ahead"
         self.on_main = "identical"
         self.checks = [{"name": "test", "status": "completed", "conclusion": "success"},
                        {"name": "postgres", "status": "completed", "conclusion": "success"}]
         self.asset_status = 200
         self.me_status = 401
+        self.smoke_runs = 0
+        self.asset_fails_from_run: int | None = None  # the script bundle 404s from this smoke run on
+        self.asset_fails_on_run: int | None = None  # the script bundle 404s in this smoke run only
+        self.staging_record_fails = False  # GitHub refuses to record factory/staging statuses
+        self.redeploy_at: tuple[int, dict] | None = None  # (nth smoke run, staging health from then on)
         self.store: list[dict] = []  # every issue: number, title, labels, created_at, state
         self.labels: set[str] = set()
         self.issues: list[dict] = []  # bodies of issues the checker opened
@@ -75,9 +83,16 @@ class World:
         if path.startswith(f"{base}/commits/") and path.endswith("/status"):
             sha = path.split("/")[-2]
             statuses = [{"context": "factory/release", "state": self.marks[sha]}] if sha in self.marks else []
+            if sha in self.staged:
+                statuses.append({"context": "factory/staging", "state": "success", "description": self.staged[sha]})
             return httpx.Response(200, json={"statuses": [{"context": "ci/other", "state": "success"}, *statuses]})
         if path.startswith(f"{base}/statuses/") and method == "POST":
             sha, body = path.split("/")[-1], json.loads(request.content)
+            if body["context"] == "factory/staging":
+                if self.staging_record_fails:
+                    return httpx.Response(502, json={})
+                self.staged[sha] = body["description"]
+                return httpx.Response(201, json={})
             assert body["context"] == "factory/release"
             self.marks[sha] = body["state"]
             self.mark_posts.append((sha, body["state"]))
@@ -111,12 +126,19 @@ class World:
             self.labels.add(json.loads(request.content)["name"])
             return httpx.Response(201, json={})
         if path == f"{base}/compare/{OLD}...{NEW}":
-            return httpx.Response(200, json={"status": self.status, "ahead_by": 3,
-                                             "files": [{"filename": f} for f in self.files]})
+            return httpx.Response(200, json={"status": self.status, "ahead_by": len(self.line),
+                                             "files": [{"filename": f} for f in self.files],
+                                             "commits": [{"sha": c} for c in self.line]})
+        if path.startswith(f"{base}/compare/{OLD}...") and path.split("...")[-1] in self.line:
+            return httpx.Response(200, json={"status": "ahead", "files": [{"filename": f} for f in self.files]})
+        if path == f"{base}/commits" and method == "GET":
+            assert params.get("sha") == NEW
+            return httpx.Response(200, json=[{"sha": c} for c in reversed(self.line)] + [{"sha": OLD}])
         if path == f"{base}/compare/{NEW}...main":
             return httpx.Response(200, json={"status": self.on_main})
-        if path == f"{base}/commits/{NEW}/check-runs":
-            return httpx.Response(200, json={"check_runs": self.checks})
+        if path.startswith(f"{base}/commits/") and path.endswith("/check-runs"):
+            sha = path.split("/")[-2]
+            return httpx.Response(200, json={"check_runs": self.commit_checks.get(sha, self.checks)})
         if path == f"{base}/git/refs/heads/release" and method == "PATCH":
             body = json.loads(request.content)
             self.patches.append(body)
@@ -145,10 +167,16 @@ class World:
         if url == f"{STAGING}/":
             return httpx.Response(200, text=APP)
         if url == f"{STAGING}/assets/index-1.js":
+            run = self.smoke_runs + 1
+            if (self.asset_fails_from_run and run >= self.asset_fails_from_run) or run == self.asset_fails_on_run:
+                return httpx.Response(404, text="")
             return httpx.Response(self.asset_status, text="x" * 5000)
         if url == f"{STAGING}/api/meta":
             return httpx.Response(200, json={"auth": {"api_key": True}})
-        if url == f"{STAGING}/api/me":
+        if url == f"{STAGING}/api/me":  # the last request of a smoke run
+            self.smoke_runs += 1
+            if self.redeploy_at and self.redeploy_at[0] == self.smoke_runs:
+                self.staging = self.redeploy_at[1]
             return httpx.Response(self.me_status, json={"detail": "Not signed in"})
         return httpx.Response(404)
 
@@ -200,6 +228,129 @@ def test_staging_must_run_the_candidate_for_the_soak_period(world):
     result = world.run()
     assert result.status == "held" and "10 of 30 minutes" in result.detail
     assert world.patches == [] and world.issues == []
+
+
+MID = "d" * 40
+EARLY = "e" * 40
+
+
+def test_a_busy_main_still_releases_the_newest_commit_staging_has_run_long_enough(world):
+    # Merges keep replacing staging's commit: NEW only just deployed, but MID ran 45 minutes ago and is contained
+    # in NEW, so it has been on staging for the soak period.
+    world.line = [EARLY, MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke passed"
+    result = world.run()
+    assert result.status == "promoted", result.as_dict()
+    assert world.patches == [{"sha": MID, "force": False}]
+    assert NEW in world.staged  # this run recorded when staging started NEW
+
+
+def test_only_commits_staging_deployed_are_candidates(world):
+    # EARLY never ran on staging by itself (it may be a side-branch commit of a merge): never promoted, even
+    # though later commits that contain it soaked; MID needs its own 30 minutes.
+    world.line = [EARLY, MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=20))}; smoke passed"
+    result = world.run()
+    assert result.status == "held" and "long enough" in result.detail
+    assert world.patches == []
+    world.clock.sleep(15 * 60)  # MID now on staging for 35 minutes
+    assert world.run().status == "promoted"
+    assert world.patches == [{"sha": MID, "force": False}]
+
+
+def test_staging_is_recorded_even_while_the_interval_holds(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    assert world.run().status == "held"
+    assert world.staged[NEW].startswith("Staging since ")
+
+
+def test_a_soaked_commit_with_failing_checks_is_skipped_for_an_older_one(world):
+    world.line = [EARLY, MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=50))}; smoke passed"
+    world.staged[EARLY] = f"Staging since {iso(NOW - timedelta(minutes=70))}; smoke passed"
+    world.commit_checks[MID] = [{"name": "test", "status": "completed", "conclusion": "failure"}]
+    assert world.run().status == "promoted"
+    assert world.patches == [{"sha": EARLY, "force": False}]
+
+
+def test_an_older_commit_needs_its_own_passing_smoke_result(world):
+    # MID soaked, but no smoke result was recorded while staging ran it; NEW has not soaked yet.
+    world.line = [MID, NEW]
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}"
+    result = world.run()
+    assert result.status == "held" and "no passing smoke result" in result.detail
+    assert world.patches == []
+    # A failure recorded while staging ran it holds it too (NEW, which fixed it, has not soaked yet).
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke failed"
+    result = world.run()
+    assert result.status == "held" and "failed smoke while staging ran it" in result.detail
+    assert world.patches == []
+
+
+def test_each_run_records_staging_smoke_for_the_commit_it_runs(world):
+    world.moved_at = NOW - timedelta(minutes=60)  # held by the interval: only the observation happens
+    world.run()
+    assert world.staged[NEW].endswith("smoke passed")
+    world.asset_status = 404
+    world.staged.clear()
+    world.run()
+    assert world.staged[NEW].endswith("smoke failed")
+
+
+def test_a_smoke_failure_sticks_until_staging_restarts_the_commit(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    world.asset_status = 404
+    world.run()
+    world.asset_status = 200
+    world.run()  # passing again on the same start does not clear the failure
+    assert world.staged[NEW].endswith("smoke failed")
+    world.staging["started_at"] = iso(NOW + timedelta(minutes=1))
+    world.run()
+    assert world.staged[NEW].endswith("smoke passed")
+
+
+def test_a_deploy_during_the_smoke_run_records_no_smoke_result(world):
+    world.moved_at = NOW - timedelta(minutes=60)
+    world.redeploy_at = (1, {"ok": True, "commit": OTHER, "started_at": iso(NOW)})
+    world.run()
+    assert world.staged[NEW] == f"Staging since {iso(NOW - timedelta(minutes=45))}"  # start only, no smoke verdict
+
+
+def test_a_deploy_during_the_promotion_smoke_holds_the_release(world):
+    world.redeploy_at = (2, {"ok": True, "commit": OTHER, "started_at": iso(NOW)})
+    result = world.run()
+    assert result.status == "held" and "changed during the check" in result.detail
+    assert world.patches == []
+
+
+def test_a_recorded_smoke_failure_holds_staging_current_deployment(world):
+    world.staged[NEW] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke failed"  # this very start
+    result = world.run()  # both smoke runs now pass
+    assert result.status == "held" and "failed smoke" in result.detail
+    assert world.patches == []
+
+
+def test_a_promotion_smoke_failure_is_recorded_and_sticks(world):
+    world.asset_fails_from_run = 2  # the observation passes, the promotion-time smoke fails
+    assert world.run().status == "failed"
+    assert world.staged[NEW].endswith("smoke failed")
+    world.asset_fails_from_run = None
+    world.smoke_runs = 0
+    result = world.run()
+    assert result.status == "held" and "failed smoke" in result.detail
+    assert world.patches == []
+
+
+def test_a_restart_of_the_same_commit_resets_its_soak(world):
+    world.staged[NEW] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke passed"
+    world.staging["started_at"] = iso(NOW - timedelta(minutes=5))  # Railway restarted NEW five minutes ago
+    result = world.run()
+    assert result.status == "held" and "5 of 30 minutes" in result.detail
+    assert world.staged[NEW].startswith(f"Staging since {iso(NOW - timedelta(minutes=5))}")
 
 
 def test_no_factory_code_changed_means_no_release_and_no_restart(world):
@@ -339,6 +490,15 @@ def test_staging_smoke_failure_blocks_the_release(world):
     result = world.run()
     assert result.status == "failed" and "/assets/index-1.js" in result.detail
     assert world.patches == [] and len(world.issues) == 1
+
+
+def test_a_smoke_failure_that_cannot_be_recorded_still_blocks_the_release(world):
+    world.asset_fails_on_run = 1  # the observation fails; a second smoke run would pass
+    world.staging_record_fails = True  # and GitHub refuses the record of that failure
+    result = world.run()
+    assert result.status == "failed" and "/assets/index-1.js" in result.detail
+    assert world.patches == [] and NEW not in world.staged
+    assert world.smoke_runs == 1  # the release stopped at the failure it saw; no second run could clear it
 
 
 def test_smoke_reports_auth_that_lets_anonymous_calls_through(world):
