@@ -19,6 +19,7 @@ from .auth import router as auth_router
 from .config import get_settings
 from .db import init_engine
 from .gateway import router as gateway_router
+from .goals import router as goals_router
 from .merge_manager import router as merge_queue_router
 from .mind.api import router as mind_router
 from .mind.runtime import EngineRuntime
@@ -60,6 +61,8 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
             return JSONResponse({"detail": "Invalid credential request"}, status_code=422)
         if request.url.path.startswith("/api/workspaces/") and request.url.path.endswith("/linear"):
             return JSONResponse({"detail": "Invalid Linear configuration request"}, status_code=422)
+        if request.url.path.startswith("/api/workspaces/") and "/goals" in request.url.path:
+            return JSONResponse({"detail": "Invalid goal request"}, status_code=422)
         return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
@@ -72,6 +75,7 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
         return response
 
     app.include_router(api_router)
+    app.include_router(goals_router)
     app.include_router(auth_router)
     app.include_router(gateway_router)
     app.include_router(onboarding_router)

@@ -174,12 +174,19 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         review = review_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+    from .triage_settings import TriageSettings
+    from pydantic import ValidationError
+    try:
+        triage = TriageSettings.model_validate(raw.get("triage", {})).model_dump()
+    except ValidationError:
+        raise HTTPException(422, "Invalid triage settings: use positive finite budgets and bounded integer interval, tokens and turns") from None
     mind = _mind_settings(raw.get("mind"))
     merged = merged_settings(raw)
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
     merged["mind"] = mind
+    merged["triage"] = triage
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -221,6 +228,10 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
             raise HTTPException(422, "Learning lifecycle is managed by the onboarding policy endpoint")
         before = merged_settings(ws.settings)
         updated = {**before, **patch}
+        if "triage" in patch:
+            if not isinstance(patch["triage"], dict):
+                raise HTTPException(422, "triage must be an object")
+            updated["triage"] = {**before["triage"], **patch["triage"]}
         if "review" in patch:
             try:
                 updated["review"] = {**before["review"], **validate_review(patch["review"])}
@@ -726,6 +737,8 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
             config["enabled"] = False
         linear_config.save_config(db, workspace, linear_config.LinearConfig.model_validate(config), user.id,
                                   commit=False)
+    from .goals import remove_repository
+    remove_repository(db, workspace_id, repo_id)
     workstream_events = workstreams.remove_repository_defaults(db, workspace_id, repo_id, user)
     db.delete(repo)
     db.commit()

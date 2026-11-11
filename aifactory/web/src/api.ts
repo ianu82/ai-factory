@@ -104,7 +104,37 @@ export interface CredentialsResponse {
   server_fallbacks: Record<string, boolean>;
 }
 
+export interface AdmissionPolicy {
+  enabled: boolean;
+  repo_ids: string[];
+  max_urgency: number;
+}
+export interface Goal {
+  id: string;
+  workspace_id: string;
+  name: string;
+  description: string;
+  owner_id: string;
+  repo_ids: string[];
+  admission: AdmissionPolicy;
+  workstream_id: string | null;
+  state: "active" | "archived";
+}
+export interface EffectiveGoals {
+  source: "workspace" | "workstream";
+  goals: (Goal & { effective_admission: AdmissionPolicy & { source: string; invalid?: boolean } })[];
+}
+export interface TriageConfig {
+  enabled: boolean;
+  interval_seconds: number;
+  run_usd: number;
+  day_usd: number;
+  run_tokens: number;
+  max_turns: number;
+}
+
 export interface Settings {
+  triage: TriageConfig;
   learning?: { status: "learning" | "applied"; preset: Settings["autonomy"] };
   provider: "mindshub" | "openai";
   decision_judges: DecisionJudgeMode;

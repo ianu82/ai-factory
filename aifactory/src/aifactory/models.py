@@ -119,6 +119,24 @@ class Repository(Base):
     __table_args__ = (UniqueConstraint("workspace_id", "full_name"),)
 
 
+class Goal(Base):
+    """Stable workspace identity; an optional workstream link does not replace the ID."""
+
+    __tablename__ = "goals"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    repo_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    admission: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Not a FK: workstreams are an optional capability, not a schema prerequisite.
+    workstream_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    state: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class Workstream(Base):
     __tablename__ = "workstreams"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)

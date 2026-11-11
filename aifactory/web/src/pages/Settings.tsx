@@ -11,6 +11,7 @@ import { ago } from "../format";
 import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
+import { TriageSettings } from "../components/TriageSettings";
 import { LinearSettings } from "../components/LinearSettings";
 
 const SECTIONS = [
@@ -18,6 +19,7 @@ const SECTIONS = [
   ["models", "Models & workers"],
   ["credentials", "Credentials"],
   ["linear", "Linear"],
+  ["triage", "Goals / triage"],
   ["repositories", "Repositories"],
   ["members", "Members"],
   ["workspace", "Workspace"],
@@ -26,6 +28,7 @@ const SECTIONS = [
 export function SettingsPage() {
   const { section = "policies" } = useParams();
   const { ws } = useWs();
+  const saveSettings = useSaveSettings();
   return (
     <>
       <div className="page-head"><h1>Settings</h1><span className="muted" style={{ fontSize: 12.5 }}>{ws.name}</span></div>
@@ -38,6 +41,7 @@ export function SettingsPage() {
             {section === "policies" && <Policies />}
             {section === "models" && <Models key={ws.id} />}
             {section === "credentials" && <Credentials />}
+            {section === "triage" && <TriageSettings key={ws.id} save={saveSettings} />}
             {section === "linear" && <LinearSettings key={ws.id} />}
             {section === "repositories" && <Repositories />}
             {section === "members" && <Members />}
