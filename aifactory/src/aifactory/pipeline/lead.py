@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
@@ -218,13 +218,7 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
         return notes
     current = {d.id: question_mark(db, d) for d in decisions}
     merges = {d.id for d in decisions if d.kind == "approve_merge"}
-    # When the watcher last saw review change on each merge approval (watch_reviews): the latest per decision.
-    review_changed: dict[str, datetime] = {}
-    if merges:
-        decision_of = Event.data["decision_id"].as_string()
-        review_changed = dict(db.query(decision_of, func.max(Event.created_at)).filter(
-            Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed", decision_of.in_(merges))
-            .group_by(decision_of).all())
+    seen = _review_seen(db, [d for d in decisions if d.id in merges])
     rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
         .order_by(Message.created_at.desc(), Message.id.desc())
     for m in rows:
@@ -239,14 +233,43 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
         if mark != current[decision_id] and (mark is not None or decision_id in merges):
             notes[decision_id] = None
             continue
-        # Nor once review changed after the Lead read it: a note saying review was clean must not outlive a new
-        # finding, even when the Lead can't run to replace it (a spent budget). Its next run writes a new one.
+        # Nor once review was seen to differ from what the Lead read when it wrote: a note saying review was clean
+        # must not outlive a new finding, even when the Lead can't run to replace it (a spent budget), and whoever
+        # saw it first (the watcher, or a later run that left the note alone). Seeing the same review again isn't a
+        # change. The Lead's next run writes a new note.
         read_at = _parse(attribution.get("review_read_at")) or m.created_at
-        if decision_id in review_changed and review_changed[decision_id] > read_at:
+        last = seen.get(decision_id)
+        if last is not None and last[0] > read_at and (
+                last[1] is None or last[1] != attribution.get("review_fingerprint")):
             notes[decision_id] = None
             continue
         notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at), "run_id": attribution.get("run_id")}
     return {d: note for d, note in notes.items() if note is not None}
+
+
+def _review_seen(db, merges: list[Decision]) -> dict[str, tuple[datetime, str | None]]:
+    """What was last seen of each merge approval's review, and when: by the watcher (its latest lead_review_changed)
+    or by a Lead run (the snapshot its result keeps, read at read_at), whichever is later."""
+    seen: dict[str, tuple[datetime, str | None]] = {}
+    if not merges:
+        return seen
+    ids = {d.id for d in merges}
+    outcome_ids = {d.outcome_id for d in merges if d.outcome_id}
+    decision_of = Event.data["decision_id"].as_string()
+    latest = db.query(decision_of.label("decision_id"), func.max(Event.created_at).label("at")).filter(
+        Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed", decision_of.in_(ids)) \
+        .group_by(decision_of).subquery()
+    for e in db.query(Event).join(latest, and_(decision_of == latest.c.decision_id, Event.created_at == latest.c.at)) \
+            .filter(Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed"):
+        seen[(e.data or {})["decision_id"]] = (e.created_at, (e.data or {}).get("fingerprint"))
+    for outcome_id in outcome_ids:
+        run = db.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status == "succeeded") \
+            .order_by(Run.started_at.desc()).first()
+        for decision_id, review in (((run.result or {}).get("reviews") or {}) if run else {}).items():
+            at = _parse(review.get("read_at")) if isinstance(review, dict) else None
+            if decision_id in ids and at is not None and (decision_id not in seen or at > seen[decision_id][0]):
+                seen[decision_id] = (at, review.get("fingerprint"))
+    return seen
 
 
 # waking ----------------------------------------------------------------------------------------------------------
@@ -884,8 +907,9 @@ class Tools:
             actor = lead_user(s).id
             data = {**self.source, **({"decision_id": decision_id, "question": question_mark(s, decision)}
                                       if decision is not None else {})}
-            if decision_id in self.read_at:
+            if decision_id in self.read_at:  # what review said when this was written, and when it was read
                 data["review_read_at"] = self.read_at[decision_id].isoformat()
+                data["review_fingerprint"] = review_fingerprint(self.reviews[decision_id])
             s.add(Message(workspace_id=self.ws, outcome_id=self.outcome_id, author_id=actor, author_kind="lead",
                           body=text[:4000], attribution=data))
         record(self.ws, "lead_note", f"Lead: {text[:300]}", outcome_id=self.outcome_id, run_id=self.run_id,
@@ -1034,7 +1058,8 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.result = {"summary": summary, "actions": tools.actions,
                           # What review said about each merge approval's commit: an unsettled one is looked at again.
                           "reviews": {d: {"head": st["head"], "settled": settled(st), "line": tools.lines[d],
-                                          "fingerprint": review_fingerprint(st)}
+                                          "fingerprint": review_fingerprint(st),
+                                          "read_at": tools.read_at[d].isoformat()}
                                       for d, st in tools.reviews.items()}}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})

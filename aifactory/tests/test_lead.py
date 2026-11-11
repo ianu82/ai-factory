@@ -1073,3 +1073,28 @@ def test_the_lead_reads_review_again_before_it_writes_about_a_merge(world, model
     with db.session_scope() as s:  # nothing was said about the merge
         assert not [m for m in s.query(Message).filter_by(author_kind="lead")
                     if (m.attribution or {}).get("decision_id") == world["merge"]]
+
+
+def test_a_merge_note_stands_until_review_is_seen_to_differ_from_what_it_was_written_on(world, client, monkeypatch):
+    def shown():
+        inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+        return inbox[world["merge"]]["lead_note"]
+
+    merge_ready(world)
+    monkeypatch.setattr(lead, "review_state", unreviewed())
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Not reviewed yet: wait for Codex."})
+    written_on = lead.review_fingerprint(tools.reviews[world["merge"]])
+    # The watcher catches up with the review the Lead already read: the same review, so the note stands.
+    lead.record(world["ws"], "lead_review_changed", "Review of PR #12 at abcdef1: not in yet.",
+                outcome_id=world["outcome"], data={"decision_id": world["merge"], "head": HEAD,
+                                                   "fingerprint": written_on})
+    assert shown()["text"].endswith("wait for Codex.")
+    # A later run, woken for something else, reads a P1 and leaves the note alone: that note no longer holds.
+    with db.session_scope() as s:
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="succeeded", started_at=db.utcnow(), result={"reviews": {world["merge"]: {
+                      "head": HEAD, "settled": True, "fingerprint": "a-p1-arrived",
+                      "read_at": (db.utcnow() + timedelta(seconds=1)).isoformat()}}}))
+    assert shown() is None
