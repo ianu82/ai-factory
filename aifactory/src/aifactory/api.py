@@ -855,6 +855,20 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
     return S.outcome(outcome, [], [])
 
 
+@router.get("/workspaces/{workspace_id}/outcomes/{outcome_id}/conversation")
+def outcome_conversation(workspace_id: str, outcome_id: str, user: User = Depends(current_user),
+                         db: Session = Depends(get_db)):
+    """The outcome as a conversation: the request, the Lead's posts with the steps behind each, people's messages and
+    decisions, in order (conversation.py)."""
+    from .conversation import conversation
+
+    _ws(db, user, workspace_id)
+    o = db.get(Outcome, outcome_id)
+    if o is None or o.workspace_id != workspace_id:
+        raise HTTPException(404, "Outcome not found")
+    return conversation(db, o)
+
+
 @router.get("/workspaces/{workspace_id}/outcomes/{outcome_id}")
 def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)

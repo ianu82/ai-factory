@@ -367,6 +367,35 @@ export interface Decision {
   lead_note?: { text: string; created_at: string; run_id?: string | null } | null;
 }
 
+/** An outcome as a conversation (GET …/outcomes/{id}/conversation). */
+export interface ConversationStep {
+  at: string;
+  who: string;
+  text: string;
+  level: string;
+  event: string;
+  cost_usd?: number;
+}
+
+interface StepGroup {
+  steps: ConversationStep[];
+  steps_omitted: number;
+}
+
+export type ConversationItem =
+  | { kind: "request"; at: string; title: string; brief: string; acceptance: string[]; from: string; by: string }
+  | ({ kind: "lead"; id: string; at: string; text: string; task_key: string | null; update: boolean; decision_id: string | null } & StepGroup)
+  | { kind: "lead_guidance"; id: string; at: string; text: string; task_key: string | null; delivered: boolean }
+  | { kind: "person"; id: string; at: string; text: string; task_key: string | null; author: string; operator: boolean; delivered: boolean }
+  | { kind: "factory"; id: string; at: string; text: string; task_key: string | null }
+  | { kind: "decision"; at: string; decision: Decision }
+  | ({ kind: "working"; at: string } & StepGroup);
+
+export interface Conversation {
+  items: ConversationItem[];
+  lead: { model: string | null; running: boolean; last_active: string | null };
+}
+
 export interface FactoryEvent {
   id: number;
   outcome_id: string | null;

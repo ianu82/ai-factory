@@ -56,7 +56,7 @@ def lead_run(world, seen, *, ago=timedelta(minutes=5), status="succeeded"):
 
 def test_waiting_decisions_and_peoples_posts_wake_the_lead(world):
     due = woken()[world["outcome"]]
-    assert due["reasons"] == ["2 decisions waiting on someone"]
+    assert due["reasons"] == ["2 decisions waiting on someone", "you've just joined this outcome"]
     assert set(due["decisions"]) == {world["question"], world["merge"]}
     lead_run(world, due["seen"])
     assert world["outcome"] not in woken()  # nothing new since its last run
@@ -135,6 +135,7 @@ def test_no_lead_for_finished_paused_disabled_or_review_work(world, change):
 def test_its_first_run_reads_old_posts_without_waking_for_them(world):
     with db.session_scope() as s:
         s.query(Decision).delete()
+        s.get(Outcome, world["outcome"]).created_at = db.utcnow() - timedelta(days=3)  # not new: nothing to join
         s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
                       author_kind="user", body="Old note", created_at=db.utcnow() - timedelta(days=3)))
     assert world["outcome"] not in woken()
@@ -563,3 +564,106 @@ def test_the_inbox_shows_the_leads_recommendation_on_its_decision(world, client)
     note = inbox[world["merge"]]["lead_note"]
     assert note["text"] == "CI and the verifier passed. Merge it." and note["run_id"] == "run-1" and note["created_at"]
     assert inbox[world["question"]]["lead_note"] is None
+
+
+def milestone(world, kind, ago=timedelta(0), message="", task=True):
+    with db.session_scope() as s:
+        event = Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"] if task else None,
+                      kind=kind, message=message or kind, created_at=db.utcnow() - ago)
+        s.add(event)
+        s.flush()
+        return event.id
+
+
+def test_progress_wakes_the_lead_to_report_in_batches(world):
+    seen = woken()[world["outcome"]]["seen"]
+    lead_run(world, seen, ago=timedelta(minutes=5))
+    published = milestone(world, "published", message="Opened PR #12")
+    milestone(world, "stage", message="Stage: ci")  # not a milestone
+    assert world["outcome"] not in woken()  # within ten minutes of its last run: batched into the next update
+    with db.session_scope() as s:
+        s.query(Run).one().started_at = db.utcnow() - timedelta(minutes=11)
+    due = woken()[world["outcome"]]
+    assert due["reasons"] == ["1 step of progress to report"] and due["seen"]["event_id"] == published
+    lead_run(world, due["seen"], ago=timedelta(minutes=10, seconds=30))
+    assert world["outcome"] not in woken()  # reported
+
+
+def test_a_finished_outcome_reports_how_it_ended_within_the_hour(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=20))
+    with db.session_scope() as s:
+        o = s.get(Outcome, world["outcome"])
+        o.status, o.completed_at = "completed", db.utcnow() - timedelta(minutes=5)
+    milestone(world, "outcome_completed", task=False)
+    assert woken()[world["outcome"]]["reasons"] == ["1 step of progress to report"]  # its open decisions don't count
+    with db.session_scope() as s:
+        s.get(Outcome, world["outcome"]).completed_at = db.utcnow() - timedelta(hours=2)
+    assert world["outcome"] not in woken()
+
+
+def test_post_update_adds_to_the_outcomes_conversation(world):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    assert "Posted" in tools.call("post_update", {"text": "T1 is open as PR #12; Codex is reviewing it."})
+    with db.session_scope() as s:
+        update = s.query(Message).one()
+        assert update.author_kind == "lead" and update.attribution == {"source": "lead", "run_id": "run-1",
+                                                                      "kind": "update"}
+        assert s.query(Event).filter_by(kind="lead_update").one().data["source"] == "lead"
+
+
+def test_the_outcome_reads_as_a_conversation(world, client):
+    base = db.utcnow() - timedelta(hours=1)
+    with db.session_scope() as s:
+        s.get(Outcome, world["outcome"]).created_at = base
+        s.get(Decision, world["question"]).created_at = base + timedelta(minutes=5)
+        s.get(Decision, world["merge"]).created_at = base + timedelta(minutes=6)
+        s.add_all([
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="plan_approved",
+                  message="Plan approved by the plan reviewer", created_at=base + timedelta(minutes=1)),
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="run_finished",
+                  message="Builder succeeded", data={"role": "builder", "cost_usd": 0.38},
+                  created_at=base + timedelta(minutes=2)),
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="run_finished", message="Lead finished",
+                  data={"role": "lead"}, created_at=base + timedelta(minutes=2, seconds=30)),
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="agent_thought",
+                  message="thinking", created_at=base + timedelta(minutes=2, seconds=40)),
+        ])
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    tools.call("post_update", {"text": "The plan is approved and T1 is built."})
+    tools.call("post_guidance", {"text": "Prefer the durable queue.", "task": "T1"})
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Ready to merge."})
+    with db.session_scope() as s:
+        for m, minutes in zip(s.query(Message).order_by(Message.created_at), (3, 4, 7)):
+            m.created_at = base + timedelta(minutes=minutes)
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"], author_kind="user",
+                      body="Why is the merge waiting?", created_at=base + timedelta(minutes=8)))
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="published",
+                    message="Opened PR #12", created_at=base + timedelta(minutes=9)))
+
+    r = client.get(f"/api/workspaces/{world['ws']}/outcomes/{world['outcome']}/conversation")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert [i["kind"] for i in items] == ["request", "lead", "lead_guidance", "decision", "decision", "lead", "person",
+                                          "working"]
+    request, update, guidance, question, merge, note, person, working = items
+    assert request["title"] == "Search" and request["from"] == "the app"
+    assert update["update"] is True and update["text"] == "The plan is approved and T1 is built."
+    assert [(s_["who"], s_["text"]) for s_ in update["steps"]] == [
+        ("Planner", "Plan approved by the plan reviewer"), ("Builder · T1", "Builder succeeded")]
+    assert update["steps"][1]["cost_usd"] == 0.38  # the Lead's own run and agent thoughts aren't steps
+    assert guidance["task_key"] == "T1" and guidance["text"] == "Prefer the durable queue."
+    assert question["decision"]["id"] == world["question"] and question["decision"]["lead_note"] is None
+    assert merge["decision"]["lead_note"]["text"] == "Ready to merge." and merge["decision"]["task_key"] == "T1"
+    assert note["update"] is False and note["decision_id"] == world["merge"] and note["steps"] == []
+    assert person["author"] == "Ian" and person["operator"] is False
+    assert [s_["text"] for s_ in working["steps"]] == ["Opened PR #12"]
+
+    with db.session_scope() as s:
+        other = Workspace(org_id=s.get(Workspace, world["ws"]).org_id, name="Other", slug="other")
+        s.add(other)
+        s.flush()
+        elsewhere = Outcome(workspace_id=other.id, number=1, title="Elsewhere")
+        s.add(elsewhere)
+        s.flush()
+        elsewhere_id = elsewhere.id
+    assert client.get(f"/api/workspaces/{world['ws']}/outcomes/{elsewhere_id}/conversation").status_code == 404
