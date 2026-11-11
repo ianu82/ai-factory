@@ -110,10 +110,14 @@ class Stop(Exception):
 
 
 class TaskRunner:
-    def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock]):
+    def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock],
+                 owner: str | None = None):
         self.task_id = task_id
         self.cancelled = cancelled
         self.repo_lock = repo_lock
+        # The instance whose lease this runner works under: once another instance holds the task, its writes stop
+        # (see lifecycle.transition). None: no check (CI polling, which is not leased).
+        self.owner = owner
         self.builder: LocalSandbox | None = None
         self.feedback: list[str] = []
         self.patch: Patch | None = None
@@ -247,7 +251,8 @@ class TaskRunner:
     def update(self, **fields: Any) -> None:
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if (task.status, task.stage) != (self.task.status, self.task.stage) or not transition(s, task, **fields):
+            if (task.status, task.stage) != (self.task.status, self.task.stage) or not transition(
+                    s, task, owner=self.owner, **fields):
                 raise Stop()
             for key, value in fields.items():
                 setattr(self.task, key, value)
@@ -279,7 +284,11 @@ class TaskRunner:
                     ev.setdefault("failure_facts", []).append({"kind": key, **value,
                                                               "attempt": task.attempt, "at": utcnow().isoformat()})
                 ev[key] = value
-            task.evidence = ev
+            if self.owner is None:
+                task.evidence = ev
+            elif not s.query(Task).filter(Task.id == self.task_id, Task.lease_owner.in_(("", self.owner))).update(
+                    {Task.evidence: ev}, synchronize_session=False):
+                raise Stop()  # another instance holds the task now: its evidence is not this runner's to write
             self.task.evidence = ev
 
     def artifact(self, kind: str, name: str, content: str = "", run_id: str | None = None, **data: Any) -> str:
@@ -299,7 +308,7 @@ class TaskRunner:
               options: list[dict[str, Any]] | None = None) -> None:
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if not transition(s, task, status=status, blocked_reason=body[:2000], lease_owner=""):
+            if not transition(s, task, owner=self.owner, status=status, blocked_reason=body[:2000], lease_owner=""):
                 raise Stop()
             # The decision and state transition commit together; no second transaction
             # can create a retry decision after a concurrent stop.
@@ -1335,13 +1344,27 @@ class TaskRunner:
 
     # CI ------------------------------------------------------------------------
     def _guard(self, status: str | None = None) -> None:
-        """Revalidate after every network/lock wait, before taking another action."""
+        """Revalidate after every network/lock wait, before taking another action. What follows a guard is a push, a
+        comment or a merge, so a runner whose task is no longer its own stops here as well."""
         if self.cancelled.is_set():
             raise Stop()
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if (status and task.status != status) or not transition(s, task, lease_owner=task.lease_owner):
+            if (status and task.status != status) or not self._holds(s, task):
                 raise Stop()
+
+    def _holds(self, s, task: Task) -> bool:
+        """Whether the task is still this runner's to act on, asked in one conditional write.
+
+        A scheduled runner works on a running task under its instance's lease from its first step to its last: it
+        gives the lease up only in the write that parks, requeues or blocks the task, and stops there. So for it a
+        lease that is nobody's is a takeover as much as another instance's: whoever took the task has let go of it
+        since (parked it for CI, or its server stopped) and the candidate this runner holds may be out of date.
+        A runner without an owner (a CI poll: those tasks are parked, leased to nobody) is asked only whether the
+        task may still change."""
+        if self.owner is not None and task.status != "running":
+            return False
+        return transition(s, task, owner=self.owner, exclusive=True, lease_owner=task.lease_owner)
 
     async def ci_then_merge(self) -> None:
         # Token resolution is inside the same guarded path as all later observations.
@@ -1504,7 +1527,8 @@ class TaskRunner:
         with session_scope() as s:
             ws = lock_workspace(s, self.ws)
             task = s.get(Task, self.task_id)
-            if self.cancelled.is_set() or not transition(s, task, lease_owner=task.lease_owner):
+            # The last check before the merge, which cannot be taken back: the task must still be this runner's.
+            if self.cancelled.is_set() or not self._holds(s, task):
                 raise Stop()
             if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
                 return None

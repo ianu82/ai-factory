@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from difflib import SequenceMatcher
 from typing import Any, Sequence
 
 PLANNER_REPORT: dict[str, Any] = {
@@ -137,7 +136,6 @@ SCHEMAS = {"planner": PLANNER_REPORT, "builder": BUILDER_REPORT, "verifier": VER
            "plan_reviewer": PLAN_REVIEW_REPORT}
 
 
-CRITERION_MATCH = 0.8  # how alike a reported criterion and one of the task's must be to count as the same one
 
 
 def _criterion_key(text: Any) -> str:
@@ -154,17 +152,12 @@ def _criterion_number(text: Any) -> int:
     return int(found.group(1)) if found else 0
 
 
-def _likeness(a: str, b: str) -> float:
-    shorter, longer = sorted((a, b), key=len)
-    if len(shorter) >= 24 and shorter in longer:
-        return 1.0  # a criterion cut short, or quoted inside a longer sentence
-    return SequenceMatcher(None, a, b).ratio()
-
-
 def uncovered_criteria(expected: Sequence[str], criteria: list[dict[str, Any]]) -> list[tuple[int, str]]:
-    """The task's acceptance criteria (list number, text) that a verifier's report has no result for. Each reported
-    result counts for one criterion: the one whose text it gives exactly, names by its list number, or rewords
-    recognisably. A repeated result, or one that gives another criterion's text, does not cover a second one."""
+    """The task's acceptance criteria (list number, text) that a verifier's report has no result for. A result
+    counts for the one criterion it identifies: by that criterion's text (case, spacing, a leading list number and
+    closing punctuation aside) or by its list number alone. Other wording identifies none, however close: a sentence
+    that reads like one criterion can read as much like another ("returns 200 for valid requests", "returns 400 for
+    invalid requests"). A repeated result does not cover a second criterion."""
     wanted = {n: key for n, text in enumerate(expected, 1) if (key := _criterion_key(text))}
     texts = [c.get("criterion") for c in criteria]
     keys = [_criterion_key(text) for text in texts]
@@ -175,18 +168,8 @@ def uncovered_criteria(expected: Sequence[str], criteria: list[dict[str, Any]]) 
         if hit is not None:
             free.remove(hit)
             del missing[n]
-    for i in list(free):  # its list number alone
-        n = _criterion_number(texts[i])
-        if n in missing:
-            free.remove(i)
-            del missing[n]
-    known = set(wanted.values())
-    loose = [i for i in free if keys[i] and keys[i] not in known and not _criterion_number(texts[i])]
-    for n, key in list(missing.items()):  # a recognisable rewording
-        best = max(loose, key=lambda i: _likeness(key, keys[i]), default=None)
-        if best is not None and _likeness(key, keys[best]) >= CRITERION_MATCH:
-            loose.remove(best)
-            del missing[n]
+    for i in free:  # its list number alone
+        missing.pop(_criterion_number(texts[i]), None)
     return [(n, " ".join(str(expected[n - 1]).split())) for n in missing]
 
 
@@ -239,9 +222,14 @@ def validate_report(role: str, report: Any, expected_criteria: Sequence[str] | N
             more = f" (and {len(uncovered) - 5} more)" if len(uncovered) > 5 else ""
             return None, (f"The report has results for {total - len(uncovered)} of the task's {total} acceptance "
                           f"criteria ({len(uncovered)} missing). Not covered: {listed}{more}. Report on every "
-                          "criterion once, with its text copied exactly, a status and evidence; a result that "
-                          "repeats or replaces a criterion does not count for another one. Use unverified for one "
-                          "you could not check.")
+                          "criterion once, named by its text copied exactly from the task's list or by its list "
+                          "number alone (for example 2), with a status and evidence; a reworded, shortened or "
+                          "repeated criterion does not count. Use unverified for one you could not check.")
+        wanted = list(expected_criteria or [])
+        for result in criteria:  # a result named by list number carries the criterion's text from here on
+            n = _criterion_number(result.get("criterion"))
+            if 0 < n <= len(wanted) and _criterion_key(wanted[n - 1]):
+                result["criterion"] = " ".join(str(wanted[n - 1]).split())
         unmet = any(c.get("status") != "pass" for c in criteria)
         blocker = any(f.get("severity") == "blocker" for f in report.get("findings") or [])
         if report["verdict"] == "pass" and unmet:

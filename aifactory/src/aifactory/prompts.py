@@ -105,7 +105,8 @@ How to work:
   but do not try to fix the implementation — you are reviewing only.
 - For each acceptance criterion, record pass/fail/unverified with concrete evidence
   (commands and their results, file:line references). Report a result for every criterion; one you could not
-  check is unverified.
+  check is unverified. Name each criterion by its text copied exactly from the list, or by its list number alone:
+  a reworded or shortened criterion is not accepted as a result for it.
 - Also look for regressions, broken behaviour, security problems, missing tests, and changes
   outside the task's scope. Report them as findings, each with a severity:
   - blocker: the change must not merge as it is. It breaks existing behaviour, loses or corrupts data, opens a

@@ -81,23 +81,36 @@ def test_each_result_in_a_verifier_report_counts_for_one_criterion_only():
 
     listing, empty = "The page lists every open order", "The page shows a message when there are no orders"
     wanted = [listing, empty]
-    # The right number of results, but one criterion twice, or a text that is not a criterion of the task.
-    for texts in ((listing, listing), (listing, "The code is tidy"), (listing, "")):
+    # The right number of results, but one criterion twice, a text that is not a criterion of the task, or the
+    # other criterion in other words, cut short, or numbered with other words: none of them says which is meant.
+    for texts in ((listing, listing), (listing, "The code is tidy"), (listing, ""),
+                  (listing, "The page shows a message when no orders exist"),
+                  (listing, "The page shows a message when there are"),
+                  (listing, "2. The page shows a message")):
         ok, err = validate_report("verifier", report(*texts), expected_criteria=wanted)
         assert ok is None and "results for 1 of the task's 2 acceptance criteria (1 missing)" in err, texts
         assert f"Not covered: 2. {empty}. Report on every criterion once" in err, texts
+        assert "copied exactly from the task's list or by its list number alone" in err, texts
     ok, err = validate_report("verifier", report("Looks fine", "Tests pass"), expected_criteria=wanted)
     assert ok is None and "results for 0 of the task's 2 acceptance criteria (2 missing)" in err
-    # A result that is recognisably the criterion counts: in any order; with its list number, other case and
-    # spacing or a full stop; reworded a little; cut short; named by its number alone; beside the reviewer's own.
+    # A result that names its criterion counts: in any order; with its list number, other case and spacing or a
+    # full stop; by its list number alone; beside the reviewer's own.
     for texts in ((empty, listing),
                   ("1. the page lists every open order.", "2.  The page shows a message  when there are no orders"),
-                  ("The page lists all open orders", empty),
-                  (listing, "The page shows a message when there are"),
                   ("Criterion 1", "2"),
                   (listing, empty, "No regressions in the existing tests")):
         accepted = report(*texts)
         assert validate_report("verifier", accepted, expected_criteria=wanted) == (accepted, ""), texts
+    # A result named by number is kept with the criterion's text, so the report says what was checked.
+    numbered = report("Criterion 2", "#1", "7")
+    assert validate_report("verifier", numbered, expected_criteria=wanted)[0] is numbered
+    assert [c["criterion"] for c in numbered["criteria"]] == [empty, listing, "7"]
+    # Two criteria that read alike are two: a second result for one of them, reworded, is not a result for the other.
+    valid, invalid = "API returns 200 for valid requests", "API returns 400 for invalid requests"
+    ok, err = validate_report("verifier", report(valid, "The API returns 200 for a valid request"),
+                              expected_criteria=[valid, invalid])
+    assert ok is None and f"Not covered: 2. {invalid}. Report on every criterion once" in err
+    assert validate_report("verifier", report(invalid, valid), expected_criteria=[valid, invalid])[0] is not None
     # Two criteria that differ in a single letter are still two criteria.
     files = ["a.txt exists", "b.txt exists"]
     assert validate_report("verifier", report("a.txt exists", "a.txt exists"), expected_criteria=files)[0] is None
