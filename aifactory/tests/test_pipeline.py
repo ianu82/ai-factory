@@ -78,6 +78,7 @@ def factory(tmp_path, monkeypatch):
         # These scenarios exercise an established operational workspace, not first-run learning.
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
         settings["limits"]["ci_minutes"] = 1
+        settings["review"]["wait_seconds"] = 0
         ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings=settings)
         user = User(email="dev@acme.test", name="Dev")
         s.add_all([ws, user])
@@ -1627,6 +1628,13 @@ def test_learning_is_rechecked_immediately_before_merge(factory, monkeypatch, tr
 
     calls = []
     class GitHub:
+        async def review_feedback(self, *args):
+            return []
+
+        async def checks(self, *args):
+            from aifactory.github import CheckSummary
+            return CheckSummary("success", [])
+
         def __init__(self, token):
             self.pulls = 0
 

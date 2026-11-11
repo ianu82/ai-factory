@@ -360,13 +360,13 @@ class GitHub:
     async def pull(self, full_name: str, number: int) -> dict[str, Any]:
         return await self.request("GET", f"/repos/{full_name}/pulls/{number}")
 
-    async def comment(self, full_name: str, number: int, body: str) -> None:
-        await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body})
+    async def comment(self, full_name: str, number: int, body: str) -> dict[str, Any]:
+        return await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body})
 
     async def _review_pages(self, path: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         page = 1
-        while True:
+        while page <= 100:
             batch = await self.request("GET", path, params={"per_page": 100, "page": page})
             if not isinstance(batch, list):
                 raise GitHubError("Malformed GitHub review response")
@@ -374,6 +374,7 @@ class GitHub:
             if len(batch) < 100:
                 return rows
             page += 1
+        raise GitHubError("Review snapshot exceeds 100 pages; completeness cannot be established")
 
     async def reviews(self, full_name: str, number: int) -> list[dict[str, Any]]:
         return await self._review_pages(f"/repos/{full_name}/pulls/{number}/reviews")
@@ -426,6 +427,8 @@ class GitHub:
             data = await self.graphql(query, {"owner": owner, "name": name, "number": number, "after": after})
             pull = ((data.get("repository") or {}).get("pullRequest") or {})
             nodes, cursor = page_info(pull.get("reviewThreads"))
+            if len(threads) + len(nodes) > 10_000:
+                raise GitHubError("Review snapshot exceeds 10000 threads")
             for thread in nodes:
                 if not thread.get("id") or type(thread.get("isResolved")) is not bool:
                     raise GitHubError("Incomplete GitHub review thread")
@@ -438,6 +441,8 @@ class GitHub:
                     comment_seen.add(comment_cursor)
                     more = await self.graphql(nested_query, {"id": thread["id"], "after": comment_cursor})
                     batch, comment_cursor = page_info((more.get("node") or {}).get("comments"))
+                    if len(comments) + len(batch) > 10_000:
+                        raise GitHubError("Review thread exceeds 10000 comments")
                     comments.extend(batch)
                 thread = {**thread, "comments": {"nodes": comments}}
                 threads.append(thread)
@@ -466,7 +471,7 @@ class GitHub:
 
     async def review_feedback(self, full_name: str, number: int, policy: dict) -> list[dict[str, Any]]:
         """Collect a complete authenticated snapshot; never swallow provider errors."""
-        from .review import normalize_feedback, review_policy
+        from .review import FACTORY_REPLY_MARKER, normalize_feedback, review_policy
 
         policy = review_policy({"review": policy})
         if policy["address"] == "off":
@@ -477,10 +482,49 @@ class GitHub:
         pull = await self.pull(full_name, number)
         if (not self.installation_bound and not identity.get("login")) or not (pull.get("user") or {}).get("login"):
             raise GitHubError("GitHub review identity is unavailable")
-        return normalize_feedback(reviews=await self.reviews(full_name, number),
-                                  threads=await self.review_threads(full_name, number),
-                                  comments=await self.issue_comments(full_name, number),
-                                  policy=policy, identity=identity, pull_author=pull["user"])
+        reviews = await self.reviews(full_name, number)
+        threads = await self.review_threads(full_name, number)
+        comments = await self.issue_comments(full_name, number)
+        findings = normalize_feedback(reviews=reviews, threads=threads, comments=comments,
+                                      policy=policy, identity=identity, pull_author=pull["user"])
+        permissions: dict[str, bool] = {}
+
+        async def writer(login: str) -> bool:
+            key = login.casefold()
+            if not key:
+                return False
+            if key not in permissions:
+                permissions[key] = await self.repository_author_permission(full_name, login) in (
+                    "admin", "maintain", "write", "push")
+            return permissions[key]
+
+        kept = []
+        for f in findings:
+            if f["author_type"].casefold() == "bot" or f["author"].casefold().endswith("[bot]") or await writer(f["author"]):
+                kept.append(f)
+                continue
+            # A writer's reply endorses the thread; +1 endorsements are checked
+            # through paginated REST reactions, not aggregate reaction counts.
+            endorsed = False
+            if f.get("thread_id"):
+                thread = next(t for t in threads if t["id"] == f["thread_id"])
+                for reply in thread["comments"]["nodes"]:
+                    if (reply.get("replyTo") and FACTORY_REPLY_MARKER not in (reply.get("body") or "")
+                            and await writer((reply.get("author") or {}).get("login", ""))):
+                        endorsed = True
+                        break
+            if not endorsed:
+                resource = (f"pulls/comments/{f['comment_id']}" if f["kind"] == "inline" else
+                            f"issues/comments/{f['id'].split(':', 1)[1]}" if f["kind"] == "issue_comment" else None)
+                if resource:
+                    reactions = await self._review_pages(f"/repos/{full_name}/{resource}/reactions")
+                    for reaction in reactions:
+                        if reaction.get("content") == "+1" and await writer((reaction.get("user") or {}).get("login", "")):
+                            endorsed = True
+                            break
+            if endorsed:
+                kept.append(f)
+        return kept
 
     async def _actions_checks(self, full_name: str, sha: str) -> list[dict[str, Any]]:
         """Fine-grained tokens often lack the Checks permission; Actions read covers workflow jobs."""

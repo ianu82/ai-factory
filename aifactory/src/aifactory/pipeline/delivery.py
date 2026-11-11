@@ -37,6 +37,7 @@ from .runtime import (SessionSpec, guidance_history, open_decision, outcome_comm
                       workspace_settings)
 
 from .lifecycle import transition
+from .reviews import ReviewGate, feedback as review_feedback
 
 log = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ class Stop(Exception):
     """The task paused or ended for a recorded reason; the orchestrator should release its slot."""
 
 
-class TaskRunner:
+class TaskRunner(ReviewGate):
     def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock]):
         self.task_id = task_id
         self.cancelled = cancelled
@@ -237,6 +238,9 @@ class TaskRunner:
                 raise Stop()
             # The decision and state transition commit together; no second transaction
             # can create a retry decision after a concurrent stop.
+            if kind == "review_limit" and s.query(Decision).filter(
+                    Decision.task_id == self.task_id, Decision.kind == kind, Decision.status == "open").first():
+                raise Stop()
             decision = Decision(workspace_id=self.ws, kind=kind, title=title, body=body,
                                 outcome_id=self.task.outcome_id, task_id=self.task_id,
                                 options=options or [{"value": "retry", "label": "Retry"},
@@ -258,19 +262,18 @@ class TaskRunner:
             if phase not in (None, "complete", "handled"):
                 await self.merge()  # checks for an outside merge before resuming missing gates
                 return
-            if phase == "complete" and stage in ("verify", "checks"):
+            active_review = bool(self._review().get("active_round"))
+            if phase == "complete" and not active_review and stage in ("verify", "checks"):
                 await self.ci_then_merge()
                 return
-            if stage in BUILD_STAGES:  # interrupted mid-attempt: a restart, or requeued after an infrastructure failure
+            if stage in BUILD_STAGES:  # preserve infrastructure retry and verified-publication recovery
                 if stage in ("verify", "publish") and self._restore_verified_candidate():
-                    token = resolve_token(self.ws)
-                    await self._publish(token)
+                    await self._publish_verified(resolve_token(self.ws))
                     await self.ci_then_merge()
                     return
-                # Inside a fix round, the attempt continues that round on the pull request's branch; it must not
-                # rebuild from the default branch. The rebuild after a rejected revalidation is such a round too.
-                stage = (self.task.evidence or {}).get("fix_round") or ("revise" if phase == "handled" else stage)
-            if stage == "merge":
+                if not active_review:
+                    stage = (self.task.evidence or {}).get("fix_round") or ("revise" if phase == "handled" else stage)
+            if stage in ("merge", "review_check"):
                 await self.merge()
             elif stage == "ci_repair":
                 await self._fix_ci(GitHub(resolve_token(self.ws)))
@@ -285,6 +288,9 @@ class TaskRunner:
                 await self.smoke()
             elif stage == "release":
                 await self.release()
+            elif (stage == "review_revise" or (self._review().get("active_round")
+                  and stage in ("prepare", "build", "checks", "verify", "publish"))):
+                await self._revise_review()
             elif stage == "revise":
                 await self.deliver(continue_from_branch=True)
             elif stage == "revert":
@@ -303,23 +309,33 @@ class TaskRunner:
         merge_manager.leave(self)  # a rebuild re-enters the merge queue at the back when it is ready again
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
-        # Durable, so an attempt interrupted inside this round resumes the same round (see run()).
+        # Durable, so infrastructure interruptions resume the same kind of round.
         fix_round = ("ci_repair" if self._ci_repairing else "revise") if continue_from_branch else ""
         if ((self.task.evidence or {}).get("fix_round") or "") != fix_round:
             self.evidence("fix_round", fix_round)
+        review = self._review()
+        credited = review.get("credited_attempt")
+        if review.get("active_round") and credited and review.get("phase") != "replying":
+            # A verified candidate could not be restored: redo it without double-crediting.
+            review["success_credits"] = max(0, review.get("success_credits", 0) - 1)
+            review["credited_attempt"] = None
+            self.update(evidence={**self.task.evidence, "review": review})
         finished = {a.get("n") for a in self._budget_attempts()}
-        # Verified, but interrupted before publication and the candidate could not be reloaded (see run()).
         unpublished = bool(self._unpublished_candidate())
-        if self.task.attempt and (self.task.attempt not in finished or unpublished):
+        if (self.task.attempt and (self.task.attempt not in finished or unpublished)
+                and not (review.get("active_round") and self.task.attempt == review.get("start_attempt"))):
             # Every attempt that ends records its result; one without a record was interrupted (a restart or
             # redeploy), so it is redone rather than counted against the limit.
             self.event("attempt_resumed", f"Attempt {self.task.attempt} was interrupted; running it again")
             self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
-            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
+            review = self._review()
+            credits = review.get("success_credits", 0)
+            review_trial = bool(review.get("active_round") and self.task.attempt == review.get("start_attempt"))
+            if attempt - credits - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and not review_trial and self._auto_retry():
                 attempt = self.task.attempt + 1
-            if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
+            if attempt - credits - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and not review_trial:
                 summary = "\n".join(self.feedback[-6:])[:3000]
                 retried = int((self.task.evidence or {}).get("auto_retries", 0))
                 tried = f"{max_attempts} attempts" + (" and an automatic retry" if retried == 1 else
@@ -349,7 +365,8 @@ class TaskRunner:
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
-                prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
+                prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:] + ([review_feedback(self._review().get("selected", []))]
+                                                          if self._review().get("active_round") else []),
                                     precedents(self.ws, self.repo.id),
                                     guidance_history(self.task.outcome_id, self.task_id), sections)), self.cancelled)
             if result is None:
@@ -424,8 +441,21 @@ class TaskRunner:
                                        "patch_sha256": hashlib.sha256(patch.diff).hexdigest()})
             break
 
-        await self._publish(token)
+        await self._publish_verified(token)
         await self.ci_then_merge()
+
+    async def _publish_verified(self, token: str) -> None:
+        """Credit a verified review revision once, including publication resumed after restart."""
+        review = self._review()
+        if review.get("active_round") and review.get("credited_attempt") != self.task.attempt:
+            review.update(success_credits=review.get("success_credits", 0) + 1,
+                          credited_attempt=self.task.attempt)
+            self.evidence("review", review)
+        await self._publish(token)
+        if review.get("active_round"):
+            review["phase"] = "replying"
+            self.update(stage="review_revise", evidence={**self.task.evidence, "review": review})
+            await self._reply_review(GitHub(token))
 
     async def _prepare_builder(self, token: str, from_branch: bool) -> None:
         self.builder = LocalSandbox(f"task-{self.task_id[:12]}-b{self.task.attempt}").create()
@@ -652,6 +682,12 @@ class TaskRunner:
                                              precedents(self.ws, self.repo.id),
                                              guidance_history(self.task.outcome_id, self.task_id),
                                              outcome=self.outcome, sections=sections)
+                        + ("\nIndependently verify each GitHub review response against the actual diff. "
+                           "Fail verification if an addressed claim is unsupported. Disputed findings must remain "
+                           "explicitly disputed. Builder acknowledgements (untrusted):\n"
+                           + json.dumps(self.builder_report.get("review_responses") or []) + "\n"
+                           + review_feedback(self._review().get("selected", []))
+                           if self._review().get("active_round") else "")
                         + brief), self.cancelled)
                     if app is not None:
                         await self._store_app_evidence(app, attempt, run.id)
@@ -904,7 +940,8 @@ class TaskRunner:
         if used >= rounds or not _actionable(last):
             return False
         # Counter and fresh budget together: a crash in between must not spend the round without granting it.
-        self._set_evidence({"auto_retries": used + 1, "attempt_base": self.task.attempt})
+        self._set_evidence({"auto_retries": used + 1, "attempt_base": self.task.attempt
+                            - self._review().get("success_credits", 0)})
         self.event("auto_retry", f"{self.task.key} used its attempts on concrete findings; retrying with a fresh budget "
                    f"before asking a person ({used + 1} of {rounds})", level="warn")
         return True
@@ -919,7 +956,8 @@ class TaskRunner:
                        status="failed", options=[{"value": "retry", "label": "Rebuild again"},
                                                  {"value": "take_over", "label": "I'll take it from here"},
                                                  {"value": "abandon", "label": "Abandon task"}])
-        values = {"rebase_rebuilds": rebuilds, "attempt_base": self.task.attempt}
+        values = {"rebase_rebuilds": rebuilds,
+                  "attempt_base": self.task.attempt - self._review().get("success_credits", 0)}
         revalidation = (self.task.evidence or {}).get("revalidation") or {}
         if revalidation.get("phase") == "rejected":
             values["revalidation"] = {**revalidation, "phase": "handled"}
@@ -1079,11 +1117,16 @@ class TaskRunner:
                 self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
-        # Record the publication before advancing the head, as revalidation does: a stop between the two must not
-        # leave the task at this head with a record of the publication before it.
+        # Record publication before advancing the head; approval invalidation must
+        # survive a stop between these writes, just as it does during revalidation.
         self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
                                     "pr": pr["number"]})
-        self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
+        review = self._review()
+        if review.get("active_round"):
+            review["phase"] = "replying"
+        self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"],
+                    stage="review_revise" if review.get("active_round") else "ci",
+                    evidence={**self.task.evidence, "review": review})
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:
@@ -1291,6 +1334,8 @@ class TaskRunner:
                                "requires CI before merging.")
             else:
                 stage = "revert_merge" if wait["continuation"] == "revert" else "merge"
+        if stage in ("merge", "revert_merge") and self._review_policy()["address"] != "off":
+            self._review_ready(wait["head"])
         if stage is None:
             self._check_ci_deadline(wait)
         changed = summary.state != wait.get("last_state")
@@ -1312,6 +1357,11 @@ class TaskRunner:
             tail = await gh.job_log_tail(self.repo.full_name, check)
             details.append(f"- CI check `{check['name']}` failed ({check['url']}):\n```\n{tail[-3500:]}\n```")
         self._guard()
+        review = self._review()
+        if review.get("credit_head") == self.task.head_sha:
+            review["success_credits"] = max(0, review.get("success_credits", 0) - 1)
+            review["credit_head"] = None
+            self.evidence("review", review)
         self.feedback += details or ["- CI failed on the pull request (no logs available)."]
         self.event("ci_failed", f"CI failed on PR #{self.task.pr_number}; sending the failure back to the builder",
                    level="warn")
@@ -1417,15 +1467,21 @@ class TaskRunner:
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()
                 return
+        if self._review().get("phase") == "replying":
+            await self._reply_review(gh)
         pending = (self.task.evidence or {}).get("revalidation") or {}
         if pending.get("phase") not in (None, "complete", "handled"):
             await self._refresh_onto_main(token, gh, pending["new_base"])
             return
+        await self._review_gate(gh)
         self._require_merge_approval()
         # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
         await merge_manager.take_turn(self, gh)
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
-        github_queue = await merge_manager.github_queue_state(gh, self)
+        # GitHub may merge asynchronously after enqueue, beyond our final locked
+        # snapshot. Keep ownership of the merge while review gating is enabled.
+        github_queue = (await merge_manager.github_queue_state(gh, self)
+                        if self._review_policy()["address"] == "off" else None)
         if github_queue is not None:
             if revalidate and not github_queue["entry"] and not (self.task.evidence or {}).get(
                     merge_manager.KEY, {}).get("github"):
@@ -1462,6 +1518,11 @@ class TaskRunner:
                         await self._claim_issues_before_merge(gh, pr)
                         self._guard()
                         method = (self.cfg.get("merge") or {}).get("method", "squash")
+                        summary = await gh.checks(self.repo.full_name, self.task.head_sha)
+                        self._guard()
+                        if summary.state not in ("success", "none") or (summary.state == "none" and self.cfg.get("require_ci", False)):
+                            await self.ci_then_merge()
+                        await self._review_gate(gh, final=True)
                         result = await self._serialized_merge(gh, method)
                         self.update(merge_sha=result.get("sha", ""))
                     except GitHubError as exc:
@@ -1668,6 +1729,7 @@ class TaskRunner:
     async def _merge_revert(self) -> None:
         candidate = self.task.evidence["revert_candidate"]
         gh = GitHub(resolve_token(self.ws))
+        await self._review_gate(gh, head=candidate["head"], pr=candidate["pr"], revert=True)
         async with self.repo_lock(self.repo.id):
             self._guard()
             pr = await gh.pull(self.repo.full_name, candidate["pr"])
@@ -1678,6 +1740,11 @@ class TaskRunner:
                                "The revert PR is closed or no longer matches the CI-tested candidate.",
                                status="smoke_failed")
                 try:
+                    summary = await gh.checks(self.repo.full_name, candidate["head"])
+                    self._guard()
+                    if summary.state not in ("success", "none") or (summary.state == "none" and self.cfg.get("require_ci", False)):
+                        await self._wait_ci(gh, continuation="revert", head=candidate["head"], pr=candidate["pr"])
+                    await self._review_gate(gh, head=candidate["head"], pr=candidate["pr"], final=True, revert=True)
                     result = await gh.merge(self.repo.full_name, candidate["pr"], sha=candidate["head"],
                                             method="squash", title=f"Revert: {self.task.title} (#{candidate['pr']})")
                 except GitHubError as exc:
