@@ -418,6 +418,8 @@ test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts"
   const t = createMindHttpTransport(request, responseRequest, readMindSSE);
   const signal = new AbortController().signal;
   assert.equal((await t.list(signal))[0].workspace_id, "billing");
+  const { mindThread } = await import("./mindHttp.ts");
+  assert.equal(mindThread({ ...wireThread, title: "New conversation" }).title, "");  // empty: not listed in the sidebar
   const h = await t.create("billing", signal);
   assert.deepEqual(calls.find((c) => c.init.method === "POST")?.init.json, { billing_workspace_id: "billing" });
   assert.equal(h.status.model, "claude-opus-5-5");
