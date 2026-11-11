@@ -60,10 +60,11 @@ def test_read_family_authorization_and_redaction(world, name, person):
         for _, _, t, *_ in work:
             t.pr_number, t.pr_url = 12, "https://github.com/org/repo/pull/12"
         db.commit()
-    for i, (ws, o, *_) in enumerate(work):
-        args = {"workspace_id": ws.id}
-        if name == "outcome_detail":
-            args["outcome_id"] = o.id
+    def scope(ws, o, t):  # the object a detail read needs, in that workspace
+        return {"outcome_id": o.id} if name == "outcome_detail" else (
+            {"outcome_id": o.id, "task_id": t.id} if name == "task_detail" else {})
+    for i, (ws, o, t, *_) in enumerate(work):
+        args = {"workspace_id": ws.id, **scope(ws, o, t)}
         if i == 2:
             with pytest.raises(HTTPException) as exc:
                 read_call(name, args, context)
@@ -76,7 +77,7 @@ def test_read_family_authorization_and_redaction(world, name, person):
     member = db.query(Membership).filter_by(user_id=users[person].id, workspace_id=work[0][0].id).one()
     db.delete(member); db.commit()
     with pytest.raises(HTTPException):
-        read_call(name, {"workspace_id": work[0][0].id, **({"outcome_id": work[0][1].id} if name == "outcome_detail" else {})}, context)
+        read_call(name, {"workspace_id": work[0][0].id, **scope(*work[0][:3])}, context)
 
 
 def test_production_transcripts_bounded_cursor_and_progress(world):
@@ -151,6 +152,94 @@ def test_a_task_with_huge_evidence_reads_bounded_and_truncated(world):
     evidence = detail["items"][0]["tasks"][0]["evidence"]
     assert len(evidence) == MAX_ITEMS
     assert detail["truncated"]
+
+
+def test_lists_carry_brief_tasks_and_outcome_detail_the_full_ones(world):
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    t.evidence = {f"check{i}": "x" * 1500 for i in range(40)}
+    t.spec = "s" * 1900
+    db.commit()
+    ctx = Context(db, users[0].id)
+    for name in ("overview", "list_tasks"):
+        result = read_call(name, {"workspace_id": ws.id}, ctx)
+        task = (result["items"][0]["work"] if name == "overview" else result["items"])[0]
+        assert task["key"] == t.key and "evidence" not in task and "spec" not in task
+        assert len(json.dumps(result)) < 10_000
+    detail = read_call("outcome_detail", {"workspace_id": ws.id, "outcome_id": o.id}, ctx)
+    # Over the budget, so shortened: every field of the task survives, only its texts are cut.
+    task = detail["items"][0]["tasks"][0]
+    assert detail["truncated"] and detail["narrow"]
+    assert set(task) >= {"evidence", "spec", "acceptance", "status"} and len(task["evidence"]) == 40
+    assert all(len(v) <= 401 for v in task["evidence"].values())
+
+
+def test_an_oversized_result_is_shortened_to_the_budget_and_says_so(world):
+    from aifactory.mind.tools import RESULT_BUDGET
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    for i in range(30):
+        db.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="question", title=f"Q{i}",
+                        body="b" * 1900, options=[], status="open"))
+    db.commit()
+    result = read_call("open_decisions", {"workspace_id": ws.id}, Context(db, users[0].id))
+    assert len(json.dumps(result, ensure_ascii=False)) <= RESULT_BUDGET
+    assert result["truncated"] and "narrow" in result
+
+
+def test_nested_objects_are_narrowed_last_and_the_budget_always_holds(world):
+    from aifactory.mind.tools import RESULT_BUDGET
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    # About 1 MB, nested three levels: over the budget after every shortening step, so the hard fallback applies.
+    t.evidence = {f"k{i}": {f"n{j}": {f"m{k}": "z" * 40 for k in range(10)} for j in range(50)} for i in range(50)}
+    db.commit()
+    ctx = Context(db, users[0].id)
+    for name, args in (("task_detail", {"outcome_id": o.id, "task_id": t.id}), ("outcome_detail", {"outcome_id": o.id})):
+        result = read_call(name, {"workspace_id": ws.id, **args}, ctx)
+        assert len(json.dumps(result, ensure_ascii=False)) <= RESULT_BUDGET
+        assert result["truncated"] and "narrow" in result
+
+
+def test_brief_tasks_redact_before_they_cut(world):
+    from aifactory.mind.tools import BRIEF_TEXT
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    t.blocked_reason = "x" * (BRIEF_TEXT - 10) + SECRET  # the credential crosses the cut
+    db.commit()
+    result = read_call("overview", {"workspace_id": ws.id}, Context(db, users[0].id))
+    assert "sk-" not in json.dumps(result)
+
+
+def test_a_shortened_event_page_continues_after_the_last_event_shown(world):
+    db, users, work = world
+    ws, o, t, _, _, run, _ = work[0]
+    for j in range(20):
+        db.add(Event(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="note", message=f"{j} " + "y" * 1900,
+                     data={"pad": ["z" * 1900] * 3}))
+    db.commit()
+    ctx = Context(db, users[0].id)
+    first = read_call("recent_events", {"workspace_id": ws.id}, ctx)
+    shown = [e["id"] for e in first["items"]]
+    assert first["truncated"] and "narrow" in first and len(shown) < 20
+    assert first["next_cursor"] == shown[-1]
+    second = read_call("recent_events", {"workspace_id": ws.id, "cursor": first["next_cursor"]}, ctx)
+    following = db.query(Event.id).filter(Event.workspace_id == ws.id, Event.id < shown[-1]).order_by(Event.id.desc()).first()[0]
+    assert second["items"][0]["id"] == following  # nothing skipped between the pages
+
+
+def test_task_detail_reads_any_task_in_full_and_only_in_its_outcome(world):
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    other = Outcome(workspace_id=ws.id, number=2, title="Other")
+    db.add(other)
+    db.commit()
+    ctx = Context(db, users[0].id)
+    task = read_call("task_detail", {"workspace_id": ws.id, "outcome_id": o.id, "task_id": t.id}, ctx)["items"][0]
+    assert task["key"] == t.key and "evidence" in task and "spec" in task
+    with pytest.raises(HTTPException) as exc:  # a task is read only through its own outcome
+        read_call("task_detail", {"workspace_id": ws.id, "outcome_id": other.id, "task_id": t.id}, ctx)
+    assert exc.value.status_code == 404
 
 
 def test_pull_requests_report_recorded_ci_decisions_and_the_page_snapshot(world, monkeypatch):
