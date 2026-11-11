@@ -47,6 +47,7 @@ def bridge(monkeypatch):
         monkeypatch.setattr(vm.VMBridge, "get", classmethod(lambda cls: fake))
         monkeypatch.setattr(vm, "vm_available", lambda: (True, "test"))
         monkeypatch.setattr(vm, "_LIVE", set())
+        monkeypatch.setattr(vm, "_sweeping", None)  # a fresh lock per test (each runs its own event loop)
         return fake
     return install
 
@@ -60,6 +61,24 @@ def test_the_sweep_destroys_only_old_unowned_active_sandboxes(bridge):
     report = asyncio.run(vm.sweep_orphans(NOW))
     assert [c for c in fake.calls if c[0] == "forget"] == [("forget", "orphan")]
     assert report == {"active": 2, "owned": 1, "destroyed": 1, "cap": vm.SANDBOX_CAP}
+
+
+def test_the_sweep_destroys_orphans_concurrently(bridge, monkeypatch):
+    fake = bridge([{"id": f"o{i}", "status": "RUNNING", "createdAt": at(600)} for i in range(20)])
+    inflight, peak = 0, 0
+    original = fake.call
+
+    async def slow(op, args=None, timeout=600):
+        nonlocal inflight, peak
+        if op == "forget":
+            inflight += 1
+            peak = max(peak, inflight)
+            await asyncio.sleep(0.01)
+            inflight -= 1
+        return await original(op, args, timeout)
+    monkeypatch.setattr(fake, "call", slow)
+    report = asyncio.run(vm.sweep_orphans(NOW))
+    assert report["destroyed"] == 20 and 1 < peak <= vm.SWEEP_DESTROYS
 
 
 def test_the_sweep_never_raises_when_the_list_fails(bridge, monkeypatch):

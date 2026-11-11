@@ -106,6 +106,15 @@ ORPHAN_GRACE = timedelta(minutes=10)  # a VM being created right now is not regi
 SANDBOX_CAP = int(os.environ.get("AIFACTORY_VM_CAP", "100"))  # Railway's per-environment limit on the plan
 CAP_ERROR = "Too many running sandboxes"
 TERMINAL = {"FAILED", "DESTROYED", "DESTROYING"}
+SWEEP_DESTROYS = 8  # destroys in flight at once: 100 orphans take seconds, not 100 sequential calls
+_sweeping: asyncio.Lock | None = None  # one sweep at a time (periodic and cap-triggered)
+
+
+def _sweep_lock() -> asyncio.Lock:
+    global _sweeping
+    if _sweeping is None:
+        _sweeping = asyncio.Lock()
+    return _sweeping
 
 
 def _created(value: Any) -> datetime | None:
@@ -121,26 +130,32 @@ async def sweep_orphans(now: datetime | None = None) -> dict[str, Any]:
     ok, why = vm_available()
     if not ok:
         return {"skipped": why}
-    bridge = VMBridge.get()
-    try:
-        items = (await bridge.call("sandboxes", {}, timeout=120)).get("items") or []
-    except Exception as exc:
-        log.warning("VM sweep could not list sandboxes: %s", exc)
-        return {"skipped": "list failed"}
-    now = now or datetime.now(timezone.utc)
-    active = [s for s in items if s.get("status") not in TERMINAL]
-    orphans = []
-    for s in active:
-        created = _created(s.get("createdAt"))
-        if s["id"] not in _LIVE and created is not None and now - created >= ORPHAN_GRACE:
-            orphans.append(s["id"])
-    destroyed = 0
-    for vm_id in orphans:
+    async with _sweep_lock():
+        bridge = VMBridge.get()
         try:
-            await bridge.call("forget", {"id": vm_id}, timeout=120)
-            destroyed += 1
+            items = (await bridge.call("sandboxes", {}, timeout=120)).get("items") or []
         except Exception as exc:
-            log.warning("VM sweep could not destroy %s: %s", vm_id, exc)
+            log.warning("VM sweep could not list sandboxes: %s", exc)
+            return {"skipped": "list failed"}
+        now = now or datetime.now(timezone.utc)
+        active = [s for s in items if s.get("status") not in TERMINAL]
+        orphans = []
+        for s in active:
+            created = _created(s.get("createdAt"))
+            if s["id"] not in _LIVE and created is not None and now - created >= ORPHAN_GRACE:
+                orphans.append(s["id"])
+        limit = asyncio.Semaphore(SWEEP_DESTROYS)
+
+        async def destroy(vm_id: str) -> bool:
+            async with limit:
+                try:
+                    await bridge.call("forget", {"id": vm_id}, timeout=120)
+                    return True
+                except Exception as exc:
+                    log.warning("VM sweep could not destroy %s: %s", vm_id, exc)
+                    return False
+
+        destroyed = sum(await asyncio.gather(*(destroy(vm_id) for vm_id in orphans)))
     if destroyed:
         log.warning("VM sweep destroyed %d orphaned sandbox(es)", destroyed)
     return {"active": len(active) - destroyed, "owned": len(_LIVE), "destroyed": destroyed, "cap": SANDBOX_CAP}
