@@ -19,7 +19,8 @@ export function DecisionsPage() {
   };
   const toggle = async (d: Decision) => {
     try {
-      await api(`/api/workspaces/${ws.id}/decisions/${d.id}`, { method: "PATCH", json: { reusable: !d.reusable, scope: "workspace" } });
+      if (d.kind === "ruling" && d.reusable) await api(`/api/workspaces/${ws.id}/rulings/${d.id}`, { method: "DELETE" });
+      else await api(`/api/workspaces/${ws.id}/decisions/${d.id}`, { method: "PATCH", json: { reusable: !d.reusable, scope: "workspace" } });
       qc.invalidateQueries({ queryKey: ["decisions", ws.id] });
     } catch (err) {
       toast((err as Error).message, true);
@@ -44,11 +45,12 @@ export function DecisionsPage() {
           <p className="muted">UTC cohorts by review completion. Overrule rate: corrected automatic verdicts from the cohort / decided and sent back verdicts. Suggest counts as held.</p>
         </section>}
 
+        {ws.role !== "viewer" && <AddRule onAdded={corrected} />}
         {q.isLoading ? <Skeleton /> : !q.data?.length ? (
           <Empty title="No decisions yet">Approvals, answers and unblocks are recorded here with who made them. Tick "Remember for future work" to turn one into a standing precedent.</Empty>
         ) : (
           <>
-            <div className="list-section">Precedents the Factory follows · {precedents.length}</div>
+            <div className="list-section">Team rules and precedents the Factory follows · {precedents.length}</div>
             {precedents.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>None yet.</div>}
             <ul className="rows">{precedents.map((d) => <Row key={d.id} d={d} admin={admin} toggle={toggle} corrected={corrected} open={() => d.outcome_id && navigate(`/w/${ws.id}/outcomes/${d.outcome_id}`)} />)}</ul>
             <div className="list-section">History · {history.length}</div>
@@ -109,10 +111,36 @@ function Row({ d, admin, toggle, open, corrected }: { d: Decision; admin: boolea
       <div className="meta">
         <span>{d.resolved_by_name || "—"} · {ago(d.resolved_at)}</span>
         {canOverrule && <button className="btn sm ghost" onClick={e => { e.stopPropagation(); setEditing(true); }}>Overrule</button>}
-        {admin && d.comment && d.status !== "superseded" && (
+        {(admin || (d.kind === "ruling" && d.reusable)) && d.comment && d.status !== "superseded" && (
           <button className="btn sm ghost" onClick={(e) => { e.stopPropagation(); toggle(d); }}>{d.reusable ? "Retire" : "Make precedent"}</button>
         )}
       </div>
     </li>
+  );
+}
+
+/** State a rule every agent in the workspace follows: planners, builders, verifiers and Leads are all given it. */
+function AddRule({ onAdded }: { onAdded: () => void }) {
+  const { ws } = useWs();
+  const toast = useToast();
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await api(`/api/workspaces/${ws.id}/rulings`, { method: "POST", json: { text, scope: "workspace" } });
+      setText("");
+      onAdded();
+    } catch (err) { toast((err as Error).message, true); }
+    finally { setSaving(false); }
+  };
+  return (
+    <form className="add-rule" onSubmit={submit} style={{ display: "flex", gap: 8, padding: "12px 22px", alignItems: "flex-start" }}>
+      <label htmlFor="new-rule" className="sr-only">New team rule</label>
+      <textarea id="new-rule" rows={1} maxLength={4000} value={text} onChange={e => setText(e.target.value)} style={{ flex: 1 }}
+        placeholder="Add a team rule every agent follows, e.g. “Build token-shaped test strings at runtime, never as literals”" />
+      <button className="btn sm" disabled={saving || !text.trim()}>Add rule</button>
+    </form>
   );
 }
