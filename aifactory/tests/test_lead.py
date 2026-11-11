@@ -385,3 +385,42 @@ def test_a_decision_on_stopped_work_is_left_alone(world):
         s.get(Outcome, world["outcome"]).status = "cancelled"
     out = tools.call("resolve_decision", {"decision_id": world["question"], "option": "answer", "comment": "Use it."})
     assert "no longer applies" in out
+
+
+def test_runs_in_progress_hold_their_share_of_the_outcome_budget(world, model):
+    def budget(outcome_usd):
+        with db.session_scope() as s:
+            w = s.get(Workspace, world["ws"])
+            w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": outcome_usd}}
+
+    with db.session_scope() as s:  # a builder still running may spend up to the run cap ($5 here)
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
+                  status="running", cost_usd=0.0))
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="verifier", harness="native",
+                  status="running", started_at=db.utcnow() - timedelta(hours=5)))  # cut off by a restart: holds nothing
+    budget(4)
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "held by runs in progress" in row.error and model.calls == []
+    budget(6)
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and row.config_snapshot["budget_reserved"] == 1.0  # $6 less the builder's $5
+
+
+def test_lead_turns_counts_every_model_call_including_the_summary(world, model):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "lead": {"enabled": True, "run_usd": 2.0, "turns": 2}}
+    model.scripts = {"lead": busy}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and row.turns == 2 and model.calls == ["lead", "lead"]
+
+
+def test_a_failed_final_cost_reading_keeps_the_last_one(world, model, monkeypatch):
+    unpriced(world)
+    monkeypatch.setattr(lead, "ModelClient", MeteredModel)
+    model.scripts = {"lead": lambda messages: busy(messages) if step(messages) == 0
+                     else {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    MeteredModel.readings = [0.5, 0.7]  # read after each call; the final read after the run finds nothing
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and row.cost_usd == 0.7 and row.cost_known is False

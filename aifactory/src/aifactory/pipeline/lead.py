@@ -419,6 +419,42 @@ def _limit(value: Any) -> float | None:
     return max(0.0, float(value))
 
 
+def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | None, run_cap: float | None,
+             alive: timedelta) -> float:
+    """Atomically reserve this run's share of what the outcome has left, and return its spending cap.
+
+    The outcome row is locked while the share is worked out and recorded on the run. Known spend comes off the
+    budget, and so does what each run still in progress may spend: its own reserved cap, or the workspace's run
+    cap, less what it has recorded. With some costs still unpriced, the known total is a lower bound. A run marked
+    running for longer than ``alive`` was cut off by a restart and holds nothing.
+    """
+    from sqlalchemy import text
+
+    with session_scope() as s:
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(text("BEGIN IMMEDIATE"))  # SQLite has no row locks: take its write lock before reading
+        else:
+            s.query(Outcome).filter(Outcome.id == outcome_id).with_for_update().one()
+        if outcome_limit is not None:
+            spent, _ = outcome_cost(outcome_id)
+            held = 0.0
+            for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,
+                                             Run.started_at > utcnow() - alive):
+                snapshot = other.config_snapshot or {}
+                limit = _limit(snapshot.get("budget_reserved"))
+                limit = limit if limit is not None else _limit((snapshot.get("limits") or {}).get("run_usd"))
+                limit = limit if limit is not None else run_cap
+                held += max(0.0, (limit or 0.0) - float(other.cost_usd or 0.0))
+            if spent >= outcome_limit:
+                raise BudgetExceeded("The outcome's budget is spent")
+            if spent + held >= outcome_limit:
+                raise BudgetExceeded("The outcome's remaining budget is held by runs in progress")
+            cap = min(cap, outcome_limit - spent - held)
+        row = s.get(Run, run_id)
+        row.config_snapshot = {**(row.config_snapshot or {}), "budget_reserved": cap}
+    return cap
+
+
 async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen: dict[str, Any],
                    decisions: list[str] | None = None) -> Run:
     """One Lead run on an outcome. Never raises: every failure ends the run as failed, with the reason recorded."""
@@ -440,17 +476,13 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
     client = provider = None
     started = False
     status, error, summary = "failed", "", ""
+    reading: list[float] = []  # MindsHub's latest estimate of this run's cost, read during the run
     try:
         budgets = settings["budgets"]
         usd = min(x for x in (_limit(budgets.get("run_usd")), cfg["run_usd"]) if x is not None)
-        outcome_limit = _limit(budgets.get("outcome_usd"))
-        spent, known = outcome_cost(outcome_id)
-        if outcome_limit is not None:
-            # With some costs still unpriced, the known total is a lower bound: it alone can exhaust the budget,
-            # and what is left is at most the limit less it. The run's own cap bounds the rest.
-            if spent >= outcome_limit:
-                raise BudgetExceeded("The outcome's budget is spent")
-            usd = min(usd, outcome_limit - spent)
+        minutes_each = _limit((settings.get("limits") or {}).get("run_minutes")) or 60
+        usd = _reserve(outcome_id, run_id, usd, _limit(budgets.get("outcome_usd")), _limit(budgets.get("run_usd")),
+                       timedelta(minutes=2 * minutes_each))
         ledger.max_cost_usd = usd
         tokens = _limit(budgets.get("run_tokens"))
         ledger.max_tokens = int(tokens) if tokens is not None else None
@@ -474,6 +506,8 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             if ledger.cost_known:
                 return
             spent_now = await client.session_cost(run_id)
+            if spent_now is not None and math.isfinite(spent_now) and spent_now >= 0:
+                reading[:] = [spent_now]
             if spent_now is None:
                 raise BudgetExceeded("The Lead's spend couldn't be measured, so it stopped")
             if spent_now >= usd:
@@ -509,8 +543,9 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.status, row.error, row.finished_at = status, error, utcnow()
             row.turns = ledger.calls
             row.input_tokens, row.output_tokens = ledger.input_tokens, ledger.output_tokens
-            row.cost_usd = round(measured if measured is not None else ledger.cost_usd, 6)
-            row.cost_known = measured is not None or ledger.cost_known
+            # A final reading that fails leaves the last one taken during the run: a lower bound, so not "known".
+            row.cost_usd = round(measured if measured is not None else max([ledger.cost_usd, *reading]), 6)
+            row.cost_known = measured is not None or (ledger.cost_known and not reading)
             row.result = {"summary": summary, "actions": tools.actions}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
@@ -533,8 +568,8 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
                                     f"{'; '.join(reasons)}.\n\nThe outcome's record:\n{record_now}"},
     ]
     nudges = 0
-    for turn in range(turns + 1):
-        final = turn >= turns
+    for turn in range(turns):
+        final = turn == turns - 1  # the last allowed call is the summary
         if final:
             messages.append({"role": "user", "content": "You are out of turns. Call finish now with your summary."})
         message = await client.chat(model=model, messages=messages, tools=[TOOLS[-1]] if final else TOOLS,
