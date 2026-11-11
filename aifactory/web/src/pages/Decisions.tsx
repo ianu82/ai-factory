@@ -7,7 +7,7 @@ import { ago, DECISION_KIND } from "../format";
 import { Empty, Skeleton, useToast } from "../ui";
 
 export function DecisionsPage() {
-  const { ws } = useWs();
+  const { ws, me } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
   const navigate = useNavigate();
@@ -28,7 +28,7 @@ export function DecisionsPage() {
     }
   };
   // Rulings come from their own uncapped list, so an old rule is always shown (and can be retired).
-  const rulings = useQuery({ queryKey: ["rulings", ws.id], queryFn: () => api<{ rulings: { id: string; title: string; text: string; scope: string; by: string; at: string | null; kind: string }[] }>(`/api/workspaces/${ws.id}/rulings`) });
+  const rulings = useQuery({ queryKey: ["rulings", ws.id], queryFn: () => api<{ rulings: { id: string; title: string; text: string; scope: string; by: string; by_id: string | null; at: string | null; kind: string }[] }>(`/api/workspaces/${ws.id}/rulings`) });
   const listed = new Set((q.data || []).map((d) => d.id));
   const older = (rulings.data?.rulings || []).filter((r) => r.kind === "ruling" && !listed.has(r.id));
   const retire = async (id: string) => {
@@ -66,10 +66,10 @@ export function DecisionsPage() {
             {older.length > 0 && <ul className="rows">{older.map((r) => (
               <li key={r.id} className="row">
                 <span className="dot good" />
-                <div style={{ minWidth: 0 }}><div className="title">{r.title}</div><div className="sub"><span>Team rule · {r.scope}</span></div></div>
+                <div style={{ minWidth: 0 }}><div className="title">{r.title}</div><div className="sub"><span>Team rule · {r.scope}</span></div><p style={{ whiteSpace: "pre-wrap", margin: "4px 0 0" }}>{r.text}</p></div>
                 <div className="meta">
                   <span>{r.by || "—"} · {ago(r.at)}</span>
-                  {admin && <button className="btn sm ghost" onClick={() => retire(r.id)}>Retire</button>}
+                  {(admin || r.by_id === me.user.id) && <button className="btn sm ghost" onClick={() => retire(r.id)}>Retire</button>}
                 </div>
               </li>))}</ul>}
             <ul className="rows">{precedents.map((d) => <Row key={d.id} d={d} admin={admin} toggle={toggle} corrected={corrected} open={() => d.outcome_id && navigate(`/w/${ws.id}/outcomes/${d.outcome_id}`)} />)}</ul>

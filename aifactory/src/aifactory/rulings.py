@@ -53,6 +53,7 @@ def view(d: Decision, names: dict[str, str]) -> dict[str, Any]:
     return {"id": d.id, "kind": d.kind, "title": d.title, "text": d.comment if d.kind == KIND else
             f"{d.resolution}{' — ' + d.comment if d.comment else ''}", "scope": d.scope,
             "outcome_id": d.outcome_id, "task_id": d.task_id, "by": names.get(d.resolved_by or "", ""),
+            "by_id": d.resolved_by,
             "at": d.resolved_at.isoformat() if d.resolved_at else None, "source": (d.attribution or {}).get("source")}
 
 
