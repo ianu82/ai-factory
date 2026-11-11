@@ -54,7 +54,7 @@ STRUCTURAL_KEYS = frozenset({
     "citations", "action_cards", "history", "tools", "workspace_id", "kind", "outcome_id", "task_id", "label",
     "href", "seq", "message_id", "type", "data", "call_id", "name", "summary", "card", "code", "message",
     "thread_cost", "daily_spend", "daily_limit", "revision", "workspace", "object", "fields", "effect", "result",
-    "action_id", "ok", "reason", "detail", "items", "truncated", "provenance", "accounting",
+    "action_id", "ok", "reason", "detail", "items", "truncated", "provenance", "accounting", "narrow",
 })
 
 

@@ -153,6 +153,35 @@ def test_a_task_with_huge_evidence_reads_bounded_and_truncated(world):
     assert detail["truncated"]
 
 
+def test_lists_carry_brief_tasks_and_outcome_detail_the_full_ones(world):
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    t.evidence = {f"check{i}": "x" * 1500 for i in range(40)}
+    t.spec = "s" * 1900
+    db.commit()
+    ctx = Context(db, users[0].id)
+    for name in ("overview", "list_tasks"):
+        result = read_call(name, {"workspace_id": ws.id}, ctx)
+        task = (result["items"][0]["work"] if name == "overview" else result["items"])[0]
+        assert task["key"] == t.key and "evidence" not in task and "spec" not in task
+        assert len(json.dumps(result)) < 10_000
+    detail = read_call("outcome_detail", {"workspace_id": ws.id, "outcome_id": o.id}, ctx)
+    assert "evidence" in detail["items"][0]["tasks"][0]
+
+
+def test_an_oversized_result_is_shortened_to_the_budget_and_says_so(world):
+    from aifactory.mind.tools import RESULT_BUDGET
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    for i in range(30):
+        db.add(Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="question", title=f"Q{i}",
+                        body="b" * 1900, options=[], status="open"))
+    db.commit()
+    result = read_call("open_decisions", {"workspace_id": ws.id}, Context(db, users[0].id))
+    assert len(json.dumps(result, ensure_ascii=False)) <= RESULT_BUDGET
+    assert result["truncated"] and "narrow" in result
+
+
 def test_pull_requests_report_recorded_ci_decisions_and_the_page_snapshot(world, monkeypatch):
     import time
 
