@@ -46,7 +46,8 @@ def _entry(task: Task) -> dict[str, Any]:
 def _sort_key(task: Task, priority: int) -> tuple:
     entry = _entry(task)
     # The current turn holder stays first; otherwise priority, then arrival.
-    return (0 if entry.get("turn") else 1, entry.get("granted_at") or "", priority,
+    # A task paused behind a red main steps aside, so a repair (or anything else) behind it can reach the head.
+    return (0 if entry.get("turn") else 1, entry.get("granted_at") or "", 1 if entry.get("paused") else 0, priority,
             entry.get("entered_at") or "", task.id)
 
 

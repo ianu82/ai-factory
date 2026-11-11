@@ -1097,11 +1097,19 @@ class TaskRunner:
         self._require_merge_approval()
         # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
         await merge_manager.take_turn(self, gh)
+        revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
         github_queue = await merge_manager.github_queue_state(gh, self)
         if github_queue is not None:
+            if revalidate and not github_queue["entry"] and not (self.task.evidence or {}).get(
+                    merge_manager.KEY, {}).get("github"):
+                # Enqueue only a head verified against the current main; otherwise rebase and revalidate first.
+                main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard()
+                if main_sha != self.task.base_sha:
+                    await self._refresh_onto_main(token, gh, main_sha)
+                    return
             await merge_manager.merge_via_github_queue(self, gh, github_queue)
         self.stage("merge", f"Merging PR #{self.task.pr_number}")
-        revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
         refresh_onto: str | None = None
         # Merges into one repository are serialized; CI waits and rebuilds happen outside the lock.
         async with self.repo_lock(self.repo.id):

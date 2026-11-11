@@ -230,3 +230,43 @@ def test_two_outcomes_deliver_through_the_queue_end_to_end(factory):
         for t in merged:
             assert t.status == "completed" and (t.evidence or {}).get("merge_queue", {}).get("turn") is True
         assert merge_manager.held_back(s) == set()
+
+
+def test_a_paused_head_steps_aside_for_a_repair_behind_it(factory, monkeypatch):
+    async def failing_checks(self, full_name, sha):
+        from aifactory.github import CheckSummary
+
+        return CheckSummary("failure", [{"name": "tests", "status": "completed", "conclusion": "failure"}])
+
+    monkeypatch.setattr(FakeGitHub, "checks", failing_checks)
+    normal = merge_task(factory, key="T1")
+    with pytest.raises(Stop):
+        take(normal)  # paused at the head: main is red
+    with session_scope() as s:
+        fix = s.get(Task, merge_task(factory, key="T2", source="signal", pr=2))
+        s.add(Signal(workspace_id=factory["ws"], source="ci_failure", fingerprint="main-red-2", title="CI failing",
+                     status="accepted", outcome_id=fix.outcome_id))
+        fix_id = fix.id
+        assert merge_manager.ordered(s, factory["repo"])[0].id == fix_id
+    take(fix_id)
+    assert state(fix_id)[2]["turn"] is True
+
+
+def test_github_queue_rebases_a_stale_head_before_enqueueing(factory, monkeypatch):
+    QueueGitHub.entry, QueueGitHub.enqueued = None, []
+    tid = merge_task(factory, key="T1")
+    r = runner(tid)
+    r.task.base_sha = "stale"
+    refreshed = []
+
+    async def refresh(self, token, gh, main_sha):
+        refreshed.append(main_sha)
+
+    monkeypatch.setattr(TaskRunner, "_refresh_onto_main", refresh)
+    monkeypatch.setattr(delivery, "GitHub", QueueGitHub)
+    monkeypatch.setattr(TaskRunner, "_require_merge_approval", lambda self: None)
+    with session_scope() as s:
+        s.get(Task, tid).base_sha = "stale"
+    r = runner(tid)
+    asyncio.run(r.merge())
+    assert refreshed and QueueGitHub.enqueued == []
