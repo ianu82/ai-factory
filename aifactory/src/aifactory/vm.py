@@ -397,7 +397,8 @@ class RailwayVMSandbox:
 
     async def exec(self, command: str, *, timeout: float = 600, cwd: str | None = None,
                    env: dict[str, str] | None = None, stdin: bytes | None = None,
-                   on_output: Callable[[bytes], None] | None = None) -> ExecResult:
+                   on_output: Callable[[bytes], None] | None = None,
+                   output_redactor=None) -> ExecResult:
         if self._closed:
             raise SandboxError("Sandbox is closed")
         if stdin is not None:
@@ -417,6 +418,8 @@ class RailwayVMSandbox:
             return ExecResult(command=command, exit_code=124, output="(VM command did not return)", duration=timeout,
                               timed_out=True)
         raw = (result.get("stdout") or "") + (result.get("stderr") or "")
+        if output_redactor is not None:
+            raw = output_redactor.feed(raw, final=True)
         if on_output and raw:
             try:
                 on_output(raw.encode())

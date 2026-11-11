@@ -9,6 +9,7 @@ import shlex
 import time
 from typing import Any
 
+from ..image_input import ImageOutputRedactor, ImagePayloadRedactor
 from ..sandbox import SandboxError
 from ..sandbox import read_text as sb_read_text
 from ..sandbox import write_text as sb_write_text
@@ -64,14 +65,19 @@ def tool_specs(writable: bool) -> list[dict[str, Any]]:
 
 
 class ToolBox:
-    def __init__(self, session: HarnessSession):
+    def __init__(self, session: HarnessSession, *, redactor: ImagePayloadRedactor | None = None):
         self.session = session
+        self.redactor = redactor or ImagePayloadRedactor(session.image_inputs)
         self.log: list[str] = []
 
     async def call(self, name: str, args: Any) -> str:
         output = await self._tool(self.session, name, args)
-        self.log.append(f"{name} {json.dumps(args)[:300] if isinstance(args, dict) else str(args)[:300]}")
-        return output
+        safe_args = json.dumps(self.redactor.value(args)) if isinstance(args, dict) else self.redactor.text(str(args))
+        self.log.append(f"{name} {safe_args[:300]}")
+        return self.redactor.text(output)
+
+    async def _exec(self, sandbox, command, **kwargs):
+        return await sandbox.exec(command, output_redactor=ImageOutputRedactor(self.redactor), **kwargs)
 
     async def _tool(self, session: HarnessSession, name: str, args: Any) -> str:
         if not isinstance(args, dict):
@@ -86,19 +92,19 @@ class ToolBox:
                        f"|| find {shlex.quote(path)} -type f -not -path '*/.git/*' -not -path '*/node_modules/*')")
                 if pattern:
                     cmd += f" | grep -E {shlex.quote(_glob_to_regex(pattern))}"
-                result = await sandbox.exec(cmd + " | head -n 3000", timeout=60)
+                result = await self._exec(sandbox, cmd + " | head -n 3000", timeout=60)
                 session.on_progress("tool", f"Listed files in {path}", {"tool": name})
                 return clip(result.output or "(no files)")
             if name == "read_file":
                 text = await sb_read_text(sandbox, args["path"])
-                lines = text.splitlines()
+                lines = self.redactor.text(text).splitlines()
                 start = max(1, int(args.get("start_line") or 1))
                 end = int(args.get("end_line") or min(len(lines), start + 1499))
                 end = min(end, len(lines), start + 2999)
                 body = "\n".join(f"{i:>5}\t{lines[i - 1]}" for i in range(start, end + 1)) if lines else "(empty file)"
                 more = f"\n… file has {len(lines)} lines; showing {start}-{end}" if end < len(lines) or start > 1 else ""
                 session.on_progress("tool", f"Read {args['path']}", {"tool": name, "path": args["path"]})
-                return clip(body + more)
+                return clip(self.redactor.text(body + more))
             if name == "search":
                 path = args.get("path") or "."
                 sandbox.resolve(path)
@@ -106,19 +112,19 @@ class ToolBox:
                 cmd = (f"if command -v rg >/dev/null; then rg -n --no-heading --max-columns 300 --max-count 50{glob} "
                        f"-e {shlex.quote(args['pattern'])} {shlex.quote(path)}; else grep -rnE --exclude-dir=.git "
                        f"--exclude-dir=node_modules {shlex.quote(args['pattern'])} {shlex.quote(path)}; fi | head -n 400")
-                result = await sandbox.exec(cmd, timeout=60)
-                session.on_progress("tool", f"Searched for {args['pattern'][:80]}", {"tool": name})
+                result = await self._exec(sandbox, cmd, timeout=60)
+                session.on_progress("tool", f"Searched for {self.redactor.text(args['pattern'])[:80]}", {"tool": name})
                 return clip(result.output or "(no matches)")
             if name == "run":
                 timeout = max(10, min(int(args.get("timeout_seconds") or 300), 1800, int(session.command_timeout),
                                       int(max(30, session.remaining() - 60))))
                 command = str(args["command"])
-                session.on_progress("command", command[:300], {"tool": name})
+                session.on_progress("command", self.redactor.text(command)[:300], {"tool": name})
                 started = time.monotonic()
-                result = await sandbox.exec(command, timeout=timeout)
+                result = await self._exec(sandbox, command, timeout=timeout)
                 session.on_progress("command_result", f"exit {result.exit_code} in {time.monotonic() - started:.0f}s",
-                                    {"command": command[:300], "exit_code": result.exit_code, "timed_out": result.timed_out})
-                return clip(result.for_model())
+                                    {"command": self.redactor.text(command)[:300], "exit_code": result.exit_code, "timed_out": result.timed_out})
+                return clip(self.redactor.text(result.for_model()))
             if name == "write_file" and session.writable:
                 await sb_write_text(sandbox, args["path"], args.get("content", ""))
                 session.on_progress("edit", f"Wrote {args['path']}", {"tool": name, "path": args["path"]})

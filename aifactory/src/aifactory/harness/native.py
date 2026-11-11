@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..attachments import IMAGE_EXTENSIONS, decode_content
+from ..image_input import ImagePayloadRedactor, rejects_image_input
 from ..inference import BudgetExceeded, InferenceError
+from ..pipeline.image_validation import validate_image
 from .base import HarnessFailed, HarnessResult, HarnessSession
 from .schemas import validate_report
 from .tools import ToolBox, clip, finish_tool, tool_specs
@@ -35,12 +38,34 @@ class NativeHarness:
         return True, "Built-in Factory agent"
 
     async def run(self, session: HarnessSession) -> HarnessResult:
-        toolbox = ToolBox(session)
+        redactor = ImagePayloadRedactor(session.image_inputs)
+        session.client.image_redactor = redactor
+        original_progress = session.on_progress
+
+        def safe_progress(kind, message, data):
+            original_progress(kind, redactor.text(message), redactor.value(data))
+
+        session.on_progress = safe_progress
+        toolbox = ToolBox(session, redactor=redactor)
+        content: Any = session.prompt
+        if session.image_inputs:
+            content = [{"type": "text", "text": session.prompt}]
+            for image in session.image_inputs:
+                try:
+                    mime = image["mime_type"]
+                    if mime not in IMAGE_EXTENSIONS.values():
+                        raise ValueError("Unsupported image type")
+                    validate_image(decode_content(image["content"]), mime)
+                except (ValueError, KeyError):
+                    raise HarnessFailed("Invalid session image input") from None
+                content.append({"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{image['content']}"}})
+        files_only = False
         finish = finish_tool(session.report_schema)
         tools = tool_specs(session.writable) + [finish]
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": session.system},
-            {"role": "user", "content": session.prompt},
+            {"role": "user", "content": content},
         ]
         turns = nudges = report_attempts = 0
         while True:
@@ -48,7 +73,7 @@ class NativeHarness:
                 raise HarnessFailed("Cancelled")
             for note in session.take_guidance():
                 messages.append({"role": "user", "content": f"Guidance from your team (takes priority): {note}"})
-                session.on_progress("guidance", "Delivered team guidance to the agent", {"text": note[:500]})
+                session.on_progress("guidance", "Delivered team guidance to the agent", {"text": redactor.text(note)[:500]})
             if turns >= session.max_turns + 3:
                 raise HarnessFailed(f"Stopped after {turns} turns without a valid final report")
             if session.remaining() <= 0:
@@ -60,19 +85,26 @@ class NativeHarness:
             elif warning := budget_warning(session, turns):
                 messages.append({"role": "user", "content": warning})
             self._trim(messages)
-            try:
-                message = await session.client.chat(
-                    model=session.model,
-                    messages=messages,
-                    tools=[finish] if final_turn else tools,
-                    tool_choice="required" if final_turn else None,
-                    ledger=session.ledger,
-                    reasoning_effort=session.reasoning_effort,
-                )
-            except BudgetExceeded as exc:
-                raise HarnessFailed(str(exc)) from exc
-            except InferenceError as exc:
-                raise HarnessFailed(f"Model request failed: {exc}") from exc
+            while True:
+                try:
+                    message = await session.client.chat(
+                        model=session.model, messages=messages,
+                        tools=[finish] if final_turn else tools,
+                        tool_choice="required" if final_turn else None,
+                        ledger=session.ledger, reasoning_effort=session.reasoning_effort,
+                    )
+                    break
+                except BudgetExceeded as exc:
+                    raise HarnessFailed(redactor.text(str(exc))) from None
+                except InferenceError as exc:
+                    if session.image_inputs and not files_only and rejects_image_input(exc):
+                        files_only = True
+                        for entry in messages:
+                            if isinstance(entry.get("content"), list):
+                                entry["content"] = [p for p in entry["content"] if p.get("type") != "image_url"]
+                        session.on_progress("warning", "The provider does not support image input; continuing with attachment files and text only.", {})
+                        continue
+                    raise HarnessFailed(f"Model request failed: {redactor.text(str(exc))}") from None
             turns += 1
             calls = message.get("tool_calls") or []
             assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
@@ -82,7 +114,7 @@ class NativeHarness:
                 assistant["_raw"] = message["_raw"]  # Responses API: replay reasoning items verbatim
             messages.append(assistant)
             if message.get("content"):
-                session.on_progress("thought", clip(message["content"], 600), {})
+                session.on_progress("thought", clip(redactor.text(message["content"]), 600), {})
             if not calls:
                 nudges += 1
                 if nudges > 4:
@@ -100,7 +132,7 @@ class NativeHarness:
                     args = None
                 if name == "finish" and accepted is None:
                     report_attempts += 1
-                    report, error = validate_report(session.role, args)
+                    report, error = validate_report(session.role, redactor.value(args))
                     if report is not None:
                         accepted = report
                         output = "Report accepted."
@@ -114,11 +146,17 @@ class NativeHarness:
                     output = await toolbox.call(name, args)
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": output})
             if accepted is not None:
-                return HarnessResult(report=accepted, turns=turns, transcript=messages[-6:], log="\n".join(toolbox.log))
+                return HarnessResult(report=accepted, turns=turns, transcript=redactor.value(messages[-6:]),
+                                     log=redactor.text("\n".join(toolbox.log)))
 
     def _trim(self, messages: list[dict[str, Any]]) -> None:
         """Keep the conversation within budget by eliding the oldest tool outputs."""
-        total = sum(len(str(m.get("content") or "")) for m in messages)
+        def text_length(content):
+            if isinstance(content, list):
+                return sum(len(p.get("text", "")) for p in content if p.get("type") == "text")
+            return len(content or "")
+
+        total = sum(text_length(m.get("content")) for m in messages)
         if total <= CONTEXT_CHAR_BUDGET:
             return
         for message in messages[2:-8]:

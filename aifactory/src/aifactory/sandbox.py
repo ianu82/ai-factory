@@ -262,7 +262,8 @@ class LocalSandbox:
 
     async def exec(self, command: str, *, timeout: float = 600, cwd: str | None = None,
                    env: dict[str, str] | None = None, stdin: bytes | None = None,
-                   on_output: Callable[[bytes], None] | None = None) -> ExecResult:
+                   on_output: Callable[[bytes], None] | None = None,
+                   output_redactor=None) -> ExecResult:
         if self._closed:
             raise SandboxError("Sandbox is closed")
         workdir = self.resolve(cwd) if cwd else self.work
@@ -281,24 +282,40 @@ class LocalSandbox:
         total = 0
         timed_out = False
 
-        async def pump() -> None:
+        import codecs
+
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+        def append_output(block: bytes) -> None:
             nonlocal total
+            if not block:
+                return
+            total += len(block)
+            chunks.append(block)
+            if on_output is not None:
+                try:
+                    on_output(block)
+                except Exception:  # progress reporting must never break a command
+                    pass
+            # Keep memory bounded: retain head and a rolling tail.
+            if total > 4 * (HEAD_BYTES + TAIL_BYTES):
+                joined = b"".join(chunks)
+                chunks[:] = [joined[:HEAD_BYTES], joined[-(TAIL_BYTES * 2):]]
+
+        async def pump() -> None:
             assert proc.stdout is not None
             while True:
                 block = await proc.stdout.read(65536)
+                eof = not block
+                if output_redactor is not None:
+                    block = output_redactor.feed(decoder.decode(block, final=eof), final=eof).encode()
                 if not block:
+                    if eof:
+                        break
+                    continue
+                append_output(block)
+                if eof:
                     break
-                total += len(block)
-                chunks.append(block)
-                if on_output is not None:
-                    try:
-                        on_output(block)
-                    except Exception:  # progress reporting must never break a command
-                        pass
-                # Keep memory bounded: retain head and a rolling tail.
-                if total > 4 * (HEAD_BYTES + TAIL_BYTES):
-                    joined = b"".join(chunks)
-                    chunks[:] = [joined[:HEAD_BYTES], joined[-(TAIL_BYTES * 2):]]
 
         try:
             if stdin is not None and proc.stdin is not None:
@@ -319,6 +336,10 @@ class LocalSandbox:
                 except asyncio.TimeoutError:
                     pass
             self._groups.discard(proc.pid)
+            if timed_out and output_redactor is not None:
+                # wait_for cancelled the pump before EOF. Preserve its withheld
+                # diagnostic tail, through the same redaction/callback/buffer path.
+                append_output(output_redactor.feed(decoder.decode(b"", final=True), final=True).encode())
         data = b"".join(chunks)
         output, truncated = _clip(data)
         return ExecResult(
