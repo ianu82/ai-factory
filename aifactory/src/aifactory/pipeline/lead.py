@@ -203,13 +203,14 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
     if not outcome_ids:
         return notes
     current = {d.id: question_mark(db, d) for d in decisions}
-    # When the watcher last saw review change on each merge approval (watch_reviews).
+    merges = {d.id for d in decisions if d.kind == "approve_merge"}
+    # When the watcher last saw review change on each merge approval (watch_reviews): the latest per decision.
     review_changed: dict[str, datetime] = {}
-    for e in db.query(Event).filter(Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed") \
-            .order_by(Event.id.desc()).limit(500):
-        decision_id = (e.data or {}).get("decision_id")
-        if decision_id in wanted and decision_id not in review_changed:
-            review_changed[decision_id] = e.created_at
+    if merges:
+        decision_of = Event.data["decision_id"].as_string()
+        review_changed = dict(db.query(decision_of, func.max(Event.created_at)).filter(
+            Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed", decision_of.in_(merges))
+            .group_by(decision_of).all())
     rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
         .order_by(Message.created_at.desc(), Message.id.desc())
     for m in rows:
@@ -218,9 +219,10 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
         if decision_id not in wanted or decision_id in notes:
             continue
         # A note answers the question as it was when written: once the question or the commit up for merging
-        # changes, it is advice for something else and isn't shown. (Notes from before marks were recorded carry
-        # none and still show.)
-        if attribution.get("question") not in (None, current[decision_id]):
+        # changes, it is advice for something else and isn't shown. Notes from before marks were recorded carry
+        # none: they still show on a question, but not on a merge, where the commit may since have changed.
+        mark = attribution.get("question")
+        if mark != current[decision_id] and (mark is not None or decision_id in merges):
             notes[decision_id] = None
             continue
         # Nor once review changed after the Lead read it: a note saying review was clean must not outlive a new

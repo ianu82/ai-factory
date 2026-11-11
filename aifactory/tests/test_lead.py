@@ -985,3 +985,18 @@ def test_a_review_change_withdraws_the_leads_merge_note_without_a_run(world, cli
     assert shown()["text"].endswith("I recommend merging.")
     review_changed()  # a P1 arrives; the outcome's budget may be spent, so no run replaces the note
     assert shown() is None
+    with db.session_scope() as s:  # however much review changes on other merges afterwards
+        s.add_all([Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="lead_review_changed",
+                         message="Review of another PR changed.", data={"decision_id": f"other-{i}"})
+                   for i in range(501)])
+    assert shown() is None
+
+
+def test_a_note_from_before_marks_shows_on_a_question_but_not_on_a_merge(world, client):
+    with db.session_scope() as s:  # written before notes recorded what they answered
+        for decision_id, text in ((world["question"], "Use the durable queue."), (world["merge"], "Merge it.")):
+            s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=lead.lead_user(s).id,
+                          author_kind="lead", body=text, attribution={"decision_id": decision_id}))
+    inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+    assert inbox[world["question"]]["lead_note"]["text"] == "Use the durable queue."
+    assert inbox[world["merge"]]["lead_note"] is None  # the commit it was about may not be the one up for merging
