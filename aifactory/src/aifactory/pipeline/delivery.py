@@ -31,7 +31,8 @@ from ..sandbox import LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, outcome_cost, precedents,
+                      publish_decision, run_agent,
                       workspace_settings)
 
 from .lifecycle import transition
@@ -250,7 +251,7 @@ class TaskRunner:
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")
-            spent, known = outcome_cost(self.task.outcome_id)
+            spent, known = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
             if budget and known and spent >= budget and not (self.task.evidence or {}).get("budget_override"):
                 self.block("budget", f"Outcome #{self.outcome.number} reached its ${budget:.0f} budget",
                            f"Spent ${spent:.2f}. Raise the budget in Settings or approve continuing.", status="needs_input",

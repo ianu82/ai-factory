@@ -271,7 +271,7 @@ def test_lead_settings_are_validated(client, signed_in):
     ws = signed_in["workspaces"][0]["id"]
     r = client.patch(f"/api/workspaces/{ws}", json={"settings": {"lead": {"enabled": False, "run_usd": 1, "turns": 10}}})
     assert r.status_code == 200 and r.json()["settings"]["lead"] == {"enabled": False, "run_usd": 1.0, "turns": 10}
-    for bad in ({"run_usd": 50}, {"turns": 0}, {"enabled": "yes"}, {"model": "x"}, "on"):
+    for bad in ({"run_usd": 50}, {"turns": 1}, {"enabled": "yes"}, {"model": "x"}, "on"):
         assert client.patch(f"/api/workspaces/{ws}", json={"settings": {"lead": bad}}).status_code == 422
     with db.session_scope() as s:  # the refused changes left the saved settings alone
         assert s.get(Workspace, ws).settings["lead"] == {"enabled": False, "run_usd": 1.0, "turns": 10}
@@ -424,3 +424,24 @@ def test_a_failed_final_cost_reading_keeps_the_last_one(world, model, monkeypatc
     MeteredModel.readings = [0.5, 0.7]  # read after each call; the final read after the run finds nothing
     row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
     assert row.status == "succeeded" and row.cost_usd == 0.7 and row.cost_known is False
+
+
+def test_every_admission_counts_what_a_running_lead_has_reserved(world):
+    from aifactory.pipeline.planning import _over_budget
+    from aifactory.pipeline.runtime import outcome_committed
+
+    with db.session_scope() as s:
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
+                  status="succeeded", cost_usd=1.0, cost_known=True))
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="running", cost_usd=0.5, config_snapshot={"budget_reserved": 2.0}))
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="succeeded", cost_usd=0.25, config_snapshot={"budget_reserved": 2.0}))  # finished: holds nothing
+    assert outcome_committed(world["outcome"]) == (1.0 + 0.5 + 0.25 + 1.5, True)  # spent, plus $1.50 still held
+    settings = {"budgets": {"outcome_usd": 3.0}}
+    assert "reached its $3 budget" in _over_budget(world["outcome"], settings)  # planning can't take the Lead's share
+    assert _over_budget(world["outcome"], {"budgets": {"outcome_usd": 4.0}}) == ""
+
+
+def test_a_lead_always_has_a_turn_to_act(world):
+    assert lead.settings_for({"lead": {"turns": 1}})["turns"] == 2  # one to act, and the summary

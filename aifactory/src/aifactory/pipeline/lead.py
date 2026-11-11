@@ -82,7 +82,8 @@ def settings_for(settings: dict[str, Any]) -> dict[str, Any]:
     usd = cfg.get("run_usd")
     cfg["run_usd"] = float(usd) if type(usd) in (int, float) and math.isfinite(usd) and usd >= 0 else DEFAULTS["run_usd"]
     turns = cfg.get("turns")
-    cfg["turns"] = max(1, min(int(turns), 80)) if type(turns) is int else DEFAULTS["turns"]
+    # At least two: one to act, and the last, which only writes the summary.
+    cfg["turns"] = max(2, min(int(turns), 80)) if type(turns) is int else DEFAULTS["turns"]
     return cfg
 
 

@@ -16,7 +16,7 @@ from .decision_judges import allowed_resolutions, build_context, validate_report
 from .events import notify, record
 from .inference import BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider, workspace_models
 from .models import Decision, Outcome, Run
-from .pipeline.runtime import outcome_cost, workspace_settings
+from .pipeline.runtime import outcome_committed, workspace_settings
 
 SYSTEM = """You are a decision judge in the Factory control plane, not an execution agent.
 Review only the supplied record. You have no tools, repository access or authority
@@ -71,7 +71,7 @@ def _admit_budget(outcome_id: str, run_id: str, usd: float | None,
         active = s.query(Run).filter_by(outcome_id=outcome_id, role="judge", status="running").all()
         if any(r.id != run_id and (r.config_snapshot or {}).get("budget_admitted") for r in active):
             raise BudgetExceeded("Outcome budget is reserved by another judge review")
-        spent, known = outcome_cost(outcome_id)
+        spent, known = outcome_committed(outcome_id)  # including what a running Lead has reserved
         if outcome_limit is not None:
             if not known:
                 raise BudgetExceeded("Remaining outcome budget is unknown")

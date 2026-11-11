@@ -183,8 +183,8 @@ def _lead_settings(value: Any) -> dict[str, Any]:
         raise HTTPException(422, "lead.enabled must be true or false")
     if type(usd) not in (int, float) or not math.isfinite(usd) or not 0 <= usd <= 20:
         raise HTTPException(422, "lead.run_usd must be a number from 0 to 20")
-    if type(turns) is not int or not 1 <= turns <= 80:
-        raise HTTPException(422, "lead.turns must be a whole number from 1 to 80")
+    if type(turns) is not int or not 2 <= turns <= 80:  # one to act, and the last for the summary
+        raise HTTPException(422, "lead.turns must be a whole number from 2 to 80")
     return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
 
 

@@ -297,6 +297,20 @@ def outcome_cost(outcome_id: str) -> tuple[float, bool]:
         return run_cost + score_cost, run_unknown == 0 and score_unknown == 0
 
 
+def outcome_committed(outcome_id: str) -> tuple[float, bool]:
+    """What admitting more paid work must count against the outcome's budget: its recorded cost (outcome_cost), plus
+    what Lead runs in progress have reserved and not yet spent (pipeline/lead.py). A run admitted after a Lead can't
+    spend what the Lead set aside. A restart marks interrupted Lead runs failed, so no reservation outlives its run."""
+    spent, known = outcome_cost(outcome_id)
+    with session_scope() as s:
+        held = 0.0
+        for run in s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status == "running"):
+            reserved = (run.config_snapshot or {}).get("budget_reserved")
+            if isinstance(reserved, (int, float)) and not isinstance(reserved, bool) and reserved > 0:
+                held += max(0.0, float(reserved) - float(run.cost_usd or 0.0))
+    return spent + held, known
+
+
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,
                   task_id: str | None = None, options: list[dict[str, Any]] | None = None,
                   metadata: dict[str, Any] | None = None) -> str:
