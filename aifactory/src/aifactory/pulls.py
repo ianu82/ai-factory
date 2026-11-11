@@ -152,8 +152,10 @@ def classify(row: dict[str, Any]) -> tuple[str, str]:
         return "attention", "GitHub is blocking the merge (branch protection or required review)"
     if factory.get("status") == "awaiting_approval":
         return "ready", "Checks passed; merge needs approval in AI Factory"
-    if factory.get("status") in ("running", "queued", "waiting_ci") and factory.get("stage") in ("ci", "merge", "publish"):
-        return "checks", "The Factory is merging this" if factory.get("stage") == "merge" else "The Factory is watching CI"
+    if factory.get("status") in ("running", "queued", "waiting_ci") and factory.get("stage") in (
+            "ci", "review", "merge", "publish"):
+        return "checks", {"merge": "The Factory is merging this", "review": "The Factory is waiting for a review"}.get(
+            factory.get("stage"), "The Factory is watching CI")
     return "ready", "Checks passed" if ci.get("state") == "success" else "No checks reported"
 
 
