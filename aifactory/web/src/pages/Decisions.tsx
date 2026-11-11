@@ -20,7 +20,7 @@ export function DecisionsPage() {
   const toggle = async (d: Decision) => {
     try {
       if (d.kind === "ruling" && d.reusable) await api(`/api/workspaces/${ws.id}/rulings/${d.id}`, { method: "DELETE" });
-      else await api(`/api/workspaces/${ws.id}/decisions/${d.id}`, { method: "PATCH", json: { reusable: !d.reusable, scope: "workspace" } });
+      else await api(`/api/workspaces/${ws.id}/decisions/${d.id}`, { method: "PATCH", json: { reusable: !d.reusable, scope: d.scope === "repository" ? "repository" : "workspace" } });
       qc.invalidateQueries({ queryKey: ["decisions", ws.id] });
     } catch (err) {
       toast((err as Error).message, true);

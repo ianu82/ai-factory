@@ -151,7 +151,7 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
                 break
             offset += page
         # Team rulings are rules, not examples: every applicable one is always given, beyond the limit.
-        rules = [d for d in applicable(query.filter(Decision.kind == "ruling").limit(200).all())]
+        rules = applicable(query.filter(Decision.kind == "ruling").all())
         return rules + found[:limit]
 
 
