@@ -208,11 +208,6 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 budgets[o.workspace_id] = _limit((settings.get("budgets") or {}).get("outcome_usd"))
             if not cache[o.workspace_id]["enabled"]:
                 continue
-            limit = budgets[o.workspace_id]
-            if limit is not None and outcome_committed(o.id)[0] >= limit and not continued_past_budget(s, o.id):
-                # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
-                # and trying every 15 minutes would only fill the activity with failed runs.
-                continue
             runs = s.query(Run).filter(Run.outcome_id == o.id, Run.role == "lead")
             last = runs.order_by(Run.started_at.desc()).first()
             if last is not None:
@@ -236,6 +231,11 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             if posts:
                 reasons.append(f"{len(posts)} new post{'s' if len(posts) != 1 else ''} from people")
             if not reasons:
+                continue
+            limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
+            if limit is not None and outcome_committed(o.id)[0] >= limit and not continued_past_budget(s, o.id):
+                # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
+                # and trying every 15 minutes would only fill the activity with failed runs.
                 continue
             until = posts[-1].created_at.isoformat() if posts else seen.get("posts_until")
             woken.append({"workspace_id": o.workspace_id, "outcome_id": o.id, "reasons": reasons,

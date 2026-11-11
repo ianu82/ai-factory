@@ -539,3 +539,16 @@ def test_a_person_letting_a_spent_outcome_continue_lets_its_lead_work(world, mod
     model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
     row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
     assert row.status == "succeeded" and row.config_snapshot["budget_reserved"] == 2.0  # only its own cap applies
+
+
+def test_a_cut_off_lead_run_holds_no_budget(world):
+    from aifactory.pipeline.runtime import outcome_committed
+
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": 2}}
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="running", started_at=db.utcnow() - timedelta(hours=1),
+                  config_snapshot={"budget_reserved": 2.0}))  # crashed holding the whole budget
+    assert outcome_committed(world["outcome"]) == (0.0, True)  # stale: it holds nothing
+    assert world["outcome"] in woken()  # so its Lead can run again
