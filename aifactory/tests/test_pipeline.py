@@ -2174,3 +2174,24 @@ def test_patch_paths_use_nul_delimiters(factory):
         finally:
             await sandbox.close()
     asyncio.run(go())
+
+
+def test_checks_and_smoke_run_holding_a_host_check_slot(factory, monkeypatch):
+    # A repository's checks (usually its whole suite) share the host with every other job. Each run holds a check
+    # slot, so a crowd of them waits its turn instead of timing out together; the timeout starts with the slot.
+    from aifactory.pipeline.check_slots import check_slot_usage
+
+    run_commands = delivery.TaskRunner._run_commands
+    held = []
+
+    async def recording(self, sandbox, commands, kind, timeout=1500):
+        if commands:
+            held.append((kind, check_slot_usage()["running"]))
+        return await run_commands(self, sandbox, commands, kind, timeout)
+
+    monkeypatch.setattr(delivery.TaskRunner, "_run_commands", recording)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked")), "pipeline did not finish"
+    assert outcome_status(outcome_id) == "completed"
+    assert ("check", 1) in held and ("smoke", 1) in held, held
+    assert all(running == 1 for kind, running in held if kind in ("check", "smoke")), held
