@@ -185,6 +185,103 @@ def test_failed_verification_feeds_back_and_second_attempt_passes(factory):
     assert seen_feedback, "builder never saw the verifier's feedback"
 
 
+def _reviewing(report):
+    """A verifier that looks at the change, then reports ``report``."""
+    def verifier(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh"})]}
+        return {"content": "", "tool_calls": [call("finish", report)]}
+    return verifier
+
+
+def test_a_later_review_is_given_the_previous_verdict_and_what_changed_since(factory):
+    def adds_notes(messages):  # leaves greet.sh as the first attempt wrote it
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("write_file", {"path": "notes.txt", "content": "quoting\n"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Added notes.",
+                                                              "tests": []})]}
+
+    passed = [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}]
+    # A blocker fails a change whose criteria all pass. The second review then fails the criterion it had passed.
+    first = {"verdict": "fail", "summary": "Unsafe quoting.", "criteria": passed, "findings": [
+        {"severity": "blocker", "description": "greet.sh breaks when HOME has spaces", "location": "greet.sh:1"}]}
+    second = {"verdict": "fail", "summary": "The greeting is wrong after all.", "findings": [],
+              "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "prints Hello"}]}
+    builder, _ = _in_turn(good_builder, adds_notes, good_builder)
+    verifier, reviews = _in_turn(_reviewing(first), _reviewing(second), passing_verifier)
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=120)
+    assert _task_state(outcome_id)[0] == "completed"
+    records = _attempt_records(outcome_id)
+    assert [(a["n"], a["result"]) for a in records] == [
+        (1, "verification_failed"), (2, "verification_failed"), (3, "verified")]
+    # The first review has nothing before it. The second is given the first verdict and which files changed since.
+    assert "## Your previous review" not in reviews[0]
+    for said in ("## Your previous review (attempt 1)", "Verdict: fail. Unsafe quoting.",
+                 f"- [pass] {CRITERION} — sh test.sh exit 0",
+                 "- blocker: greet.sh breaks when HOME has spaces greet.sh:1",
+                 "Files whose diff changed: notes.txt", "Files whose diff is the same as then: greet.sh"):
+        assert said in reviews[1], said
+    assert "was not recorded" not in reviews[1] and "The base commit moved" not in reviews[1]
+    # The third attempt changed nothing, and its review is told so.
+    assert "## Your previous review (attempt 2)" in reviews[2]
+    assert "No file's diff changed: the change is exactly as that review saw it." in reviews[2]
+    # A criterion that passed and then failed is recorded on the attempt and on the event.
+    assert "flipped" not in records[0] and records[1]["flipped"] == [CRITERION]
+    with session_scope() as s:
+        failed = s.query(Event).filter(Event.outcome_id == outcome_id,
+                                       Event.kind == "verification_failed").order_by(Event.id).all()
+        assert [e.data.get("flipped") for e in failed] == [None, [CRITERION]]
+
+
+def test_major_findings_on_a_passing_review_are_shown_on_the_pull_request(factory):
+    findings = [{"severity": "major", "description": "Add a regression test for an empty HOME", "location": "test.sh"},
+                {"severity": "minor", "description": "Quote the greeting consistently", "location": "greet.sh:1"}]
+    ScriptedModel.scripts["verifier"] = _reviewing({
+        "verdict": "pass", "summary": "Greeting verified.", "findings": findings,
+        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}]})
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"  # advice does not stop the merge
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [(1, "verified")]
+    body = FakeGitHub.pulls[1]["body"]
+    assert ("### Reviewer notes\nThe independent review passed, with these points to follow up:\n"
+            "- Add a regression test for an empty HOME (`test.sh`)") in body
+    assert "Quote the greeting consistently" not in body
+
+
+def test_a_verifier_report_missing_a_criterion_is_corrected_in_the_same_session(factory):
+    second = "test.sh passes"
+
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        report = json.loads(planner_script(messages)["tool_calls"][0]["function"]["arguments"])
+        report["tasks"][0]["acceptance"] = [CRITERION, second]
+        return {"content": "", "tool_calls": [call("finish", report)]}
+
+    replies = []
+
+    def verifier(messages):
+        if step(messages) < 2:
+            return passing_verifier(messages)  # looks, then reports on one of the task's two criteria
+        replies[:] = [m["content"] for m in messages if m["role"] == "tool" and "Report not accepted" in m["content"]]
+        return {"content": "", "tool_calls": [call("finish", {
+            "verdict": "pass", "summary": "Greeting verified.", "findings": [],
+            "criteria": [{"criterion": c, "status": "pass", "evidence": "sh test.sh exit 0"}
+                         for c in (CRITERION, second)]})]}
+
+    ScriptedModel.scripts.update(planner=planner, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+    assert len(replies) == 1 and replies[0].startswith(
+        "Report not accepted: The report has results for 1 of the task's 2 acceptance criteria (1 missing).")
+    with session_scope() as s:  # one verifier session: it corrected its report instead of failing
+        assert s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "verifier").count() == 1
+
+
 def test_plan_approval_policy_waits_for_a_person(factory, client):
     with session_scope() as s:
         ws = s.get(Workspace, factory["ws"])
@@ -794,16 +891,19 @@ def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(fact
     assert title == "T1 did not pass after 1 attempts and an automatic retry"
     with session_scope() as s:
         verdict = s.get(Task, task_id).evidence["attempts"][-1]["verdict"]
+        # The verifier passed the change; the runtime failure alone fails it, as a blocker.
+        assert verdict["verdict"] == "fail" and all(c["status"] == "pass" for c in verdict["criteria"])
+        assert [f["severity"] for f in verdict["findings"] if f.get("location") == "runtime QA"] == ["blocker"]
         assert any("Required runtime QA failed: the app did not start" in f["description"] for f in verdict["findings"])
 
 
 def test_a_runtime_qa_failure_is_recorded_even_when_the_verifier_already_failed(factory):
-    def bare_failing_verifier(messages):  # fails with all criteria passing and no findings
+    def bare_failing_verifier(messages):  # fails on its own grounds, with no findings
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "true"})]}
         return {"content": "", "tool_calls": [call("finish", {
             "verdict": "fail", "summary": "Not convinced.",
-            "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "ok"}], "findings": []})]}
+            "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "not shown"}], "findings": []})]}
 
     ScriptedModel.scripts["verifier"] = bare_failing_verifier
     with session_scope() as s:
@@ -958,6 +1058,65 @@ def test_reviewer_findings_survive_a_retry(factory):
     runner = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
     joined = "\n".join(runner.feedback)
     assert "Race on credential save" in joined and "stale token" in joined and "events published before commit" in joined
+
+
+def _review_with_open_points(messages):
+    """A review that fails the criterion and raises eight findings: ten lines of feedback."""
+    if step(messages) == 0:
+        return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh"})]}
+    return {"content": "", "tool_calls": [call("finish", {
+        "verdict": "fail", "summary": "Greeting is not robust.",
+        "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "breaks under set -u"}],
+        "findings": [{"severity": "blocker" if i == 0 else "major", "description": f"Open point {i}",
+                      "location": f"greet.sh:{i}"} for i in range(8)]})]}
+
+
+def test_the_builder_gets_the_whole_review_and_its_open_points_outlive_a_failed_check_and_a_restart(factory):
+    def typo_builder(messages):  # a change that fails the repository's check
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [
+                call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factry!'\n"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    builder, prompts = _in_turn(good_builder, typo_builder, _slow_builder, good_builder)
+    verifier, _ = _in_turn(_review_with_open_points, passing_verifier)
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: len(prompts) == 3, timeout=120)  # the server restarts during the third attempt
+    assert _task_state(outcome_id)[:2] == ("queued", "build")
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=120)
+    assert _task_state(outcome_id)[0] == "completed" and len(prompts) == 4
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [
+        (1, "verification_failed"), (2, "checks_failed"), (3, "verified")]
+    unmet = f"Criterion not met: {CRITERION} — breaks under set -u"
+    # After the failed review: all of it, though it is more than eight lines.
+    assert "## Feedback from the previous attempt — address every point" in prompts[1]
+    assert "- Independent review FAILED. Greeting is not robust." in prompts[1] and f"  - {unmet}" in prompts[1]
+    assert all(f"Open point {i} greet.sh:{i}" in prompts[1] for i in range(8))
+    assert "## Still open from the review" not in prompts[1]
+    # After the failed check: its failure in full, then what the review left open, under a standing heading. The
+    # third prompt was built by the runner that ran the check; the fourth after the restart, from the evidence.
+    standing = "\n".join(["## Still open from the review of attempt 1", f"- {unmet}",
+                          "- blocker: Open point 0 greet.sh:0",
+                          *[f"- major: Open point {i} greet.sh:{i}" for i in range(1, 8)]])
+    for prompt in prompts[2:]:
+        assert "`sh test.sh` failed (exit 1)" in prompt and "expected greeting, got: Hello, Factry!" in prompt
+        assert standing in prompt
+
+
+def test_the_attempt_limit_decision_shows_the_whole_of_the_latest_feedback(factory):
+    ScriptedModel.scripts["verifier"] = _review_with_open_points
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 0}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    with session_scope() as s:
+        body = s.get(Decision, _open_decision(outcome_id, "unblock")).body
+    assert "- Independent review FAILED. Greeting is not robust." in body
+    assert f"  - Criterion not met: {CRITERION} — breaks under set -u" in body
+    assert all(f"Open point {i} greet.sh:{i}" in body for i in range(8))
 
 
 def test_runtime_qa_boots_the_app_and_attaches_screenshots(factory):
@@ -3272,7 +3431,8 @@ def test_rebased_rejection_cannot_merge_until_subsequent_scripted_verification_p
             return {'content': '', 'tool_calls': [call('run', {'command': 'sh test.sh'})]}
         if verified[-1] == 'reject':
             return {'content': '', 'tool_calls': [call('finish', {
-                'verdict': 'fail', 'summary': 'Please cover the interaction', 'criteria': [],
+                'verdict': 'fail', 'summary': 'Please cover the interaction',
+                'criteria': [{'criterion': CRITERION, 'status': 'fail', 'evidence': 'interaction not covered'}],
                 'findings': [{'severity': 'major', 'description': 'Add interaction coverage'}]})]}
         return passing_verifier(messages)
 

@@ -126,6 +126,9 @@ class TaskRunner:
         self._instructions: dict[tuple[str, bool], list[str]] = {}
         self._load()
         self.feedback = self._prior_feedback()
+        # Where the latest attempt's results sit in ``self.feedback``. Every other line is a note for the round (a
+        # setup problem, a branch conflict, a CI failure, revalidation feedback), kept until a review passes.
+        self._results = slice(0, len(self.feedback))
         self.builder_report = (self.task.evidence or {}).get("builder_report") or {}
         revalidation = (self.task.evidence or {}).get("revalidation") or {}
         if revalidation.get("phase") in ("rejected", "handled"):
@@ -140,27 +143,91 @@ class TaskRunner:
         return plan_context(self.task_id) + self._instructions[key]
 
     def _prior_feedback(self) -> list[str]:
-        """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
-        notes: list[str] = []
-        for attempt in (self.task.evidence or {}).get("attempts", [])[-3:]:
-            verdict = attempt.get("verdict") or {}
-            if attempt.get("result") == "verification_failed" and verdict:
-                notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
-                for c in _objects(verdict.get("criteria")):
-                    if c.get("status") != "pass":
-                        notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
-                for f in _objects(verdict.get("findings")):
-                    if f.get("severity") in ("blocker", "major"):
-                        notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
-            elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks") or []):
-                for c in attempt["checks"]:
-                    if not c.get("ok"):
-                        notes.append(f"- In an earlier attempt, check `{c.get('command')}` failed (exit {c.get('exit_code')})"
-                                     + (" (it fails the same way on the base commit)" if c.get("preexisting") else "")
-                                     + (f":\n```\n{c['tail']}\n```" if c.get("tail") else ""))
-            elif attempt.get("result") in ("checks_failed", "policy"):
-                notes.append(f"- An earlier attempt failed: {attempt.get('detail') or attempt.get('result')}")
-        return notes
+        """The latest attempt's results, rebuilt from the evidence so they survive retries and restarts. What an
+        earlier review left open is added when the builder's prompt is built (see ``_builder_feedback``)."""
+        for attempt in reversed((self.task.evidence or {}).get("attempts", [])):
+            result = attempt.get("result") if isinstance(attempt, dict) else None
+            if result is None or result in NOT_ATTEMPTS or result == "builder_blocked":
+                continue  # not the end of an attempt: what came before it still stands
+            verdict, failed = attempt.get("verdict"), [c for c in _objects(attempt.get("checks")) if not c.get("ok")]
+            if result == "verification_failed" and isinstance(verdict, dict) and verdict:
+                return _review_feedback(verdict, str(attempt.get("app_log") or ""))
+            if result == "checks_failed" and failed:
+                return [f"- Check `{c.get('command')}` failed (exit {c.get('exit_code')})"
+                        + (" (it fails the same way on the base commit)" if c.get("preexisting") else "")
+                        + (f":\n```\n{c['tail']}\n```" if c.get("tail") else "") for c in failed]
+            if result == "builder_failed":
+                return [f"- The previous builder session ended without a report: {attempt.get('error') or ''}"]
+            if result == "policy" and attempt.get("detail"):
+                return [str(attempt["detail"])]
+            return [f"- The previous attempt failed: {result}"] if result in ("checks_failed", "policy") else []
+        return []
+
+    def _builder_feedback(self) -> list[str]:
+        """What the next builder session is told: the latest attempt's results in full, then the round's notes, then
+        what the most recent review left open when the latest attempt did not reach review. From here on, lines
+        added to ``self.feedback`` are the results of the attempt that is starting."""
+        results = self.feedback[self._results]
+        del self.feedback[self._results]
+        self._results = slice(len(self.feedback), None)
+        lines, room = [], FEEDBACK_CHARS
+        items = list(dict.fromkeys(results + self.feedback))
+        for i, item in enumerate(items):
+            if len(item) > room:
+                left = len(items) - i - 1
+                lines.append(f"{item[:room]}\n… (cut for length; {left} more feedback item(s) left out)")
+                break
+            lines.append(item)
+            room -= len(item)
+        review = self._open_review()
+        if review and _review_feedback(review[1])[0] not in results:
+            points = _open_points(review[1])
+            if points:
+                lines += ["", f"## Still open from the review of attempt {review[0]}", *points]
+        return lines
+
+    def _open_review(self) -> tuple[Any, dict[str, Any]] | None:
+        """The task's most recent review, when it failed: (attempt, verdict). None once a review has passed."""
+        for attempt in reversed((self.task.evidence or {}).get("attempts", [])):
+            if isinstance(attempt, dict) and attempt.get("result") in ("verified", "verification_failed"):
+                verdict = attempt.get("verdict")
+                failed = attempt["result"] == "verification_failed" and isinstance(verdict, dict) and verdict
+                return (attempt.get("n"), verdict) if failed else None
+        return None
+
+    def _previous_review(self, patch: Patch) -> dict[str, Any] | None:
+        """The last verdict on this task within the current budget and which files' diffs changed since, for the
+        verifier's prompt (see ``prompts.previous_review``). The file lists are None when the diff that review saw
+        cannot be loaded."""
+        last = next((a for a in reversed(self._budget_attempts())
+                     if isinstance(a.get("verdict"), dict) and a["verdict"].get("verdict")), None)
+        if last is None:
+            return None
+        before = self._stored_diff(last)
+        changed, unchanged = _diff_changes(before, patch.diff) if before is not None else (None, None)
+        return {"attempt": last.get("n"), "verdict": last["verdict"], "changed": changed, "unchanged": unchanged,
+                "base": last.get("base_sha") or ""}
+
+    def _stored_diff(self, attempt: dict[str, Any]) -> bytes | None:
+        """The diff an attempt's review saw, or None when it was not stored whole."""
+        if not attempt.get("diff_artifact_id") or not attempt.get("patch_sha256"):
+            return None
+        with session_scope() as s:
+            diff = s.get(Artifact, attempt["diff_artifact_id"])
+            raw = (diff.content or "").encode() if diff is not None else None
+        return raw if raw is not None and hashlib.sha256(raw).hexdigest() == attempt["patch_sha256"] else None
+
+    def _reviewed_diff(self, patch: Patch, attempt: int) -> str:
+        """The stored diff of the candidate under review: the attempt's own diff artifact, or a new one when the
+        candidate has none (a revalidation reviews the rebased change)."""
+        content = patch.diff.decode("utf-8", "replace")
+        with session_scope() as s:
+            latest = s.query(Artifact).filter(Artifact.task_id == self.task_id, Artifact.kind == "diff").order_by(
+                Artifact.created_at.desc()).first()
+            if latest is not None and latest.content == content[:400_000]:
+                return latest.id
+        return self.artifact("diff", f"Attempt {attempt} diff as reviewed", content, files=patch.files,
+                             additions=patch.additions, deletions=patch.deletions)
 
     # state ---------------------------------------------------------------------
     def _load(self) -> None:
@@ -319,7 +386,7 @@ class TaskRunner:
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
                 attempt = self.task.attempt + 1
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
-                summary = "\n".join(self.feedback[-6:])[:3000]
+                summary = "\n".join(self.feedback[self._results] or self.feedback)[:3000]
                 retried = int((self.task.evidence or {}).get("auto_retries", 0))
                 tried = f"{max_attempts} attempts" + (" and an automatic retry" if retried == 1 else
                                                       f" and {retried} automatic retries" if retried else "")
@@ -365,7 +432,7 @@ class TaskRunner:
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
-                prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
+                prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
                                     precedents(self.ws, self.repo.id),
                                     guidance_history(self.task.outcome_id, self.task_id), sections)), self.cancelled)
             if result is None:
@@ -665,6 +732,7 @@ class TaskRunner:
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
         qa_cfg = self.cfg.get("qa") or {}
         error = ""
+        previous = self._previous_review(patch)
         for tries in range(2):
             sandbox = None
             app: AppRun | None = None
@@ -685,11 +753,11 @@ class TaskRunner:
                         workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                         harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
                         attempt=attempt, writable=False, effective_settings=self.settings,
-                        repositories={self.repo.full_name: self.cfg},
+                        repositories={self.repo.full_name: self.cfg}, expected_criteria=len(self.task.acceptance or []),
                         prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
                                              precedents(self.ws, self.repo.id),
                                              guidance_history(self.task.outcome_id, self.task_id),
-                                             outcome=self.outcome, sections=sections)
+                                             outcome=self.outcome, sections=sections, previous=previous)
                         + brief), self.cancelled)
                     if app is not None:
                         await self._store_app_evidence(app, attempt, run.id)
@@ -707,9 +775,9 @@ class TaskRunner:
             runtime_problem = self._runtime_problem(app, qa_cfg)
             if runtime_problem:
                 # Recorded as a finding whatever the verifier said, so later attempts (and the automatic retry) see
-                # the concrete failure; a passing verdict is overridden.
+                # the concrete failure; a passing verdict is overridden. A blocker: the change must not merge as it is.
                 report = {**report, "findings": [*(report.get("findings") or []), {
-                    "severity": "major", "description": f"Required runtime QA failed: {runtime_problem}",
+                    "severity": "blocker", "description": f"Required runtime QA failed: {runtime_problem}",
                     "location": "runtime QA"}]}
                 if report["verdict"] == "pass":
                     report = {**report, "verdict": "fail",
@@ -724,19 +792,23 @@ class TaskRunner:
                     self._set_evidence({"infra_retries": 0, "infra_retry_at": None, "infra_phase": None})
                 self.event("verified", f"Independent verification passed: {report.get('summary', '')[:300]}",
                            level="success")
+                self.feedback.clear()  # a passing review settles everything raised before it
+                self._results = slice(0, 0)
                 return report
-            failing = [c for c in _objects(report.get("criteria")) if c.get("status") != "pass"]
-            findings = [f for f in _objects(report.get("findings")) if f.get("severity") in ("blocker", "major")]
-            self.feedback.append("- Independent review FAILED. " + report.get("summary", "")[:1500])
-            self.feedback += [f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:600]}"
-                              for c in failing]
-            self.feedback += [f"  - {f['severity']}: {str(f.get('description', ''))[:600]} {f.get('location', '')}"
-                              for f in findings]
-            if runtime_problem and app is not None and app.evidence.get("log_tail"):
-                self.feedback.append(f"  - App log when it failed:\n```\n{app.evidence['log_tail'][-1500:]}\n```")
+            app_log = str(app.evidence.get("log_tail") or "")[-1500:] if runtime_problem and app is not None else ""
+            if self._results.stop is not None:  # no attempt is running (a revalidation): this replaces the last results
+                del self.feedback[self._results]
+                self._results = slice(len(self.feedback), None)
+            self.feedback += _review_feedback(report, app_log)
+            self._results = slice(self._results.start, len(self.feedback))
+            # With what this review saw, so the next one can be told what changed since, and the criteria it failed
+            # that the previous review had passed.
+            seen = {"diff_artifact_id": self._reviewed_diff(patch, attempt), "base_sha": self.task.base_sha,
+                    "patch_sha256": hashlib.sha256(patch.diff).hexdigest()} | ({"app_log": app_log} if app_log else {})
+            flipped = {"flipped": _flipped(previous["verdict"], report)} if previous else {}
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
-                                       "checks": _brief(self.checks), "app_run": self.app_summary})
-            self.event("verification_failed", report.get("summary", "")[:400], level="warn")
+                                       "checks": _brief(self.checks), "app_run": self.app_summary, **seen, **flipped})
+            self.event("verification_failed", str(report.get("summary") or "")[:400], level="warn", **flipped)
             return None
         if infrastructure_problem(error) == "transient":
             self._infrastructure(attempt, "verify", error, "transient")
@@ -1147,6 +1219,13 @@ class TaskRunner:
             c = by.get(criterion) or next((v for k, v in by.items() if k and criterion[:40] in k), {})
             mark = {"pass": "✅", "fail": "❌"}.get(c.get("status", ""), "◻️")
             lines.append(f"- {mark} {criterion}" + (f"  \n  <sub>{c.get('evidence', '')[:400]}</sub>" if c else ""))
+        notes = [f for f in _objects(self.verifier_report.get("findings")) if f.get("severity") == "major"]
+        if notes:  # advice on a passing review: it did not stop the merge
+            lines += ["", "### Reviewer notes", "The independent review passed, with these points to follow up:"]
+            lines += [f"- {_one_line(f.get('description'))}" + (f" (`{_one_line(f['location'], 120)}`)"
+                                                                if f.get("location") else "") for f in notes[:10]]
+            if len(notes) > 10:
+                lines.append(f"- … and {len(notes) - 10} more in the verification report")
         if self.app_summary:
             a = self.app_summary
             where = a.get("isolation") or "a fresh sandbox"
@@ -1607,8 +1686,10 @@ class TaskRunner:
                     verdict = await self._verify(token, patch, self.task.attempt)
                     state["verifier"] = self.verifier_report
                     if verdict is None:
+                        # The review is the latest results in ``self.feedback`` and an attempt record, which
+                        # ``_prior_feedback`` reads after a restart: nothing to carry in the revalidation state.
                         state.update(phase="rejected", reason="failed independent verification after rebase",
-                                     feedback=self.feedback[-8:])
+                                     feedback=[])
                     else:
                         state["phase"] = "passed"
                     self.evidence("revalidation", state)
@@ -1844,6 +1925,68 @@ def _revalidation_section(state: dict[str, Any]) -> str:
 def _objects(items: Any) -> list[dict[str, Any]]:
     """The objects in a model-written list (a verifier's criteria or findings); anything else in it is skipped."""
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+FEEDBACK_CHARS = 40_000  # the most feedback one builder prompt carries; each item is already cut to its own limit
+
+
+def _one_line(text: Any, limit: int = 300) -> str:
+    return " ".join(str(text or "").split())[:limit]
+
+
+def _review_feedback(verdict: dict[str, Any], app_log: str = "") -> list[str]:
+    """A failed review as the builder's feedback: its summary, each criterion that is not met and each blocker or
+    major finding."""
+    lines = ["- Independent review FAILED. " + str(verdict.get("summary") or "")[:1500]]
+    lines += [f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:600]}"
+              for c in _objects(verdict.get("criteria")) if c.get("status") != "pass"]
+    lines += [f"  - {f['severity']}: {str(f.get('description', ''))[:600]} {f.get('location', '')}"
+              for f in _objects(verdict.get("findings")) if f.get("severity") in ("blocker", "major")]
+    if app_log:
+        lines.append(f"  - App log when it failed:\n```\n{app_log}\n```")
+    return lines
+
+
+def _open_points(verdict: dict[str, Any]) -> list[str]:
+    """What a failed review left open, one line each: criteria that are not met and blocker or major findings."""
+    points = [f"- Criterion not met: {_one_line(c.get('criterion'))} — {_one_line(c.get('evidence'))}"
+              for c in _objects(verdict.get("criteria")) if c.get("status") != "pass"]
+    points += [f"- {f['severity']}: {_one_line(f.get('description'))} {_one_line(f.get('location'), 120)}".rstrip()
+               for f in _objects(verdict.get("findings")) if f.get("severity") in ("blocker", "major")]
+    if not points and verdict.get("summary"):  # an older verdict that failed on its summary alone
+        points = [f"- {_one_line(verdict['summary'])}"]
+    return points[:30] + ([f"- … and {len(points) - 30} more"] if len(points) > 30 else [])
+
+
+def _diff_by_file(diff: bytes) -> dict[str, bytes]:
+    """A unified diff split into each file's part, by its ``diff --git`` headers."""
+    parts: dict[str, bytes] = {}
+    for part in re.split(rb"^(?=diff --git )", diff, flags=re.MULTILINE):
+        if part.startswith(b"diff --git "):
+            header = part.split(b"\n", 1)[0]
+            same = re.fullmatch(rb"diff --git a/(.+) b/\1", header)
+            parts[(same.group(1) if same else header[len(b"diff --git "):]).decode("utf-8", "replace")] = part
+    return parts
+
+
+def _diff_changes(before: bytes, after: bytes) -> tuple[list[str], list[str]]:
+    """Between two diffs of the same change: the files whose diff is different now (or that are in only one of
+    them), and the files whose diff is the same."""
+    old, new = _diff_by_file(before), _diff_by_file(after)
+    gone = [f"{name} (no longer part of the change)" for name in old if name not in new]
+    return [name for name in new if old.get(name) != new[name]] + gone, [name for name in new
+                                                                         if old.get(name) == new[name]]
+
+
+def _flipped(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """Criteria the previous verdict passed and this one does not, matched by their text (trimmed, case-folded): a
+    reworded criterion does not match."""
+    def key(c: dict[str, Any]) -> str:
+        return str(c.get("criterion") or "").strip().casefold()
+
+    passed = {key(c) for c in _objects(before.get("criteria")) if c.get("status") == "pass"} - {""}
+    return [str(c.get("criterion")) for c in _objects(after.get("criteria"))
+            if c.get("status") != "pass" and key(c) in passed]
 
 
 def _actionable(attempt: dict[str, Any]) -> bool:
