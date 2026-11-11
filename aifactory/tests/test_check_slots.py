@@ -31,6 +31,29 @@ def test_slots_follow_the_cpus_the_host_allows(monkeypatch):
     assert check_slot_count() == 1  # unreadable: the host's default
 
 
+def test_the_quota_comes_from_cgroup_v2_or_v1(tmp_path, monkeypatch):
+    from aifactory import sandbox
+
+    monkeypatch.delenv("AIFACTORY_CHECK_CONCURRENCY", raising=False)
+    monkeypatch.setattr(check_slots, "_cpu_set", lambda: 48)
+
+    def cgroup(name, files):
+        root = tmp_path / name
+        for path, value in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(value + "\n")
+        monkeypatch.setattr(sandbox, "CGROUP_ROOT", root)
+        return sandbox.host_capacity().get("cpu_quota"), check_slot_count()
+
+    assert cgroup("v2", {"cpu.max": "2400000 100000"}) == (24.0, 4)
+    assert cgroup("v2-unlimited", {"cpu.max": "max 100000"}) == (None, 8)  # the CPU set decides
+    assert cgroup("v1", {"cpu,cpuacct/cpu.cfs_quota_us": "1200000",
+                         "cpu,cpuacct/cpu.cfs_period_us": "100000"}) == (12.0, 2)
+    assert cgroup("v1-alone", {"cpu/cpu.cfs_quota_us": "600000", "cpu/cpu.cfs_period_us": "100000"}) == (6.0, 1)
+    assert cgroup("v1-unlimited", {"cpu/cpu.cfs_quota_us": "-1", "cpu/cpu.cfs_period_us": "100000"}) == (None, 8)
+    assert cgroup("none", {}) == (None, 8)
+
+
 def test_checks_beyond_the_slots_wait_their_turn(monkeypatch):
     monkeypatch.setenv("AIFACTORY_CHECK_CONCURRENCY", "2")
     state = {"now": 0, "peak": 0}
