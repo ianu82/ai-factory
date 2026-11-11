@@ -72,6 +72,19 @@ def workspace_settings(workspace_id: str) -> dict[str, Any]:
         return merged_settings(ws.settings if ws else {})
 
 
+def budget_extension(settings: dict[str, Any]) -> float:
+    """Dollars that continuing a task past the outcome budget adds to what is spent by then: budgets.continue_usd
+    when that is a positive number, else a quarter of the budget. The budget decision's button states this amount
+    and resolving it grants the same, so both read it here."""
+    budgets = settings.get("budgets") or {}
+
+    def positive(value: Any) -> float:
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return float(value) if number and 0 < value < float("inf") else 0.0
+
+    return max(0.01, round(positive(budgets.get("continue_usd")) or positive(budgets.get("outcome_usd")) / 4, 2))
+
+
 def guidance_history(outcome_id: str, task_id: str | None = None) -> list[str]:
     """All team guidance so far for an outcome (and this task), for inclusion in new prompts."""
     with session_scope() as s:
@@ -322,6 +335,18 @@ def outcome_committed(outcome_id: str) -> tuple[float, bool]:
             if isinstance(reserved, (int, float)) and not isinstance(reserved, bool) and reserved > 0:
                 held += max(0.0, float(reserved) - float(run.cost_usd or 0.0))
     return spent + held, known
+
+
+def outcome_allowance(outcome_id: str, budget: float | None = None) -> float:
+    """What the outcome may spend in all, to compare with outcome_committed(): ``budget``, or the largest amount a
+    person allowed one of its tasks when they let it continue past the budget (``budget_allowance_usd``, granted in
+    decisions.resolve and enforced by the gate in deliver()), whichever is more. 0.0 with neither. A task still
+    carrying the older ``budget_override`` has no amount until it next runs, when the gate gives it one."""
+    with session_scope() as s:
+        evidence = [ev for (ev,) in s.query(Task.evidence).filter(Task.outcome_id == outcome_id)]
+    allowed = [ev.get("budget_allowance_usd") for ev in evidence if isinstance(ev, dict)]
+    return max([float(budget or 0.0)] + [float(amount) for amount in allowed
+                                         if isinstance(amount, (int, float)) and not isinstance(amount, bool)])
 
 
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,

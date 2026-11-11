@@ -141,8 +141,10 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
         <dd>
           {runs.length === 0 ? "None yet" : runs.map((r) => (
             <div key={r.id} className="checkline">
-              <Mark status={r.status === "succeeded" ? "pass" : r.status === "running" ? "none" : "fail"} />
-              <span>{r.role} · {HARNESS_LABEL[r.harness]} · <span className="mono">{r.model}</span></span>
+              <Mark status={r.status === "succeeded" ? "pass"
+                : r.status === "running" || r.status === "interrupted" ? "none" : "fail"} />
+              <span>{r.role} · {HARNESS_LABEL[r.harness]} · <span className="mono">{r.model}</span>
+                {r.status === "interrupted" && " · Interrupted"}</span>
               <span className="muted num">{tokens(r.input_tokens + r.output_tokens)} tok · {money(r.cost_usd, r.cost_known)} · {duration(r.started_at, r.finished_at)}</span>
             </div>
           ))}

@@ -126,8 +126,12 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             task.evidence = fresh_budget(task.evidence)
     elif kind == "budget" and task:
         if resolution == "retry":
-            ev = dict(task.evidence or {})
-            ev["budget_override"] = True
+            from .pipeline.runtime import budget_extension, outcome_committed, workspace_settings
+
+            # An allowance, not an end to the limit: the gate in deliver() stops the task again once it is spent.
+            ev = {k: v for k, v in (task.evidence or {}).items() if k != "budget_override"}
+            ev["budget_allowance_usd"] = round(outcome_committed(task.outcome_id)[0]
+                                               + budget_extension(workspace_settings(task.workspace_id)), 2)
             task.evidence = ev
             task.status = "queued"
         else:
