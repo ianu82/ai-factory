@@ -456,10 +456,7 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
         gh = GitHub(resolve_credential(workspace_id))
         # The PR as it is now: a commit pushed straight to it isn't what the Factory put up for merging, and nothing
         # else here would notice (the task keeps the commit it published).
-        live = ((await gh.pull(repo, number)).get("head") or {}).get("sha")
-        if not isinstance(live, str) or not live:
-            raise ValueError("pull request has no head commit")
-        state["live_head"] = live
+        state["live_head"] = await _pr_head(gh, repo, number)
         latest: dict[str, str] = {}
         for review in await gh.reviews(repo, number):
             if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
@@ -476,19 +473,30 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
             if t.get("isResolved") or t.get("isOutdated") is True:
                 continue
             first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
-            if ((first.get("pullRequestReview") or {}).get("state") or "").upper() == "DISMISSED":
-                continue  # a dismissed review's findings aren't active, as in review.normalize_feedback
+            author = (first.get("author") or {}).get("login") or ""
+            of = ((first.get("pullRequestReview") or {}).get("state") or "").upper()
+            if of == "DISMISSED" or (of == "CHANGES_REQUESTED" and latest.get(author) != "CHANGES_REQUESTED"):
+                continue  # not active: dismissed, or a change request its reviewer since replaced (review.py does too)
             body = first.get("body") or ""
             found = SEVERITY.search(body)
             state["open"].append({"id": t.get("id") or "", "severity": found.group(1) if found else "",
                                   "path": t.get("path") or "",
-                                  "line": t.get("line"), "by": ((first.get("author") or {}).get("login") or ""),
+                                  "line": t.get("line"), "by": author,
                                   "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
+        # And again after: a commit pushed while review was being read makes this a snapshot of the old one.
+        state["live_head"] = await _pr_head(gh, repo, number)
         state["checked"] = True
     except Exception as exc:  # anything at all (a credential that no longer decrypts, a timeout): unknown, never clean
         log.warning("review state of %s#%s unreadable: %r", repo, number, exc)
         state["checked"] = False
     return state
+
+
+async def _pr_head(gh, repo: str, number: int) -> str:
+    sha = ((await gh.pull(repo, number)).get("head") or {}).get("sha")
+    if not isinstance(sha, str) or not sha:
+        raise ValueError("pull request has no head commit")
+    return sha
 
 
 def review_line(state: dict[str, Any], number: int) -> str:

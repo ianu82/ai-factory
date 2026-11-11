@@ -798,9 +798,9 @@ class FakeGitHub:
         return FakeGitHub.threads_data
 
 
-def thread(body, *, resolved=False, outdated=False, line=3, path="a.py", review="COMMENTED"):
+def thread(body, *, resolved=False, outdated=False, line=3, path="a.py", review="COMMENTED", by=lead.CODEX):
     return {"id": f"t-{path}-{line}", "isResolved": resolved, "isOutdated": outdated, "path": path, "line": line,
-            "comments": {"nodes": [{"author": {"login": lead.CODEX}, "body": body,
+            "comments": {"nodes": [{"author": {"login": by}, "body": body,
                                     "pullRequestReview": {"state": review}}]}}
 
 
@@ -809,13 +809,17 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
 
     monkeypatch.setattr(github, "GitHub", FakeGitHub)
     monkeypatch.setattr(github, "resolve_credential", lambda ws: "token")
-    FakeGitHub.reviews_data = [{"commit_id": "an-older-commit", "state": "COMMENTED", "user": {"login": lead.CODEX}}]
+    FakeGitHub.reviews_data = [{"commit_id": "an-older-commit", "state": "COMMENTED", "user": {"login": lead.CODEX}},
+                               {"commit_id": "an-older-commit", "state": "CHANGES_REQUESTED", "user": {"login": "pat"}},
+                               {"commit_id": HEAD, "state": "APPROVED", "user": {"login": "pat"}}]
     FakeGitHub.comments_data = [{"user": {"login": lead.CODEX}, "body": f"Codex Review: Reviewed commit `{HEAD[:10]}`"}]
     FakeGitHub.threads_data = [thread("**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"),
                                thread("P1 Badge", resolved=True, path="b.py"),
                                thread("P0 Badge", outdated=True, path="c.py"),
                                thread("P1 Badge  Don't ship this file", line=None, path="d.py"),  # a file comment
-                               thread("P1 Badge  Withdrawn", path="e.py", review="DISMISSED")]  # its review dismissed
+                               thread("P1 Badge  Withdrawn", path="e.py", review="DISMISSED"),  # its review dismissed
+                               # pat requested changes, then approved: that change request is replaced
+                               thread("P1 Badge  Rename it", path="f.py", review="CHANGES_REQUESTED", by="pat")]
     state = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
     assert state["checked"] and state["reviewed"]  # Codex's receipt names this commit
     assert [(f["severity"], f["path"]) for f in state["open"]] == [("P1", "a.py"), ("P1", "d.py")]
@@ -828,6 +832,16 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     assert lead.review_line(moved, 12).startswith("Review of PR #12 at abcdef1: the PR has moved on to fffffff")
     assert lead.review_fingerprint(moved) != lead.review_fingerprint(state)  # the watcher withdraws earlier notes
     monkeypatch.setattr(FakeGitHub, "live_head", HEAD)
+
+    class PushedDuring(FakeGitHub):  # a commit lands on the PR while review is being read
+        heads = iter([HEAD, "f" * 40])
+
+        async def pull(self, repo, number):
+            return {"head": {"sha": next(PushedDuring.heads)}}
+
+    monkeypatch.setattr(github, "GitHub", PushedDuring)
+    assert not lead.settled(asyncio.run(lead.review_state("ws", "team/app", 12, HEAD)))
+    monkeypatch.setattr(github, "GitHub", FakeGitHub)
 
     class Partial(FakeGitHub):
         async def review_threads(self, repo, number):  # the helper refuses partial GraphQL data
