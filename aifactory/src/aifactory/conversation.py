@@ -71,10 +71,14 @@ def conversation(db: Session, outcome: Outcome, viewer_id: str | None = None) ->
     if steps:
         thread.append({"kind": "working", "at": steps[-1]["at"], **_steps(steps)})
 
-    last = db.query(Run).filter(Run.outcome_id == outcome.id, Run.role == "lead").order_by(Run.started_at.desc()).first()
+    runs = db.query(Run).filter(Run.outcome_id == outcome.id, Run.role == "lead").order_by(Run.started_at).all()
+    last = runs[-1] if runs else None
     return {"items": thread, "started_in_mind": mind,
             "lead": {"model": last.model if last else None, "running": bool(last and last.status == "running"),
-                     "last_active": S.ts((last.finished_at or last.started_at) if last else None)}}
+                     "last_active": S.ts((last.finished_at or last.started_at) if last else None),
+                     # The Lead's narration and decisions are model spend of their own, within the outcome's cost.
+                     "cost_usd": round(sum(r.cost_usd or 0.0 for r in runs), 4),
+                     "cost_known": all(r.cost_known for r in runs)}}
 
 
 def _started_in_mind(db: Session, outcome: Outcome, viewer_id: str | None) -> dict[str, Any] | None:
@@ -142,7 +146,9 @@ def _step(e: Event, keys: dict[str, str]) -> dict[str, Any]:
     who = role or ("Planner" if e.kind.startswith("plan") or e.kind.startswith("planning") else "Factory")
     key = keys.get(e.task_id)
     step = {"at": S.ts(e.created_at), "who": f"{who} · {key}" if key else who, "text": e.message, "level": e.level,
-            "event": e.kind}
+            "event": e.kind, "run_id": e.run_id}
+    if isinstance(data.get("url"), str) and data["url"].startswith("https://"):
+        step["url"] = data["url"]
     if e.kind == "run_finished" and isinstance(data.get("cost_usd"), (int, float)):
         step["cost_usd"] = round(float(data["cost_usd"]), 4)
     return step

@@ -16,8 +16,8 @@ const RESOLUTION: Record<string, string> = {
   dismiss: "Dismissed", fix: "Fix opened", revert: "Reverted",
 };
 
-/** An outcome as a conversation: the Lead narrates, decisions sit in the thread, people message the Lead, and an
- * inspector keeps progress and tasks in view. "Full activity" opens the classic detail. */
+/** An outcome as a conversation: the Lead narrates, decisions sit in the thread, people message the Lead, and a side
+ * panel keeps progress and tasks in view. "Full activity" opens the classic detail. */
 export function OutcomeThread({ outcomeId, onBack }: { outcomeId: string; onBack: () => void }) {
   const { ws } = useWs();
   const [full, setFull] = useState(false);
@@ -62,6 +62,7 @@ export function OutcomeThread({ outcomeId, onBack }: { outcomeId: string; onBack
             <dl className="ofacts">
               <dt>Delivered</dt><dd className="num">{outcome.progress.done} of {outcome.progress.total || "—"}</dd>
               <dt>Cost so far</dt><dd className="num">{money(outcome.cost_usd, outcome.cost_known)}</dd>
+              {!!convo.data?.lead.cost_usd && <><dt>of which the Lead</dt><dd className="num">{money(convo.data.lead.cost_usd, convo.data.lead.cost_known)}</dd></>}
               <dt>Lead</dt><dd>{convo.data?.lead.model ? `${convo.data.lead.model}${convo.data.lead.running ? " · working" : convo.data.lead.last_active ? ` · active ${clock(convo.data.lead.last_active)}` : ""}` : "Joins at its first update"}</dd>
             </dl>
           </section>
@@ -174,8 +175,9 @@ function Item({ item }: { item: ConversationItem }) {
     case "person":
       return (
         <div className="operson">
-          <div className="by">{item.author}{item.operator ? " (operator)" : ""} · {clock(item.at)}{item.task_key ? ` · about ${item.task_key}` : ""}</div>
+          <div className="by">{item.author}{item.operator ? " (operator)" : ""} · {clock(item.at)}</div>
           <Prose text={item.text} />
+          <div className="oreceipt">To the Lead and {item.task_key ? `${item.task_key}'s agents` : "the outcome's agents"} · {item.delivered ? "delivered to an agent" : "waiting for an agent's next step"}</div>
         </div>
       );
     case "factory":
@@ -238,7 +240,8 @@ function Steps({ steps, omitted }: { steps: ConversationStep[]; omitted: number 
           {omitted > 0 && <li className="faint">{omitted} earlier step{omitted === 1 ? "" : "s"} in Full activity</li>}
           {steps.map((s, i) => (
             <li key={i} className={s.level}>
-              <span className="time num">{clock(s.at)}</span><b>{s.who}</b><span>{s.text}{s.cost_usd != null && <span className="faint"> · {money(s.cost_usd)}</span>}</span>
+              <span className="time num">{clock(s.at)}</span><b>{s.who}</b><span>{s.text}{s.cost_usd != null && <span className="faint"> · {money(s.cost_usd)}</span>}
+                {s.url && <> · <a className="linkish" href={s.url} target="_blank" rel="noreferrer">open</a></>}</span>
             </li>
           ))}
         </ol>

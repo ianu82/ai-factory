@@ -638,7 +638,10 @@ def test_the_outcome_reads_as_a_conversation(world, client):
         s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"], author_kind="user",
                       body="Why is the merge waiting?", created_at=base + timedelta(minutes=8)))
         s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="published",
-                    message="Opened PR #12", created_at=base + timedelta(minutes=9)))
+                    message="Opened PR #12", data={"url": "https://github.com/team/app/pull/12"},
+                    created_at=base + timedelta(minutes=9)))
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="succeeded", model="opus-5-5", cost_usd=0.21, started_at=base + timedelta(minutes=3)))
 
     r = client.get(f"/api/workspaces/{world['ws']}/outcomes/{world['outcome']}/conversation")
     assert r.status_code == 200, r.text
@@ -657,6 +660,9 @@ def test_the_outcome_reads_as_a_conversation(world, client):
     assert note["update"] is False and note["decision_id"] == world["merge"] and note["steps"] == []
     assert person["author"] == "Ian" and person["operator"] is False
     assert [s_["text"] for s_ in working["steps"]] == ["Opened PR #12"]
+    assert working["steps"][0]["url"] == "https://github.com/team/app/pull/12"  # evidence, one click away
+    assert r.json()["lead"] == {"model": "opus-5-5", "running": False, "last_active": r.json()["lead"]["last_active"],
+                                "cost_usd": 0.21, "cost_known": True}  # the Lead's own spend, its own line
 
     with db.session_scope() as s:
         other = Workspace(org_id=s.get(Workspace, world["ws"]).org_id, name="Other", slug="other")

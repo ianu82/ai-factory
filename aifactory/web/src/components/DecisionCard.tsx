@@ -40,6 +40,7 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
       toast("Recorded");
       qc.invalidateQueries({ queryKey: ["inbox", ws.id] });
       qc.invalidateQueries({ queryKey: ["outcome", ws.id] });
+      qc.invalidateQueries({ queryKey: ["conversation", ws.id] });
       qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });
     } catch (err) {
       toast((err as Error).message, true);

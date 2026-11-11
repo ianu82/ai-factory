@@ -374,6 +374,8 @@ export interface ConversationStep {
   text: string;
   level: string;
   event: string;
+  run_id?: string | null;
+  url?: string;
   cost_usd?: number;
 }
 
@@ -395,7 +397,7 @@ export interface Conversation {
   items: ConversationItem[];
   /** Set when a Mind conversation became this outcome; thread_id only for that conversation's owner. */
   started_in_mind: { thread_id: string | null } | null;
-  lead: { model: string | null; running: boolean; last_active: string | null };
+  lead: { model: string | null; running: boolean; last_active: string | null; cost_usd: number; cost_known: boolean };
 }
 
 export interface FactoryEvent {

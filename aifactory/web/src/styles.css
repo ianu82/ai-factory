@@ -706,6 +706,7 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
 .olead .prose { font-size: 14px; line-height: 1.6; color: var(--body); }
 .onote { margin-left: 42px; font-size: 13px; color: var(--body); }
 .onote .by { color: var(--faint); }
+.oreceipt { margin-top: 4px; font-size: 11.5px; color: var(--faint); }
 .operson { margin-left: auto; max-width: 80%; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 10px 14px; }
 .oneeds { margin-left: 42px; }
 .oneeds-tag { color: var(--human) !important; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px !important; }
