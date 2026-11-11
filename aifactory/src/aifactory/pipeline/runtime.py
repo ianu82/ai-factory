@@ -113,7 +113,8 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
     return take
 
 
-def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -> list[Decision]:
+def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12,
+                repo_ids: list[str] | None = None) -> list[Decision]:
     """Reusable, attributed human decisions that apply to this workspace (and repository)."""
     with session_scope() as s:
         query = (s.query(Decision)
@@ -125,6 +126,13 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
                      DecisionReview.workspace_id == workspace_id,
                      DecisionReview.correction_decision_id.is_not(None))).desc(),
                            Decision.resolved_at.desc(), Decision.id))
+
+        def applicable_to(d: Decision, repo: str) -> bool:
+            if d.task_id:
+                t = s.get(Task, d.task_id)
+                return bool(t and t.repo_id == repo)
+            o = s.get(Outcome, d.outcome_id) if d.outcome_id else None
+            return bool(o and repo in (o.repo_ids or []))
 
         def applicable(rows: list[Decision]) -> list[Decision]:
             """A repository-scoped decision applies to the repository it was made about (its task's, else its
@@ -147,12 +155,17 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
         found: list[Decision] = []
         offset, page = 0, max(limit * 4, 20)
         while len(found) < limit:
-            rows = query.offset(offset).limit(page).all()
+            rows = query.filter(Decision.kind != "ruling").offset(offset).limit(page).all()
             found += applicable(rows)
             if len(rows) < page:
                 break
             offset += page
-        return found[:limit]
+        # Team rulings are rules, not examples: every applicable one is always given, beyond the limit.
+        rules = applicable(query.filter(Decision.kind == "ruling").all())
+        if repo_id is None and repo_ids is not None:
+            # Planning across an outcome's repositories: a repository rule for another repository doesn't apply.
+            rules = [d for d in rules if d.scope == "workspace" or any(applicable_to(d, r) for r in repo_ids)]
+        return rules + found[:limit]
 
 
 @dataclass(frozen=True)
