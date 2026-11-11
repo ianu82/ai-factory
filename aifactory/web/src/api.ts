@@ -120,6 +120,8 @@ export interface Settings {
   reasoning_effort?: string;
   linear?: LinearConfig;
   mind?: { daily_budget_usd: number };
+  /** Slack and email aren't available yet and are always off; alerts show in the Inbox. */
+  alerts?: { after_minutes: number; slack: boolean; email: boolean };
 }
 
 export interface ModelCheckResult {
@@ -299,6 +301,21 @@ export interface Run {
   outcome_number?: number;
   outcome_title?: string;
   task_key?: string | null;
+}
+
+/** Stuck work or a repeated failure the watch found (pipeline/watch.py), shown at the top of the Inbox. */
+export interface Alert {
+  id: string;
+  kind: "overdue" | "unasked" | "stalled" | "quiet" | "repeated";
+  title: string;
+  body: string;
+  since: string;
+  opened_at: string | null;
+  outcome_id: string | null;
+  decision_id: string | null;
+  outcome_number: number | null;
+  outcome_title: string;
+  task_key: string | null;
 }
 
 export type DecisionJudgeMode = "off" | "suggest" | "decide";

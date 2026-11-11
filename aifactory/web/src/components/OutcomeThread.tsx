@@ -175,11 +175,11 @@ function Item({ item }: { item: ConversationItem }) {
         </article>
       );
     case "lead_guidance":
-      return <div className="onote"><div className="by">Lead · {clock(item.at)} · to {item.task_key ? `${item.task_key}'s agents` : "the agents"}{item.delivered ? ", delivered" : ""}</div><Prose text={item.text} /></div>;
+      return <div className="onote"><div className="by">Lead · {clock(item.at)} · to {item.task_key ? `${item.task_key}'s agents` : "the agents"}{item.delivered ? ", delivered" : ""}<RememberRule messageId={item.id} /></div><Prose text={item.text} /></div>;
     case "person":
       return (
         <div className="operson">
-          <div className="by">{item.author}{item.operator ? " (operator)" : ""} · {clock(item.at)}</div>
+          <div className="by">{item.author}{item.operator ? " (operator)" : ""} · {clock(item.at)}<RememberRule messageId={item.id} /></div>
           <Prose text={item.text} />
           <div className="oreceipt">To the Lead and {item.task_key ? `${item.task_key}'s agents` : "the outcome's agents"} · {item.delivered ? "delivered to an agent" : "waiting for an agent's next step"}</div>
         </div>
@@ -355,4 +355,29 @@ export function LeadComposer({ outcome, onPrivate }: { outcome: MindOutcomeLink;
       </div>
     </form>
   );
+}
+
+/** Turn guidance into a team rule: every agent in the workspace is given it from now on (Decisions lists and retires
+ * rules). */
+function RememberRule({ messageId }: { messageId: string }) {
+  const { ws } = useWs();
+  const toast = useToast();
+  const qc = useQueryClient();
+  const [state, setState] = useState<"idle" | "saving" | "done">("idle");
+  if (ws.role === "viewer") return null;
+  if (state === "done") return <span className="faint"> · Team rule</span>;
+  const remember = async () => {
+    setState("saving");
+    try {
+      await api(`/api/workspaces/${ws.id}/rulings`, { method: "POST", json: { message_id: messageId, scope: "workspace" } });
+      setState("done");
+      qc.invalidateQueries({ queryKey: ["decisions", ws.id] });
+      toast("Every agent in this workspace will follow this from now on");
+    } catch (err) {
+      setState("idle");
+      toast((err as Error).message, true);
+    }
+  };
+  return <button type="button" className="linkish oremember" disabled={state === "saving"} onClick={remember}
+    title="Every agent in this workspace follows team rules. Retire it on the Decisions page.">Make a team rule</button>;
 }
