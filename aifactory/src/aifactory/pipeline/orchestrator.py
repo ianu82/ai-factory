@@ -55,6 +55,8 @@ class Orchestrator:
         self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
         self._relay_task: asyncio.Task | None = None
         self._vm_sweep_task: asyncio.Task | None = None
+        self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
+        self._lead_check = float("-inf")
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -78,6 +80,9 @@ class Orchestrator:
             job.cancel()
         for job in list(self._ci_polls.values()):
             job.cancel()
+        for job in list(self._leads.values()):
+            job.cancel()
+        await asyncio.gather(*list(self._leads.values()), return_exceptions=True)
         if self._loop_task:
             self._loop_task.cancel()
         await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
@@ -107,7 +112,8 @@ class Orchestrator:
             running = [t.id for t in s.query(Task).filter(Task.id.in_(list(self._tasks)),
                                                         Task.status == "running")]
         return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
-                "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage()}
+                "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage(),
+                "leads": list(self._leads)}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
@@ -118,6 +124,9 @@ class Orchestrator:
                 task.lease_owner = ""
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
+        from .lead import recover as recover_leads
+
+        recover_leads()
         self._complete_accepted()
 
     def _complete_accepted(self) -> None:
@@ -151,6 +160,7 @@ class Orchestrator:
                 await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
                 await self._maybe_sweep_vms()
+                await self._maybe_run_leads()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -339,6 +349,32 @@ class Orchestrator:
                 log.exception("signal sync failed for %s", workspace_id)
             finally:
                 db.close()
+
+    async def _maybe_run_leads(self) -> None:
+        """Start the Lead of each outcome that has something needing judgement (pipeline/lead.py), at most every 10
+        seconds and within the server's Lead limit. A Lead runs beside the scheduler, never inside its tick."""
+        import time
+
+        from .lead import concurrency, due, run_lead
+
+        free = concurrency() - len(self._leads)
+        now = time.monotonic()
+        if self._stopping or free <= 0 or now - self._lead_check < 10:
+            return
+        self._lead_check = now
+        for item in (await asyncio.to_thread(due, frozenset(self._leads)))[:free]:
+            outcome_id = item["outcome_id"]
+            job = asyncio.create_task(run_lead(item["workspace_id"], outcome_id, item["reasons"], item["seen"],
+                                               item["decisions"]), name=f"lead-{outcome_id[:8]}")
+            self._leads[outcome_id] = job
+
+            def done(finished: asyncio.Task, outcome_id: str = outcome_id) -> None:
+                self._leads.pop(outcome_id, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    log.error("Lead of %s failed: %r", outcome_id, finished.exception())
+                self.wake()
+
+            job.add_done_callback(done)
 
     async def _maybe_sweep_vms(self) -> None:
         """Every 15 minutes, starting 10 minutes after startup (a deployment being replaced may still be closing its

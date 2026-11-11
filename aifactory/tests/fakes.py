@@ -28,7 +28,7 @@ class ScriptedModel:
 
     async def chat(self, *, model, messages, tools=None, ledger=None, **_kwargs):
         system = messages[0]["content"]
-        role = "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "plan_reviewer" if "You are the plan reviewer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
+        role = "lead" if "You are the Lead" in system else "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "plan_reviewer" if "You are the plan reviewer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
         if role == "judge":
             ScriptedModel.judge_calls.append({"model": model, "messages": messages, "tools": tools, **_kwargs})
         else:

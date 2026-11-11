@@ -381,7 +381,7 @@ export interface FactoryEvent {
 
 export interface Message {
   id: string;
-  author_kind: "user" | "factory";
+  author_kind: "user" | "factory" | "lead";
   author: string;
   body: string;
   delivered: boolean;
