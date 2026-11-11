@@ -357,9 +357,31 @@ class TaskRunner:
                 cause = infrastructure_problem(error)
                 if cause:
                     self._infrastructure(attempt, "build", error, cause)
-                self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
-                self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
-                continue
+                # A session stopped by its own cap (time, turns, tokens, cost) may have left the work done, so its
+                # tree is checked as it stands: unless it is empty or the candidate this runner already judged.
+                left = None
+                if any(cap.lower() in error.lower() for cap in RUN_CAPS):
+                    try:
+                        left = await extract_patch(self.builder, self.task.base_sha)
+                    except SandboxError:
+                        pass
+                if left is None or left.empty or (self.patch is not None and left.diff == self.patch.diff):
+                    self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
+                    self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
+                    continue
+                from ..harness import HarnessResult
+
+                self.feedback.append(f"- The previous builder session reached its limit before it reported "
+                                     f"({error[:300]}). The factory checked the change as that session left it. Work "
+                                     "in small complete steps and finish with your report before the limit.")
+                self.event("builder_unreported", f"The builder session reached its limit before it reported "
+                           f"({error[:200]}); checking the {len(left.files)} file(s) it changed as they stand",
+                           level="warn", error=error[:300], files=len(left.files))
+                # A stand-in for the report, shown to the verifier and on the pull request in place of a summary.
+                result = HarnessResult(turns=run.turns or 0, report={"status": "unreported", "summary": (
+                    f"The builder session reached its limit before it reported ({error[:200]}), so there is no "
+                    "builder summary. This change is the working tree as that session left it; the Factory checks "
+                    "and verifies it as it stood.")})
             self.builder_report = result.report
             self.evidence("builder_report", self.builder_report)
             if result.report.get("status") == "blocked":
@@ -933,7 +955,10 @@ class TaskRunner:
                 return False
             builder = s.get(Run, diff.run_id) if diff.run_id else None
             raw, data = (diff.content or "").encode(), dict(diff.data or {})
-            report = dict((builder.result if builder else None) or {})
+            # A builder stopped by its cap has no result on its run: the stand-in for its report is kept with the
+            # task, like every builder report, and no builder has run since this candidate was verified.
+            report = dict((builder.result if builder else None) or (self.task.evidence or {}).get("builder_report")
+                          or {})
         if hashlib.sha256(raw).hexdigest() != last["patch_sha256"]:
             return False
         self.patch = Patch(diff=raw, files=list(data.get("files") or []), additions=int(data.get("additions") or 0),

@@ -289,7 +289,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
-            if limit is not None and outcome_committed(o.id)[0] >= limit and not continued_past_budget(s, o.id):
+            if (o.status not in FINISHED and limit is not None and outcome_committed(o.id)[0] >= limit
+                    and not continued_past_budget(s, o.id)):
                 # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
                 # and trying every 15 minutes would only fill the activity with failed runs.
                 continue
@@ -594,7 +595,9 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
             s.execute(text("BEGIN IMMEDIATE"))  # SQLite has no row locks: take its write lock before reading
         else:
             s.query(Outcome).filter(Outcome.id == outcome_id).with_for_update().one()
-        if outcome_limit is not None and not continued_past_budget(s, outcome_id):
+        # A finished outcome's closing update runs within the Lead's own run cap, even when the outcome is spent.
+        finished = s.query(Outcome.status).filter(Outcome.id == outcome_id).scalar() in FINISHED
+        if outcome_limit is not None and not finished and not continued_past_budget(s, outcome_id):
             spent, _ = outcome_cost(outcome_id)
             held = 0.0
             for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,
