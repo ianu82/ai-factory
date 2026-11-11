@@ -73,7 +73,7 @@ def conversation(db: Session, outcome: Outcome, viewer_id: str | None = None) ->
 
     runs = db.query(Run).filter(Run.outcome_id == outcome.id, Run.role == "lead").order_by(Run.started_at).all()
     last = runs[-1] if runs else None
-    return {"items": thread, "started_in_mind": mind,
+    return {"items": thread, "started_in_mind": mind, "status": outcome.status,
             "lead": {"model": last.model if last else None, "running": bool(last and last.status == "running"),
                      "last_active": S.ts((last.finished_at or last.started_at) if last else None),
                      # The Lead's narration and decisions are model spend of their own, within the outcome's cost.

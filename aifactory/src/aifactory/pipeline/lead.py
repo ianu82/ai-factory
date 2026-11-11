@@ -266,7 +266,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             introduced = s.query(Message.id).filter(Message.outcome_id == o.id, Message.author_kind == "lead").first()
             joined = not finished and introduced is None and o.created_at > now - FIRST_LOOK
             ended_at = o.completed_at or o.updated_at
-            reported = done is not None and ended_at is not None and done.started_at >= ended_at
+            # Reported only by an update posted after it ended: a run that merely started afterwards may not have.
+            reported = ended_at is not None and any(
+                (m.attribution or {}).get("kind") == "update" for m in s.query(Message).filter(
+                    Message.outcome_id == o.id, Message.author_kind == "lead", Message.created_at >= ended_at))
             ending = finished and not reported
             if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
                 progress = []  # batch progress into one update

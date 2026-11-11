@@ -125,8 +125,8 @@ def test_the_lead_waits_its_turn(world):
 def test_no_lead_for_finished_paused_disabled_or_review_work(world, change):
     with db.session_scope() as s:
         o, w = s.get(Outcome, world["outcome"]), s.get(Workspace, world["ws"])
-        if change == "finished":
-            o.status = "completed"
+        if change == "finished":  # long enough ago that its ending was reported
+            o.status, o.completed_at = "completed", db.utcnow() - timedelta(hours=2)
         elif change == "paused":
             w.paused = True
         elif change == "disabled":

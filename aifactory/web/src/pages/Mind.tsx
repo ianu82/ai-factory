@@ -7,7 +7,7 @@ import { MindScroll } from "../mindScroll";
 import { useMind } from "../components/mind/MindProvider";
 import { AssistantTurn, LiveTurn, SourceLink, UserTurn, citationKey } from "../components/mind/MindTurns";
 import { MindComposer, type ComposerHandle } from "../components/mind/MindComposer";
-import { Handoff, LeadComposer } from "../components/OutcomeThread";
+import { Handoff, LeadComposer, outcomeOpen, useOutcomeConversation } from "../components/OutcomeThread";
 import { OUTCOME_STATUS } from "../format";
 import type { MindOutcomeLink } from "../api";
 import "../components/mind/Mind.css";
@@ -152,8 +152,11 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
   const title = state.active?.title || "New conversation";
   // A conversation that became an outcome continues with the outcome's Lead; Mind is still there, privately.
   const outcome = state.active?.id === threadId ? state.active.outcome ?? null : null;
-  // A finished outcome's Lead no longer answers messages: the composer goes back to Mind.
-  const leadOpen = !!outcome && !["completed", "cancelled", "partially_completed"].includes(outcome.status);
+  // A finished outcome's Lead no longer answers messages: the composer goes back to Mind. The status comes from the
+  // outcome's conversation, which keeps polling; the thread's copy is as old as its last load.
+  const linked = useOutcomeConversation(outcome);
+  const outcomeStatus = linked.data?.status ?? outcome?.status;
+  const leadOpen = outcomeOpen(outcome, outcomeStatus);
   const [privately, setPrivately] = useState(false);
   const reloaded = useRef(false);
   useEffect(() => { setPrivately(false); reloaded.current = false; }, [threadId]);
@@ -200,7 +203,8 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
       {/* Keyed by completion, so two identical replies are each announced. */}
       <div className="sr" aria-live="polite"><span key={state.announcementId}>{state.announcement}</span></div>
     </div>
-    <MindRail messages={state.messages} busy={state.busy} steps={state.steps} startedAt={state.startedAt} outcome={outcome}
+    <MindRail messages={state.messages} busy={state.busy} steps={state.steps} startedAt={state.startedAt}
+      outcome={outcome && outcomeStatus ? { ...outcome, status: outcomeStatus } : outcome}
       workspace={workspaces.find((w) => w.id === state.active?.workspace_id)?.name} cost={state.active ? mindCost(state.active) : null} />
   </div>;
 }

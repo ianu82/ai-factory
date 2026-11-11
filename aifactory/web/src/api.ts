@@ -395,6 +395,8 @@ export type ConversationItem =
 
 export interface Conversation {
   items: ConversationItem[];
+  /** The outcome's status now: a Mind conversation's copy of it is as old as the thread's last load. */
+  status: string;
   /** Set when a Mind conversation became this outcome; thread_id only for that conversation's owner. */
   started_in_mind: { thread_id: string | null } | null;
   lead: { model: string | null; running: boolean; last_active: string | null; cost_usd: number; cost_known: boolean };

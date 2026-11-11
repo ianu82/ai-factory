@@ -294,13 +294,23 @@ function Composer({ outcomeId, number, tasks }: { outcomeId: string; number: num
 
 /** In a Mind conversation that became an outcome: the outcome's conversation continues below the hand-off, visible to
  * the workspace's members, and the composer messages the Lead (or Mind, privately). */
-export function Handoff({ outcome }: { outcome: MindOutcomeLink }) {
-  const active = !FINISHED.includes(outcome.status);
-  const convo = useQuery({
-    queryKey: ["conversation", outcome.workspace_id, outcome.id],
-    queryFn: () => api<Conversation>(`/api/workspaces/${outcome.workspace_id}/outcomes/${outcome.id}/conversation`),
-    refetchInterval: active ? 10_000 : 60_000, // after it ends, the Lead's closing update can still arrive
+export function useOutcomeConversation(outcome: MindOutcomeLink | null) {
+  return useQuery({
+    queryKey: ["conversation", outcome?.workspace_id, outcome?.id],
+    queryFn: () => api<Conversation>(`/api/workspaces/${outcome!.workspace_id}/outcomes/${outcome!.id}/conversation`),
+    enabled: !!outcome,
+    // After it ends, the Lead's closing update can still arrive: keep listening, more slowly.
+    refetchInterval: (query) => (FINISHED.includes(query.state.data?.status || outcome?.status || "") ? 60_000 : 10_000),
   });
+}
+
+/** Whether a linked outcome is still open, read from its live status rather than the Mind thread's snapshot. */
+export function outcomeOpen(outcome: MindOutcomeLink | null, status?: string): boolean {
+  return !!outcome && !FINISHED.includes(status || outcome.status);
+}
+
+export function Handoff({ outcome }: { outcome: MindOutcomeLink }) {
+  const convo = useOutcomeConversation(outcome);
   return (
     <section className="ohandoff" aria-label={`Outcome #${outcome.number}`}>
       <div role="separator" className="ohandoff-line" aria-label="This conversation became an outcome">
