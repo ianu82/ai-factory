@@ -49,7 +49,7 @@ def test_recorded_events_read_as_messages_between_parties(client, signed_in):
         ("Merge Manager", "Ian's Mind", "inform"),
         ("Operator", "Factory", "request"),
         ("Ian", "Factory", "answer"),
-        ("Ian's Mind", "Builders", "inform"),
+        ("Ian's Mind", "Planning, builders and verifiers", "inform"),
         ("Verifier · T1", "Builder · T1", "answer"),
         ("Planner", "Factory", "propose"),
     ]
@@ -149,7 +149,8 @@ def test_the_lead_speaks_as_the_lead(client, signed_in):
            data={**source, "kind": "update"})  # its post in the outcome's conversation
     said = [(m["kind"], m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
     assert said == [("lead_update", "Lead", "People", "inform"), ("lead_note", "Lead", "People", "inform"),
-                    ("lead_note", "Lead", "People", "propose"), ("guidance", "Lead", "Builders · T1", "inform"),
+                    ("lead_note", "Lead", "People", "propose"),
+                    ("guidance", "Lead", "Builder and verifier · T1", "inform"),
                     ("decision_resolved", "Lead", "Factory", "answer")]
     assert len(messages(client, ws, party="lead")["items"]) == 5
 
@@ -162,7 +163,10 @@ def test_filters_by_party_intent_and_outcome(client, signed_in):
     record(ws, "decision_requested", "T1 needs a decision", outcome_id=outcome, task_id=task, data={"kind": "question"})
 
     assert [m["from"]["role"] for m in messages(client, ws, party="minds")["items"]] == ["mind"]
-    assert [m["kind"] for m in messages(client, ws, party="verifier")["items"]] == ["verified"]
+    # Guidance for the whole outcome is read by planning, builders and verifiers, so it shows under each of them.
+    assert [m["kind"] for m in messages(client, ws, party="verifier")["items"]] == ["guidance", "verified"]
+    assert [m["kind"] for m in messages(client, ws, party="planning")["items"]] == ["guidance"]
+    assert [m["kind"] for m in messages(client, ws, party="builders")["items"]] == ["guidance", "verified"]
     # A party matches as sender or receiver: People receive the decision request; the operator sends a retry.
     assert {m["kind"] for m in messages(client, ws, party="people")["items"]} == {"decision_requested", "operator_retry"}
     assert [m["kind"] for m in messages(client, ws, intent="request")["items"]] == ["decision_requested", "operator_retry"]

@@ -29,9 +29,9 @@ GROUPS: dict[str, set[str]] = {
     "minds": {"mind"},
     "lead": {"lead"},
     "people": {"person", "people", "operator"},
-    "planning": {"planner", "plan_reviewer"},
-    "builders": {"builder", "checks"},
-    "verifier": {"verifier"},
+    "planning": {"planner", "plan_reviewer", "outcome_agents"},
+    "builders": {"builder", "checks", "task_agents", "outcome_agents"},
+    "verifier": {"verifier", "task_agents", "outcome_agents"},
     "ci": {"ci"},
     "judges": {"judge"},
     "supervisor": {"supervisor"},
@@ -144,6 +144,18 @@ def _handed_over(event: Event, ctx: Context) -> Ends:
     return _task_party("factory", "Factory")(event, ctx), receiver, "handoff"
 
 
+def _guidance(event: Event, ctx: Context) -> Ends:
+    # Who reads guidance (runtime.guidance_history): a task's guidance goes into that task's builder and verifier
+    # prompts; guidance for the whole outcome also goes into the planner's and the plan reviewer's. The receiver's
+    # role puts the message under each of those filters.
+    if event.task_id:
+        task = ctx.tasks.get(event.task_id)
+        receiver = party("task_agents", f"Builder and verifier · {task.key}" if task else "Builder and verifier")
+    else:
+        receiver = party("outcome_agents", "Planning, builders and verifiers")
+    return _who(event, ctx), receiver, "inform"
+
+
 def _lead_note(event: Event, ctx: Context) -> Ends:
     # A note on a decision is the Lead's recommendation to the people who decide it; otherwise it keeps them informed.
     return LEAD, PEOPLE, "propose" if (event.data or {}).get("decision_id") else "inform"
@@ -163,7 +175,7 @@ RULES: dict[str, Rule] = {
     "verification_failed": fixed(_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
     "verified": fixed(_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
     "ci_failed": fixed(_task_party("ci", "CI"), _task_party("builder", "Builder"), "inform"),
-    "guidance": fixed(_who, _task_party("builder", "Builders"), "inform"),
+    "guidance": _guidance,
     "operator_relay": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "operator_retry": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "task_handed_over": _handed_over,

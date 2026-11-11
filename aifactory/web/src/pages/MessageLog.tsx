@@ -12,7 +12,7 @@ import { INTENT_FILTERS, PARTY_FILTERS, byDay, messagesUrl, verb } from "../mess
 const ICONS: Record<string, typeof Brain> = {
   mind: Brain, lead: Compass, person: User, people: Users, operator: Send, factory: Cog, planner: ClipboardList,
   plan_reviewer: ClipboardCheck, builder: Hammer, checks: ListChecks, verifier: ShieldCheck, ci: Workflow,
-  judge: Scale, supervisor: Radar, merge_manager: GitMerge,
+  judge: Scale, supervisor: Radar, merge_manager: GitMerge, task_agents: Hammer, outcome_agents: Hammer,
 };
 const TONES: Record<string, Tone> = { success: "good", warn: "human", error: "bad" };
 
