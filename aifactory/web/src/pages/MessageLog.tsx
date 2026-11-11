@@ -1,8 +1,8 @@
 import { useMemo } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
-import { ArrowUpRight, Brain, ClipboardCheck, ClipboardList, Cog, GitMerge, Hammer, ListChecks, Radar, Scale, Send,
-  ShieldCheck, User, Users, Workflow, X } from "lucide-react";
+import { ArrowUpRight, Brain, ClipboardCheck, ClipboardList, Cog, Compass, GitMerge, Hammer, ListChecks, Radar, Scale,
+  Send, ShieldCheck, User, Users, Workflow, X } from "lucide-react";
 import { api, type AgentMessage, type MessagePage, type MessageParty } from "../api";
 import { useWs } from "../App";
 import { clock, type Tone } from "../format";
@@ -10,7 +10,7 @@ import { Dot, Empty, Skeleton } from "../ui";
 import { INTENT_FILTERS, PARTY_FILTERS, byDay, messagesUrl, verb } from "../messageLog";
 
 const ICONS: Record<string, typeof Brain> = {
-  mind: Brain, person: User, people: Users, operator: Send, factory: Cog, planner: ClipboardList,
+  mind: Brain, lead: Compass, person: User, people: Users, operator: Send, factory: Cog, planner: ClipboardList,
   plan_reviewer: ClipboardCheck, builder: Hammer, checks: ListChecks, verifier: ShieldCheck, ci: Workflow,
   judge: Scale, supervisor: Radar, merge_manager: GitMerge,
 };

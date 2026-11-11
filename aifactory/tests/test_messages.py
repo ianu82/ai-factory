@@ -132,6 +132,25 @@ def test_a_takeover_that_could_not_complete_keeps_its_answer(client, signed_in):
     assert said == [("decision_resolved", "Ian", "Factory")]
 
 
+def test_the_lead_speaks_as_the_lead(client, signed_in):
+    ws, _, outcome, task = world(signed_in)
+    with SessionLocal() as db:
+        lead = User(email="lead@factory.local", name="Lead", is_system=True)
+        db.add(lead); db.commit()
+        lead_id = lead.id
+    source = {"source": "lead", "run_id": "r1"}
+    record(ws, "decision_resolved", "Lead: answer — Which cache?", outcome_id=outcome, task_id=task, actor=lead_id,
+           data={"decision_id": "d1", "resolution": "answer", **source})
+    record(ws, "guidance", "Lead: use the cached client", outcome_id=outcome, task_id=task, actor=lead_id, data=source)
+    record(ws, "lead_note", "Lead: approve; CI is green and every finding is fixed", outcome_id=outcome,
+           actor=lead_id, data={**source, "decision_id": "d2"})
+    record(ws, "lead_note", "Lead: waiting on CI", outcome_id=outcome, actor=lead_id, data=source)
+    said = [(m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
+    assert said == [("Lead", "People", "inform"), ("Lead", "People", "propose"), ("Lead", "Builders · T1", "inform"),
+                    ("Lead", "Factory", "answer")]
+    assert len(messages(client, ws, party="lead")["items"]) == 4
+
+
 def test_filters_by_party_intent_and_outcome(client, signed_in):
     ws, user, outcome, task = world(signed_in)
     record(ws, "verified", "Verified", outcome_id=outcome, task_id=task)

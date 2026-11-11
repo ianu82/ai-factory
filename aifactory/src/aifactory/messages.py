@@ -27,6 +27,7 @@ SCAN = 1000  # events read at most per page, so a narrow filter over a long hist
 # Party roles, and the filter groups people pick from on the page.
 GROUPS: dict[str, set[str]] = {
     "minds": {"mind"},
+    "lead": {"lead"},
     "people": {"person", "people", "operator"},
     "planning": {"planner", "plan_reviewer"},
     "builders": {"builder", "checks"},
@@ -48,6 +49,7 @@ PEOPLE = party("people", "People")
 PLANNER = party("planner", "Planner")
 PLAN_REVIEWER = party("plan_reviewer", "Plan reviewer")
 OPERATOR = party("operator", "Operator")
+LEAD = party("lead", "Lead")  # the agent that owns one outcome end to end (pipeline/lead.py)
 
 
 def message_data(sender: dict[str, Any], receiver: dict[str, Any], intent: str) -> dict[str, Any]:
@@ -67,6 +69,8 @@ class Context:
 def _who(event: Event, ctx: Context) -> dict[str, Any]:
     """The person (or their Mind, or the operator relay, or policy) behind an event that a person caused."""
     data = event.data or {}
+    if data.get("source") == "lead":  # the Lead acts as its own system user, with this attribution
+        return LEAD
     if event.actor == "operator" or (event.actor or "") in ctx.operators:
         return OPERATOR
     name = ctx.names.get(event.actor or "")
@@ -140,6 +144,11 @@ def _handed_over(event: Event, ctx: Context) -> Ends:
     return _task_party("factory", "Factory")(event, ctx), receiver, "handoff"
 
 
+def _lead_note(event: Event, ctx: Context) -> Ends:
+    # A note on a decision is the Lead's recommendation to the people who decide it; otherwise it keeps them informed.
+    return LEAD, PEOPLE, "propose" if (event.data or {}).get("decision_id") else "inform"
+
+
 # Recorded events that are messages between parties. Everything else in the journal stays activity, including the
 # transitions recorded beside an answer: plan_approved follows the reviewer's plan_reviewed, a person's
 # decision_resolved, or a plan handed over through a Mind; operator_decision is the receipt for a relayed
@@ -158,6 +167,7 @@ RULES: dict[str, Rule] = {
     "operator_relay": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "operator_retry": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "task_handed_over": _handed_over,
+    "lead_note": _lead_note,
 }
 KINDS = (*RULES, MESSAGE_KIND)
 
@@ -221,7 +231,7 @@ def log(db: Session, workspace_id: str, *, before: int | None = None, limit: int
     actors = {e.actor for e in events if e.actor and e.actor not in ("factory", "operator", "policy")}
     users = db.query(User).filter(User.id.in_(actors)).all() if actors else []
     names = {u.id: u.name or u.email or "Someone" for u in users}
-    operators = {u.id for u in users if u.is_system}
+    operators = {u.id for u in users if u.is_system and (u.email or "").startswith("operator")}
     task_ids = {e.task_id for e in events if e.task_id}
     tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_(task_ids))} if task_ids else {}
     ctx = Context(names, tasks, operators)

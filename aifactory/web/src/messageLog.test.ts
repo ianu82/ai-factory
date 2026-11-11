@@ -19,7 +19,7 @@ test("rows read as sentences: sender, verb, receiver", () => {
 
 test("filters map to the API's party and intent values, with 'everyone' and 'all' first", () => {
   assert.equal(PARTY_FILTERS[0].key, "");
-  assert.deepEqual(PARTY_FILTERS.slice(1).map((f) => f.key), ["minds", "people", "planning", "builders", "verifier", "ci", "factory"]);
+  assert.deepEqual(PARTY_FILTERS.slice(1).map((f) => f.key), ["minds", "lead", "people", "planning", "builders", "verifier", "ci", "factory"]);
   assert.deepEqual(INTENT_FILTERS.map((f) => f.key), ["", "request", "propose", "answer", "inform", "handoff"]);
 });
 
