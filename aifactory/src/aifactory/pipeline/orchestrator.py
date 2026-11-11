@@ -148,8 +148,10 @@ class Orchestrator:
                 run.status, run.error = "interrupted", "Interrupted by a restart"
                 # Not now: a session found days later would show a duration it never had.
                 run.finished_at = last_event.get(run.id) or run.started_at
-                if run.provider == "mindshub":
-                    run.cost_known = False  # the cost reconciliation then asks MindsHub what the session really cost
+                # A request in flight when the process died was charged and never recorded, so what the session
+                # recorded is a lower bound. The cost reconciliation asks MindsHub what its sessions really cost; no
+                # other provider can say, and those stay unknown.
+                run.cost_known = False
                 closed[run.workspace_id] = closed.get(run.workspace_id, 0) + 1
             for workspace_id, count in closed.items():
                 record(workspace_id, "runs_interrupted",

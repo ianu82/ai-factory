@@ -1061,7 +1061,8 @@ def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
 
 def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch):
     """A killed process never closes its sessions (seen live: 371 of 2,211 still "running"). The restart closes them
-    as interrupted, when they were last heard from, keeping what they used; MindsHub prices them afterwards."""
+    as interrupted, when they were last heard from, keeping what they used as a lower bound: a request in flight was
+    charged and never recorded. MindsHub prices its sessions afterwards; no other provider can."""
     from datetime import timedelta
 
     from aifactory import inference
@@ -1109,11 +1110,12 @@ def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch
         # Closed when the session was last heard from (its start, if it left no event), not when it was found.
         assert run["builder"].finished_at == at(9)
         assert run["verifier"].finished_at == run["mindshub"].finished_at == started
+        # What a session recorded is kept, and its cost marked unknown: the request it was waiting for is not in it.
         used = run["builder"]
         assert (used.turns, used.input_tokens, used.output_tokens, used.cost_usd, used.cost_known) == (
-            4, 4000, 800, 0.5, True)
-        # What a MindsHub session recorded is kept, and marked unknown so the reconciliation asks what it really cost.
+            4, 4000, 800, 0.5, False)
         assert (run["mindshub"].turns, run["mindshub"].cost_usd, run["mindshub"].cost_known) == (2, 0.25, False)
+        assert run["verifier"].cost_known is False  # it recorded nothing, which does not show it spent nothing
         # The Lead's own recovery closes its sessions; a session that had finished stays as it ended.
         assert run["lead"].status == "failed" and run["lead"].finished_at > at(40)
         done = run["finished"]
@@ -1122,6 +1124,7 @@ def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch
         assert (task.status, task.attempt) == ("queued", 1)  # the task is requeued as before
         assert [(e.message, e.data) for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [
             ("Closed 3 agent sessions that a restart interrupted", {"runs": 3})]
+    assert runtime.outcome_cost(outcome_id) == (0.75, False)  # so the outcome's total is "at least", not exact
 
     async def session_cost(self, session_id):
         return 1.75 if session_id == ids["mindshub"] else None
@@ -1133,7 +1136,7 @@ def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch
     with session_scope() as s:
         priced, other = s.get(Run, ids["mindshub"]), s.get(Run, ids["builder"])
         assert (priced.cost_usd, priced.cost_known) == (1.75, True)
-        assert (other.cost_usd, other.cost_known) == (0.5, True)
+        assert (other.cost_usd, other.cost_known) == (0.5, False)  # only MindsHub can say what a session cost
 
 
 def test_smoke_failure_is_reverted_under_recovery_policy(factory):
