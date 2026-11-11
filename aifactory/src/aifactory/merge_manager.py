@@ -14,7 +14,9 @@ The manager gives one task per repository the merge turn at a time:
 - A rebuild leaves the queue: a task sent back to its builder re-enters at the back when it is ready again.
 - Main red: while the default branch's latest CI is failing, the queue pauses (except for repair work: reverts and
   tasks of a "steward" or "ci_failure" signal outcome) and retries a few minutes later, so new merges never pile on
-  top of a broken main. Repositories can turn this off with ``merge.hold_on_red_main: false``.
+  top of a broken main. Repositories can turn this off with ``merge.hold_on_red_main: false``. The pause also
+  starts one urgent repair outcome for the repository (``merge.auto_repair``, on by default), so a red main gets
+  fixed without waiting for a person; if the repair itself gets stuck, it asks a person like any outcome.
 - GitHub merge queue: when the default branch has a GitHub merge queue (``merge.queue``: "auto", the default, or
   "github"), the turn holder is added to GitHub's queue instead of merged directly. GitHub tests the merge group
   in order, and the task completes when GitHub merges it.
@@ -175,6 +177,7 @@ async def take_turn(runner, gh) -> None:
                 runner.event("merge_queue_paused", f"Merge queue paused: {runner.repo.default_branch} is failing "
                              f"({', '.join(failing[:3])}). Merging resumes when it is green.", level="warn",
                              failing=failing[:10])
+            ensure_repair(runner, failing)
             # Give up any turn, so a repair behind this task can reach the head.
             _park(runner, {**entry, "position": 1, "paused": "main_red", "turn": False, "granted_at": None},
                   retry_after=RED_MAIN_RETRY)
@@ -187,6 +190,44 @@ async def take_turn(runner, gh) -> None:
         runner.event("merge_turn", f"Merge turn for PR #{runner.task.pr_number}", position=1, length=len(ids))
     entry.update(position=1, paused="", retry_at=None)
     _write(runner, entry)
+
+
+FINISHED = ("completed", "cancelled")
+
+
+def ensure_repair(runner, failing: list[str]) -> str | None:
+    """Make sure an urgent repair outcome is working on the repository's red main; return its id.
+
+    One repair per repository at a time: while a repair outcome is unfinished (including one waiting on a person
+    because the repair itself failed), no second one is started. Repositories can opt out with
+    ``merge.auto_repair: false`` (the queue still pauses; a person starts the fix).
+    """
+    if (runner.cfg.get("merge") or {}).get("auto_repair", True) is False:
+        return None
+    from .models import Signal
+    from .signals import outcome_from_text, upsert_signal
+
+    repo = runner.repo
+    with session_scope() as s:
+        active = (s.query(Outcome).join(Signal, Signal.outcome_id == Outcome.id)
+                  .filter(Outcome.workspace_id == runner.task.workspace_id, Signal.repo_id == repo.id,
+                          Signal.source.in_(REPAIR_SOURCES), Outcome.status.notin_(FINISHED)).first())
+        if active is not None:
+            return active.id
+        sig, _ = upsert_signal(s, runner.task.workspace_id, source="ci_failure",
+                               title=f"{repo.default_branch} is failing in {repo.full_name}",
+                               body=f"Failing checks: {', '.join(failing[:10])}.", url="",
+                               external_id=f"{repo.full_name}:main-red", repo_id=repo.id)
+        outcome = outcome_from_text(
+            s, runner.task.workspace_id, None, f"Fix failing {repo.default_branch} in {repo.full_name}",
+            f"The default branch's CI is failing ({', '.join(failing[:10])}), so the merge queue is paused. Find the "
+            "cause on the current main and fix it, or revert the change that broke it. Keep the change minimal.",
+            [repo.id], source="signal", signal_id=sig.id, priority=0)
+        sig.status, sig.outcome_id = "accepted", outcome.id
+        oid, number = outcome.id, outcome.number
+    runner.event("merge_queue_repair", f"Started urgent outcome #{number} to fix the failing "
+                 f"{repo.default_branch}", level="warn", outcome=oid)
+    return oid
 
 
 # GitHub merge queue -------------------------------------------------------------------------------------------
