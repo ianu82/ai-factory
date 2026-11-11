@@ -13,12 +13,15 @@ from ..models import Outcome, Task, Workspace
 STOPPED = {"cancelled", "abandoned", "handed_over", "completed", "reverted"}
 
 
-def transition(session, task: Task, *, owner: str | None = None, **fields) -> bool:
-    """`owner` is the instance making the change: the row must still be leased to it, or to nobody (several stages
-    release the lease on purpose and keep working). A runner whose task another instance took changes nothing."""
+def transition(session, task: Task, *, owner: str | None = None, exclusive: bool = False, **fields) -> bool:
+    """`owner` is the instance making the change: the row must still be leased to it, or to nobody (the scheduler
+    tidies up after a shutdown released its leases). A runner whose task another instance took changes nothing.
+
+    `exclusive`: the row must be leased to `owner` itself. For what cannot be taken back (a push, a comment, a merge):
+    a lease that is nobody's may have been another instance's a moment ago."""
     if fields.get("lease_owner") == "":
         fields["lease_expires_at"] = None  # an expiry never outlives its owner
-    held = () if owner is None else (Task.lease_owner.in_(("", owner)),)
+    held = () if owner is None else (Task.lease_owner.in_((owner,) if exclusive else ("", owner)),)
     result = session.execute(
         update(Task).where(
             Task.id == task.id, Task.status == task.status, Task.stage == task.stage,

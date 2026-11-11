@@ -1250,8 +1250,18 @@ def test_a_start_leaves_open_the_sessions_of_a_task_another_instance_is_running(
     orch._maybe_reclaim()  # the lease is still live
     assert state(live) == ("running", True)
     clock[0] = until + timedelta(seconds=1)  # its owner died without closing anything
+    # Another server claims the task the moment its requeue is committed, and starts a session before this pass ends.
+    reclaim, started = orch._reclaim, []
+
+    def reclaim_then_another_server_starts(**kwargs):
+        requeued = reclaim(**kwargs)
+        started.extend(session(task_id) for task_id in requeued)
+        return requeued
+
+    monkeypatch.setattr(orch, "_reclaim", reclaim_then_another_server_starts)
     orch._maybe_reclaim()
     assert (lease(held), state(live)) == (("queued", "", None), ("interrupted", False))
+    assert [state(run_id) for run_id in started] == [("running", True)]  # only what the dead owner left is closed
     with session_scope() as s:
         assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}] * 2
 
@@ -1319,8 +1329,9 @@ def test_shutdown_gives_up_the_leases_it_still_holds(factory, monkeypatch):
 
 def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
     """Its lease ran out while it was stalled; another instance requeued the task and started it: same status and
-    stage, a different owner. Nothing the first runner writes may land. A lease released on purpose (waiting for CI,
-    the merge queue) is nobody's, and the runner keeps working."""
+    stage, a different owner. Nothing the first runner writes may land. A row leased to nobody still takes its
+    writes (a shutdown releases the leases before the last runners have ended); what cannot be taken back is held
+    to more, see the next test."""
     first, second = Orchestrator(), Orchestrator()
     task_id = leased_task(factory, lease_owner=first.instance)
     runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock(), first.instance)
@@ -1355,7 +1366,9 @@ def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
 def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
     """The guard before every push and comment, and the last check before the merge itself, ask who holds the task.
     A runner that stalled past its lease and woke after another instance started the task must not merge the pull
-    request: its new owner may be revising it."""
+    request: its new owner may be revising it. Nor after the new owner let go of the lease again (its server
+    stopped, or it parked the task for CI): a scheduled runner acts only on a running task leased to its own
+    instance."""
     first, second = Orchestrator(), Orchestrator()
     runner = merge_gate_runner(factory)
     runner.owner = first.instance
@@ -1366,24 +1379,29 @@ def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
             merged.append((number, kwargs["sha"]))
             return {"sha": "merged"}
 
-    def hold(owner):
+    def hold(owner, status="running"):
         with session_scope() as s:
-            s.get(Task, runner.task_id).lease_owner = owner
+            task = s.get(Task, runner.task_id)
+            task.status, task.lease_owner = status, owner
 
-    hold(second.instance)
-    for stale in (runner._guard, lambda: runner._guard("running"),
-                  lambda: runner._merge_under_workspace_lock(GitHub(), "squash")):
-        with pytest.raises(delivery.Stop):
-            stale()
+    # Held by the other instance; released by it while running (its server stopped); parked by it for CI.
+    for owner, status in ((second.instance, "running"), ("", "running"), ("", "waiting_ci")):
+        hold(owner, status)
+        for stale in (runner._guard, lambda: runner._guard("running"),
+                      lambda: runner._merge_under_workspace_lock(GitHub(), "squash")):
+            with pytest.raises(delivery.Stop):
+                stale()
+        assert lease(runner.task_id)[:2] == (status, owner)  # a refused guard changes nothing
     assert merged == []
-    assert lease(runner.task_id)[:2] == ("running", second.instance)  # a refused guard changes nothing
 
-    for owner in (first.instance, ""):  # its own task, or a lease released on purpose
-        hold(owner)
-        runner._guard()
-        assert runner._merge_under_workspace_lock(GitHub(), "squash") == {"sha": "merged"}
-        assert lease(runner.task_id)[:2] == ("running", owner)
-    assert merged == [(1, "head")] * 2
+    hold(first.instance)
+    runner._guard()
+    assert runner._merge_under_workspace_lock(GitHub(), "squash") == {"sha": "merged"}
+    assert (merged, lease(runner.task_id)[:2]) == ([(1, "head")], ("running", first.instance))
+
+    runner.owner = None  # a CI poll works on a parked task that nobody leases, and is not asked
+    hold("", "waiting_ci")
+    runner._guard("waiting_ci")
 
 
 def test_a_transition_without_an_owner_does_not_ask_who_holds_the_lease(factory):

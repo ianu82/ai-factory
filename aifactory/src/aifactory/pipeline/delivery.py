@@ -1252,14 +1252,26 @@ class TaskRunner:
     # CI ------------------------------------------------------------------------
     def _guard(self, status: str | None = None) -> None:
         """Revalidate after every network/lock wait, before taking another action. What follows a guard is a push, a
-        comment or a merge, so a runner whose task another instance took stops here as well."""
+        comment or a merge, so a runner whose task is no longer its own stops here as well."""
         if self.cancelled.is_set():
             raise Stop()
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if (status and task.status != status) or not transition(
-                    s, task, owner=self.owner, lease_owner=task.lease_owner):
+            if (status and task.status != status) or not self._holds(s, task):
                 raise Stop()
+
+    def _holds(self, s, task: Task) -> bool:
+        """Whether the task is still this runner's to act on, asked in one conditional write.
+
+        A scheduled runner works on a running task under its instance's lease from its first step to its last: it
+        gives the lease up only in the write that parks, requeues or blocks the task, and stops there. So for it a
+        lease that is nobody's is a takeover as much as another instance's: whoever took the task has let go of it
+        since (parked it for CI, or its server stopped) and the candidate this runner holds may be out of date.
+        A runner without an owner (a CI poll: those tasks are parked, leased to nobody) is asked only whether the
+        task may still change."""
+        if self.owner is not None and task.status != "running":
+            return False
+        return transition(s, task, owner=self.owner, exclusive=True, lease_owner=task.lease_owner)
 
     async def ci_then_merge(self) -> None:
         # Token resolution is inside the same guarded path as all later observations.
@@ -1423,7 +1435,7 @@ class TaskRunner:
             ws = lock_workspace(s, self.ws)
             task = s.get(Task, self.task_id)
             # The last check before the merge, which cannot be taken back: the task must still be this runner's.
-            if self.cancelled.is_set() or not transition(s, task, owner=self.owner, lease_owner=task.lease_owner):
+            if self.cancelled.is_set() or not self._holds(s, task):
                 raise Stop()
             if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
                 return None

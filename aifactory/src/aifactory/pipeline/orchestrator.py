@@ -159,10 +159,14 @@ class Orchestrator:
         recover_leads()
         self._complete_accepted()
 
-    def _reclaim(self) -> list[str]:
+    def _reclaim(self, close_runs: bool = False) -> list[str]:
         """Requeue the running tasks nobody holds: no owner, no expiry (rows from before leases had one) or a lease
         that ran out. A live lease is another instance's work. A task this instance runs is its own to finish, even
-        when its heartbeat fell behind. Returns the ids of the tasks it requeued."""
+        when its heartbeat fell behind. Returns the ids of the tasks it requeued.
+
+        `close_runs`: their owner died mid-session, so close the sessions it left open, in the transaction that
+        requeues the tasks: once that is committed another server may claim one and start a session of its own. A
+        start closes every session nobody is running right after this, so it does not ask."""
         from sqlalchemy import or_
 
         now = utcnow()
@@ -185,6 +189,8 @@ class Orchestrator:
                 record(task.workspace_id, "resumed",
                        f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
+            if close_runs and reclaimed:
+                self._close_interrupted_runs(reclaimed, session=s)
         return reclaimed
 
     def _maybe_reclaim(self) -> None:
@@ -194,9 +200,7 @@ class Orchestrator:
         if time.monotonic() - getattr(self, "_last_reclaim", float("-inf")) < HEARTBEAT_SECONDS:
             return
         self._last_reclaim = time.monotonic()
-        reclaimed = self._reclaim()
-        if reclaimed:  # their owner died mid-session; the start-up pass left those sessions open for it
-            self._close_interrupted_runs(reclaimed)
+        self._reclaim(close_runs=True)  # the start-up pass left a live owner's sessions open for it
 
     def _lease_end(self):
         from datetime import timedelta
@@ -224,13 +228,16 @@ class Orchestrator:
             except Exception:  # a failed beat is retried at the next one; two may be missed before the lease runs out
                 log.exception("lease heartbeat failed")
 
-    def _close_interrupted_runs(self, tasks: list[str] | None = None) -> None:
+    def _close_interrupted_runs(self, tasks: list[str] | None = None, session=None) -> None:
         """A killed process never reaches run_agent's finally, so its sessions would stay "running" for good.
         Close them as interrupted, which is not a verdict on the work. Lead sessions are closed by lead.recover().
 
         At a start (`tasks` is None) that is every open session except those of a task another instance holds with a
-        live lease: that session is running now, on the other server. They are closed when their task is reclaimed
-        (`tasks`: the ids just requeued), if its owner dies without closing them."""
+        live lease: that session is running now, on the other server. They are closed when their task is reclaimed,
+        if its owner dies without closing them (`tasks`: the ids being requeued; `session`: the transaction that
+        requeues them, so a session another server starts after claiming one is never among them)."""
+        from contextlib import nullcontext
+
         from sqlalchemy import func, or_, select
 
         from ..models import Event, Run
@@ -242,7 +249,7 @@ class Orchestrator:
             held = select(Task.id).where(Task.status == "running", Task.lease_owner.notin_(("", self.instance)),
                                          Task.lease_expires_at > utcnow())
             open_runs += (or_(Run.task_id.is_(None), Run.task_id.notin_(held)),)
-        with session_scope() as s:
+        with (session_scope() if session is None else nullcontext(session)) as s:
             # Events are indexed by outcome, not by run; a session's events carry both.
             last_event = dict(s.query(Event.run_id, func.max(Event.created_at)).filter(
                 Event.outcome_id.in_(select(Run.outcome_id).where(*open_runs)),
