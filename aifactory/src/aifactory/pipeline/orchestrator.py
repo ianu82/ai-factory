@@ -53,6 +53,7 @@ class Orchestrator:
 
         self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
         self._relay_task: asyncio.Task | None = None
+        self._vm_sweep_task: asyncio.Task | None = None
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -85,6 +86,9 @@ class Orchestrator:
         if self._relay_task:
             self._relay_task.cancel()
             await asyncio.gather(self._relay_task, return_exceptions=True)
+        if self._vm_sweep_task:
+            self._vm_sweep_task.cancel()
+            await asyncio.gather(self._vm_sweep_task, return_exceptions=True)
         await asyncio.sleep(0)
 
     def wake(self) -> None:
@@ -145,6 +149,7 @@ class Orchestrator:
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
+                await self._maybe_sweep_vms()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -333,6 +338,33 @@ class Orchestrator:
                 log.exception("signal sync failed for %s", workspace_id)
             finally:
                 db.close()
+
+    async def _maybe_sweep_vms(self) -> None:
+        """Every 15 minutes, starting 10 minutes after startup (a deployment being replaced may still be closing its
+        VMs): destroy sandbox VMs no job holds, and log how full the environment is. It runs beside the scheduler,
+        never inside its tick. Orphans once filled Railway's cap and silently moved all work onto this host."""
+        import time
+
+        now = time.monotonic()
+        first = getattr(self, "_vm_sweep_due", None)
+        if first is None:
+            self._vm_sweep_due = now + 600
+            return
+        if now < first or (self._vm_sweep_task is not None and not self._vm_sweep_task.done()):
+            return
+        self._vm_sweep_due = now + 900
+        self._vm_sweep_task = asyncio.create_task(self._sweep_vms(), name="vm-sweep")
+
+    async def _sweep_vms(self) -> None:
+        from ..vm import sweep_orphans
+
+        try:
+            report = await sweep_orphans()
+        except Exception:  # never let a sweep failure reach the scheduler
+            log.exception("VM sweep failed")
+            return
+        if "skipped" not in report:
+            log.info("inventory vms %s", report)
 
     async def _maybe_inventory(self) -> None:
         import time
