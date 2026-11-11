@@ -69,8 +69,10 @@ export function MessageLogPage() {
         {log.isLoading ? <Skeleton /> : log.isError ? (
           <Empty title="Couldn't load the Message Log">{(log.error as Error).message}</Empty>
         ) : messages.length === 0 ? (
-          <Empty title={party || intent || outcome ? "No messages match" : "No messages yet"}>
-            {party || intent || outcome ? "Try another filter."
+          <Empty title={party || intent || outcome ? "No messages match" : "No messages yet"}
+            action={log.hasNextPage ? <OlderButton loading={log.isFetchingNextPage} onClick={() => void log.fetchNextPage()} /> : undefined}>
+            {log.hasNextPage ? "None among the latest messages; older ones may match."
+              : party || intent || outcome ? "Try another filter."
               : "Plans sent for review, verifier findings, decisions asked and answered, and relayed commands appear here as they happen."}
           </Empty>
         ) : (
@@ -84,17 +86,17 @@ export function MessageLogPage() {
               </section>
             ))}
             {log.hasNextPage && (
-              <div className="msg-more">
-                <button className="btn" disabled={log.isFetchingNextPage} onClick={() => void log.fetchNextPage()}>
-                  {log.isFetchingNextPage ? "Loading…" : "Load older messages"}
-                </button>
-              </div>
+              <div className="msg-more"><OlderButton loading={log.isFetchingNextPage} onClick={() => void log.fetchNextPage()} /></div>
             )}
           </>
         )}
       </div>
     </>
   );
+}
+
+function OlderButton({ loading, onClick }: { loading: boolean; onClick: () => void }) {
+  return <button className="btn" disabled={loading} onClick={onClick}>{loading ? "Loading…" : "Load older messages"}</button>;
 }
 
 function Party({ p }: { p: MessageParty }) {

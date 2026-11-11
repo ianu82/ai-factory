@@ -62,6 +62,18 @@ def test_recorded_events_read_as_messages_between_parties(client, signed_in):
     assert items[0]["to"]["for"] == "Ian"
 
 
+def test_a_plan_worked_out_with_a_mind_is_handed_to_the_factory(client, signed_in):
+    ws, user, outcome, _ = world(signed_in)
+    record(ws, "plan_proposed", "Plan v1: 2 task(s)", outcome_id=outcome, actor=user,
+           data={"plan_id": "p", "source": "mind", "action_id": "a1"})
+    record(ws, "plan_approved", "Plan approved by Ian via Mind", outcome_id=outcome, actor=user,
+           data={"plan_id": "p", "source": "mind", "action_id": "a1"})
+    record(ws, "plan_approved", "Plan approved by the plan reviewer (opus-5-5)", outcome_id=outcome, actor="policy")
+    said = [(m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
+    assert said == [("Plan reviewer", "Planner", "answer"), ("Ian's Mind", "Factory", "answer"),
+                    ("Ian's Mind", "Factory", "handoff")]
+
+
 def test_filters_by_party_intent_and_outcome(client, signed_in):
     ws, user, outcome, task = world(signed_in)
     record(ws, "verified", "Verified", outcome_id=outcome, task_id=task)

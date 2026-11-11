@@ -91,32 +91,52 @@ def _const(value: dict[str, Any]) -> Callable[[Event, Context], dict[str, Any]]:
     return lambda event, ctx: value
 
 
-def _approver(event: Event, ctx: Context) -> dict[str, Any]:
-    # A reviewer's approval is recorded by policy, with the reviewer named only in the message.
+Ends = tuple[dict[str, Any], dict[str, Any], str]
+Rule = Callable[[Event, Context], Ends]
+
+
+def fixed(sender: Callable[[Event, Context], dict[str, Any]], receiver: Callable[[Event, Context], dict[str, Any]],
+          intent: str) -> Rule:
+    return lambda event, ctx: (sender(event, ctx), receiver(event, ctx), intent)
+
+
+def _person_acted(event: Event, ctx: Context) -> bool:
+    return (event.actor or "") in ctx.names
+
+
+def _plan_proposed(event: Event, ctx: Context) -> Ends:
+    # A plan worked out with a person (adopt_plan, through their Mind) is handed to the Factory to build: no planner
+    # or plan reviewer took part.
+    if _person_acted(event, ctx):
+        return _who(event, ctx), FACTORY, "handoff"
+    return PLANNER, PLAN_REVIEWER, "request"
+
+
+def _plan_approved(event: Event, ctx: Context) -> Ends:
+    # A reviewer's approval is recorded by policy, with the reviewer named only in the message; a person's (or their
+    # Mind's) approval answers the Factory, which asked for it.
     if "plan reviewer" in (event.message or ""):
-        return PLAN_REVIEWER
-    return _who(event, ctx)
+        return PLAN_REVIEWER, PLANNER, "answer"
+    return _who(event, ctx), FACTORY, "answer"
 
-
-Rule = tuple[Callable[[Event, Context], dict[str, Any]], Callable[[Event, Context], dict[str, Any]], str]
 
 # Recorded events that are messages between parties. Everything else in the journal stays activity.
 RULES: dict[str, Rule] = {
-    "plan_proposed": (_const(PLANNER), _const(PLAN_REVIEWER), "request"),
-    "plan_reviewed": (_const(PLAN_REVIEWER), _const(PLANNER), "answer"),
-    "plan_approved": (_approver, _const(PLANNER), "answer"),
-    "decision_requested": (_task_party("factory", "Factory"), _const(PEOPLE), "request"),
-    "decision_resolved": (_who, _const(FACTORY), "answer"),
-    "decision_overruled": (_who, _const(FACTORY), "answer"),
-    "candidate_rejected": (_task_party("checks", "Checks"), _task_party("builder", "Builder"), "answer"),
-    "verification_failed": (_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
-    "verified": (_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
-    "ci_failed": (_task_party("ci", "CI"), _task_party("builder", "Builder"), "inform"),
-    "guidance": (_who, _task_party("builder", "Builders"), "inform"),
-    "operator_relay": (_const(OPERATOR), _const(FACTORY), "request"),
-    "operator_decision": (_const(OPERATOR), _const(FACTORY), "answer"),
-    "operator_retry": (_const(OPERATOR), _const(FACTORY), "request"),
-    "task_handed_over": (_who, _const(FACTORY), "handoff"),
+    "plan_proposed": _plan_proposed,
+    "plan_reviewed": fixed(_const(PLAN_REVIEWER), _const(PLANNER), "answer"),
+    "plan_approved": _plan_approved,
+    "decision_requested": fixed(_task_party("factory", "Factory"), _const(PEOPLE), "request"),
+    "decision_resolved": fixed(_who, _const(FACTORY), "answer"),
+    "decision_overruled": fixed(_who, _const(FACTORY), "answer"),
+    "candidate_rejected": fixed(_task_party("checks", "Checks"), _task_party("builder", "Builder"), "answer"),
+    "verification_failed": fixed(_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
+    "verified": fixed(_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
+    "ci_failed": fixed(_task_party("ci", "CI"), _task_party("builder", "Builder"), "inform"),
+    "guidance": fixed(_who, _task_party("builder", "Builders"), "inform"),
+    "operator_relay": fixed(_const(OPERATOR), _const(FACTORY), "request"),
+    "operator_decision": fixed(_const(OPERATOR), _const(FACTORY), "answer"),
+    "operator_retry": fixed(_const(OPERATOR), _const(FACTORY), "request"),
+    "task_handed_over": fixed(_who, _const(FACTORY), "handoff"),
 }
 KINDS = (*RULES, MESSAGE_KIND)
 
@@ -145,8 +165,7 @@ def project(event: Event, ctx: Context) -> dict[str, Any] | None:
             return None
         sender, receiver, intent = declared
     elif event.kind in RULES:
-        build_from, build_to, intent = RULES[event.kind]
-        sender, receiver = build_from(event, ctx), build_to(event, ctx)
+        sender, receiver, intent = RULES[event.kind](event, ctx)
     else:
         return None
     task = ctx.tasks.get(event.task_id or "")
