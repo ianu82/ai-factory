@@ -39,7 +39,12 @@ jobs:
           uv pip install --python .venv/bin/python --no-deps --no-build-isolation "anton-agent @ git+https://github.com/mindsdb/anton@537cc1fb11849e9d152870738af22ca55c1d59d8"
           uv pip install --python .venv/bin/python -e '.[dev]'
           npm install -g @openai/codex@0.167.0 --no-audit --no-fund
-          .venv/bin/python -m playwright install --with-deps chromium
+          # Chromium for the browser tests. apt is used only when the browser cannot start with the libraries the
+          # runner image already has, so an outage of Ubuntu's package servers does not fail every build
+          # (11 Nov 2026: 'Temporary failure resolving archive.ubuntu.com' on the runners for over 20 minutes).
+          .venv/bin/python -m playwright install chromium
+          .venv/bin/python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.chromium.launch().close(); p.stop()" \
+            || { echo "Chromium did not start; installing its system libraries with apt"; .venv/bin/python -m playwright install-deps chromium; }
       - name: Web type-check and build
         run: cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npm test && npx vite build
       - name: Tests (pipeline end-to-end, gateway, Native/Anton/Codex harnesses)
@@ -76,7 +81,12 @@ jobs:
           python -m pip install --quiet uv
           uv venv .venv
           uv pip install --python .venv/bin/python -e '.[dev,postgres]'
-          .venv/bin/python -m playwright install --with-deps chromium
+          # Chromium for the browser tests. apt is used only when the browser cannot start with the libraries the
+          # runner image already has, so an outage of Ubuntu's package servers does not fail every build
+          # (11 Nov 2026: 'Temporary failure resolving archive.ubuntu.com' on the runners for over 20 minutes).
+          .venv/bin/python -m playwright install chromium
+          .venv/bin/python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.chromium.launch().close(); p.stop()" \
+            || { echo "Chromium did not start; installing its system libraries with apt"; .venv/bin/python -m playwright install-deps chromium; }
       - name: Tests against Postgres
         env:
           AIFACTORY_TEST_DATABASE_URL: postgresql://factory:factory@127.0.0.1:5432/factory_test
