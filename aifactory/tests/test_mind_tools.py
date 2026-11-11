@@ -166,7 +166,11 @@ def test_lists_carry_brief_tasks_and_outcome_detail_the_full_ones(world):
         assert task["key"] == t.key and "evidence" not in task and "spec" not in task
         assert len(json.dumps(result)) < 10_000
     detail = read_call("outcome_detail", {"workspace_id": ws.id, "outcome_id": o.id}, ctx)
-    assert "evidence" in detail["items"][0]["tasks"][0]
+    # Over the budget, so shortened: every field of the task survives, only its texts are cut.
+    task = detail["items"][0]["tasks"][0]
+    assert detail["truncated"] and detail["narrow"]
+    assert set(task) >= {"evidence", "spec", "acceptance", "status"} and len(task["evidence"]) == 40
+    assert all(len(v) <= 401 for v in task["evidence"].values())
 
 
 def test_an_oversized_result_is_shortened_to_the_budget_and_says_so(world):

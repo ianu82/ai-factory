@@ -49,9 +49,11 @@ def clean(value: Any, state: list[bool] | None = None, text: int = MAX_TEXT, ite
             out = out[:text] + "…"
         return out
     if isinstance(value, dict):
-        if len(value) > items:  # stored objects (task evidence, event data) are bounded like lists
+        # Stored objects (task evidence, event data) are bounded like lists, but always at MAX_ITEMS keys: a shorter
+        # result keeps every field of a record and shortens only its texts and lists.
+        if len(value) > MAX_ITEMS:
             state[0] = True
-        return {clean(str(k), state, text, items): clean(v, state, text, items) for k, v in islice(value.items(), items)}
+        return {clean(str(k), state, text, items): clean(v, state, text, items) for k, v in islice(value.items(), MAX_ITEMS)}
     if isinstance(value, (list, tuple)):
         if len(value) > items:
             state[0] = True
@@ -62,7 +64,7 @@ def clean(value: Any, state: list[bool] | None = None, text: int = MAX_TEXT, ite
 # Every model call re-sends the turn's earlier tool results, so one oversized read is paid for again and again (a
 # five-bullet answer over two full reads cost $2.21). A result over the budget is shortened in steps, and says so.
 RESULT_BUDGET = 40_000  # characters of JSON, roughly 10k tokens
-SHORTER = ((400, 10), (150, 5))  # (characters per text, items per list) for each further step
+SHORTER = ((400, 10), (150, 5))  # (characters per text, items per list; objects keep their fields) for each step
 NARROW = "Shortened to fit: read one object (outcome_detail, or runs with a run_id) for its full text."
 BRIEF_TEXT = 300
 
