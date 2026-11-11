@@ -1060,6 +1060,86 @@ def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
         assert s.query(Event).filter(Event.task_id == task.id, Event.kind == "attempt_resumed").count() == 1
 
 
+def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch):
+    """A killed process never closes its sessions (seen live: 371 of 2,211 still "running"). The restart closes them
+    as interrupted, when they were last heard from, keeping what they used as a lower bound: a request in flight was
+    charged and never recorded. MindsHub prices its sessions afterwards; no other provider can."""
+    from datetime import timedelta
+
+    from aifactory import inference
+    from aifactory.db import utcnow
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    started = utcnow().replace(microsecond=0) - timedelta(days=3)
+
+    def at(minutes):
+        return started + timedelta(minutes=minutes)
+
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="Greeting",
+                    spec="Make greet.sh print Hello, Factory!", acceptance=[CRITERION], repo_id=factory["repo"],
+                    status="running", stage="build", attempt=1)
+        s.add(task)
+        s.flush()
+        common = {"workspace_id": factory["ws"], "outcome_id": outcome_id, "task_id": task.id, "harness": "native",
+                  "started_at": started}
+        runs = {
+            "builder": Run(**common, role="builder", turns=4, input_tokens=4000, output_tokens=800, cost_usd=0.5),
+            "verifier": Run(**common, role="verifier"),
+            "mindshub": Run(**common, role="builder", provider="mindshub", turns=2, cost_usd=0.25),
+            "lead": Run(**{**common, "task_id": None, "harness": "control_plane"}, role="lead"),
+            "finished": Run(**common, role="verifier", status="failed", error="Verdict: fail", finished_at=at(5)),
+        }
+        s.add_all(runs.values())
+        s.flush()
+        # Only a session's own events say when it was last alive; the last is the outcome's, from no session.
+        for name, minutes in (("builder", 2), ("builder", 9), ("finished", 30), (None, 40)):
+            s.add(Event(workspace_id=factory["ws"], outcome_id=outcome_id, run_id=runs[name].id if name else None,
+                        kind="tool", created_at=at(minutes)))
+        ids, task_id = {name: run.id for name, run in runs.items()}, task.id
+
+    Orchestrator()._recover()
+    Orchestrator()._recover()  # the next restart finds nothing left to close
+    with session_scope() as s:
+        run = {name: s.get(Run, run_id) for name, run_id in ids.items()}
+        for name in ("builder", "verifier", "mindshub"):
+            assert (run[name].status, run[name].error) == ("interrupted", "Interrupted by a restart"), name
+        # Closed when the session was last heard from (its start, if it left no event), not when it was found.
+        assert run["builder"].finished_at == at(9)
+        assert run["verifier"].finished_at == run["mindshub"].finished_at == started
+        # What a session recorded is kept, and its cost marked unknown: the request it was waiting for is not in it.
+        used = run["builder"]
+        assert (used.turns, used.input_tokens, used.output_tokens, used.cost_usd, used.cost_known) == (
+            4, 4000, 800, 0.5, False)
+        assert (run["mindshub"].turns, run["mindshub"].cost_usd, run["mindshub"].cost_known) == (2, 0.25, False)
+        assert run["verifier"].cost_known is False  # it recorded nothing, which does not show it spent nothing
+        # The Lead's own recovery closes its sessions; a session that had finished stays as it ended.
+        assert run["lead"].status == "failed" and run["lead"].finished_at > at(40)
+        done = run["finished"]
+        assert (done.status, done.error, done.finished_at) == ("failed", "Verdict: fail", at(5))
+        task = s.get(Task, task_id)
+        assert (task.status, task.attempt) == ("queued", 1)  # the task is requeued as before
+        assert [(e.message, e.data) for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [
+            ("Closed 3 agent sessions that a restart interrupted", {"runs": 3})]
+    assert runtime.outcome_cost(outcome_id) == (0.75, False)  # so the outcome's total is "at least", not exact
+
+    async def session_cost(self, session_id):
+        return 1.75 if session_id == ids["mindshub"] else None
+
+    monkeypatch.setattr(inference.ModelClient, "session_cost", session_cost)
+    monkeypatch.setattr(inference, "resolve_provider",
+                        lambda ws: inference.ProviderConfig("mindshub", "http://model.test/v1", "k", "MindsHub"))
+    asyncio.run(Orchestrator()._maybe_reconcile_costs())
+    with session_scope() as s:
+        priced, other = s.get(Run, ids["mindshub"]), s.get(Run, ids["builder"])
+        assert (priced.cost_usd, priced.cost_known) == (1.75, True)
+        assert (other.cost_usd, other.cost_known) == (0.5, False)  # only MindsHub can say what a session cost
+
+
 def test_smoke_failure_is_reverted_under_recovery_policy(factory):
     with session_scope() as s:
         repo = s.get(Repository, factory["repo"])
@@ -2215,6 +2295,130 @@ def test_infrastructure_failures_are_retried_after_a_backoff_without_using_attem
         assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
         first = workspace_metrics(s, factory["ws"])["first_attempt_pass_rate"]
         assert (first["numerator"], first["denominator"]) == (1, 1)  # infrastructure retries are not attempts
+
+
+def _task_past_the_budget(factory, evidence=None, **budgets):
+    """A queued task whose outcome has spent $41.25 of its $40 budget, with one more session of unknown cost."""
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        # No Lead: what a running Lead has reserved counts as spent, which would move the amounts asserted below.
+        ws.settings = {**ws.settings, "lead": {"enabled": False}, "budgets": {**ws.settings["budgets"], **budgets}}
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="Greeting",
+                    spec="Make greet.sh print Hello, Factory!", acceptance=[CRITERION], repo_id=factory["repo"],
+                    status="queued", evidence=evidence or {})
+        earlier = {"workspace_id": factory["ws"], "outcome_id": outcome_id, "role": "planner", "harness": "native",
+                   "status": "succeeded"}
+        spending = Run(**earlier, cost_usd=41.25)
+        s.add_all([task, spending, Run(**earlier, cost_known=False)])
+        s.get(Outcome, outcome_id).status = "running"
+        s.flush()
+        return outcome_id, task.id, spending.id
+
+
+def _verifier_that_fails_after_spending(run_id, cost):
+    """A verifier that rejects the change; by the time it reports, the outcome's known spending is ``cost``."""
+    def script(messages):
+        if step(messages) == 1:
+            with session_scope() as s:
+                s.get(Run, run_id).cost_usd = cost
+        return _always_failing_verifier(messages)
+
+    return script
+
+
+def _continue_past_budget(factory, decision_id):
+    """Answer a budget decision with its first option. Returns the task's status and the allowance that granted."""
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "retry")
+    db.close()
+    with session_scope() as s:
+        task = s.get(Task, s.get(Decision, decision_id).task_id)
+        return task.status, task.evidence["budget_allowance_usd"]
+
+
+@pytest.mark.parametrize("continue_usd,amount", [(None, "10"), (2.5, "2.50")])  # unset: a quarter of the $40 budget
+def test_known_spending_alone_stops_a_task_at_the_outcome_budget(factory, continue_usd, amount):
+    """One session of unknown cost used to switch the limit off (seen live: 21% of sessions have no known cost).
+    The button states what continuing grants, and continuing grants exactly that."""
+    outcome_id, task_id, _ = _task_past_the_budget(factory, **({"continue_usd": continue_usd} if continue_usd else {}))
+    assert drive(lambda: _open_decision(outcome_id, "budget"))
+    assert runtime.outcome_committed(outcome_id) == (41.25, False)
+    decision_id = _open_decision(outcome_id, "budget")
+    with session_scope() as s:
+        task, decision = s.get(Task, task_id), s.get(Decision, decision_id)
+        assert task.status == "needs_input" and not (task.evidence or {}).get("attempts")
+        assert decision.title == f"Outcome #{s.get(Outcome, outcome_id).number} reached its $40 budget"
+        assert decision.body == ("Spent $41.25; the limit was $40.00. Raise the budget in Settings, or continue with "
+                                 f"${amount} more than is spent now.")
+        assert decision.options == [{"value": "retry", "label": f"Continue with ${amount} more"},
+                                    {"value": "abandon", "label": "Stop"}]
+    assert _continue_past_budget(factory, decision_id) == ("queued", 41.25 + float(amount))
+
+
+def test_continuing_past_the_budget_grants_an_allowance_not_an_end_to_the_limit(factory):
+    outcome_id, task_id, spending = _task_past_the_budget(factory)
+    assert drive(lambda: _open_decision(outcome_id, "budget"))
+    first = _open_decision(outcome_id, "budget")
+    assert (runtime.outcome_allowance(outcome_id), runtime.outcome_allowance(outcome_id, 40)) == (0.0, 40.0)
+    assert _continue_past_budget(factory, first) == ("queued", 51.25)
+    assert runtime.outcome_allowance(outcome_id, 40) == 51.25  # what the outcome may now spend in all
+
+    # The task works again, and by the end of its next attempt the outcome has spent more than it was allowed.
+    ScriptedModel.scripts["verifier"] = _verifier_that_fails_after_spending(spending, 53.75)
+    assert drive(lambda: _open_decision(outcome_id, "budget"))
+    second = _open_decision(outcome_id, "budget")
+    assert second != first and [a["result"] for a in _attempt_records(outcome_id)] == ["verification_failed"]
+    with session_scope() as s:
+        decision, number = s.get(Decision, second), s.get(Outcome, outcome_id).number
+        assert decision.title == f"Outcome #{number} reached the $51.25 it was allowed to spend"
+        assert decision.body == ("Spent $53.75; the limit was $51.25 (the $40 budget, extended when it last continued)."
+                                 " Raise the budget in Settings, or continue with $10 more than is spent now.")
+    assert _continue_past_budget(factory, second) == ("queued", 63.75)  # each answer adds to what is spent by then
+    assert runtime.outcome_allowance(outcome_id, 40) == 63.75
+
+    ScriptedModel.scripts["verifier"] = passing_verifier
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "completed", task.blocked_reason
+
+
+def test_an_outcome_may_spend_the_most_that_any_of_its_tasks_was_allowed(factory):
+    # One figure for everything that spends on the outcome's account but is not a task (the Lead): the budget, or
+    # more once a person has let one of the outcome's tasks continue past it.
+    outcome_id, task_id, _ = _task_past_the_budget(factory, evidence={"budget_allowance_usd": 51.25})
+    with session_scope() as s:
+        first = s.get(Task, task_id)
+        for key, evidence in (("T2", {"budget_allowance_usd": 45}), ("T3", {"attempts": []})):
+            s.add(Task(workspace_id=first.workspace_id, outcome_id=outcome_id, plan_id=first.plan_id, key=key,
+                       title="Another task", spec="Nothing to do", acceptance=[CRITERION], repo_id=first.repo_id,
+                       status="blocked", evidence=evidence))
+    assert runtime.outcome_allowance(outcome_id) == runtime.outcome_allowance(outcome_id, 40) == 51.25
+    assert runtime.outcome_allowance(outcome_id, 60) == 60.0  # a budget raised above every allowance rules again
+    assert (runtime.outcome_allowance("no outcome"), runtime.outcome_allowance("no outcome", 40)) == (0.0, 40.0)
+
+
+def test_a_task_that_was_let_past_the_budget_for_good_gets_one_allowance_instead(factory):
+    """Before allowances, continuing set budget_override and the outcome budget never applied to the task again."""
+    outcome_id, task_id, spending = _task_past_the_budget(factory, evidence={"budget_override": True})
+    ScriptedModel.scripts["verifier"] = _verifier_that_fails_after_spending(spending, 53.75)
+    assert drive(lambda: _open_decision(outcome_id, "budget"))
+    # The old answer let one more attempt run; the allowance it was converted to then stopped the task.
+    assert [a["result"] for a in _attempt_records(outcome_id)] == ["verification_failed"]
+    with session_scope() as s:
+        evidence = s.get(Task, task_id).evidence
+        assert "budget_override" not in evidence and evidence["budget_allowance_usd"] == 51.25
+        decision, number = s.get(Decision, _open_decision(outcome_id, "budget")), s.get(Outcome, outcome_id).number
+        assert decision.title == f"Outcome #{number} reached the $51.25 it was allowed to spend"
 
 
 def _fix_greeting():

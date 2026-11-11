@@ -448,6 +448,19 @@ def test_benchmark_trial_link_excluded_from_delivery_and_legacy_stats(client, si
                                  "anton": {"runs": 0, "succeeded": 0}}
 
 
+def test_harness_counts_leave_out_sessions_a_restart_interrupted(client, signed_in):
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        _, _, t = seed(s, ws)
+        s.add_all([Run(workspace_id=ws, outcome_id=t.outcome_id, task_id=t.id, role="builder", harness="native",
+                       status=status, cost_usd=1, input_tokens=10, output_tokens=5)
+                   for status in ("succeeded", "failed", "interrupted")])
+    data = client.get(f"/api/workspaces/{ws}/stats").json()
+    # Neither a success nor a failure of the harness; what the session used still counts.
+    assert data["harnesses"]["native"] == {"runs": 2, "succeeded": 1}
+    assert (data["cost"]["usd"], data["tokens"]) == (3, 45)
+
+
 def test_autonomy_many_outcomes_keeps_histories_local(client, signed_in):
     ws, user = signed_in["workspaces"][0]["id"], signed_in["user"]["id"]
     cases = ("automatic", "approval", "outside_window", "message", "retry", "decision", "external", "unknown")

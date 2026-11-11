@@ -125,10 +125,39 @@ class Orchestrator:
                 task.lease_owner = ""
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
+        self._close_interrupted_runs()
         from .lead import recover as recover_leads
 
         recover_leads()
         self._complete_accepted()
+
+    def _close_interrupted_runs(self) -> None:
+        """A killed process never reaches run_agent's finally, so its sessions would stay "running" for good.
+        Close them as interrupted, which is not a verdict on the work. Lead sessions are closed by lead.recover()."""
+        from sqlalchemy import func, select
+
+        from ..models import Event, Run
+
+        open_runs = (Run.status == "running", Run.role != "lead")
+        with session_scope() as s:
+            # Events are indexed by outcome, not by run; a session's events carry both.
+            last_event = dict(s.query(Event.run_id, func.max(Event.created_at)).filter(
+                Event.outcome_id.in_(select(Run.outcome_id).where(*open_runs)),
+                Event.run_id.in_(select(Run.id).where(*open_runs))).group_by(Event.run_id).all())
+            closed: dict[str, int] = {}
+            for run in s.query(Run).filter(*open_runs).all():
+                run.status, run.error = "interrupted", "Interrupted by a restart"
+                # Not now: a session found days later would show a duration it never had.
+                run.finished_at = last_event.get(run.id) or run.started_at
+                # A request in flight when the process died was charged and never recorded, so what the session
+                # recorded is a lower bound. The cost reconciliation asks MindsHub what its sessions really cost; no
+                # other provider can say, and those stay unknown.
+                run.cost_known = False
+                closed[run.workspace_id] = closed.get(run.workspace_id, 0) + 1
+            for workspace_id, count in closed.items():
+                record(workspace_id, "runs_interrupted",
+                       f"Closed {count} agent session{'s' if count != 1 else ''} that a restart interrupted",
+                       data={"runs": count}, session=s)
 
     def _complete_accepted(self) -> None:
         """Repair: acknowledging (or opening a fix for) a failed post-merge check used to leave the merged task

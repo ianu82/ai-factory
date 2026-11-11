@@ -376,7 +376,8 @@ class Run(Base):
     provider: Mapped[str] = mapped_column(String(20), default="")
     model: Mapped[str] = mapped_column(String(100), default="")
     attempt: Mapped[int] = mapped_column(Integer, default=1)
-    status: Mapped[str] = mapped_column(String(20), default="running")  # running|succeeded|failed|cancelled|error
+    # running|succeeded|failed|cancelled|error|interrupted (closed after a restart; not a verdict on the work)
+    status: Mapped[str] = mapped_column(String(20), default="running")
     turns: Mapped[int] = mapped_column(Integer, default=0)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
