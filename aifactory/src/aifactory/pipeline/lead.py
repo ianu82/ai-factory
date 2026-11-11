@@ -133,8 +133,9 @@ You were woken because something on your outcome needs judgement. Read the outco
 - Request changes on a pull request (resolve_decision with "reject" on a merge approval) when review findings,
   failed checks or the verifier's report show it isn't ready. Say exactly what must change.
 - Merge approvals: merge_reviews in the record says what review reports for the exact commit up for merging, read
-  from GitHub now. Never recommend merging while that commit's review isn't in, while it couldn't be read, or
-  while P0 or P1 findings are open: request changes citing the open P0/P1 findings, or say what is outstanding.
+  from GitHub now. Never recommend merging while that commit's review isn't in, while it couldn't be read, while
+  a reviewer requests changes, or while P0 or P1 findings are open: request changes citing the open P0/P1 findings
+  or the change request, or say what is outstanding.
   List any lower-severity findings still open. Your notes on a merge approval start with that review line
   automatically.
 - Post guidance (post_guidance) when the agents need direction that isn't tied to a decision.
@@ -434,7 +435,7 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
     """What review says about this exact commit of a pull request, read from GitHub: whether a reviewer has
     reported on it, who requests changes, and the review threads still open on the code (neither resolved nor
     outdated), with their severity. Unreadable means unknown, never clean."""
-    from ..github import GitHub, GitHubError, resolve_credential
+    from ..github import GitHub, resolve_credential
 
     state: dict[str, Any] = {"head": head, "checked": False, "reviewed": False, "open": [],
                              "changes_requested_by": []}
@@ -464,8 +465,8 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
                                   "line": t.get("line"), "by": ((first.get("author") or {}).get("login") or ""),
                                   "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
         state["checked"] = True
-    except (GitHubError, KeyError, TypeError, ValueError) as exc:
-        log.warning("review state of %s#%s unreadable: %s", repo, number, exc)
+    except Exception as exc:  # anything at all (a credential that no longer decrypts, a timeout): unknown, never clean
+        log.warning("review state of %s#%s unreadable: %r", repo, number, exc)
         state["checked"] = False
     return state
 

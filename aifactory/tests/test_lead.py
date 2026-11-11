@@ -11,6 +11,7 @@ from aifactory.inference import ProviderConfig
 from aifactory.models import (Decision, DecisionReview, Event, Message, Outcome, Plan, Repository, Run, Task, User,
                               Workspace)
 from aifactory.pipeline import lead
+from aifactory.security import SecretError
 from tests.fakes import ScriptedModel, call, step
 
 
@@ -821,6 +822,13 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
 
     monkeypatch.setattr(github, "GitHub", Partial)
     assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["checked"] is False  # unknown, never clean
+
+    def undecryptable(ws):  # the stored token no longer decrypts, e.g. after the server's key rotated
+        raise SecretError("cannot decrypt")
+
+    monkeypatch.setattr(github, "GitHub", FakeGitHub)
+    monkeypatch.setattr(github, "resolve_credential", undecryptable)
+    assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["checked"] is False
 
 def unreviewed(*_args):
     async def state(ws, repo, number, head):
