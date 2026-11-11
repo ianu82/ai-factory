@@ -144,6 +144,7 @@ class Orchestrator:
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
+                await self._maybe_sweep_vms()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -332,6 +333,20 @@ class Orchestrator:
                 log.exception("signal sync failed for %s", workspace_id)
             finally:
                 db.close()
+
+    async def _maybe_sweep_vms(self) -> None:
+        """At startup (nothing is held yet) and every 15 minutes: destroy sandbox VMs no job holds, and log how full
+        the environment is. Orphans once filled Railway's cap and silently moved all work onto this host."""
+        import time
+
+        from ..vm import sweep_orphans
+
+        if time.monotonic() - getattr(self, "_last_vm_sweep", float("-inf")) < 900:
+            return
+        self._last_vm_sweep = time.monotonic()
+        report = await sweep_orphans()
+        if "skipped" not in report:
+            log.info("inventory vms %s", report)
 
     async def _maybe_inventory(self) -> None:
         import time

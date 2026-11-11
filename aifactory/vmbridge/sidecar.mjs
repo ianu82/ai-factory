@@ -3,7 +3,7 @@
 // the Railway token stays in this process and VMs are created with an empty environment.
 import readline from 'node:readline';
 import {randomUUID} from 'node:crypto';
-import {ExecNotStartedError, Sandbox} from 'railway';
+import {DEFAULT_RAILWAY_GRAPHQL_ENDPOINT, ExecNotStartedError, Sandbox} from 'railway';
 import WebSocket from 'ws';
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -27,6 +27,18 @@ const client = {
   webSocketImpl: ExecWebSocket,
 };
 const boxes = new Map();
+
+// Direct GraphQL for the orphan sweep: the SDK's list includes destroyed sandboxes and hides its cursor, and an
+// orphan may not answer a connect, so it is destroyed by id. Same endpoint and auth headers as the SDK.
+async function graphql(query, variables) {
+  const auth = client.authType === 'project-token' ? {'project-access-token': client.token}
+    : {Authorization: `Bearer ${client.token}`};
+  const res = await fetch(process.env.RAILWAY_GRAPHQL_ENDPOINT || DEFAULT_RAILWAY_GRAPHQL_ENDPOINT, {
+    method: 'POST', headers: {'content-type': 'application/json', ...auth}, body: JSON.stringify({query, variables})});
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || body.errors) throw new Error(`Railway GraphQL ${res.status}: ${JSON.stringify(body.errors || '').slice(0, 300)}`);
+  return body.data;
+}
 const procs = new Map();
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
 
@@ -46,6 +58,25 @@ function template(spec) {
 
 const ops = {
   async ping() { return {ok: true, configured: Boolean(client.token && client.environmentId)}; },
+  async sandboxes() {
+    const items = [];
+    let after = null;
+    for (let page = 0; page < 20; page++) {
+      const data = await graphql('query($e: String!, $after: String) { sandboxes(environmentId: $e, active: true, '
+        + 'first: 100, after: $after) { edges { node { id status createdAt } } pageInfo { hasNextPage endCursor } } }',
+        {e: client.environmentId, after});
+      items.push(...data.sandboxes.edges.map((edge) => edge.node));
+      if (!data.sandboxes.pageInfo.hasNextPage) break;
+      after = data.sandboxes.pageInfo.endCursor;
+    }
+    return {items};
+  },
+  async forget(a) {
+    await graphql('mutation($e: String!, $id: String!) { sandboxDestroy(environmentId: $e, id: $id) { id status } }',
+      {e: client.environmentId, id: a.id});
+    boxes.delete(a.id);
+    return {destroyed: true};
+  },
   async create(a) {
     const options = {...client, resources: a.resources, idleTimeoutMinutes: a.idleTimeoutMinutes ?? 20,
       networkIsolation: a.networkIsolation || 'ISOLATED', env: {}, domains: []};
