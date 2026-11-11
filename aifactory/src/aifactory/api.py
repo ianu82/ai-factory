@@ -1288,7 +1288,8 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
         "human": {"decisions": len(decisions), "open": sum(d.status == "open" for d in decisions),
                   "interventions": sum(human_message(m) for m in db.query(Message).filter(
                       Message.workspace_id == workspace_id, Message.author_kind == "user"))},
-        "harnesses": {h: {"runs": sum(r.harness == h for r in runs),
+        # A session a restart interrupted says nothing about the harness: it counts neither for nor against it.
+        "harnesses": {h: {"runs": sum(r.harness == h and r.status != "interrupted" for r in runs),
                           "succeeded": sum(r.harness == h and r.status == "succeeded" for r in runs)}
                       for h in ("native", "codex", "anton")},
     }

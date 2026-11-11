@@ -14,7 +14,9 @@ type Stats = {
   harnesses: Record<string, { runs: number; succeeded: number }>;
 };
 
-const RUN_TONE: Record<string, "good" | "bad" | "active" | "idle"> = { succeeded: "good", failed: "bad", error: "bad", running: "active", cancelled: "idle" };
+const RUN_TONE: Record<string, "good" | "bad" | "active" | "idle"> = {
+  succeeded: "good", failed: "bad", error: "bad", running: "active", cancelled: "idle", interrupted: "idle",
+};
 
 export function RunsPage() {
   const { ws } = useWs();

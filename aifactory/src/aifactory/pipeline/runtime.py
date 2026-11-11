@@ -71,6 +71,19 @@ def workspace_settings(workspace_id: str) -> dict[str, Any]:
         return merged_settings(ws.settings if ws else {})
 
 
+def budget_extension(settings: dict[str, Any]) -> float:
+    """Dollars that continuing a task past the outcome budget adds to what is spent by then: budgets.continue_usd
+    when that is a positive number, else a quarter of the budget. The budget decision's button states this amount
+    and resolving it grants the same, so both read it here."""
+    budgets = settings.get("budgets") or {}
+
+    def positive(value: Any) -> float:
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return float(value) if number and 0 < value < float("inf") else 0.0
+
+    return max(0.01, round(positive(budgets.get("continue_usd")) or positive(budgets.get("outcome_usd")) / 4, 2))
+
+
 def guidance_history(outcome_id: str, task_id: str | None = None) -> list[str]:
     """All team guidance so far for an outcome (and this task), for inclusion in new prompts."""
     with session_scope() as s:
