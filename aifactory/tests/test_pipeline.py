@@ -2085,18 +2085,28 @@ def test_failing_tests_are_compared_with_the_base_commit():
     assert not delivery._same_failure(other(), {**other(), "failures": [network]})  # only the base printed test names
     assert not delivery._same_failure(other(), {"ok": True})
     assert not delivery._same_failure(other(timed_out=True), other(timed_out=False))
-    # Out of time on the base as well: too slow for the limit whatever the change does. What each run had printed
-    # by then differs, so it is not compared; a failing test only the candidate printed still counts.
-    assert delivery._same_failure(other(124, timed_out=True), other(124, signature="def", timed_out=True))
-    assert not delivery._same_failure({**other(124, timed_out=True), "failures": [network]}, other(124, timed_out=True))
+    # Out of time on the base as well: too slow for the limit whatever the change does, when both runs had got
+    # about as far. What each had printed by then differs, so the text is not compared, only how much there was; a
+    # failing test only the candidate printed still counts.
+    def slow(progress=900, **more):
+        return other(124, timed_out=True, progress=progress, **more)
+
+    assert delivery._same_failure(slow(), slow(600, signature="def"))
+    assert delivery._same_failure(slow(0), slow(0))  # both hang before printing anything
+    assert not delivery._same_failure(slow(0), slow())  # it stopped at once: it may hang because of the change
+    assert not delivery._same_failure(slow(400), slow())  # it stopped printing well before the base did
+    assert not delivery._same_failure(slow(5000), slow())  # it printed far more: it may be looping
+    assert not delivery._same_failure(other(124, timed_out=True), slow())  # progress not recorded proves nothing
+    assert not delivery._same_failure(slow(), other(124, timed_out=True))
+    assert not delivery._same_failure(slow(failures=[network]), slow())
+    assert delivery._progress("\x1b[32mrun 1\x1b[0m\n") == 5 and delivery._progress("") == 0
     assert not delivery._same_failure(other(), None)
     # A check that failed on two runs is excused only when both runs match the base: what the first run alone failed
     # is still the candidate's, however the second run ended.
     twice = {"ok": False, "failures": [network], "first": {"failures": [network, "FAILED tests/test_new.py::test_new"]}}
     assert not delivery._same_failure(twice, base)
     assert delivery._same_failure({**twice, "first": {"failures": [network]}}, base)
-    slow = other(124, timed_out=True)
-    assert not delivery._same_failure({**slow, "first": other()}, slow)  # failed, then out of time as the base is
+    assert not delivery._same_failure({**slow(), "first": other()}, slow())  # failed, then out of time as the base is
     # Two failed runs failed the same way only with the same exit code and the same failing tests or, where the
     # output names none, the same output.
     assert delivery._same_run(other(), other()) and delivery._same_run({"failures": [network]}, {"failures": [network]})
@@ -2219,11 +2229,13 @@ def test_a_failure_without_test_names_is_preexisting_only_when_the_base_prints_t
 
 
 # Counts its runs in its sandbox. With flaky.txt in the checkout only its first run fails, with broken.txt every run
-# fails the same way, and with slow.txt a run that gets that far says which run it is and does not finish in time.
+# fails the same way, with stuck.txt a run that gets that far hangs before it prints anything, and with slow.txt a
+# run that gets that far says which run it is and does not finish in time.
 COUNTED_CHECK = ('echo run >> "$TMPDIR/runs"\n'
                  'n=$(grep -c run "$TMPDIR/runs")\n'
                  'if [ -f flaky.txt ] && [ "$n" = 1 ]; then echo "run $n: connection reset by peer"; exit 1; fi\n'
                  'if [ -f broken.txt ]; then echo "broken.txt must not exist"; exit 3; fi\n'
+                 'if [ -f stuck.txt ]; then sleep 30; fi\n'
                  'echo "run $n"\n'
                  'if [ -f slow.txt ]; then sleep 30; fi\n')
 
@@ -2403,6 +2415,31 @@ def test_a_check_that_times_out_on_the_base_commit_too_is_preexisting(factory, m
     assert "; the limit is 3s) (pre-existing, see below)" in briefs[0]
     assert "- `sh counted.sh`: times out on the base commit too" in briefs[0]
     assert "(the limit is 3s); it times out on the base commit too, so not caused by this change" in body
+
+
+def test_a_timeout_that_got_less_far_than_the_base_commit_s_is_not_preexisting(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "stuck.txt", prompts, briefs)
+    _land_on_main(factory, "slow.txt", "x\n")  # on the base commit the check prints its run, then runs out of time
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # First attempt: the check hangs before it prints anything, which the base commit's run does not explain.
+        # Second attempt: it gets as far as the base commit's run before the limit.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        check, again = _counted(records[0]), _counted(records[1])
+        assert (check["cause"], check["timed_out"], check.get("preexisting"), check["tail"].strip()) == (
+            "timeout", True, None, "")
+        assert (again["cause"], again["timed_out"], again.get("preexisting")) == ("preexisting", True, True)
+    assert "Check `sh counted.sh` timed out after " in prompts[1]
+    assert ("(it times out on the base commit too, but the two runs had not got equally far when they were stopped, "
+            "so this timeout counts as a failure of your change)") in prompts[1]
+    assert len(briefs) == 1 and "- `sh counted.sh`: times out on the base commit too" in briefs[0]
 
 
 def test_a_check_that_fails_and_then_times_out_as_the_base_commit_does_is_not_preexisting(factory, monkeypatch):

@@ -652,7 +652,8 @@ class TaskRunner:
         if not result.ok:
             row["failures"] = _failing_tests(result.output)
             row["signature"] = _output_signature(result.output, sandbox)
-            row |= {"cause": "timeout", "limit": timeout} if result.timed_out else {"cause": "real"}
+            row |= ({"cause": "timeout", "limit": timeout, "progress": _progress(result.output)} if result.timed_out
+                    else {"cause": "real"})
         return row, result.output
 
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
@@ -847,6 +848,9 @@ class TaskRunner:
             elif first and _same_failure({**check, "first": None}, theirs):
                 check["vs_base"] = (" (the base commit fails as the second run did, not as the first, so the first "
                                     "run's failure counts as a failure of your change)")
+            elif check.get("timed_out") and theirs.get("timed_out"):
+                check["vs_base"] = (" (it times out on the base commit too, but the two runs had not got equally far "
+                                    "when they were stopped, so this timeout counts as a failure of your change)")
             elif theirs and not theirs.get("ok", True):
                 check["vs_base"] = (" (it fails on the base commit too, but not with the same output, so it counts "
                                     "as a failure of your change)")
@@ -1940,14 +1944,32 @@ def _output_signature(output: str, sandbox: Any = None) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:32] if text else ""
 
 
+def _progress(output: str) -> int:
+    """How far a command had got when it was stopped at the time limit: how much it had printed, colours removed."""
+    return len(_ANSI.sub("", output or "").strip())
+
+
+def _as_far(candidate: dict[str, Any], base: dict[str, Any]) -> bool:
+    """Whether two runs stopped at the time limit had got about as far: neither had printed more than twice what
+    the other had. What a run had printed by then depends on the machine's load, so the margin is wide; it still
+    tells a suite that is too slow for the limit (both runs get about as far) from a change that makes the command
+    hang or loop (one run stops printing early, or prints far more). Progress that was not recorded proves
+    nothing."""
+    mine, theirs = candidate.get("progress"), base.get("progress")
+    if mine is None or theirs is None:
+        return False
+    return max(mine, theirs) <= 2 * min(mine, theirs)
+
+
 def _same_failure(candidate: dict[str, Any], base: dict[str, Any] | None) -> bool:
     """Whether a check failing on the candidate fails the same way on the base commit, with nothing new. For pytest
     output: no node id that the base does not fail too. Other output has no test names to compare, and "the base
     exits non-zero as well" is not enough (a build can fail on the base for one reason and on the candidate for
     another), so both runs must end with the same exit code and print the same thing (``_output_signature``).
     A check that runs out of time on the candidate and on the base is too slow for the limit whatever the change
-    does, unless the candidate printed failing tests the base did not; one that runs out of time on the candidate
-    only is the candidate's failure.
+    does, provided the two runs had got about as far by then (``_as_far``: a candidate that stopped printing early,
+    or printed far more, may hang or loop because of the change) and the candidate printed no failing test the base
+    did not; one that runs out of time on the candidate only is the candidate's failure.
     A check that failed on two runs (``first`` holds the first) must match the base on both: what only one of them
     failed is still the candidate's, whichever run it was.
     Anything else is inconclusive, and the failure counts against the attempt."""
@@ -1956,7 +1978,8 @@ def _same_failure(candidate: dict[str, Any], base: dict[str, Any] | None) -> boo
     if candidate.get("first") and not _same_failure(candidate["first"], base):
         return False
     if candidate.get("timed_out"):
-        return bool(base.get("timed_out")) and set(candidate.get("failures") or []) <= set(base.get("failures") or [])
+        return (bool(base.get("timed_out")) and _as_far(candidate, base)
+                and set(candidate.get("failures") or []) <= set(base.get("failures") or []))
     new, old = candidate.get("failures"), base.get("failures")
     if new is None or old is None:
         return (new is None and old is None and candidate.get("exit_code") == base.get("exit_code")
