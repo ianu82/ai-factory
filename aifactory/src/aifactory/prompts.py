@@ -101,9 +101,16 @@ How to work:
 - Run the tests and any commands needed to gather evidence. Write throwaway checks if useful,
   but do not try to fix the implementation — you are reviewing only.
 - For each acceptance criterion, record pass/fail/unverified with concrete evidence
-  (commands and their results, file:line references).
+  (commands and their results, file:line references). Report a result for every criterion; one you could not
+  check is unverified. Name each criterion by its text copied exactly from the list, or by its list number alone:
+  a reworded or shortened criterion is not accepted as a result for it.
 - Also look for regressions, broken behaviour, security problems, missing tests, and changes
-  outside the task's scope. Report them as findings with a severity.
+  outside the task's scope. Report them as findings, each with a severity:
+  - blocker: the change must not merge as it is. It breaks existing behaviour, loses or corrupts data, opens a
+    security hole, or does not actually do what a criterion says.
+  - major: it should be fixed, but does not stop the merge. It goes on the pull request and to the builder as
+    advice.
+  - minor: a small improvement.
 - Separate the change from its environment. When a test or command fails, check whether it fails the same way
   without the change (for example in a clean checkout of {base} in a temporary directory). A failure that is
   identical on the base commit AND unrelated to the task (not something the task is meant to fix, and in code the
@@ -114,9 +121,12 @@ How to work:
 - Opt-in test suites that are skipped by default stay skipped, unless the change touches the integration they
   cover or the acceptance criteria call for them; then run them and treat their results as evidence.
 - Judge the change by this task's criteria, and use the original request to read them as intended: a change
-  that meets the wording of the criteria but contradicts the request is a major finding. Work the plan gives to
-  another task is not missing from this one.
-- verdict "pass" only if every criterion passes with evidence and there are no blocker findings.
+  that meets the wording of the criteria but contradicts the request does not do what they say, which is a
+  blocker finding. Work the plan gives to another task is not missing from this one.
+- The verdict follows from the criteria and the findings, and from nothing else. It is "fail" when a criterion is
+  not met (fail or unverified) or there is a blocker finding; otherwise it is "pass", and major and minor findings
+  stay on it as advice. To fail a change, mark the criterion it does not meet or raise a blocker: a concern you
+  would not call a blocker does not fail it.
 
 When done, call finish with your verdict."""
 
@@ -200,7 +210,9 @@ def plan_review_prompt(outcome: Any, repos: list[Any], decisions: list[Any], gui
 
 def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisions: list[Any],
                  guidance: list[str] | None = None, sections: list[str] | None = None) -> str:
-    """``sections`` are preformatted: the plan around the task and the repository's instructions for agents."""
+    """``sections`` are preformatted: the plan around the task and the repository's instructions for agents.
+    ``feedback`` is preformatted too: the latest attempt's results, then (under its own heading) what an earlier
+    review left open."""
     cfg = repo.config or {}
     lines = [
         f"# Task {task.key}: {task.title}",
@@ -245,10 +257,61 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
     return "\n".join(lines)
 
 
+def previous_review(previous: dict[str, Any], base_sha: str) -> list[str]:
+    """The last verdict on this task and what changed since, so a review builds on the one before it instead of
+    starting over on new grounds. ``previous`` is {attempt, verdict, changed, unchanged, base}; the two file lists
+    are None when the diff that review saw could not be loaded, and nothing is then claimed about what changed."""
+    def one(text: Any, limit: int) -> str:
+        return _clip(" ".join(str(text or "").split()), limit)
+
+    def objects(items: Any) -> list[dict[str, Any]]:
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    def listed(names: list[str]) -> str:
+        return ", ".join(names[:40]) + (f" and {len(names) - 40} more" if len(names) > 40 else "")
+
+    verdict = previous.get("verdict") or {}
+    lines = ["", f"## Your previous review (attempt {previous.get('attempt')})",
+             "A verifier session before you reviewed an earlier state of this change. Build on that review; do not "
+             "start over.",
+             f"Verdict: {verdict.get('verdict')}. {one(verdict.get('summary'), 600)}"]
+    lines += [f"- [{c.get('status')}] {one(c.get('criterion'), 300)} — {one(c.get('evidence'), 300)}"
+              for c in objects(verdict.get("criteria"))[:40]]
+    findings = [f for f in objects(verdict.get("findings")) if f.get("severity") in ("blocker", "major")]
+    if findings:
+        lines += ["Its blocker and major findings:"]
+        lines += [f"- {f['severity']}: {one(f.get('description'), 300)} {one(f.get('location'), 120)}".rstrip()
+                  for f in findings[:20]]
+    lines += ["", "### What changed since then"]
+    changed, unchanged = previous.get("changed"), previous.get("unchanged")
+    if changed is None or unchanged is None:
+        lines.append("Nothing is known about which files changed since then: the diff that review saw could not be "
+                     "loaded.")
+    elif not changed:
+        lines.append("No file's diff changed: the change is exactly as that review saw it.")
+    else:
+        lines += [f"Files whose diff changed: {listed(changed)}",
+                  f"Files whose diff is the same as then: {listed(unchanged) or 'none'}"]
+    before = previous.get("base") or ""
+    if not before:
+        lines.append("The base commit that review ran against was not recorded: the base branch may have moved since.")
+    elif before != base_sha:
+        lines.append(f"The base commit moved from {before} to {base_sha}: newer commits on the base branch are part "
+                     "of what changed.")
+    lines += ["", "### How to use the previous review",
+              "- First check whether each point it raised is now resolved.",
+              "- A criterion that passed then stays passed, unless what changed since then broke it or you can say "
+              "what was missed then.",
+              "- A new blocker must point at something that changed since then, or say why it was not raised then.",
+              "- Do not re-open a settled point in different words."]
+    return lines
+
+
 def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str, Any], checks: list[dict[str, Any]],
                   decisions: list[Any] | None = None, guidance: list[str] | None = None, outcome: Any = None,
-                  sections: list[str] | None = None) -> str:
-    """``sections`` are preformatted: the plan around the task and the repository's instructions for agents."""
+                  sections: list[str] | None = None, previous: dict[str, Any] | None = None) -> str:
+    """``sections`` are preformatted: the plan around the task and the repository's instructions for agents.
+    ``previous`` is the last verdict on this task and what changed since (see ``previous_review``)."""
     lines = [
         f"# Verify task {task.key}: {task.title}",
         "",
@@ -282,6 +345,8 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
                   "These answers and requests refine the specification and acceptance criteria. Where one clarifies "
                   "or relaxes a criterion, judge the criterion as clarified; check that requested fixes were made.",
                   *[f"- {g}" for g in guidance[-12:]]]
+    if previous:
+        lines += previous_review(previous, base_sha)
     if checks:
         lines += ["", "## Configured checks already run by the factory on this candidate"]
         for check in checks:

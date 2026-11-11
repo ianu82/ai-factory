@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Sequence
 
 PLANNER_REPORT: dict[str, Any] = {
     "type": "object",
@@ -125,8 +126,47 @@ SCHEMAS = {"planner": PLANNER_REPORT, "builder": BUILDER_REPORT, "verifier": VER
            "plan_reviewer": PLAN_REVIEW_REPORT}
 
 
-def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]:
-    """Light, forgiving validation: returns (normalized_report, error)."""
+
+
+def _criterion_key(text: Any) -> str:
+    """A criterion's text reduced to what identifies it: case, spacing, a list number and quoting are ignored."""
+    key = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    key = re.sub(r"^(?:criterion )?\(?#?\d{1,3}[.):] ", "", key)
+    return key.strip(" \"'`*.…")
+
+
+def _criterion_number(text: Any) -> int:
+    """The list number when a reported criterion only refers to it ("2", "Criterion 2"); otherwise 0."""
+    plain = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    found = re.fullmatch(r"(?:(?:criterion|ac) ?)?#?(\d{1,3})[.):]?", plain)
+    return int(found.group(1)) if found else 0
+
+
+def uncovered_criteria(expected: Sequence[str], criteria: list[dict[str, Any]]) -> list[tuple[int, str]]:
+    """The task's acceptance criteria (list number, text) that a verifier's report has no result for. A result
+    counts for the one criterion it identifies: by that criterion's text (case, spacing, a leading list number and
+    closing punctuation aside) or by its list number alone. Other wording identifies none, however close: a sentence
+    that reads like one criterion can read as much like another ("returns 200 for valid requests", "returns 400 for
+    invalid requests"). A repeated result does not cover a second criterion."""
+    wanted = {n: key for n, text in enumerate(expected, 1) if (key := _criterion_key(text))}
+    texts = [c.get("criterion") for c in criteria]
+    keys = [_criterion_key(text) for text in texts]
+    free = list(range(len(criteria)))
+    missing = dict(wanted)
+    for n, key in wanted.items():  # the criterion's own text
+        hit = next((i for i in free if keys[i] == key), None)
+        if hit is not None:
+            free.remove(hit)
+            del missing[n]
+    for i in free:  # its list number alone
+        missing.pop(_criterion_number(texts[i]), None)
+    return [(n, " ".join(str(expected[n - 1]).split())) for n in missing]
+
+
+def validate_report(role: str, report: Any,
+                    expected_criteria: Sequence[str] | None = None) -> tuple[dict[str, Any] | None, str]:
+    """Light, forgiving validation: returns (normalized_report, error). ``expected_criteria`` are the task's
+    acceptance criteria, when the caller knows them: a verifier's report needs a result of its own for each."""
     if not isinstance(report, dict):
         return None, "The report must be a JSON object."
     schema = SCHEMAS[role]
@@ -165,10 +205,31 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
         if not isinstance(report.get("findings") or [], list) or any(
                 not isinstance(f, dict) for f in report.get("findings") or []):
             return None, "findings must be a list of objects."
-        if report["verdict"] == "pass" and any(c.get("status") != "pass" for c in criteria):
+        if uncovered := uncovered_criteria(expected_criteria or [], criteria):
+            total = sum(1 for text in expected_criteria or [] if _criterion_key(text))
+            listed = "; ".join(f"{n}. {text[:200]}" for n, text in uncovered[:5])
+            more = f" (and {len(uncovered) - 5} more)" if len(uncovered) > 5 else ""
+            return None, (f"The report has results for {total - len(uncovered)} of the task's {total} acceptance "
+                          f"criteria ({len(uncovered)} missing). Not covered: {listed}{more}. Report on every "
+                          "criterion once, named by its text copied exactly from the task's list or by its list "
+                          "number alone (for example 2), with a status and evidence; a reworded, shortened or "
+                          "repeated criterion does not count. Use unverified for one you could not check.")
+        wanted = list(expected_criteria or [])
+        for result in criteria:  # a result named by list number carries the criterion's text from here on
+            n = _criterion_number(result.get("criterion"))
+            if 0 < n <= len(wanted) and _criterion_key(wanted[n - 1]):
+                result["criterion"] = " ".join(str(wanted[n - 1]).split())
+        unmet = any(c.get("status") != "pass" for c in criteria)
+        blocker = any(f.get("severity") == "blocker" for f in report.get("findings") or [])
+        if report["verdict"] == "pass" and unmet:
             return None, "A pass verdict requires every criterion to pass. Use fail (or verify further)."
-        if report["verdict"] == "pass" and any(f.get("severity") == "blocker" for f in report.get("findings") or []):
+        if report["verdict"] == "pass" and blocker:
             return None, "A pass verdict cannot include blocker findings."
+        # Only an unmet criterion or a blocker fails a change; major and minor findings are advice on a pass.
+        if report["verdict"] == "fail" and not unmet and not blocker:
+            return None, ("A fail verdict needs a criterion that is not met or a blocker finding. Mark the criterion "
+                          "that is not met as fail; or raise the finding to blocker if the change must not merge as "
+                          "it is; or use pass and keep the findings as advice.")
     if role == "builder" and report.get("status") not in ("done", "blocked"):
         return None, "status must be done or blocked."
     if role == "plan_reviewer":
