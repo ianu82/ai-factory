@@ -2,11 +2,40 @@ from __future__ import annotations
 
 import os
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+
+def shard_of(nodeid: str, total: int) -> int:
+    """Which of `total` shards (1-based) runs this test: a stable hash of its file and function.
+
+    The parameters of a parametrised test are left out of the key, so all its cases run in one shard and an id
+    that differs between runs can never put a case in two shards or in none.
+    """
+    return zlib.crc32(nodeid.split("[", 1)[0].encode()) % total + 1
+
+
+def pytest_collection_modifyitems(config, items):
+    """CI runs the suite on several runners at once: AIFACTORY_TEST_SHARD=2/3 keeps the second third of the tests.
+
+    Unset (a developer's machine, the Factory's own check commands) every test runs, as before. Every test sets
+    up its own data directory and database (`isolated_env`), so which tests share a process does not matter.
+    """
+    spec = os.environ.get("AIFACTORY_TEST_SHARD", "").strip()
+    if not spec:
+        return
+    index, _, total = spec.partition("/")
+    if not (index.isdigit() and total.isdigit() and 1 <= int(index) <= int(total)):
+        raise pytest.UsageError(f"AIFACTORY_TEST_SHARD must look like 2/3, got {spec!r}")
+    keep = [item for item in items if shard_of(item.nodeid, int(total)) == int(index)]
+    dropped = [item for item in items if shard_of(item.nodeid, int(total)) != int(index)]
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = keep
 
 
 @pytest.fixture(autouse=True)
