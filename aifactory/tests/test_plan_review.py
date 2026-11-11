@@ -10,7 +10,7 @@ from aifactory.db import session_scope
 from aifactory.harness.schemas import validate_report
 from aifactory.inference import PLAN_REVIEWER_MODEL, workspace_models
 from aifactory.models import Decision, Event, Outcome, Plan, Run, Task, Workspace
-from aifactory.pipeline import planning
+from aifactory.pipeline import delivery, planning
 
 from .fakes import ScriptedModel, call
 from .test_pipeline import factory, new_outcome, planner_script  # noqa: F401 - workspace, repository and user fixture
@@ -156,6 +156,96 @@ def test_a_failed_revision_leaves_the_reviewed_plan_with_a_person(factory):
     assert decision[0] == "approve_plan"
     assert "could not revise this plan after the review: planner crashed" in decision[1]
     assert "- major (T1): Add a test for the new greeting." in decision[1]
+
+
+def test_planning_retries_an_outage_and_then_plans_without_asking_anyone(factory, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    sessions = []
+
+    def planner(messages):
+        if len(messages) == 2:
+            sessions.append(1)
+        if len(sessions) == 1:
+            raise InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
+        return planner_script(messages)
+
+    ScriptedModel.scripts["planner"] = planner
+    ScriptedModel.scripts["plan_reviewer"] = approve
+    oid = new_outcome(factory)
+    status, plans, tasks, decision, roles = plan(oid)
+    assert status == "running" and tasks == 1 and decision is None
+    assert plans == [(1, "approved", "approve")]
+    assert roles == ["planner", "planner", "plan_reviewer"]
+    with session_scope() as s:
+        retry = s.query(Event).filter_by(outcome_id=oid, kind="infra_retry").one()
+        assert retry.level == "warn" and "retrying in 0 min (1 of 3)" in retry.message
+
+
+def test_planning_asks_a_person_after_the_outage_outlasts_its_retries(factory, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    sessions = []
+
+    def unavailable(messages):
+        sessions.append(1)
+        raise InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
+
+    ScriptedModel.scripts["planner"] = unavailable
+    oid = new_outcome(factory)
+    status, plans, tasks, decision, roles = plan(oid)
+    assert len(sessions) == delivery.INFRA_RETRIES + 1 and roles == ["planner"] * len(sessions)
+    assert status == "blocked" and plans == [] and tasks == 0
+    kind, body = decision
+    assert kind == "unblock"
+    assert f"Planning failed {delivery.INFRA_RETRIES + 1} times in a row for reasons outside the plan" in body
+    assert "upstream unavailable" in body
+    with session_scope() as s:
+        retries = s.query(Event).filter_by(outcome_id=oid, kind="infra_retry").order_by(Event.id).all()
+        assert [e.data["delay"] for e in retries] == [0, 0, 0]
+        assert "(3 of 3)" in retries[-1].message
+
+
+def test_a_provider_that_refuses_the_planner_holds_the_workspace(factory):
+    from aifactory.inference import InferenceError
+
+    sessions = []
+
+    def out_of_credit(messages):
+        sessions.append(1)
+        raise InferenceError("Server returned 402: your MindsHub credits are used up", status=402)
+
+    ScriptedModel.scripts["planner"] = out_of_credit
+    oid = new_outcome(factory)
+    status, plans, tasks, decision, roles = plan(oid)
+    # The outcome stays in planning with no decision of its own; the workspace's hold is the one thing to answer.
+    assert status == "planning" and plans == [] and tasks == 0 and decision is None and roles == ["planner"]
+    assert len(sessions) == 1
+    with session_scope() as s:
+        hold = s.query(Decision).filter_by(workspace_id=factory["ws"], status="open").one()
+        assert (hold.kind, hold.outcome_id, hold.task_id) == ("provider_hold", None, None)
+        assert "planning outcome #1" in hold.body and "credits are used up" in hold.body
+        assert s.query(Event).filter_by(outcome_id=oid, kind="provider_hold").one().level == "warn"
+
+
+def test_a_planner_that_fails_on_its_own_is_not_retried(factory):
+    sessions = []
+
+    def crashing(messages):
+        sessions.append(1)
+        raise RuntimeError("boom")
+
+    ScriptedModel.scripts["planner"] = crashing
+    oid = new_outcome(factory)
+    status, plans, tasks, decision, roles = plan(oid)
+    assert len(sessions) == 1 and status == "blocked" and plans == []
+    kind, body = decision
+    assert kind == "unblock" and body.startswith("The planner could not produce a plan.") and "boom" in body
+    with session_scope() as s:
+        assert s.query(Event).filter_by(outcome_id=oid, kind="infra_retry").count() == 0
+        assert s.query(Decision).filter_by(workspace_id=factory["ws"], kind="provider_hold").count() == 0
 
 
 def test_approve_first_skips_the_reviewer(factory):

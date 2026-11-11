@@ -196,6 +196,12 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             elif resolution == "cancel":
                 outcome.status = "cancelled"
                 stop(outcome.id)
+    elif kind == "provider_hold":
+        # Closing the decision is what lifts the hold: the workspace's parked tasks are queued and its outcomes still
+        # planning, so the scheduler starts them again. A hold is only ever resumed, and is never a precedent.
+        if resolution != "retry":
+            raise DecisionError("Choose one of: retry")
+        decision.reusable = False
     payload = record(decision.workspace_id, "decision_resolved", f"{author}: {resolution} — {decision.title}",
                      outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
                      data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
