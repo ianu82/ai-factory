@@ -18,7 +18,13 @@ _SUFFIXES = {".md", ".txt", ".json", ".csv", ".toml", ".py", ".sh", ".sql", ".js
 
 
 class DefinitionError(ValueError):
-    pass
+    def __init__(self, message: str, *, path: str = "bundle", field: str = "bundle"):
+        super().__init__(message)
+        self.path = path
+        self.field = field
+
+    def detail(self) -> dict[str, str]:
+        return {"path": self.path, "field": self.field, "message": str(self)}
 
 
 def utf8_size(text: str) -> int:
@@ -112,38 +118,52 @@ def bundle_size(bundle: Bundle) -> int:
 def validate_bundle(bundle: Bundle, repository_ids: set[str]) -> Bundle:
     ids: set[str] = set()
     names: set[tuple] = set()
-    for kind, entries in (("skill", bundle.skills), ("instruction", bundle.instructions),
+    for kind, entries in (("skills", bundle.skills), ("instructions", bundle.instructions),
                           ("knowledge", bundle.knowledge)):
-        for entry in entries:
+        for index, entry in enumerate(entries):
+            path = f"{kind}.{index}"
+
+            def fail(field, message):
+                raise DefinitionError(message, path=f"{path}.{field}", field=field)
+
             if not _NAME.fullmatch(entry.id) or entry.id in ids:
-                raise DefinitionError(f"Unsafe or duplicate definition ID: {entry.id!r}")
+                fail("id", f"Unsafe or duplicate definition ID: {entry.id!r}")
             ids.add(entry.id)
-            if not _NAME.fullmatch(entry.name) or not entry.description.strip():
-                raise DefinitionError(f"{entry.id}: require safe name and nonempty description")
+            if not _NAME.fullmatch(entry.name):
+                fail("name", f"{entry.id}: require safe name")
+            if not entry.description.strip():
+                fail("description", f"{entry.id}: require nonempty description")
             key = (kind, entry.name, entry.role, entry.repository_id)
             if key in names:
-                raise DefinitionError(f"Duplicate {kind} name {entry.name!r} in the same role/repository scope")
+                fail("name", f"Duplicate {kind} name {entry.name!r} in the same role/repository scope")
             names.add(key)
-            for repo_id in (entry.repository_id, entry.source.repository_id):
+            for field, repo_id in (("repository_id", entry.repository_id),
+                                   ("source.repository_id", entry.source.repository_id)):
                 if repo_id is not None and repo_id not in repository_ids:
-                    raise DefinitionError(f"{entry.name}: repository {repo_id} does not belong to this workspace")
+                    fail(field, f"{entry.name}: repository {repo_id} does not belong to this workspace")
             if entry.source.kind != "managed" and not entry.source.repository_id:
-                raise DefinitionError(f"{entry.name}: repository source requires repository_id")
+                fail("source.repository_id", f"{entry.name}: repository source requires repository_id")
             if entry.source.path is not None:
-                safe_path(entry.source.path)
+                try:
+                    safe_path(entry.source.path)
+                except DefinitionError as exc:
+                    fail("source.path", str(exc))
             if entry.source.kind == "repository_context":
                 if (kind != "knowledge" or entry.repository_id != entry.source.repository_id
                         or entry.role is not None):
-                    raise DefinitionError("repository_context must be a knowledge page scoped only to its source repository")
+                    fail("source", "repository_context must be a knowledge page scoped only to its source repository")
             if isinstance(entry, Skill):
                 if utf8_size(entry.body) > SKILL_BODY_LIMIT:
-                    raise DefinitionError(f"{entry.name}: skill body exceeds {SKILL_BODY_LIMIT} UTF-8 bytes")
-                for path, content in entry.files.items():
+                    fail("body", f"{entry.name}: skill body exceeds {SKILL_BODY_LIMIT} UTF-8 bytes")
+                for filename, content in entry.files.items():
                     if "\x00" in content:
-                        raise DefinitionError(f"Unsupported binary file: {path}")
-                    safe_path(path)
-                    if path == "SKILL.md" or PurePosixPath(path).suffix.lower() not in _SUFFIXES:
-                        raise DefinitionError(f"Unsupported supporting file: {path}")
+                        fail(f"files.{filename}", f"Unsupported binary file: {filename}")
+                    try:
+                        safe_path(filename)
+                    except DefinitionError as exc:
+                        fail(f"files.{filename}", str(exc))
+                    if filename == "SKILL.md" or PurePosixPath(filename).suffix.lower() not in _SUFFIXES:
+                        fail(f"files.{filename}", f"Unsupported supporting file: {filename}")
     if bundle_size(bundle) > BUNDLE_LIMIT:
         raise DefinitionError(f"Active workspace bundle exceeds {BUNDLE_LIMIT} UTF-8 bytes")
     return bundle

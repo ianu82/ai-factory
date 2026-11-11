@@ -554,8 +554,8 @@ def test_detected_connection_notes_exact_projected_limit(client, signed_in, monk
     assert response.status_code == (422 if excess else 200), response.text
     with db.session_scope() as session:
         snapshot = get_snapshot(session, ws)
-        assert snapshot.revision == 1
-        assert len(history(session, ws)) == 1
+        assert snapshot.revision == (1 if excess else 2)
+        assert len(history(session, ws)) == (1 if excess else 2)
         if excess:
             assert "1048576" in response.text
             assert not session.scalar(select(Repository).where(Repository.workspace_id == ws))
@@ -679,8 +679,8 @@ def test_bootstrap_context_writes_validate_under_locks(workspace, monkeypatch, c
     assert calls == ["lock_workspace", "lock_repositories", "validate_repository_change"]
     with db.session_scope() as session:
         snapshot = get_snapshot(session, ws)
-        assert snapshot.revision == 1
-        assert len(history(session, ws)) == 1
+        assert snapshot.revision == (1 if oversized else 2)
+        assert len(history(session, ws)) == (1 if oversized else 2)
         assert get_snapshot(session, ws, 1).bundle.knowledge[-1].body == "Original notes"
         if path == "existing":
             repo = session.get(Repository, a)
@@ -698,6 +698,8 @@ def test_bootstrap_context_writes_validate_under_locks(workspace, monkeypatch, c
             assert "1048576" in caplog.text
             assert bundle_size(snapshot.bundle) == BUNDLE_LIMIT - 1024
         else:
+            assert snapshot.author == "bootstrap"
+            assert any(p.body == context for p in get_snapshot(session, ws, 2).bundle.knowledge)
             assert any(p.body == context for p in snapshot.bundle.knowledge)
 
 

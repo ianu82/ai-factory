@@ -276,3 +276,42 @@ def test_scorer_cost_routes_tenancy_and_admin_only(client, signed_in):
     assert client.get(root + suffix.replace('/scores/', '/scores/wrong')).status_code == 404
     assert client.post(root + cost_suffix.replace('/attempts/', '/attempts/wrong'), json=body).status_code == 404
     assert client.post(root + cost_suffix, json=body).status_code == 200
+
+
+def test_definition_routes_and_foreign_object_ids_are_isolated(client, signed_in):
+    ws = signed_in["workspaces"][0]["id"]
+    root = f"/api/workspaces/{ws}/definitions"
+    with session_scope() as db:
+        repo = Repository(workspace_id=ws, full_name="org/private")
+        db.add(repo)
+        db.flush()
+        rid = repo.id
+    bundle = {"knowledge": [{"id": "private-page", "name": "private", "description": "d", "body": "secret"}]}
+    own = client.put(root, json={"expected_revision": 0, "bundle": bundle}).json()
+    other = TestClient(client.app)
+    other.post("/auth/dev", json={"email": "foreign@example.test", "organization": "Foreign"})
+    foreign_ws = other.get("/api/me").json()["workspaces"][0]["id"]
+    foreign = f"/api/workspaces/{foreign_ws}/definitions"
+    # Even a colliding local revision number must not resolve the foreign opaque ID.
+    assert other.put(foreign, json={"expected_revision": 0, "bundle": {}}).status_code == 200
+    for method, suffix, body in [
+        ("get", "", None), ("get", "/versions", None),
+        ("get", "/versions/" + own["revision_id"], None),
+        ("get", "/knowledge", None), ("get", "/knowledge/private-page", None),
+        ("put", "", {"expected_revision": 1, "bundle": bundle}),
+        ("post", "/restore", {"expected_revision": 1, "revision_id": own["revision_id"]}),
+        ("put", "/source", {"expected_revision": 1, "source": {"kind": "repository", "repository_id": rid}}),
+    ]:
+        assert getattr(other, method)(root + suffix, **({"json": body} if body is not None else {})).status_code == 404
+    assert other.get(foreign + "/versions/" + own["revision_id"]).status_code == 404
+    assert other.post(foreign + "/restore", json={"expected_revision": 1, "revision_id": own["revision_id"]}).status_code == 404
+    assert other.get(foreign + "/knowledge/private-page").status_code == 404
+    assert other.get(foreign + "/knowledge?q=secret").json()["pages"] == []
+    assert other.put(foreign + "/source", json={"expected_revision": 1,
+                     "source": {"kind": "repository", "repository_id": rid}}).status_code == 422
+    for field in ["repository_id", "source"]:
+        forged = {"knowledge": [{"id": "x", "name": "x", "description": "d",
+                                 field: rid if field == "repository_id" else {"kind": "repository", "repository_id": rid}}]}
+        assert other.put(foreign, json={"expected_revision": 1, "bundle": forged}).status_code == 422
+    assert client.get(root).json() == own
+    assert other.get(foreign).json()["revision"] == 1

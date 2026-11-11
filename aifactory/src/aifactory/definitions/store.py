@@ -97,7 +97,8 @@ def get_snapshot(db: Session, workspace_id: str, revision: int | None = None) ->
 
 
 def save_bundle(db: Session, workspace_id: str, bundle: Bundle, *, expected_revision: int,
-                author: str, restored_from: int | None = None) -> Snapshot:
+                author: str, restored_from: int | None = None,
+                active_source: dict | None = None) -> Snapshot:
     """Validate and stage a new revision atomically. No commit; caller owns transaction.
 
     Validation and conflicts do not mutate the head. History does not consume quota.
@@ -118,18 +119,23 @@ def save_bundle(db: Session, workspace_id: str, bundle: Bundle, *, expected_revi
     number = current + 1
     state = db.get(DefinitionState, workspace_id, populate_existing=True)
     if state is None:
-        db.add(DefinitionState(workspace_id=workspace_id, revision=number))
+        state = DefinitionState(workspace_id=workspace_id, revision=number)
+        db.add(state)
     else:
         state.revision = number
+    if active_source is not None:
+        state.active_source = active_source
     row = DefinitionRevision(workspace_id=workspace_id, revision=number, bundle=bundle.model_dump(),
-                             author=author, restored_from=restored_from)
+                             author=author, restored_from=restored_from,
+                             source=(state.active_source if state else None),
+                             desired_source=state.desired_source)
     db.add(row)
     db.flush()
     return Snapshot(workspace_id, number, bundle.model_copy(deep=True), author, row.created_at)
 
 
 def restore_revision(db: Session, workspace_id: str, revision: int, *, expected_revision: int,
-                     author: str) -> Snapshot:
+                     author: str, active_source: dict | None = None) -> Snapshot:
     lock_workspace(db, workspace_id)
     repos = lock_repositories(db, workspace_id)
     if _head(db, workspace_id) != expected_revision:
@@ -150,7 +156,7 @@ def restore_revision(db: Session, workspace_id: str, revision: int, *, expected_
             repo.config = {**(repo.config or {}), "context": notes.get(repo.id, "")}
         db.flush()
         return save_bundle(db, workspace_id, old.bundle, expected_revision=expected_revision,
-                           author=author, restored_from=revision)
+                           author=author, restored_from=revision, active_source=active_source)
 
 
 def history(db: Session, workspace_id: str) -> list[Snapshot]:
@@ -159,12 +165,21 @@ def history(db: Session, workspace_id: str) -> list[Snapshot]:
         .order_by(DefinitionRevision.revision))]
 
 
-def validate_repository_change(db: Session, workspace_id: str) -> None:
+def validate_repository_change(db: Session, workspace_id: str, *, author: str | None = None) -> None:
     """Caller holds the workspace/repository locks before changing repository config."""
     db.flush()
     snapshot = get_snapshot(db, workspace_id)
     owned = set(db.scalars(select(Repository.id).where(Repository.workspace_id == workspace_id)))
     validate_bundle(snapshot.bundle, owned)
+    if author is not None:
+        # Compare with immutable content, not the live context projection. Config
+        # remains the sole editable source; history stores a read-only copy.
+        previous = get_snapshot(db, workspace_id, snapshot.revision).bundle
+        before = {p.id: p.body for p in previous.knowledge if p.source.kind == "repository_context"}
+        after = {p.id: p.body for p in snapshot.bundle.knowledge if p.source.kind == "repository_context"}
+        if before != after:
+            save_bundle(db, workspace_id, snapshot.bundle,
+                        expected_revision=snapshot.revision, author=author)
 
 
 def guard_disconnect(db: Session, workspace_id: str, repository_id: str) -> None:
@@ -172,6 +187,10 @@ def guard_disconnect(db: Session, workspace_id: str, repository_id: str) -> None
     lock_workspace(db, workspace_id)
     lock_repositories(db, workspace_id)
     snapshot = get_snapshot(db, workspace_id)
+    state = db.get(DefinitionState, workspace_id, populate_existing=True)
+    if state and any((source or {}).get("repository_id") == repository_id
+                     for source in (state.desired_source, state.active_source)):
+        raise DefinitionError("Change the definitions source before disconnecting this repository")
     refs = [e.name for e in snapshot.bundle.entries() if e.source.kind != "repository_context"
             and repository_id in (e.repository_id, e.source.repository_id)]
     if refs:

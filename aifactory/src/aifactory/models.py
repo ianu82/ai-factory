@@ -727,6 +727,9 @@ class DefinitionState(Base):
     __tablename__ = "definition_states"
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
     revision: Mapped[int] = mapped_column(Integer, default=0)
+    desired_source: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    active_source: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    sync_diagnostics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class DefinitionRevision(Base):
@@ -740,6 +743,8 @@ class DefinitionRevision(Base):
     author: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     restored_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    desired_source: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (UniqueConstraint("workspace_id", "revision"),)
 
 
