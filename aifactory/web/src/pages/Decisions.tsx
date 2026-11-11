@@ -64,7 +64,7 @@ export function DecisionsPage() {
 }
 
 function Row({ d, admin, toggle, open, corrected }: { d: Decision; admin: boolean; toggle: (d: Decision) => void; open: () => void; corrected: () => void }) {
-  const { ws } = useWs();
+  const { ws, me } = useWs();
   const toast = useToast();
   const [editing, setEditing] = useState(false);
   const [answer, setAnswer] = useState("");
@@ -111,7 +111,7 @@ function Row({ d, admin, toggle, open, corrected }: { d: Decision; admin: boolea
       <div className="meta">
         <span>{d.resolved_by_name || "—"} · {ago(d.resolved_at)}</span>
         {canOverrule && <button className="btn sm ghost" onClick={e => { e.stopPropagation(); setEditing(true); }}>Overrule</button>}
-        {(admin || (d.kind === "ruling" && d.reusable)) && d.comment && d.status !== "superseded" && (
+        {(admin || (d.kind === "ruling" && d.reusable && d.resolved_by === me.user.id)) && d.comment && d.status !== "superseded" && (
           <button className="btn sm ghost" onClick={(e) => { e.stopPropagation(); toggle(d); }}>{d.reusable ? "Retire" : "Make precedent"}</button>
         )}
       </div>

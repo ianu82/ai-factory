@@ -164,3 +164,10 @@ def test_retiring_a_ruling_stops_it_being_given(world, client):
     assert client.get(f"/api/workspaces/{world['ws']}/rulings").json()["rulings"] == []
     with db.session_scope() as s:
         assert s.get(Decision, rid).status == "resolved"  # kept in history
+
+
+def test_every_ruling_is_given_beyond_the_precedent_limit(world, client):
+    ids = [client.post(f"/api/workspaces/{world['ws']}/rulings", json={"text": f"Rule {i}"}).json()["id"]
+           for i in range(15)]
+    given = {d.id for d in precedents(world["ws"], world["repo"])}
+    assert set(ids) <= given
