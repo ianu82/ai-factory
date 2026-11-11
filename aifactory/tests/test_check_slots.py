@@ -93,7 +93,12 @@ def test_the_task_reports_waiting_for_a_slot(monkeypatch):
         def event(self, kind, message, level="info", **data):
             events.append((kind, message, data))
 
+    class Sandbox:
+        def __init__(self, kind):
+            self.kind = kind
+
     runner = Runner()
+    local, vm = Sandbox("local"), Sandbox("vm")
 
     async def go():
         release = asyncio.Event()
@@ -104,12 +109,14 @@ def test_the_task_reports_waiting_for_a_slot(monkeypatch):
 
         first = asyncio.create_task(holder())
         await asyncio.sleep(0)
-        async with delivery.TaskRunner._check_slot(runner, False):  # no checks configured: nothing to wait for
+        async with delivery.TaskRunner._check_slot(runner, local, False):  # no checks configured: nothing to wait for
             pass
+        async with delivery.TaskRunner._check_slot(runner, vm):  # checks in a VM run off this host
+            assert check_slot_usage()["running"] == 1  # only the holder
         assert events == []
 
         async def checks():
-            async with delivery.TaskRunner._check_slot(runner):
+            async with delivery.TaskRunner._check_slot(runner, local):
                 return check_slot_usage()["running"]
 
         second = asyncio.create_task(checks())
