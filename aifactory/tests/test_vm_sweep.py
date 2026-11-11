@@ -99,8 +99,19 @@ def test_creating_at_the_cap_sweeps_orphans_and_retries_once(bridge):
     assert "new" not in vm._LIVE  # a closed VM is no longer held, so a later sweep may reclaim it
 
 
-def test_creating_at_the_cap_with_nothing_to_reclaim_fails_as_before(bridge):
-    fake = bridge([], create_errors=1)
+def test_creating_at_the_cap_with_nothing_to_reclaim_retries_once_then_fails(bridge):
+    fake = bridge([], create_errors=2)
     with pytest.raises(SandboxError, match="Too many running sandboxes"):
         asyncio.run(vm.RailwayVMSandbox.create())
-    assert [op for op, _ in fake.calls] == ["create", "sandboxes"]
+    assert [op for op, _ in fake.calls] == ["create", "sandboxes", "create"]
+
+
+def test_concurrent_creations_at_the_cap_all_retry_after_one_sweep_frees_capacity(bridge):
+    # Both hit the cap; the first sweep destroys the orphan, the second finds nothing left but still retries.
+    fake = bridge([{"id": "orphan", "status": "RUNNING", "createdAt": at(600)}], create_errors=2)
+
+    async def both():
+        return await asyncio.gather(vm.RailwayVMSandbox.create(), vm.RailwayVMSandbox.create())
+    boxes = asyncio.run(both())
+    assert [b.vm_id for b in boxes] == ["new", "new"]
+    assert [op for op, _ in fake.calls].count("forget") == 1

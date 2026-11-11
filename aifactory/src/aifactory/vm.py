@@ -320,8 +320,9 @@ class RailwayVMSandbox:
                 raise
             # The environment is full: reclaim orphans and try once more, rather than quietly running on the host.
             log.error("Railway sandbox cap reached; sweeping orphaned VMs before one retry")
-            swept = await sweep_orphans()
-            if not swept.get("destroyed"):
+            # Retry after any sweep that could list the environment: when several creations hit the cap at once,
+            # their sweeps queue on one lock and the first frees capacity for all of them.
+            if "skipped" in await sweep_orphans():
                 raise
             info = await bridge.call("create", args, timeout=timeout)
         _LIVE.add(info["id"])
