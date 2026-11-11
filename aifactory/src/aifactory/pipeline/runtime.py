@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import timedelta
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -310,9 +311,13 @@ def outcome_committed(outcome_id: str) -> tuple[float, bool]:
     what Lead runs in progress have reserved and not yet spent (pipeline/lead.py). A run admitted after a Lead can't
     spend what the Lead set aside. A restart marks interrupted Lead runs failed, so no reservation outlives its run."""
     spent, known = outcome_cost(outcome_id)
+    # A Lead run lasts at most 15 minutes; one still marked running after 30 was cut off and holds nothing (the
+    # same rule as pipeline/lead.STALE), so a crash can't keep an outcome's budget reserved until the next restart.
+    alive = utcnow() - timedelta(minutes=30)
     with session_scope() as s:
         held = 0.0
-        for run in s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status == "running"):
+        for run in s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status == "running",
+                                       Run.started_at > alive):
             reserved = (run.config_snapshot or {}).get("budget_reserved")
             if isinstance(reserved, (int, float)) and not isinstance(reserved, bool) and reserved > 0:
                 held += max(0.0, float(reserved) - float(run.cost_usd or 0.0))
