@@ -329,6 +329,18 @@ def outcome_committed(outcome_id: str) -> tuple[float, bool]:
     return spent + held, known
 
 
+def outcome_allowance(outcome_id: str, budget: float | None = None) -> float:
+    """What the outcome may spend in all, to compare with outcome_committed(): ``budget``, or the largest amount a
+    person allowed one of its tasks when they let it continue past the budget (``budget_allowance_usd``, granted in
+    decisions.resolve and enforced by the gate in deliver()), whichever is more. 0.0 with neither. A task still
+    carrying the older ``budget_override`` has no amount until it next runs, when the gate gives it one."""
+    with session_scope() as s:
+        evidence = [ev for (ev,) in s.query(Task.evidence).filter(Task.outcome_id == outcome_id)]
+    allowed = [ev.get("budget_allowance_usd") for ev in evidence if isinstance(ev, dict)]
+    return max([float(budget or 0.0)] + [float(amount) for amount in allowed
+                                         if isinstance(amount, (int, float)) and not isinstance(amount, bool)])
+
+
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,
                   task_id: str | None = None, options: list[dict[str, Any]] | None = None,
                   metadata: dict[str, Any] | None = None) -> str:

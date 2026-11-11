@@ -2174,7 +2174,9 @@ def test_continuing_past_the_budget_grants_an_allowance_not_an_end_to_the_limit(
     outcome_id, task_id, spending = _task_past_the_budget(factory)
     assert drive(lambda: _open_decision(outcome_id, "budget"))
     first = _open_decision(outcome_id, "budget")
+    assert (runtime.outcome_allowance(outcome_id), runtime.outcome_allowance(outcome_id, 40)) == (0.0, 40.0)
     assert _continue_past_budget(factory, first) == ("queued", 51.25)
+    assert runtime.outcome_allowance(outcome_id, 40) == 51.25  # what the outcome may now spend in all
 
     # The task works again, and by the end of its next attempt the outcome has spent more than it was allowed.
     ScriptedModel.scripts["verifier"] = _verifier_that_fails_after_spending(spending, 53.75)
@@ -2187,12 +2189,28 @@ def test_continuing_past_the_budget_grants_an_allowance_not_an_end_to_the_limit(
         assert decision.body == ("Spent $53.75; the limit was $51.25 (the $40 budget, extended when it last continued)."
                                  " Raise the budget in Settings, or continue with $10 more than is spent now.")
     assert _continue_past_budget(factory, second) == ("queued", 63.75)  # each answer adds to what is spent by then
+    assert runtime.outcome_allowance(outcome_id, 40) == 63.75
 
     ScriptedModel.scripts["verifier"] = passing_verifier
     assert drive(lambda: outcome_status(outcome_id) == "completed")
     with session_scope() as s:
         task = s.get(Task, task_id)
         assert task.status == "completed", task.blocked_reason
+
+
+def test_an_outcome_may_spend_the_most_that_any_of_its_tasks_was_allowed(factory):
+    # One figure for everything that spends on the outcome's account but is not a task (the Lead): the budget, or
+    # more once a person has let one of the outcome's tasks continue past it.
+    outcome_id, task_id, _ = _task_past_the_budget(factory, evidence={"budget_allowance_usd": 51.25})
+    with session_scope() as s:
+        first = s.get(Task, task_id)
+        for key, evidence in (("T2", {"budget_allowance_usd": 45}), ("T3", {"attempts": []})):
+            s.add(Task(workspace_id=first.workspace_id, outcome_id=outcome_id, plan_id=first.plan_id, key=key,
+                       title="Another task", spec="Nothing to do", acceptance=[CRITERION], repo_id=first.repo_id,
+                       status="blocked", evidence=evidence))
+    assert runtime.outcome_allowance(outcome_id) == runtime.outcome_allowance(outcome_id, 40) == 51.25
+    assert runtime.outcome_allowance(outcome_id, 60) == 60.0  # a budget raised above every allowance rules again
+    assert (runtime.outcome_allowance("no outcome"), runtime.outcome_allowance("no outcome", 40)) == (0.0, 40.0)
 
 
 def test_a_task_that_was_let_past_the_budget_for_good_gets_one_allowance_instead(factory):
