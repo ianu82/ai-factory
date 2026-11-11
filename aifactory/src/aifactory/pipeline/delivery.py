@@ -20,6 +20,7 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
+from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
@@ -221,6 +222,7 @@ class TaskRunner:
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
+        merge_manager.leave(self)  # a rebuild re-enters the merge queue at the back when it is ready again
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
         finished = {a.get("n") for a in self._budget_attempts()}
@@ -1093,6 +1095,11 @@ class TaskRunner:
             await self._refresh_onto_main(token, gh, pending["new_base"])
             return
         self._require_merge_approval()
+        # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
+        await merge_manager.take_turn(self, gh)
+        github_queue = await merge_manager.github_queue_state(gh, self)
+        if github_queue is not None:
+            await merge_manager.merge_via_github_queue(self, gh, github_queue)
         self.stage("merge", f"Merging PR #{self.task.pr_number}")
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
         refresh_onto: str | None = None
