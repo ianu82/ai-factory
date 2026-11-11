@@ -194,12 +194,13 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     mind = _mind_settings(raw.get("mind"))
-    merged = merged_settings(raw)
+    lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
+    merged = merged_settings({**raw, "lead": lead})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
     merged["mind"] = mind
-    merged["lead"] = _lead_settings(raw.get("lead"))
+    merged["lead"] = lead
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):

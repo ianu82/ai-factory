@@ -39,6 +39,7 @@ FINISHED = ("completed", "cancelled", "partially_completed")
 # The delegated operator's safe set (bootstrap.RELAY_ONLY): none of these approves, spends, stops or merges.
 ACTIONS = {("question", "answer"), ("unblock", "retry"), ("unblock", "acknowledge"), ("approve_merge", "reject")}
 NEEDS_TEXT = {"answer", "reject"}
+STOPPED = ("completed", "abandoned", "cancelled", "reverted", "handed_over")  # tasks a person or the Factory ended
 COOLDOWN = timedelta(seconds=60)  # its own actions can open the next decision: let the agents move first
 RETRY_AFTER = timedelta(minutes=15)  # after a failed run (model unavailable, budget, timeout), before trying again
 STALE = timedelta(minutes=30)  # a run still marked running after this was cut off by a restart
@@ -339,10 +340,17 @@ class Tools:
         option, comment = (option or "").strip(), (comment or "").strip()
         db = SessionLocal()
         try:
+            # Lock the outcome and task while checking and resolving, so a person's cancel can't land in between and
+            # be undone by the resolution (resolve() can send a cancelled task back to the queue).
+            outcome = db.query(Outcome).filter(Outcome.id == self.outcome_id).with_for_update().one()
             decision = db.query(Decision).filter(Decision.id == decision_id,
                                                  Decision.outcome_id == self.outcome_id).first()
             if decision is None or decision.status != "open":
                 return "No open decision with that id on your outcome."
+            locked = db.query(Task).filter(Task.id == decision.task_id).with_for_update().one_or_none() \
+                if decision.task_id else None
+            if outcome.status in FINISHED or (locked is not None and locked.status in STOPPED):
+                return "That work has been stopped or finished, so this decision no longer applies. Leave it."
             if (decision.kind, option) not in ACTIONS:
                 return ("You may not choose that. Leave a note for people (note_for_people) with what you found and "
                         "the option you recommend.")
@@ -437,7 +445,9 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         usd = min(x for x in (_limit(budgets.get("run_usd")), cfg["run_usd"]) if x is not None)
         outcome_limit = _limit(budgets.get("outcome_usd"))
         spent, known = outcome_cost(outcome_id)
-        if outcome_limit is not None and known:
+        if outcome_limit is not None:
+            # With some costs still unpriced, the known total is a lower bound: it alone can exhaust the budget,
+            # and what is left is at most the limit less it. The run's own cap bounds the rest.
             if spent >= outcome_limit:
                 raise BudgetExceeded("The outcome's budget is spent")
             usd = min(usd, outcome_limit - spent)

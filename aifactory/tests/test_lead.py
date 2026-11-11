@@ -359,3 +359,29 @@ def test_the_leads_guidance_is_not_counted_as_a_persons_intervention(world, clie
         s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
                       author_kind="user", body="Please hurry."))
     assert client.get(f"/api/workspaces/{world['ws']}/stats").json()["human"]["interventions"] == 1
+
+
+def test_known_spend_alone_can_exhaust_the_outcome_budget(world, model):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": 1}}
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
+                  status="succeeded", cost_usd=1.5, cost_known=True))
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="verifier", harness="native",
+                  status="succeeded", cost_usd=0.0, cost_known=False))  # still being priced
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "budget is spent" in row.error and model.calls == []
+
+
+def test_a_decision_on_stopped_work_is_left_alone(world):
+    with db.session_scope() as s:
+        s.get(Task, world["task"]).status = "cancelled"  # a person stopped T1 while the Lead was working
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    out = tools.call("resolve_decision", {"decision_id": world["question"], "option": "answer", "comment": "Use it."})
+    assert "no longer applies" in out
+    with db.session_scope() as s:
+        assert s.get(Decision, world["question"]).status == "open" and s.get(Task, world["task"]).status == "cancelled"
+        s.get(Task, world["task"]).status = "needs_input"
+        s.get(Outcome, world["outcome"]).status = "cancelled"
+    out = tools.call("resolve_decision", {"decision_id": world["question"], "option": "answer", "comment": "Use it."})
+    assert "no longer applies" in out
