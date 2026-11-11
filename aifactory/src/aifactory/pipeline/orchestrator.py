@@ -22,6 +22,7 @@ from ..models import Decision, Outcome, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
+from .holds import held_workspaces
 from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
 from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
@@ -635,6 +636,8 @@ class Orchestrator:
         now = utcnow().isoformat()
         with session_scope() as s:
             workspaces = {w.id: w for w in s.query(Workspace)}
+            # The model provider refused these workspaces: nothing starts there until a person resumes the hold.
+            on_hold = held_workspaces(s)
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
                         for o in s.query(Outcome).filter(Outcome.source != "review", Outcome.status == "planning")]
@@ -660,6 +663,7 @@ class Orchestrator:
             while len(active) < global_limit:
                 eligible = [c for c in candidates if c.id not in active
                             and c.workspace_id in workspaces and not workspaces[c.workspace_id].paused
+                            and c.workspace_id not in on_hold
                             and counts.get(c.workspace_id, 0) < limits[c.workspace_id][limit_key]]
                 if not eligible:
                     break

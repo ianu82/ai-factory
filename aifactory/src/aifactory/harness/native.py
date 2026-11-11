@@ -100,7 +100,7 @@ class NativeHarness:
                     args = None
                 if name == "finish" and accepted is None:
                     report_attempts += 1
-                    report, error = validate_report(session.role, args)
+                    report, error = validate_report(session.role, args, session.expected_criteria)
                     if report is not None:
                         accepted = report
                         output = "Report accepted."

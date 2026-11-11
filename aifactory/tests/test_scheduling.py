@@ -10,7 +10,7 @@ import pytest
 
 from aifactory.config import get_settings, reset_settings_cache
 from aifactory.db import session_scope
-from aifactory.models import Organization, Outcome, Plan, Repository, Task, User, Workspace
+from aifactory.models import Decision, Organization, Outcome, Plan, Repository, Task, User, Workspace
 from aifactory.pipeline import orchestrator as module
 from aifactory.pipeline.orchestrator import Orchestrator
 from aifactory.pipeline.runtime import merged_settings
@@ -175,6 +175,36 @@ def test_blocked_and_paused_candidates_skip_without_consuming_turns(queue, monke
             await jobs.tick()
             assert jobs.started == [a1, c1, a2, b1]
             assert paused not in jobs.started
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("phase", ["planning", "delivery"])
+def test_a_workspace_on_provider_hold_gets_nothing_started_until_it_is_resumed(queue, monkeypatch, phase):
+    set_limit(monkeypatch, phase, 4)
+    started = queue(phase)
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [started]
+            with session_scope() as s:
+                s.add(Decision(id="hold", workspace_id="w1", kind="provider_hold",
+                               title="Model provider refused: work is on hold",
+                               options=[{"value": "retry", "label": "Resume work"}]))
+            held = queue(phase, priority=0)
+            other = queue(phase, ws="w2")
+            await jobs.tick()
+            # What was already running is left alone; another workspace's work still starts.
+            assert jobs.started == [started, other]
+            assert set(jobs.orch._planning if phase == "planning" else jobs.orch._tasks) == {started, other}
+            with session_scope() as s:
+                s.get(Decision, "hold").status = "resolved"
+            await jobs.tick()
+            assert jobs.started == [started, other, held]
         finally:
             await jobs.stop()
 
