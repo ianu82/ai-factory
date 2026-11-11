@@ -965,3 +965,23 @@ def test_a_note_shows_only_against_the_question_it_answered(world, client, monke
     with db.session_scope() as s:  # the question itself is rewritten in place
         s.get(Decision, world["merge"]).body = "Merge PR #12 now that the base moved?"
     assert shown() is None
+
+
+def test_a_review_change_withdraws_the_leads_merge_note_without_a_run(world, client, monkeypatch):
+    def shown():
+        inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+        return inbox[world["merge"]]["lead_note"]
+
+    def review_changed():
+        lead.record(world["ws"], "lead_review_changed", "Review of PR #12 at abcdef1: 1 open review finding, 1 of them "
+                    "P0/P1.", outcome_id=world["outcome"], data={"decision_id": world["merge"], "head": HEAD})
+
+    merge_ready(world)
+    monkeypatch.setattr(lead, "review_state", unreviewed())
+    review_changed()  # an earlier change, which this run's read already covers
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Clean. I recommend merging."})
+    assert shown()["text"].endswith("I recommend merging.")
+    review_changed()  # a P1 arrives; the outcome's budget may be spent, so no run replaces the note
+    assert shown() is None

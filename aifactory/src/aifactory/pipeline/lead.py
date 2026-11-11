@@ -203,6 +203,13 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
     if not outcome_ids:
         return notes
     current = {d.id: question_mark(db, d) for d in decisions}
+    # When the watcher last saw review change on each merge approval (watch_reviews).
+    review_changed: dict[str, datetime] = {}
+    for e in db.query(Event).filter(Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed") \
+            .order_by(Event.id.desc()).limit(500):
+        decision_id = (e.data or {}).get("decision_id")
+        if decision_id in wanted and decision_id not in review_changed:
+            review_changed[decision_id] = e.created_at
     rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
         .order_by(Message.created_at.desc(), Message.id.desc())
     for m in rows:
@@ -214,6 +221,12 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
         # changes, it is advice for something else and isn't shown. (Notes from before marks were recorded carry
         # none and still show.)
         if attribution.get("question") not in (None, current[decision_id]):
+            notes[decision_id] = None
+            continue
+        # Nor once review changed after the Lead read it: a note saying review was clean must not outlive a new
+        # finding, even when the Lead can't run to replace it (a spent budget). Its next run writes a new one.
+        read_at = _parse(attribution.get("review_read_at")) or m.created_at
+        if decision_id in review_changed and review_changed[decision_id] > read_at:
             notes[decision_id] = None
             continue
         notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at), "run_id": attribution.get("run_id")}
@@ -600,12 +613,14 @@ class Tools:
         self.closing = False  # woken to report how the outcome ended: its update is the closing report
         self.reviews: dict[str, dict[str, Any]] = {}  # merge approval id -> review state of its commit (lines below)
         self.lines: dict[str, str] = {}
+        self.read_at: dict[str, datetime] = {}  # when each review was read: a later change makes the note stale
 
     async def read_reviews(self) -> None:
         """Review states for this outcome's open merge approvals, from GitHub, before the Lead reads its record.
         A commit pushed while GitHub was being read is read again, once; a later one is caught by _unseen_commit."""
         for _ in range(2):
             for decision_id, repo, number, head in self._unread():
+                self.read_at[decision_id] = utcnow()  # before the read: a change recorded during it counts as later
                 state = await review_state(self.ws, repo, number, head)
                 self.reviews[decision_id] = state
                 self.lines[decision_id] = review_line(state, number)
@@ -778,6 +793,8 @@ class Tools:
             actor = lead_user(s).id
             data = {**self.source, **({"decision_id": decision_id, "question": question_mark(s, decision)}
                                       if decision is not None else {})}
+            if decision_id in self.read_at:
+                data["review_read_at"] = self.read_at[decision_id].isoformat()
             s.add(Message(workspace_id=self.ws, outcome_id=self.outcome_id, author_id=actor, author_kind="lead",
                           body=text[:4000], attribution=data))
         record(self.ws, "lead_note", f"Lead: {text[:300]}", outcome_id=self.outcome_id, run_id=self.run_id,
