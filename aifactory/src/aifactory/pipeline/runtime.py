@@ -155,6 +155,7 @@ class SessionSpec:
     effective_settings: Mapping[str, Any] | None = None
     model_override: str | None = None
     repositories: Mapping[str, Any] | None = None
+    expected_criteria: int | None = None  # the task's acceptance criteria, for a verifier (see validate_report)
 
     def __post_init__(self) -> None:
         # Own a recursively immutable snapshot, not a reference to mutable workspace/repo JSON.
@@ -227,6 +228,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         session = HarnessSession(
             run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
             client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
+            expected_criteria=spec.expected_criteria,
             deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
             on_progress=on_progress, take_guidance=take_guidance(spec.outcome_id, spec.task_id),
             # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.

@@ -125,8 +125,10 @@ SCHEMAS = {"planner": PLANNER_REPORT, "builder": BUILDER_REPORT, "verifier": VER
            "plan_reviewer": PLAN_REVIEW_REPORT}
 
 
-def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]:
-    """Light, forgiving validation: returns (normalized_report, error)."""
+def validate_report(role: str, report: Any,
+                    expected_criteria: int | None = None) -> tuple[dict[str, Any] | None, str]:
+    """Light, forgiving validation: returns (normalized_report, error). ``expected_criteria`` is how many acceptance
+    criteria the task has, when the caller knows: a verifier's report needs a result for each."""
     if not isinstance(report, dict):
         return None, "The report must be a JSON object."
     schema = SCHEMAS[role]
@@ -165,10 +167,21 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
         if not isinstance(report.get("findings") or [], list) or any(
                 not isinstance(f, dict) for f in report.get("findings") or []):
             return None, "findings must be a list of objects."
-        if report["verdict"] == "pass" and any(c.get("status") != "pass" for c in criteria):
+        if expected_criteria and len(criteria) < expected_criteria:
+            return None, (f"The report has results for {len(criteria)} of the task's {expected_criteria} acceptance "
+                          f"criteria ({expected_criteria - len(criteria)} missing). Report on every criterion, "
+                          "verbatim, with a status and evidence; use unverified for one you could not check.")
+        unmet = any(c.get("status") != "pass" for c in criteria)
+        blocker = any(f.get("severity") == "blocker" for f in report.get("findings") or [])
+        if report["verdict"] == "pass" and unmet:
             return None, "A pass verdict requires every criterion to pass. Use fail (or verify further)."
-        if report["verdict"] == "pass" and any(f.get("severity") == "blocker" for f in report.get("findings") or []):
+        if report["verdict"] == "pass" and blocker:
             return None, "A pass verdict cannot include blocker findings."
+        # Only an unmet criterion or a blocker fails a change; major and minor findings are advice on a pass.
+        if report["verdict"] == "fail" and not unmet and not blocker:
+            return None, ("A fail verdict needs a criterion that is not met or a blocker finding. Mark the criterion "
+                          "that is not met as fail; or raise the finding to blocker if the change must not merge as "
+                          "it is; or use pass and keep the findings as advice.")
     if role == "builder" and report.get("status") not in ("done", "blocked"):
         return None, "status must be done or blocked."
     if role == "plan_reviewer":
