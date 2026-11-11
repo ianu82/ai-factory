@@ -29,7 +29,7 @@ MAX_EVENTS = 3000
 MAX_STEPS = 40
 
 
-def conversation(db: Session, outcome: Outcome) -> dict[str, Any]:
+def conversation(db: Session, outcome: Outcome, viewer_id: str | None = None) -> dict[str, Any]:
     from .pipeline.lead import notes_for
 
     tasks = {t.id: t for t in db.query(Task).filter(Task.outcome_id == outcome.id)}
@@ -42,7 +42,11 @@ def conversation(db: Session, outcome: Outcome) -> dict[str, Any]:
     users = {u.id: u for u in db.query(User).filter(User.id.in_({p for p in people if p}))}
     notes = notes_for(db, [d for d in decisions if d.status == "open"])
 
-    items: list[tuple[datetime, int, dict[str, Any]]] = [(outcome.created_at, 0, _request(db, outcome, users))]
+    mind = _started_in_mind(db, outcome, viewer_id)
+    request = _request(db, outcome, users)
+    if mind:
+        request["from"] = "a Mind conversation"
+    items: list[tuple[datetime, int, dict[str, Any]]] = [(outcome.created_at, 0, request)]
     for m in messages:
         items.append((m.created_at, 1, _message(m, users, keys)))
     for d in decisions:
@@ -68,9 +72,22 @@ def conversation(db: Session, outcome: Outcome) -> dict[str, Any]:
         thread.append({"kind": "working", "at": steps[-1]["at"], **_steps(steps)})
 
     last = db.query(Run).filter(Run.outcome_id == outcome.id, Run.role == "lead").order_by(Run.started_at.desc()).first()
-    return {"items": thread,
+    return {"items": thread, "started_in_mind": mind,
             "lead": {"model": last.model if last else None, "running": bool(last and last.status == "running"),
                      "last_active": S.ts((last.finished_at or last.started_at) if last else None)}}
+
+
+def _started_in_mind(db: Session, outcome: Outcome, viewer_id: str | None) -> dict[str, Any] | None:
+    """Whether a Mind conversation became this outcome. Only its owner gets the link: the conversation before the
+    hand-off is private to them."""
+    from .mind.api import OUTCOME_KINDS
+    from .models import MindAction
+
+    for action in db.query(MindAction).filter(MindAction.workspace_id == outcome.workspace_id,
+                                              MindAction.kind.in_(OUTCOME_KINDS), MindAction.status == "succeeded"):
+        if (action.result or {}).get("outcome_id") == outcome.id:
+            return {"thread_id": action.thread_id if viewer_id and action.owner_id == viewer_id else None}
+    return None
 
 
 def _steps(steps: list[dict[str, Any]]) -> dict[str, Any]:

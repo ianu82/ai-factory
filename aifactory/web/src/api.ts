@@ -393,6 +393,8 @@ export type ConversationItem =
 
 export interface Conversation {
   items: ConversationItem[];
+  /** Set when a Mind conversation became this outcome; thread_id only for that conversation's owner. */
+  started_in_mind: { thread_id: string | null } | null;
   lead: { model: string | null; running: boolean; last_active: string | null };
 }
 
@@ -541,9 +543,12 @@ export interface MindMessage {
   /** The turn's steps; durationMs only when this browser timed the turn. */
   steps?: MindStep[]; durationMs?: number; failed?: boolean;
 }
+/** The outcome a Mind conversation became when its owner confirmed a card that created one. */
+export interface MindOutcomeLink { id: string; number: number; title: string; status: string; workspace_id: string }
 export interface MindThread {
   id: string; title: string; workspace_id: string;
   cost_usd: number | null; cost_known: boolean; updated_at?: string;
+  outcome?: MindOutcomeLink | null;
 }
 export interface MindStatus {
   model: string | null; available: boolean; reason?: string;
@@ -572,6 +577,7 @@ export interface MindWireCard {
 export interface MindWireThread {
   id: string; title: string; billing_workspace_id: string; model_id: string | null;
   status: string; cost: { usd: number | null; known: boolean }; updated_at?: string;
+  outcome?: MindOutcomeLink | null;
 }
 export interface MindWireMessage {
   id: string; role: "user" | "assistant"; text: string;

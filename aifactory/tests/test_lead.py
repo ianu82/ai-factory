@@ -667,3 +667,32 @@ def test_the_outcome_reads_as_a_conversation(world, client):
         s.flush()
         elsewhere_id = elsewhere.id
     assert client.get(f"/api/workspaces/{world['ws']}/outcomes/{elsewhere_id}/conversation").status_code == 404
+
+
+def test_a_mind_conversation_that_became_the_outcome_continues_with_its_lead(world):
+    from aifactory.conversation import conversation
+    from aifactory.mind.api import thread_view
+    from aifactory.models import MindAction, MindThread
+
+    with db.session_scope() as s:
+        thread = MindThread(owner_id=world["uid"], billing_workspace_id=world["ws"], workspace_ids=[world["ws"]])
+        s.add(thread)
+        s.flush()
+        s.add(MindAction(thread_id=thread.id, owner_id=world["uid"], workspace_id=world["ws"], kind="create_outcome",
+                         status="pending"))  # a card not yet confirmed hands nothing off
+        s.flush()
+        assert thread_view(s, thread)["outcome"] is None
+        s.add(MindAction(thread_id=thread.id, owner_id=world["uid"], workspace_id=world["ws"], kind="create_outcome",
+                         status="succeeded", result={"ok": True, "outcome_id": world["outcome"], "number": 7}))
+        s.flush()
+        handed = thread_view(s, thread)["outcome"]
+        assert (handed["id"], handed["number"], handed["title"]) == (world["outcome"], 7, "Search")
+        o = s.get(Outcome, world["outcome"])
+        mine = conversation(s, o, world["uid"])
+        assert mine["started_in_mind"] == {"thread_id": thread.id}  # its owner gets the way back
+        assert mine["items"][0]["from"] == "a Mind conversation"
+        assert conversation(s, o, "someone-else")["started_in_mind"] == {"thread_id": None}  # private before hand-off
+        other = Outcome(workspace_id=world["ws"], number=8, title="Unrelated", status="running")
+        s.add(other)
+        s.flush()
+        assert conversation(s, other, world["uid"])["started_in_mind"] is None

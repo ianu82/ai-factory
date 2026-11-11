@@ -866,7 +866,7 @@ def outcome_conversation(workspace_id: str, outcome_id: str, user: User = Depend
     o = db.get(Outcome, outcome_id)
     if o is None or o.workspace_id != workspace_id:
         raise HTTPException(404, "Outcome not found")
-    return conversation(db, o)
+    return conversation(db, o, user.id)
 
 
 @router.get("/workspaces/{workspace_id}/outcomes/{outcome_id}")

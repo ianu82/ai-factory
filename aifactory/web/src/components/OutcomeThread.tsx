@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowUp, Ban, ChevronDown, ChevronRight, Compass } from "lucide-react";
-import { api, type Conversation, type ConversationItem, type ConversationStep, type OutcomeDetail as Detail, type Task } from "../api";
+import { api, type Conversation, type ConversationItem, type ConversationStep, type MindOutcomeLink, type OutcomeDetail as Detail, type Task } from "../api";
 import { useWs } from "../App";
 import { clock, DECISION_KIND, money, TASK_STATUS } from "../format";
 import { Dot, Prose, Skeleton, Status, useToast } from "../ui";
@@ -43,7 +43,7 @@ export function OutcomeThread({ outcomeId, onBack }: { outcomeId: string; onBack
   const plan = [...plans].reverse().find((p) => p.status !== "superseded") || plans[plans.length - 1];
   return (
     <div className="othread">
-      <Header detail={detail.data} active={active} onBack={onBack} />
+      <Header detail={detail.data} active={active} onBack={onBack} mind={convo.data?.started_in_mind ?? null} />
       <div className="othread-body">
         <section className="othread-main" aria-label="Conversation">
           {convo.isLoading ? <Skeleton rows={6} /> : convo.error || !convo.data ? (
@@ -81,7 +81,7 @@ export function OutcomeThread({ outcomeId, onBack }: { outcomeId: string; onBack
   );
 }
 
-function Header({ detail, active, onBack }: { detail: Detail; active: boolean; onBack: () => void }) {
+function Header({ detail, active, onBack, mind }: { detail: Detail; active: boolean; onBack: () => void; mind: Conversation["started_in_mind"] }) {
   const { ws } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
@@ -103,6 +103,8 @@ function Header({ detail, active, onBack }: { detail: Detail; active: boolean; o
         <nav aria-label="Breadcrumb"><button type="button" className="linkish" onClick={onBack}>Outcomes</button><span aria-hidden="true"> / </span><span className="ref">#{outcome.number}</span></nav>
         <span className="faint">{repositories.map((r) => r.full_name).join(", ")}</span>
         <span style={{ flex: 1 }} />
+        {mind && (mind.thread_id ? <Link className="linkish" to={`/w/${ws.id}/mind/${mind.thread_id}`}>Started in My Mind</Link>
+          : <span className="faint">Started in a Mind conversation</span>)}
         {active && ws.role !== "viewer" && <button className="btn sm ghost danger" onClick={cancel}><Ban size={14} /> Cancel outcome</button>}
       </div>
       <h1>{outcome.title}</h1>
@@ -138,7 +140,7 @@ function dayOf(iso: string): string {
     ...(date.getFullYear() !== today.getFullYear() ? { year: "numeric" } : {}) });
 }
 
-function Thread({ items }: { items: ConversationItem[] }) {
+export function Thread({ items }: { items: ConversationItem[] }) {
   let day = "";
   return (
     <ol className="othread-list">
@@ -283,7 +285,57 @@ function Composer({ outcomeId, number, tasks }: { outcomeId: string; number: num
   );
 }
 
-export function OutcomeLink({ id, number }: { id: string; number: number }) {
-  const { ws } = useWs();
-  return <Link className="ref" to={`/w/${ws.id}/outcomes/${id}`}>#{number}</Link>;
+/** In a Mind conversation that became an outcome: the outcome's conversation continues below the hand-off, visible to
+ * the workspace's members, and the composer messages the Lead (or Mind, privately). */
+export function Handoff({ outcome }: { outcome: MindOutcomeLink }) {
+  const active = !FINISHED.includes(outcome.status);
+  const convo = useQuery({
+    queryKey: ["conversation", outcome.workspace_id, outcome.id],
+    queryFn: () => api<Conversation>(`/api/workspaces/${outcome.workspace_id}/outcomes/${outcome.id}/conversation`),
+    refetchInterval: active ? 10_000 : false,
+  });
+  return (
+    <section className="ohandoff" aria-label={`Outcome #${outcome.number}`}>
+      <div role="separator" className="ohandoff-line" aria-label="This conversation became an outcome">
+        <span>This conversation is now <Link to={`/w/${outcome.workspace_id}/outcomes/${outcome.id}`}>outcome #{outcome.number}</Link></span>
+      </div>
+      <p className="ohandoff-note">Everything below is visible to the workspace's members. Everything above stays in your Mind.</p>
+      {convo.data ? <Thread items={convo.data.items.filter((i) => i.kind !== "request")} />
+        : convo.error ? <p className="faint">{(convo.error as Error).message}</p> : <p className="faint">Loading the outcome…</p>}
+    </section>
+  );
+}
+
+/** Message an outcome's Lead from anywhere (the Mind page after a hand-off). */
+export function LeadComposer({ outcome, onPrivate }: { outcome: MindOutcomeLink; onPrivate: () => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const send = async () => {
+    const body = text.trim();
+    if (!body) return;
+    setBusy(true);
+    try {
+      await api(`/api/workspaces/${outcome.workspace_id}/outcomes/${outcome.id}/messages`, { method: "POST", json: { body } });
+      setText("");
+      qc.invalidateQueries({ queryKey: ["conversation", outcome.workspace_id, outcome.id] });
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form className="ocomposer" onSubmit={(e) => { e.preventDefault(); send(); }}>
+      <label htmlFor="handoff-message" className="sr-only">Message the Lead</label>
+      <textarea id="handoff-message" rows={2} value={text} placeholder={`Message the Lead about #${outcome.number}…`}
+        onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+      <div className="row">
+        <button type="button" className="linkish" onClick={onPrivate}>Ask my Mind privately instead</button>
+        <span style={{ flex: 1 }} />
+        <button type="submit" className="osend" aria-label="Send" disabled={busy || !text.trim()}><ArrowUp size={15} /></button>
+      </div>
+    </form>
+  );
 }
