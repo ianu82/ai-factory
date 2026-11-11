@@ -29,7 +29,7 @@ from ..events import notify, record
 from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider,
                          workspace_models)
 from ..models import Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User, Workspace
-from .runtime import outcome_cost, workspace_settings
+from .runtime import outcome_committed, outcome_cost, workspace_settings
 
 log = logging.getLogger(__name__)
 
@@ -198,11 +198,14 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
         paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
         outcomes = s.query(Outcome).filter(Outcome.status.notin_(FINISHED), Outcome.source != "review").all()
         cache: dict[str, dict[str, Any]] = {}
+        budgets: dict[str, Any] = {}
         for o in outcomes:
             if o.id in running or o.workspace_id in paused:
                 continue
             if o.workspace_id not in cache:
-                cache[o.workspace_id] = settings_for(workspace_settings(o.workspace_id))
+                settings = workspace_settings(o.workspace_id)
+                cache[o.workspace_id] = settings_for(settings)
+                budgets[o.workspace_id] = _limit((settings.get("budgets") or {}).get("outcome_usd"))
             if not cache[o.workspace_id]["enabled"]:
                 continue
             runs = s.query(Run).filter(Run.outcome_id == o.id, Run.role == "lead")
@@ -229,10 +232,23 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append(f"{len(posts)} new post{'s' if len(posts) != 1 else ''} from people")
             if not reasons:
                 continue
+            limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
+            if limit is not None and outcome_committed(o.id)[0] >= limit and not continued_past_budget(s, o.id):
+                # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
+                # and trying every 15 minutes would only fill the activity with failed runs.
+                continue
             until = posts[-1].created_at.isoformat() if posts else seen.get("posts_until")
             woken.append({"workspace_id": o.workspace_id, "outcome_id": o.id, "reasons": reasons,
                           "decisions": changed, "seen": {"decisions": marks, "posts_until": until}})
     return woken
+
+
+def continued_past_budget(db, outcome_id: str) -> bool:
+    """A person chose to let this outcome continue past its budget: a budget decision answered "Continue anyway".
+    The Lead never answers budget decisions, so only people (or an operator they delegated to) grant this. From then
+    on the outcome's budget doesn't stop its Lead; each Lead run is still held to its own cap."""
+    return db.query(Decision.id).filter(Decision.outcome_id == outcome_id, Decision.kind == "budget",
+                                        Decision.status == "resolved", Decision.resolution == "retry").first() is not None
 
 
 def _parse(value: Any) -> datetime | None:
@@ -480,7 +496,8 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
              alive: timedelta) -> float:
     """Atomically reserve this run's share of what the outcome has left, and return its spending cap.
 
-    The outcome row is locked while the share is worked out and recorded on the run. Known spend comes off the
+    The outcome row is locked while the share is worked out and recorded on the run. Once a person has let the
+    outcome continue past its budget, only the run's own cap applies. Otherwise known spend comes off the
     budget, and so does what each run still in progress may spend: its own reserved cap, or the workspace's run
     cap, less what it has recorded. With some costs still unpriced, the known total is a lower bound. A run marked
     running for longer than ``alive`` was cut off by a restart and holds nothing.
@@ -492,7 +509,7 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
             s.execute(text("BEGIN IMMEDIATE"))  # SQLite has no row locks: take its write lock before reading
         else:
             s.query(Outcome).filter(Outcome.id == outcome_id).with_for_update().one()
-        if outcome_limit is not None:
+        if outcome_limit is not None and not continued_past_budget(s, outcome_id):
             spent, _ = outcome_cost(outcome_id)
             held = 0.0
             for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,
