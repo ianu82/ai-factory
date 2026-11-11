@@ -84,6 +84,8 @@ def recovered_from_infra(result: str, failing_phase: str | None) -> bool:
     if result == "infra" or done is None:
         return False
     return failing_phase is None or _PHASE_ORDER[done] >= _PHASE_ORDER.get(failing_phase, 0)
+
+
 # Stages inside the build/verify loop; a task found in one after a restart was interrupted mid-attempt.
 BUILD_STAGES = ("prepare", "build", "checks", "verify", "publish")
 # Check results on clean checkouts of base commits, by (repository, base commit, command), shared by every task.
@@ -614,6 +616,7 @@ class TaskRunner:
                    "tail": result.output[-4000:]}
             if not result.ok:
                 row["failures"] = _failing_tests(result.output)
+                row["signature"] = _output_signature(result.output, sandbox)
             results.append(row)
             self.event(f"{kind}_result", f"{'✓' if result.ok else '✗'} {command}",
                        level="success" if result.ok else "warn", command=command, exit_code=result.exit_code,
@@ -677,6 +680,10 @@ class TaskRunner:
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))
             if report["verdict"] == "pass":
+                if (self.task.evidence or {}).get("infra_retries"):
+                    # Verification completed, which ends a run of infrastructure retries. The build loop's "verified"
+                    # record would do it too, but a revalidation that passes writes no attempt record.
+                    self._set_evidence({"infra_retries": 0, "infra_retry_at": None, "infra_phase": None})
                 self.event("verified", f"Independent verification passed: {report.get('summary', '')[:300]}",
                            level="success")
                 return report
@@ -752,11 +759,20 @@ class TaskRunner:
         problems (``cause`` "provider") wait for a person. Transient ones requeue the same attempt after a backoff;
         once ``INFRA_RETRIES`` consecutive retries have failed as well, a person decides."""
         record = {"n": attempt, "result": "infra", "cause": cause or "transient", "phase": phase, "error": error[:500]}
-        retries = int((self.task.evidence or {}).get("infra_retries", 0))
+        ev = self.task.evidence or {}
+        retries = int(ev.get("infra_retries", 0))
+        # The run of retries ends only when the furthest phase that failed in it completes. A later failure in an
+        # earlier phase must not replace it: the next build's records would then end a run the verifier started,
+        # and a verifier that keeps failing would be retried without limit.
+        unresolved = max((p for p in (ev.get("infra_phase"), phase) if p in _PHASE_ORDER), key=_PHASE_ORDER.get)
+        # The build loop redoes the attempt that failed, so its number is handed back. A revalidation after the base
+        # moved verifies a candidate whose attempt has ended, and run() resumes that revalidation: the number stays.
+        revalidating = (ev.get("revalidation") or {}).get("phase") not in (None, "complete", "handled")
+        resume_at = attempt if revalidating else attempt - 1
         if cause == "provider" or retries >= INFRA_RETRIES:
             # Cleared with the decision: a person's retry runs at once and starts a new series of automatic retries.
             self._set_evidence({"attempts": record, "infra_retries": 0, "infra_retry_at": None, "infra_phase": None})
-            self.update(attempt=attempt - 1)
+            self.update(attempt=resume_at)
             if cause == "provider":
                 what = "model provider" if phase in ("build", "verify") else "access"
                 self.block("unblock", f"{self.task.key}: {what} problem"
@@ -768,12 +784,12 @@ class TaskRunner:
                        f"retrying keeps the task's attempt budget. Last error:\n\n{error[:1500]}",
                        options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}])
         delay = INFRA_BACKOFF_SECONDS[min(retries, len(INFRA_BACKOFF_SECONDS) - 1)]
-        self._set_evidence({"attempts": record, "infra_retries": retries + 1, "infra_phase": phase,
+        self._set_evidence({"attempts": record, "infra_retries": retries + 1, "infra_phase": unresolved,
                             "infra_retry_at": (utcnow() + timedelta(seconds=delay)).isoformat()})
         self.event("infra_retry", f"Attempt {attempt}: {_PHASES[phase].lower()} hit an infrastructure problem "
                    f"({error[:200]}). Not counted as an attempt; retrying in {delay // 60} min "
                    f"({retries + 1} of {INFRA_RETRIES})", level="warn", phase=phase, delay=delay)
-        self.update(attempt=attempt - 1, status="queued", lease_owner="")
+        self.update(attempt=resume_at, status="queued", lease_owner="")
         raise Stop()
 
     async def _failing_on_base(self, token: str, failed: list[dict[str, Any]]) -> bool:
@@ -790,11 +806,14 @@ class TaskRunner:
                 check["vs_base"] = " (it fails the same way on the base commit, so your change did not cause it)"
             elif theirs.get("ok"):
                 check["vs_base"] = " (it passes on the base commit)"
-            elif check.get("failures"):
-                new = sorted(set(check["failures"]) - set(theirs.get("failures") or ()))
+            elif check.get("failures") and theirs.get("failures"):
+                new = sorted(set(check["failures"]) - set(theirs["failures"]))
                 if new:
                     check["vs_base"] = (f" (failing here but not on the base commit: {', '.join(new[:20])}"
                                         + (f" and {len(new) - 20} more" if len(new) > 20 else "") + ")")
+            elif theirs and not theirs.get("ok", True):
+                check["vs_base"] = (" (it fails on the base commit too, but not with the same output, so it counts "
+                                    "as a failure of your change)")
         return all(c.get("preexisting") for c in failed)
 
     def _base_key(self) -> tuple[str, ...]:
@@ -820,12 +839,13 @@ class TaskRunner:
         try:
             await checkout(sandbox, self.repo.full_name, token, self.task.base_sha, f"base-{self.task_id[:8]}")
             sandbox = await self._isolate_builder(sandbox, "checking the base commit")
-            setup = await self._prepare(sandbox, "base_setup")
-            if any(not r["ok"] for r in setup):
-                self.event("base_checks_unavailable", "Setup failed on the base commit, so its check results prove "
-                           "nothing; the failing checks count against this attempt", level="warn")
-                return None
-            results = await self._run_commands(sandbox, missing, "base_check")
+            async with self._check_slot(sandbox):  # a second run of the suite on this host, like the candidate's
+                setup = await self._prepare(sandbox, "base_setup")
+                if any(not r["ok"] for r in setup):
+                    self.event("base_checks_unavailable", "Setup failed on the base commit, so its check results "
+                               "prove nothing; the failing checks count against this attempt", level="warn")
+                    return None
+                results = await self._run_commands(sandbox, missing, "base_check")
         finally:
             await sandbox.close()
         for row in results:
@@ -1817,16 +1837,38 @@ def _failing_tests(output: str) -> list[str] | None:
     return sorted(set(ids))
 
 
+_VOLATILE = re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?"  # timestamps
+                       r"|\b\d\d:\d\d:\d\d(?:[.,]\d+)?\b"  # times of day
+                       r"|\b\d+(?:\.\d+)?\s?(?:ms|s)\b"  # durations
+                       r"|\b0x[0-9a-fA-F]+\b")  # addresses
+
+
+def _output_signature(output: str, sandbox: Any = None) -> str:
+    """A digest of a failing command's whole output with what differs between two runs of the same failure taken
+    out: colours, the sandbox's own paths, timestamps, durations and memory addresses. "" when there is no output,
+    which proves nothing. Two runs with the same signature printed the same thing."""
+    text = _ANSI.sub("", output or "")
+    # A local sandbox's work directory is inside its root; a VM has only a work directory.
+    for attr, name in (("root", "<sandbox>"), ("work", "<sandbox>/work")):
+        if getattr(sandbox, attr, None):
+            text = text.replace(str(getattr(sandbox, attr)), name)
+    text = "\n".join(line.rstrip() for line in _VOLATILE.sub("<n>", text).strip().splitlines())
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:32] if text else ""
+
+
 def _same_failure(candidate: dict[str, Any], base: dict[str, Any] | None) -> bool:
-    """Whether a check failing on the candidate fails on the base commit too, with nothing new: for pytest output no
-    node id the base does not also fail; for other commands the base also exits non-zero (and the candidate does not
-    time out where the base finished)."""
+    """Whether a check failing on the candidate fails the same way on the base commit, with nothing new. For pytest
+    output: no node id that the base does not fail too. Other output has no test names to compare, and "the base
+    exits non-zero as well" is not enough (a build can fail on the base for one reason and on the candidate for
+    another), so both runs must end with the same exit code and print the same thing (``_output_signature``).
+    Anything else is inconclusive, and the failure counts against the attempt."""
     if not base or base.get("ok", True) or (candidate.get("timed_out") and not base.get("timed_out")):
         return False
     new, old = candidate.get("failures"), base.get("failures")
-    if new is None:
-        return old is None  # nothing to compare on either side: the command exits non-zero on the base as well
-    return set(new) <= set(old or ())
+    if new is None or old is None:
+        return (new is None and old is None and candidate.get("exit_code") == base.get("exit_code")
+                and bool(candidate.get("signature")) and candidate.get("signature") == base.get("signature"))
+    return set(new) <= set(old)
 
 
 def _signal(workspace_id: str, repo_id: str | None, source: str, title: str, body: str, url: str) -> None:

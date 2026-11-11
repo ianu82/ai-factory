@@ -2072,12 +2072,41 @@ def test_failing_tests_are_compared_with_the_base_commit():
     assert delivery._same_failure({"ok": False, "failures": [network]}, base)
     assert not delivery._same_failure({"ok": False, "failures": [network, "FAILED tests/test_greet.py::test_hi"]}, base)
     assert not delivery._same_failure({"ok": False, "failures": None}, base)  # the candidate broke the whole run
-    # Other commands: the same command also exits non-zero on the base, and does not time out only on the candidate.
-    assert delivery._same_failure({"ok": False, "failures": None}, {"ok": False, "failures": None})
-    assert not delivery._same_failure({"ok": False, "failures": None}, {"ok": True})
-    assert not delivery._same_failure({"ok": False, "failures": None, "timed_out": True},
-                                      {"ok": False, "failures": None, "timed_out": False})
-    assert not delivery._same_failure({"ok": False, "failures": None}, None)
+    # Other commands have no test names to compare. That the base exits non-zero too is not enough: it must end with
+    # the same exit code and print the same thing.
+    def other(exit_code=1, signature="abc", **more):
+        return {"ok": False, "failures": None, "exit_code": exit_code, "signature": signature, **more}
+
+    assert delivery._same_failure(other(), other())
+    assert not delivery._same_failure(other(), other(signature="def"))  # the base fails for another reason
+    assert not delivery._same_failure(other(), other(exit_code=2))
+    assert not delivery._same_failure(other(signature=""), other(signature=""))  # no output proves nothing
+    assert not delivery._same_failure({"ok": False, "failures": None}, {"ok": False, "failures": None})
+    assert not delivery._same_failure(other(), {**other(), "failures": [network]})  # only the base printed test names
+    assert not delivery._same_failure(other(), {"ok": True})
+    assert not delivery._same_failure(other(timed_out=True), other(timed_out=False))
+    assert not delivery._same_failure(other(), None)
+
+
+def test_a_failure_signature_ignores_what_differs_between_two_runs_of_the_same_failure():
+    from types import SimpleNamespace
+
+    def output(root, when, took, address):
+        return (f"\x1b[31merror\x1b[0m: {root}/work/src/app.ts(3,1): TS2304 Cannot find name 'x'.   \n"
+                f"{when} build failed in {took} at {address}\n")
+
+    candidate = SimpleNamespace(root="/data/jobs/task-1-attempt1", work="/data/jobs/task-1-attempt1/work")
+    base = SimpleNamespace(root="/data/jobs/task-1-base1", work="/data/jobs/task-1-base1/work")
+    theirs = output(candidate.root, "2026-11-11T14:56:17.120Z", "1.52s", "0x7f3a2c")
+    one = delivery._output_signature(theirs, candidate)
+    two = delivery._output_signature(output(base.root, "2026-11-12 09:01:02", "941 ms", "0x10ffe0"), base)
+    assert one and one == two
+    # A second error is a different failure, however the first one reads.
+    assert one != delivery._output_signature(theirs + "error: src/new.ts(1,1): TS1005 ';' expected.\n", candidate)
+    vm = SimpleNamespace(work="/workspace")  # a VM has only a work directory
+    assert delivery._output_signature("/workspace/src/app.ts: bad", vm) == delivery._output_signature(
+        "/data/jobs/task-1-base1/work/src/app.ts: bad", base)
+    assert delivery._output_signature("", candidate) == delivery._output_signature(" \n", None) == ""
 
 
 ENV_CHECK = ('echo "FAILED tests/test_env.py::test_network - OSError: network is unreachable"\n'
@@ -2128,6 +2157,45 @@ def test_check_failures_that_also_fail_on_the_base_commit_are_not_charged(factor
     assert "not on the base commit: FAILED tests/test_greet.py::test_greeting" in prompts[1]
     assert len(briefs) == 1 and "## Pre-existing check failures" in briefs[0]
     assert "FAILED tests/test_env.py::test_network" in briefs[0]
+
+
+LINT_CHECK = ('echo "lint: $(pwd)/legacy.sh:3: unused variable"\n'
+              'if [ -f broken.txt ]; then echo "lint: $(pwd)/broken.txt:1: stray file"; fi\n'
+              "exit 1\n")
+
+
+def test_a_failure_without_test_names_is_preexisting_only_when_the_base_prints_the_same(factory):
+    _land_on_main(factory, "lint.sh", LINT_CHECK)  # a linter that fails on main too, and prints the sandbox's own path
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": ["sh test.sh", "sh lint.sh"]}
+    prompts = []
+
+    def builder(messages):
+        if step(messages) == 0:
+            prompts.append(messages[1]["content"])
+            if len(prompts) == 1:  # the first attempt adds a lint failure of its own
+                return {"content": "", "tool_calls": [
+                    call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}),
+                    call("write_file", {"path": "broken.txt", "content": "x\n"}, 1)]}
+            return {"content": "", "tool_calls": [call("run", {"command": "rm -f broken.txt"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # Both attempts exit 1, as the base commit does. Only the second prints what the base commit prints.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        assert task.attempt == 2
+        assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
+            "sh test.sh": None, "sh lint.sh": True}
+    assert "it fails on the base commit too, but not with the same output" in prompts[1]
 
 
 def _slow_builder(messages):
@@ -2282,6 +2350,36 @@ def test_only_completing_the_failed_phase_ends_a_run_of_infrastructure_retries(r
     assert delivery.recovered_from_infra(result, failing) is ends
 
 
+def test_a_run_of_infrastructure_retries_keeps_the_furthest_phase_that_failed(factory):
+    _, task_id, _ = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.status, task.stage, task.attempt = "running", "verify", 1
+    runner = _runner(task_id)
+
+    def fail(phase):
+        with pytest.raises(delivery.Stop):
+            runner._infrastructure(1, phase, "MindsHub error 503: upstream unavailable", "transient")
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            return task.status, task.attempt, task.evidence.get("infra_retries"), task.evidence.get("infra_phase")
+
+    assert fail("verify") == ("queued", 0, 1, "verify")
+    # The retry's sandbox fails next. That is an earlier phase, and it must not replace the one the run waits for.
+    assert fail("prepare") == ("queued", 0, 2, "verify")
+    # The next retry builds again and its checks fail as they do on the base commit: the verifier has still not run.
+    runner.evidence("attempts", {"n": 1, "result": "checks_preexisting"})
+    assert (runner.task.evidence["infra_retries"], runner.task.evidence["infra_phase"]) == (2, "verify")
+    assert fail("verify") == ("queued", 0, 3, "verify")
+    # So a verifier that keeps failing reaches a person instead of being retried without limit.
+    assert fail("verify") == ("blocked", 0, 0, None)
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.task_id == task_id, Decision.kind == "unblock",
+                                            Decision.status == "open").one()
+        assert decision.title == "T1: infrastructure problem"
+        assert "Independent verification failed 4 times in a row" in decision.body
+
+
 def test_base_check_results_are_cached_per_workspace_and_configuration():
     from types import SimpleNamespace
 
@@ -2412,6 +2510,46 @@ def test_revalidation_rejection_rebuilds_with_feedback_even_if_summary_fails(fac
         assert len(FakeGitHub.pulls[number]['body']) < 8000
     else:
         assert any('Missing interaction test' in f for f in seen)
+
+
+def test_an_infrastructure_failure_while_revalidating_keeps_the_attempt_and_resumes(factory, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    task_id, _ = _revalidation_candidate(factory)
+    main = _land_on_main(factory, "other.txt", "new main\n")
+
+    def unavailable(messages):
+        raise InferenceError("MindsHub unreachable: ConnectTimeout", retryable=True)
+
+    ScriptedModel.scripts["verifier"] = unavailable
+    with pytest.raises(delivery.Stop):
+        asyncio.run(_runner(task_id)._refresh_onto_main("token", FakeGitHub("t"), main))
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        # The candidate's attempt ended when it was first verified, so its number is not handed back, and the
+        # revalidation is still where it stopped.
+        assert (task.status, task.stage, task.attempt) == ("queued", "verify", 1)
+        assert task.evidence["revalidation"]["phase"] == "verify"
+        assert (task.evidence["infra_retries"], task.evidence["infra_phase"]) == (1, "verify")
+        assert [(a["n"], a["result"], a["phase"]) for a in task.evidence["attempts"]] == [(1, "infra", "verify")]
+        task.status = "running"  # the orchestrator picks the task up again once the backoff has passed
+
+    seen = []
+
+    async def ci(self):
+        seen.append("ci")
+    monkeypatch.setattr(delivery.TaskRunner, "ci_then_merge", ci)
+    ScriptedModel.scripts["verifier"] = passing_verifier
+    asyncio.run(_runner(task_id).run())
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert seen == ["ci"] and task.evidence["revalidation"]["phase"] == "complete"
+        assert (task.stage, task.attempt) == ("ci", 1)
+        # A passing revalidation writes no attempt record, and still ends the run of retries.
+        assert not task.evidence.get("infra_retries") and not task.evidence.get("infra_phase")
+        assert [a["result"] for a in task.evidence["attempts"]] == ["infra"]
+    assert not FakeGitHub.merged
 
 
 def test_revalidation_summary_bounds_unicode_commands_reports_and_paths():
