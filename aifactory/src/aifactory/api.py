@@ -855,6 +855,20 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
     return S.outcome(outcome, [], [])
 
 
+@router.get("/workspaces/{workspace_id}/outcomes/{outcome_id}/conversation")
+def outcome_conversation(workspace_id: str, outcome_id: str, user: User = Depends(current_user),
+                         db: Session = Depends(get_db)):
+    """The outcome as a conversation: the request, the Lead's posts with the steps behind each, people's messages and
+    decisions, in order (conversation.py)."""
+    from .conversation import conversation
+
+    _ws(db, user, workspace_id)
+    o = db.get(Outcome, outcome_id)
+    if o is None or o.workspace_id != workspace_id:
+        raise HTTPException(404, "Outcome not found")
+    return conversation(db, o, user.id)
+
+
 @router.get("/workspaces/{workspace_id}/outcomes/{outcome_id}")
 def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
@@ -1005,6 +1019,9 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
                                                          "decision_resolved", "task_completed", "outcome_created"]))
                   .order_by(Event.id.desc()).limit(50).all())
     change_outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({e.outcome_id for e in recent if e.outcome_id}))}
+    from .pipeline.lead import notes_for
+
+    lead_notes = notes_for(db, decisions)
     return {
         "decisions": [S.decision(d, {
             "outcome_number": outcomes[d.outcome_id].number if d.outcome_id in outcomes else None,
@@ -1013,6 +1030,7 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
             "pr_url": tasks[d.task_id].pr_url if d.task_id in tasks else "",
             "pr_number": tasks[d.task_id].pr_number if d.task_id in tasks else None,
             "priority": outcomes[d.outcome_id].priority if d.outcome_id in outcomes else 2,
+            "lead_note": lead_notes.get(d.id),
         }) for d in decisions],
         "since": S.ts(since),
         "changes": [event_dict(e) | ({"outcome_number": change_outcomes[e.outcome_id].number,

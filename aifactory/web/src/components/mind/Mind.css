@@ -15,7 +15,7 @@
   border-left: 1px solid var(--line-strong);
 }
 .mind-nav-thread {
-  display: block; padding: 4px 8px; border-radius: var(--r); font-size: 12.5px; color: var(--muted);
+  display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: var(--r); font-size: 12.5px; color: var(--muted);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .mind-nav-thread:hover { background: rgba(14, 15, 16, 0.05); color: var(--ink); }
