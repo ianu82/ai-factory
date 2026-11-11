@@ -171,3 +171,6 @@ def test_every_ruling_is_given_beyond_the_precedent_limit(world, client):
            for i in range(15)]
     given = {d.id for d in precedents(world["ws"], world["repo"])}
     assert set(ids) <= given
+    for i in range(10):  # more than 20 in all: the Lead still gets every ruling
+        client.post(f"/api/workspaces/{world['ws']}/rulings", json={"text": f"Rule {15 + i}"})
+    assert len(lead.outcome_record(world["outcome"])["team_rules"]) == 25

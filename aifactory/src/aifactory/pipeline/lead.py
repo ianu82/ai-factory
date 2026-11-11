@@ -375,7 +375,9 @@ def outcome_record(outcome_id: str) -> dict[str, Any]:
                  if d.scope == "workspace" or d.outcome_id == o.id
                  or (d.task_id and s.get(Task, d.task_id) and s.get(Task, d.task_id).repo_id in (o.repo_ids or []))
                  or (not d.task_id and d.outcome_id and s.get(Outcome, d.outcome_id)
-                     and set(s.get(Outcome, d.outcome_id).repo_ids or []) & set(o.repo_ids or []))][:20]
+                     and set(s.get(Outcome, d.outcome_id).repo_ids or []) & set(o.repo_ids or []))]
+        # Every team ruling, always; other reusable precedents are examples, so the newest few suffice.
+        rules = [d for d in rules if d.kind == "ruling"] + [d for d in rules if d.kind != "ruling"][:12]
         return {
             "team_rules": [{"rule": d.title, "detail": d.comment if d.kind == "ruling" else
                             f"{d.resolution}{' — ' + d.comment if d.comment else ''}", "scope": d.scope}
