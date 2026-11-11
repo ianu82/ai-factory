@@ -384,6 +384,25 @@ def test_legacy_cards_still_render_and_ask_for_a_new_proposal(world):
     assert edit(ctx, legacy.id, 1, dismiss=True)["status"] == "dismissed"
 
 
+def test_proposals_take_outcome_numbers_and_task_keys(world):
+    db, users, work = world
+    ws, o, t, *_ = work[0]
+    ctx = Context(db, users[0].id, "thread")
+    guidance = propose("propose_send_guidance", {"workspace_id": ws.id, "outcome_id": "#1", "text": "Keep going"}, ctx)
+    assert guidance["object"]["id"] == o.id and guidance["object"]["label"].startswith("#1 ")
+    cancel = propose("propose_cancel_task", {"workspace_id": ws.id, "outcome_id": "1", "task_id": "t1"}, ctx)
+    take = propose("propose_take_over_task", {"workspace_id": ws.id, "outcome_id": o.id, "task_id": "#1 T1"}, ctx)
+    for card in (cancel, take):
+        action = db.get(MindAction, card["id"])
+        assert (action.outcome_id, action.task_id) == (o.id, t.id)
+    # No #7 here; and a workspace the person is not in, though it has a #1.
+    for workspace_id, number in ((ws.id, "#7"), (work[2][0].id, "#1")):
+        with pytest.raises(HTTPException) as exc:
+            propose("propose_send_guidance", {"workspace_id": workspace_id, "outcome_id": number, "text": "x"}, ctx)
+        assert exc.value.status_code == 404
+    assert db.query(MindAction).count() == 3
+
+
 def test_cross_workspace_and_task_proposals(world):
     db, users, work = world
     ws, o, *_ = work[0]
