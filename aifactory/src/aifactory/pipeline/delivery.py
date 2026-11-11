@@ -174,7 +174,8 @@ class TaskRunner:
         items = list(dict.fromkeys(results + self.feedback))
         for i, item in enumerate(items):
             if len(item) > room:
-                lines.append(f"{item[:room]}\n… (cut for length; {len(items) - i - 1} more feedback item(s) left out)")
+                left = len(items) - i - 1
+                lines.append(f"{item[:room]}\n… (cut for length; {left} more feedback item(s) left out)")
                 break
             lines.append(item)
             room -= len(item)
