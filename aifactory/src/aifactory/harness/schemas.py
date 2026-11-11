@@ -121,8 +121,42 @@ PLAN_REVIEW_REPORT: dict[str, Any] = {
     "required": ["verdict", "summary", "findings"],
 }
 
+RISK_DIMENSIONS = (
+    "blast_radius", "data_and_migrations", "authentication_and_permissions",
+    "public_interfaces", "dependencies", "configuration", "deployment",
+)
+RISK_LEVELS = ("low", "medium", "high", "critical")
+RISK_JUDGE_REPORT: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "level": {"type": "string", "enum": list(RISK_LEVELS)},
+        "reasons": {"type": "object", "properties": {
+            dimension: {"type": "string", "minLength": 1} for dimension in RISK_DIMENSIONS
+        }, "required": list(RISK_DIMENSIONS), "additionalProperties": False},
+    },
+    "required": ["level", "reasons"],
+    "additionalProperties": False,
+}
+SECURITY_SEVERITIES = ("blocker", "major", "minor")
+SECURITY_REVIEW_REPORT: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "fail"]},
+        "summary": {"type": "string", "minLength": 1},
+        "findings": {"type": "array", "items": {
+            "type": "object", "properties": {
+                "severity": {"type": "string", "enum": list(SECURITY_SEVERITIES)},
+                "location": {"type": "string", "minLength": 1},
+                "description": {"type": "string", "minLength": 1},
+            }, "required": ["severity", "location", "description"],
+        }},
+    },
+    "required": ["verdict", "summary", "findings"],
+}
+
 SCHEMAS = {"planner": PLANNER_REPORT, "builder": BUILDER_REPORT, "verifier": VERIFIER_REPORT,
-           "plan_reviewer": PLAN_REVIEW_REPORT}
+           "plan_reviewer": PLAN_REVIEW_REPORT, "risk_judge": RISK_JUDGE_REPORT,
+           "security_reviewer": SECURITY_REVIEW_REPORT}
 
 
 def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]:
@@ -133,6 +167,28 @@ def validate_report(role: str, report: Any) -> tuple[dict[str, Any] | None, str]
     missing = [k for k in schema["required"] if k not in report]
     if missing:
         return None, f"The report is missing required fields: {', '.join(missing)}."
+    if role == "risk_judge":
+        if report["level"] not in RISK_LEVELS:
+            return None, "level must be low, medium, high or critical."
+        reasons = report["reasons"]
+        if (not isinstance(reasons, dict) or set(reasons) != set(RISK_DIMENSIONS)
+                or any(not isinstance(v, str) or not v.strip() for v in reasons.values())):
+            return None, "reasons must include a nonempty reason for all seven risk dimensions."
+    if role == "security_reviewer":
+        if report["verdict"] not in ("pass", "fail"):
+            return None, "verdict must be pass or fail."
+        if not isinstance(report["summary"], str) or not report["summary"].strip():
+            return None, "summary must be a nonempty string."
+        findings = report["findings"]
+        if not isinstance(findings, list):
+            return None, "findings must be a list."
+        for finding in findings:
+            if (not isinstance(finding, dict) or finding.get("severity") not in SECURITY_SEVERITIES
+                    or any(not isinstance(finding.get(k), str) or not finding[k].strip()
+                           for k in ("description", "location"))):
+                return None, "Each finding requires a valid severity, location and description."
+        if report["verdict"] == "pass" and any(f["severity"] == "blocker" for f in findings):
+            return None, "A pass verdict cannot include blocker findings."
     if role == "planner":
         tasks = report.get("tasks")
         if not isinstance(tasks, list):

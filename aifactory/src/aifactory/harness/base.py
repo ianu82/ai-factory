@@ -27,7 +27,7 @@ class HarnessFailed(RuntimeError):
 @dataclass
 class HarnessSession:
     run_id: str
-    role: str  # planner|builder|verifier
+    role: str  # planner|builder|verifier|plan_reviewer|risk_judge|security_reviewer
     system: str
     prompt: str
     sandbox: LocalSandbox

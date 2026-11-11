@@ -59,7 +59,12 @@ def finish_tool(schema: dict[str, Any]) -> dict[str, Any]:
         "parameters": schema}}
 
 
-def tool_specs(writable: bool) -> list[dict[str, Any]]:
+def tool_specs(writable: bool, *, role: str = "") -> list[dict[str, Any]]:
+    if role == "risk_judge":
+        tools = [json.loads(json.dumps(t)) for t in READ_TOOLS[:3]]
+        tools[0]["function"]["description"] = "List safe checkout files (no history or session files)."
+        tools[2]["function"]["description"] = "Search safe checkout files for literal text; returns file:line matches."
+        return tools
     return list(READ_TOOLS) + (WRITE_TOOLS if writable else [])
 
 
@@ -78,6 +83,8 @@ class ToolBox:
             return "Error: tool arguments were not valid JSON. Retry with a JSON object."
         sandbox = session.sandbox
         try:
+            if session.role == "risk_judge":
+                return await _judge_tool(session, name, args)
             if name == "list_files":
                 path = args.get("path") or "."
                 sandbox.resolve(path)
@@ -165,3 +172,126 @@ def _glob_to_regex(glob: str) -> str:
             out += c
         i += 1
     return "(^|/)" + out + "$"
+
+
+# Runs in the checkout's sandbox (also on VMs), not on the control-plane filesystem.
+# No agent-supplied shell, executable code, git commands or environment are accepted.
+# Descriptor-relative NOFOLLOW opens prevent traversal and symlink replacement races.
+_JUDGE_INSPECT = r"""
+import fnmatch, json, os, stat, sys
+LIMIT = 30000
+MAX_FILES = 3000
+MAX_BYTES = 400000
+DENIED = {'.git', '.factory', '.anton', '.codex', '.claude', '.sessions',
+          'home', 'sessions', 'session', 'node_modules', '__pycache__'}
+def allowed(name):
+    lower = name.lower()
+    return (lower not in DENIED and not lower.startswith('.')
+            and not any(word in lower for word in ('report', 'transcript', 'session'))
+            and not lower.endswith(('.log', '.jsonl')))
+def open_at(parent, name, directory=False):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if directory:
+        flags |= os.O_DIRECTORY
+    fd = os.open(name, flags, dir_fd=parent)
+    mode = os.fstat(fd).st_mode
+    if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
+        os.close(fd)
+        raise ValueError()
+    return fd
+try:
+    root, tool, args = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+    path = args.get('path') or '.'
+    if not isinstance(path, str) or path.startswith('/') or '\\' in path:
+        raise ValueError()
+    parts = path.split('/')
+    if any(p == '..' or (p not in ('', '.') and not allowed(p)) for p in parts):
+        raise ValueError()
+    parts = [p for p in parts if p not in ('', '.')]
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    for part in parts[:-1] if tool == 'read_file' else parts:
+        child = open_at(fd, part, True)
+        os.close(fd)
+        fd = child
+    def read(parent, name):
+        child = open_at(parent, name)
+        try:
+            data = os.read(child, MAX_BYTES + 1)
+            if len(data) > MAX_BYTES:
+                return '[file exceeds inspection byte limit]'
+            return data.decode('utf-8', 'replace')
+        finally:
+            os.close(child)
+    output = []
+    size = count = visited = 0
+    def emit(text):
+        global size
+        remaining = LIMIT - size
+        if remaining > 0:
+            output.append(text[:remaining])
+            size += min(len(text), remaining) + 1
+    if tool == 'read_file':
+        if not parts:
+            raise ValueError()
+        lines = read(fd, parts[-1]).splitlines()
+        start = max(1, int(args.get('start_line') or 1))
+        end = min(len(lines), start + 2999, int(args.get('end_line') or start + 1499))
+        for i in range(start, end + 1):
+            emit(str(i) + '\t' + lines[i-1])
+    else:
+        # Search uses a bounded literal pattern: never executes regex code or an
+        # unbounded backtracking regex supplied by the model.
+        pattern = args.get('pattern') or ''
+        if not isinstance(pattern, str) or len(pattern) > 1000:
+            raise ValueError()
+        glob = args.get('glob') if tool == 'search' else args.get('pattern')
+        def walk(parent, prefix='', depth=0):
+            global count, visited
+            if depth > 40:
+                return
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > 20000 or count >= MAX_FILES or size >= LIMIT:
+                        return
+                    if not allowed(entry.name) or entry.is_symlink():
+                        continue
+                    name = prefix + entry.name
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            child = open_at(parent, entry.name, True)
+                            try:
+                                walk(child, name + '/', depth + 1)
+                            finally:
+                                os.close(child)
+                        elif entry.is_file(follow_symlinks=False):
+                            count += 1
+                            if glob and not fnmatch.fnmatch(name, glob):
+                                continue
+                            if tool == 'list_files':
+                                emit(name)
+                            else:
+                                for i, line in enumerate(read(parent, entry.name).splitlines(), 1):
+                                    if pattern in line:
+                                        emit(name + ':' + str(i) + ':' + line[:300])
+                    except OSError:
+                        continue
+        walk(fd, ('/'.join(parts) + '/') if parts else '')
+    os.close(fd)
+    print('\n'.join(output) or '(no results)')
+except Exception:
+    print('Error: checkout inspection refused or unavailable.')
+"""
+
+
+async def _judge_tool(session: HarnessSession, name: str, args: dict[str, Any]) -> str:
+    if name not in {"list_files", "read_file", "search"}:
+        return "Error: tool unavailable in blind judge profile."
+    if len(json.dumps(args)) > 16000:
+        return "Error: checkout inspection arguments exceed limit."
+    command = "python3 -I -c " + shlex.quote(_JUDGE_INSPECT) + " " + " ".join(
+        shlex.quote(value) for value in (str(session.sandbox.work), name, json.dumps(args)))
+    result = await session.sandbox.exec(command, timeout=30)
+    if not result.ok or result.truncated:
+        return "Error: checkout inspection refused or unavailable."
+    return clip(result.output)

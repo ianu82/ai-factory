@@ -83,6 +83,9 @@ class AntonHarness:
         return True, "MindsDB Anton agent with Factory tools"
 
     async def run(self, session: HarnessSession) -> HarnessResult:
+        if session.role == "risk_judge":
+            from .native import NativeHarness
+            return await NativeHarness().run(session)
         ok, why = self.availability()
         if not ok:
             raise HarnessUnavailable(why)

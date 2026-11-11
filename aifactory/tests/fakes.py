@@ -28,7 +28,7 @@ class ScriptedModel:
 
     async def chat(self, *, model, messages, tools=None, ledger=None, **_kwargs):
         system = messages[0]["content"]
-        role = "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "plan_reviewer" if "You are the plan reviewer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
+        role = "risk_judge" if "You are the blind risk judge" in system else "security_reviewer" if "You are the security reviewer" in system else "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "plan_reviewer" if "You are the plan reviewer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
         if role == "judge":
             ScriptedModel.judge_calls.append({"model": model, "messages": messages, "tools": tools, **_kwargs})
         else:
@@ -36,6 +36,10 @@ class ScriptedModel:
         if ledger:
             ledger.check()
             ledger.add(model, (1000, 200))
+        if role == "risk_judge" and role not in self.scripts:
+            return low_risk_review(messages)
+        if role == "security_reviewer" and role not in self.scripts:
+            return passing_security_review(messages)
         if role == "plan_reviewer" and role not in self.scripts:
             return approving_plan_review(messages)
         return self.scripts[role](messages)
@@ -167,3 +171,17 @@ class FakeGitHub:
         pr["merged"], pr["state"], pr["merge_commit_sha"] = True, "closed", merged_sha
         self.merged.append(number)
         return {"sha": merged_sha, "merged": True}
+
+
+def low_risk_review(_messages: list[dict[str, Any]]) -> dict[str, Any]:
+    from aifactory.harness.schemas import RISK_DIMENSIONS
+
+    return {"content": "", "tool_calls": [call("finish", {
+        "level": "low", "reasons": {key: "No material risk found." for key in RISK_DIMENSIONS},
+    })]}
+
+
+def passing_security_review(_messages: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"content": "", "tool_calls": [call("finish", {
+        "verdict": "pass", "summary": "No security findings.", "findings": [],
+    })]}

@@ -17,7 +17,7 @@ from ..events import notify, record
 from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
-from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
+from ..inference import BudgetExceeded, ModelClient, UsageLedger, resolve_provider, workspace_models
 from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from ..review import DEFAULT_REVIEW
@@ -38,6 +38,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
+               "risk_judge_turns": 30, "security_reviewer_turns": 40,
                "run_minutes": 60,
                "ci_minutes": 45, "max_changed_lines": 1500},
     "reasoning_effort": "medium",
@@ -176,17 +177,20 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                 and settings["provider"] != workspace_settings(spec.workspace_id)["provider"]
                 else resolve_provider(spec.workspace_id))
     models = workspace_models(settings, provider=provider.provider)
+    harness_name = "native" if spec.role == "risk_judge" else (
+        spec.harness or settings["harness"].get("verifier", "native"))
     model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier,
-             "plan_reviewer": models.plan_reviewer}[spec.role]
+             "plan_reviewer": models.plan_reviewer, "risk_judge": models.verifier,
+             "security_reviewer": models.verifier}[spec.role]
     model = spec.model_override or provider.model_override or model
     version, snapshot = configuration_version(
-        role=spec.role, system=spec.system, harness=spec.harness, provider=provider, model=model,
+        role=spec.role, system=spec.system, harness=harness_name, provider=provider, model=model,
         settings=settings, repositories=spec.repositories, sandbox_kind=getattr(spec.sandbox, "kind", "local"))
     limits = settings["limits"]
     budgets = settings["budgets"]
     with session_scope() as s:
         run = Run(workspace_id=spec.workspace_id, outcome_id=spec.outcome_id, task_id=spec.task_id, role=spec.role,
-                  harness=spec.harness, provider=provider.provider, model=model, attempt=spec.attempt,
+                  harness=harness_name, provider=provider.provider, model=model, attempt=spec.attempt,
                   config_version=version, config_snapshot=snapshot)
         s.add(run)
         s.flush()
@@ -195,18 +199,34 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                          max_tokens=budgets.get("run_tokens"))
     client = ModelClient(provider, session_id=run_id)
     turns = limits.get(f"{spec.role}_turns", 80)
-    harness = get_harness(spec.harness)
+    if spec.role in ("risk_judge", "security_reviewer"):
+        turns = max(1, min(int(turns), 60))
+    harness = get_harness(harness_name)
     gateway_token = ""
     result: HarnessResult | None = None
     error = ""
     status = "succeeded"
+    preflight_complete = False
     try:
-        if spec.harness == "codex":
+        if spec.role in ("risk_judge", "security_reviewer"):
+            # Check before attachments, gateway grants or another paid session.
+            ledger.check()
+            spent, known = outcome_cost(spec.outcome_id)
+            if not known:
+                raise BudgetExceeded("Outcome cost is unknown; review cannot start")
+            budget = budgets.get("outcome_usd")
+            if budget is not None:
+                remaining = budget - spent
+                if remaining <= 0:
+                    raise BudgetExceeded("Outcome budget exhausted before review")
+                ledger.max_cost_usd = min(ledger.max_cost_usd, remaining) if ledger.max_cost_usd is not None else remaining
+        preflight_complete = True
+        if harness_name == "codex":
             gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
                                                provider=provider, ledger=ledger))
         record(spec.workspace_id, "run_started", f"{harness.label} {spec.role} started on {model}",
                outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
-               data={"role": spec.role, "harness": spec.harness, "model": model, "provider": provider.provider,
+               data={"role": spec.role, "harness": harness_name, "model": model, "provider": provider.provider,
                      "attempt": spec.attempt})
         notify(spec.workspace_id, "run", run_id)
 
@@ -223,16 +243,19 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
 
         session = HarnessSession(
             run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
-            client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
+            client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable and spec.role != "risk_judge",
+            max_turns=turns,
             deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
-            on_progress=on_progress, take_guidance=take_guidance(spec.outcome_id, spec.task_id),
+            on_progress=on_progress,
+            take_guidance=(lambda: []) if spec.role == "risk_judge" else take_guidance(spec.outcome_id, spec.task_id),
             # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.
             gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
             gateway_token=gateway_token,
             reasoning_effort=settings.get("reasoning_effort"),
         )
-        context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
-        session.prompt += context
+        if spec.role != "risk_judge":
+            context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
+            session.prompt += context
         result = await harness.run(session)
     except asyncio.CancelledError:
         status, error = "cancelled", "Cancelled"
@@ -242,7 +265,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     finally:
         if gateway_token:
             revoke(run_id)
-        measured = await client.session_cost(run_id) if provider.provider == "mindshub" else None
+        measured = await client.session_cost(run_id) if preflight_complete and provider.provider == "mindshub" else None
         with session_scope() as s:
             row = s.get(Run, run_id)
             row.status = status
@@ -253,7 +276,8 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             if measured is not None:
                 row.cost_usd, row.cost_known = round(measured, 6), True
             else:
-                row.cost_usd, row.cost_known = round(ledger.cost_usd, 6), ledger.cost_known and ledger.calls > 0
+                row.cost_usd = round(ledger.cost_usd, 6)
+                row.cost_known = ledger.cost_known and (ledger.calls > 0 or not preflight_complete)
             if result:
                 row.result = result.report
             # Reserve in the same transaction as completion: a restart cannot lose sampled work.

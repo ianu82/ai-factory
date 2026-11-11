@@ -28,7 +28,7 @@ class NativeHarness:
     async def run(self, session: HarnessSession) -> HarnessResult:
         toolbox = ToolBox(session)
         finish = finish_tool(session.report_schema)
-        tools = tool_specs(session.writable) + [finish]
+        tools = tool_specs(session.writable, role=session.role) + [finish]
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": session.system},
             {"role": "user", "content": session.prompt},
@@ -37,7 +37,7 @@ class NativeHarness:
         while True:
             if session.cancelled.is_set():
                 raise HarnessFailed("Cancelled")
-            for note in session.take_guidance():
+            for note in ([] if session.role == "risk_judge" else session.take_guidance()):
                 messages.append({"role": "user", "content": f"Guidance from your team (takes priority): {note}"})
                 session.on_progress("guidance", "Delivered team guidance to the agent", {"text": note[:500]})
             if turns >= session.max_turns + 3:
