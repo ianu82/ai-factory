@@ -362,26 +362,28 @@ class TaskRunner:
         if not main:
             return
         recorded = self.task.base_sha or ""
-        if not recorded or not (await sb.exec(f"git merge-base --is-ancestor {shlex.quote(recorded)} HEAD",
-                                              timeout=60)).ok:
-            # The recorded base can belong to an attempt that was never published: a restart begins the attempt
-            # again from the latest code and records that base, while the branch still sits on an older one.
-            # Trusting it would skip this rebase, and every newer commit on the base branch would then count as
-            # this task's change (reverting main's protected files, for one). The base recorded when the branch was
-            # last published is the branch's real base. Branches published before it was recorded fall back to
-            # where the branch meets the recorded base (a later commit of the same history), then main.
-            actual = ""
-            published = str(((self.task.evidence or {}).get("published") or {}).get("base") or "")
-            if published and (await sb.exec(f"git merge-base --is-ancestor {shlex.quote(published)} HEAD",
-                                             timeout=60)).ok:
-                actual = published
-            for other in (recorded, main):
-                if actual or not other:
-                    continue
-                merged = await sb.exec(f"git merge-base HEAD {shlex.quote(other)}", timeout=60)
-                actual = merged.output.strip() if merged.ok else ""
-            if not actual:
-                return
+        published = str(((self.task.evidence or {}).get("published") or {}).get("base") or "")
+        # The base recorded when the branch was last published is the branch's real base, so it is trusted first.
+        # The task's recorded base can belong to an attempt that was never published: a restart begins the attempt
+        # again from the latest code and records that base, while the branch still sits on another one. Trusting
+        # it would skip this rebase when it is newer than the branch, and when it is an older commit the branch
+        # also contains, every commit between the two would count as this task's change (republishing commits
+        # removed from a rewound main, for one). Branches published before the base was recorded fall back to the
+        # recorded base when the branch contains it, then to where the branch meets it (a later commit of the same
+        # history), then main.
+        actual = ""
+        for known in (published, recorded):
+            if known and not actual and (await sb.exec(
+                    f"git merge-base --is-ancestor {shlex.quote(known)} HEAD", timeout=60)).ok:
+                actual = known
+        for other in (recorded, main):
+            if actual or not other:
+                continue
+            merged = await sb.exec(f"git merge-base HEAD {shlex.quote(other)}", timeout=60)
+            actual = merged.output.strip() if merged.ok else ""
+        if not actual:
+            return
+        if actual != recorded:
             self.event("branch_base_corrected", f"{branch} sits on {actual[:8]}, not the recorded base "
                        f"{recorded[:8] or '(none)'}; bringing it up to date from there", level="warn",
                        recorded=recorded, actual=actual)

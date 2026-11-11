@@ -392,6 +392,36 @@ def test_a_revision_starts_from_the_branchs_real_base_when_the_recorded_one_was_
     assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
 
 
+def test_a_revision_trusts_the_published_base_over_a_recorded_one_the_branch_also_contains(factory):
+    """An unpublished retry can record a rewound main: an older commit that the published branch also contains.
+    The base recorded at publishing still marks where the task's own commits begin, so the commit main dropped is
+    not republished as the task's change."""
+    _land_on_main(factory, "dropme.txt", "removed by a force-push later\n")
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    published = {}
+
+    def rewind_main():  # drop the dropme.txt commit; the unpublished retry then records the rewound main
+        git("reset", "-q", "--hard", "HEAD~1", cwd=seed)
+        git("push", "-q", "-f", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+        main = git("rev-parse", "HEAD", cwd=seed)
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            published["base"] = task.evidence["published"]["base"]
+            assert published["base"] != main
+            task.base_sha = main
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, rewind_main)
+    with session_scope() as s:
+        corrected = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "branch_base_corrected").one()
+        assert corrected.data["actual"] == published["base"] and corrected.data["recorded"] == main
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
+    assert "greet.sh" in tree and "dropme.txt" not in tree
+
+
 def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_overlap(factory):
     told, saw_markers, rejected = [], [], []
 
