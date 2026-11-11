@@ -62,6 +62,8 @@ class World:
         self.me_status = 401
         self.smoke_runs = 0
         self.asset_fails_from_run: int | None = None  # the script bundle 404s from this smoke run on
+        self.asset_fails_on_run: int | None = None  # the script bundle 404s in this smoke run only
+        self.staging_record_fails = False  # GitHub refuses to record factory/staging statuses
         self.redeploy_at: tuple[int, dict] | None = None  # (nth smoke run, staging health from then on)
         self.store: list[dict] = []  # every issue: number, title, labels, created_at, state
         self.labels: set[str] = set()
@@ -87,6 +89,8 @@ class World:
         if path.startswith(f"{base}/statuses/") and method == "POST":
             sha, body = path.split("/")[-1], json.loads(request.content)
             if body["context"] == "factory/staging":
+                if self.staging_record_fails:
+                    return httpx.Response(502, json={})
                 self.staged[sha] = body["description"]
                 return httpx.Response(201, json={})
             assert body["context"] == "factory/release"
@@ -163,7 +167,8 @@ class World:
         if url == f"{STAGING}/":
             return httpx.Response(200, text=APP)
         if url == f"{STAGING}/assets/index-1.js":
-            if self.asset_fails_from_run and self.smoke_runs + 1 >= self.asset_fails_from_run:
+            run = self.smoke_runs + 1
+            if (self.asset_fails_from_run and run >= self.asset_fails_from_run) or run == self.asset_fails_on_run:
                 return httpx.Response(404, text="")
             return httpx.Response(self.asset_status, text="x" * 5000)
         if url == f"{STAGING}/api/meta":
@@ -272,12 +277,17 @@ def test_a_soaked_commit_with_failing_checks_is_skipped_for_an_older_one(world):
 
 
 def test_an_older_commit_needs_its_own_passing_smoke_result(world):
-    # MID soaked, but smoke failed while staging ran it; NEW (which fixed it) has not soaked yet.
+    # MID soaked, but no smoke result was recorded while staging ran it; NEW has not soaked yet.
     world.line = [MID, NEW]
     world.staging["started_at"] = iso(NOW - timedelta(minutes=5))
-    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke failed"
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}"
     result = world.run()
     assert result.status == "held" and "no passing smoke result" in result.detail
+    assert world.patches == []
+    # A failure recorded while staging ran it holds it too (NEW, which fixed it, has not soaked yet).
+    world.staged[MID] = f"Staging since {iso(NOW - timedelta(minutes=45))}; smoke failed"
+    result = world.run()
+    assert result.status == "held" and "failed smoke while staging ran it" in result.detail
     assert world.patches == []
 
 
@@ -480,6 +490,15 @@ def test_staging_smoke_failure_blocks_the_release(world):
     result = world.run()
     assert result.status == "failed" and "/assets/index-1.js" in result.detail
     assert world.patches == [] and len(world.issues) == 1
+
+
+def test_a_smoke_failure_that_cannot_be_recorded_still_blocks_the_release(world):
+    world.asset_fails_on_run = 1  # the observation fails; a second smoke run would pass
+    world.staging_record_fails = True  # and GitHub refuses the record of that failure
+    result = world.run()
+    assert result.status == "failed" and "/assets/index-1.js" in result.detail
+    assert world.patches == [] and NEW not in world.staged
+    assert world.smoke_runs == 1  # the release stopped at the failure it saw; no second run could clear it
 
 
 def test_smoke_reports_auth_that_lets_anonymous_calls_through(world):

@@ -178,6 +178,8 @@ class Releaser:
         self.cfg, self.gh, self.web, self.sleep, self.now = cfg, gh, web, sleep, now
         self.steps: list[str] = []
         self.dry_run = False
+        # What this run saw when it smoke-checked staging's deployment and it failed: (commit, start, problems).
+        self.smoke_failure: tuple[str, datetime, list[str]] | None = None
 
     # --- GitHub -----------------------------------------------------------------------------------------------
     def _gh(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -376,12 +378,15 @@ class Releaser:
         staging = _health(self.web, self.cfg.staging_url)
         commit, started = str(staging.get("commit") or ""), _time(staging.get("started_at"))
         if staging.get("ok") and commit and started is not None:
+            # Smoke the exact tree staging runs now, so an older commit is only ever promoted on a smoke result
+            # from when that commit itself was deployed. A deploy that starts during the smoke run makes the
+            # result belong to neither commit, so only the start is recorded then.
+            problems = smoke(self.web, self.cfg.staging_url)
+            stable = self._still_running(commit, started)
+            if problems and stable:
+                self.smoke_failure = (commit, started, problems)  # blocks this run even if it cannot be recorded
             try:
-                # Smoke the exact tree staging runs now, so an older commit is only ever promoted on a smoke result
-                # from when that commit itself was deployed. A deploy that starts during the smoke run makes the
-                # result belong to neither commit, so only the start is recorded then.
-                passed = not smoke(self.web, self.cfg.staging_url)
-                self._note_staged(commit, started, smoke_ok=passed if self._still_running(commit, started) else None)
+                self._note_staged(commit, started, smoke_ok=not problems if stable else None)
             except (ReleaseError, httpx.HTTPError) as exc:
                 self.step(f"Could not record staging's commit: {exc}")
 
@@ -509,6 +514,10 @@ class Releaser:
         self.step(f"{compare.get('ahead_by', '?')} commit(s) since {cfg.branch} at {current[:7]} change Factory code")
         if self._compare(candidate, cfg.source_branch).get("status") not in ("ahead", "identical"):
             return Result("failed", f"{candidate[:7]} is not on {cfg.source_branch}.", candidate, current)
+        if self.smoke_failure is not None and self.smoke_failure[:2] == (candidate, started):
+            # This run already saw staging's deployment fail smoke. Nothing is released from a failing staging,
+            # whether or not that failure could be recorded and whatever a second smoke run would say.
+            return Result("failed", "Staging smoke failed: " + "; ".join(self.smoke_failure[2]), candidate, current)
 
         # Merges keep replacing staging's commit, so waiting for its current commit to soak would starve releases
         # while the Factory is busy. Promote the newest commit staging actually deployed (it has its own

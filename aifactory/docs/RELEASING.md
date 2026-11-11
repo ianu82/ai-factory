@@ -45,7 +45,8 @@ A run, in order:
    - every GitHub check on it passed (checks still running hold the release);
    - staging passes smoke checks: the web app and its script bundle load, `/api/meta` answers, and `/api/me`
      refuses an anonymous caller. An older commit needs a passing result recorded while staging ran that commit
-     itself; staging's current commit is checked again before promotion.
+     itself; staging's current commit is checked again before promotion. A run that sees staging's current
+     deployment fail smoke releases nothing and reports it, even when GitHub would not record the failure.
 
    The next runs then confirm production, as in step 2.
 
