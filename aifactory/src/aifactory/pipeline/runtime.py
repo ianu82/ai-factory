@@ -30,6 +30,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "decision_judges": "decide",
     # One agent per outcome, responsible for delivering it (pipeline/lead.py).
     "lead": {"enabled": True, "run_usd": 2.0, "turns": 30},
+    # Alerts show in the app's Inbox. Slack and email are delivery options that aren't available yet: both stay off.
+    "alerts": {"after_minutes": 120, "slack": False, "email": False},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
