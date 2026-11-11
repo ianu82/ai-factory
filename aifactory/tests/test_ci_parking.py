@@ -17,6 +17,7 @@ from aifactory.pipeline.orchestrator import Orchestrator
 from .fakes import FakeGitHub, ScriptedModel, call, git, step
 from .test_pipeline import factory, new_outcome  # noqa: F401 - local remote/model fixture
 from .test_pipeline import _approve_and_finish, _event_kinds, _in_turn, _task_state, drive, good_builder
+from .test_pipeline import _approve_merge_after_main_moves, _land_on_main, _merge_candidate, outcome_status
 
 
 def candidate(ids, *, stage="ci"):
@@ -559,6 +560,30 @@ def test_a_refreshed_head_with_the_reviewed_change_is_neither_asked_for_nor_wait
     assert (result["head"], result["of"], result["state"]) == (new, head, "reviewed")
     assert approval(tid).endswith(f"\n\nReviewed at {new[:10]} by {CODEX['login']} (the same change as {head[:10]}, "
                                   "which they reviewed): nothing open.")
+
+
+def test_an_approval_carried_to_the_rebased_change_meets_no_review_request_and_no_review_wait(factory, monkeypatch):
+    review_on(factory)
+    monkeypatch.setattr(delivery, "REVIEW_POLL_SECONDS", 0)
+    reviewed = []
+
+    def codex(number, head):  # reviews the pull request's first head by itself, and no head after it
+        if head and not reviewed:
+            reviewed.append(head)
+            codex_reviewed(head)
+
+    monkeypatch.setattr(FakeGitHub, "reviewer", codex)
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"))
+    assert drive(lambda: outcome_status(outcome_id) == "completed", timeout=120), " ".join(_event_kinds(outcome_id))
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    # The rebased head is the reviewed change: it is not asked for or waited for, and the approval went with it.
+    assert FakeGitHub.merged == [1] and asked == 1 and head != approved_head
+    assert reviewed == [approved_head] and FakeGitHub.comments == []
+    result = evidence["review"]["result"]
+    assert (result["head"], result["of"], result["state"]) == (head, approved_head, "reviewed")
+    kinds = _event_kinds(outcome_id)
+    assert [k for k in kinds if k.startswith("review_")] == ["review_received"] and "approval_carried" in kinds
 
 
 def test_a_reviewers_finding_is_fixed_answered_and_reviewed_again_before_a_person_is_asked(factory, monkeypatch):
