@@ -364,6 +364,7 @@ export interface Decision {
   pr_url?: string;
   pr_number?: number | null;
   priority?: number;
+  lead_note?: { text: string; created_at: string; run_id?: string | null } | null;
 }
 
 export interface FactoryEvent {

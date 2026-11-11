@@ -359,3 +359,14 @@ def test_the_leads_guidance_is_not_counted_as_a_persons_intervention(world, clie
         s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
                       author_kind="user", body="Please hurry."))
     assert client.get(f"/api/workspaces/{world['ws']}/stats").json()["human"]["interventions"] == 1
+
+
+def test_the_inbox_shows_the_leads_recommendation_on_its_decision(world, client):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Earlier view: wait for CI."})
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "CI and the verifier passed. Merge it."})
+    tools.call("note_for_people", {"text": "A note about the outcome, not a decision."})
+    inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+    note = inbox[world["merge"]]["lead_note"]
+    assert note["text"] == "CI and the verifier passed. Merge it." and note["run_id"] == "run-1" and note["created_at"]
+    assert inbox[world["question"]]["lead_note"] is None

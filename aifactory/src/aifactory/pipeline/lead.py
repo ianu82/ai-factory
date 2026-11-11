@@ -111,6 +111,25 @@ def recover() -> int:
         return len(stale)
 
 
+def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
+    """The Lead's latest note on each decision: what it found and recommends, shown where people decide."""
+    from ..serializers import ts
+
+    outcome_ids = {d.outcome_id for d in decisions if d.outcome_id}
+    wanted = {d.id for d in decisions}
+    notes: dict[str, dict[str, Any]] = {}
+    if not outcome_ids:
+        return notes
+    rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
+        .order_by(Message.created_at.desc(), Message.id.desc())
+    for m in rows:
+        decision_id = (m.attribution or {}).get("decision_id")
+        if decision_id in wanted and decision_id not in notes:
+            notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at),
+                                  "run_id": (m.attribution or {}).get("run_id")}
+    return notes
+
+
 # waking ----------------------------------------------------------------------------------------------------------
 
 def _marks(db, outcome_id: str) -> dict[str, str]:
