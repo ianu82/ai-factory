@@ -13,6 +13,7 @@ import logging
 import re
 import shlex
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -26,6 +27,7 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
+from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
 from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
@@ -295,7 +297,9 @@ class TaskRunner:
             self.patch = patch
             diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
                           files=patch.files, additions=patch.additions, deletions=patch.deletions)
-            self.checks = await self._run_commands(self.builder, self.cfg.get("checks") or [], "check")
+            commands = self.cfg.get("checks") or []
+            async with self._check_slot(self.builder, bool(commands)):
+                self.checks = await self._run_commands(self.builder, commands, "check")
             failed = [c for c in self.checks if not c["ok"]]
             if failed:
                 self.feedback += [f"- Check `{c['command']}` failed (exit {c['exit_code']}):\n```\n{c['tail']}\n```"
@@ -440,6 +444,29 @@ class TaskRunner:
         if len(patch.diff) > 5_000_000:
             return "- The diff is larger than 5 MB. Remove generated or binary files from the change."
         return ""
+
+    @asynccontextmanager
+    async def _check_slot(self, sandbox, needed: bool = True):
+        """Hold a host check slot while the repository's checks run in a local sandbox (see check_slots), saying so
+        when every slot is taken. Waiting spends none of a command's timeout. Checks in a VM run off this host and
+        take no slot."""
+        if not needed or getattr(sandbox, "kind", "local") != "local":
+            yield
+            return
+        started = time.monotonic()
+        waited = False
+
+        def waiting(running: int, queued: int) -> None:
+            nonlocal waited
+            waited = True
+            self.event("check_slot_wait", f"Waiting for a check slot: {running} running on this server, {queued} waiting",
+                       running=running, waiting=queued)
+
+        async with check_slot(on_wait=waiting):
+            if waited:
+                seconds = round(time.monotonic() - started, 1)
+                self.event("check_slot", f"Got a check slot after waiting {seconds:.0f}s", waited=seconds)
+            yield
 
     async def _run_commands(self, sandbox: LocalSandbox, commands: list[str], kind: str,
                             timeout: float = 1500) -> list[dict[str, Any]]:
@@ -1189,8 +1216,9 @@ class TaskRunner:
             try:
                 await checkout(sandbox, self.repo.full_name, token, state["head"], self.task.branch)
                 if state["phase"] == "checks":
-                    setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-                    self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
+                    async with self._check_slot(sandbox, bool(self.cfg.get("setup") or self.cfg.get("checks"))):
+                        setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                        self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
                     state.update(setup=setup, checks=self.checks)
                     failed = [c for c in setup + self.checks if not c["ok"]]
                     if failed:
@@ -1268,8 +1296,9 @@ class TaskRunner:
             gh = GitHub(token)
             ref = self.task.merge_sha or await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
             await checkout(sandbox, self.repo.full_name, token, ref, f"smoke-{self.task_id[:8]}")
-            await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-            results = await self._run_commands(sandbox, commands, "smoke")
+            async with self._check_slot(sandbox):
+                await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                results = await self._run_commands(sandbox, commands, "smoke")
         finally:
             await sandbox.close()
         ok = all(r["ok"] for r in results)
