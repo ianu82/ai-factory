@@ -161,12 +161,14 @@ async def take_turn(runner, gh) -> None:
         queue = ordered(s, runner.repo.id)
     ids = [t.id for t in queue]
     position = ids.index(runner.task_id) + 1 if runner.task_id in ids else len(ids) + 1
-    if position > 1:
+    repair = _is_repair(runner)
+    # A repair for a broken main (a revert, a CI-failure fix) never waits behind the queue: the holder rebases onto it.
+    if position > 1 and not repair:
         if first or entry.get("position") != position:
             runner.event("merge_queued", f"Waiting to merge: position {position} of {len(ids)} in the "
                          f"{runner.repo.full_name} merge queue", position=position, length=len(ids))
         _park(runner, {**entry, "position": position, "paused": "", "turn": False, "granted_at": None})
-    if cfg.get("hold_on_red_main", True) and not _is_repair(runner):
+    if cfg.get("hold_on_red_main", True) and not repair:
         failing = await main_is_red(gh, runner)
         runner._guard()
         if failing:
@@ -177,6 +179,10 @@ async def take_turn(runner, gh) -> None:
             # Give up any turn, so a repair behind this task can reach the head.
             _park(runner, {**entry, "position": 1, "paused": "main_red", "turn": False, "granted_at": None},
                   retry_after=RED_MAIN_RETRY)
+        with session_scope() as s:  # the queue may have changed while main was being checked
+            queue = ordered(s, runner.repo.id)
+        if queue and queue[0].id != runner.task_id and not entry.get("turn"):
+            _park(runner, {**entry, "position": 2, "paused": ""})
     if not entry.get("turn"):
         entry.update(turn=True, granted_at=utcnow().isoformat())
         runner.event("merge_turn", f"Merge turn for PR #{runner.task.pr_number}", position=1, length=len(ids))

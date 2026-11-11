@@ -342,3 +342,15 @@ def test_a_turn_holder_paused_by_red_main_gives_up_its_turn(factory, monkeypatch
     with pytest.raises(Stop):
         take(tid)
     assert state(tid)[2]["turn"] is False
+
+
+def test_a_repair_bypasses_a_turn_holder(factory):
+    holder = merge_task(factory, key="T1")
+    take(holder)
+    with session_scope() as s:
+        fix = s.get(Task, merge_task(factory, key="T2", source="signal", pr=2))
+        s.add(Signal(workspace_id=factory["ws"], source="ci_failure", fingerprint="main-red-3", title="CI failing",
+                     status="accepted", outcome_id=fix.outcome_id))
+        fix_id = fix.id
+    take(fix_id)  # does not park behind the holder
+    assert state(fix_id)[0] != "queued"
