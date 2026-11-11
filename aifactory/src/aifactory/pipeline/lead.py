@@ -16,6 +16,7 @@ so delivery metrics count them as the Factory's own work, not a person's.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -383,10 +384,15 @@ async def watch_reviews() -> int:
                                 task.head_sha, known))
     changed = 0
     for workspace_id, outcome_id, task_id, decision_id, repo, number, head, known in watched:
-        line = review_line(await review_state(workspace_id, repo, number, head), number)
-        if line != known.get("line") or head != known.get("head"):
+        state = await review_state(workspace_id, repo, number, head)
+        line, mark = review_line(state, number), review_fingerprint(state)
+        if known.get("fingerprint"):
+            moved = mark != known["fingerprint"]  # the findings themselves, not just their summary line
+        else:  # recorded before fingerprints existed
+            moved = line != known.get("line") or head != known.get("head")
+        if moved:
             record(workspace_id, "lead_review_changed", line, outcome_id=outcome_id, task_id=task_id,
-                   data={"decision_id": decision_id, "head": head, "line": line})
+                   data={"decision_id": decision_id, "head": head, "line": line, "fingerprint": mark})
             changed += 1
     return changed
 
@@ -432,12 +438,14 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
                for c in await gh.issue_comments(repo, number)):
             state["reviewed"] = True
         for t in await gh.review_threads(repo, number):
-            if t.get("isResolved") or t.get("line") is None:  # resolved, or outdated (no line on the current diff)
+            # Outdated is GitHub's own flag: a comment on a whole file has no line and is still current.
+            if t.get("isResolved") or t.get("isOutdated") is True:
                 continue
             first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
             body = first.get("body") or ""
             found = SEVERITY.search(body)
-            state["open"].append({"severity": found.group(1) if found else "", "path": t.get("path") or "",
+            state["open"].append({"id": t.get("id") or "", "severity": found.group(1) if found else "",
+                                  "path": t.get("path") or "",
                                   "line": t.get("line"), "by": ((first.get("author") or {}).get("login") or ""),
                                   "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
         state["checked"] = True
@@ -462,6 +470,16 @@ def review_line(state: dict[str, Any], number: int) -> str:
     if state.get("changes_requested_by"):
         parts.append("changes requested by " + ", ".join(state["changes_requested_by"]))
     return f"Review of {at}: " + ("; ".join(parts) if parts else "reviewed, no open findings") + "."
+
+
+def review_fingerprint(state: dict[str, Any]) -> str:
+    """The review state itself, not its one-line summary: a P1 replaced by another P1, or a finding rewritten, is a
+    change the Lead must read even though the line still says "1 open review finding, 1 of them P0/P1"."""
+    findings = sorted((f.get("id") or "", f.get("severity") or "", f.get("text") or "") for f in state.get("open", []))
+    body = json.dumps({"head": state.get("head"), "checked": bool(state.get("checked")),
+                       "reviewed": bool(state.get("reviewed")), "changes": sorted(state.get("changes_requested_by", [])),
+                       "open": findings}, sort_keys=True)
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
 
 
 def settled(state: dict[str, Any]) -> bool:
@@ -883,7 +901,8 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.cost_known = measured is not None or (ledger.cost_known and not reading and attempts == ledger.calls)
             row.result = {"summary": summary, "actions": tools.actions,
                           # What review said about each merge approval's commit: an unsettled one is looked at again.
-                          "reviews": {d: {"head": st["head"], "settled": settled(st), "line": tools.lines[d]}
+                          "reviews": {d: {"head": st["head"], "settled": settled(st), "line": tools.lines[d],
+                                          "fingerprint": review_fingerprint(st)}
                                       for d, st in tools.reviews.items()}}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})

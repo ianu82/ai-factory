@@ -793,8 +793,8 @@ class FakeGitHub:
         return FakeGitHub.threads_data
 
 
-def thread(body, *, resolved=False, line=3, path="a.py"):
-    return {"id": f"t-{path}-{line}", "isResolved": resolved, "path": path, "line": line,
+def thread(body, *, resolved=False, outdated=False, line=3, path="a.py"):
+    return {"id": f"t-{path}-{line}", "isResolved": resolved, "isOutdated": outdated, "path": path, "line": line,
             "comments": {"nodes": [{"author": {"login": lead.CODEX}, "body": body}]}}
 
 
@@ -807,11 +807,13 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     FakeGitHub.comments_data = [{"user": {"login": lead.CODEX}, "body": f"Codex Review: Reviewed commit `{HEAD[:10]}`"}]
     FakeGitHub.threads_data = [thread("**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"),
                                thread("P1 Badge", resolved=True, path="b.py"),
-                               thread("P0 Badge", line=None, path="c.py")]  # outdated: no line on the current diff
+                               thread("P0 Badge", outdated=True, path="c.py"),
+                               thread("P1 Badge  Don't ship this file", line=None, path="d.py")]  # a file comment
     state = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
     assert state["checked"] and state["reviewed"]  # Codex's receipt names this commit
-    assert [(f["severity"], f["path"], f["text"]) for f in state["open"]] == [("P1", "a.py", "Fix the lock")]
-    assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: 1 open review finding, 1 of them P0/P1."
+    assert [(f["severity"], f["path"]) for f in state["open"]] == [("P1", "a.py"), ("P1", "d.py")]
+    assert state["open"][0]["text"] == "Fix the lock"
+    assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: 2 open review findings, 2 of them P0/P1."
 
     class Partial(FakeGitHub):
         async def review_threads(self, repo, number):  # the helper refuses partial GraphQL data
@@ -877,9 +879,12 @@ def test_the_watcher_wakes_the_lead_only_when_review_changes(world, monkeypatch)
     assert asyncio.run(lead.watch_reviews()) == 1
     assert woken()[world["outcome"]]["reasons"] == ["what review says about a merge approval changed"]
     assert asyncio.run(lead.watch_reviews()) == 0  # recorded: the same state isn't a change again
+    states.update(open=[{"id": "another-thread", "severity": "P1"}])  # a different P1, the same summary line
+    assert asyncio.run(lead.watch_reviews()) == 1
     with db.session_scope() as s:
-        event = s.query(Event).filter_by(kind="lead_review_changed").one()
-        assert event.message == "Review of PR #12 at abcdef1: 1 open review finding, 1 of them P0/P1."
+        events = s.query(Event).filter_by(kind="lead_review_changed").order_by(Event.id).all()
+        assert [e.message for e in events] == ["Review of PR #12 at abcdef1: 1 open review finding, 1 of them P0/P1."] * 2
+        assert events[0].data["fingerprint"] != events[1].data["fingerprint"]
 
 
 def test_every_open_merge_approval_is_read(world, monkeypatch):
