@@ -247,7 +247,6 @@ def test_a_paused_head_steps_aside_for_a_repair_behind_it(factory, monkeypatch):
         s.add(Signal(workspace_id=factory["ws"], source="ci_failure", fingerprint="main-red-2", title="CI failing",
                      status="accepted", outcome_id=fix.outcome_id))
         fix_id = fix.id
-        assert merge_manager.ordered(s, factory["repo"])[0].id == fix_id
     take(fix_id)
     assert state(fix_id)[2]["turn"] is True
 
@@ -263,6 +262,10 @@ def test_github_queue_rebases_a_stale_head_before_enqueueing(factory, monkeypatc
         refreshed.append(main_sha)
 
     monkeypatch.setattr(TaskRunner, "_refresh_onto_main", refresh)
+    async def open_pull(self, full_name, number):
+        return {"merged": False, "state": "open"}
+
+    monkeypatch.setattr(QueueGitHub, "pull", open_pull)
     monkeypatch.setattr(delivery, "GitHub", QueueGitHub)
     monkeypatch.setattr(TaskRunner, "_require_merge_approval", lambda self: None)
     with session_scope() as s:
@@ -270,3 +273,26 @@ def test_github_queue_rebases_a_stale_head_before_enqueueing(factory, monkeypatc
     r = runner(tid)
     asyncio.run(r.merge())
     assert refreshed and QueueGitHub.enqueued == []
+
+
+def test_a_stale_turn_yields_to_the_newer_holder(factory):
+    old, new = merge_task(factory, key="T1"), merge_task(factory, key="T2", pr=2)
+    with session_scope() as s:
+        s.get(Task, old).evidence = {"merge_queue": {"entered_at": "2026-01-01", "turn": True, "granted_at": "2026-01-01"}}
+        s.get(Task, new).evidence = {"merge_queue": {"entered_at": "2026-01-02", "turn": True, "granted_at": "2026-01-03"}}
+    with session_scope() as s:
+        assert merge_manager.ordered(s, factory["repo"])[0].id == new
+    with pytest.raises(Stop):
+        take(old)
+    assert state(old)[2]["turn"] is False
+
+
+def test_explicit_github_mode_never_falls_back_on_a_lookup_failure(factory):
+    class Broken(QueueGitHub):
+        async def graphql(self, query, variables):
+            raise RuntimeError("boom")
+
+    r = runner(merge_task(factory, key="T1"))
+    r.cfg = {**r.cfg, "merge": {"queue": "github"}}
+    with pytest.raises(Stop):
+        asyncio.run(merge_manager.github_queue_state(Broken("token"), r))

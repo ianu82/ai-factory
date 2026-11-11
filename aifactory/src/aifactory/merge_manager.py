@@ -58,7 +58,12 @@ def ordered(session, repo_id: str, *, include_github: bool = False) -> list[Task
             .filter(Task.repo_id == repo_id, Task.status.in_(MEMBER_STATUSES)))
     members = [(t, p if p is not None else 2) for t, p in rows if _entry(t).get("entered_at") and not t.merge_sha
                and (include_github or not _entry(t).get("github"))]
-    return [t for t, p in sorted(members, key=lambda tp: _sort_key(*tp))]
+    queue = [t for t, p in sorted(members, key=lambda tp: _sort_key(*tp))]
+    # A holder that left the queue (e.g. for a new approval) and came back may still carry a stale turn: the most
+    # recently granted turn wins, and take_turn drops the stale one when that task finds itself behind.
+    holders = sorted((t for t in queue if _entry(t).get("turn")), key=lambda t: _entry(t).get("granted_at") or "",
+                     reverse=True)
+    return holders + [t for t in queue if not _entry(t).get("turn")]
 
 
 def held_back(session) -> set[str]:
@@ -160,7 +165,7 @@ async def take_turn(runner, gh) -> None:
         if first or entry.get("position") != position:
             runner.event("merge_queued", f"Waiting to merge: position {position} of {len(ids)} in the "
                          f"{runner.repo.full_name} merge queue", position=position, length=len(ids))
-        _park(runner, {**entry, "position": position, "paused": ""})
+        _park(runner, {**entry, "position": position, "paused": "", "turn": False, "granted_at": None})
     if cfg.get("hold_on_red_main", True) and not _is_repair(runner):
         failing = await main_is_red(gh, runner)
         runner._guard()
@@ -195,6 +200,8 @@ async def github_queue_state(gh, runner) -> dict[str, Any] | None:
         data = await gh.graphql(QUEUE_QUERY, {"owner": owner, "name": name, "branch": runner.repo.default_branch,
                                               "number": runner.task.pr_number})
     except Exception:
+        if mode == "github":  # explicitly GitHub's queue: never fall back to a direct merge on a lookup failure
+            _park(runner, _entry(runner.task), retry_after=GITHUB_QUEUE_RETRY)
         return None
     repo = (data.get("data") or data).get("repository") or {}
     if not repo.get("mergeQueue"):
