@@ -16,7 +16,9 @@ import { SettingsPage } from "./pages/Settings";
 import { NewOutcome } from "./pages/NewOutcome";
 import { Onboarding } from "./onboarding/Onboarding";
 import { memberHasDeferred, STEP_LABELS, useOnboarding } from "./onboarding/state";
-import { MindDock, MindProvider, MindRouteContext } from "./components/MindDock";
+import { MindProvider } from "./components/mind/MindProvider";
+import { MindNav } from "./components/mind/MindNav";
+import { MindConversation, MindHome } from "./pages/Mind";
 
 type Ctx = { me: Me; meta: Meta; ws: Workspace; live: string; openCapture: () => void };
 const WorkspaceCtx = createContext<Ctx | null>(null);
@@ -64,8 +66,19 @@ function Loading({ error }: { error?: unknown }) {
 /** Stable deep links (used by runtime QA and docs): /go/outcomes → the first workspace's Outcomes. */
 function GoTo({ workspaceId }: { workspaceId: string }) {
   const { section = "inbox" } = useParams();
-  const allowed = ["inbox", "outcomes", "pulls", "runs", "signals", "decisions", "settings", "onboarding"];
+  const allowed = ["mind", "inbox", "outcomes", "pulls", "runs", "signals", "decisions", "settings", "onboarding"];
   return <Navigate to={`/w/${workspaceId}/${allowed.includes(section) ? section : "inbox"}`} replace />;
+}
+
+function MindHomeRoute() {
+  const { ws } = useWs();
+  return <MindHome workspaceId={ws.id} />;
+}
+
+function MindThreadRoute() {
+  const { ws } = useWs();
+  const { threadId = "" } = useParams();
+  return <MindConversation workspaceId={ws.id} threadId={threadId} />;
 }
 
 function NoWorkspace() {
@@ -116,6 +129,8 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
           {ws.paused && <div className="banner">This workspace is paused. Running work finishes its current step; nothing new starts.</div>}
           {live === "offline" && <div className="banner">Live updates disconnected. Reconnecting…</div>}
           <Routes>
+            <Route path="mind" element={<MindHomeRoute />} />
+            <Route path="mind/:threadId" element={<MindThreadRoute />} />
             <Route path="inbox" element={<InboxPage />} />
             <Route path="inbox/:decisionId" element={<InboxPage />} />
             <Route path="outcomes" element={<OutcomesPage />} />
@@ -133,9 +148,6 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
       </div>
       {capture && !blockCapture && <NewOutcome onClose={() => setCapture(false)} />}
       </>}
-      {/* Outside the page routes, so it stays mounted on every workspace screen, onboarding and Settings included. */}
-      <MindRouteContext />
-      <MindDock workspaceId={ws.id} />
     </WorkspaceCtx.Provider>
   );
 }
@@ -194,6 +206,7 @@ function Sidebar() {
         )}
       </div>
       <button className="capture" onClick={openCapture}><Plus size={15} /> New outcome <kbd>C</kbd></button>
+      <MindNav workspaceId={ws.id} />
       <NavLink to={`${base}/inbox`} className="nav-item"><InboxIcon /> Inbox
         {!!inbox.data?.decisions.length && <span className="count" aria-label={`${inbox.data.decisions.length} need you`}>{inbox.data.decisions.length}</span>}
       </NavLink>

@@ -54,7 +54,7 @@ STRUCTURAL_KEYS = frozenset({
     "citations", "action_cards", "history", "tools", "workspace_id", "kind", "outcome_id", "task_id", "label",
     "href", "seq", "message_id", "type", "data", "call_id", "name", "summary", "card", "code", "message",
     "thread_cost", "daily_spend", "daily_limit", "revision", "workspace", "object", "fields", "effect", "result",
-    "action_id", "ok", "reason", "detail", "items", "truncated", "provenance",
+    "action_id", "ok", "reason", "detail", "items", "truncated", "provenance", "accounting",
 })
 
 
@@ -248,7 +248,10 @@ def thread_view(db, thread):
 
 def message_view(row, history=False):
     keys = ("id", "thread_id", "role", "text", "context", "citations", "action_cards", "status", "created_at")
-    return {k: getattr(row, k) for k in keys} | ({"history": row.history} if history else {})
+    # The tools a reply used, by name only: the page shows them as the reply's steps.
+    tools = (row.history or {}).get("tools") if isinstance(row.history, dict) else None
+    steps = [{"name": str(t.get("name") or "")} for t in tools or [] if isinstance(t, dict) and t.get("name")]
+    return {k: getattr(row, k) for k in keys} | {"steps": steps} | ({"history": row.history} if history else {})
 
 
 def transcript(db, thread, history=False):
@@ -296,16 +299,35 @@ def get_thread(thread_id: str, user: User = Depends(current_user), db: Session =
     return transcript(db, row)
 
 
+SETTLING = "Mind is settling the cost of the last reply. Try again in a moment."
+
+
 @router.get("/status")
 async def status(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
                  runtime=Depends(get_runtime)):
     require_member(db, user, workspace_id)
     ledger = store.TurnLedger(user.id, workspace_id, runtime=runtime)
+
+    def unsettled() -> bool:
+        # A fresh session sees what reconcile just committed (this request's session may hold an older snapshot).
+        with SessionLocal() as session:
+            return session.query(MindCharge).filter_by(user_id=user.id, settled=False).first() is not None
+
     try:
-        result = await readiness(runtime, workspace_id, ledger)
+        # Settle first: a send, and an uncached readiness probe's own admission, refuse while a charge is unsettled.
         await ledger.reconcile()
+        if unsettled():
+            result = {"status": "unavailable", "model_id": None, "reason": SETTLING, "accounting": "pending"}
+        else:
+            result = await readiness(runtime, workspace_id, ledger)
+            await ledger.reconcile()
+            # Ready or not: a probe that ran (and was charged) may still be settling.
+            result = {**result, "accounting": "pending" if unsettled() else "settled"}
     except store.AccountingError as exc:
         result = {"status": "unavailable", "model_id": None, "reason": str(exc)}
+        if exc.code in ("accounting_pending", "accounting_busy"):
+            # Settling, here or in another tab: still pending, so the page keeps checking (as the stream maps it).
+            result = {**result, "reason": SETTLING, "accounting": "pending"}
     except Exception:
         result = {"status": "unavailable", "model_id": None, "reason": "Mind is unavailable."}
     finally:
@@ -480,6 +502,25 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 if not asyncio.current_task().cancelling():
                     await queue.put(None)
 
+        persisted = False
+
+        def persist(status):
+            nonlocal persisted
+            with SessionLocal() as session:
+                secrets = secrets_for(session, user_id, scope)
+                safe = scrub_events(cut_open_credential(events), secrets)
+                row = session.get(MindMessage, assistant_id)
+                row.text = "".join(e["data"].get("text", "") for e in safe if e["type"] == "token")
+                row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]
+                row.action_cards = [e["data"]["card"] for e in safe if e["type"] == "action_card"]
+                row.history = {"tools": [e["data"] for e in safe if e["type"] == "tool_finished"]}
+                row.status = status
+                session.execute(update(MindThread).where(MindThread.id == thread_id,
+                    MindThread.active_turn == turn_id).values(active_turn=None, lease_until=None,
+                    status=status, updated_at=utcnow()))
+                session.commit()
+            persisted = True
+
         def envelope(typ, data):
             return {"seq": len(events) + 1, "thread_id": thread_id, "message_id": assistant_id,
                     "type": typ, "data": data}
@@ -519,8 +560,10 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                 events.append(envelope("usage", store.wire_usage(session, user_id, thread_id)))
                 events.append(envelope("done", {"status": terminal}))
                 safe = scrub_events(cut_open_credential(events), secrets_for(session, user_id, scope))
-            # The turn has a final status now. A client that stops reading during this last flush (the browser
-            # treats an error frame as the end of its work) must not turn it into "interrupted".
+            # Save the finished turn before its last frames go out: a client that reloads on "done" must find it
+            # saved. The turn has a final status now, so a client that stops reading during this last flush (the
+            # browser treats an error frame as the end of its work) must not turn it into "interrupted".
+            persist(terminal)
             flushed = True
             for event in safe[released:]:
                 yield encoded(event)
@@ -540,19 +583,9 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
                     item = queue.get_nowait()
                     if item is not None:
                         events.append(envelope(*item))
-                # Persist even on disconnect. No durable worker or public event bus.
-                with SessionLocal() as session:
-                    secrets = secrets_for(session, user_id, scope)
-                    safe = scrub_events(cut_open_credential(events), secrets)
-                    row = session.get(MindMessage, assistant_id)
-                    row.text = "".join(e["data"].get("text", "") for e in safe if e["type"] == "token")
-                    row.citations = [c for e in safe if e["type"] == "tool_finished" for c in e["data"].get("citations", [])]
-                    row.action_cards = [e["data"]["card"] for e in safe if e["type"] == "action_card"]
-                    row.history = {"tools": [e["data"] for e in safe if e["type"] == "tool_finished"]}
-                    row.status = terminal
-                    session.execute(update(MindThread).where(MindThread.id == thread_id,
-                        MindThread.active_turn == turn_id).values(active_turn=None, lease_until=None,
-                        status=terminal, updated_at=utcnow()))
-                    session.commit()
+                # Persist even on disconnect (unless the finished turn was saved before its last frames).
+                # No durable worker or public event bus.
+                if not persisted:
+                    persist(terminal)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})

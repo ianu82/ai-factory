@@ -37,7 +37,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_retry_rounds": 1,
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
-    "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "run_minutes": 60,
+    "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
+               "run_minutes": 60,
                "ci_minutes": 45, "max_changed_lines": 1500},
     "reasoning_effort": "medium",
     # Per person per UTC day across all their workspaces, the lowest of their workspaces' limits (mind/store.py).
@@ -170,12 +171,13 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     """Run one harness session as a recorded Run. Returns (run, result_or_None, error)."""
     settings = (merged_settings(json.loads(canonical_json(spec.effective_settings)))
                 if spec.effective_settings is not None else workspace_settings(spec.workspace_id))
-    models = workspace_models(settings)
-    model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier}[spec.role]
     provider = (resolve_provider(spec.workspace_id, required_provider=settings["provider"])
                 if spec.effective_settings is not None
                 and settings["provider"] != workspace_settings(spec.workspace_id)["provider"]
                 else resolve_provider(spec.workspace_id))
+    models = workspace_models(settings, provider=provider.provider)
+    model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier,
+             "plan_reviewer": models.plan_reviewer}[spec.role]
     model = spec.model_override or provider.model_override or model
     version, snapshot = configuration_version(
         role=spec.role, system=spec.system, harness=spec.harness, provider=provider, model=model,

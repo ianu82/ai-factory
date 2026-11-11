@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MindController, canConfirm, mindCost, mindLink, mindPrivateKey, mindRouteContext, mindSuggestions, readMindSSE, validMindBudget, type MindTransport } from "./mind.ts";
+import { MindController, canConfirm, formatDuration, mindCost, mindLink, mindPrivateKey, mindRouteContext, mindSuggestions, readMindSSE, stepLabel, validMindBudget, type MindTransport } from "./mind.ts";
 import type { MindCard, MindEvent, MindHistory } from "./api.ts";
 
 const card: MindCard = { id: "c1", revision: 1, kind: "create_outcome", workspace_id: "target", title: "Create outcome", fields: { title: "Original", brief: "A brief" }, status: "proposed" };
@@ -244,7 +244,7 @@ test("token/tool progress is visual only; completion announces once; terminal bu
     receive({ type: "tool_start", name: "read_runs" });
     assert.equal(c.getSnapshot().announcement, "");
     assert.equal(c.getSnapshot().draft, "Some more");
-    assert.match(c.getSnapshot().progress, /read_runs/);
+    assert.match(c.getSnapshot().progress, /read runs/);
     receive(done);
   };
   await c.send("question");
@@ -278,22 +278,45 @@ test("identical consecutive completions each get a new live-region identity, nev
   assert.equal(c.getSnapshot().announcementId, 0);
 });
 
-test("mobile sheet and backdrop stack below shared modals regardless of mount order", async () => {
+test("Mind's floating controls stay below shared modals", async () => {
   const { readFile } = await import("node:fs/promises");
-  const dockStyles = await readFile(new URL("./components/MindDock.css", import.meta.url), "utf8");
+  const mindStyles = await readFile(new URL("./components/mind/Mind.css", import.meta.url), "utf8");
   const sharedStyles = await readFile(new URL("./styles.css", import.meta.url), "utf8");
-  const mobileStyles = dockStyles.slice(dockStyles.indexOf("@media (max-width: 760px)"));
   const layer = (styles: string, selector: string) => {
     const rule = styles.split(`${selector} {`)[1]?.split("}")[0];
     const value = rule?.match(/z-index:\s*(\d+)/)?.[1];
     assert.ok(value, `${selector} must declare a stacking layer`);
     return Number(value);
   };
-  const backdrop = layer(mobileStyles, ".mind-scrim");
-  const sheet = layer(mobileStyles, ".mind-dock");
-  const modal = layer(sharedStyles, ".scrim");
-  assert.ok(backdrop < sheet, "Mind controls must be above their own backdrop");
-  assert.ok(sheet < modal, "the modal owning focus must not be covered by Mind");
+  assert.ok(layer(mindStyles, ".mind-jump") < layer(sharedStyles, ".scrim"), "a modal owning focus must not be covered by Mind");
+});
+
+test("a turn records the steps Mind took and how long it worked, and labels tools in plain words", async () => {
+  const { controller: c, transport } = harness(); await c.create("billing");
+  transport.send = async (_thread, _body, _signal, receive) => {
+    receive({ type: "tool_start", name: "open_decisions" });
+    assert.deepEqual(c.getSnapshot().steps, [{ name: "open_decisions", done: false }]);
+    assert.equal(c.getSnapshot().progress, "Checking open decisions");
+    receive({ type: "tool_result", name: "open_decisions", citations: [{ label: "Retry?", url: "/w/a/inbox" }] });
+    receive({ type: "tool_start", name: "outcome_detail" });
+    receive({ type: "tool_result", name: "outcome_detail" });
+    receive(done);
+  };
+  await c.send("What needs me?");
+  const reply = c.getSnapshot().messages.at(-1)!;
+  assert.deepEqual(reply.steps, [{ name: "open_decisions", done: true, citations: 1 }, { name: "outcome_detail", done: true, citations: 0 }]);
+  assert.equal(typeof reply.durationMs, "number");
+  assert.equal(stepLabel("propose_retry_task", false), "Preparing a retry for your approval");
+  assert.equal(stepLabel("brand_new_tool", true), "Used brand new tool");
+  assert.equal(stepLabel("propose_rename_thing", true), "Prepared rename thing for your approval");
+  assert.equal(formatDuration(12_400), "12s");
+  assert.equal(formatDuration(125_000), "2m 5s");
+  assert.equal(formatDuration(null), null);
+});
+
+test("Mind pages are trusted in-app links", () => {
+  assert.equal(mindLink("/w/ws1/mind/t1"), "internal");
+  assert.equal(mindLink("/w/ws1/mind"), "internal");
 });
 
 test("mobile focus trap yields Escape, Tab, focus and restoration to another modal", async () => {
@@ -409,7 +432,7 @@ test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts"
   assert.equal(events.find((e) => e.type === "text_delta")?.text, "Complete 🧠");
   const completed = events.at(-1);
   assert.equal(completed?.type, "done");
-  if (completed?.type === "done") assert.equal(completed.status.budget_state, "pending_accounting");
+  if (completed?.type === "done") assert.equal(completed.status?.budget_state, "pending_accounting");
   assert.equal(calls.some((c) => c.path.endsWith("/confirm")), false);
   const action = h.messages[0].cards![0];
   await t.revise("thread", action, { text: "Edited" }, signal);
@@ -421,15 +444,97 @@ test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts"
   assert.match(confirmed.result!.text, /Completed: Send guidance/);
 });
 
+test("a failed turn reloads its saved reply without another paid readiness check, and keeps its budget failure", async () => {
+  const { createMindHttpTransport } = await import("./mindHttp.ts");
+  const wireThread = { id: "thread", title: "Delivery", billing_workspace_id: "billing", model_id: "opus-5-5", cost: { usd: 0.4, known: true } };
+  const paths: string[] = [];
+  const request: any = async (path: string) => {
+    paths.push(path);
+    if (path.startsWith("/api/mind/status?")) return { status: "ready", model_id: "opus-5-5" };
+    return { thread: wireThread, messages: [{ id: "reply", role: "assistant", text: "Partial", citations: [], action_cards: [], status: "failed" }] };
+  };
+  const envelope = (type: string, data: unknown) => `data: ${JSON.stringify({ seq: 1, thread_id: "thread", message_id: "reply", type, data })}\n\n`;
+  const stream = envelope("token", { text: "Partial" }) + envelope("error", { code: "budget_exceeded", message: "This reply hit its spending limit." })
+    + envelope("usage", { thread_cost: wireThread.cost, daily_spend: 1, daily_limit: 10 }) + envelope("done", { status: "failed" });
+  const t = createMindHttpTransport(request, (async () => response(stream)) as any, readMindSSE);
+  const events: MindEvent[] = [];
+  await assert.rejects(t.send("thread", { content: "Question", context: null }, new AbortController().signal, (e) => events.push(e)), /spending limit/);
+  assert.equal(paths.some((p) => p.startsWith("/api/mind/status?")), false);
+  const completed = events.at(-1);
+  assert.equal(completed?.type, "done");
+  if (completed?.type === "done") {
+    assert.equal(completed.status, undefined);
+    assert.equal(completed.budget, "budget_exceeded");
+    assert.equal(completed.message.content, "Partial");
+  }
+  // The controller keeps the blocked state through the reload instead of re-enabling the composer.
+  const { controller: c, transport } = harness();
+  await c.select("thread");
+  transport.send = async (_thread, _body, _signal, receive) => {
+    for (const event of events) receive(event);
+    throw new Error("This reply hit its spending limit.");
+  };
+  await c.send("Question");
+  assert.equal(c.state.status?.budget_state, "budget_exceeded");
+  assert.equal(c.state.messages.at(-1)?.content, "Partial");
+});
+
 test("wire unavailable, accounting and budget codes map to explicit blocked states", async () => {
   const { mindStatus, mindBudget, mindUsage } = await import("./mindHttp.ts");
   const status = mindStatus({ status: "unavailable", model_id: null, reason: "Missing saved key" });
   assert.equal(status.available, false);
   assert.equal(status.reason, "Missing saved key");
+  assert.equal(mindStatus({ status: "ready", model_id: "opus-5-5", accounting: "pending" }).budget_state, "pending_accounting");
+  assert.equal(mindStatus({ status: "ready", model_id: "opus-5-5", accounting: "settled" }).budget_state, "ok");
+  // Still settling after the readiness cache expired: blocked, and still pending so the page keeps checking.
+  assert.equal(mindStatus({ status: "unavailable", model_id: null, reason: "Mind is settling", accounting: "pending" }).budget_state, "pending_accounting");
   assert.equal(mindBudget("budget_exceeded"), "budget_exceeded");
   assert.equal(mindBudget("accounting_busy"), "pending_accounting");
   assert.equal(mindBudget("accounting_pending"), "pending_accounting");
   for (const [daily_spend, daily_limit, state] of [[0, 0, "budget_exceeded"], [10, 10, "budget_exceeded"], [null, 10, "pending_accounting"], [1, 10, "ok"]] as const) {
     assert.equal(mindUsage(status, { daily_spend, daily_limit, thread_cost: { usd: null, known: false } }).budget_state, state);
   }
+});
+
+test("a successful status check clears only the error a failed one left", async () => {
+  const { controller: c, transport } = harness();
+  let fail = true;
+  transport.status = async () => { if (fail) throw new Error("offline"); return { model: "m", available: true, budget_state: "ok" }; };
+  await c.checkStatus("billing");
+  assert.match(c.state.error, /offline/);
+  assert.equal(c.state.status?.available, false);
+  fail = false;
+  await c.checkStatus("billing");
+  assert.equal(c.state.error, "");
+  assert.equal(c.state.status?.available, true);
+});
+
+test("a new conversation opens only when its first message can be sent", async () => {
+  const { controller: c, transport } = harness();
+  transport.create = async () => ({ ...history(), messages: [], status: { model: null, available: false, reason: "Add a key", budget_state: "ok" } });
+  let sent = false, created = 0;
+  transport.send = async () => { sent = true; };
+  assert.equal(await c.start("billing", "Hello"), null);
+  assert.equal(sent, false);
+  // With a status check, an unavailable Mind creates no conversation at all.
+  transport.status = async () => ({ model: null, available: false, reason: "Add a key", budget_state: "ok" });
+  const create = transport.create;
+  transport.create = async (...args) => { created++; return create(...args); };
+  assert.equal(await c.start("billing", "Hello"), null);
+  assert.equal(created, 0);
+  transport.status = async () => history().status;
+  transport.create = async () => ({ ...history(), messages: [] });
+  assert.equal(await c.start("billing", "Hello"), "t1");
+});
+
+test("a failed readiness check ends as unavailable with its reason, never checking forever", async () => {
+  const { controller: c, transport } = harness();
+  transport.status = async () => { throw new Error("offline"); };
+  await c.checkStatus("billing");
+  const status = c.getSnapshot().status!;
+  assert.equal(status.available, false);
+  assert.match(status.reason || "", /offline/);
+  transport.status = async () => history().status;
+  await c.checkStatus("billing");
+  assert.equal(c.getSnapshot().status?.available, true);
 });

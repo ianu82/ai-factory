@@ -100,12 +100,15 @@ def _add_missing_columns(engine: Engine) -> None:
     """Additive schema evolution: new nullable model columns are added to existing tables."""
     from sqlalchemy import inspect, text
 
-    inspector = inspect(engine)
+    tables = Base.metadata.sorted_tables
+    # One reflection for every table (two catalog queries per table on PostgreSQL otherwise, at each start).
+    reflected = inspect(engine).get_multi_columns(filter_names=[t.name for t in tables])
+    existing = {name: {c["name"] for c in columns} for (_schema, name), columns in reflected.items()}
     with engine.begin() as conn:
-        for table in Base.metadata.sorted_tables:
-            if not inspector.has_table(table.name):
+        for table in tables:
+            if table.name not in existing:
                 continue
-            present = {c["name"] for c in inspector.get_columns(table.name)}
+            present = existing[table.name]
             for column in table.columns:
                 if column.name in present or not column.nullable:
                     continue

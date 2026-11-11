@@ -108,7 +108,7 @@ export interface Settings {
   learning?: { status: "learning" | "applied"; preset: Settings["autonomy"] };
   provider: "mindshub" | "openai";
   decision_judges: DecisionJudgeMode;
-  models: { default?: string; planner?: string; builder?: string; verifier?: string; judge?: string };
+  models: { default?: string; planner?: string; plan_reviewer?: string; builder?: string; verifier?: string; judge?: string };
   harness: { builder: string; verifier: string; planner: string };
   concurrency: number;
   planning_concurrency?: number;
@@ -124,7 +124,7 @@ export interface Settings {
 
 export interface ModelCheckResult {
   provider: string | null;
-  roles: Record<"planner" | "builder" | "verifier", {
+  roles: Record<"planner" | "plan_reviewer" | "builder" | "verifier", {
     model: string;
     status: "supported" | "unsupported" | "unknown";
     explanation: string;
@@ -389,12 +389,19 @@ export interface Message {
   created_at: string;
 }
 
+export interface PlanReview {
+  verdict: "approve" | "revise" | "escalate" | "error";
+  summary?: string;
+  model?: string;
+  findings?: { severity: string; task?: string; description: string }[];
+}
+
 export interface Plan {
   id: string;
   version: number;
   status: string;
   summary: string;
-  content: { summary?: string; tasks?: any[]; risks?: string[]; questions?: any[] };
+  content: { summary?: string; tasks?: any[]; risks?: string[]; questions?: any[]; review?: PlanReview };
   approved_by: string | null;
   approved_at: string | null;
   created_at: string;
@@ -496,13 +503,17 @@ export interface MindCard {
   effect?: string;
   result?: { text: string; citations?: MindCitation[] };
 }
+/** One thing Mind did during a turn: a Factory read or a proposal, by tool name. */
+export interface MindStep { name: string; done: boolean; citations?: number }
 export interface MindMessage {
   id: string; role: "user" | "assistant"; content: string;
   citations?: MindCitation[]; cards?: MindCard[];
+  /** The turn's steps; durationMs only when this browser timed the turn. */
+  steps?: MindStep[]; durationMs?: number; failed?: boolean;
 }
 export interface MindThread {
   id: string; title: string; workspace_id: string;
-  cost_usd: number | null; cost_known: boolean;
+  cost_usd: number | null; cost_known: boolean; updated_at?: string;
 }
 export interface MindStatus {
   model: string | null; available: boolean; reason?: string;
@@ -511,10 +522,12 @@ export interface MindStatus {
 export interface MindHistory { thread: MindThread; messages: MindMessage[]; status: MindStatus }
 export type MindEvent =
   | { type: "text_delta"; text: string }
-  | { type: "tool_start" | "tool_result"; name: string }
+  | { type: "tool_start"; name: string }
+  | { type: "tool_result"; name: string; citations?: MindCitation[] }
   | { type: "action_card"; card: MindCard }
   | { type: "status"; status: MindStatus }
-  | { type: "done"; message: MindMessage; thread: MindThread; status: MindStatus }
+  /** A failed turn carries no fresh status (no second readiness check), only the budget state its failure implies. */
+  | { type: "done"; message: MindMessage; thread: MindThread; status?: MindStatus; budget?: MindStatus["budget_state"] }
   | { type: "error"; message: string; reason?: string };
 
 /** T1/T3 HTTP shapes; the dock uses a small presentation projection above. */
@@ -528,14 +541,15 @@ export interface MindWireCard {
 }
 export interface MindWireThread {
   id: string; title: string; billing_workspace_id: string; model_id: string | null;
-  status: string; cost: { usd: number | null; known: boolean };
+  status: string; cost: { usd: number | null; known: boolean }; updated_at?: string;
 }
 export interface MindWireMessage {
   id: string; role: "user" | "assistant"; text: string;
   citations: MindWireCitation[]; action_cards: MindWireCard[]; status: string;
+  steps?: { name: string }[];
 }
 export interface MindWireHistory { thread: MindWireThread; messages: MindWireMessage[] }
-export interface MindWireStatus { status: "ready" | "unavailable"; model_id: string | null; reason?: string }
+export interface MindWireStatus { status: "ready" | "unavailable"; model_id: string | null; reason?: string; accounting?: "pending" | "settled" }
 export interface MindWireUsage {
   thread_cost: { usd: number | null; known: boolean };
   daily_spend: number | null; daily_limit: number;
