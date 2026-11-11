@@ -26,7 +26,7 @@ def people():
         org = Organization(name="Org")
         alice, bob = User(name="Alice", email="alice@t"), User(name="Bob", email="bob@t")
         db.add_all([org, alice, bob]); db.flush()
-        first = Workspace(org_id=org.id, name="Platform", slug="platform")
+        first = Workspace(org_id=org.id, name="Platform", slug="platform", outcome_seq=7)  # outcome #7 below
         second = Workspace(org_id=org.id, name="Mobile", slug="mobile")
         db.add_all([first, second]); db.flush()
         db.add_all([Membership(user_id=alice.id, workspace_id=first.id, role="member"),
@@ -132,8 +132,8 @@ class ProposingRuntime:
             await emit({"type": "text_delta", "text": "T1 is queued again."})
             await ledger.after_call(0.02)
             return
-        await tools.call("propose_retry_task", {"workspace_id": self.ids["first"], "outcome_id": self.ids["outcome"],
-                                                "task_id": self.ids["task"], "decision_id": self.ids["unblock"]})
+        await tools.call("propose_resolve_decision", {"workspace_id": self.ids["first"],
+                                                      "decision_id": self.ids["unblock"], "option": "retry"})
         await emit({"type": "text_delta", "text": "I can retry T1 once you confirm."})
         await ledger.after_call(0.01)
 
@@ -144,7 +144,7 @@ def test_a_proposed_action_runs_once_only_after_confirmation(app_as, people):
     thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
     events = send(client, thread, "Can T1 run again?")
     card = next(e["data"]["card"] for e in events if e["type"] == "action_card")
-    assert card["status"] == "pending" and card["kind"] == "retry_task"
+    assert card["status"] == "pending" and card["kind"] == "resolve_decision"
     with SessionLocal() as db:
         assert db.get(Task, people["task"]).status == "blocked"  # a proposal never executes
     base = f"/api/mind/threads/{thread}/actions/{card['id']}"
@@ -171,6 +171,130 @@ def test_a_proposed_action_runs_once_only_after_confirmation(app_as, people):
     events = send(client, thread, "Did it work?", key="m2")
     assert events[-1]["data"] == {"status": "complete"}
     assert any(m["role"] == "assistant" and "retry T1" in m["text"] for m in runtime.histories[-1])
+
+
+class ScriptedCalls(ProposingRuntime):
+    """Makes the given tool calls through the real private dispatcher and keeps what each returned to the model."""
+
+    def __init__(self, ids, calls):
+        super().__init__(ids)
+        self.calls, self.results = calls, []
+
+    async def run_turn(self, context, history, emit, tools, ledger):
+        await ledger.before_call()
+        for name, arguments in self.calls:
+            self.results.append(await tools.call(name, arguments))
+        await emit({"type": "text_delta", "text": "Here is what I can do once you confirm."})
+        await ledger.after_call(0.01)
+
+
+def planned(**values):
+    from aifactory.mind.actions import planner_task_schema
+    extra = {"constraints": ["Only members can search"], "files": ["src/search.py"]}
+    return {"depends_on": [], **values, **{k: v for k, v in extra.items() if k in planner_task_schema()["properties"]}}
+
+
+def test_a_plan_worked_out_with_mind_starts_building_once_confirmed(app_as, people):
+    client, app, actor = app_as
+    task = planned(key="T1", title="Search endpoint", repo="acme/platform", spec="Add GET /search with paging.",
+                   acceptance=["GET /search?q=x returns matching outcomes"])
+    args = {"workspace_id": people["first"], "title": "Search", "text": "Search outcomes by title."}
+    app.state.mind_runtime = runtime = ScriptedCalls(people, [
+        ("propose_build_plan", {**args, "tasks": [{**task, "depends_on": ["T9"]}]}),
+        ("propose_build_plan", {**args, "tasks": [task]})])
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    events = send(client, thread, "Let's plan search together")
+    refused, card = runtime.results
+    # The planner's validator explains itself, so the model can fix the plan; nothing was saved for it.
+    assert refused["refused"] is True and refused["status"] == 422 and "depends on unknown tasks" in refused["reason"]
+    assert [e["data"]["card"]["id"] for e in events if e["type"] == "action_card"] == [card["id"]]
+    assert any(e["type"] == "tool_finished" and e["data"]["summary"] == "Factory refused the call" for e in events)
+    assert card["kind"] == "build_plan" and card["fields"]["plan"] == "T1 Search endpoint — acme/platform"
+    assert card["effect"].startswith("Create a new outcome “Search” in Platform with this 1-task plan (T1)")
+    with SessionLocal() as db:
+        assert db.query(Outcome).filter_by(workspace_id=people["first"]).count() == 1  # a proposal creates nothing
+        assert db.query(MindAction).count() == 1
+    base = f"/api/mind/threads/{thread}/actions/{card['id']}"
+    actor[0] = people["bob"]
+    assert client.post(f"{base}/confirm", json={"expected_revision": 1}).status_code == 404
+    actor[0] = people["alice"]
+    confirmed = client.post(f"{base}/confirm", json={"expected_revision": 1})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "succeeded" and confirmed.json()["effect"].startswith("Create #8 “Search”")
+    assert client.post(f"{base}/confirm", json={"expected_revision": 1}).status_code == 409
+    with SessionLocal() as db:
+        new = db.query(Outcome).filter_by(workspace_id=people["first"], number=8).one()
+        assert new.status == "running" and new.source == "mind" and new.created_by == people["alice"]
+        plan = db.query(Plan).filter_by(outcome_id=new.id).one()
+        assert plan.status == "approved" and plan.approved_by == people["alice"]
+        built = db.query(Task).filter_by(outcome_id=new.id).one()
+        assert (built.key, built.spec, built.status) == ("T1", "Add GET /search with paging.", "pending")
+        assert db.query(Event).filter_by(outcome_id=new.id, kind="planning_started").count() == 0  # no planner ran
+
+
+def test_a_secret_saved_after_a_plan_card_never_reaches_the_plan(app_as, people):
+    client, app, _ = app_as
+    opaque = "opaque-plan-secret-0007"  # no credential pattern would recognize it
+    task = planned(key="T1", title="Search endpoint", repo="acme/platform", spec=f"Call the index with {opaque}",
+                   acceptance=[f"Search works with {opaque}"])
+    app.state.mind_runtime = runtime = ScriptedCalls(people, [("propose_build_plan", {
+        "workspace_id": people["first"], "title": "Search", "text": "Search outcomes.", "tasks": [task],
+        "risks": [f"Rotating {opaque}"]})])
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    send(client, thread, "Plan search")
+    card = runtime.results[0]
+    with SessionLocal() as db:
+        assert opaque in json.dumps(db.get(MindAction, card["id"]).snapshot)  # not a secret when proposed
+        db.add(Secret(workspace_id=people["first"], kind="github_token", ciphertext=encrypt(opaque)))
+        db.commit()
+    confirmed = client.post(f"/api/mind/threads/{thread}/actions/{card['id']}/confirm", json={"expected_revision": 1})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "succeeded" and opaque not in confirmed.text
+    with SessionLocal() as db:
+        new = db.query(Outcome).filter_by(workspace_id=people["first"], number=8).one()
+        plan = db.query(Plan).filter_by(outcome_id=new.id).one()
+        built = db.query(Task).filter_by(outcome_id=new.id).one()
+        assert opaque not in json.dumps(plan.content) and "[redacted]" in built.spec
+        assert opaque not in built.spec + json.dumps(built.acceptance)
+        assert opaque not in json.dumps(db.get(MindAction, card["id"]).snapshot)
+
+
+def test_a_viewer_is_refused_and_its_thread_keeps_its_scope(app_as, people):
+    client, app, actor = app_as
+    actor[0] = people["bob"]  # a viewer of the first workspace, not a member of the second
+    app.state.mind_runtime = runtime = ScriptedCalls(people, [
+        ("propose_cancel_task", {"workspace_id": people["first"], "outcome_id": people["outcome"],
+                                 "task_id": people["task"]}),
+        ("propose_create_outcome", {"workspace_id": people["second"], "title": "Not mine", "text": "No."})])
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    events = send(client, thread, "Stop T1")
+    assert events[-1]["data"] == {"status": "complete"}
+    viewer, stranger = runtime.results
+    assert viewer["refused"] and viewer["status"] == 403
+    assert stranger["refused"] and stranger["status"] == 404
+    with SessionLocal() as db:
+        assert db.query(MindAction).count() == 0 and db.get(Task, people["task"]).status == "blocked"
+        assert people["second"] not in db.get(MindThread, thread).workspace_ids
+    assert client.get(f"/api/mind/threads/{thread}").status_code == 200  # a refusal never widens (and hides) it
+
+
+def test_take_over_through_the_app_hands_the_task_over(app_as, people):
+    client, app, _ = app_as
+    app.state.mind_runtime = ScriptedCalls(people, [("propose_take_over_task", {
+        "workspace_id": people["first"], "outcome_id": people["outcome"], "task_id": people["task"]})])
+    thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    card = next(e["data"]["card"] for e in send(client, thread, "I'll take T1") if e["type"] == "action_card")
+    assert card["kind"] == "take_over_task" and card["fields"] == {}
+    confirmed = client.post(f"/api/mind/threads/{thread}/actions/{card['id']}/confirm", json={"expected_revision": 1})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["result"]["handover"] == {"published": False}  # the follow-up ran after the commit
+    with SessionLocal() as db:
+        assert db.get(Task, people["task"]).status == "handed_over"
+        assert db.get(Decision, people["unblock"]).status == "superseded"
+        event = db.query(Event).filter_by(kind="task_handed_over", task_id=people["task"]).one()
+        assert event.message.startswith("Alice via Mind took over T1") and event.actor == people["alice"]
+    saved = client.get(f"/api/mind/threads/{thread}").json()["messages"][1]["action_cards"][0]
+    assert saved["status"] == "succeeded" and saved["result"]["handover"] == {"published": False}
 
 
 class FakeProvider:

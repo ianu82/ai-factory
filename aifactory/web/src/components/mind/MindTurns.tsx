@@ -98,16 +98,39 @@ export function LiveTurn({ draft, steps, startedAt }: { draft: string; steps: Mi
  * An action Mind proposes, waiting on the person. Nothing runs until they approve it here; the effect line says
  * exactly what will happen, and the text can be edited first.
  */
+/** What each card field means. Only `text` is editable (T3 accepts only fields.text); the rest are what Mind proposed. */
+const FIELD_LABELS: Record<string, string> = {
+  option: "Choice", title: "Title", repository: "Repository", repositories: "Repositories", priority: "Priority", plan: "Plan",
+};
+const TEXT_LABELS: Record<string, string> = {
+  resolve_decision: "Comment", send_guidance: "Guidance", create_outcome: "Brief", build_plan: "Summary",
+};
+
+function CardFacts({ card }: { card: MindCard }) {
+  const facts = Object.entries(card.fields).filter(([key, value]) => key !== "text" && key !== "plan" && value);
+  const plan = (card.fields.plan || "").split("\n").map((line) => line.trim()).filter(Boolean);
+  return <>
+    {facts.length > 0 && <dl className="mind-action-facts">
+      {facts.map(([key, value]) => <div key={key}><dt>{FIELD_LABELS[key] || key}</dt><dd>{value}</dd></div>)}
+    </dl>}
+    {plan.length > 0 && <div className="mind-action-plan">
+      <span className="mind-action-label">{FIELD_LABELS.plan}</span>
+      <ol>{plan.map((line, i) => <li key={i}>{line}</li>)}</ol>
+    </div>}
+  </>;
+}
+
 export function ActionApproval({ card, roles, pending, busy, actions }: {
   card: MindCard; roles: Record<string, Role>; pending: boolean; busy: boolean;
   actions: { confirm: (card: MindCard) => void; dismiss: (card: MindCard) => void; revise: (card: MindCard, fields: Record<string, string>) => void };
 }) {
   const [editing, setEditing] = useState(false);
-  const [fields, setFields] = useState(card.fields);
-  useEffect(() => { setFields(card.fields); setEditing(false); }, [card.revision, card.status, card.fields]);
+  const [text, setText] = useState(card.fields.text ?? "");
+  useEffect(() => { setText(card.fields.text ?? ""); setEditing(false); }, [card.revision, card.status, card.fields]);
   const eligible = canConfirm(card, roles, pending ? [card.id] : []);
   const disabled = pending || busy;
-  const entries = Object.entries(card.fields);
+  const editable = "text" in card.fields;
+  const textLabel = TEXT_LABELS[card.kind] || "Text";
   if (card.status === "confirmed") return <div className="mind-action done">
     <CircleCheck aria-hidden /><div><b>{card.title}</b><p>{card.result?.text || "Done."}</p>
       {!!card.result?.citations?.length && <Sources citations={card.result.citations} />}</div>
@@ -117,22 +140,23 @@ export function ActionApproval({ card, roles, pending, busy, actions }: {
     <header><CircleDot aria-hidden /><span className="mind-action-kind">Needs your approval</span></header>
     <h4>{card.title}</h4>
     {card.effect && <p className="mind-action-effect">{card.effect}</p>}
-    {editing ? <form onSubmit={(e) => { e.preventDefault(); actions.revise(card, fields); }}>
-      {Object.entries(fields).map(([key, value]) => <label key={key} className="mind-action-field">
-        <span className="sr">{key}</span>
-        <textarea className="textarea" value={value} disabled={disabled} rows={Math.min(8, Math.max(3, value.split("\n").length + 1))}
-          onChange={(e) => setFields({ ...fields, [key]: e.target.value })} autoFocus />
-      </label>)}
+    <CardFacts card={card} />
+    {editing ? <form onSubmit={(e) => { e.preventDefault(); actions.revise(card, { ...card.fields, text }); }}>
+      <label className="mind-action-field">
+        <span className="mind-action-label">{textLabel}</span>
+        <textarea className="textarea" value={text} disabled={disabled} rows={Math.min(10, Math.max(3, text.split("\n").length + 1))}
+          onChange={(e) => setText(e.target.value)} autoFocus />
+      </label>
       <div className="mind-action-buttons">
         <button className="btn sm primary" disabled={disabled}>Save changes</button>
-        <button type="button" className="btn sm ghost" disabled={disabled} onClick={() => { setEditing(false); setFields(card.fields); }}>Cancel</button>
+        <button type="button" className="btn sm ghost" disabled={disabled} onClick={() => { setEditing(false); setText(card.fields.text ?? ""); }}>Cancel</button>
       </div>
-    </form> : entries.length > 0 && <blockquote className="mind-action-text">{entries.map(([key, value]) => <p key={key}>{value}</p>)}</blockquote>}
+    </form> : !!card.fields.text && <blockquote className="mind-action-text" aria-label={textLabel}>{card.fields.text}</blockquote>}
     {card.status === "stale" && <p role="status" className="mind-action-note">The target changed since Mind proposed this. Ask Mind to look again.</p>}
     {card.status === "executing" && <p role="status" className="mind-action-note">Running… reload in a moment for the result.</p>}
     {card.status === "proposed" && !editing && <div className="mind-action-buttons">
       <button className="btn sm primary" disabled={disabled || !eligible} onClick={() => actions.confirm(card)}>{pending ? "Working…" : "Approve"}</button>
-      {entries.length > 0 && <button className="btn sm" disabled={disabled || !eligible} onClick={() => setEditing(true)}>Edit</button>}
+      {editable && <button className="btn sm" disabled={disabled || !eligible} onClick={() => setEditing(true)}>Edit {textLabel.toLowerCase()}</button>}
       <button className="btn sm ghost" disabled={disabled} onClick={() => actions.dismiss(card)}>Dismiss</button>
       {!eligible && !pending && <span className="muted mind-action-role">You need member access in that workspace to approve.</span>}
     </div>}

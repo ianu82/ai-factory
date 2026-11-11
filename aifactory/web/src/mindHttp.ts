@@ -1,14 +1,23 @@
 import type { api, apiResponse, MindCard, MindCitation, MindHistory, MindStatus, MindThread, MindWireCard, MindWireHistory, MindWireMessage, MindWireStatus, MindWireThread, MindWireUsage } from "./api";
 import type { readMindSSE, MindTransport } from "./mind";
 
-export const mindThread = (t: MindWireThread): MindThread => ({ id: t.id, title: t.title, workspace_id: t.billing_workspace_id, cost_usd: t.cost.usd, cost_known: t.cost.known, updated_at: t.updated_at });
+// A thread keeps the database's default title until its first message names it: that one is not listed yet.
+const UNTITLED = "New conversation";
+export const mindThread = (t: MindWireThread): MindThread => ({ id: t.id, title: t.title === UNTITLED ? "" : t.title, workspace_id: t.billing_workspace_id, cost_usd: t.cost.usd, cost_known: t.cost.known, updated_at: t.updated_at });
 const citations = (items: { label: string; href: string }[] = []): MindCitation[] => items.map((item) => ({ label: item.label, url: item.href }));
+/** What the card says happened: never "Completed" when a follow-up (closing a PR, opening a draft) did not happen. */
+function resultText(c: MindWireCard): string {
+  const r = c.result!;
+  if (!r.ok) return `Not completed: ${r.reason || "target changed"}`;
+  const missing = Array.isArray(r.incomplete) ? r.incomplete.filter((x): x is string => typeof x === "string") : [];
+  return r.partial && missing.length ? `Partly done. Did not happen: ${missing.join("; ")}.` : `Completed: ${c.effect}`;
+}
 export function mindCard(c: MindWireCard): MindCard {
   return {
     id: c.id, revision: c.revision, kind: c.kind, workspace_id: c.workspace.id,
     title: c.object.label, fields: c.fields, effect: c.effect,
     status: c.status === "pending" ? "proposed" : c.status === "succeeded" ? "confirmed" : c.status,
-    ...(c.result ? { result: { text: c.result.ok ? `Completed: ${c.effect}` : `Not completed: ${c.result.reason || "target changed"}`, citations: citations([c.object]) } } : {}),
+    ...(c.result ? { result: { text: resultText(c), citations: citations([c.object]) } } : {}),
   };
 }
 export const mindMessage = (m: MindWireMessage) => ({ id: m.id, role: m.role, content: m.text, citations: citations(m.citations), cards: (m.action_cards || []).map(mindCard),

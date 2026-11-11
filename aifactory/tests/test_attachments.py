@@ -596,26 +596,26 @@ def test_png_bomb_rejected_before_decompression(monkeypatch):
 
 
 def test_failure_after_outcome_creation_rolls_back_claims_and_events(client, attachment_api, monkeypatch):
-    from aifactory import api
+    from aifactory import events
     from aifactory.models import Event, Outcome
 
     root, repo = attachment_api
     aid = upload(client, root).json()["id"]
-    original = api.record
+    original = events.record  # work_services.create_outcome records the attachments (as POST /outcomes did)
 
     def fail(*args, **kwargs):
         if args[1] == "attachments_added":
             raise RuntimeError("transaction interrupted")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(api, "record", fail)
+    monkeypatch.setattr(events, "record", fail)
     with pytest.raises(RuntimeError, match="transaction interrupted"):
         submit(client, root, repo, [aid])
     with session_scope() as s:
         assert s.get(Artifact, aid).outcome_id is None
         assert s.query(Outcome).count() == 0
         assert s.query(Event).filter(Event.kind.in_(["outcome_created", "attachments_added"])).count() == 0
-    monkeypatch.setattr(api, "record", original)
+    monkeypatch.setattr(events, "record", original)
     assert submit(client, root, repo, [aid]).status_code == 200
 
 

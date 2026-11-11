@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Callable
 
@@ -10,12 +10,13 @@ from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from .. import pulls
 from .. import serializers as S
 from ..auth import require_member
 from ..db import utcnow
 from ..events import event_dict
 from ..metrics import workspace_metrics
-from ..models import Decision, Event, Outcome, Plan, Run, Task, User
+from ..models import Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User
 from ..security import redact
 from ..work_services import outcome_rows, target
 
@@ -61,6 +62,10 @@ def citation(workspace_id: str, kind: str, id: str | int, label: str,
              outcome_id: str | None = None, task_id: str | None = None) -> dict:
     base = f"/w/{workspace_id}"
     href = f"{base}/outcomes/{outcome_id or id}" if kind in ("outcome", "task", "run") or outcome_id else f"{base}/inbox"
+    if kind == "workspace":
+        href = f"{base}/outcomes"
+    elif kind == "repository":
+        href = f"{base}/settings/repositories"
     if task_id or kind == "task":
         href += f"?task={task_id or id}"
     return {"workspace_id": workspace_id, "kind": kind, "id": id, "label": redact(label), "href": href}
@@ -171,21 +176,35 @@ def list_tasks(args, context):
                 lambda t: citation(t.workspace_id, "task", t.id, t.title, t.outcome_id, t.id))
 
 
-@register("outcome_detail", "Outcome plans, task evidence, PR links, recorded CI and delivery metrics (not live GitHub).",
+@register("outcome_detail", "Outcome plans, task evidence, PR links, recorded CI, its decisions (newest first), the "
+          "guidance people posted (newest first) and delivery metrics (not live GitHub).",
           {"outcome_id": {"type": "string"}}, ("outcome_id",))
 def outcome_detail(args, context):
     o, _ = target(context.db, current(context), args["workspace_id"], args["outcome_id"])
     tasks = list_tasks({**args}, context)
-    plans = context.db.query(Plan).filter_by(outcome_id=o.id).order_by(Plan.version.desc()).limit(args["limit"] + 1).all()
+    db, limit = context.db, args["limit"]
+    plans = db.query(Plan).filter_by(outcome_id=o.id).order_by(Plan.version.desc()).limit(limit + 1).all()
+    decisions = scoped(context, args, Decision).filter_by(outcome_id=o.id).order_by(
+        Decision.created_at.desc(), Decision.id).limit(limit + 1).all()
+    messages = scoped(context, args, Message).filter_by(outcome_id=o.id).order_by(
+        Message.created_at.desc(), Message.id).limit(limit + 1).all()
+    for row in [*decisions, *messages]:
+        validate_links(context, args, row)
+    names = {u.id: u.name or u.email or "" for u in db.query(User).filter(
+        User.id.in_({m.author_id for m in messages if m.author_id}))}
     return {"items": [{"outcome": outcome_view(context, o), "tasks": tasks["items"],
-                       "plans": [S.plan(p) for p in plans[:args["limit"]]],
-                       "workspace_delivery_evidence": workspace_metrics(context.db, o.workspace_id),
+                       "plans": [S.plan(p) for p in plans[:limit]],
+                       "decisions": [S.decision(d) for d in decisions[:limit]],
+                       "messages": [S.message(m, names.get(m.author_id or "", "Factory")) for m in messages[:limit]],
+                       "workspace_delivery_evidence": workspace_metrics(db, o.workspace_id),
                        "provenance": "Recorded Factory evidence; workspace delivery metrics use metrics.py admission/assistance conventions."}],
             "citations": [citation(o.workspace_id, "outcome", o.id, o.title), *tasks["citations"]],
-            "truncated": tasks["truncated"] or len(plans) > args["limit"]}
+            "truncated": tasks["truncated"] or any(len(rows) > limit for rows in (plans, decisions, messages))}
 
 
-@register("open_decisions", "Open questions, blockers and approvals (read only).", {"outcome_id": {"type": "string"}})
+@register("open_decisions", "Open questions, blockers and approvals waiting on a person, each with the options "
+          "(value and label) propose_resolve_decision can choose and what it is about (outcome, task, PR). "
+          "actionable is false while a decision judge is still reviewing it.", {"outcome_id": {"type": "string"}})
 def open_decisions(args, context):
     query = scoped(context, args, Decision).filter_by(status="open")
     if args.get("outcome_id"):
@@ -193,7 +212,13 @@ def open_decisions(args, context):
         query = query.filter_by(outcome_id=args["outcome_id"])
     def view(d):
         validate_links(context, args, d)
-        return S.decision(d)
+        o = context.db.get(Outcome, d.outcome_id) if d.outcome_id else None
+        t = context.db.get(Task, d.task_id) if d.task_id else None
+        # The inbox's context: what the decision is about, so a proposal can name it.
+        return S.decision(d, {"outcome_number": o.number if o else None, "outcome_title": o.title if o else "",
+                              "task_key": t.key if t else None, "task_status": t.status if t else None,
+                              "pr_number": t.pr_number if t else None, "pr_url": t.pr_url if t else "",
+                              "head_sha": t.head_sha if t else ""})
     return page(query.order_by(Decision.created_at, Decision.id), args, view,
                 lambda d: citation(d.workspace_id, "decision", d.id, d.title, d.outcome_id, d.task_id))
 
@@ -257,18 +282,110 @@ def recent_events(args, context):
     return result
 
 
+@register("repositories", "Connected repositories (id, owner/name, default branch, description): the ones "
+          "propose_create_outcome and propose_build_plan can name.")
+def repositories(args, context):
+    query = scoped(context, args, Repository).order_by(Repository.full_name, Repository.id)
+    return page(query, args, lambda r: {"id": r.id, "full_name": r.full_name, "default_branch": r.default_branch,
+                                        "description": r.description},
+                lambda r: citation(r.workspace_id, "repository", r.id, r.full_name))
+
+
+FAILED_CHECKS = ("failure", "error", "timed_out", "cancelled")  # as pulls.py counts a check as failing
+
+
+@register("pull_requests", "Pull requests the Factory opened, as the Factory recorded them: repository, number and "
+          "link, task and outcome, head and merge commits, the last recorded CI result with failing checks, smoke, "
+          "and the open decision waiting on it with its options. state: open (default: not merged and not closed by "
+          "the Factory, including handed-over work), merged or all. Review "
+          "threads and live CI are on GitHub; github holds the app's Pull requests page snapshot when it is recent.",
+          {"outcome_id": {"type": "string"}, "state": {"type": "string"}})
+def pull_requests(args, context):
+    state = args.get("state", "open")
+    if state not in ("open", "merged", "all"):
+        raise HTTPException(422, "state must be open, merged or all")
+    db, ws = context.db, args["workspace_id"]
+    query = scoped(context, args, Task).filter(Task.pr_number.isnot(None))
+    if args.get("outcome_id"):
+        target(db, current(context), ws, args["outcome_id"])
+        query = query.filter(Task.outcome_id == args["outcome_id"])
+    if state == "open":
+        # The pull request's own recorded state, not the task's: a handed-over task's PR stays open for its person.
+        query = query.filter(Task.merge_sha == "", Task.evidence["pr_closed"].as_boolean().is_not(True))
+    elif state == "merged":
+        query = query.filter(Task.merge_sha != "")
+    repos = {r.id: r.full_name for r in scoped(context, args, Repository)}
+    snapshot = pulls.cached(ws)  # no GitHub call: only what the Pull requests page fetched recently
+    live = {(r.get("repo"), r.get("number")): r for r in (snapshot or {}).get("items") or [] if isinstance(r, dict)}
+
+    def view(t):
+        validate_links(context, args, t)
+        o = db.get(Outcome, t.outcome_id)
+        decision = scoped(context, args, Decision).filter_by(outcome_id=t.outcome_id, task_id=t.id, status="open") \
+            .order_by(Decision.created_at.desc(), Decision.id).first()
+        evidence = t.evidence if isinstance(t.evidence, dict) else {}
+        ci = evidence.get("ci") if isinstance(evidence.get("ci"), dict) else {}
+        checks = [c for c in ci.get("checks") or [] if isinstance(c, dict)]
+        smoke = evidence.get("smoke") if isinstance(evidence.get("smoke"), dict) else {}
+        item = {"repository": repos.get(t.repo_id, ""), "number": t.pr_number, "url": t.pr_url,
+                "merged": bool(t.merge_sha), "closed_by_factory": bool(evidence.get("pr_closed")),
+                "head_sha": t.head_sha, "merge_sha": t.merge_sha,
+                "outcome": {"id": o.id, "number": o.number, "title": o.title, "status": o.status},
+                "task": {"id": t.id, "key": t.key, "title": t.title, "status": t.status, "stage": t.stage,
+                         "attempt": t.attempt, "blocked_reason": t.blocked_reason},
+                "ci": {"state": ci.get("state"), "head": ci.get("head"), "at": ci.get("at"), "checks": len(checks),
+                       "failing": [c.get("name") for c in checks if c.get("conclusion") in FAILED_CHECKS][:20],
+                       "pending": [c.get("name") for c in checks if c.get("status") not in (None, "completed")][:20]}
+                      if ci else None,
+                "smoke": smoke.get("state"),
+                "decision": {"id": decision.id, "kind": decision.kind, "title": decision.title,
+                             "options": decision.options, "actionable": S.actionable(decision)} if decision else None}
+        row = live.get((repos.get(t.repo_id), t.pr_number))
+        if row:
+            detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+            item["github"] = {"group": row.get("group"), "reason": row.get("reason"), "draft": row.get("draft"),
+                              "ci": row.get("ci"), **{k: detail.get(k) for k in (
+                                  "mergeable_state", "open_threads", "open_thread_authors", "changes_requested_by",
+                                  "threads_unchecked")}}
+        return item
+    result = page(query.order_by(Task.updated_at.desc(), Task.id), args, view,
+                  lambda t: citation(ws, "task", t.id, f"PR #{t.pr_number} ({t.key})", t.outcome_id, t.id))
+    if snapshot:
+        result["github_fetched_at"] = datetime.fromtimestamp(snapshot["fetched_at"], timezone.utc).isoformat()
+    return result
+
+
+TYPES = {"string": str, "integer": int, "boolean": bool, "array": list, "object": dict}
+
+
 def validate_arguments(schema, args):
-    if not isinstance(args, dict) or set(args) - set(schema["properties"]) or any(k not in args for k in schema["required"]):
-        raise HTTPException(422, "Invalid tool arguments")
-    types = {"string": str, "integer": int, "boolean": bool}
-    for key, value in args.items():
-        spec = schema["properties"][key]
-        if type(value) is not types[spec["type"]]:
-            raise HTTPException(422, "Invalid tool argument type")
-        if isinstance(value, str) and (len(value) > spec.get("maxLength", 300) or not value.strip()):
-            raise HTTPException(422, "Invalid tool argument text")
-        if type(value) is int and not spec.get("minimum", value) <= value <= spec.get("maximum", value):
-            raise HTTPException(422, "Tool argument outside bounds")
+    """Model arguments against a tool's own schema: closed objects, bounded lists, nonblank bounded text."""
+    _valid(schema, args, "")
+
+
+def _valid(spec, value, where):
+    kind = spec["type"]
+    if type(value) is not TYPES[kind]:
+        raise HTTPException(422, f"Invalid tool argument type: {where}" if where else "Invalid tool arguments")
+    if kind == "object":
+        properties = spec.get("properties", {})
+        missing = [k for k in spec.get("required", ()) if k not in value]
+        if set(value) - set(properties) or missing:
+            # Name only schema keys: an unknown key is the model's own text.
+            raise HTTPException(422, "Invalid tool arguments" + (f" at {where}" if where else "")
+                                + (f"; missing {', '.join(missing)}" if missing else "; unknown argument"))
+        for key, child in value.items():
+            _valid(properties[key], child, f"{where}.{key}" if where else key)
+    elif kind == "array":
+        if not spec.get("minItems", 0) <= len(value) <= spec.get("maxItems", MAX_ITEMS):
+            raise HTTPException(422, f"Tool argument outside bounds: {where}")
+        for i, child in enumerate(value):
+            _valid(spec["items"], child, f"{where}[{i}]")
+    elif kind == "string":
+        if len(value) > spec.get("maxLength", 300) or not value.strip():
+            raise HTTPException(422, f"Invalid tool argument text: {where}")
+    elif kind == "integer" and not spec.get("minimum", value) <= value <= spec.get("maximum", value):
+        raise HTTPException(422, f"Tool argument outside bounds: {where}")
 
 
 def read_call(name: str, args: dict, context: Context) -> dict:

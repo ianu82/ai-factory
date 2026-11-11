@@ -25,32 +25,47 @@ class HandoverError(RuntimeError):
     pass
 
 
-def mark_handed_over(task_id: str, user: User) -> dict[str, Any]:
-    """Stop the Factory's work on the task (status, open decisions). Returns what publishing needs."""
-    who = user.name or user.email
+def mark_handed_over(task_id: str, user: User, *, action_id: str | None = None, session=None,
+                     pending_events: list[dict] | None = None) -> dict[str, Any]:
+    """Stop the Factory's work on the task (status, open decisions). Returns what publishing needs.
+
+    With a session (a confirmed Mind card), the change joins the caller's transaction and its event waits in
+    pending_events until the caller has committed; it is attributed "<person> via Mind"."""
+    if session is not None:
+        return _hand_over(session, task_id, user, action_id, pending_events)
     with session_scope() as s:
-        task = s.get(Task, task_id)
-        if task is None:
-            raise HandoverError("Task not found")
-        if task.status in NOT_TAKEABLE:
-            raise HandoverError(f"{task.key} is already {task.status.replace('_', ' ')}")
-        task.status, task.stage = "handed_over", ""
-        task.blocked_reason = f"Handed over to {who}"
-        task.finished_at = utcnow()
-        for d in s.query(Decision).filter(Decision.task_id == task_id, Decision.status == "open"):
-            d.status = "superseded"
-        diff = (s.query(Artifact).filter(Artifact.task_id == task_id, Artifact.kind == "diff")
-                .order_by(Artifact.created_at.desc()).first())
-        outcome = s.get(Outcome, task.outcome_id)
-        repo = s.get(Repository, task.repo_id)
-        record(task.workspace_id, "task_handed_over", f"{who} took over {task.key}; the Factory stopped working on it",
-               outcome_id=task.outcome_id, task_id=task.id, actor=user.id, level="warn", session=s)
-        return {"workspace_id": task.workspace_id, "outcome_id": task.outcome_id, "key": task.key, "title": task.title,
-                "number": outcome.number if outcome else 0, "pr_url": task.pr_url, "branch": task.branch,
-                "base_sha": task.base_sha, "repo": repo.full_name if repo else "",
-                "default_branch": repo.default_branch if repo else "main",
-                "diff": diff.content if diff else "", "files": (diff.data or {}).get("files", []) if diff else [],
-                "who": who}
+        return _hand_over(s, task_id, user, None, None)
+
+
+def _hand_over(s, task_id: str, user: User, action_id: str | None, pending_events: list[dict] | None) -> dict[str, Any]:
+    who = user.name or user.email
+    task = s.get(Task, task_id)
+    if task is None:
+        raise HandoverError("Task not found")
+    if task.status in NOT_TAKEABLE:
+        raise HandoverError(f"{task.key} is already {task.status.replace('_', ' ')}")
+    task.status, task.stage = "handed_over", ""
+    task.blocked_reason = f"Handed over to {who}"
+    task.finished_at = utcnow()
+    for d in s.query(Decision).filter(Decision.task_id == task_id, Decision.status == "open"):
+        d.status = "superseded"
+    diff = (s.query(Artifact).filter(Artifact.task_id == task_id, Artifact.kind == "diff")
+            .order_by(Artifact.created_at.desc()).first())
+    outcome = s.get(Outcome, task.outcome_id)
+    repo = s.get(Repository, task.repo_id)
+    actor = who + (" via Mind" if action_id else "")
+    payload = record(task.workspace_id, "task_handed_over", f"{actor} took over {task.key}; the Factory stopped working on it",
+                     outcome_id=task.outcome_id, task_id=task.id, actor=user.id, level="warn", session=s,
+                     data={"source": "mind", "action_id": action_id} if action_id else None,
+                     publish=pending_events is None)
+    if pending_events is not None:
+        pending_events.append(payload)
+    return {"workspace_id": task.workspace_id, "outcome_id": task.outcome_id, "key": task.key, "title": task.title,
+            "number": outcome.number if outcome else 0, "pr_url": task.pr_url, "branch": task.branch,
+            "base_sha": task.base_sha, "repo": repo.full_name if repo else "",
+            "default_branch": repo.default_branch if repo else "main",
+            "diff": diff.content if diff else "", "files": (diff.data or {}).get("files", []) if diff else [],
+            "who": who}
 
 
 async def publish_candidate(task_id: str, info: dict[str, Any]) -> dict[str, Any]:

@@ -172,7 +172,8 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
       <div className="mind-bottom">
         <div className="mind-column">
           <Notice status={state.status} workspaceId={threadWorkspace || workspaceId} onRetry={threadWorkspace ? recheck : undefined} />
-          <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy}
+          {/* Stop only while a reply streams: busy also covers loading the history, which Stop must not abort. */}
+          <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy && !loading}
             disabled={loading || failed || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
         </div>
       </div>

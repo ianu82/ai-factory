@@ -225,3 +225,12 @@
 @media (prefers-reduced-motion: reduce) { .mind-worked-head .chev, .mind-composer { transition: none; } }
 
 .mind-recent-more { margin-top: 10px; }
+
+/* Action cards: what Mind proposed, labelled; only the text is editable. */
+.mind-action-facts { display: grid; gap: 2px; margin: 8px 0 0; }
+.mind-action-facts > div { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 12px; font-size: 12.5px; }
+.mind-action-facts dt { color: var(--muted); }
+.mind-action-facts dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.mind-action-label { display: block; font-size: 11.5px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+.mind-action-plan ol { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.5; }
+.mind-action-text { white-space: pre-wrap; }
