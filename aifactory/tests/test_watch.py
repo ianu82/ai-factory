@@ -126,6 +126,12 @@ def test_an_active_outcome_with_no_activity_is_quiet_only_when_nothing_runs(worl
     assert live(world) == {"quiet": "watching"}
     watch.run()  # the watch's own records, and the Lead it woke, are not the work moving
     assert live(world) == {"quiet": "watching"}
+    with db.session_scope() as s:  # the provider refused the workspace: nothing starts until a person resumes
+        hold = Decision(workspace_id=world["ws"], kind="provider_hold", title="Model provider refused: work is on hold",
+                        options=[{"value": "retry", "label": "Resume work"}])
+        s.add(hold)
+    watch.run()
+    assert live(world) == {}  # the hold is what to answer, not each outcome it stopped
 
 
 def test_the_same_failure_across_outcomes_is_one_alert(world, client):

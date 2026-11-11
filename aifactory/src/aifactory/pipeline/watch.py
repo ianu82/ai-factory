@@ -4,7 +4,8 @@ Every WATCH_EVERY the orchestrator calls run(), which looks in each workspace th
 - overdue: a decision that has waited on a person longer than the workspace's alert time (alerts.after_minutes);
 - unasked: a task waiting on a person with no open decision, so there is nothing anyone can answer;
 - stalled: an outcome where nothing is moving and nothing asks a person (its open tasks wait on dropped ones);
-- quiet: an outcome with work marked active but no activity for QUIET, while the workspace runs nothing at all;
+- quiet: an outcome with work marked active but no activity for QUIET, while the workspace runs nothing at all
+  and isn't on a provider hold;
 - repeated: the same failure on REPEAT_TASKS tasks or REPEAT_OUTCOMES outcomes within REPEAT_WINDOW.
 
 Each condition is one Alert row while it lasts, keyed by what it is about: raised once and cleared when the
@@ -31,6 +32,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Alert, Decision, Event, Outcome, Run, Task, Workspace
 from ..serializers import actionable
+from .holds import held_workspaces
 from .orchestrator import ACTIVE_TASK, HUMAN_TASK
 from .planning import ACTIVE_OUTCOME
 from .runtime import DEFAULT_SETTINGS, merged_settings
@@ -119,6 +121,9 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
     for t in tasks:
         by_outcome.setdefault(t.outcome_id, []).append(t)
     busy = s.query(Run.id).filter(Run.workspace_id == workspace_id, Run.status == "running").first() is not None
+    # A provider hold stops all work on purpose, and is itself a decision waiting on a person (an overdue alert once
+    # it has waited): every outcome going quiet under it isn't news.
+    held = workspace_id in held_workspaces(s)
     for o in outcomes.values():
         mine = by_outcome.get(o.id, [])
         if o.status == "attention" and o.id not in asked_outcomes and o.id not in unasked:
@@ -128,7 +133,7 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
                     f"which {'was' if len(dropped) == 1 else 'were'} dropped." if waiting else o.title)
             add(f"stalled:{o.id}", "stalled", "Nothing is moving and nothing asks a person", body, outcome_id=o.id)
         active = [t for t in mine if t.status in ACTIVE_TASK]
-        if o.status == "running" and active and not busy:
+        if o.status == "running" and active and not busy and not held:
             last = _last_activity(s, o.id)
             if last is not None and now - last >= QUIET:
                 add(f"quiet:{o.id}", "quiet", f"No activity for over {_span(QUIET)}, though work is marked active",
