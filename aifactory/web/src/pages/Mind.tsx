@@ -7,6 +7,9 @@ import { MindScroll } from "../mindScroll";
 import { useMind } from "../components/mind/MindProvider";
 import { AssistantTurn, LiveTurn, SourceLink, UserTurn, citationKey } from "../components/mind/MindTurns";
 import { MindComposer, type ComposerHandle } from "../components/mind/MindComposer";
+import { Handoff, LeadComposer, outcomeOpen, useOutcomeConversation } from "../components/OutcomeThread";
+import { OUTCOME_STATUS } from "../format";
+import type { MindOutcomeLink } from "../api";
 import "../components/mind/Mind.css";
 
 const RECENT = 12;
@@ -147,6 +150,21 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
                     revise: (c: Parameters<typeof controller.revise>[0], f: Record<string, string>) => void controller.revise(c, f) };
   const previousUser = (index: number) => [...state.messages.slice(0, index)].reverse().find((m) => m.role === "user");
   const title = state.active?.title || "New conversation";
+  // A conversation that became an outcome continues with the outcome's Lead; Mind is still there, privately.
+  const outcome = state.active?.id === threadId ? state.active.outcome ?? null : null;
+  // A finished outcome's Lead no longer answers messages: the composer goes back to Mind. The status comes from the
+  // outcome's conversation, which keeps polling; the thread's copy is as old as its last load.
+  const linked = useOutcomeConversation(outcome);
+  const outcomeStatus = linked.data?.status ?? outcome?.status;
+  const leadOpen = outcomeOpen(outcome, outcomeStatus);
+  const [privately, setPrivately] = useState(false);
+  const reloaded = useRef(false);
+  useEffect(() => { setPrivately(false); reloaded.current = false; }, [threadId]);
+  const madeOutcome = state.messages.some((m) => m.cards?.some((c) => (c.kind === "create_outcome" || c.kind === "build_plan") && c.status === "confirmed"));
+  useEffect(() => {
+    // Confirming the card created the outcome: reload once so the hand-off appears without a page refresh.
+    if (madeOutcome && !outcome && !state.busy && !reloaded.current) { reloaded.current = true; void controller.reload(); }
+  }, [madeOutcome, outcome, state.busy, controller]);
   return <div className="mind-page">
     <div className="mind-main">
       <header className="mind-head">
@@ -165,6 +183,7 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
                   onRetry={m.failed ? () => { const prompt = previousUser(i); if (prompt) void controller.send(prompt.content); } : undefined} />)}
             {state.busy && <LiveTurn draft={state.draft} steps={state.steps} startedAt={state.startedAt} />}
             {state.error && !state.busy && <div className="mind-error" role="alert">{state.error}</div>}
+            {outcome && <Handoff outcome={outcome} />}
           </>}
         </div>
       </div>
@@ -172,22 +191,28 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
       <div className="mind-bottom">
         <div className="mind-column">
           <Notice status={state.status} workspaceId={threadWorkspace || workspaceId} onRetry={threadWorkspace ? recheck : undefined} />
-          {/* Stop only while a reply streams: busy also covers loading the history, which Stop must not abort. */}
-          <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy && !loading}
-            disabled={loading || failed || !!reason} disabledReason={reason || undefined} placeholder="Reply to Mind…" autoFocus />
+          {outcome && leadOpen && !privately ? <LeadComposer outcome={outcome} onPrivate={() => setPrivately(true)} /> : <>
+            {/* Stop only while a reply streams: busy also covers loading the history, which Stop must not abort. */}
+            <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy && !loading}
+              disabled={loading || failed || !!reason} disabledReason={reason || undefined}
+              placeholder={leadOpen ? "Ask your Mind privately…" : "Reply to Mind…"} autoFocus />
+            {outcome && leadOpen && <button type="button" className="linkish mind-to-lead" onClick={() => setPrivately(false)}>Message the Lead about #{outcome.number} instead</button>}
+          </>}
         </div>
       </div>
       {/* Keyed by completion, so two identical replies are each announced. */}
       <div className="sr" aria-live="polite"><span key={state.announcementId}>{state.announcement}</span></div>
     </div>
     <MindRail messages={state.messages} busy={state.busy} steps={state.steps} startedAt={state.startedAt}
+      outcome={outcome && outcomeStatus ? { ...outcome, status: outcomeStatus } : outcome}
       workspace={workspaces.find((w) => w.id === state.active?.workspace_id)?.name} cost={state.active ? mindCost(state.active) : null} />
   </div>;
 }
 
 /** Alongside the conversation: this turn's progress, everything the conversation touched, and its cost. */
-export function MindRail({ messages, busy, steps, startedAt, workspace, cost }: {
+export function MindRail({ messages, busy, steps, startedAt, workspace, cost, outcome = null }: {
   messages: MindMessage[]; busy: boolean; steps: MindMessage["steps"]; startedAt: number | null; workspace?: string; cost: string | null;
+  outcome?: MindOutcomeLink | null;
 }) {
   const last = [...messages].reverse().find((m) => m.role === "assistant" && (m.steps?.length || m.content));
   const shown = busy ? steps || [] : last?.steps || [];
@@ -196,6 +221,14 @@ export function MindRail({ messages, busy, steps, startedAt, workspace, cost }: 
     return all.filter((c, i) => all.findIndex((d) => citationKey(d) === citationKey(c)) === i).slice(-12).reverse();
   }, [messages]);
   return <aside className="mind-rail" aria-label="About this conversation">
+    {outcome && <section className="mind-card">
+      <h3>Outcome <Link className="ref" to={`/w/${outcome.workspace_id}/outcomes/${outcome.id}`}>#{outcome.number}</Link></h3>
+      <dl className="mind-facts">
+        <dt>Status</dt><dd>{OUTCOME_STATUS[outcome.status]?.label || outcome.status}</dd>
+        <dt>Visible to</dt><dd>The workspace's members</dd>
+      </dl>
+      <Link className="linkish" to={`/w/${outcome.workspace_id}/outcomes/${outcome.id}`}>Open the outcome</Link>
+    </section>}
     <section className="mind-card">
       <h3>Progress</h3>
       {shown.length ? <ol className="mind-progress">{shown.map((s, i) => <li key={i} className={s.done ? "done" : "running"}>
@@ -210,7 +243,7 @@ export function MindRail({ messages, busy, steps, startedAt, workspace, cost }: 
         : <p className="faint">Outcomes, tasks and pull requests Mind looks at appear here.</p>}
     </section>
     <section className="mind-card">
-      <h3>Conversation</h3>
+      <h3>{outcome ? "Your Mind, before the hand-off" : "Conversation"}</h3>
       <dl className="mind-facts">
         {workspace && <><dt>Workspace</dt><dd>{workspace}</dd></>}
         {cost && <><dt>Cost so far</dt><dd className="num">{cost}</dd></>}

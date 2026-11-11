@@ -8,7 +8,7 @@ import { useWs } from "../App";
 import { ago, money, OUTCOME_STATUS } from "../format";
 import { Dot, Empty, GateTrack, Skeleton } from "../ui";
 import type { Task } from "../api";
-import { OutcomeDetail } from "../components/OutcomeDetail";
+import { OutcomeThread } from "../components/OutcomeThread";
 import { SetupNotice, useSetupState } from "../components/Setup";
 import { BOARD_COLUMNS, boardColumn, boardColumns, inQA, isQueued, qaCount } from "../outcomesBoard";
 
@@ -56,6 +56,9 @@ export function OutcomesPage() {
   const select = (id: string) => navigate(`/w/${ws.id}/outcomes/${id}`);
   const close = () => navigate(`/w/${ws.id}/outcomes`);
 
+  // An open outcome is its own page: a conversation with its Lead, its decisions and an inspector.
+  if (outcomeId) return <OutcomeThread key={outcomeId} outcomeId={outcomeId} onBack={close} />;
+
   if (!outcomeId && !outcomes.isLoading && !setup.loading && all.length === 0 && !setup.ready) {
     return (
       <>
@@ -101,11 +104,6 @@ export function OutcomesPage() {
             </ul>
           )}
         </div>
-        {outcomeId && (
-          <aside className="panel" aria-label="Outcome detail">
-            <OutcomeDetail key={outcomeId} outcomeId={outcomeId} onClose={close} />
-          </aside>
-        )}
       </div>
     </>
   );
