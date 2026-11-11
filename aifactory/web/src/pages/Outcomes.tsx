@@ -10,11 +10,12 @@ import { Dot, Empty, GateTrack, Skeleton } from "../ui";
 import type { Task } from "../api";
 import { OutcomeDetail } from "../components/OutcomeDetail";
 import { SetupNotice, useSetupState } from "../components/Setup";
-import { BOARD_COLUMNS, boardColumns, isQueued } from "../outcomesBoard";
+import { BOARD_COLUMNS, boardColumn, boardColumns, inQA, isQueued, qaCount } from "../outcomesBoard";
 
 const FILTERS: { key: string; label: string; match: (o: Outcome) => boolean }[] = [
   { key: "active", label: "Active", match: (o) => ["planning", "running", "awaiting_approval", "needs_input", "attention", "blocked"].includes(o.status) },
   { key: "needs", label: "Needs you", match: (o) => o.open_decisions > 0 },
+  { key: "qa", label: "In QA", match: (o) => boardColumn(o) === "qa" },
   { key: "done", label: "Delivered", match: (o) => ["completed", "partially_completed"].includes(o.status) },
   { key: "all", label: "All", match: () => true },
 ];
@@ -110,10 +111,24 @@ export function OutcomesPage() {
   );
 }
 
+/** The status a list row or board card shows: Queued and In QA are read from the tasks (also beside an open
+ * decision, as "Queued · 1 decision"), the rest from the outcome. */
+function outcomeStatus(o: Outcome) {
+  if (isQueued(o)) return { label: "Queued", tone: "idle" as const };
+  if (o.status === "running" && inQA(o)) return { label: "In QA", tone: "active" as const };
+  return OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
+}
+
+/** Building with some tasks already in QA: say how many, so tests in flight are not hidden behind "In progress". */
+function QaNote({ o }: { o: Outcome }) {
+  const n = qaCount(o);
+  return n > 0 && !inQA(o) && boardColumn(o) === "building"
+    ? <span className="qa-note" title="Tasks being tested by the configured checks, the independent verifier or CI">{n} in QA</span> : null;
+}
+
 function OutcomeRow({ o, selected, onSelect, repos }: { o: Outcome; selected: boolean; onSelect: () => void; repos: string[] }) {
   const queued = isQueued(o);
-  const s = queued ? { label: "Queued", tone: "idle" as const }
-    : OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
+  const s = outcomeStatus(o);
   return (
     <li className={`row ${selected ? "selected" : ""}`} onClick={onSelect} tabIndex={0} aria-selected={selected}
       onKeyDown={(e) => e.key === "Enter" && onSelect()}>
@@ -128,6 +143,7 @@ function OutcomeRow({ o, selected, onSelect, repos }: { o: Outcome; selected: bo
             {o.open_decisions > 0 ? `${s.label} · ${o.open_decisions} decision${o.open_decisions > 1 ? "s" : ""}` : s.label}
           </span>
           {o.progress.total > 0 && <span className="num">{o.progress.done}/{o.progress.total} tasks</span>}
+          <QaNote o={o} />
           <span className="wide">{repos.join(", ")}</span>
         </div>
       </div>
@@ -170,7 +186,7 @@ function Board({ outcomes, selected, onSelect }: { outcomes: Outcome[]; selected
 }
 
 function BoardCard({ o, selected, onSelect }: { o: Outcome; selected: boolean; onSelect: () => void }) {
-  const s = isQueued(o) ? { label: "Queued", tone: "idle" as const } : OUTCOME_STATUS[o.status] || { label: o.status, tone: "idle" as const };
+  const s = outcomeStatus(o);
   return (
     <li className={`board-card ${selected ? "selected" : ""}`} onClick={onSelect} tabIndex={0} aria-selected={selected}
       onKeyDown={(e) => e.key === "Enter" && onSelect()}>
@@ -179,6 +195,7 @@ function BoardCard({ o, selected, onSelect }: { o: Outcome; selected: boolean; o
         <Dot tone={s.tone} title={s.label} />
         <span>{s.label}</span>
         {o.progress.total > 0 && <span className="num">{o.progress.done}/{o.progress.total} tasks</span>}
+        <QaNote o={o} />
         {o.open_decisions > 0 && <span className="board-decisions">{o.open_decisions} decision{o.open_decisions > 1 ? "s" : ""}</span>}
         {o.prs.length > 0 && <span className="num" title={o.prs.map((p) => `#${p.number}`).join(", ")}><GitPullRequest size={12} /> {o.prs.length}</span>}
         <span className="num board-ago">{ago(o.updated_at)}</span>
