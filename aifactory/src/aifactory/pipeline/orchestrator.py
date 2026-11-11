@@ -14,11 +14,13 @@ import logging
 import os
 from typing import Any
 
+from .. import merge_manager
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Decision, Outcome, Task, User, Workspace
-from ..sandbox import host_capacity
+from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
+from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
 from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
@@ -35,6 +37,7 @@ HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_fa
 
 class Orchestrator:
     def __init__(self) -> None:
+        self._purge_task: asyncio.Task | None = None
         self.instance = f"{os.getpid()}"
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
@@ -47,16 +50,28 @@ class Orchestrator:
         self._stopping = False
         self._last_signal_sync = float("-inf")
         self._linear_task: asyncio.Task | None = None
+        from ..operator_relay import Relay
+
+        self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
+        self._relay_task: asyncio.Task | None = None
+        self._vm_sweep_task: asyncio.Task | None = None
+        self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
+        self._lead_check = float("-inf")
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
         if self._loop_task is None:
-            log.info("capacity %s", host_capacity())
+            log.info("capacity %s check_slots=%d", host_capacity(), check_slot_count())
+            trash = quarantine_orphaned_jobs()
+            if trash is not None:
+                log.info("moved job directories left by the previous run aside: %s", trash.name)
+            self._purge_task = asyncio.create_task(asyncio.to_thread(purge_quarantine), name="purge-jobs")
             self._recover()
             self._loop_task = asyncio.create_task(self._run(), name="orchestrator")
             from ..linear_sync import LinearSync
 
             self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
+            self._relay_task = asyncio.create_task(self._relay.run(), name="operator-relay")
 
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
@@ -65,12 +80,21 @@ class Orchestrator:
             job.cancel()
         for job in list(self._ci_polls.values()):
             job.cancel()
+        for job in list(self._leads.values()):
+            job.cancel()
+        await asyncio.gather(*list(self._leads.values()), return_exceptions=True)
         if self._loop_task:
             self._loop_task.cancel()
         await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
         if self._linear_task:
             self._linear_task.cancel()
             await asyncio.gather(self._linear_task, return_exceptions=True)
+        if self._relay_task:
+            self._relay_task.cancel()
+            await asyncio.gather(self._relay_task, return_exceptions=True)
+        if self._vm_sweep_task:
+            self._vm_sweep_task.cancel()
+            await asyncio.gather(self._vm_sweep_task, return_exceptions=True)
         await asyncio.sleep(0)
 
     def wake(self) -> None:
@@ -88,7 +112,8 @@ class Orchestrator:
             running = [t.id for t in s.query(Task).filter(Task.id.in_(list(self._tasks)),
                                                         Task.status == "running")]
         return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
-                "global_limit": get_settings().global_concurrency}
+                "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage(),
+                "leads": list(self._leads)}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
@@ -99,6 +124,9 @@ class Orchestrator:
                 task.lease_owner = ""
                 record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
+        from .lead import recover as recover_leads
+
+        recover_leads()
         self._complete_accepted()
 
     def _complete_accepted(self) -> None:
@@ -131,6 +159,8 @@ class Orchestrator:
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
+                await self._maybe_sweep_vms()
+                await self._maybe_run_leads()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -142,6 +172,15 @@ class Orchestrator:
     def log_inventory(self) -> None:
         """Operator visibility in the server log: open work, its state and what it waits on."""
         from ..models import Decision
+
+        try:
+            log.info("inventory disk %s", disk_report())
+        except OSError as exc:
+            log.warning("inventory disk unavailable: %s", exc)
+        try:
+            log.info("inventory processes %s", process_report())
+        except OSError as exc:
+            log.warning("inventory processes unavailable: %s", exc)
 
         with session_scope() as s:
             open_outcomes = s.query(Outcome).filter(Outcome.status.notin_(["completed", "cancelled"])).all()
@@ -311,6 +350,59 @@ class Orchestrator:
             finally:
                 db.close()
 
+    async def _maybe_run_leads(self) -> None:
+        """Start the Lead of each outcome that has something needing judgement (pipeline/lead.py), at most every 10
+        seconds and within the server's Lead limit. A Lead runs beside the scheduler, never inside its tick."""
+        import time
+
+        from .lead import concurrency, due, run_lead
+
+        free = concurrency() - len(self._leads)
+        now = time.monotonic()
+        if self._stopping or free <= 0 or now - self._lead_check < 10:
+            return
+        self._lead_check = now
+        for item in (await asyncio.to_thread(due, frozenset(self._leads)))[:free]:
+            outcome_id = item["outcome_id"]
+            job = asyncio.create_task(run_lead(item["workspace_id"], outcome_id, item["reasons"], item["seen"],
+                                               item["decisions"]), name=f"lead-{outcome_id[:8]}")
+            self._leads[outcome_id] = job
+
+            def done(finished: asyncio.Task, outcome_id: str = outcome_id) -> None:
+                self._leads.pop(outcome_id, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    log.error("Lead of %s failed: %r", outcome_id, finished.exception())
+                self.wake()
+
+            job.add_done_callback(done)
+
+    async def _maybe_sweep_vms(self) -> None:
+        """Every 15 minutes, starting 10 minutes after startup (a deployment being replaced may still be closing its
+        VMs): destroy sandbox VMs no job holds, and log how full the environment is. It runs beside the scheduler,
+        never inside its tick. Orphans once filled Railway's cap and silently moved all work onto this host."""
+        import time
+
+        now = time.monotonic()
+        first = getattr(self, "_vm_sweep_due", None)
+        if first is None:
+            self._vm_sweep_due = now + 600
+            return
+        if now < first or (self._vm_sweep_task is not None and not self._vm_sweep_task.done()):
+            return
+        self._vm_sweep_due = now + 900
+        self._vm_sweep_task = asyncio.create_task(self._sweep_vms(), name="vm-sweep")
+
+    async def _sweep_vms(self) -> None:
+        from ..vm import sweep_orphans
+
+        try:
+            report = await sweep_orphans()
+        except Exception:  # never let a sweep failure reach the scheduler
+            log.exception("VM sweep failed")
+            return
+        if "skipped" not in report:
+            log.info("inventory vms %s", report)
+
     async def _maybe_inventory(self) -> None:
         import time
 
@@ -330,8 +422,9 @@ class Orchestrator:
             try:
                 provider = resolve_provider(workspace_id)
                 names = await ModelClient(provider).list_models()
-                models = workspace_models(workspace_settings(workspace_id))
-                wanted = {provider.model_override} if provider.model_override else {models.planner, models.builder, models.verifier}
+                models = workspace_models(workspace_settings(workspace_id), provider=provider.provider)
+                wanted = ({provider.model_override} if provider.model_override else
+                          {models.planner, models.plan_reviewer, models.builder, models.verifier})
                 missing = sorted(m for m in wanted if m and m not in names)
                 log.info("readiness %s provider=%s models=%d configured=%s missing=%s", workspace_id[:6],
                          provider.provider, len(names), sorted(wanted), missing or "none")
@@ -343,7 +436,7 @@ class Orchestrator:
     def _promote(self) -> None:
         """Advance pending tasks whose dependencies completed, and roll up outcome status."""
         with session_scope() as s:
-            outcomes = s.query(Outcome).filter(Outcome.status.in_(["running", "attention"])).all()
+            outcomes = s.query(Outcome).filter(Outcome.source != "review", Outcome.status.in_(["running", "attention"])).all()
             for outcome in outcomes:
                 tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
                 by_key = {t.key: t for t in tasks}
@@ -402,13 +495,16 @@ class Orchestrator:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
-                        for o in s.query(Outcome).filter(Outcome.status == "planning")]
+                        for o in s.query(Outcome).filter(Outcome.source != "review", Outcome.status == "planning")]
             queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Task.status == "queued")]
+                      .filter(Outcome.source != "review", Task.status == "queued")]
+            # The merge manager hands out one merge turn per repository; the rest wait without a slot.
+            held = merge_manager.held_back(s)
+            queued = [c for c in queued if c.id not in held]
             planning_by_ws: dict[str, int] = {}
             for outcome in s.query(Outcome).filter(Outcome.id.in_(list(self._planning))):
                 planning_by_ws[outcome.workspace_id] = planning_by_ws.get(outcome.workspace_id, 0) + 1

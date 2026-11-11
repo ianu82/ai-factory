@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .models import Artifact, Decision, DecisionReview, MemoryEntry, Message, Outcome, Plan, Repository, Run, Signal, Task, User, Workspace, Workstream
+from .models import Artifact, Decision, DecisionReview, MemoryEntry, Message, Outcome, Plan, PullReview, ReviewAttempt, Repository, Run, Signal, Task, User, Workspace, Workstream
 
 
 def ts(value: datetime | None) -> str | None:
@@ -48,8 +48,23 @@ def repository(r: Repository) -> dict[str, Any]:
         policy = steward_policy()
         policy_invalid = True
     return {"id": r.id, "full_name": r.full_name, "default_branch": r.default_branch, "description": r.description,
-            "config": {**config, "steward": policy}, "steward_policy_invalid": policy_invalid,
-            "created_at": ts(r.created_at)}
+            "config": {**config, "steward": policy,
+                       "review": {"mode": "off", "allow_untrusted_local": False,
+                                  **(config.get("review") if isinstance(config.get("review"), dict) else {})}},
+            "steward_policy_invalid": policy_invalid, "created_at": ts(r.created_at)}
+
+
+def pull_review(r: PullReview) -> dict[str, Any]:
+    return {"id": r.id, "workspace_id": r.workspace_id, "repo_id": r.repo_id, "pr_number": r.pr_number,
+            "outcome_id": r.outcome_id, "head_sha": r.head_sha, "comment_id": r.comment_id,
+            "created_at": ts(r.created_at), "updated_at": ts(r.updated_at)}
+
+
+def review_attempt(a: ReviewAttempt) -> dict[str, Any]:
+    return {"id": a.id, "review_id": a.review_id, "head_sha": a.head_sha, "base_sha": a.base_sha,
+            "status": a.status, "verdict": a.verdict or {}, "evidence": a.evidence or {},
+            "created_at": ts(a.created_at), "updated_at": ts(a.updated_at),
+            "started_at": ts(a.started_at), "finished_at": ts(a.finished_at)}
 
 
 def run(r: Run) -> dict[str, Any]:

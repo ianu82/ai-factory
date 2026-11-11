@@ -137,7 +137,7 @@ def test_outcome_is_planned_built_verified_merged_and_smoke_tested(factory):
         assert task.status == "completed" and task.merge_sha and task.pr_number == 1
         assert task.evidence["smoke"]["state"] == "passed"
         assert task.evidence["ci"]["state"] == "success"
-        assert {r.role for r in runs} == {"planner", "builder", "verifier"}
+        assert {r.role for r in runs} == {"planner", "plan_reviewer", "builder", "verifier"}
         assert all(r.input_tokens > 0 for r in runs)
         branch = task.branch
     assert FakeGitHub.merged == [1]
@@ -361,6 +361,92 @@ def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
     bare = factory["remotes"] / "acme/demo.git"
     assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
     assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
+def test_a_revision_starts_from_the_branchs_real_base_when_the_recorded_one_was_never_published(factory):
+    """A restart begins an attempt again from the latest main and records that base, but the attempt is never
+    published: the branch still sits on its older base. The revision must still be brought up to date, or main's
+    newer commits count as the task's own change."""
+    published = {}
+
+    def move():
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            published["base"] = task.evidence["published"]["base"]
+            assert published["base"] == task.base_sha  # publishing records the branch's base
+            task.base_sha = main  # what the unpublished fresh attempt recorded
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    kinds = _event_kinds(outcome_id)
+    assert "branch_base_corrected" in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        corrected = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "branch_base_corrected").one()
+        assert corrected.data["actual"] == published["base"]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
+def test_a_publication_record_for_an_earlier_head_is_not_trusted_for_the_base(factory):
+    """A stop between a push and its record leaves the record describing the publication before it: another head,
+    on an older base the branch still contains. Trusting that base would count main's commits since then as the
+    task's own change, so the record's base counts only while its head is the branch's head."""
+    _land_on_main(factory, "earlier.txt", "on main before the task started\n")
+    bare = factory["remotes"] / "acme/demo.git"
+
+    def move():
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            record = task.evidence["published"]
+            assert record["base"] == task.base_sha
+            older = git("rev-parse", f"{record['base']}~1", cwd=bare)
+            task.evidence = {**task.evidence, "published": {**record, "head": "0" * 40, "base": older}}
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, move)
+    kinds = _event_kinds(outcome_id)
+    assert "branch_base_corrected" not in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=bare).split()
+    assert {"greet.sh", "other.txt", "earlier.txt"} <= set(tree)
+
+
+def test_a_revision_trusts_the_published_base_over_a_recorded_one_the_branch_also_contains(factory):
+    """An unpublished retry can record a rewound main: an older commit that the published branch also contains.
+    The base recorded at publishing still marks where the task's own commits begin, so the commit main dropped is
+    not republished as the task's change."""
+    _land_on_main(factory, "dropme.txt", "removed by a force-push later\n")
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    published = {}
+
+    def rewind_main():  # drop the dropme.txt commit; the unpublished retry then records the rewound main
+        git("reset", "-q", "--hard", "HEAD~1", cwd=seed)
+        git("push", "-q", "-f", str(factory["remotes"] / "acme/demo.git"), "main", cwd=seed)
+        main = git("rev-parse", "HEAD", cwd=seed)
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            published["base"] = task.evidence["published"]["base"]
+            assert published["base"] != main
+            task.base_sha = main
+        return main
+
+    outcome_id, main = _request_changes_after_main_moves(factory, rewind_main)
+    with session_scope() as s:
+        corrected = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "branch_base_corrected").one()
+        assert corrected.data["actual"] == published["base"] and corrected.data["recorded"] == main
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
+    _approve_and_finish(factory, outcome_id)
+    tree = git("ls-tree", "--name-only", "main", cwd=factory["remotes"] / "acme/demo.git").split()
+    assert "greet.sh" in tree and "dropme.txt" not in tree
 
 
 def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_overlap(factory):
@@ -796,7 +882,8 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
              "depends_on": []}]})]}
 
     def builder(messages):
-        name = "a.txt" if "Add a.txt" in messages[1]["content"] else "b.txt"
+        # A builder's prompt lists the plan's other tasks too: identify the task by its heading.
+        name = "a.txt" if messages[1]["content"].startswith("# Task T1:") else "b.txt"
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("write_file", {"path": name, "content": name}),
                                                   call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}, 1)
@@ -1096,7 +1183,7 @@ def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
             {"key": "T2", "title": "Write B", "repo": "acme/demo", "spec": "b", "acceptance": ["B written"], "depends_on": []}]})]}
 
     def builder(messages):
-        name = "A" if "Write A" in messages[1]["content"] else "B"
+        name = "A" if messages[1]["content"].startswith("# Task T1:") else "B"
         if step(messages) == 0:  # both tasks rewrite the same line: whichever merges second conflicts
             return {"content": "", "tool_calls": [call("write_file", {"path": "shared.txt", "content": f"{name}\n"}),
                                                   call("write_file", {"path": f"{name}.txt", "content": name}, 1)]}
@@ -1178,7 +1265,8 @@ def test_a_split_outcome_closes_its_issue_with_the_last_merge(factory):
             {"key": "T2", "title": "Add b.txt", "repo": "acme/demo", "spec": "b", "acceptance": ["b.txt exists"], "depends_on": []}]})]}
 
     def builder(messages):
-        name = "a.txt" if "Add a.txt" in messages[1]["content"] else "b.txt"
+        # A builder's prompt lists the plan's other tasks too: identify the task by its heading.
+        name = "a.txt" if messages[1]["content"].startswith("# Task T1:") else "b.txt"
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("write_file", {"path": name, "content": name})]}
         return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": f"added {name}"})]}
@@ -2172,3 +2260,24 @@ def test_patch_paths_use_nul_delimiters(factory):
         finally:
             await sandbox.close()
     asyncio.run(go())
+
+
+def test_checks_and_smoke_run_holding_a_host_check_slot(factory, monkeypatch):
+    # A repository's checks (usually its whole suite) share the host with every other job. Each run holds a check
+    # slot, so a crowd of them waits its turn instead of timing out together; the timeout starts with the slot.
+    from aifactory.pipeline.check_slots import check_slot_usage
+
+    run_commands = delivery.TaskRunner._run_commands
+    held = []
+
+    async def recording(self, sandbox, commands, kind, timeout=1500):
+        if commands:
+            held.append((kind, check_slot_usage()["running"]))
+        return await run_commands(self, sandbox, commands, kind, timeout)
+
+    monkeypatch.setattr(delivery.TaskRunner, "_run_commands", recording)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked")), "pipeline did not finish"
+    assert outcome_status(outcome_id) == "completed"
+    assert ("check", 1) in held and ("smoke", 1) in held, held
+    assert all(running == 1 for kind, running in held if kind in ("check", "smoke")), held

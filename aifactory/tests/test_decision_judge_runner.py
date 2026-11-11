@@ -6,6 +6,7 @@ from datetime import timedelta
 import pytest
 
 from aifactory import db, decision_judge_runner as runner
+from aifactory.pipeline.runtime import outcome_cost  # the recorded spend these tests check
 from aifactory.inference import InferenceError, ProviderConfig
 from aifactory.models import Decision, DecisionReview, Event, Run, Workspace
 from tests.fakes import ScriptedModel, call
@@ -337,7 +338,7 @@ def test_concurrent_judges_cannot_share_remaining_budget(data, model, monkeypatc
     first = asyncio.run(concurrent())
     assert first[0].status == "succeeded" and first[1]["verdict"] == "decide"
     assert len(calls) == 1
-    assert runner.outcome_cost(data[3]) == (.06, True)
+    assert outcome_cost(data[3]) == (.06, True)
     # Once finalized, a subsequent review uses only the unspent allowance.
     next_row, next_result, next_error = run(data)
     assert next_result["verdict"] == "hold" and "exceeded" in next_error
@@ -384,4 +385,4 @@ def test_simultaneous_budget_admission_is_atomic(data, model, monkeypatch):
 
     results = asyncio.run(race())
     assert sorted(r[1]["verdict"] for r in results) == ["decide", "hold"]
-    assert len(calls) == 1 and runner.outcome_cost(data[3]) == (.06, True)
+    assert len(calls) == 1 and outcome_cost(data[3]) == (.06, True)

@@ -104,3 +104,50 @@ steps, and exits non-zero on a failure.
      release and then promotes the fix. It never promotes the marked commit again, even though staging ran it.
 - **Merging.** Merge one pull request at a time and confirm `main`'s CI on it before the next. Two individually
   green pull requests can still break `main` together, and staging shows it before production does.
+
+## Operator relays without a restart
+
+Bootstrap `resolve`, `guidance`, `retry` and `cancel` items apply only when production starts, which now happens
+only on a release. To act sooner, post the same items as a command on the control issue the bootstrap names. It
+is a Linear issue or a GitHub issue:
+
+```json
+"control": {"linear": {"issue": "ENG-1234"}, "operators": ["ian@example.com"]}
+"control": {"repository": "ianu82/ai-factory", "issue": 123, "operators": ["ianu82"]}
+```
+
+A command is a comment that starts with `/factory` and holds one fenced `json` block, for example:
+
+    /factory
+    ```json
+    {"resolve": [{"outcome": 39, "task": "T1", "kind": "approve_merge", "resolution": "reject",
+                  "head": "5591799", "comment": "Codex P1: scrub the whole payload once, at the boundary."}],
+     "guidance": [{"outcome": 39, "task": "T1", "body": "..."}],
+     "retry": [{"outcome": 20}]}
+    ```
+
+The Factory polls the issue every 30 seconds, applies the items with the bootstrap's own rules (the `head` guard,
+relays only outside the bootstrap workspace, a live `cancel` never discards started work), and replies on the
+issue with what it applied or skipped. Nonces are optional; the comment id supplies them, so each command applies
+once. A command first seen more than a day after it was posted is not applied. Keep the control issue out of
+intake: no `factory-auto` label on Linear, no `factory` or `factory:auto` label on GitHub.
+
+Who counts as an operator:
+
+- **Linear.** `operators` lists Linear users by email or user id. A command counts only when its author is listed
+  and is an active member of the Linear workspace (not deactivated, not a guest, not an app); this is read with
+  each comment, so removing someone takes effect on the next poll. Comments from integrations or synced external
+  users have no Linear author and never count. The Factory reads and replies with the bootstrap workspace's Linear
+  API key (Settings → Linear), which needs comment write access; until that key is saved the channel logs the
+  missing key and waits. Replies are posted as the key's owner, often an operator: they start with
+  `Factory relay for`, which the poller skips, and never with `/factory`, so they are never taken as commands.
+- **GitHub.** `operators` lists logins, and GitHub is asked for each command whether that login has write access
+  to the repository. The Factory uses the workspace's GitHub access, which needs Issues write to reply.
+
+Replies that fail (a missing permission, an outage) are retried with a growing delay: the next poll, then twice
+as long each time, at most one try per command every ten minutes, with one log line per try. A channel whose
+polls fail (a missing Linear key, an exhausted rate limit) backs off the same way and recovers on its first good
+poll. Answers that never posted are retried after a restart too. A Linear reply carries an id fixed per command,
+and the Factory looks that id up before each retry, so a reply whose response was lost is recognised rather than
+posted twice, however long ago it was posted. Switching the channel leaves the old
+channel's unanswered replies unposted; the commands themselves were applied.

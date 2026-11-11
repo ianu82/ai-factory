@@ -39,6 +39,23 @@ def test_verifier_cannot_pass_with_failing_criterion():
     assert ok is None and "every criterion" in err
 
 
+def test_verifier_reports_need_lists_of_objects():
+    for criteria in (["the endpoint returns 200"], "all criteria pass"):
+        ok, err = validate_report("verifier", {"verdict": "pass", "summary": "ok", "criteria": criteria})
+        assert ok is None and "criteria must be a list of objects" in err
+    ok, err = validate_report("verifier", {"verdict": "fail", "summary": "no", "criteria": [], "findings": ["bad"]})
+    assert ok is None and "findings must be a list of objects" in err
+
+
+def test_stored_verdicts_with_malformed_lists_are_read_without_crashing():
+    from aifactory.pipeline.delivery import _actionable, _objects
+
+    assert _objects(["c", {"criterion": "d"}, None]) == [{"criterion": "d"}]
+    assert _objects("text") == [] and _objects(None) == []
+    verdict = {"criteria": ["c", {"criterion": "d", "status": "fail"}], "findings": "none"}
+    assert _actionable({"result": "verification_failed", "verdict": verdict})
+
+
 def test_sandbox_exec_timeout_and_clipping(tmp_path):
     sb = LocalSandbox("t1", root=tmp_path).create()
     sb.work.mkdir()

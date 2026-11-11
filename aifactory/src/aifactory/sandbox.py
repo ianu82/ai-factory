@@ -96,6 +96,57 @@ def _clip(data: bytes) -> tuple[str, bool]:
     return f"{head}\n\n… [{len(data) - HEAD_BYTES - TAIL_BYTES:,} bytes omitted] …\n\n{tail}", True
 
 
+TRASH_PREFIX = ".trash-"
+_live_roots: set[Path] = set()  # job directories of sandboxes open in this process
+
+
+def quarantine_orphaned_jobs(jobs_dir: Path | None = None) -> Path | None:
+    """Move every job directory present at startup aside, in O(1) per directory.
+
+    Sandboxes never survive a restart: close() removes a job's directory, and an interrupted attempt is redone
+    in a fresh sandbox. So each restart used to leave every running job's checkout, virtualenv and node_modules
+    on the volume, and a resumed job reused its stale directory. Renaming keeps startup fast however much was
+    left; purge_quarantine() deletes the moved directories in the background.
+    """
+    root = jobs_dir or get_settings().jobs_dir
+    if not root.is_dir():
+        return None
+    live = {p.resolve() for p in _live_roots}
+    orphans = [p for p in root.iterdir() if not p.name.startswith(TRASH_PREFIX) and p.resolve() not in live]
+    if not orphans:
+        return None
+    trash = root / f"{TRASH_PREFIX}{time.time_ns()}"
+    trash.mkdir()
+    os.chmod(trash, 0o700)
+    for path in orphans:
+        try:
+            path.rename(trash / path.name)
+        except OSError:
+            shutil.rmtree(path, ignore_errors=True)
+    return trash
+
+
+def purge_quarantine(jobs_dir: Path | None = None) -> int:
+    """Delete quarantined job directories (slow for large checkouts; run it off the event loop)."""
+    root = jobs_dir or get_settings().jobs_dir
+    removed = 0
+    if root.is_dir():
+        for trash in root.glob(f"{TRASH_PREFIX}*"):
+            shutil.rmtree(trash, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def disk_report(data_dir: Path | None = None) -> dict[str, Any]:
+    """Volume usage for the inventory log, cheap enough to run every few minutes (no directory walks)."""
+    settings = get_settings()
+    usage = shutil.disk_usage(data_dir or settings.data_dir)
+    jobs = settings.jobs_dir
+    count = sum(1 for p in jobs.iterdir() if not p.name.startswith(TRASH_PREFIX)) if jobs.is_dir() else 0
+    return {"used_gb": round(usage.used / 1e9, 1), "total_gb": round(usage.total / 1e9, 1),
+            "used_percent": round(100 * usage.used / usage.total, 1) if usage.total else 0, "job_dirs": count}
+
+
 class LocalSandbox:
     """A job directory with optional per-job UID isolation."""
 
@@ -117,6 +168,7 @@ class LocalSandbox:
         for path in (self.root, self.home, self.tmp):
             path.mkdir(parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
+        _live_roots.add(self.root)
         if isolation_available():
             self.uid = _uid_pool.acquire()
         return self
@@ -143,6 +195,7 @@ class LocalSandbox:
         await self.kill_all()
         if self.uid is not None:
             _uid_pool.release(self.uid)
+        _live_roots.discard(self.root)
         if not keep_files:
             shutil.rmtree(self.root, ignore_errors=True)
 
@@ -425,13 +478,34 @@ def job_cpus(uid: int | None) -> set[int] | None:
     return set(allowed[start:start + width])
 
 
+def process_report(proc: Path = Path("/proc")) -> dict[str, Any]:
+    """Tasks in use against the container's ceiling, and how many are zombies (exited, never reaped). Zombies
+    growing between inventories mean orphans are not being reaped; the image runs tini as PID 1 for that."""
+    info = {key: value for key, value in host_capacity().items() if key in ("pids_current", "pids_max")}
+    zombies = 0
+    for stat in proc.glob("[0-9]*/stat"):
+        try:
+            # Bytes: a job may name its process anything, not necessarily UTF-8. The command name in parentheses
+            # may contain spaces and parentheses, so the state is the first field after the last ")".
+            if stat.read_bytes().rsplit(b")", 1)[1].split()[0] == b"Z":
+                zombies += 1
+        except (OSError, IndexError):
+            continue
+    info["zombies"] = zombies
+    return info
+
+
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
 def host_capacity() -> dict[str, Any]:
     """What a job can use on this host: CPUs, process and memory ceilings (cgroup v2 / v1 or rlimit)."""
+    root = CGROUP_ROOT
 
-    def first(*paths: str) -> str | None:
+    def first(*paths: Path) -> str | None:
         for path in paths:
             try:
-                return Path(path).read_text().strip()
+                return path.read_text().strip()
             except OSError:
                 continue
         return None
@@ -444,14 +518,19 @@ def host_capacity() -> dict[str, Any]:
         info["nproc_rlimit"] = None if soft == resource.RLIM_INFINITY else soft
     except (ImportError, AttributeError, ValueError):
         pass
-    info["pids_max"] = first("/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max")
-    info["pids_current"] = first("/sys/fs/cgroup/pids.current", "/sys/fs/cgroup/pids/pids.current")
-    memory = first("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    info["pids_max"] = first(root / "pids.max", root / "pids" / "pids.max")
+    info["pids_current"] = first(root / "pids.current", root / "pids" / "pids.current")
+    memory = first(root / "memory.max", root / "memory" / "memory.limit_in_bytes")
     if memory and memory.isdigit():
         memory = f"{int(memory) / 2**30:.1f}GiB"
     info["memory_max"] = memory
-    cpu = first("/sys/fs/cgroup/cpu.max")
-    if cpu and cpu.split()[0].isdigit():
-        quota, period = cpu.split()[:2]
+    cpu = first(root / "cpu.max")
+    if cpu is not None:  # v2: "<quota> <period>", or "max <period>" for none
+        quota, period = (cpu.split() + ["", ""])[:2]
+    else:  # v1: the cpu controller's CFS quota (-1 for none), mounted alone or with cpuacct
+        controllers = [root / name for name in ("cpu", "cpu,cpuacct", "cpuacct,cpu")]
+        quota = first(*(c / "cpu.cfs_quota_us" for c in controllers)) or ""
+        period = first(*(c / "cpu.cfs_period_us" for c in controllers)) or ""
+    if quota.isdigit() and period.isdigit() and int(quota) > 0 and int(period) > 0:
         info["cpu_quota"] = round(int(quota) / int(period), 1)
     return info

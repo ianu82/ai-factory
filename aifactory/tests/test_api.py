@@ -242,10 +242,11 @@ def test_model_check_sends_valid_png_and_deduplicates_inherited_roles(client, si
     _mock_image_provider(monkeypatch, upstream)
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200, r.text
-    assert sorted(seen) == ["default-model", "other-model"]
+    assert sorted(seen) == ["default-model", "opus-5-5", "other-model"]
     roles = r.json()["roles"]
     assert roles["planner"]["model"] == roles["verifier"]["model"] == "default-model"
     assert roles["builder"]["model"] == "other-model"
+    assert roles["plan_reviewer"]["model"] == "opus-5-5"
     assert {role["status"] for role in roles.values()} == {"supported"}
 
 
@@ -291,7 +292,9 @@ def test_model_check_classifies_provider_errors_safely(client, signed_in, monkey
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200
     assert {role["status"] for role in r.json()["roles"].values()} == {expected}
-    assert len(seen) == 1  # no retries, including include-removal, or text-only fallback
+    # One probe per distinct model (the default and the plan reviewer's), with no retries,
+    # include-removal, or text-only fallback.
+    assert len(seen) == 2
     assert "mdb_secret-never-expose" not in r.text + caplog.text
     assert message not in r.text
 
@@ -317,7 +320,8 @@ def test_model_check_missing_credentials_and_builtin_default(client, signed_in, 
     r = client.post(f"/api/workspaces/{ws_id}/models/check")
     assert r.status_code == 200
     assert r.json()["provider"] is None
-    assert {role["model"] for role in r.json()["roles"].values()} == {"gpt-terra"}
+    assert {role: result["model"] for role, result in r.json()["roles"].items()} == {
+        "planner": "gpt-terra", "plan_reviewer": "opus-5-5", "builder": "gpt-terra", "verifier": "gpt-terra"}
     assert {role["status"] for role in r.json()["roles"].values()} == {"unknown"}
 
 
@@ -384,7 +388,7 @@ def test_model_catalog_never_probes_selected_models(client, signed_in, monkeypat
 def test_model_checks_report_distinct_results_independently(client, signed_in, monkeypatch):
     ws_id = signed_in["workspaces"][0]["id"]
     client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"models": {
-        "planner": "accepts", "builder": "rejects", "verifier": "unavailable"}}})
+        "planner": "accepts", "plan_reviewer": "accepts", "builder": "rejects", "verifier": "unavailable"}}})
     seen = []
 
     def upstream(request):
@@ -398,8 +402,31 @@ def test_model_checks_report_distinct_results_independently(client, signed_in, m
     _mock_image_provider(monkeypatch, upstream)
     roles = client.post(f"/api/workspaces/{ws_id}/models/check").json()["roles"]
     assert len(seen) == 3
-    assert [roles[role]["status"] for role in ("planner", "builder", "verifier")] == [
-        "supported", "unsupported", "unknown"]
+    assert [roles[role]["status"] for role in ("planner", "plan_reviewer", "builder", "verifier")] == [
+        "supported", "supported", "unsupported", "unknown"]
+
+
+def test_model_check_picks_the_plan_reviewer_default_for_the_resolved_provider(client, signed_in, monkeypatch):
+    """A MindsHub workspace whose only key is OpenAI's runs on OpenAI, so its reviewer default is the verifier's."""
+    from aifactory import model_checks
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"provider": "mindshub", "models": {
+        "default": "default-model", "verifier": "verifier-model"}}})
+    seen = []
+
+    def upstream(request):
+        seen.append(json.loads(request.content)["model"])
+        return httpx.Response(200, json={"output": []})
+
+    _mock_image_provider(monkeypatch, upstream)
+    monkeypatch.setattr(model_checks, "resolve_provider", lambda _: ProviderConfig(
+        "openai", "https://provider.test/v1", "key", "OpenAI"))
+    r = client.post(f"/api/workspaces/{ws_id}/models/check")
+    assert r.status_code == 200 and r.json()["provider"] == "openai"
+    assert sorted(seen) == ["default-model", "verifier-model"]
+    assert r.json()["roles"]["plan_reviewer"] == {
+        "model": "verifier-model", "status": "supported", "explanation": "The model accepted image input."}
 
 
 def test_model_check_overall_timeout_is_bounded(client, signed_in, monkeypatch):
@@ -620,3 +647,162 @@ def test_partial_merge_settings_preserve_all_keys_and_advertise_capability(clien
     response = client.patch(path, json={"config": {"merge": {"reverify": "invalid"}}})
     assert response.status_code == 422
     assert client.get("/api/meta").json()["capabilities"]["reverify"] is True
+
+
+@pytest.mark.parametrize("mode", ["off", "all", "labelled"])
+def test_repository_review_policy_roundtrip(client, signed_in, mode):
+    from aifactory.models import Repository
+
+    wid = signed_in["workspaces"][0]["id"]
+    existing = {"checks": ["pytest"], "custom": {"keep": True}, "review": {"max_rounds": 4}}
+    with session_scope() as db:
+        repo = Repository(workspace_id=wid, full_name="acme/reviews", config=existing)
+        db.add(repo)
+        db.flush()
+        rid = repo.id
+    path = f"/api/workspaces/{wid}/repositories"
+    assert client.get(path).json()[0]["config"]["review"] == {
+        "mode": "off", "allow_untrusted_local": False, "max_rounds": 4}
+    response = client.patch(f"{path}/{rid}", json={"config": {"review": {"mode": mode}}})
+    assert response.status_code == 200, response.text
+    assert response.json()["config"] == {**existing, "steward": {"mode": "propose", "fix_minutes": 60},
+                                         "review": {"mode": mode, "allow_untrusted_local": False, "max_rounds": 4}}
+    response = client.patch(f"{path}/{rid}", json={"config": {"review": {"allow_untrusted_local": True}}})
+    assert response.status_code == 200
+    policy = {"mode": mode, "allow_untrusted_local": True, "max_rounds": 4}
+    assert client.get(path).json()[0]["config"]["review"] == policy
+    with session_scope() as db:
+        assert db.get(Repository, rid).config == {**existing, "review": policy}
+
+
+@pytest.mark.parametrize("review", [None, [], "all", {"mode": "on"}, {"mode": None}, {"mode": True},
+                                    {"allow_untrusted_local": "false"}, {"allow_untrusted_local": 1},
+                                    {"allow_untrusted_local": None}, {"unknown": True}])
+def test_repository_review_policy_rejects_invalid_atomically(client, signed_in, review):
+    from aifactory.models import Repository
+
+    wid = signed_in["workspaces"][0]["id"]
+    existing = {"checks": ["pytest"], "review": {"mode": "labelled"}, "custom": "keep"}
+    with session_scope() as db:
+        repo = Repository(workspace_id=wid, full_name="acme/reviews", config=existing)
+        db.add(repo)
+        db.flush()
+        rid = repo.id
+    response = client.patch(f"/api/workspaces/{wid}/repositories/{rid}",
+                            json={"config": {"checks": ["bad"], "review": review}})
+    assert response.status_code == 422, response.text
+    with session_scope() as db:
+        assert db.get(Repository, rid).config == existing
+
+
+@pytest.mark.parametrize("role,expected", [("owner", 200), ("admin", 200), ("member", 403), ("viewer", 403)])
+def test_repository_review_policy_authorization(client, signed_in, role, expected):
+    from aifactory.models import Membership, Repository
+
+    wid = signed_in["workspaces"][0]["id"]
+    with session_scope() as db:
+        db.query(Membership).filter_by(workspace_id=wid).one().role = role
+        repo = Repository(workspace_id=wid, full_name="acme/reviews")
+        db.add(repo)
+        db.flush()
+        rid = repo.id
+    response = client.patch(f"/api/workspaces/{wid}/repositories/{rid}",
+                            json={"config": {"review": {"mode": "all", "allow_untrusted_local": True}}})
+    assert response.status_code == expected, response.text
+    with session_scope() as db:
+        assert db.get(Repository, rid).config == ({"review": {"mode": "all", "allow_untrusted_local": True}}
+                                                  if expected == 200 else {})
+
+
+def test_repository_review_policy_workspace_boundary(client, signed_in):
+    from aifactory.models import Repository
+
+    wid = signed_in["workspaces"][0]["id"]
+    with session_scope() as db:
+        org_id = db.get(Workspace, wid).org_id
+        other = Workspace(org_id=org_id, name="Other", slug="other")
+        db.add(other)
+        db.flush()
+        repo = Repository(workspace_id=other.id, full_name="acme/private", config={"context": "private"})
+        db.add(repo)
+        db.flush()
+        rid, other_id = repo.id, other.id
+    payload = {"config": {"review": {"mode": "all"}}}
+    assert client.patch(f"/api/workspaces/{wid}/repositories/{rid}", json=payload).status_code == 404
+    assert client.patch(f"/api/workspaces/{other_id}/repositories/{rid}", json=payload).status_code == 404
+    with session_scope() as db:
+        assert db.get(Repository, rid).config == {"context": "private"}
+
+
+@pytest.mark.parametrize("mode", ["off", "all", "labelled"])
+def test_connect_repository_review_policy(client, signed_in, monkeypatch, mode):
+    async def detect(_wid, name):
+        return {"full_name": name}, {"checks": ["pytest"], "detected": ["Python"]}
+
+    monkeypatch.setattr(api_module, "_detect_repository", detect)
+    wid = signed_in["workspaces"][0]["id"]
+    path = f"/api/workspaces/{wid}/repositories"
+    r = client.post(path, json={"full_name": "acme/reviews", "config": {"review": {"mode": mode}}})
+    assert r.status_code == 200, r.text
+    assert r.json()["config"]["review"] == {"mode": mode, "allow_untrusted_local": False}
+    assert r.json()["config"]["checks"] == ["pytest"]
+    assert client.post(path, json={"full_name": "acme/invalid", "config": {
+        "review": {"allow_untrusted_local": "true"}}}).status_code == 422
+
+
+@pytest.mark.parametrize("field,value", [("mode", "off"), ("mode", "all"),
+                                         ("allow_untrusted_local", False), ("allow_untrusted_local", True)])
+def test_workspace_rejects_repository_only_review_options(client, signed_in, field, value):
+    wid = signed_in["workspaces"][0]["id"]
+    with session_scope() as db:
+        before = db.get(Workspace, wid).settings
+    response = client.patch(f"/api/workspaces/{wid}", json={"settings": {
+        "max_attempts": 7, "review": {"max_rounds": 5, field: value}}})
+    assert response.status_code == 422, response.text
+    assert f"review.{field}" in response.json()["detail"]
+    with session_scope() as db:
+        assert db.get(Workspace, wid).settings == before
+
+
+def test_disconnect_repository_deletes_review_history_and_keeps_costs(client, signed_in):
+    # Uses foreign-key-enforcing SQLite by default, or Postgres through
+    # AIFACTORY_TEST_DATABASE_URL, exactly like the rest of the API suite.
+    from aifactory.models import Outcome, PullReview, Repository, ReviewAttempt
+    from aifactory.pull_reviews import get_or_create_attempt, get_or_create_review
+
+    wid = signed_in["workspaces"][0]["id"]
+    with session_scope() as db:
+        repo = Repository(workspace_id=wid, full_name="acme/review-history")
+        other = Repository(workspace_id=wid, full_name="acme/keep-history")
+        db.add_all([repo, other])
+        db.flush()
+        review = get_or_create_review(db, repo, 42)
+        review_id, outcome_id, repo_id = review.id, review.outcome_id, repo.id
+        for head in ("head1", "head2"):
+            get_or_create_attempt(db, review, head, "base")
+        other_review = get_or_create_review(db, other, 42)
+        get_or_create_attempt(db, other_review, "head1", "base")
+        other_id = other_review.id
+        run = Run(workspace_id=wid, outcome_id=outcome_id, role="reviewer", harness="native", cost_usd=1.5)
+        db.add(run)
+        db.flush()
+        run_id = run.id
+    response = client.delete(f"/api/workspaces/{wid}/repositories/{repo_id}")
+    assert response.status_code == 200, response.text
+    with session_scope() as db:
+        assert db.get(Repository, repo_id) is None
+        assert db.get(PullReview, review_id) is None
+        assert db.query(ReviewAttempt).filter_by(review_id=review_id).count() == 0
+        assert db.get(Outcome, outcome_id).source == "review"
+        assert db.get(Run, run_id).cost_usd == 1.5
+        assert db.get(PullReview, other_id) is not None
+        assert db.query(ReviewAttempt).filter_by(review_id=other_id).count() == 1
+
+
+def test_review_intake_controls_are_deferred_until_intake_exists():
+    from pathlib import Path
+
+    settings = (Path(__file__).resolve().parents[1] / "web/src/pages/Settings.tsx").read_text()
+    assert "Review pull requests" not in settings
+    assert "allow_untrusted_local" not in settings
+    assert "review_mode" not in settings

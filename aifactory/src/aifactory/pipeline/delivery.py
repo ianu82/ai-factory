@@ -13,6 +13,7 @@ import logging
 import re
 import shlex
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -20,14 +21,18 @@ from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..guided import README_TEMPLATE, outcome_guidance
+from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..models import Artifact, Decision, Outcome, Repository, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import LocalSandbox, SandboxError
+from .check_slots import check_slot
+from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, publish_decision, run_agent,
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, outcome_cost, precedents,
+                      publish_decision, run_agent,
                       workspace_settings)
 
 from .lifecycle import transition
@@ -56,12 +61,22 @@ class TaskRunner:
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
         self.app_summary: dict[str, Any] | None = None
+        # The repository's agent instructions, by base commit and whether they are for the verifier.
+        self._instructions: dict[tuple[str, bool], list[str]] = {}
         self._load()
         self.feedback = self._prior_feedback()
         self.builder_report = (self.task.evidence or {}).get("builder_report") or {}
         revalidation = (self.task.evidence or {}).get("revalidation") or {}
         if revalidation.get("phase") in ("rejected", "handled"):
             self.feedback += revalidation.get("feedback") or []
+
+    async def _sections(self, verifier: bool = False) -> list[str]:
+        """The plan around this task and the repository's instructions for agents, read at the base commit (never
+        from the candidate, which the builder may have changed)."""
+        key = (self.task.base_sha or "", verifier)
+        if key not in self._instructions:
+            self._instructions[key] = await repo_instructions(self.repo.full_name, key[0], verifier=verifier)
+        return plan_context(self.task_id) + self._instructions[key]
 
     def _prior_feedback(self) -> list[str]:
         """Reviewer findings from earlier attempts survive retries and restarts, so new attempts converge."""
@@ -70,10 +85,10 @@ class TaskRunner:
             verdict = attempt.get("verdict") or {}
             if attempt.get("result") == "verification_failed" and verdict:
                 notes.append(f"- An earlier attempt failed independent review: {str(verdict.get('summary', ''))[:800]}")
-                for c in verdict.get("criteria") or []:
+                for c in _objects(verdict.get("criteria")):
                     if c.get("status") != "pass":
                         notes.append(f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:400]}")
-                for f in verdict.get("findings") or []:
+                for f in _objects(verdict.get("findings")):
                     if f.get("severity") in ("blocker", "major"):
                         notes.append(f"  - {f.get('severity')}: {str(f.get('description', ''))[:400]} {f.get('location', '')}")
             elif attempt.get("result") == "checks_failed" and any(not c.get("ok") for c in attempt.get("checks") or []):
@@ -91,6 +106,8 @@ class TaskRunner:
             task = s.get(Task, self.task_id)
             self.task = Task(**{c.name: getattr(task, c.name) for c in Task.__table__.columns})
             outcome = s.get(Outcome, task.outcome_id)
+            if outcome.source == "review":
+                raise ValueError("Review outcomes cannot enter task delivery")
             self.outcome = Outcome(**{c.name: getattr(outcome, c.name) for c in Outcome.__table__.columns})
             repo = s.get(Repository, task.repo_id)
             self.repo = Repository(**{c.name: getattr(repo, c.name) for c in Repository.__table__.columns})
@@ -208,6 +225,7 @@ class TaskRunner:
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
+        merge_manager.leave(self)  # a rebuild re-enters the merge queue at the back when it is ready again
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
         finished = {a.get("n") for a in self._budget_attempts()}
@@ -233,7 +251,7 @@ class TaskRunner:
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")
-            spent, known = outcome_cost(self.task.outcome_id)
+            spent, known = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
             if budget and known and spent >= budget and not (self.task.evidence or {}).get("budget_override"):
                 self.block("budget", f"Outcome #{self.outcome.number} reached its ${budget:.0f} budget",
                            f"Spent ${spent:.2f}. Raise the budget in Settings or approve continuing.", status="needs_input",
@@ -241,13 +259,14 @@ class TaskRunner:
             if self.builder is None:
                 await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
+            sections = await self._sections()
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
                 prompt=build_prompt(self.task, self.outcome, self.repo, self.feedback[-8:],
                                     precedents(self.ws, self.repo.id),
-                                    guidance_history(self.task.outcome_id, self.task_id))), self.cancelled)
+                                    guidance_history(self.task.outcome_id, self.task_id), sections)), self.cancelled)
             if result is None:
                 if any(p.lower() in error.lower() for p in PROVIDER_PROBLEMS):
                     self.block("unblock", f"{self.task.key}: model provider problem", error,
@@ -281,7 +300,9 @@ class TaskRunner:
             self.patch = patch
             diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
                           files=patch.files, additions=patch.additions, deletions=patch.deletions)
-            self.checks = await self._run_commands(self.builder, self.cfg.get("checks") or [], "check")
+            commands = self.cfg.get("checks") or []
+            async with self._check_slot(self.builder, bool(commands)):
+                self.checks = await self._run_commands(self.builder, commands, "check")
             failed = [c for c in self.checks if not c["ok"]]
             if failed:
                 self.feedback += [f"- Check `{c['command']}` failed (exit {c['exit_code']}):\n```\n{c['tail']}\n```"
@@ -339,7 +360,40 @@ class TaskRunner:
         sb, default = self.builder, self.repo.default_branch
         found = await sb.exec(f"git rev-parse --verify -q origin/{shlex.quote(default)}^{{commit}}", timeout=60)
         main = found.output.strip() if found.ok else ""
-        if not main or not self.task.base_sha or main == self.task.base_sha:
+        if not main:
+            return
+        recorded = self.task.base_sha or ""
+        record = (self.task.evidence or {}).get("published") or {}
+        tip = await sb.exec("git rev-parse HEAD", timeout=60)
+        # A publication record describes one pushed head. A stop between a push and its record leaves the record
+        # describing the publication before it, so its base counts only while its head is still the branch's head.
+        published = str(record.get("base") or "") if tip.ok and record.get("head") == tip.output.strip() else ""
+        # The base recorded when the branch was last published is the branch's real base, so it is trusted first.
+        # The task's recorded base can belong to an attempt that was never published: a restart begins the attempt
+        # again from the latest code and records that base, while the branch still sits on another one. Trusting
+        # it would skip this rebase when it is newer than the branch, and when it is an older commit the branch
+        # also contains, every commit between the two would count as this task's change (republishing commits
+        # removed from a rewound main, for one). Branches published before the base was recorded fall back to the
+        # recorded base when the branch contains it, then to where the branch meets it (a later commit of the same
+        # history), then main.
+        actual = ""
+        for known in (published, recorded):
+            if known and not actual and (await sb.exec(
+                    f"git merge-base --is-ancestor {shlex.quote(known)} HEAD", timeout=60)).ok:
+                actual = known
+        for other in (recorded, main):
+            if actual or not other:
+                continue
+            merged = await sb.exec(f"git merge-base HEAD {shlex.quote(other)}", timeout=60)
+            actual = merged.output.strip() if merged.ok else ""
+        if not actual:
+            return
+        if actual != recorded:
+            self.event("branch_base_corrected", f"{branch} sits on {actual[:8]}, not the recorded base "
+                       f"{recorded[:8] or '(none)'}; bringing it up to date from there", level="warn",
+                       recorded=recorded, actual=actual)
+            self.update(base_sha=actual)
+        if main == self.task.base_sha:
             return
         if (self.task.evidence or {}).get("ci", {}).get("state") == "failure":
             self.event("revalidate", "The base branch moved; rebasing the CI repair before verification")
@@ -427,6 +481,29 @@ class TaskRunner:
             return "- The diff is larger than 5 MB. Remove generated or binary files from the change."
         return ""
 
+    @asynccontextmanager
+    async def _check_slot(self, sandbox, needed: bool = True):
+        """Hold a host check slot while the repository's checks run in a local sandbox (see check_slots), saying so
+        when every slot is taken. Waiting spends none of a command's timeout. Checks in a VM run off this host and
+        take no slot."""
+        if not needed or getattr(sandbox, "kind", "local") != "local":
+            yield
+            return
+        started = time.monotonic()
+        waited = False
+
+        def waiting(running: int, queued: int) -> None:
+            nonlocal waited
+            waited = True
+            self.event("check_slot_wait", f"Waiting for a check slot: {running} running on this server, {queued} waiting",
+                       running=running, waiting=queued)
+
+        async with check_slot(on_wait=waiting):
+            if waited:
+                seconds = round(time.monotonic() - started, 1)
+                self.event("check_slot", f"Got a check slot after waiting {seconds:.0f}s", waited=seconds)
+            yield
+
     async def _run_commands(self, sandbox: LocalSandbox, commands: list[str], kind: str,
                             timeout: float = 1500) -> list[dict[str, Any]]:
         results = []
@@ -455,6 +532,7 @@ class TaskRunner:
                 if qa_cfg.get("start"):
                     app = await self._start_app(sandbox, qa_cfg)
                     brief = verifier_brief(app)
+                sections = await self._sections(verifier=True)
                 run, result, error = await run_agent(SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                     harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
@@ -462,7 +540,8 @@ class TaskRunner:
                     repositories={self.repo.full_name: self.cfg},
                     prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
                                          precedents(self.ws, self.repo.id),
-                                         guidance_history(self.task.outcome_id, self.task_id))
+                                         guidance_history(self.task.outcome_id, self.task_id),
+                                         outcome=self.outcome, sections=sections)
                     + brief), self.cancelled)
                 if app is not None:
                     await self._store_app_evidence(app, attempt, run.id)
@@ -494,11 +573,13 @@ class TaskRunner:
                 self.event("verified", f"Independent verification passed: {report.get('summary', '')[:300]}",
                            level="success")
                 return report
-            failing = [c for c in report.get("criteria", []) if c.get("status") != "pass"]
-            findings = [f for f in report.get("findings", []) if f.get("severity") in ("blocker", "major")]
+            failing = [c for c in _objects(report.get("criteria")) if c.get("status") != "pass"]
+            findings = [f for f in _objects(report.get("findings")) if f.get("severity") in ("blocker", "major")]
             self.feedback.append("- Independent review FAILED. " + report.get("summary", "")[:1500])
-            self.feedback += [f"  - Criterion not met: {c['criterion']} — {c.get('evidence', '')[:600]}" for c in failing]
-            self.feedback += [f"  - {f['severity']}: {f['description'][:600]} {f.get('location', '')}" for f in findings]
+            self.feedback += [f"  - Criterion not met: {c.get('criterion')} — {str(c.get('evidence', ''))[:600]}"
+                              for c in failing]
+            self.feedback += [f"  - {f['severity']}: {str(f.get('description', ''))[:600]} {f.get('location', '')}"
+                              for f in findings]
             if runtime_problem and app is not None and app.evidence.get("log_tail"):
                 self.feedback.append(f"  - App log when it failed:\n```\n{app.evidence['log_tail'][-1500:]}\n```")
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
@@ -740,13 +821,16 @@ class TaskRunner:
                 self.event("revalidation_warning", f"Could not publish status: {str(exc)[:200]}", level="warn")
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
+        # Record the publication before advancing the head, as revalidation does: a stop between the two must not
+        # leave the task at this head with a record of the publication before it.
+        self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
+                                    "pr": pr["number"]})
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
-        self.evidence("published", {"head": head, "at": utcnow().isoformat(), "pr": pr["number"]})
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:
         lines = [self.builder_report.get("summary", "").strip() or self.task.title, "", "### Acceptance criteria"]
-        by = {c.get("criterion"): c for c in self.verifier_report.get("criteria", [])}
+        by = {c.get("criterion"): c for c in _objects(self.verifier_report.get("criteria"))}
         for criterion in self.task.acceptance:
             c = by.get(criterion) or next((v for k, v in by.items() if k and criterion[:40] in k), {})
             mark = {"pass": "✅", "fail": "❌"}.get(c.get("status", ""), "◻️")
@@ -1077,8 +1161,21 @@ class TaskRunner:
             await self._refresh_onto_main(token, gh, pending["new_base"])
             return
         self._require_merge_approval()
-        self.stage("merge", f"Merging PR #{self.task.pr_number}")
+        # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
+        await merge_manager.take_turn(self, gh)
         revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
+        github_queue = await merge_manager.github_queue_state(gh, self)
+        if github_queue is not None:
+            if revalidate and not github_queue["entry"] and not (self.task.evidence or {}).get(
+                    merge_manager.KEY, {}).get("github"):
+                # Enqueue only a head verified against the current main; otherwise rebase and revalidate first.
+                main_sha = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard()
+                if main_sha != self.task.base_sha:
+                    await self._refresh_onto_main(token, gh, main_sha)
+                    return
+            await merge_manager.merge_via_github_queue(self, gh, github_queue)
+        self.stage("merge", f"Merging PR #{self.task.pr_number}")
         refresh_onto: str | None = None
         # Merges into one repository are serialized; CI waits and rebuilds happen outside the lock.
         async with self.repo_lock(self.repo.id):
@@ -1165,16 +1262,17 @@ class TaskRunner:
             if self.task.head_sha != state["head"]:
                 # A merge approval belongs to the published candidate, not its branch name.
                 # Persist the new publication before advancing the head, including on resume.
-                self.evidence("published", {"head": state["head"], "at": utcnow().isoformat(),
-                                            "pr": self.task.pr_number})
+                self.evidence("published", {"head": state["head"], "base": state["new_base"],
+                                            "at": utcnow().isoformat(), "pr": self.task.pr_number})
             self.update(head_sha=state["head"], base_sha=state["new_base"])
         if state["phase"] in ("checks", "verify"):
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
             try:
                 await checkout(sandbox, self.repo.full_name, token, state["head"], self.task.branch)
                 if state["phase"] == "checks":
-                    setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-                    self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
+                    async with self._check_slot(sandbox, bool(self.cfg.get("setup") or self.cfg.get("checks"))):
+                        setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                        self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
                     state.update(setup=setup, checks=self.checks)
                     failed = [c for c in setup + self.checks if not c["ok"]]
                     if failed:
@@ -1252,8 +1350,9 @@ class TaskRunner:
             gh = GitHub(token)
             ref = self.task.merge_sha or await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
             await checkout(sandbox, self.repo.full_name, token, ref, f"smoke-{self.task_id[:8]}")
-            await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
-            results = await self._run_commands(sandbox, commands, "smoke")
+            async with self._check_slot(sandbox):
+                await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
+                results = await self._run_commands(sandbox, commands, "smoke")
         finally:
             await sandbox.close()
         ok = all(r["ok"] for r in results)
@@ -1427,6 +1526,11 @@ def _revalidation_section(state: dict[str, Any]) -> str:
             f"```json\n{payload}\n```\n{REVALIDATION_END}")
 
 
+def _objects(items: Any) -> list[dict[str, Any]]:
+    """The objects in a model-written list (a verifier's criteria or findings); anything else in it is skipped."""
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
 def _actionable(attempt: dict[str, Any]) -> bool:
     """Whether an attempt's record gives the next attempt something concrete to fix."""
     result = attempt.get("result")
@@ -1437,8 +1541,8 @@ def _actionable(attempt: dict[str, Any]) -> bool:
     if result == "verification_failed":
         verdict = attempt.get("verdict") or {}  # optional report fields may be null
         # Exactly what the feedback relays to the next attempt: unmet criteria and blocker/major findings.
-        return (any(c.get("status") != "pass" for c in verdict.get("criteria") or [])
-                or any(f.get("severity") in ("blocker", "major") for f in verdict.get("findings") or []))
+        return (any(c.get("status") != "pass" for c in _objects(verdict.get("criteria")))
+                or any(f.get("severity") in ("blocker", "major") for f in _objects(verdict.get("findings"))))
     return False
 
 

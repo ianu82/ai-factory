@@ -33,11 +33,14 @@ def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
 
 def resolve(db: Session, decision: Decision, user: User, resolution: str, comment: str = "",
             reusable: bool = False, scope: str = "item", *, action_id: str | None = None,
-            pending_events: list[dict] | None = None) -> dict[str, Any]:
-    if action_id and (pending_events is None or not (
-            (decision.kind == "question" and resolution == "answer") or
-            (decision.kind == "unblock" and decision.task_id and resolution == "retry"))):
-        raise DecisionError("Unsupported Mind resolution")
+            pending_events: list[dict] | None = None, after: list[tuple] | None = None,
+            attribution: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Apply a person's resolution. The app's endpoint commits and publishes here. A confirmed Mind card
+    (action_id) keeps everything in its own transaction instead: plan approval and hand-over join it, events wait
+    in pending_events, and what must follow the commit (stopping planners and jobs, publishing a hand-over's
+    candidate, closing a dropped pull request) goes to ``after`` for work_services.finish()."""
+    if action_id and (pending_events is None or after is None):
+        raise DecisionError("A Mind resolution leaves its events and follow-up work to its confirmation")
     if decision.status != "open":
         raise DecisionError("This decision is already resolved")
     valid = {o.get("value") for o in decision.options or []} | {"dismiss"}
@@ -46,7 +49,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
     decision.resolution = resolution
     decision.comment = comment.strip()[:8000]
-    decision.attribution = {"source": "mind", "action_id": action_id} if action_id else None
+    # A confirmed Mind card, or a Factory agent acting on its own (the Lead: {"source": "lead", "run_id": …}).
+    decision.attribution = {"source": "mind", "action_id": action_id} if action_id else attribution
     decision.resolved_by = user.id
     decision.resolved_at = utcnow()
     decision.reusable = bool(reusable and comment.strip())
@@ -56,6 +60,21 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     take_over: str | None = None
     dropped: str | None = None
     completed: list[dict] = []  # events of tasks this decision completed
+    author = (user.name or user.email) + (" via Mind" if action_id else "")
+
+    def approve(plan: Plan) -> None:
+        if after is None:
+            db.commit()
+            approve_plan(plan.id, approved_by=user.id)
+        else:
+            approve_plan(plan.id, approved_by=user.id, session=db, pending_events=pending_events, by=author,
+                         attribution=decision.attribution)
+
+    def stop(outcome_id: str) -> None:
+        if after is None:
+            orchestrator.cancel_outcome(outcome_id)
+        else:
+            after.append(("stop_outcome", outcome_id))
 
     def guidance(text: str) -> None:
         if text.strip() and outcome:
@@ -68,8 +87,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         plan = (db.query(Plan).filter(Plan.outcome_id == outcome.id, Plan.status == "proposed")
                 .order_by(Plan.version.desc()).first())
         if resolution == "approve" and plan:
-            db.commit()
-            approve_plan(plan.id, approved_by=user.id)
+            approve(plan)
         elif resolution == "replan":
             guidance(comment)
             if plan:
@@ -77,7 +95,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             outcome.status = "planning"
         elif resolution == "cancel":
             outcome.status = "cancelled"
-            orchestrator.cancel_outcome(outcome.id)
+            stop(outcome.id)
     elif kind == "question" and outcome and task is None:
         if resolution == "answer":
             guidance(comment)
@@ -87,11 +105,10 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             plan = (db.query(Plan).filter(Plan.outcome_id == outcome.id, Plan.status == "proposed")
                     .order_by(Plan.version.desc()).first())
             if plan:
-                db.commit()
-                approve_plan(plan.id, approved_by=user.id)
+                approve(plan)
         elif resolution == "cancel":
             outcome.status = "cancelled"
-            orchestrator.cancel_outcome(outcome.id)
+            stop(outcome.id)
     elif kind == "question" and task:
         if resolution == "answer":
             guidance(comment)
@@ -115,6 +132,13 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             task.status = "queued"
         else:
             task.status = "abandoned"
+    elif kind == "budget" and outcome:  # planning stopped at the outcome budget
+        if resolution == "retry":
+            guidance(comment)
+            outcome.status, outcome.blocked_reason = "planning", ""
+        elif resolution == "cancel":
+            outcome.status = "cancelled"
+            orchestrator.cancel_outcome(outcome.id)
     elif kind == "unblock":
         if task:
             if resolution == "retry":
@@ -137,8 +161,18 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             elif resolution == "abandon":
                 task.status = "abandoned"
                 dropped = task.id
-            elif resolution == "take_over":
+            elif resolution == "take_over" and after is None:
                 take_over = task.id  # finished after this decision is recorded
+            elif resolution == "take_over":
+                from .pipeline.handover import HandoverError, mark_handed_over
+
+                try:
+                    info = mark_handed_over(task.id, user, action_id=action_id, session=db,
+                                            pending_events=pending_events)
+                except HandoverError as exc:
+                    raise DecisionError(str(exc)) from None
+                after.extend([("stop_task", task.id, task.workspace_id, task.outcome_id),
+                              ("publish_candidate", task.id, info)])
             elif resolution == "revert":
                 task.status, task.stage, task.blocked_reason = "queued", "revert", ""
             elif resolution in ACCEPTING:
@@ -149,15 +183,15 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                     from .signals import outcome_from_text
 
                     outcome_from_text(db, decision.workspace_id, user, f"Fix: {decision.title}",
-                                      f"{decision.body}\n\n{comment}".strip(), [task.repo_id], source="improvement")
+                                      f"{decision.body}\n\n{comment}".strip(), [task.repo_id], source="improvement",
+                                      action_id=action_id, pending_events=pending_events)
         elif outcome:
             if resolution == "retry":
                 guidance(comment)
                 outcome.status, outcome.blocked_reason = "planning", ""
             elif resolution == "cancel":
                 outcome.status = "cancelled"
-                orchestrator.cancel_outcome(outcome.id)
-    author = (user.name or user.email) + (" via Mind" if action_id else "")
+                stop(outcome.id)
     payload = record(decision.workspace_id, "decision_resolved", f"{author}: {resolution} — {decision.title}",
                      outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
                      data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
@@ -166,11 +200,11 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     if pending_events is not None:
         pending_events.extend(completed)
         pending_events.append(payload)
-        # Keep this on the object timeline even when retry has no guidance text.
-        if action_id and resolution == "retry" and outcome:
+        # Keep a retry without guidance text on the object timeline. With text, guidance() already posted it.
+        if action_id and resolution == "retry" and outcome and not comment.strip():
             db.add(Message(workspace_id=decision.workspace_id, outcome_id=outcome.id,
                            task_id=decision.task_id, author_id=user.id, author_kind="user",
-                           body="Retried task" + (f": {comment.strip()}" if comment.strip() else "."),
+                           body="Retried task." if decision.task_id else "Retried planning.",
                            attribution=decision.attribution))
     else:
         db.commit()
@@ -178,7 +212,10 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         publish_changes([*completed, payload])
     result: dict[str, Any] = {"ok": True}
     if dropped and task and task.pr_number:
-        result["dropped"] = dropped
+        if after is None:
+            result["dropped"] = dropped
+        else:
+            after.append(("close_pull", dropped, "Abandoned"))
     if take_over:
         from .pipeline.handover import HandoverError, mark_handed_over
 

@@ -70,16 +70,29 @@ class ModelSelection:
     builder: str
     verifier: str
     judge: str
+    plan_reviewer: str
+    lead: str
 
 
-def workspace_models(settings: dict[str, Any]) -> ModelSelection:
+# Plans are reviewed by the strongest available model unless the workspace picks one.
+PLAN_REVIEWER_MODEL = "opus-5-5"
+
+
+def workspace_models(settings: dict[str, Any], provider: str | None = None) -> ModelSelection:
+    """The model for each role. Pass the provider that will serve the run (resolve_provider can fall back
+    to another one), so the plan reviewer's default is a model that provider has."""
     models = settings.get("models") or {}
     default = models.get("default") or "gpt-terra"
+    verifier = models.get("verifier") or default
+    on_mindshub = (provider or settings.get("provider") or "mindshub") == "mindshub"
     return ModelSelection(
         planner=models.get("planner") or default,
         builder=models.get("builder") or default,
-        verifier=models.get("verifier") or default,
+        verifier=verifier,
         judge=models.get("judge") or default,
+        plan_reviewer=models.get("plan_reviewer") or (PLAN_REVIEWER_MODEL if on_mindshub else verifier),
+        # The Lead is responsible for an outcome end to end: the strongest model, like the plan reviewer.
+        lead=models.get("lead") or (PLAN_REVIEWER_MODEL if on_mindshub else verifier),
     )
 
 

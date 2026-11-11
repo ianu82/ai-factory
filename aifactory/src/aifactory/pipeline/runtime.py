@@ -27,6 +27,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "review": DEFAULT_REVIEW,
     "provider": "mindshub",
     "decision_judges": "decide",
+    # One agent per outcome, responsible for delivering it (pipeline/lead.py).
+    "lead": {"enabled": True, "run_usd": 2.0, "turns": 30},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
@@ -37,9 +39,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_retry_rounds": 1,
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
-    "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "run_minutes": 60,
+    "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
+               "run_minutes": 60,
                "ci_minutes": 45, "max_changed_lines": 1500},
     "reasoning_effort": "medium",
+    # Per person per UTC day across all their workspaces, the lowest of their workspaces' limits (mind/store.py).
+    "mind": {"daily_budget_usd": 10.0},
 }
 
 
@@ -168,12 +173,13 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     """Run one harness session as a recorded Run. Returns (run, result_or_None, error)."""
     settings = (merged_settings(json.loads(canonical_json(spec.effective_settings)))
                 if spec.effective_settings is not None else workspace_settings(spec.workspace_id))
-    models = workspace_models(settings)
-    model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier}[spec.role]
     provider = (resolve_provider(spec.workspace_id, required_provider=settings["provider"])
                 if spec.effective_settings is not None
                 and settings["provider"] != workspace_settings(spec.workspace_id)["provider"]
                 else resolve_provider(spec.workspace_id))
+    models = workspace_models(settings, provider=provider.provider)
+    model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier,
+             "plan_reviewer": models.plan_reviewer}[spec.role]
     model = spec.model_override or provider.model_override or model
     version, snapshot = configuration_version(
         role=spec.role, system=spec.system, harness=spec.harness, provider=provider, model=model,
@@ -289,6 +295,20 @@ def outcome_cost(outcome_id: str) -> tuple[float, bool]:
             func.count(ScorerResult.id).filter(ScorerResult.cost_known.is_(False)),
         ).filter(ScorerResult.run_id.in_(select(Run.id).where(Run.outcome_id == outcome_id))).one()
         return run_cost + score_cost, run_unknown == 0 and score_unknown == 0
+
+
+def outcome_committed(outcome_id: str) -> tuple[float, bool]:
+    """What admitting more paid work must count against the outcome's budget: its recorded cost (outcome_cost), plus
+    what Lead runs in progress have reserved and not yet spent (pipeline/lead.py). A run admitted after a Lead can't
+    spend what the Lead set aside. A restart marks interrupted Lead runs failed, so no reservation outlives its run."""
+    spent, known = outcome_cost(outcome_id)
+    with session_scope() as s:
+        held = 0.0
+        for run in s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status == "running"):
+            reserved = (run.config_snapshot or {}).get("budget_reserved")
+            if isinstance(reserved, (int, float)) and not isinstance(reserved, bool) and reserved > 0:
+                held += max(0.0, float(reserved) - float(run.cost_usd or 0.0))
+    return spent + held, known
 
 
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,
