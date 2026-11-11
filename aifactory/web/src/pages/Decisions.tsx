@@ -15,6 +15,7 @@ export function DecisionsPage() {
   const metrics = useQuery({ queryKey: ["stats", ws.id], queryFn: () => api<{ decision_judges: Record<string, { decided: number; sent_back: number; held: number; overruled: number; overrule_rate: number }> }>(`/api/workspaces/${ws.id}/stats`) });
   const corrected = () => {
     qc.invalidateQueries({ queryKey: ["decisions", ws.id] });
+    qc.invalidateQueries({ queryKey: ["rulings", ws.id] });
     qc.invalidateQueries({ queryKey: ["stats", ws.id] });
   };
   const toggle = async (d: Decision) => {
@@ -25,6 +26,16 @@ export function DecisionsPage() {
     } catch (err) {
       toast((err as Error).message, true);
     }
+  };
+  // Rulings come from their own uncapped list, so an old rule is always shown (and can be retired).
+  const rulings = useQuery({ queryKey: ["rulings", ws.id], queryFn: () => api<{ rulings: { id: string; title: string; text: string; scope: string; by: string; at: string | null; kind: string }[] }>(`/api/workspaces/${ws.id}/rulings`) });
+  const listed = new Set((q.data || []).map((d) => d.id));
+  const older = (rulings.data?.rulings || []).filter((r) => r.kind === "ruling" && !listed.has(r.id));
+  const retire = async (id: string) => {
+    try {
+      await api(`/api/workspaces/${ws.id}/rulings/${id}`, { method: "DELETE" });
+      corrected();
+    } catch (err) { toast((err as Error).message, true); }
   };
   const precedents = (q.data || []).filter((d) => d.reusable && d.status !== "superseded");
   const history = (q.data || []).filter((d) => !d.reusable || d.status === "superseded");
@@ -52,6 +63,15 @@ export function DecisionsPage() {
           <>
             <div className="list-section">Team rules and precedents the Factory follows · {precedents.length}</div>
             {precedents.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>None yet.</div>}
+            {older.length > 0 && <ul className="rows">{older.map((r) => (
+              <li key={r.id} className="row">
+                <span className="dot good" />
+                <div style={{ minWidth: 0 }}><div className="title">{r.title}</div><div className="sub"><span>Team rule · {r.scope}</span></div></div>
+                <div className="meta">
+                  <span>{r.by || "—"} · {ago(r.at)}</span>
+                  {admin && <button className="btn sm ghost" onClick={() => retire(r.id)}>Retire</button>}
+                </div>
+              </li>))}</ul>}
             <ul className="rows">{precedents.map((d) => <Row key={d.id} d={d} admin={admin} toggle={toggle} corrected={corrected} open={() => d.outcome_id && navigate(`/w/${ws.id}/outcomes/${d.outcome_id}`)} />)}</ul>
             <div className="list-section">History · {history.length}</div>
             {history.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>Other resolved decisions will appear here, with who made them.</div>}

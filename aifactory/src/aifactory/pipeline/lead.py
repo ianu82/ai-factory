@@ -479,7 +479,14 @@ class Tools:
             return f"Invalid arguments for {name}."
 
     def _outcome_record(self) -> str:
-        return _bounded(outcome_record(self.outcome_id))
+        from ..mind.tools import clean
+
+        record_ = outcome_record(self.outcome_id)
+        rules = record_.pop("team_rules", [])
+        # Rules are never shortened away with the rest of the record: every one applies.
+        lines = [f"- [{r['scope']}] {clean(r['rule'])}: {clean(r['detail'])}"[:700] for r in rules]
+        return _bounded(record_) + ("\n\nteam_rules (all of them; follow every one):\n" + "\n".join(lines)
+                                    if lines else "\n\nteam_rules: none")
 
     def _task_detail(self, task: str) -> str:
         from .. import serializers as S
