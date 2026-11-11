@@ -774,42 +774,51 @@ def test_review_line_says_what_review_reports_for_the_commit():
     assert not lead.settled(state) and lead.settled({**state, "reviewed": True})
 
 
+class FakeGitHub:
+    """GitHub's review reads through the client's helpers (complete, validated pages)."""
+    reviews_data: list = []
+    comments_data: list = []
+    threads_data: list = []
+
+    def __init__(self, _token):
+        pass
+
+    async def reviews(self, repo, number):
+        return FakeGitHub.reviews_data
+
+    async def issue_comments(self, repo, number):
+        return FakeGitHub.comments_data
+
+    async def review_threads(self, repo, number):
+        return FakeGitHub.threads_data
+
+
+def thread(body, *, resolved=False, line=3, path="a.py"):
+    return {"id": f"t-{path}-{line}", "isResolved": resolved, "path": path, "line": line,
+            "comments": {"nodes": [{"author": {"login": lead.CODEX}, "body": body}]}}
+
+
 def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     from aifactory import github
 
-    calls = []
-
-    class FakeGitHub:
-        def __init__(self, _token):
-            pass
-
-        async def request(self, method, path, *, json=None, params=None, **_kw):
-            calls.append(path)
-            if path.endswith("/reviews"):
-                return [{"commit_id": "an-older-commit", "state": "COMMENTED", "user": {"login": lead.CODEX}}]
-            if "/issues/" in path:
-                return [{"user": {"login": lead.CODEX}, "body": f"Codex Review\\n**Reviewed commit:** `{HEAD[:10]}`"}]
-            return {"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": [
-                {"isResolved": False, "isOutdated": False, "path": "a.py", "line": 3, "comments": {"nodes": [
-                    {"author": {"login": lead.CODEX}, "body": "**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"}]}},
-                {"isResolved": True, "isOutdated": False, "path": "b.py", "line": 1, "comments": {"nodes": [{"body": "P1 Badge"}]}},
-                {"isResolved": False, "isOutdated": True, "path": "c.py", "line": 1, "comments": {"nodes": [{"body": "P0 Badge"}]}},
-            ]}}}}}
-
     monkeypatch.setattr(github, "GitHub", FakeGitHub)
     monkeypatch.setattr(github, "resolve_credential", lambda ws: "token")
+    FakeGitHub.reviews_data = [{"commit_id": "an-older-commit", "state": "COMMENTED", "user": {"login": lead.CODEX}}]
+    FakeGitHub.comments_data = [{"user": {"login": lead.CODEX}, "body": f"Codex Review: Reviewed commit `{HEAD[:10]}`"}]
+    FakeGitHub.threads_data = [thread("**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"),
+                               thread("P1 Badge", resolved=True, path="b.py"),
+                               thread("P0 Badge", line=None, path="c.py")]  # outdated: no line on the current diff
     state = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
     assert state["checked"] and state["reviewed"]  # Codex's receipt names this commit
     assert [(f["severity"], f["path"], f["text"]) for f in state["open"]] == [("P1", "a.py", "Fix the lock")]
     assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: 1 open review finding, 1 of them P0/P1."
 
-    class Broken(FakeGitHub):
-        async def request(self, *a, **k):
-            raise github.GitHubError("rate limited", status=403)
+    class Partial(FakeGitHub):
+        async def review_threads(self, repo, number):  # the helper refuses partial GraphQL data
+            raise github.GitHubError("GitHub GraphQL returned errors or missing data")
 
-    monkeypatch.setattr(github, "GitHub", Broken)
+    monkeypatch.setattr(github, "GitHub", Partial)
     assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["checked"] is False  # unknown, never clean
-
 
 def unreviewed(*_args):
     async def state(ws, repo, number, head):
@@ -839,23 +848,54 @@ def test_a_merge_note_starts_with_the_review_of_its_commit(world, model, monkeyp
     assert row.result["reviews"][world["merge"]]["settled"] is False and row.result["reviews"][world["merge"]]["head"] == HEAD
 
 
-def test_a_push_or_a_pending_review_wakes_the_lead_again(world):
+def test_a_push_wakes_the_lead_again(world):
     merge_ready(world)
     seen = woken()[world["outcome"]]["seen"]
-    with db.session_scope() as s:
-        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
-                  status="succeeded", started_at=db.utcnow() - timedelta(minutes=5), config_snapshot={"seen": seen},
-                  result={"reviews": {world["merge"]: {"head": HEAD, "settled": False}}}))
-    assert world["outcome"] not in woken()  # looked at five minutes ago
-    with db.session_scope() as s:
-        s.query(Run).one().started_at = db.utcnow() - timedelta(minutes=11)
-    assert woken()[world["outcome"]]["reasons"] == ["review of a merge approval may be in now"]
-    with db.session_scope() as s:
-        s.query(Run).one().result = {"reviews": {world["merge"]: {"head": HEAD, "settled": True}}}
-    assert world["outcome"] not in woken()  # reviewed: nothing to look at again
-    merge_ready(world, head="f" * 40)  # a new commit is up for merging
+    lead_run(world, seen, ago=timedelta(minutes=5))
+    assert world["outcome"] not in woken()
+    merge_ready(world, head="f" * 40)  # a new commit is up for merging: a new question
     assert woken()[world["outcome"]]["decisions"] == [world["merge"]]
 
+
+def test_the_watcher_wakes_the_lead_only_when_review_changes(world, monkeypatch):
+    merge_ready(world)
+    states = {"line": None}
+
+    async def review(ws, repo, number, head):
+        return {"head": head, "checked": True, "reviewed": states["reviewed"], "open": states["open"],
+                "changes_requested_by": []}
+
+    monkeypatch.setattr(lead, "review_state", review)
+    assert asyncio.run(lead.watch_reviews()) == 0  # the Lead hasn't looked yet: its own wake covers it
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
+    with db.session_scope() as s:  # the Lead advised while review wasn't in
+        s.query(Run).one().result = {"reviews": {world["merge"]: {
+            "head": HEAD, "settled": False, "line": "Review of PR #12 at abcdef1: not in yet."}}}
+    states.update(reviewed=False, open=[])
+    assert asyncio.run(lead.watch_reviews()) == 0 and world["outcome"] not in woken()  # nothing changed
+    states.update(reviewed=True, open=[{"severity": "P1"}])  # the review arrives, with a P1
+    assert asyncio.run(lead.watch_reviews()) == 1
+    assert woken()[world["outcome"]]["reasons"] == ["what review says about a merge approval changed"]
+    assert asyncio.run(lead.watch_reviews()) == 0  # recorded: the same state isn't a change again
+    with db.session_scope() as s:
+        event = s.query(Event).filter_by(kind="lead_review_changed").one()
+        assert event.message == "Review of PR #12 at abcdef1: 1 open review finding, 1 of them P0/P1."
+
+
+def test_every_open_merge_approval_is_read(world, monkeypatch):
+    monkeypatch.setattr(lead, "review_state", unreviewed())
+    with db.session_scope() as s:
+        for n in range(6):
+            t = Task(workspace_id=world["ws"], outcome_id=world["outcome"], plan_id=world["plan"],
+                     repo_id=world["repo"], key=f"T{n + 10}", title=f"Task {n}", status="awaiting_approval",
+                     pr_number=100 + n, head_sha=f"{n}" * 40)
+            s.add(t)
+            s.flush()
+            s.add(Decision(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=t.id, kind="approve_merge",
+                           title=f"Merge PR #{100 + n}?", options=[{"value": "approve"}, {"value": "reject"}]))
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    assert len(tools.lines) == 6  # no approval goes unread, however many there are
 
 def test_continuing_past_the_budget_wakes_the_lead(world):
     seen = woken()[world["outcome"]]["seen"]

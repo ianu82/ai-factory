@@ -58,18 +58,10 @@ MAX_MINUTES = 15
 PER_RUN = {"resolve_decision": 5, "post_guidance": 3, "note_for_people": 5, "post_update": 2}
 RESULT_CHARS = 40_000
 # Merge approvals: what review says about the exact commit up for merging, read from GitHub on every run.
-REVIEW_RECHECK = timedelta(minutes=10)  # while that commit's review isn't in, look again this often
+REVIEW_RECHECK = timedelta(minutes=10)  # how often the watcher reads what review says about open merge approvals
 CODEX = "chatgpt-codex-connector[bot]"
 SEVERITY = re.compile(r"\b(P[0-3]) Badge")
 BLOCKING = ("P0", "P1")
-THREADS = """query($owner: String!, $name: String!, $number: Int!, $after: String) {
-  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    reviewThreads(first: 100, after: $after) {
-      nodes { isResolved isOutdated path line comments(first: 1) { nodes { author { login } body } } }
-      pageInfo { hasNextPage endCursor }
-    }
-  } }
-}"""
 MAX_OUTPUT = 8000  # tokens a Lead request may write
 MIN_OUTPUT = 512  # below this a request can't do anything useful: the run stops instead
 UNPRICED_OUTPUT = 4000  # without a price, a smaller reply bounds what one request can spend
@@ -323,8 +315,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append("you've just joined this outcome")
             if ending:
                 reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
-            if done is not None and _reviews_due(s, done, marks, now):
-                reasons.append("review of a merge approval may be in now")
+            if done is not None and s.query(Event.id).filter(
+                    Event.outcome_id == o.id, Event.kind == "lead_review_changed",
+                    Event.created_at > done.started_at).first() is not None:
+                reasons.append("what review says about a merge approval changed")
             continued = None if finished else s.query(func.max(Decision.resolved_at)).filter(
                 Decision.outcome_id == o.id, Decision.kind == "budget", Decision.status == "resolved",
                 Decision.resolution == "retry").scalar()
@@ -363,19 +357,56 @@ def _progress(db, outcome_id: str, after: Any, now: datetime) -> list[int]:
     return [row.id for row in query.order_by(Event.id)]
 
 
-def _reviews_due(db, done: Run, marks: dict[str, str], now: datetime) -> bool:
-    """A merge approval whose commit the last finished run found unreviewed (or couldn't read) is looked at again
-    every REVIEW_RECHECK, while the decision is open and the commit unchanged: the review arrives later."""
-    if now - done.started_at < REVIEW_RECHECK:
-        return False
-    for decision_id, seen in ((done.result or {}).get("reviews") or {}).items():
-        if decision_id not in marks or not isinstance(seen, dict) or seen.get("settled"):
-            continue
-        decision = db.get(Decision, decision_id)
-        task = db.get(Task, decision.task_id) if decision and decision.task_id else None
-        if task is not None and (task.head_sha or "") == seen.get("head"):
-            return True
-    return False
+async def watch_reviews() -> int:
+    """Review can change on a commit nobody pushes to: a reviewer's receipt arrives, someone requests changes, a P0
+    or P1 thread opens. Every REVIEW_RECHECK the orchestrator reads, from GitHub, what review says now about each
+    open merge approval a Lead has already looked at, and compares it with what the Lead (or this watcher) last saw.
+    A change is recorded as lead_review_changed, which wakes that outcome's Lead. Unchanged reviews cost GitHub reads
+    only, no model call. Returns how many changed."""
+    watched = []
+    with session_scope() as s:
+        paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
+        enabled: dict[str, bool] = {}
+        for d in s.query(Decision).filter(Decision.status == "open", Decision.kind == "approve_merge",
+                                          Decision.task_id.isnot(None)):
+            outcome = s.get(Outcome, d.outcome_id) if d.outcome_id else None
+            task = s.get(Task, d.task_id)
+            repo = s.get(Repository, task.repo_id) if task else None
+            if outcome is None or outcome.status in FINISHED or d.workspace_id in paused or task is None \
+                    or repo is None or not task.pr_number or not task.head_sha:
+                continue
+            if d.workspace_id not in enabled:
+                enabled[d.workspace_id] = settings_for(workspace_settings(d.workspace_id))["enabled"]
+            known = _last_review(s, d)
+            if enabled[d.workspace_id] and known is not None:
+                watched.append((d.workspace_id, d.outcome_id, d.task_id, d.id, repo.full_name, task.pr_number,
+                                task.head_sha, known))
+    changed = 0
+    for workspace_id, outcome_id, task_id, decision_id, repo, number, head, known in watched:
+        line = review_line(await review_state(workspace_id, repo, number, head), number)
+        if line != known.get("line") or head != known.get("head"):
+            record(workspace_id, "lead_review_changed", line, outcome_id=outcome_id, task_id=task_id,
+                   data={"decision_id": decision_id, "head": head, "line": line})
+            changed += 1
+    return changed
+
+
+def _last_review(db, decision: Decision) -> dict[str, Any] | None:
+    """What was last seen of a merge approval's review: by the Lead's latest finished run, or by the watcher since."""
+    seen: tuple[datetime, dict[str, Any]] | None = None
+    for run in db.query(Run).filter(Run.outcome_id == decision.outcome_id, Run.role == "lead",
+                                    Run.status == "succeeded").order_by(Run.started_at.desc()).limit(5):
+        review = ((run.result or {}).get("reviews") or {}).get(decision.id)
+        if isinstance(review, dict):
+            seen = (run.started_at, review)
+            break
+    for event in db.query(Event).filter(Event.outcome_id == decision.outcome_id, Event.kind == "lead_review_changed") \
+            .order_by(Event.id.desc()).limit(20):
+        if (event.data or {}).get("decision_id") == decision.id:
+            if seen is None or event.created_at > seen[0]:
+                seen = (event.created_at, event.data)
+            break
+    return seen[1] if seen else None
 
 
 async def review_state(workspace_id: str, repo: str, number: int, head: str) -> dict[str, Any]:
@@ -387,41 +418,29 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
     state: dict[str, Any] = {"head": head, "checked": False, "reviewed": False, "open": [],
                              "changes_requested_by": []}
     try:
+        # The client's helpers read every page and refuse partial GraphQL data: a partial read is never clean.
         gh = GitHub(resolve_credential(workspace_id))
         latest: dict[str, str] = {}
-        for review in await gh.request("GET", f"/repos/{repo}/pulls/{number}/reviews", params={"per_page": 100}):
+        for review in await gh.reviews(repo, number):
             if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
                 state["reviewed"] = True
             if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                 latest[(review.get("user") or {}).get("login", "")] = review["state"]
         state["changes_requested_by"] = sorted(u for u, st in latest.items() if st == "CHANGES_REQUESTED" and u)
-        for page in range(1, 4):  # Codex reports each commit it reviewed in a PR comment naming it
-            comments = await gh.request("GET", f"/repos/{repo}/issues/{number}/comments",
-                                        params={"per_page": 100, "page": page})
-            if any((c.get("user") or {}).get("login") == CODEX and head[:10] in (c.get("body") or "")
-                   for c in comments):
-                state["reviewed"] = True
-            if len(comments) < 100:
-                break
-        owner, _, name = repo.partition("/")
-        after = None
-        for _ in range(5):
-            data = await gh.request("POST", "/graphql", json={"query": THREADS, "variables": {
-                "owner": owner, "name": name, "number": number, "after": after}})
-            threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
-            for t in threads["nodes"]:
-                if t.get("isResolved") or t.get("isOutdated"):
-                    continue
-                first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
-                body = first.get("body") or ""
-                found = SEVERITY.search(body)
-                state["open"].append({"severity": found.group(1) if found else "", "path": t.get("path") or "",
-                                      "line": t.get("line"), "by": ((first.get("author") or {}).get("login") or ""),
-                                      "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
-            if not (threads.get("pageInfo") or {}).get("hasNextPage"):
-                state["checked"] = True
-                break
-            after = threads["pageInfo"].get("endCursor")
+        # Codex reports each commit it reviewed in a PR comment naming it.
+        if any((c.get("user") or {}).get("login") == CODEX and head[:10] in (c.get("body") or "")
+               for c in await gh.issue_comments(repo, number)):
+            state["reviewed"] = True
+        for t in await gh.review_threads(repo, number):
+            if t.get("isResolved") or t.get("line") is None:  # resolved, or outdated (no line on the current diff)
+                continue
+            first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
+            body = first.get("body") or ""
+            found = SEVERITY.search(body)
+            state["open"].append({"severity": found.group(1) if found else "", "path": t.get("path") or "",
+                                  "line": t.get("line"), "by": ((first.get("author") or {}).get("login") or ""),
+                                  "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
+        state["checked"] = True
     except (GitHubError, KeyError, TypeError, ValueError) as exc:
         log.warning("review state of %s#%s unreadable: %s", repo, number, exc)
         state["checked"] = False
@@ -574,7 +593,7 @@ class Tools:
                 repo = s.get(Repository, task.repo_id) if task else None
                 if task is not None and repo is not None and task.pr_number and task.head_sha:
                     wanted.append((d.id, repo.full_name, task.pr_number, task.head_sha))
-        for decision_id, repo, number, head in wanted[:5]:
+        for decision_id, repo, number, head in wanted:
             state = await review_state(self.ws, repo, number, head)
             self.reviews[decision_id] = state
             self.lines[decision_id] = review_line(state, number)
