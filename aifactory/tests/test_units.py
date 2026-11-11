@@ -335,6 +335,10 @@ def test_tree_id_tells_when_the_files_of_a_checkout_changed_and_leaves_its_index
         # Putting the files back gives the first id again: the id depends on the files alone.
         assert (await sb.exec("echo before > source.py && echo candidate > new.py && rm 'made by a check.txt'")).ok
         assert await tree_id(sb) == start
+        # A checkout the Factory made ignores its scratch directory (.git/info/exclude): the id is still there.
+        assert (await sb.exec("mkdir -p .git/info && printf '\\n.factory/\\n' >> .git/info/exclude")).ok
+        assert "!! .factory/" in (await sb.exec("git status --porcelain --ignored")).output
+        assert await tree_id(sb) == start
     asyncio.run(go())
     assert git("ls-files") == tracked and git("diff", "--cached", "--name-only") == ""
     assert "?? new.py\n" in git("status", "--porcelain")

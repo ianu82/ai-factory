@@ -290,9 +290,12 @@ async def tree_id(sandbox: LocalSandbox) -> str | None:
     could not say. Two equal ids mean the same files with the same content. Ignored files (caches, a local
     database) and the scratch directory are not part of it. The files are added to a copy of the index, so the
     checkout's own index is left as it was."""
+    # The scratch directory is dropped from the copy after adding, not kept out with an exclude pathspec: where the
+    # checkout ignores it (checkout() lists it in .git/info/exclude), `git add` fails for a pathspec that names it.
     script = ('index="$(mktemp -d)/index"; cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null; '
-              "GIT_INDEX_FILE=\"$index\" git add -A -- . ':(top,exclude).factory' ':(top,exclude).factory/**' "
-              '>/dev/null 2>&1 && GIT_INDEX_FILE="$index" git write-tree; rm -rf "$(dirname "$index")"')
+              'export GIT_INDEX_FILE="$index"; git add -A >/dev/null 2>&1 && '
+              f"git rm -r -q --cached --ignore-unmatch -- ':(top){SCRATCH}' >/dev/null 2>&1 && git write-tree; "
+              'rm -rf "$(dirname "$index")"')
     result = await sandbox.exec(script, timeout=120)
     last = result.output.strip().rpartition("\n")[2].strip()
     return last if _TREE_ID.fullmatch(last) else None
