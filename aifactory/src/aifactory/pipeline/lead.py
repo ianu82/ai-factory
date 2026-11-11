@@ -23,7 +23,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
@@ -130,7 +130,8 @@ You were woken because something on your outcome needs judgement. Read the outco
   over), or when you are not confident, leave a note for people (note_for_people) with what you found and the
   option you recommend. People read it in the outcome and the Inbox.
 - When a person has posted on the outcome, reply with note_for_people. Answer their question directly.
-- Keep the outcome's conversation current. When you first join an outcome, or progress woke you, post one short
+- Keep the outcome's conversation current. When you first join an outcome, when progress woke you, and when the
+  outcome has ended, post one short
   update with post_update: what happened since your last update and what it means, then what happens next. People
   see each agent step under your update, so don't list them; say what they add up to. Two to four sentences.
 Finish with a short summary of what you did and what is still waiting, then call finish.
@@ -226,7 +227,9 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
     woken: list[dict[str, Any]] = []
     with session_scope() as s:
         paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
-        outcomes = s.query(Outcome).filter(or_(Outcome.status.notin_(FINISHED), Outcome.completed_at > now - JUST_FINISHED),
+        # Cancelled outcomes have no completed_at: when they ended is their last update.
+        ended = func.coalesce(Outcome.completed_at, Outcome.updated_at)
+        outcomes = s.query(Outcome).filter(or_(Outcome.status.notin_(FINISHED), ended > now - JUST_FINISHED),
                                            Outcome.source != "review").all()
         cache: dict[str, dict[str, Any]] = {}
         budgets: dict[str, Any] = {}
@@ -257,8 +260,14 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             changed = [d for d, mark in marks.items() if known.get(d) != mark]
             since = _parse(seen.get("posts_until")) if done is not None else now - FIRST_LOOK
             posts = [] if finished else _people_posts(s, o.id, since)
-            progress = _progress(s, o.id, seen.get("event_id"), now)
-            joined = last is None and not finished and o.created_at > now - FIRST_LOOK
+            progress = [] if finished else _progress(s, o.id, seen.get("event_id"), now)
+            # Durable markers, so a run that didn't post the update is retried: an introduction until the Lead has
+            # posted one on this outcome, and the ending until a run that succeeded started after it.
+            introduced = s.query(Message.id).filter(Message.outcome_id == o.id, Message.author_kind == "lead").first()
+            joined = not finished and introduced is None and o.created_at > now - FIRST_LOOK
+            ended_at = o.completed_at or o.updated_at
+            reported = done is not None and ended_at is not None and done.started_at >= ended_at
+            ending = finished and not reported
             if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
                 progress = []  # batch progress into one update
             reasons = []
@@ -270,6 +279,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append(f"{len(progress)} step{'s' if len(progress) != 1 else ''} of progress to report")
             if joined:
                 reasons.append("you've just joined this outcome")
+            if ending:
+                reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
@@ -280,7 +291,9 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             until = posts[-1].created_at.isoformat() if posts else seen.get("posts_until")
             woken.append({"workspace_id": o.workspace_id, "outcome_id": o.id, "reasons": reasons,
                           "decisions": changed, "seen": {"decisions": marks, "posts_until": until,
-                                                         "event_id": max(progress) if progress else seen.get("event_id")}})
+                                                         "event_id": max(progress) if progress else seen.get("event_id"),
+                                                         # Progress, joining and ending each need a posted update.
+                                                         "update_due": bool(progress or joined or ending)}})
     return woken
 
 
@@ -644,6 +657,9 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         async with asyncio.timeout(minutes * 60):
             summary = await _loop(client, model, ledger, tools, settings, cfg["turns"], number, reasons, outcome_id,
                                   budget)
+        if seen.get("update_due") and not any(a["tool"] == "post_update" for a in tools.actions):
+            # Woken to report: a run that didn't fails, so the next run (after RETRY_AFTER) reports it.
+            raise LeadFailed("The Lead didn't post the update it was woken to give")
         status = "succeeded"
     except asyncio.CancelledError:
         status, error = "cancelled", "Stopped"

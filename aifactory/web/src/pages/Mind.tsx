@@ -152,6 +152,8 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
   const title = state.active?.title || "New conversation";
   // A conversation that became an outcome continues with the outcome's Lead; Mind is still there, privately.
   const outcome = state.active?.id === threadId ? state.active.outcome ?? null : null;
+  // A finished outcome's Lead no longer answers messages: the composer goes back to Mind.
+  const leadOpen = !!outcome && !["completed", "cancelled", "partially_completed"].includes(outcome.status);
   const [privately, setPrivately] = useState(false);
   const reloaded = useRef(false);
   useEffect(() => { setPrivately(false); reloaded.current = false; }, [threadId]);
@@ -186,12 +188,12 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
       <div className="mind-bottom">
         <div className="mind-column">
           <Notice status={state.status} workspaceId={threadWorkspace || workspaceId} onRetry={threadWorkspace ? recheck : undefined} />
-          {outcome && !privately ? <LeadComposer outcome={outcome} onPrivate={() => setPrivately(true)} /> : <>
+          {outcome && leadOpen && !privately ? <LeadComposer outcome={outcome} onPrivate={() => setPrivately(true)} /> : <>
             {/* Stop only while a reply streams: busy also covers loading the history, which Stop must not abort. */}
             <MindComposer onSend={(text) => void controller.send(text)} onStop={() => controller.cancel()} running={state.busy && !loading}
               disabled={loading || failed || !!reason} disabledReason={reason || undefined}
-              placeholder={outcome ? "Ask your Mind privately…" : "Reply to Mind…"} autoFocus />
-            {outcome && <button type="button" className="linkish mind-to-lead" onClick={() => setPrivately(false)}>Message the Lead about #{outcome.number} instead</button>}
+              placeholder={leadOpen ? "Ask your Mind privately…" : "Reply to Mind…"} autoFocus />
+            {outcome && leadOpen && <button type="button" className="linkish mind-to-lead" onClick={() => setPrivately(false)}>Message the Lead about #{outcome.number} instead</button>}
           </>}
         </div>
       </div>

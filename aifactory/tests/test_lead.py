@@ -52,6 +52,10 @@ def lead_run(world, seen, *, ago=timedelta(minutes=5), status="succeeded"):
     with db.session_scope() as s:
         s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
                   status=status, started_at=db.utcnow() - ago, config_snapshot={"seen": seen}))
+        if status == "succeeded":  # a run that succeeded has introduced the Lead
+            s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=lead.lead_user(s).id,
+                          author_kind="lead", body="I'm the Lead for #7.", created_at=db.utcnow() - ago,
+                          attribution={"source": "lead", "kind": "update"}))
 
 
 def test_waiting_decisions_and_peoples_posts_wake_the_lead(world):
@@ -211,7 +215,8 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
                                           "comment": "Use the durable queue: jobs must survive restarts."}, 0),
                 call("resolve_decision", {"decision_id": world["merge"], "option": "approve"}, 1),
                 call("note_for_people", {"decision_id": world["merge"],
-                                         "text": "PR #12 is ready: CI and the verifier passed. I recommend merging."}, 2)]}
+                                         "text": "PR #12 is ready: CI and the verifier passed. I recommend merging."}, 2),
+                call("post_update", {"text": "I'm the Lead for #7. T1's question is answered; the merge waits on you."}, 3)]}
         return {"content": "", "tool_calls": [call("finish", {"summary": "Answered T1's question; merge needs you."})]}
 
     model.scripts = {"lead": script}
@@ -222,7 +227,7 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
     assert row.model == "lead-model" and row.provider == "mindshub" and row.turns == 2
     assert row.cost_known and row.cost_usd == round(2 * (1000 * 1 + 200 * 2) / 1e6, 6)
     assert row.result["summary"] == "Answered T1's question; merge needs you."
-    assert [a["tool"] for a in row.result["actions"]] == ["resolve_decision", "note_for_people"]
+    assert [a["tool"] for a in row.result["actions"]] == ["resolve_decision", "note_for_people", "post_update"]
     assert model.calls == ["lead", "lead"]
     first = seen_requests[0]
     assert first[0]["content"].startswith("You are the Lead") and "UNTRUSTED DATA" in first[0]["content"]
@@ -241,7 +246,7 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
         assert guidance.attribution == {"source": "lead", "run_id": row.id}  # attributed in the same transaction
         resolved = s.query(Event).filter_by(kind="decision_resolved").one()
         assert resolved.data["source"] == "lead" and resolved.data["run_id"] == row.id
-        note = s.query(Message).filter_by(author_kind="lead").one()
+        note = next(m for m in s.query(Message).filter_by(author_kind="lead") if (m.attribution or {}).get("decision_id"))
         assert note.attribution == {"source": "lead", "run_id": row.id, "decision_id": world["merge"]}
         kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == world["outcome"]).order_by(Event.id)]
         assert kinds[0] == "run_started" and kinds[-1] == "run_finished"
@@ -595,10 +600,33 @@ def test_a_finished_outcome_reports_how_it_ended_within_the_hour(world):
         o = s.get(Outcome, world["outcome"])
         o.status, o.completed_at = "completed", db.utcnow() - timedelta(minutes=5)
     milestone(world, "outcome_completed", task=False)
-    assert woken()[world["outcome"]]["reasons"] == ["1 step of progress to report"]  # its open decisions don't count
+    due = woken()[world["outcome"]]
+    assert due["reasons"] == ["the outcome has ended (completed)"]  # its open decisions don't count
+    assert due["seen"]["update_due"] is True
+    lead_run(world, due["seen"], ago=timedelta(minutes=2))
+    assert world["outcome"] not in woken()  # a run after the end reported it
     with db.session_scope() as s:
+        s.query(Run).delete()
         s.get(Outcome, world["outcome"]).completed_at = db.utcnow() - timedelta(hours=2)
-    assert world["outcome"] not in woken()
+    assert world["outcome"] not in woken()  # too long ago
+
+
+def test_a_cancelled_outcome_reports_how_it_ended(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=20))
+    with db.session_scope() as s:  # cancelling records no completion time: when it ended is its last update
+        o = s.get(Outcome, world["outcome"])
+        o.status, o.updated_at = "cancelled", db.utcnow() - timedelta(minutes=3)
+    assert woken()[world["outcome"]]["reasons"] == ["the outcome has ended (cancelled)"]
+
+
+def test_a_run_woken_to_report_fails_if_it_posts_no_update(world, model):
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Nothing to add"})]}}
+    due = woken()[world["outcome"]]  # a new outcome: the Lead introduces itself
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], due["reasons"], due["seen"], due["decisions"]))
+    assert row.status == "failed" and "didn't post the update" in row.error
+    with db.session_scope() as s:
+        s.query(Run).delete()
+    assert "you've just joined this outcome" in woken()[world["outcome"]]["reasons"]  # still owed
 
 
 def test_post_update_adds_to_the_outcomes_conversation(world):

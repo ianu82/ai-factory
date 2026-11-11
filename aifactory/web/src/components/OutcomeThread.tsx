@@ -10,6 +10,7 @@ import { DecisionCard } from "./DecisionCard";
 import { OutcomeDetail } from "./OutcomeDetail";
 
 const FINISHED = ["completed", "cancelled", "partially_completed"];
+const SETTLE_MS = 45 * 60_000;
 const RESOLUTION: Record<string, string> = {
   answer: "Answered", approve: "Approved", reject: "Changes requested", replan: "Sent back to the planner",
   retry: "Retried", acknowledge: "Acknowledged", abandon: "Abandoned", take_over: "Taken over", cancel: "Cancelled",
@@ -27,10 +28,13 @@ export function OutcomeThread({ outcomeId, onBack }: { outcomeId: string; onBack
     refetchInterval: (query) => (FINISHED.includes(query.state.data?.outcome.status || "") ? false : 15_000),
   });
   const active = !FINISHED.includes(detail.data?.outcome.status || "");
+  // The Lead reports how an outcome ended up to ten minutes (and a retry) after it does: keep listening a while.
+  const ended = Date.parse(detail.data?.outcome.completed_at || detail.data?.outcome.updated_at || "");
+  const settling = !active && Number.isFinite(ended) && Date.now() - ended < SETTLE_MS;
   const convo = useQuery({
     queryKey: ["conversation", ws.id, outcomeId],
     queryFn: () => api<Conversation>(`/api/workspaces/${ws.id}/outcomes/${outcomeId}/conversation`),
-    refetchInterval: active ? 10_000 : false,
+    refetchInterval: active || settling ? 10_000 : false,
   });
   if (detail.isLoading) return <div className="othread"><Skeleton rows={8} /></div>;
   if (detail.error || !detail.data) {
@@ -295,7 +299,7 @@ export function Handoff({ outcome }: { outcome: MindOutcomeLink }) {
   const convo = useQuery({
     queryKey: ["conversation", outcome.workspace_id, outcome.id],
     queryFn: () => api<Conversation>(`/api/workspaces/${outcome.workspace_id}/outcomes/${outcome.id}/conversation`),
-    refetchInterval: active ? 10_000 : false,
+    refetchInterval: active ? 10_000 : 60_000, // after it ends, the Lead's closing update can still arrive
   });
   return (
     <section className="ohandoff" aria-label={`Outcome #${outcome.number}`}>
