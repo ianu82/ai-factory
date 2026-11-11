@@ -145,10 +145,13 @@ def test_the_lead_speaks_as_the_lead(client, signed_in):
     record(ws, "lead_note", "Lead: approve; CI is green and every finding is fixed", outcome_id=outcome,
            actor=lead_id, data={**source, "decision_id": "d2"})
     record(ws, "lead_note", "Lead: waiting on CI", outcome_id=outcome, actor=lead_id, data=source)
-    said = [(m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
-    assert said == [("Lead", "People", "inform"), ("Lead", "People", "propose"), ("Lead", "Builders · T1", "inform"),
-                    ("Lead", "Factory", "answer")]
-    assert len(messages(client, ws, party="lead")["items"]) == 4
+    record(ws, "lead_update", "Lead: T1 is verified; T2 starts now", outcome_id=outcome, actor=lead_id,
+           data={**source, "kind": "update"})  # its post in the outcome's conversation
+    said = [(m["kind"], m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
+    assert said == [("lead_update", "Lead", "People", "inform"), ("lead_note", "Lead", "People", "inform"),
+                    ("lead_note", "Lead", "People", "propose"), ("guidance", "Lead", "Builders · T1", "inform"),
+                    ("decision_resolved", "Lead", "Factory", "answer")]
+    assert len(messages(client, ws, party="lead")["items"]) == 5
 
 
 def test_filters_by_party_intent_and_outcome(client, signed_in):

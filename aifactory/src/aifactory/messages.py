@@ -168,6 +168,7 @@ RULES: dict[str, Rule] = {
     "operator_retry": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "task_handed_over": _handed_over,
     "lead_note": _lead_note,
+    "lead_update": fixed(_const(LEAD), _const(PEOPLE), "inform"),  # the Lead's post in the outcome's conversation
 }
 KINDS = (*RULES, MESSAGE_KIND)
 
