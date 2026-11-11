@@ -5,7 +5,7 @@ from __future__ import annotations
 from aifactory.db import SessionLocal
 from aifactory.events import record
 from aifactory.messages import message_data, party
-from aifactory.models import Outcome, Plan, Repository, Task, User
+from aifactory.models import Decision, Outcome, Plan, Repository, Task, User
 
 
 def world(signed_in):
@@ -141,6 +141,31 @@ def test_a_decision_answered_in_words_shows_the_answer(client, signed_in):
            data={"decision_id": "d2", "resolution": "retry", "comment": ""})
     said = [m["says"] for m in messages(client, ws)["items"]]
     assert said == ["Ian: retry — T1 did not pass", "answer: The shared Redis client."]
+
+
+def test_a_corrected_verdict_shows_the_corrected_answer(client, signed_in):
+    ws, user, outcome, task = world(signed_in)
+    with SessionLocal() as db:
+        # What decisions.overrule() writes: a resolved decision holding the corrected answer, and an event that
+        # names the question and points at that decision.
+        correction = Decision(workspace_id=ws, outcome_id=outcome, task_id=task, kind="question", status="resolved",
+                              title="Which cache should T1 use?", resolution="answer", resolved_by=user,
+                              comment="  The shared Redis client, not a new one. ")
+        elsewhere = Decision(workspace_id="another-workspace", kind="question", title="Theirs", status="resolved",
+                             resolution="answer", comment="Not this workspace's answer.")
+        db.add_all([correction, elsewhere]); db.commit()
+        correction_id, elsewhere_id = correction.id, elsewhere.id
+    record(ws, "decision_overruled", "Ian corrected: Which cache should T1 use?", outcome_id=outcome, task_id=task,
+           actor=user, data={"decision_id": "d1", "correction_decision_id": correction_id})
+    # A correction that cannot be read (deleted, or another workspace's) keeps the event's own message.
+    record(ws, "decision_overruled", "Ian corrected: Which queue?", outcome_id=outcome, task_id=task, actor=user,
+           data={"decision_id": "d2", "correction_decision_id": elsewhere_id})
+    record(ws, "decision_overruled", "Ian corrected: Which bucket?", outcome_id=outcome, task_id=task, actor=user,
+           data={"decision_id": "d3"})
+    items = messages(client, ws)["items"]
+    assert [m["says"] for m in items] == ["Ian corrected: Which bucket?", "Ian corrected: Which queue?",
+                                          "answer: The shared Redis client, not a new one."]
+    assert {(m["from"]["label"], m["to"]["label"], m["intent"]) for m in items} == {("Ian", "Factory", "answer")}
 
 
 def test_the_lead_speaks_as_the_lead(client, signed_in):

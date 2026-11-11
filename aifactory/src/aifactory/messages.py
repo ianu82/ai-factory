@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from .models import Event, Outcome, Task, User
+from .models import Decision, Event, Outcome, Task, User
 from .serializers import ts
 
 INTENTS = ("request", "answer", "propose", "inform", "handoff")
@@ -64,6 +64,7 @@ class Context:
     names: dict[str, str]  # user id -> display name, for the page's actors
     tasks: dict[str, Task]
     operators: set[str] = field(default_factory=set)  # system users that operator relays act as
+    corrections: dict[str, Decision] = field(default_factory=dict)  # decisions that overrule an automatic verdict
 
 
 def _who(event: Event, ctx: Context) -> dict[str, Any]:
@@ -201,13 +202,18 @@ def _declared(event: Event) -> tuple[dict[str, Any], dict[str, Any], str] | None
     return (ends[0], ends[1], intent) if intent in INTENTS else None
 
 
-def _says(event: Event) -> str:
+def _says(event: Event, ctx: Context) -> str:
     """What was said. A decision's event message names who resolved which decision (the question's title), so an
-    answer given in words reads as those words; one given without any keeps the event's message."""
+    answer given in words reads as those words; one given without any keeps the event's message. A correction of an
+    automatic verdict records only that it happened: the corrected answer is on the decision that replaced it."""
     data = event.data or {}
-    comment = data.get("comment")
-    if event.kind == "decision_resolved" and isinstance(comment, str) and comment.strip():
-        resolution = data.get("resolution")
+    resolution, comment = data.get("resolution"), data.get("comment")
+    if event.kind == "decision_overruled":
+        correction = ctx.corrections.get(str(data.get("correction_decision_id") or ""))
+        resolution, comment = (correction.resolution, correction.comment) if correction else (None, None)
+    elif event.kind != "decision_resolved":
+        comment = None
+    if isinstance(comment, str) and comment.strip():
         prefix = f"{resolution}: " if isinstance(resolution, str) and resolution else ""
         return (prefix + comment.strip())[:SAYS]
     return (event.message or "")[:SAYS]
@@ -229,7 +235,7 @@ def project(event: Event, ctx: Context) -> dict[str, Any] | None:
         return None
     task = ctx.tasks.get(event.task_id or "")
     return {"id": event.id, "at": ts(event.created_at), "kind": event.kind, "level": event.level,
-            "from": sender, "to": receiver, "intent": intent, "says": _says(event),
+            "from": sender, "to": receiver, "intent": intent, "says": _says(event, ctx),
             "about": {"outcome_id": event.outcome_id, "task": {"id": task.id, "key": task.key} if task else None,
                       "pr": task.pr_number if task and task.pr_number else None}}
 
@@ -259,7 +265,11 @@ def log(db: Session, workspace_id: str, *, before: int | None = None, limit: int
     operators = {u.id for u in users if u.is_system and (u.email or "").startswith("operator")}
     task_ids = {e.task_id for e in events if e.task_id}
     tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_(task_ids))} if task_ids else {}
-    ctx = Context(names, tasks, operators)
+    corrected = {str((e.data or {}).get("correction_decision_id") or "") for e in events
+                 if e.kind == "decision_overruled"} - {""}
+    corrections = ({d.id: d for d in db.query(Decision).filter(Decision.workspace_id == workspace_id,
+                                                                Decision.id.in_(corrected))} if corrected else {})
+    ctx = Context(names, tasks, operators, corrections)
     items: list[dict[str, Any]] = []
     last_read: int | None = None
     for event in events:
