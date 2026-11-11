@@ -75,4 +75,5 @@ export const DECISION_KIND: Record<string, string> = {
   unblock: "Unblock",
   budget: "Budget",
   ruling: "Team rule",
+  provider_hold: "Provider hold",
 };

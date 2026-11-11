@@ -39,6 +39,88 @@ def test_verifier_cannot_pass_with_failing_criterion():
     assert ok is None and "every criterion" in err
 
 
+def test_only_an_unmet_criterion_or_a_blocker_fails_a_verdict():
+    def report(verdict, status="pass", severity="major"):
+        return {"verdict": verdict, "summary": "s", "criteria": [{"criterion": "c", "status": status, "evidence": "e"}],
+                "findings": [{"severity": severity, "description": "d"}]}
+
+    ok, err = validate_report("verifier", report("fail"))  # every criterion passes and the one finding is major
+    assert ok is None and "A fail verdict needs a criterion that is not met or a blocker finding" in err
+    assert "raise the finding to blocker" in err and "use pass and keep the findings as advice" in err
+    assert validate_report("verifier", report("fail", severity="minor"))[0] is None
+    assert validate_report("verifier", {"verdict": "fail", "summary": "s", "criteria": []})[0] is None
+    for accepted in (report("fail", severity="blocker"), report("fail", status="fail"),
+                     report("fail", status="unverified"), report("pass"), report("pass", severity="minor")):
+        assert validate_report("verifier", accepted) == (accepted, "")
+    ok, err = validate_report("verifier", report("pass", severity="blocker"))
+    assert ok is None and "cannot include blocker findings" in err
+
+
+def test_a_verifier_report_needs_a_result_for_every_criterion_when_the_criteria_are_known():
+    report = {"verdict": "pass", "summary": "s", "criteria": [{"criterion": "c", "status": "pass", "evidence": "e"}]}
+    three = ["c", "d", "e"]
+    ok, err = validate_report("verifier", report, expected_criteria=three)
+    assert ok is None and "results for 1 of the task's 3 acceptance criteria (2 missing)" in err
+    assert "Not covered: 2. d; 3. e. Report on every criterion once" in err
+    failing = {**report, "verdict": "fail", "criteria": [{"criterion": "c", "status": "fail", "evidence": "e"}]}
+    assert validate_report("verifier", failing, expected_criteria=three)[0] is None  # a failing report too
+    # Callers that do not know the criteria, a task without criteria, and other roles behave as before.
+    assert validate_report("verifier", report) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=None) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=[]) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=["c"]) == (report, "")
+    assert validate_report("verifier", report, expected_criteria=["c", " "]) == (report, "")  # a blank is no criterion
+    built = {"status": "done", "summary": "s"}
+    assert validate_report("builder", built, expected_criteria=three) == (built, "")
+
+
+def test_each_result_in_a_verifier_report_counts_for_one_criterion_only():
+    def report(*texts):
+        return {"verdict": "pass", "summary": "s",
+                "criteria": [{"criterion": text, "status": "pass", "evidence": "e"} for text in texts]}
+
+    listing, empty = "The page lists every open order", "The page shows a message when there are no orders"
+    wanted = [listing, empty]
+    # The right number of results, but one criterion twice, a text that is not a criterion of the task, or the
+    # other criterion in other words, cut short, or numbered with other words: none of them says which is meant.
+    for texts in ((listing, listing), (listing, "The code is tidy"), (listing, ""),
+                  (listing, "The page shows a message when no orders exist"),
+                  (listing, "The page shows a message when there are"),
+                  (listing, "2. The page shows a message")):
+        ok, err = validate_report("verifier", report(*texts), expected_criteria=wanted)
+        assert ok is None and "results for 1 of the task's 2 acceptance criteria (1 missing)" in err, texts
+        assert f"Not covered: 2. {empty}. Report on every criterion once" in err, texts
+        assert "copied exactly from the task's list or by its list number alone" in err, texts
+    ok, err = validate_report("verifier", report("Looks fine", "Tests pass"), expected_criteria=wanted)
+    assert ok is None and "results for 0 of the task's 2 acceptance criteria (2 missing)" in err
+    # A result that names its criterion counts: in any order; with its list number, other case and spacing or a
+    # full stop; by its list number alone; beside the reviewer's own.
+    for texts in ((empty, listing),
+                  ("1. the page lists every open order.", "2.  The page shows a message  when there are no orders"),
+                  ("Criterion 1", "2"),
+                  (listing, empty, "No regressions in the existing tests")):
+        accepted = report(*texts)
+        assert validate_report("verifier", accepted, expected_criteria=wanted) == (accepted, ""), texts
+    # A result named by number is kept with the criterion's text, so the report says what was checked.
+    numbered = report("Criterion 2", "#1", "7")
+    assert validate_report("verifier", numbered, expected_criteria=wanted)[0] is numbered
+    assert [c["criterion"] for c in numbered["criteria"]] == [empty, listing, "7"]
+    # Two criteria that read alike are two: a second result for one of them, reworded, is not a result for the other.
+    valid, invalid = "API returns 200 for valid requests", "API returns 400 for invalid requests"
+    ok, err = validate_report("verifier", report(valid, "The API returns 200 for a valid request"),
+                              expected_criteria=[valid, invalid])
+    assert ok is None and f"Not covered: 2. {invalid}. Report on every criterion once" in err
+    assert validate_report("verifier", report(invalid, valid), expected_criteria=[valid, invalid])[0] is not None
+    # Two criteria that differ in a single letter are still two criteria.
+    files = ["a.txt exists", "b.txt exists"]
+    assert validate_report("verifier", report("a.txt exists", "a.txt exists"), expected_criteria=files)[0] is None
+    assert validate_report("verifier", report(*files), expected_criteria=files)[0] is not None
+    # A task that lists one criterion twice needs two results for it.
+    twice = ["It works", "It works"]
+    assert validate_report("verifier", report(*twice), expected_criteria=twice)[0] is not None
+    assert validate_report("verifier", report("It works"), expected_criteria=twice)[0] is None
+
+
 def test_verifier_reports_need_lists_of_objects():
     for criteria in (["the endpoint returns 200"], "all criteria pass"):
         ok, err = validate_report("verifier", {"verdict": "pass", "summary": "ok", "criteria": criteria})
@@ -54,6 +136,35 @@ def test_stored_verdicts_with_malformed_lists_are_read_without_crashing():
     assert _objects("text") == [] and _objects(None) == []
     verdict = {"criteria": ["c", {"criterion": "d", "status": "fail"}], "findings": "none"}
     assert _actionable({"result": "verification_failed", "verdict": verdict})
+
+
+def test_two_diffs_of_a_change_are_compared_file_by_file():
+    from aifactory.pipeline.delivery import _diff_changes
+
+    def part(name, line):
+        return (f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1 +1 @@\n-old\n+{line}\n").encode()
+
+    before = part("a.py", "one") + part("b.py", "two") + part("gone.py", "three")
+    after = part("a.py", "one") + part("b.py", "2") + part("new.py", "four")
+    assert _diff_changes(before, after) == (["b.py", "new.py", "gone.py (no longer part of the change)"], ["a.py"])
+    assert _diff_changes(before, before) == ([], ["a.py", "b.py", "gone.py"])
+    assert _diff_changes(b"", after) == (["a.py", "b.py", "new.py"], [])
+
+
+def test_a_criterion_that_passed_before_and_does_not_now_is_a_flip():
+    from aifactory.pipeline.delivery import _flipped
+
+    def verdict(**statuses):
+        return {"criteria": [{"criterion": c, "status": status} for c, status in statuses.items()]}
+
+    before = {"criteria": [{"criterion": "  The page LOADS ", "status": "pass"},
+                           {"criterion": "saves", "status": "fail"},
+                           {"criterion": "exports", "status": "pass"}, "not an object"]}
+    after = {"criteria": [{"criterion": "the page loads", "status": "fail"}, {"criterion": "saves", "status": "fail"},
+                          {"criterion": "exports", "status": "unverified"}, {"criterion": "new", "status": "fail"}]}
+    assert _flipped(before, after) == ["the page loads", "exports"]  # matched trimmed and case-folded
+    assert _flipped(before, verdict(exports="pass")) == [] and _flipped({}, after) == []
+    assert _flipped(verdict(exports="pass"), verdict(**{"exports as CSV": "fail"})) == []  # reworded: no match
 
 
 def test_sandbox_exec_timeout_and_clipping(tmp_path):

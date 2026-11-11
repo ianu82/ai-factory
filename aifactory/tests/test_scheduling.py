@@ -10,7 +10,7 @@ import pytest
 
 from aifactory.config import get_settings, reset_settings_cache
 from aifactory.db import session_scope
-from aifactory.models import Organization, Outcome, Plan, Repository, Task, User, Workspace
+from aifactory.models import Decision, Organization, Outcome, Plan, Repository, Task, User, Workspace
 from aifactory.pipeline import orchestrator as module
 from aifactory.pipeline.orchestrator import Orchestrator
 from aifactory.pipeline.runtime import merged_settings
@@ -68,7 +68,7 @@ class Jobs:
             await run(item_id, "planning")
 
         class Runner:
-            def __init__(self, item_id, cancel, repo_lock):
+            def __init__(self, item_id, cancel, repo_lock, owner=None):
                 self.id = item_id
 
             async def run(self):
@@ -175,6 +175,36 @@ def test_blocked_and_paused_candidates_skip_without_consuming_turns(queue, monke
             await jobs.tick()
             assert jobs.started == [a1, c1, a2, b1]
             assert paused not in jobs.started
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("phase", ["planning", "delivery"])
+def test_a_workspace_on_provider_hold_gets_nothing_started_until_it_is_resumed(queue, monkeypatch, phase):
+    set_limit(monkeypatch, phase, 4)
+    started = queue(phase)
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [started]
+            with session_scope() as s:
+                s.add(Decision(id="hold", workspace_id="w1", kind="provider_hold",
+                               title="Model provider refused: work is on hold",
+                               options=[{"value": "retry", "label": "Resume work"}]))
+            held = queue(phase, priority=0)
+            other = queue(phase, ws="w2")
+            await jobs.tick()
+            # What was already running is left alone; another workspace's work still starts.
+            assert jobs.started == [started, other]
+            assert set(jobs.orch._planning if phase == "planning" else jobs.orch._tasks) == {started, other}
+            with session_scope() as s:
+                s.get(Decision, "hold").status = "resolved"
+            await jobs.tick()
+            assert jobs.started == [started, other, held]
         finally:
             await jobs.stop()
 
@@ -320,5 +350,71 @@ def test_planning_and_delivery_keep_independent_per_priority_cursors(queue, monk
             assert jobs.started[-2:] == [plan_low_b, build_b]
         finally:
             await jobs.stop()
+
+    asyncio.run(go())
+
+
+def lease(task_id):
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        return task.status, task.lease_owner, task.lease_expires_at
+
+
+def test_a_dispatched_task_is_leased_to_this_instance_until_its_job_ends(queue, monkeypatch):
+    from aifactory.db import utcnow
+
+    set_limit(monkeypatch, "delivery", 1)
+    task_id = queue("delivery")
+    term = timedelta(seconds=module.LEASE_SECONDS)
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            before = utcnow()
+            await jobs.tick()
+            status, owner, expires = lease(task_id)
+            assert (status, owner) == ("running", jobs.orch.instance)
+            assert before + term <= expires <= utcnow() + term
+            await jobs.complete(task_id)
+            assert lease(task_id) == ("completed", "", None)  # the expiry goes with the owner
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("ending", ["shutdown", "returns", "crashes"])
+def test_a_job_whose_task_another_instance_took_leaves_it_alone(queue, monkeypatch, ending):
+    """Its lease ran out while this instance was stalled, and another one started the task: same status, another
+    owner. However this instance's job ends, the task is no longer its to requeue or block."""
+    set_limit(monkeypatch, "delivery", 1)
+    task_id = queue("delivery")
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        release = asyncio.Event()
+
+        class Runner:
+            def __init__(self, item_id, cancel, repo_lock, owner=None):
+                pass
+
+            async def run(self):
+                await release.wait()
+                if ending == "crashes":
+                    raise RuntimeError("the sandbox went away")
+
+        monkeypatch.setattr(module, "TaskRunner", Runner)
+        try:
+            await jobs.tick()
+            expires = lease(task_id)[2]
+            with session_scope() as s:
+                s.get(Task, task_id).lease_owner = "other"
+            if ending != "shutdown":
+                release.set()
+                await asyncio.sleep(0)
+                assert not jobs.orch._tasks  # the job has ended
+        finally:
+            await jobs.stop()
+        assert lease(task_id) == ("running", "other", expires)
 
     asyncio.run(go())

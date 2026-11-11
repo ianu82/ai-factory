@@ -13,13 +13,19 @@ from ..models import Outcome, Task, Workspace
 STOPPED = {"cancelled", "abandoned", "handed_over", "completed", "reverted"}
 
 
-def transition(session, task: Task, **fields) -> bool:
+def transition(session, task: Task, *, owner: str | None = None, **fields) -> bool:
+    """`owner` is the instance making the change: the row must still be leased to it, or to nobody (several stages
+    release the lease on purpose and keep working). A runner whose task another instance took changes nothing."""
+    if fields.get("lease_owner") == "":
+        fields["lease_expires_at"] = None  # an expiry never outlives its owner
+    held = () if owner is None else (Task.lease_owner.in_(("", owner)),)
     result = session.execute(
         update(Task).where(
             Task.id == task.id, Task.status == task.status, Task.stage == task.stage,
             Task.status.notin_(STOPPED),
             exists().where(Workspace.id == Task.workspace_id, Workspace.paused.is_(False)),
             exists().where(Outcome.id == Task.outcome_id, Outcome.status != "cancelled"),
+            *held,
         ).values(**fields).execution_options(synchronize_session=False)
     )
     return result.rowcount == 1

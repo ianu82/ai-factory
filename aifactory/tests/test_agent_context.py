@@ -212,3 +212,40 @@ def test_the_verifier_prompt_without_an_outcome_is_unchanged():
     prompt = verify_prompt(task, repo, "base", {"summary": "done"}, [], outcome=outcome, sections=["", "## Extra"])
     assert "## The original request: outcome #4 Greeting" in prompt and "Say hi." in prompt and "- Friendly" in prompt
     assert prompt.endswith("## Extra")
+
+
+def test_the_verifier_prompt_carries_the_previous_review_and_what_changed_since():
+    from types import SimpleNamespace
+
+    from aifactory.prompts import verify_prompt
+
+    task = SimpleNamespace(key="T1", title="t", spec="s", acceptance=["a", "b"])
+    repo = SimpleNamespace(full_name="acme/demo", config={})
+    verdict = {"verdict": "fail", "summary": "The export\n is  wrong.", "criteria": [
+        {"criterion": "a", "status": "pass", "evidence": "ran it"},
+        {"criterion": "b", "status": "fail", "evidence": "x" * 400}],
+        "findings": [{"severity": "blocker", "description": "drops rows", "location": "export.py:9"},
+                     {"severity": "major", "description": "no test"}, {"severity": "minor", "description": "typo"}]}
+
+    def prompt(**previous):
+        return verify_prompt(task, repo, "base", {"summary": "done"}, [], previous={
+            "attempt": 2, "verdict": verdict, "changed": ["export.py"], "unchanged": ["cli.py", "io.py"],
+            "base": "base", **previous})
+
+    assert "## Your previous review" not in verify_prompt(task, repo, "base", {"summary": "done"}, [])
+    text = prompt()
+    assert "## Your previous review (attempt 2)" in text and "Verdict: fail. The export is wrong." in text
+    assert "- [pass] a — ran it" in text
+    assert "- [fail] b — " + "x" * 300 + " … [100 more characters]" in text  # long evidence is cut, and says so
+    assert "Its blocker and major findings:\n- blocker: drops rows export.py:9\n- major: no test\n" in text
+    assert "typo" not in text
+    assert "Files whose diff changed: export.py\nFiles whose diff is the same as then: cli.py, io.py" in text
+    assert "A criterion that passed then stays passed, unless what changed since then broke it" in text
+    assert "A new blocker must point at something that changed since then" in text
+    assert "The base commit moved" not in text and "was not recorded" not in text
+    # What is not known is said, not guessed.
+    unknown = prompt(changed=None, unchanged=None)
+    assert "Nothing is known about which files changed since then" in unknown and "Files whose diff" not in unknown
+    assert "No file's diff changed: the change is exactly as that review saw it." in prompt(changed=[])
+    assert "The base commit moved from older to base" in prompt(base="older")
+    assert "The base commit that review ran against was not recorded" in prompt(base="")
