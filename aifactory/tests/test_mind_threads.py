@@ -328,6 +328,53 @@ async def test_simultaneous_submissions_claim_thread_and_disconnect_persists(wor
     assert send(world, thread, "once").status_code == 409
 
 
+async def test_status_reports_pending_accounting_until_the_charge_settles(world):
+    client, runtime, _, ids = world
+    runtime.total = None  # the provider cannot report this session's cost yet
+    ledger = store.TurnLedger(ids[0], ids[2], runtime=runtime)
+    await ledger.before_call()
+    await ledger.after_call(None)
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("unavailable", "pending")
+    assert "settling" in status["reason"]
+    # Readiness is not probed while a charge is pending (a probe's own admission would refuse and misreport it).
+    probes = []
+    async def probe(workspace_id, ledger):
+        probes.append(workspace_id)
+        return {"status": "ready", "model_id": "scripted"}
+    runtime.readiness = probe
+    client.get("/api/mind/status", params={"workspace_id": ids[2]})
+    assert probes == []
+    runtime.total = .5  # reconciliation can settle it now
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("ready", "settled")
+
+
+def test_status_stays_pending_while_another_request_holds_the_accounting_claim(world, monkeypatch):
+    client, _, _, ids = world
+    async def busy(self):
+        raise store.AccountingError("accounting_busy")
+    monkeypatch.setattr(store.TurnLedger, "reconcile", busy)
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("unavailable", "pending")
+    assert "settling" in status["reason"]
+    # The field name is protocol, not content: a saved secret that happens to equal it never renames it.
+    save_secret(ids[2], "accounting")
+    assert client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()["accounting"] == "pending"
+
+
+async def test_status_reports_pending_after_an_unavailable_probe_whose_cost_is_unknown(world):
+    client, runtime, _, ids = world
+    runtime.total = None  # the provider cannot report the probe's cost yet
+    async def probe(workspace_id, ledger):
+        await ledger.before_call()
+        await ledger.after_call(None)
+        return {"status": "unavailable", "model_id": None, "reason": "model_absent"}
+    runtime.readiness = probe
+    status = client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()
+    assert (status["status"], status["accounting"]) == ("unavailable", "pending")
+
+
 def test_charged_failed_readiness_and_zero_budget(world):
     client, runtime, _, ids = world
     async def probe(workspace_id, ledger):
