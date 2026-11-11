@@ -130,6 +130,39 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     assert any("data:image/png;base64," in json.dumps(body) for body in requests[2:])
 
 
+@pytest.mark.parametrize("seconds_left", [300, 60])
+def test_anton_tool_results_warn_near_the_time_limit_and_only_finish_runs_past_it(tmp_path, monkeypatch, seconds_left):
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    port = _free_port()
+    requests: list = []
+    server = _fake_server(port, requests)
+    try:
+        sb = _sandbox(tmp_path)
+        provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
+        session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
+                                 sandbox=sb, model="fake-model", client=ModelClient(provider),
+                                 ledger=UsageLedger(run_id="r", workspace_settings={}), report_schema=BUILDER_REPORT,
+                                 writable=True, deadline=time.monotonic() + seconds_left)
+        result = asyncio.run(AntonHarness().run(session))
+    finally:
+        server.should_exit = True
+    # finish is never refused: the report is how a session that is out of budget ends.
+    assert result.report == {"status": "done", "summary": "Wrote hello.txt"}
+    # What the agent was shown for its two tool calls (write_file, then read_image) when it reported.
+    outputs = [str(item["output"]) for item in requests[-1]["input"]
+               if isinstance(item, dict) and item.get("type") == "function_call_output"]
+    assert len(outputs) == 2
+    if seconds_left == 300:  # under ten minutes: the tool ran, and its result says how much is left
+        assert (sb.work / "hello.txt").read_text() == "hi from anton\n"
+        assert "Budget: about 4 min and 79 turns are left in this session. Wrap up" in outputs[0]
+        # read_image returns an image and a line of text, not a string: the notice is added to its text.
+        assert "Loaded .factory/screen.jpg" in outputs[1]
+        assert "turns are left in this session. Wrap up" in outputs[1]
+    else:  # under 90 seconds: nothing but finish runs
+        assert not (sb.work / "hello.txt").exists()
+        assert all("so this tool did not run. Call finish now" in output for output in outputs)
+
+
 def test_a_run_is_not_paused_by_antons_per_turn_token_ceiling(tmp_path, monkeypatch):
     # Reworks of large PRs reread a big cached context on every call. Anton's own ceiling (1.25M tokens a turn, cache
     # reads at full weight) stopped those turns to ask a user who isn't there; the run's ledger bounds spend instead.
