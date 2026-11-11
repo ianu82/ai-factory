@@ -680,6 +680,7 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--sunken); border-radius
   .msg-row { padding: 10px 16px 11px; grid-template-columns: 10px 40px minmax(0, 1fr); gap: 0 10px; }
   .msg-divider { display: none; }
   .msg-outcome { max-width: 100%; }
+}
 
 /* ---------- an outcome as a conversation (OutcomeThread) ---------- */
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); border: 0; }

@@ -267,8 +267,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             joined = not finished and introduced is None and o.created_at > now - FIRST_LOOK
             ended_at = o.completed_at or o.updated_at
             # Reported only by an update posted after it ended: a run that merely started afterwards may not have.
+            # Reported only by a closing update: one a run woken for the ending posted. A progress update that
+            # happened to land after the end was written before it and doesn't say how the outcome ended.
             reported = ended_at is not None and any(
-                (m.attribution or {}).get("kind") == "update" for m in s.query(Message).filter(
+                (m.attribution or {}).get("closing") for m in s.query(Message).filter(
                     Message.outcome_id == o.id, Message.author_kind == "lead", Message.created_at >= ended_at))
             ending = finished and not reported
             if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
@@ -296,7 +298,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                           "decisions": changed, "seen": {"decisions": marks, "posts_until": until,
                                                          "event_id": max(progress) if progress else seen.get("event_id"),
                                                          # Progress, joining and ending each need a posted update.
-                                                         "update_due": bool(progress or joined or ending)}})
+                                                         "update_due": bool(progress or joined or ending),
+                                                         "closing": ending}})
     return woken
 
 
@@ -426,6 +429,7 @@ class Tools:
         self.ws, self.outcome_id, self.run_id = workspace_id, outcome_id, run_id
         self.used: dict[str, int] = {}
         self.actions: list[dict[str, Any]] = []
+        self.closing = False  # woken to report how the outcome ended: its update is the closing report
 
     @property
     def source(self) -> dict[str, str]:
@@ -537,7 +541,7 @@ class Tools:
             return "An update needs text."
         with session_scope() as s:
             actor = lead_user(s).id
-            data = {**self.source, "kind": "update"}
+            data = {**self.source, "kind": "update", **({"closing": True} if self.closing else {})}
             s.add(Message(workspace_id=self.ws, outcome_id=self.outcome_id, author_id=actor, author_kind="lead",
                           body=text[:4000], attribution=data))
         record(self.ws, "lead_update", f"Lead: {text[:300]}", outcome_id=self.outcome_id, run_id=self.run_id,
@@ -628,6 +632,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
     notify(workspace_id, "run", run_id)
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings)
     tools = Tools(workspace_id, outcome_id, run_id)
+    tools.closing = bool(seen.get("closing"))
     client = provider = None
     started = False
     status, error, summary = "failed", "", ""

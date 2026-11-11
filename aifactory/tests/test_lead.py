@@ -52,10 +52,11 @@ def lead_run(world, seen, *, ago=timedelta(minutes=5), status="succeeded"):
     with db.session_scope() as s:
         s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
                   status=status, started_at=db.utcnow() - ago, config_snapshot={"seen": seen}))
-        if status == "succeeded":  # a run that succeeded has introduced the Lead
+        if status == "succeeded":  # a run that succeeded posted its update (a closing one if it was woken for that)
             s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=lead.lead_user(s).id,
                           author_kind="lead", body="I'm the Lead for #7.", created_at=db.utcnow() - ago,
-                          attribution={"source": "lead", "kind": "update"}))
+                          attribution={"source": "lead", "kind": "update",
+                                       **({"closing": True} if (seen or {}).get("closing") else {})}))
 
 
 def test_waiting_decisions_and_peoples_posts_wake_the_lead(world):
@@ -603,8 +604,13 @@ def test_a_finished_outcome_reports_how_it_ended_within_the_hour(world):
     due = woken()[world["outcome"]]
     assert due["reasons"] == ["the outcome has ended (completed)"]  # its open decisions don't count
     assert due["seen"]["update_due"] is True
-    lead_run(world, due["seen"], ago=timedelta(minutes=2))
-    assert world["outcome"] not in woken()  # a run after the end reported it
+    assert due["seen"]["closing"] is True
+    lead_run(world, {**due["seen"], "closing": False}, ago=timedelta(minutes=2))  # a progress update after the end
+    with db.session_scope() as s:
+        s.query(Run).filter(Run.started_at > db.utcnow() - timedelta(minutes=3)).one().started_at = db.utcnow() - timedelta(minutes=3)
+    assert world["outcome"] in woken()  # isn't the closing report
+    lead_run(world, due["seen"], ago=timedelta(minutes=1, seconds=30))
+    assert world["outcome"] not in woken()  # a run woken for the ending reported it
     with db.session_scope() as s:
         s.query(Run).delete()
         s.get(Outcome, world["outcome"]).completed_at = db.utcnow() - timedelta(hours=2)
