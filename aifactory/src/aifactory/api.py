@@ -169,17 +169,38 @@ def _mind_settings(value: Any) -> dict[str, Any]:
     return {"daily_budget_usd": float(budget)}
 
 
+def _lead_settings(value: Any) -> dict[str, Any]:
+    """The Lead: on or off, its spend per run in US dollars and its turns per run."""
+    default = DEFAULT_SETTINGS["lead"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "lead accepts only enabled, run_usd and turns")
+    enabled = value.get("enabled", default["enabled"])
+    usd = value.get("run_usd", default["run_usd"])
+    turns = value.get("turns", default["turns"])
+    if type(enabled) is not bool:
+        raise HTTPException(422, "lead.enabled must be true or false")
+    if type(usd) not in (int, float) or not math.isfinite(usd) or not 0 <= usd <= 20:
+        raise HTTPException(422, "lead.run_usd must be a number from 0 to 20")
+    if type(turns) is not int or not 2 <= turns <= 80:  # one to act, and the last for the summary
+        raise HTTPException(422, "lead.turns must be a whole number from 2 to 80")
+    return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
+
+
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         review = review_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     mind = _mind_settings(raw.get("mind"))
-    merged = merged_settings(raw)
+    lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
+    merged = merged_settings({**raw, "lead": lead})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
     merged["mind"] = mind
+    merged["lead"] = lead
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -1215,7 +1236,7 @@ def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = 
 @router.get("/workspaces/{workspace_id}/stats")
 def stats(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    from .metrics import benchmark, first_attempt_result, workspace_metrics
+    from .metrics import benchmark, first_attempt_result, human_message, workspace_metrics
     from .decision_judges import judge_metrics
 
     outcomes = [o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id) if not benchmark(o)]
@@ -1265,8 +1286,8 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
                  "per_completed_task": round(total_cost / max(1, sum(t.status == "completed" for t in tasks)), 2)},
         "tokens": sum(r.input_tokens + r.output_tokens for r in runs) + score_tokens,
         "human": {"decisions": len(decisions), "open": sum(d.status == "open" for d in decisions),
-                  "interventions": db.query(Message).filter(Message.workspace_id == workspace_id,
-                                                            Message.author_kind == "user").count()},
+                  "interventions": sum(human_message(m) for m in db.query(Message).filter(
+                      Message.workspace_id == workspace_id, Message.author_kind == "user"))},
         "harnesses": {h: {"runs": sum(r.harness == h for r in runs),
                           "succeeded": sum(r.harness == h and r.status == "succeeded" for r in runs)}
                       for h in ("native", "codex", "anton")},

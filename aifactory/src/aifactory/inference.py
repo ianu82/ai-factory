@@ -71,6 +71,7 @@ class ModelSelection:
     verifier: str
     judge: str
     plan_reviewer: str
+    lead: str
 
 
 # Plans are reviewed by the strongest available model unless the workspace picks one.
@@ -90,6 +91,8 @@ def workspace_models(settings: dict[str, Any], provider: str | None = None) -> M
         verifier=verifier,
         judge=models.get("judge") or default,
         plan_reviewer=models.get("plan_reviewer") or (PLAN_REVIEWER_MODEL if on_mindshub else verifier),
+        # The Lead is responsible for an outcome end to end: the strongest model, like the plan reviewer.
+        lead=models.get("lead") or (PLAN_REVIEWER_MODEL if on_mindshub else verifier),
     )
 
 

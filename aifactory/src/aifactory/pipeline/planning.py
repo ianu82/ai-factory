@@ -22,7 +22,7 @@ from ..models import Decision, Outcome, Plan, Repository, Run, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_cost, precedents, run_agent, set_outcome,
+from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, precedents, run_agent, set_outcome,
                       merged_settings, workspace_settings)
 
 log = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ def _over_budget(outcome_id: str, settings: dict[str, Any]) -> str:
     budget = settings["budgets"].get("outcome_usd")
     if not budget:
         return ""
-    spent, _ = outcome_cost(outcome_id)
+    spent, _ = outcome_committed(outcome_id)  # including what a running Lead has reserved
     return f"The outcome reached its ${budget:.0f} budget (${spent:.2f} spent)" if spent >= budget else ""
 
 
