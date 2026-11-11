@@ -2549,11 +2549,13 @@ def test_a_provider_problem_after_the_builder_wrote_code_is_still_infrastructure
 
     ScriptedModel.scripts["builder"] = builder
     outcome_id = new_outcome(factory)
-    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    assert drive(lambda: len(_attempt_records(outcome_id)) == 1 and _task_state(outcome_id)[0] == "queued")
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
-        assert task.status == "blocked" and task.attempt == 0
+        # The provider refused the session, so the task waits in the queue under the workspace's hold.
+        assert task.status == "queued" and task.attempt == 0
         assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+    assert len(_holds(factory["ws"])) == 1
     # Not judged as a candidate: nothing was checked or reviewed.
     assert "builder_unreported" not in _event_kinds(outcome_id) and "verifier" not in ScriptedModel.calls
 
