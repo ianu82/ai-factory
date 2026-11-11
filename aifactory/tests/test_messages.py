@@ -106,6 +106,21 @@ def test_an_operator_decision_is_one_answer_from_the_operator(client, signed_in)
     assert items[0]["about"]["task"] == {"id": task, "key": "T1"}
 
 
+def test_a_takeover_reads_once_as_the_factory_handing_the_task_over(client, signed_in):
+    ws, user, outcome, task = world(signed_in)
+    # From a decision: the answer, then the hand-over it causes.
+    record(ws, "decision_resolved", "ian: take_over — T1 did not pass", outcome_id=outcome, task_id=task, actor=user,
+           data={"decision_id": "d1", "resolution": "take_over"})
+    record(ws, "task_handed_over", "ian took over T1; the Factory stopped working on it", outcome_id=outcome,
+           task_id=task, actor=user)
+    # Through a Mind: the hand-over alone.
+    record(ws, "task_handed_over", "ian via Mind took over T1; the Factory stopped working on it", outcome_id=outcome,
+           task_id=task, actor=user, data={"source": "mind", "action_id": "a1"})
+    said = [(m["kind"], m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
+    assert said == [("task_handed_over", "Factory · T1", "Ian", "handoff"),
+                    ("task_handed_over", "Factory · T1", "Ian", "handoff")]
+
+
 def test_filters_by_party_intent_and_outcome(client, signed_in):
     ws, user, outcome, task = world(signed_in)
     record(ws, "verified", "Verified", outcome_id=outcome, task_id=task)

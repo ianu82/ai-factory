@@ -123,6 +123,21 @@ def _plan_reviewed(event: Event, ctx: Context) -> Ends | None:
     return PLAN_REVIEWER, PLANNER, "answer"
 
 
+def _decision_resolved(event: Event, ctx: Context) -> Ends | None:
+    # Taking a task over reads once, as the Factory handing the task to the person (task_handed_over), which every
+    # takeover records: from a decision, the task's page or a Mind.
+    if (event.data or {}).get("resolution") == "take_over":
+        return None
+    return _who(event, ctx), FACTORY, "answer"
+
+
+def _handed_over(event: Event, ctx: Context) -> Ends:
+    # The Factory stops and the person (not their Mind, which only asked) works on the task from here.
+    name = ctx.names.get(event.actor or "")
+    receiver = party("person", name) if name and event.actor not in ctx.operators else _who(event, ctx)
+    return _task_party("factory", "Factory")(event, ctx), receiver, "handoff"
+
+
 # Recorded events that are messages between parties. Everything else in the journal stays activity, including the
 # transitions recorded beside an answer: plan_approved follows the reviewer's plan_reviewed, a person's
 # decision_resolved, or a plan handed over through a Mind; operator_decision is the receipt for a relayed
@@ -131,7 +146,7 @@ RULES: dict[str, Rule] = {
     "plan_proposed": _plan_proposed,
     "plan_reviewed": _plan_reviewed,
     "decision_requested": fixed(_task_party("factory", "Factory"), _const(PEOPLE), "request"),
-    "decision_resolved": fixed(_who, _const(FACTORY), "answer"),
+    "decision_resolved": _decision_resolved,
     "decision_overruled": fixed(_who, _const(FACTORY), "answer"),
     "candidate_rejected": fixed(_task_party("checks", "Checks"), _task_party("builder", "Builder"), "answer"),
     "verification_failed": fixed(_task_party("verifier", "Verifier"), _task_party("builder", "Builder"), "answer"),
@@ -140,7 +155,7 @@ RULES: dict[str, Rule] = {
     "guidance": fixed(_who, _task_party("builder", "Builders"), "inform"),
     "operator_relay": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "operator_retry": fixed(_const(OPERATOR), _const(FACTORY), "request"),
-    "task_handed_over": fixed(_who, _const(FACTORY), "handoff"),
+    "task_handed_over": _handed_over,
 }
 KINDS = (*RULES, MESSAGE_KIND)
 
