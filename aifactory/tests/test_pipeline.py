@@ -1948,6 +1948,21 @@ def _attempt_records(outcome_id):
         return list((task.evidence or {}).get("attempts", [])) if task else []
 
 
+def _holds(ws, status="open"):
+    with session_scope() as s:
+        return [d.id for d in s.query(Decision).filter(Decision.workspace_id == ws, Decision.kind == "provider_hold",
+                                                       Decision.status == status).order_by(Decision.created_at)]
+
+
+def _resume(factory, hold_id):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    db = SessionLocal()
+    resolve(db, db.get(Decision, hold_id), db.get(User, factory["user"]), "retry")
+    db.close()
+
+
 @pytest.mark.parametrize("error,expected", [
     # Billing and quota, as each harness reports it: the native client, Codex through the gateway, Anton through
     # the OpenAI SDK.
@@ -1984,21 +1999,161 @@ def test_provider_and_infrastructure_failures_are_recognised_for_every_harness(e
     assert delivery.infrastructure_problem(error) == expected
 
 
-def test_a_provider_billing_problem_blocks_without_using_an_attempt(factory):
+def test_a_provider_billing_problem_holds_the_workspace_without_using_an_attempt(factory):
     from aifactory.inference import InferenceError
 
     def out_of_credit(messages):
         raise InferenceError("Server returned 402: your MindsHub credits are used up", status=402)
 
+    def parked(count):
+        return len(_attempt_records(outcome_id)) == count and _task_state(outcome_id)[0] == "queued"
+
     ScriptedModel.scripts["builder"] = out_of_credit
     outcome_id = new_outcome(factory)
-    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    assert drive(lambda: parked(1))
+    [hold_id] = _holds(factory["ws"])
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
-        decision = s.query(Decision).filter(Decision.task_id == task.id, Decision.status == "open").one()
-        assert task.status == "blocked" and task.attempt == 0
-        assert decision.title == "T1: model provider problem" and "credits are used up" in decision.body
-        assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+        hold = s.get(Decision, hold_id)
+        # The task waits in the queue with no decision of its own, and the attempt was not charged.
+        assert (task.status, task.attempt, task.blocked_reason) == ("queued", 0, "")
+        assert s.query(Decision).filter(Decision.task_id == task.id).count() == 0
+        assert [(a["n"], a["result"], a["cause"], a["phase"]) for a in task.evidence["attempts"]] == [
+            (1, "infra", "provider", "build")]
+        assert (hold.outcome_id, hold.task_id, hold.title) == (None, None, "Model provider refused: work is on hold")
+        assert "credits are used up" in hold.body and "T1 of outcome #1, the builder session" in hold.body
+        assert hold.options == [{"value": "retry", "label": "Resume work"}]
+    assert outcome_status(outcome_id) == "running"
+    # Nothing starts while the hold is open.
+    assert not drive(lambda: len(_attempt_records(outcome_id)) > 1, timeout=2)
+
+    # Resumed while the provider still refuses: the task runs again and the first failure opens a new hold.
+    _resume(factory, hold_id)
+    assert drive(lambda: parked(2))
+    [second] = _holds(factory["ws"])
+    assert second != hold_id and _holds(factory["ws"], "resolved") == [hold_id]
+
+    ScriptedModel.scripts["builder"] = good_builder
+    _resume(factory, second)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [
+        (1, "infra"), (1, "infra"), (1, "verified")]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
+    assert _holds(factory["ws"]) == []
+
+
+def test_a_verifier_the_provider_refuses_holds_the_workspace_too(factory):
+    from aifactory.inference import InferenceError
+
+    refusing = [1]
+
+    def verifier(messages):
+        if refusing:
+            raise InferenceError("MindsHub: no credit remaining (insufficient balance)", status=402)
+        return passing_verifier(messages)
+
+    ScriptedModel.scripts["verifier"] = verifier
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: len(_attempt_records(outcome_id)) == 1 and _task_state(outcome_id)[0] == "queued")
+    [hold_id] = _holds(factory["ws"])
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert (task.status, task.stage, task.attempt) == ("queued", "verify", 0)
+        assert s.query(Decision).filter(Decision.task_id == task.id).count() == 0
+        assert "T1 of outcome #1, independent verification" in s.get(Decision, hold_id).body
+        assert [(a["n"], a["result"], a["cause"], a["phase"]) for a in task.evidence["attempts"]] == [
+            (1, "infra", "provider", "verify")]
+
+    refusing.clear()
+    _resume(factory, hold_id)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [(1, "infra"), (1, "verified")]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
+    assert _holds(factory["ws"]) == []
+
+
+def _running_tasks(factory, *stages):
+    """Tasks T1, T2, … of one running outcome, each mid-attempt in the given stage, with no runner behind them."""
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        s.get(Outcome, outcome_id).status = "running"
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        tasks = [Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key=f"T{n}", title=f"T{n}",
+                      repo_id=factory["repo"], status="running", stage=stage, attempt=1)
+                 for n, stage in enumerate(stages, 1)]
+        s.add_all(tasks)
+        s.flush()
+        return outcome_id, [t.id for t in tasks]
+
+
+def test_tasks_the_provider_refuses_share_one_hold(factory):
+    outcome_id, task_ids = _running_tasks(factory, "build", "verify")
+    error = "Model request failed: Server returned 402: your MindsHub credits are used up"
+    for task_id, phase in zip(task_ids, ("build", "verify")):
+        with pytest.raises(delivery.Stop):
+            _runner(task_id)._infrastructure(1, phase, error, "provider")
+    with session_scope() as s:
+        [hold] = s.query(Decision).filter(Decision.workspace_id == factory["ws"]).all()
+        assert (hold.kind, hold.status, hold.outcome_id, hold.task_id) == ("provider_hold", "open", None, None)
+        assert "T1 of outcome #1, the builder session" in hold.body and "T2" not in hold.body
+        for task in s.query(Task).filter(Task.outcome_id == outcome_id):
+            assert (task.status, task.attempt, task.blocked_reason) == ("queued", 0, "")
+            assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+            assert (task.evidence["infra_retries"], task.evidence["infra_retry_at"]) == (0, None)
+        waits = s.query(Event).filter(Event.workspace_id == factory["ws"], Event.kind == "provider_hold").all()
+        assert sorted(e.task_id for e in waits) == sorted(task_ids) and {e.level for e in waits} == {"warn"}
+        assert s.query(Event).filter(Event.workspace_id == factory["ws"],
+                                     Event.kind == "decision_requested").count() == 1
+
+
+@pytest.mark.parametrize("phase", ["prepare", "checks", "verify"])
+def test_an_access_problem_setting_up_a_sandbox_still_blocks_only_its_task(factory, phase):
+    _, [task_id] = _running_tasks(factory, "build")
+    error = "Sandbox setup failed: No GitHub access is configured for this workspace."
+    assert delivery.infrastructure_problem(error) == "provider"
+    with pytest.raises(delivery.Stop):
+        _runner(task_id)._infrastructure(1, phase, error, "provider")
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        [decision] = s.query(Decision).filter(Decision.workspace_id == factory["ws"]).all()
+        assert (task.status, task.attempt) == ("blocked", 0)
+        assert (decision.kind, decision.task_id, decision.title) == ("unblock", task_id, "T1: access problem")
+        assert [o["value"] for o in decision.options] == ["retry", "abandon"] and "No GitHub access" in decision.body
+
+
+def test_a_provider_hold_is_listed_without_an_outcome_and_can_only_be_resumed(factory, client):
+    from aifactory.pipeline.holds import open_provider_hold
+
+    ws = factory["ws"]
+    hold_id = open_provider_hold(ws, "Error code: 402 - Payment Required", "planning outcome #3")
+    # A second refusal finds the hold that is already open.
+    assert open_provider_hold(ws, "another refusal", "T2 of outcome #4, the builder session") == hold_id
+    assert _holds(ws) == [hold_id]
+    assert client.post("/auth/dev", json={"email": "dev@acme.test", "name": "Dev"}).status_code == 200
+    r = client.get(f"/api/workspaces/{ws}/inbox")
+    assert r.status_code == 200, r.text
+    [item] = r.json()["decisions"]
+    assert (item["id"], item["kind"], item["actionable"]) == (hold_id, "provider_hold", True)
+    assert (item["outcome_id"], item["task_id"], item["outcome_number"], item["task_key"]) == (None, None, None, None)
+    assert item["options"] == [{"value": "retry", "label": "Resume work"}]
+    assert "planning outcome #3" in item["body"] and "another refusal" not in item["body"]
+    for refused in ("dismiss", "abandon"):
+        r = client.post(f"/api/workspaces/{ws}/decisions/{hold_id}/resolve", json={"resolution": refused})
+        assert r.status_code == 400, r.text
+        assert _holds(ws) == [hold_id]
+    r = client.post(f"/api/workspaces/{ws}/decisions/{hold_id}/resolve",
+                    json={"resolution": "retry", "comment": "Topped up", "reusable": True})
+    assert r.status_code == 200, r.text
+    with session_scope() as s:
+        hold = s.get(Decision, hold_id)
+        assert (hold.status, hold.resolution, hold.reusable) == ("resolved", "retry", False)
+    assert _holds(ws) == []
 
 
 def test_infrastructure_failures_are_retried_after_a_backoff_without_using_attempts(factory):
