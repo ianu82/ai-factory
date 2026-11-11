@@ -113,9 +113,14 @@ def recover() -> int:
 # waking ----------------------------------------------------------------------------------------------------------
 
 def _marks(db, outcome_id: str) -> dict[str, str]:
-    """Each open decision and a fingerprint of what it asks: a new or changed question wakes the Lead again."""
+    """Each open decision waiting on someone, with a fingerprint of what it asks: a new or changed question wakes the
+    Lead again. A decision a judge is still reviewing isn't waiting on anyone yet. Judges settle what earlier
+    decisions already answer; what they hold for people reaches the Lead, and what the Lead may not decide reaches
+    people with its recommendation. One path, in that order."""
+    from ..serializers import actionable
+
     return {d.id: question_fingerprint(d)[:16] for d in db.query(Decision).filter(
-        Decision.outcome_id == outcome_id, Decision.status == "open")}
+        Decision.outcome_id == outcome_id, Decision.status == "open") if actionable(d)}
 
 
 def _people_posts(db, outcome_id: str, since: datetime | None) -> list[Message]:
@@ -219,6 +224,7 @@ def outcome_record(outcome_id: str) -> dict[str, Any]:
                        "blocked_reason": t.blocked_reason, "summary": t.summary,
                        "depends_on": t.depends_on} for t in tasks],
             "open_decisions": [{**S.decision(d), "task_key": keys.get(d.task_id),
+                                "under_judge_review": not S.actionable(d),
                                 "you_may_choose": sorted(o_["value"] for o_ in d.options or []
                                                           if (d.kind, o_.get("value")) in ACTIONS)}
                                for d in decisions],
