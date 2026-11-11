@@ -26,7 +26,8 @@ from typing import Any
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
 from ..events import notify, record
-from ..inference import BudgetExceeded, InferenceError, ModelClient, UsageLedger, resolve_provider, workspace_models
+from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider,
+                         workspace_models)
 from ..models import Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User, Workspace
 from .runtime import outcome_cost, workspace_settings
 
@@ -355,14 +356,11 @@ class Tools:
                         "recommendation instead.")
             user = lead_user(db)
             title = decision.title
-            try:
-                resolve(db, decision, user, option, comment)
+            try:  # attributed in the resolution's own transaction: the decision, its guidance and its event
+                resolve(db, decision, user, option, comment, attribution=self.source)
             except DecisionError as exc:
                 db.rollback()
                 return f"Not applied: {exc}"
-            decision = db.get(Decision, decision_id)
-            decision.attribution = self.source
-            db.commit()
         finally:
             db.close()
         self.actions.append({"tool": "resolve_decision", "decision_id": decision_id, "option": option})
@@ -447,7 +445,11 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         tokens = _limit(budgets.get("run_tokens"))
         ledger.max_tokens = int(tokens) if tokens is not None else None
         provider = resolve_provider(workspace_id)
-        model = provider.model_override or model
+        # The model for the provider that will actually serve the run (a fallback provider may not have Opus).
+        model = provider.model_override or workspace_models(settings, provider.provider).lead
+        if price_for(model, settings) is None and provider.provider != "mindshub":
+            raise BudgetExceeded("The Lead's spend can't be capped: its model has no price and its provider "
+                                 "doesn't report what a run cost")
         minutes = min(_limit((settings.get("limits") or {}).get("run_minutes")) or MAX_MINUTES, MAX_MINUTES)
         with session_scope() as s:
             row = s.get(Run, run_id)
@@ -456,8 +458,20 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
                 "run_usd": usd, "run_tokens": ledger.max_tokens, "turns": cfg["turns"], "minutes": minutes}}
         client = ModelClient(provider, session_id=run_id, timeout=minutes * 60, log_errors=False)
         started = True
+        async def within_budget() -> None:
+            """With no price for the model the ledger can't see spend, so it can't stop the run: MindsHub's own
+            estimate for this run's session does. If that can't be read, the run stops rather than spend blind."""
+            if ledger.cost_known:
+                return
+            spent_now = await client.session_cost(run_id)
+            if spent_now is None:
+                raise BudgetExceeded("The Lead's spend couldn't be measured, so it stopped")
+            if spent_now >= usd:
+                raise BudgetExceeded(f"The Lead's budget of ${usd:.2f} is spent")
+
         async with asyncio.timeout(minutes * 60):
-            summary = await _loop(client, model, ledger, tools, settings, cfg["turns"], number, reasons, outcome_id)
+            summary = await _loop(client, model, ledger, tools, settings, cfg["turns"], number, reasons, outcome_id,
+                                  within_budget)
         status = "succeeded"
     except asyncio.CancelledError:
         status, error = "cancelled", "Stopped"
@@ -501,7 +515,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
 
 
 async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings: dict[str, Any], turns: int,
-                number: int, reasons: list[str], outcome_id: str) -> str:
+                number: int, reasons: list[str], outcome_id: str, within_budget) -> str:
     record_now = await asyncio.to_thread(tools._outcome_record)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM},
@@ -516,6 +530,7 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
         message = await client.chat(model=model, messages=messages, tools=[TOOLS[-1]] if final else TOOLS,
                                     tool_choice="required" if final else None, ledger=ledger, max_tokens=8000,
                                     reasoning_effort=settings.get("reasoning_effort"))
+        await within_budget()
         calls = message.get("tool_calls") or []
         assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
         if calls:

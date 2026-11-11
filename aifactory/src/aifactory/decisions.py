@@ -33,7 +33,8 @@ def fresh_budget(evidence: dict[str, Any] | None) -> dict[str, Any]:
 
 def resolve(db: Session, decision: Decision, user: User, resolution: str, comment: str = "",
             reusable: bool = False, scope: str = "item", *, action_id: str | None = None,
-            pending_events: list[dict] | None = None, after: list[tuple] | None = None) -> dict[str, Any]:
+            pending_events: list[dict] | None = None, after: list[tuple] | None = None,
+            attribution: dict[str, Any] | None = None) -> dict[str, Any]:
     """Apply a person's resolution. The app's endpoint commits and publishes here. A confirmed Mind card
     (action_id) keeps everything in its own transaction instead: plan approval and hand-over join it, events wait
     in pending_events, and what must follow the commit (stopping planners and jobs, publishing a hand-over's
@@ -48,7 +49,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
     decision.resolution = resolution
     decision.comment = comment.strip()[:8000]
-    decision.attribution = {"source": "mind", "action_id": action_id} if action_id else None
+    # A confirmed Mind card, or a Factory agent acting on its own (the Lead: {"source": "lead", "run_id": …}).
+    decision.attribution = {"source": "mind", "action_id": action_id} if action_id else attribution
     decision.resolved_by = user.id
     decision.resolved_at = utcnow()
     decision.reusable = bool(reusable and comment.strip())

@@ -237,6 +237,9 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
         assert merge.status == "open"  # approving a merge stays with people
         guidance = s.query(Message).filter_by(author_kind="user").one()
         assert guidance.body.startswith("Use the durable queue") and guidance.author_id == the_lead.id
+        assert guidance.attribution == {"source": "lead", "run_id": row.id}  # attributed in the same transaction
+        resolved = s.query(Event).filter_by(kind="decision_resolved").one()
+        assert resolved.data["source"] == "lead" and resolved.data["run_id"] == row.id
         note = s.query(Message).filter_by(author_kind="lead").one()
         assert note.attribution == {"source": "lead", "run_id": row.id, "decision_id": world["merge"]}
         kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == world["outcome"]).order_by(Event.id)]
@@ -299,3 +302,60 @@ def test_the_orchestrator_runs_due_leads_beside_the_scheduler(monkeypatch):
 
     asyncio.run(go())
     assert started == ["o0", "o1"]
+
+
+class MeteredModel(ScriptedModel):
+    """MindsHub reporting what the run's session has cost so far, one reading per call."""
+    readings: list = []
+
+    async def session_cost(self, _session_id):
+        return MeteredModel.readings.pop(0) if MeteredModel.readings else None
+
+
+def unpriced(world):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "pricing": {}}
+
+
+def busy(messages):
+    return {"content": "", "tool_calls": [call("outcome_record", {}, step(messages))]}
+
+
+def test_without_a_price_mindshubs_estimate_caps_the_run(world, model, monkeypatch):
+    unpriced(world)
+    monkeypatch.setattr(lead, "ModelClient", MeteredModel)
+    model.scripts = {"lead": busy}
+    MeteredModel.readings = [0.5, 2.5]
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and row.error == "The Lead's budget of $2.00 is spent" and row.turns == 2
+    MeteredModel.readings = []  # no reading: stop rather than spend blind
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "couldn't be measured" in row.error and row.turns == 1
+
+
+def test_without_a_price_or_a_metered_provider_the_lead_does_not_start(world, model, monkeypatch):
+    unpriced(world)
+    monkeypatch.setattr(lead, "resolve_provider", lambda ws: ProviderConfig("openai", "unused", "SECRET", "Test"))
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "can't be capped" in row.error and model.calls == []
+
+
+def test_the_model_follows_the_provider_that_serves_the_run(world, model, monkeypatch):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "models": {"default": "gpt-x"}, "pricing": {"gpt-x": {"input": 1, "output": 1}}}
+    monkeypatch.setattr(lead, "resolve_provider", lambda ws: ProviderConfig("openai", "unused", "SECRET", "Test"))
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and (row.provider, row.model) == ("openai", "gpt-x")  # not MindsHub's Opus
+
+
+def test_the_leads_guidance_is_not_counted_as_a_persons_intervention(world, client):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    tools.call("post_guidance", {"text": "Prefer the durable queue."})
+    assert client.get(f"/api/workspaces/{world['ws']}/stats").json()["human"]["interventions"] == 0
+    with db.session_scope() as s:
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
+                      author_kind="user", body="Please hurry."))
+    assert client.get(f"/api/workspaces/{world['ws']}/stats").json()["human"]["interventions"] == 1
