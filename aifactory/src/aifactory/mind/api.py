@@ -240,10 +240,30 @@ async def readiness(runtime, workspace_id, ledger):
     return {"status": "ready" if ready else "unavailable", "model_id": model if ready else None, "reason": reason}
 
 
+OUTCOME_KINDS = ("create_outcome", "build_plan")
+
+
+def handoff(db, thread) -> dict | None:
+    """The outcome this conversation became, when the person confirmed a card that created one: from there on the
+    conversation continues with the outcome's Lead, visible to the workspace's members."""
+    from ..models import Outcome
+
+    actions = db.query(MindAction).filter(MindAction.thread_id == thread.id, MindAction.owner_id == thread.owner_id,
+                                          MindAction.kind.in_(OUTCOME_KINDS), MindAction.status == "succeeded") \
+        .order_by(MindAction.created_at).all()
+    for action in actions:
+        outcome = db.get(Outcome, (action.result or {}).get("outcome_id") or "")
+        if outcome is not None and outcome.workspace_id in (thread.workspace_ids or []):
+            return {"id": outcome.id, "number": outcome.number, "title": outcome.title, "status": outcome.status,
+                    "workspace_id": outcome.workspace_id, "action_id": action.id}
+    return None
+
+
 def thread_view(db, thread):
     return {key: getattr(thread, key) for key in ("id", "title", "billing_workspace_id", "workspace_ids",
             "model_id", "status", "created_at", "updated_at")} | {
-                "cost": store.cost(db.query(MindCharge).filter_by(thread_id=thread.id))}
+                "cost": store.cost(db.query(MindCharge).filter_by(thread_id=thread.id)),
+                "outcome": handoff(db, thread)}
 
 
 def message_view(row, history=False):

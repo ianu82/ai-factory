@@ -52,11 +52,16 @@ def lead_run(world, seen, *, ago=timedelta(minutes=5), status="succeeded"):
     with db.session_scope() as s:
         s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
                   status=status, started_at=db.utcnow() - ago, config_snapshot={"seen": seen}))
+        if status == "succeeded":  # a run that succeeded posted its update (a closing one if it was woken for that)
+            s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=lead.lead_user(s).id,
+                          author_kind="lead", body="I'm the Lead for #7.", created_at=db.utcnow() - ago,
+                          attribution={"source": "lead", "kind": "update",
+                                       **({"closing": True} if (seen or {}).get("closing") else {})}))
 
 
 def test_waiting_decisions_and_peoples_posts_wake_the_lead(world):
     due = woken()[world["outcome"]]
-    assert due["reasons"] == ["2 decisions waiting on someone"]
+    assert due["reasons"] == ["2 decisions waiting on someone", "you've just joined this outcome"]
     assert set(due["decisions"]) == {world["question"], world["merge"]}
     lead_run(world, due["seen"])
     assert world["outcome"] not in woken()  # nothing new since its last run
@@ -121,8 +126,8 @@ def test_the_lead_waits_its_turn(world):
 def test_no_lead_for_finished_paused_disabled_or_review_work(world, change):
     with db.session_scope() as s:
         o, w = s.get(Outcome, world["outcome"]), s.get(Workspace, world["ws"])
-        if change == "finished":
-            o.status = "completed"
+        if change == "finished":  # long enough ago that its ending was reported
+            o.status, o.completed_at = "completed", db.utcnow() - timedelta(hours=2)
         elif change == "paused":
             w.paused = True
         elif change == "disabled":
@@ -135,6 +140,7 @@ def test_no_lead_for_finished_paused_disabled_or_review_work(world, change):
 def test_its_first_run_reads_old_posts_without_waking_for_them(world):
     with db.session_scope() as s:
         s.query(Decision).delete()
+        s.get(Outcome, world["outcome"]).created_at = db.utcnow() - timedelta(days=3)  # not new: nothing to join
         s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
                       author_kind="user", body="Old note", created_at=db.utcnow() - timedelta(days=3)))
     assert world["outcome"] not in woken()
@@ -210,7 +216,8 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
                                           "comment": "Use the durable queue: jobs must survive restarts."}, 0),
                 call("resolve_decision", {"decision_id": world["merge"], "option": "approve"}, 1),
                 call("note_for_people", {"decision_id": world["merge"],
-                                         "text": "PR #12 is ready: CI and the verifier passed. I recommend merging."}, 2)]}
+                                         "text": "PR #12 is ready: CI and the verifier passed. I recommend merging."}, 2),
+                call("post_update", {"text": "I'm the Lead for #7. T1's question is answered; the merge waits on you."}, 3)]}
         return {"content": "", "tool_calls": [call("finish", {"summary": "Answered T1's question; merge needs you."})]}
 
     model.scripts = {"lead": script}
@@ -221,7 +228,7 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
     assert row.model == "lead-model" and row.provider == "mindshub" and row.turns == 2
     assert row.cost_known and row.cost_usd == round(2 * (1000 * 1 + 200 * 2) / 1e6, 6)
     assert row.result["summary"] == "Answered T1's question; merge needs you."
-    assert [a["tool"] for a in row.result["actions"]] == ["resolve_decision", "note_for_people"]
+    assert [a["tool"] for a in row.result["actions"]] == ["resolve_decision", "note_for_people", "post_update"]
     assert model.calls == ["lead", "lead"]
     first = seen_requests[0]
     assert first[0]["content"].startswith("You are the Lead") and "UNTRUSTED DATA" in first[0]["content"]
@@ -240,7 +247,7 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
         assert guidance.attribution == {"source": "lead", "run_id": row.id}  # attributed in the same transaction
         resolved = s.query(Event).filter_by(kind="decision_resolved").one()
         assert resolved.data["source"] == "lead" and resolved.data["run_id"] == row.id
-        note = s.query(Message).filter_by(author_kind="lead").one()
+        note = next(m for m in s.query(Message).filter_by(author_kind="lead") if (m.attribution or {}).get("decision_id"))
         assert note.attribution == {"source": "lead", "run_id": row.id, "decision_id": world["merge"]}
         kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == world["outcome"]).order_by(Event.id)]
         assert kinds[0] == "run_started" and kinds[-1] == "run_finished"
@@ -552,3 +559,180 @@ def test_a_cut_off_lead_run_holds_no_budget(world):
                   config_snapshot={"budget_reserved": 2.0}))  # crashed holding the whole budget
     assert outcome_committed(world["outcome"]) == (0.0, True)  # stale: it holds nothing
     assert world["outcome"] in woken()  # so its Lead can run again
+
+
+def test_the_inbox_shows_the_leads_recommendation_on_its_decision(world, client):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Earlier view: wait for CI."})
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "CI and the verifier passed. Merge it."})
+    tools.call("note_for_people", {"text": "A note about the outcome, not a decision."})
+    inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+    note = inbox[world["merge"]]["lead_note"]
+    assert note["text"] == "CI and the verifier passed. Merge it." and note["run_id"] == "run-1" and note["created_at"]
+    assert inbox[world["question"]]["lead_note"] is None
+
+
+def milestone(world, kind, ago=timedelta(0), message="", task=True):
+    with db.session_scope() as s:
+        event = Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"] if task else None,
+                      kind=kind, message=message or kind, created_at=db.utcnow() - ago)
+        s.add(event)
+        s.flush()
+        return event.id
+
+
+def test_progress_wakes_the_lead_to_report_in_batches(world):
+    seen = woken()[world["outcome"]]["seen"]
+    lead_run(world, seen, ago=timedelta(minutes=5))
+    published = milestone(world, "published", message="Opened PR #12")
+    milestone(world, "stage", message="Stage: ci")  # not a milestone
+    assert world["outcome"] not in woken()  # within ten minutes of its last run: batched into the next update
+    with db.session_scope() as s:
+        s.query(Run).one().started_at = db.utcnow() - timedelta(minutes=11)
+    due = woken()[world["outcome"]]
+    assert due["reasons"] == ["1 step of progress to report"] and due["seen"]["event_id"] == published
+    lead_run(world, due["seen"], ago=timedelta(minutes=10, seconds=30))
+    assert world["outcome"] not in woken()  # reported
+
+
+def test_a_finished_outcome_reports_how_it_ended_within_the_hour(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=20))
+    with db.session_scope() as s:
+        o = s.get(Outcome, world["outcome"])
+        o.status, o.completed_at = "completed", db.utcnow() - timedelta(minutes=5)
+    milestone(world, "outcome_completed", task=False)
+    due = woken()[world["outcome"]]
+    assert due["reasons"] == ["the outcome has ended (completed)"]  # its open decisions don't count
+    assert due["seen"]["update_due"] is True
+    assert due["seen"]["closing"] is True
+    lead_run(world, {**due["seen"], "closing": False}, ago=timedelta(minutes=2))  # a progress update after the end
+    with db.session_scope() as s:
+        s.query(Run).filter(Run.started_at > db.utcnow() - timedelta(minutes=3)).one().started_at = db.utcnow() - timedelta(minutes=3)
+    assert world["outcome"] in woken()  # isn't the closing report
+    lead_run(world, due["seen"], ago=timedelta(minutes=1, seconds=30))
+    assert world["outcome"] not in woken()  # a run woken for the ending reported it
+    with db.session_scope() as s:
+        s.query(Run).delete()
+        s.get(Outcome, world["outcome"]).completed_at = db.utcnow() - timedelta(hours=2)
+    assert world["outcome"] not in woken()  # too long ago
+
+
+def test_a_cancelled_outcome_reports_how_it_ended(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=20))
+    with db.session_scope() as s:  # cancelling records no completion time: when it ended is its last update
+        o = s.get(Outcome, world["outcome"])
+        o.status, o.updated_at = "cancelled", db.utcnow() - timedelta(minutes=3)
+    assert woken()[world["outcome"]]["reasons"] == ["the outcome has ended (cancelled)"]
+
+
+def test_a_run_woken_to_report_fails_if_it_posts_no_update(world, model):
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Nothing to add"})]}}
+    due = woken()[world["outcome"]]  # a new outcome: the Lead introduces itself
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], due["reasons"], due["seen"], due["decisions"]))
+    assert row.status == "failed" and "didn't post the update" in row.error
+    with db.session_scope() as s:
+        s.query(Run).delete()
+    assert "you've just joined this outcome" in woken()[world["outcome"]]["reasons"]  # still owed
+
+
+def test_post_update_adds_to_the_outcomes_conversation(world):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    assert "Posted" in tools.call("post_update", {"text": "T1 is open as PR #12; Codex is reviewing it."})
+    with db.session_scope() as s:
+        update = s.query(Message).one()
+        assert update.author_kind == "lead" and update.attribution == {"source": "lead", "run_id": "run-1",
+                                                                      "kind": "update"}
+        assert s.query(Event).filter_by(kind="lead_update").one().data["source"] == "lead"
+
+
+def test_the_outcome_reads_as_a_conversation(world, client):
+    base = db.utcnow() - timedelta(hours=1)
+    with db.session_scope() as s:
+        s.get(Outcome, world["outcome"]).created_at = base
+        s.get(Decision, world["question"]).created_at = base + timedelta(minutes=5)
+        s.get(Decision, world["merge"]).created_at = base + timedelta(minutes=6)
+        s.add_all([
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="plan_approved",
+                  message="Plan approved by the plan reviewer", created_at=base + timedelta(minutes=1)),
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="run_finished",
+                  message="Builder succeeded", data={"role": "builder", "cost_usd": 0.38},
+                  created_at=base + timedelta(minutes=2)),
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="run_finished", message="Lead finished",
+                  data={"role": "lead"}, created_at=base + timedelta(minutes=2, seconds=30)),
+            Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="agent_thought",
+                  message="thinking", created_at=base + timedelta(minutes=2, seconds=40)),
+        ])
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    tools.call("post_update", {"text": "The plan is approved and T1 is built."})
+    tools.call("post_guidance", {"text": "Prefer the durable queue.", "task": "T1"})
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Ready to merge."})
+    with db.session_scope() as s:
+        for m, minutes in zip(s.query(Message).order_by(Message.created_at), (3, 4, 7)):
+            m.created_at = base + timedelta(minutes=minutes)
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"], author_kind="user",
+                      body="Why is the merge waiting?", created_at=base + timedelta(minutes=8)))
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="published",
+                    message="Opened PR #12", data={"url": "https://github.com/team/app/pull/12"},
+                    created_at=base + timedelta(minutes=9)))
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="succeeded", model="opus-5-5", cost_usd=0.21, started_at=base + timedelta(minutes=3)))
+
+    r = client.get(f"/api/workspaces/{world['ws']}/outcomes/{world['outcome']}/conversation")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert [i["kind"] for i in items] == ["request", "lead", "lead_guidance", "decision", "decision", "lead", "person",
+                                          "working"]
+    request, update, guidance, question, merge, note, person, working = items
+    assert request["title"] == "Search" and request["from"] == "the app"
+    assert update["update"] is True and update["text"] == "The plan is approved and T1 is built."
+    assert [(s_["who"], s_["text"]) for s_ in update["steps"]] == [
+        ("Planner", "Plan approved by the plan reviewer"), ("Builder · T1", "Builder succeeded")]
+    assert update["steps"][1]["cost_usd"] == 0.38  # the Lead's own run and agent thoughts aren't steps
+    assert guidance["task_key"] == "T1" and guidance["text"] == "Prefer the durable queue."
+    assert question["decision"]["id"] == world["question"] and question["decision"]["lead_note"] is None
+    assert merge["decision"]["lead_note"]["text"] == "Ready to merge." and merge["decision"]["task_key"] == "T1"
+    assert note["update"] is False and note["decision_id"] == world["merge"] and note["steps"] == []
+    assert person["author"] == "Ian" and person["operator"] is False
+    assert [s_["text"] for s_ in working["steps"]] == ["Opened PR #12"]
+    assert working["steps"][0]["url"] == "https://github.com/team/app/pull/12"  # evidence, one click away
+    assert r.json()["lead"] == {"model": "opus-5-5", "running": False, "last_active": r.json()["lead"]["last_active"],
+                                "cost_usd": 0.21, "cost_known": True}  # the Lead's own spend, its own line
+
+    with db.session_scope() as s:
+        other = Workspace(org_id=s.get(Workspace, world["ws"]).org_id, name="Other", slug="other")
+        s.add(other)
+        s.flush()
+        elsewhere = Outcome(workspace_id=other.id, number=1, title="Elsewhere")
+        s.add(elsewhere)
+        s.flush()
+        elsewhere_id = elsewhere.id
+    assert client.get(f"/api/workspaces/{world['ws']}/outcomes/{elsewhere_id}/conversation").status_code == 404
+
+
+def test_a_mind_conversation_that_became_the_outcome_continues_with_its_lead(world):
+    from aifactory.conversation import conversation
+    from aifactory.mind.api import thread_view
+    from aifactory.models import MindAction, MindThread
+
+    with db.session_scope() as s:
+        thread = MindThread(owner_id=world["uid"], billing_workspace_id=world["ws"], workspace_ids=[world["ws"]])
+        s.add(thread)
+        s.flush()
+        s.add(MindAction(thread_id=thread.id, owner_id=world["uid"], workspace_id=world["ws"], kind="create_outcome",
+                         status="pending"))  # a card not yet confirmed hands nothing off
+        s.flush()
+        assert thread_view(s, thread)["outcome"] is None
+        s.add(MindAction(thread_id=thread.id, owner_id=world["uid"], workspace_id=world["ws"], kind="create_outcome",
+                         status="succeeded", result={"ok": True, "outcome_id": world["outcome"], "number": 7}))
+        s.flush()
+        handed = thread_view(s, thread)["outcome"]
+        assert (handed["id"], handed["number"], handed["title"]) == (world["outcome"], 7, "Search")
+        o = s.get(Outcome, world["outcome"])
+        mine = conversation(s, o, world["uid"])
+        assert mine["started_in_mind"] == {"thread_id": thread.id}  # its owner gets the way back
+        assert mine["items"][0]["from"] == "a Mind conversation"
+        assert conversation(s, o, "someone-else")["started_in_mind"] == {"thread_id": None}  # private before hand-off
+        other = Outcome(workspace_id=world["ws"], number=8, title="Unrelated", status="running")
+        s.add(other)
+        s.flush()
+        assert conversation(s, other, world["uid"])["started_in_mind"] is None
