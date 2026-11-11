@@ -1319,6 +1319,192 @@ def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch
         assert (other.cost_usd, other.cost_known) == (0.5, False)  # only MindsHub can say what a session cost
 
 
+def leased_task(ids, **fields) -> str:
+    """A task some server was running; `fields` say who holds its lease."""
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(ids)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(**{"workspace_id": ids["ws"], "outcome_id": outcome_id, "plan_id": plan.id, "key": "T1",
+                       "title": "Greeting", "repo_id": ids["repo"], "status": "running", "stage": "build",
+                       "attempt": 1, **fields})
+        s.add(task)
+        s.flush()
+        return task.id
+
+
+def lease(task_id):
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        return task.status, task.lease_owner, task.lease_expires_at
+
+
+def resumed(task_id) -> int:
+    with session_scope() as s:
+        return s.query(Event).filter(Event.task_id == task_id, Event.kind == "resumed").count()
+
+
+def test_each_server_start_has_its_own_instance_id():
+    """The process id alone, the old id, is the same number on every start in a container."""
+    first, second = Orchestrator(), Orchestrator()
+    assert first.instance != second.instance
+    assert all(0 < len(orch.instance) <= 64 for orch in (first, second))  # the lease owner column's size
+    assert first.status()["instance"] == first.instance
+
+
+def test_recovery_requeues_only_the_running_tasks_nobody_holds(factory, monkeypatch, caplog):
+    """Two servers on one database: a start must not requeue what the other one is running. A lease is live while
+    its owner keeps extending it. A task with no owner, no expiry (every row from before leases had one) or an expiry
+    in the past is nobody's, and resumes."""
+    import logging
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    caplog.set_level(logging.INFO, logger=scheduler.__name__)
+    other, until = "other-host-1-abc123", clock[0] + timedelta(seconds=60)
+    unowned = leased_task(factory)
+    legacy = leased_task(factory, lease_owner="1")  # before leases: the process id as the owner, never an expiry
+    expired = leased_task(factory, lease_owner=other, lease_expires_at=clock[0] - timedelta(seconds=1))
+    held = leased_task(factory, lease_owner=other, lease_expires_at=until)
+
+    Orchestrator()._recover()
+    assert [lease(task_id) for task_id in (unowned, legacy, expired)] == [("queued", "", None)] * 3
+    assert [resumed(task_id) for task_id in (unowned, legacy, expired, held)] == [1, 1, 1, 0]
+    assert lease(held) == ("running", other, until)
+
+    # Its owner died without releasing it: no restart is needed, the scheduler looks again every heartbeat interval.
+    orch = Orchestrator()
+    orch._maybe_reclaim()
+    assert lease(held) == ("running", other, until)  # still live
+    clock[0] = until + timedelta(seconds=30)
+    orch._maybe_reclaim()  # it looked a moment ago
+    assert lease(held) == ("running", other, until)
+    monkeypatch.setattr(scheduler, "HEARTBEAT_SECONDS", 0)  # an interval later
+    orch._maybe_reclaim()
+    assert (lease(held), resumed(held)) == (("queued", "", None), 1)
+    assert f"reclaimed T1 from instance {other}: its lease ran out 30s ago" in [r.getMessage() for r in caplog.records]
+
+
+def test_the_heartbeat_extends_only_the_leases_of_tasks_this_instance_is_running(factory, monkeypatch):
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(scheduler, "HEARTBEAT_SECONDS", 0)  # every look below is an interval after the last
+    orch, other = Orchestrator(), Orchestrator()
+    soon = clock[0] + timedelta(seconds=10)
+    mine = leased_task(factory, lease_owner=orch.instance, lease_expires_at=soon)
+    theirs = leased_task(factory, lease_owner=other.instance, lease_expires_at=soon)
+    ended = leased_task(factory, status="completed", stage="done", lease_owner=orch.instance, lease_expires_at=soon)
+    stray = leased_task(factory, lease_owner=orch.instance, lease_expires_at=soon)  # no job of this instance runs it
+    orch._tasks = {task_id: (None, None) for task_id in (mine, ended)}  # the jobs it has
+    with session_scope() as s:
+        changed = s.get(Task, mine).updated_at
+
+    orch._heartbeat()
+    extended = clock[0] + timedelta(seconds=scheduler.LEASE_SECONDS)
+    assert [lease(task_id)[2] for task_id in (mine, theirs, ended, stray)] == [extended, soon, soon, soon]
+    with session_scope() as s:
+        assert s.get(Task, mine).updated_at == changed  # a heartbeat is not a change to the task
+
+    # A task is never reclaimed by the instance whose job runs it, however late its heartbeat. Any other instance
+    # may take it once the lease has run out, and a row left without a job is picked up the same way.
+    clock[0] = extended + timedelta(seconds=1)
+    orch._maybe_reclaim()
+    assert lease(mine) == ("running", orch.instance, extended)
+    assert [lease(task_id) for task_id in (theirs, stray)] == [("queued", "", None)] * 2
+    assert lease(ended) == ("completed", orch.instance, soon)
+    other._maybe_reclaim()
+    assert (lease(mine), resumed(mine)) == (("queued", "", None), 1)
+
+
+def test_shutdown_gives_up_the_leases_it_still_holds(factory, monkeypatch):
+    """A job that could not put its task back in time leaves it running under this instance. Stopping releases the
+    lease, so the next start resumes the task at once instead of waiting for the lease to run out."""
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    now = datetime(2026, 1, 1, 12)
+    monkeypatch.setattr(scheduler, "utcnow", lambda: now)
+    until = now + timedelta(seconds=60)
+
+    async def go():
+        orch, other = Orchestrator(), Orchestrator()
+        mine = leased_task(factory, lease_owner=orch.instance, lease_expires_at=until)
+        theirs = leased_task(factory, lease_owner=other.instance, lease_expires_at=until)
+        Orchestrator()._recover()  # a start while both are held touches neither
+        assert (lease(mine), lease(theirs)) == (("running", orch.instance, until), ("running", other.instance, until))
+        await orch.stop()
+        assert (lease(mine), lease(theirs)) == (("running", "", None), ("running", other.instance, until))
+        Orchestrator()._recover()
+        assert (lease(mine), resumed(mine)) == (("queued", "", None), 1)
+        assert (lease(theirs), resumed(theirs)) == (("running", other.instance, until), 0)
+
+    asyncio.run(go())
+
+
+def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
+    """Its lease ran out while it was stalled; another instance requeued the task and started it: same status and
+    stage, a different owner. Nothing the first runner writes may land. A lease released on purpose (waiting for CI,
+    the merge queue) is nobody's, and the runner keeps working."""
+    first, second = Orchestrator(), Orchestrator()
+    task_id = leased_task(factory, lease_owner=first.instance)
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock(), first.instance)
+
+    def row():
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            return (task.status, task.summary, task.blocked_reason, task.evidence, task.lease_owner,
+                    s.query(Decision).filter(Decision.task_id == task_id).count())
+
+    runner.update(summary="mine")
+    runner.evidence("note", "mine")
+    assert row() == ("running", "mine", "", {"note": "mine"}, first.instance, 0)
+
+    with session_scope() as s:
+        s.get(Task, task_id).lease_owner = second.instance
+    for write in (lambda: runner.update(summary="stale"), lambda: runner.evidence("note", "stale"),
+                  lambda: runner.block("unblock", "Stale", "stale")):
+        with pytest.raises(delivery.Stop):
+            write()
+        assert row() == ("running", "mine", "", {"note": "mine"}, second.instance, 0)
+
+    with session_scope() as s:
+        s.get(Task, task_id).lease_owner = ""
+    runner.update(summary="released")
+    runner.evidence("note", "released")
+    with pytest.raises(delivery.Stop):  # block() always ends the runner; this time what it wrote is there
+        runner.block("unblock", "Blocked", "needs a look")
+    assert row() == ("blocked", "released", "needs a look", {"note": "released"}, "", 1)
+
+
+def test_a_transition_without_an_owner_does_not_ask_who_holds_the_lease(factory):
+    from datetime import datetime
+
+    from aifactory.pipeline.lifecycle import transition
+
+    task_id = leased_task(factory, lease_owner="someone", lease_expires_at=datetime(2026, 1, 1))
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert transition(s, task, summary="any caller")  # as before: status, stage, pause and cancellation only
+        assert not transition(s, task, owner="another", summary="not the holder")
+        assert transition(s, task, owner="someone", stage="verify")
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert (task.summary, task.stage, task.lease_owner) == ("any caller", "verify", "someone")
+        assert transition(s, task, status="blocked", lease_owner="")
+    assert lease(task_id) == ("blocked", "", None)  # an expiry never outlives its owner
+
+
 def test_smoke_failure_is_reverted_under_recovery_policy(factory):
     with session_scope() as s:
         repo = s.get(Repository, factory["repo"])
