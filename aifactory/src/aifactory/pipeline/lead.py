@@ -595,7 +595,9 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
             s.execute(text("BEGIN IMMEDIATE"))  # SQLite has no row locks: take its write lock before reading
         else:
             s.query(Outcome).filter(Outcome.id == outcome_id).with_for_update().one()
-        if outcome_limit is not None and not continued_past_budget(s, outcome_id):
+        # A finished outcome's closing update runs within the Lead's own run cap, even when the outcome is spent.
+        finished = s.query(Outcome.status).filter(Outcome.id == outcome_id).scalar() in FINISHED
+        if outcome_limit is not None and not finished and not continued_past_budget(s, outcome_id):
             spent, _ = outcome_cost(outcome_id)
             held = 0.0
             for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,
