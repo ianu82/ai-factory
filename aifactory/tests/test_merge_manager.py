@@ -313,3 +313,32 @@ def test_a_task_handed_to_github_stays_parked_when_lookup_fails_or_it_just_merge
         asyncio.run(merge_manager.merge_via_github_queue(r, QueueGitHub("token"),
                                                          {"pr_id": "PR1", "merged": True, "entry": None}))
     assert state(tid)[0] == "queued"
+
+
+def test_explicit_github_mode_without_a_queue_asks_a_person(factory):
+    QueueGitHub.has_queue = False
+    try:
+        tid = merge_task(factory, key="T1")
+        r = runner(tid)
+        r.cfg = {**r.cfg, "merge": {"queue": "github"}}
+        with pytest.raises(Stop):
+            asyncio.run(merge_manager.github_queue_state(QueueGitHub("token"), r))
+        assert state(tid)[0] == "needs_input"
+    finally:
+        QueueGitHub.has_queue = True
+
+
+def test_a_turn_holder_paused_by_red_main_gives_up_its_turn(factory, monkeypatch):
+    async def failing_checks(self, full_name, sha):
+        from aifactory.github import CheckSummary
+
+        return CheckSummary("failure", [{"name": "tests", "status": "completed", "conclusion": "failure"}])
+
+    tid = merge_task(factory, key="T1")
+    take(tid)
+    assert state(tid)[2]["turn"] is True
+    monkeypatch.setattr(FakeGitHub, "checks", failing_checks)
+    requeue(tid)
+    with pytest.raises(Stop):
+        take(tid)
+    assert state(tid)[2]["turn"] is False

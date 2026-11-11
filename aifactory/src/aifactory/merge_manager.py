@@ -174,7 +174,9 @@ async def take_turn(runner, gh) -> None:
                 runner.event("merge_queue_paused", f"Merge queue paused: {runner.repo.default_branch} is failing "
                              f"({', '.join(failing[:3])}). Merging resumes when it is green.", level="warn",
                              failing=failing[:10])
-            _park(runner, {**entry, "position": 1, "paused": "main_red"}, retry_after=RED_MAIN_RETRY)
+            # Give up any turn, so a repair behind this task can reach the head.
+            _park(runner, {**entry, "position": 1, "paused": "main_red", "turn": False, "granted_at": None},
+                  retry_after=RED_MAIN_RETRY)
     if not entry.get("turn"):
         entry.update(turn=True, granted_at=utcnow().isoformat())
         runner.event("merge_turn", f"Merge turn for PR #{runner.task.pr_number}", position=1, length=len(ids))
@@ -206,6 +208,11 @@ async def github_queue_state(gh, runner) -> dict[str, Any] | None:
         return None
     repo = (data.get("data") or data).get("repository") or {}
     if not repo.get("mergeQueue"):
+        if mode == "github":
+            runner.block("unblock", f"{runner.task.key}: no GitHub merge queue on {runner.repo.default_branch}",
+                         "This repository is set to merge through GitHub's merge queue (merge.queue: github), but "
+                         f"{runner.repo.default_branch} has none. Add one in branch protection, or set merge.queue "
+                         "to auto, then retry.", status="needs_input")
         return None
     pr = repo.get("pullRequest") or {}
     return {"pr_id": pr.get("id"), "merged": bool(pr.get("merged")), "entry": pr.get("mergeQueueEntry")}
