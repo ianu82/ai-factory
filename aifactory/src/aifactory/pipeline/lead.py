@@ -48,6 +48,62 @@ FIRST_LOOK = timedelta(days=1)  # posts older than this predate the Lead: its fi
 MAX_MINUTES = 15
 PER_RUN = {"resolve_decision": 5, "post_guidance": 3, "note_for_people": 5}
 RESULT_CHARS = 40_000
+MAX_OUTPUT = 8000  # tokens a Lead request may write
+MIN_OUTPUT = 512  # below this a request can't do anything useful: the run stops instead
+UNPRICED_OUTPUT = 4000  # without a price, a smaller reply bounds what one request can spend
+UNPRICED_MIN = 0.25  # without a price, too little budget to start a run: one request could pass it
+UNPRICED_FLOOR = 0.25  # without a price, stop once less than this share of the run's cap is left
+
+
+class LeadFailed(Exception):
+    """The run ended without doing its job; it is recorded as failed so a later run revisits what woke it."""
+
+
+class _Budget:
+    """Keeps one Lead run within its spending cap, request by request.
+
+    With a price for the model, each request's output limit comes from the dollars left after the prompt's cost:
+    a token is at least two bytes of UTF-8 in practice, so half the prompt's bytes bounds its tokens, and the
+    prompt is priced as if none of it were cached. Without a price, only MindsHub's estimate for the run's session
+    shows spend, and only after a request: the run needs a minimum budget to start, writes shorter replies, and
+    stops once what is left would no longer cover a typical request.
+    """
+
+    def __init__(self, client, run_id: str, ledger: UsageLedger, cap: float, price: tuple[float, float] | None):
+        self.client, self.run_id, self.ledger, self.cap, self.price = client, run_id, ledger, cap, price
+        self.reading: list[float] = []  # MindsHub's latest estimate of the run's cost
+        self.attempts = 0  # requests sent, including any that failed before their usage was recorded
+        if price is None and cap < UNPRICED_MIN:
+            raise BudgetExceeded(f"The Lead needs at least ${UNPRICED_MIN:.2f} to run a model whose price isn't known")
+
+    def before(self, messages: list[dict[str, Any]]) -> int:
+        """The output limit for the next request; BudgetExceeded when what is left can't cover one."""
+        if self.price is not None:
+            p_in, p_out = self.price
+            prompt = sum(len(json.dumps(m, ensure_ascii=False, default=str).encode()) for m in messages) // 2
+            left = self.cap - self.ledger.cost_usd - (prompt + 64 * len(messages)) * p_in / 1e6
+            limit = MAX_OUTPUT if p_out <= 0 else min(MAX_OUTPUT, int(max(0.0, left) * 1e6 / p_out))
+            if left <= 0 or limit < MIN_OUTPUT:
+                raise BudgetExceeded(f"The Lead's budget of ${self.cap:.2f} can't cover another request")
+            limit_out = limit
+        else:
+            spent = self.reading[0] if self.reading else 0.0
+            if self.cap - spent < self.cap * UNPRICED_FLOOR:
+                raise BudgetExceeded(f"The Lead's budget of ${self.cap:.2f} is nearly spent")
+            limit_out = UNPRICED_OUTPUT
+        self.attempts += 1
+        return limit_out
+
+    async def after(self) -> None:
+        """Without a price, read what the run has cost so far; if that can't be read, stop rather than spend blind."""
+        if self.price is not None:
+            return
+        spent = await self.client.session_cost(self.run_id)
+        if spent is None or not math.isfinite(spent) or spent < 0:
+            raise BudgetExceeded("The Lead's spend couldn't be measured, so it stopped")
+        self.reading[:] = [spent]
+        if spent >= self.cap:
+            raise BudgetExceeded(f"The Lead's budget of ${self.cap:.2f} is spent")
 
 SYSTEM = """You are the Lead for one outcome in the AI Factory: the agent responsible for delivering it end to end.
 The Factory's planner, builders and verifier do the work; the orchestrator schedules it. You make sure it gets
@@ -477,7 +533,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
     client = provider = None
     started = False
     status, error, summary = "failed", "", ""
-    reading: list[float] = []  # MindsHub's latest estimate of this run's cost, read during the run
+    budget: _Budget | None = None
     try:
         budgets = settings["budgets"]
         usd = min(x for x in (_limit(budgets.get("run_usd")), cfg["run_usd"]) if x is not None)
@@ -490,7 +546,8 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         provider = resolve_provider(workspace_id)
         # The model for the provider that will actually serve the run (a fallback provider may not have Opus).
         model = provider.model_override or workspace_models(settings, provider.provider).lead
-        if price_for(model, settings) is None and provider.provider != "mindshub":
+        price = price_for(model, settings)
+        if price is None and provider.provider != "mindshub":
             raise BudgetExceeded("The Lead's spend can't be capped: its model has no price and its provider "
                                  "doesn't report what a run cost")
         minutes = min(_limit((settings.get("limits") or {}).get("run_minutes")) or MAX_MINUTES, MAX_MINUTES)
@@ -501,26 +558,14 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
                 "run_usd": usd, "run_tokens": ledger.max_tokens, "turns": cfg["turns"], "minutes": minutes}}
         client = ModelClient(provider, session_id=run_id, timeout=minutes * 60, log_errors=False)
         started = True
-        async def within_budget() -> None:
-            """With no price for the model the ledger can't see spend, so it can't stop the run: MindsHub's own
-            estimate for this run's session does. If that can't be read, the run stops rather than spend blind."""
-            if ledger.cost_known:
-                return
-            spent_now = await client.session_cost(run_id)
-            if spent_now is not None and math.isfinite(spent_now) and spent_now >= 0:
-                reading[:] = [spent_now]
-            if spent_now is None:
-                raise BudgetExceeded("The Lead's spend couldn't be measured, so it stopped")
-            if spent_now >= usd:
-                raise BudgetExceeded(f"The Lead's budget of ${usd:.2f} is spent")
-
+        budget = _Budget(client, run_id, ledger, usd, price)
         async with asyncio.timeout(minutes * 60):
             summary = await _loop(client, model, ledger, tools, settings, cfg["turns"], number, reasons, outcome_id,
-                                  within_budget)
+                                  budget)
         status = "succeeded"
     except asyncio.CancelledError:
         status, error = "cancelled", "Stopped"
-    except BudgetExceeded as exc:
+    except (BudgetExceeded, LeadFailed) as exc:
         error = str(exc)
     except TimeoutError:
         error = "The Lead ran out of time"
@@ -531,7 +576,9 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         error = f"Lead run failed ({type(exc).__name__})"
     finally:
         measured = None
-        if started and provider is not None and provider.provider == "mindshub" and ledger.calls:
+        attempts = budget.attempts if budget else 0
+        reading = budget.reading if budget else []
+        if started and provider is not None and provider.provider == "mindshub" and attempts:
             try:
                 async with asyncio.timeout(20):
                     measured = await client.session_cost(run_id)
@@ -546,7 +593,8 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.input_tokens, row.output_tokens = ledger.input_tokens, ledger.output_tokens
             # A final reading that fails leaves the last one taken during the run: a lower bound, so not "known".
             row.cost_usd = round(measured if measured is not None else max([ledger.cost_usd, *reading]), 6)
-            row.cost_known = measured is not None or (ledger.cost_known and not reading)
+            # A request that failed before its usage was recorded may still be billed: unknown unless measured.
+            row.cost_known = measured is not None or (ledger.cost_known and not reading and attempts == ledger.calls)
             row.result = {"summary": summary, "actions": tools.actions}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
@@ -561,7 +609,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
 
 
 async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings: dict[str, Any], turns: int,
-                number: int, reasons: list[str], outcome_id: str, within_budget) -> str:
+                number: int, reasons: list[str], outcome_id: str, budget: _Budget) -> str:
     record_now = await asyncio.to_thread(tools._outcome_record)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM},
@@ -573,10 +621,11 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
         final = turn == turns - 1  # the last allowed call is the summary
         if final:
             messages.append({"role": "user", "content": "You are out of turns. Call finish now with your summary."})
+        limit = budget.before(messages)
         message = await client.chat(model=model, messages=messages, tools=[TOOLS[-1]] if final else TOOLS,
-                                    tool_choice="required" if final else None, ledger=ledger, max_tokens=8000,
+                                    tool_choice="required" if final else None, ledger=ledger, max_tokens=limit,
                                     reasoning_effort=settings.get("reasoning_effort"))
-        await within_budget()
+        await budget.after()
         calls = message.get("tool_calls") or []
         assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
         if calls:
@@ -586,8 +635,8 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
         messages.append(assistant)
         if not calls:
             nudges += 1
-            if nudges > 3:
-                return (message.get("content") or "Stopped without a summary").strip()[:2000]
+            if nudges > 3:  # it never acted: fail, so a later run revisits what woke it
+                raise LeadFailed("The Lead replied without using its tools")
             messages.append({"role": "user", "content": "Use the tools to act, then call finish with your summary."})
             continue
         for call in calls:

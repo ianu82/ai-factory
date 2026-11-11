@@ -445,3 +445,63 @@ def test_every_admission_counts_what_a_running_lead_has_reserved(world):
 
 def test_a_lead_always_has_a_turn_to_act(world):
     assert lead.settings_for({"lead": {"turns": 1}})["turns"] == 2  # one to act, and the summary
+
+
+class CapturingModel(ScriptedModel):
+    """Records each request's output limit."""
+    limits: list = []
+
+    async def chat(self, *, model, messages, tools=None, ledger=None, **kwargs):
+        CapturingModel.limits.append(kwargs.get("max_tokens"))
+        return await super().chat(model=model, messages=messages, tools=tools, ledger=ledger, **kwargs)
+
+
+def lead_settings(world, **values):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, **values}
+
+
+def test_with_a_price_each_request_is_sized_to_the_dollars_left(world, model, monkeypatch):
+    monkeypatch.setattr(lead, "ModelClient", CapturingModel)
+    CapturingModel.limits = []
+    lead_settings(world, pricing={"lead-model": {"input": 0, "output": 1000}})  # $1 per 1,000 output tokens
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "succeeded" and CapturingModel.limits == [2000]  # $2 left buys 2,000 output tokens
+    lead_settings(world, lead={"enabled": True, "run_usd": 0.0003, "turns": 30})  # less than one useful reply
+    CapturingModel.limits = []
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "can't cover another request" in row.error and CapturingModel.limits == []
+
+
+def test_without_a_price_the_lead_needs_room_for_a_request(world, model, monkeypatch):
+    unpriced(world)
+    monkeypatch.setattr(lead, "ModelClient", MeteredModel)
+    lead_settings(world, lead={"enabled": True, "run_usd": 0.1, "turns": 30})
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "needs at least $0.25" in row.error and model.calls == []
+    lead_settings(world, lead={"enabled": True, "run_usd": 2.0, "turns": 30})
+    model.scripts = {"lead": busy}
+    MeteredModel.readings = [1.7]  # $0.30 of $2 left after the first request: too little for another
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "nearly spent" in row.error and row.turns == 1
+
+
+def test_a_request_that_fails_before_its_usage_is_recorded_leaves_the_cost_unknown(world, model, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    class Down(ScriptedModel):
+        async def chat(self, **_kwargs):
+            raise InferenceError("Gateway timeout", status=504)
+
+    monkeypatch.setattr(lead, "ModelClient", Down)
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "status 504" in row.error
+    assert row.cost_known is False  # it may have been billed, and MindsHub couldn't say
+
+
+def test_a_lead_that_never_uses_its_tools_fails_so_it_is_retried(world, model):
+    model.scripts = {"lead": lambda messages: {"content": "I think it's fine."}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["test"], {}))
+    assert row.status == "failed" and "without using its tools" in row.error
