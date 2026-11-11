@@ -59,6 +59,10 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
       )}
       {d.body && <Prose text={d.body} />}
       {d.pr_url && <a className="linkish" href={d.pr_url} target="_blank" rel="noreferrer" style={{ marginTop: 6 }}>Review pull request #{d.pr_number ?? d.pr_url.split("/").pop()} on GitHub <ExternalLink /></a>}
+      {d.lead_note && <div className="lead-note" style={{ marginTop: 8 }}>
+        <b>Lead{d.outcome_number != null ? ` of #${d.outcome_number}` : ""} · {ago(d.lead_note.created_at)}</b>
+        <Prose text={d.lead_note.text} />
+      </div>}
       {d.judge && <div className="muted" style={{ marginTop: 8 }}>
         <b>Decision judge · {d.judge.effective_verdict || d.judge.state}</b>
         <p>{d.judge.summary}</p>

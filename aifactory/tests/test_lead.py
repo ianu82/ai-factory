@@ -552,3 +552,14 @@ def test_a_cut_off_lead_run_holds_no_budget(world):
                   config_snapshot={"budget_reserved": 2.0}))  # crashed holding the whole budget
     assert outcome_committed(world["outcome"]) == (0.0, True)  # stale: it holds nothing
     assert world["outcome"] in woken()  # so its Lead can run again
+
+
+def test_the_inbox_shows_the_leads_recommendation_on_its_decision(world, client):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "Earlier view: wait for CI."})
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "CI and the verifier passed. Merge it."})
+    tools.call("note_for_people", {"text": "A note about the outcome, not a decision."})
+    inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+    note = inbox[world["merge"]]["lead_note"]
+    assert note["text"] == "CI and the verifier passed. Merge it." and note["run_id"] == "run-1" and note["created_at"]
+    assert inbox[world["question"]]["lead_note"] is None
