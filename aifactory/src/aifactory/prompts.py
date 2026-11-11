@@ -285,7 +285,19 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
     if checks:
         lines += ["", "## Configured checks already run by the factory on this candidate"]
         for check in checks:
-            lines.append(f"- `{check['command']}` → {'passed' if check['ok'] else 'FAILED'}")
+            lines.append(f"- `{check['command']}` → {'passed' if check['ok'] else 'FAILED'}"
+                         + (" (pre-existing, see below)" if check.get("preexisting") else ""))
+        preexisting = [c for c in checks if not c["ok"] and c.get("preexisting")]
+        if preexisting:
+            lines += ["", "## Pre-existing check failures",
+                      f"These checks fail the same way on a clean checkout of the base commit {base_sha}, set up and "
+                      "run exactly as for the candidate, so this change did not cause them. Do not fail the candidate "
+                      "for them alone. Do fail it if the change adds failures of its own, or if an acceptance "
+                      "criterion depends on one of these tests passing."]
+            for c in preexisting:
+                ids = c.get("failures") or []
+                listed = ", ".join(ids[:30]) + (f" and {len(ids) - 30} more" if len(ids) > 30 else "")
+                lines.append(f"- `{c['command']}`: {listed or 'exits non-zero on the base commit too'}")
     return "\n".join(lines)
 
 

@@ -491,6 +491,7 @@ class Orchestrator:
     def _schedule(self) -> None:
         self._schedule_ci()
         settings = get_settings()
+        now = utcnow().isoformat()
         with session_scope() as s:
             workspaces = {w.id: w for w in s.query(Workspace)}
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
@@ -501,7 +502,9 @@ class Orchestrator:
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Outcome.source != "review", Task.status == "queued")]
+                      .filter(Outcome.source != "review", Task.status == "queued")
+                      # A task requeued after an infrastructure failure waits out its backoff.
+                      if ((t.evidence or {}).get("infra_retry_at") or "") <= now]
             # The merge manager hands out one merge turn per repository; the rest wait without a slot.
             held = merge_manager.held_back(s)
             queued = [c for c in queued if c.id not in held]

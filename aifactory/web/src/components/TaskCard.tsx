@@ -270,4 +270,6 @@ const ATTEMPT_TEXT: Record<string, string> = {
   builder_failed: "Builder session ended without a report",
   builder_blocked: "Builder asked for a decision",
   policy: "Change rejected by repository policy",
+  infra: "Model provider or sandbox unavailable — not counted as an attempt",
+  checks_preexisting: "Failing checks also fail on the base commit — verification continues",
 };

@@ -21,6 +21,8 @@ def human_message(m) -> bool:
     """A person's post. The Lead posts guidance as a user message so agents receive it, but it is the Factory's."""
     return m.author_kind == "user" and (m.attribution or {}).get("source") != "lead"
 APPROVALS = {"approve_plan", "approve_merge", "approve_release"}
+# Neither failures nor passes: "infra" (the model provider or the sandbox failed; the same attempt is redone) and
+# "checks_preexisting" (the configured checks fail on the base commit too; the attempt goes on to verification).
 FAILURES = {"builder_failed", "checks_failed", "verification_failed", "policy"}
 
 
@@ -52,10 +54,15 @@ def first_attempt_result(task, events, configured_checks):
     """True/False = conclusive first pass/failure; None = unknown; 'excluded' = waiting only."""
     attempts = (task.evidence or {}).get("attempts", [])
     conclusive = [a for a in attempts if a.get("result") in FAILURES | {"verified"}]
+    # Check failures the base commit shares are not the candidate's failures.
+    preexisting = {(a.get("n"), c.get("command")) for a in attempts if a.get("result") == "checks_preexisting"
+                   for c in a.get("checks") or [] if c.get("ok") is False}
     # A failed check is conclusive even if a later legacy 'verified' entry has
     # insufficient detail. Inspect the journal before returning unknown.
     first_verified = next((e for e in events if e.kind == "verified"), None)
-    prior_failure = any((e.kind in {"verification_failed", "candidate_rejected"} or _failed_check(e))
+    prior_failure = any((e.kind in {"verification_failed", "candidate_rejected"}
+                         or (_failed_check(e) and ((e.data or {}).get("attempt"), (e.data or {}).get("command"))
+                             not in preexisting))
                         and (first_verified is None or e.id < first_verified.id) for e in events)
     if prior_failure:
         return False
@@ -70,7 +77,8 @@ def first_attempt_result(task, events, configured_checks):
         return False
     checks, verdict = first.get("checks"), first.get("verdict") or {}
     criteria = verdict.get("criteria")
-    if checks is not None and any(c.get("ok") is False for c in checks):
+    # A pre-existing failure is not the candidate's, but the configured checks did not pass either: unknown below.
+    if checks is not None and any(c.get("ok") is False and not c.get("preexisting") for c in checks):
         return False
     if verdict.get("verdict") == "fail" or (criteria and any(c.get("status") != "pass" for c in criteria)):
         return False

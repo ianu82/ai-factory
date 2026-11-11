@@ -68,6 +68,7 @@ def factory(tmp_path, monkeypatch):
     monkeypatch.setattr(delivery, "GitHub", FakeGitHub)
     monkeypatch.setattr(delivery, "resolve_token", lambda ws: "token")
     monkeypatch.setattr(planning, "resolve_token", lambda ws: "token")
+    delivery._BASE_CHECKS.clear()  # base-commit check results are kept per process; every scenario starts cold
     ScriptedModel.calls = []
     ScriptedModel.scripts = {"planner": planner_script, "builder": good_builder, "verifier": passing_verifier}
     with session_scope() as s:
@@ -1887,6 +1888,513 @@ def test_cancelling_final_merge_waits_for_bounded_transaction(factory):
     asyncio.run(go())
 
 
+# Infrastructure failures, pre-existing check failures and restarts ----------------------------------------------
+
+def _task_state(outcome_id):
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one_or_none()
+        return (task.status, task.stage, task.pr_number) if task else (None, None, None)
+
+
+def _open_decision(outcome_id, kind):
+    with session_scope() as s:
+        d = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.kind == kind,
+                                     Decision.status == "open").one_or_none()
+        return d.id if d else None
+
+
+def _attempt_records(outcome_id):
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one_or_none()
+        return list((task.evidence or {}).get("attempts", [])) if task else []
+
+
+@pytest.mark.parametrize("error,expected", [
+    # Billing and quota, as each harness reports it: the native client, Codex through the gateway, Anton through
+    # the OpenAI SDK.
+    ("Model request failed: MindsHub: no credit remaining (insufficient balance)", "provider"),
+    ("Model request failed: Server returned 402: your MindsHub credits are used up", "provider"),
+    ('Codex did not return a report (exit 1): {"type": "turn.failed", "error": {"message": "unexpected status 400 '
+     'Bad Request: wallet_empty: Provider returned 402"}}', "provider"),
+    ("Error code: 402 - {'error': {'message': 'Payment Required'}}", "provider"),
+    ("Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing "
+     "details.', 'type': 'insufficient_quota'}}", "provider"),
+    ("Quota exceeded for model gpt-terra", "provider"),
+    ("Model request failed: MindsHub refused the credential (401): invalid key", "provider"),
+    # The provider or the sandbox was unavailable after the client's own retries.
+    ("Model request failed: MindsHub error 503: upstream unavailable", "transient"),
+    ("Model request failed: MindsHub unreachable: ConnectTimeout", "transient"),
+    ('Codex did not return a report (exit 1): {"type": "error", "message": "unexpected status 502 Bad Gateway: '
+     'upstream_error"}', "transient"),
+    ("Error code: 503 - {'error': {'message': 'Service temporarily unavailable'}}", "transient"),
+    ("Connection error.", "transient"),
+    ("Request timed out.", "transient"),
+    ("VM bridge stopped", "transient"),
+    ("Sandbox setup failed: git clone failed: Could not resolve host: github.com", "transient"),
+    # The attempt's own caps and failures stay charged.
+    ("Token budget of 1,402,000 reached", ""),
+    ("Cost budget of $5.00 reached", ""),
+    ("Time budget exhausted before a final report", ""),
+    ("Stopped after 83 turns without a valid final report", ""),
+    ("Codex exceeded its time budget", ""),
+    ("Anton exhausted its turn or time budget", ""),
+    ("The model stopped calling tools without submitting a report", ""),
+    ("Final report rejected repeatedly: summary is required", ""),
+])
+def test_provider_and_infrastructure_failures_are_recognised_for_every_harness(error, expected):
+    assert delivery.infrastructure_problem(error) == expected
+
+
+def test_a_provider_billing_problem_blocks_without_using_an_attempt(factory):
+    from aifactory.inference import InferenceError
+
+    def out_of_credit(messages):
+        raise InferenceError("Server returned 402: your MindsHub credits are used up", status=402)
+
+    ScriptedModel.scripts["builder"] = out_of_credit
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        decision = s.query(Decision).filter(Decision.task_id == task.id, Decision.status == "open").one()
+        assert task.status == "blocked" and task.attempt == 0
+        assert decision.title == "T1: model provider problem" and "credits are used up" in decision.body
+        assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+
+
+def test_infrastructure_failures_are_retried_after_a_backoff_without_using_attempts(factory):
+    from datetime import datetime
+
+    from aifactory.db import SessionLocal, utcnow
+    from aifactory.decisions import resolve
+    from aifactory.inference import InferenceError
+    from aifactory.metrics import workspace_metrics
+
+    def unavailable(messages):
+        raise InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
+
+    ScriptedModel.scripts["builder"] = unavailable
+    outcome_id = new_outcome(factory)
+
+    def infra(count):
+        return (len([a for a in _attempt_records(outcome_id) if a["result"] == "infra"]) == count
+                and _task_state(outcome_id)[0] in ("queued", "blocked"))
+
+    delays = []
+    for retry in range(delivery.INFRA_RETRIES):
+        assert drive(lambda: infra(retry + 1))
+        if retry == 0:  # the backoff holds the task back
+            assert not drive(lambda: len(_attempt_records(outcome_id)) > 1, timeout=2)
+        with session_scope() as s:
+            task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+            assert task.status == "queued" and task.attempt == 0
+            retry_at = datetime.fromisoformat(task.evidence["infra_retry_at"])
+            delays.append(round((retry_at - utcnow()).total_seconds() / 60))
+            task.evidence = {**task.evidence, "infra_retry_at": utcnow().isoformat()}  # the backoff has passed
+    assert delays == [2, 10, 10]
+
+    # The fourth failure in a row goes to a person, still without using an attempt.
+    assert drive(lambda: infra(delivery.INFRA_RETRIES + 1))
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        decision = s.query(Decision).filter(Decision.task_id == task.id, Decision.status == "open").one()
+        assert task.status == "blocked" and task.attempt == 0
+        assert decision.title == "T1: infrastructure problem" and "upstream unavailable" in decision.body
+        assert [o["value"] for o in decision.options] == ["retry", "abandon"]
+        assert {a["phase"] for a in task.evidence["attempts"]} == {"build"}
+        task.evidence = {**task.evidence, "auto_retries": 1}  # an unrelated budget the retry must keep
+        decision_id, epoch = decision.id, task.evidence.get("budget_epoch", 0)
+
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "retry")
+    db.close()
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "queued" and task.attempt == 0
+        assert task.evidence["auto_retries"] == 1 and task.evidence.get("budget_epoch", 0) == epoch
+
+    ScriptedModel.scripts["builder"] = good_builder
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    records = _attempt_records(outcome_id)
+    assert [(a["n"], a["result"]) for a in records] == [(1, "infra")] * 4 + [(1, "verified")]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
+        first = workspace_metrics(s, factory["ws"])["first_attempt_pass_rate"]
+        assert (first["numerator"], first["denominator"]) == (1, 1)  # infrastructure retries are not attempts
+
+
+@pytest.mark.parametrize("phase", ["prepare", "verify"])
+def test_an_environment_failure_redoes_the_same_attempt(factory, monkeypatch, phase):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    calls = []
+    if phase == "prepare":
+        original = delivery.checkout
+
+        async def flaky_checkout(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise gitops.GitError("git clone failed: Could not resolve host: github.com")
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(delivery, "checkout", flaky_checkout)
+    else:
+        def flaky_verifier(messages):
+            calls.append(1)
+            if len(calls) <= 2:  # both verifier sessions of the attempt find the provider down
+                raise InferenceError("MindsHub unreachable: ConnectTimeout", retryable=True)
+            return passing_verifier(messages)
+
+        ScriptedModel.scripts["verifier"] = flaky_verifier
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert task.attempt == 1
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "infra"), (1, "verified")]
+        assert records[0]["phase"] == phase and records[0]["cause"] == "transient"
+
+
+def test_failing_tests_are_compared_with_the_base_commit():
+    summary = ("=== short test summary info ===\n"
+               "FAILED tests/test_env.py::test_network - OSError: network is unreachable\n"
+               "ERROR tests/test_db.py - ImportError: No module named 'psycopg'\n"
+               "=== 1 failed, 4 passed, 1 error in 0.52s ===\n")
+    assert delivery._failing_tests(summary) == ["ERROR tests/test_db.py", "FAILED tests/test_env.py::test_network"]
+    assert delivery._failing_tests("FAILED tests/test_a.py::test_a - x\n=== 3 failed in 1.0s ===\n") is None  # clipped
+    assert delivery._failing_tests("npm ERR! Test failed.  See above for more details.") is None
+
+    network = "FAILED tests/test_env.py::test_network"
+    base = {"ok": False, "timed_out": False, "failures": [network]}
+    assert delivery._same_failure({"ok": False, "failures": [network]}, base)
+    assert not delivery._same_failure({"ok": False, "failures": [network, "FAILED tests/test_greet.py::test_hi"]}, base)
+    assert not delivery._same_failure({"ok": False, "failures": None}, base)  # the candidate broke the whole run
+    # Other commands have no test names to compare. That the base exits non-zero too is not enough: it must end with
+    # the same exit code and print the same thing.
+    def other(exit_code=1, signature="abc", **more):
+        return {"ok": False, "failures": None, "exit_code": exit_code, "signature": signature, **more}
+
+    assert delivery._same_failure(other(), other())
+    assert not delivery._same_failure(other(), other(signature="def"))  # the base fails for another reason
+    assert not delivery._same_failure(other(), other(exit_code=2))
+    assert not delivery._same_failure(other(signature=""), other(signature=""))  # no output proves nothing
+    assert not delivery._same_failure({"ok": False, "failures": None}, {"ok": False, "failures": None})
+    assert not delivery._same_failure(other(), {**other(), "failures": [network]})  # only the base printed test names
+    assert not delivery._same_failure(other(), {"ok": True})
+    assert not delivery._same_failure(other(timed_out=True), other(timed_out=False))
+    assert not delivery._same_failure(other(), None)
+
+
+def test_a_failure_signature_ignores_what_differs_between_two_runs_of_the_same_failure():
+    from types import SimpleNamespace
+
+    def output(root, when, took, address):
+        return (f"\x1b[31merror\x1b[0m: {root}/work/src/app.ts(3,1): TS2304 Cannot find name 'x'.   \n"
+                f"{when} build failed in {took} at {address}\n")
+
+    candidate = SimpleNamespace(root="/data/jobs/task-1-attempt1", work="/data/jobs/task-1-attempt1/work")
+    base = SimpleNamespace(root="/data/jobs/task-1-base1", work="/data/jobs/task-1-base1/work")
+    theirs = output(candidate.root, "2026-11-11T14:56:17.120Z", "1.52s", "0x7f3a2c")
+    one = delivery._output_signature(theirs, candidate)
+    two = delivery._output_signature(output(base.root, "2026-11-12 09:01:02", "941 ms", "0x10ffe0"), base)
+    assert one and one == two
+    # A second error is a different failure, however the first one reads.
+    assert one != delivery._output_signature(theirs + "error: src/new.ts(1,1): TS1005 ';' expected.\n", candidate)
+    vm = SimpleNamespace(work="/workspace")  # a VM has only a work directory
+    assert delivery._output_signature("/workspace/src/app.ts: bad", vm) == delivery._output_signature(
+        "/data/jobs/task-1-base1/work/src/app.ts: bad", base)
+    assert delivery._output_signature("", candidate) == delivery._output_signature(" \n", None) == ""
+
+
+ENV_CHECK = ('echo "FAILED tests/test_env.py::test_network - OSError: network is unreachable"\n'
+             "n=1\n"
+             'if [ -f broken.txt ]; then echo "FAILED tests/test_greet.py::test_greeting - assert False"; n=2; fi\n'
+             'echo "$n failed in 0.01s"\n'
+             "exit 1\n")
+
+
+def test_check_failures_that_also_fail_on_the_base_commit_are_not_charged(factory):
+    _land_on_main(factory, "env_check.sh", ENV_CHECK)  # a test that only fails in the sandbox, on main too
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": ["sh test.sh", "sh env_check.sh"]}
+    prompts, briefs = [], []
+
+    def builder(messages):
+        if step(messages) == 0:
+            prompts.append(messages[1]["content"])
+            if len(prompts) == 1:  # the first attempt also breaks a test of its own
+                return {"content": "", "tool_calls": [
+                    call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}),
+                    call("write_file", {"path": "broken.txt", "content": "x\n"}, 1)]}
+            return {"content": "", "tool_calls": [call("run", {"command": "rm -f broken.txt"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    def verifier(messages):
+        if step(messages) == 0:
+            briefs.append(messages[1]["content"])
+        return passing_verifier(messages)
+
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        assert task.attempt == 2
+        assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
+            "sh test.sh": None, "sh env_check.sh": True}
+        base_runs = s.query(Event).filter(Event.task_id == task.id, Event.kind == "base_check_result").count()
+    assert base_runs == 1  # the second attempt reused the base commit's result
+    # The builder learns which failure is its own; the verifier is told which ones predate the change.
+    assert "not on the base commit: FAILED tests/test_greet.py::test_greeting" in prompts[1]
+    assert len(briefs) == 1 and "## Pre-existing check failures" in briefs[0]
+    assert "FAILED tests/test_env.py::test_network" in briefs[0]
+
+
+LINT_CHECK = ('echo "lint: $(pwd)/legacy.sh:3: unused variable"\n'
+              'if [ -f broken.txt ]; then echo "lint: $(pwd)/broken.txt:1: stray file"; fi\n'
+              "exit 1\n")
+
+
+def test_a_failure_without_test_names_is_preexisting_only_when_the_base_prints_the_same(factory):
+    _land_on_main(factory, "lint.sh", LINT_CHECK)  # a linter that fails on main too, and prints the sandbox's own path
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": ["sh test.sh", "sh lint.sh"]}
+    prompts = []
+
+    def builder(messages):
+        if step(messages) == 0:
+            prompts.append(messages[1]["content"])
+            if len(prompts) == 1:  # the first attempt adds a lint failure of its own
+                return {"content": "", "tool_calls": [
+                    call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}),
+                    call("write_file", {"path": "broken.txt", "content": "x\n"}, 1)]}
+            return {"content": "", "tool_calls": [call("run", {"command": "rm -f broken.txt"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # Both attempts exit 1, as the base commit does. Only the second prints what the base commit prints.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        assert task.attempt == 2
+        assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
+            "sh test.sh": None, "sh lint.sh": True}
+    assert "it fails on the base commit too, but not with the same output" in prompts[1]
+
+
+def _slow_builder(messages):
+    import time as _t
+
+    _t.sleep(0.05)
+    return {"content": "", "tool_calls": [call("run", {"command": "sleep 30"}, step(messages))]}
+
+
+def _greeting_reader(seen):
+    """A builder that records the greeting it finds in its checkout before keeping the change."""
+    def builder(messages):
+        n = step(messages)
+        if n == 0:
+            return {"content": "", "tool_calls": [call("read_file", {"path": "greet.sh"})]}
+        if n == 1:
+            seen.append(messages[-1]["content"])
+            return {"content": "", "tool_calls": [
+                call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Kept the greeting.",
+                                                              "tests": []})]}
+    return builder
+
+
+def test_a_revision_interrupted_by_a_restart_continues_on_the_pull_request_branch(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {"plan": "auto", "merge": "approval", "release": "auto"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    ScriptedModel.scripts["builder"] = _slow_builder
+    db = SessionLocal()
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]),
+            "reject", comment="Please keep the script POSIX-only.")
+    db.close()
+    assert drive(lambda: _task_state(outcome_id)[1] == "build")  # the server restarts mid-revision
+    assert _task_state(outcome_id)[:2] == ("queued", "build")
+
+    seen = []
+    ScriptedModel.scripts["builder"] = _greeting_reader(seen)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    assert seen and "Hello, Factory!" in seen[0], seen  # the pull request's branch, not a fresh copy of main
+    _approve_and_finish(factory, outcome_id)
+
+
+def test_a_ci_repair_interrupted_by_a_restart_continues_on_the_pull_request_branch(factory):
+    states = iter(["failure"])
+    original = FakeGitHub.checks
+
+    async def checks(self, full_name, sha):
+        FakeGitHub.check_state = next(states, "success")
+        return await original(self, full_name, sha)
+
+    seen = []
+    repair = {"builder": _slow_builder}
+
+    def builder(messages):
+        return repair["builder"](messages) if "CI check" in messages[1]["content"] else good_builder(messages)
+
+    ScriptedModel.scripts["builder"] = builder
+    FakeGitHub.checks = checks
+    try:
+        outcome_id = new_outcome(factory)
+        assert drive(lambda: _task_state(outcome_id)[1:] == ("build", 1))  # the server restarts mid-repair
+        assert _task_state(outcome_id)[0] == "queued"
+        repair["builder"] = _greeting_reader(seen)
+        assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
+    finally:
+        FakeGitHub.checks = original
+    assert outcome_status(outcome_id) == "completed"
+    # The resumed repair was given the CI logs again and worked on the pull request's branch.
+    assert seen and "Hello, Factory!" in seen[0], seen
+
+
+def test_an_infrastructure_failure_during_a_ci_repair_redoes_the_repair_not_the_published_candidate(factory,
+                                                                                                    monkeypatch):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    states = iter(["failure"])
+    original = FakeGitHub.checks
+
+    async def checks(self, full_name, sha):
+        FakeGitHub.check_state = next(states, "success")
+        return await original(self, full_name, sha)
+
+    sessions = []
+
+    def verifier(messages):
+        if step(messages) == 0:
+            sessions.append(1)
+            if len(sessions) in (2, 3):  # both verifier sessions of the repair find the provider down
+                raise InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
+        return passing_verifier(messages)
+
+    ScriptedModel.scripts["verifier"] = verifier
+    FakeGitHub.checks = checks
+    try:
+        outcome_id = new_outcome(factory)
+        assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
+    finally:
+        FakeGitHub.checks = original
+    assert outcome_status(outcome_id) == "completed"
+    records = _attempt_records(outcome_id)
+    # The repair is redone as attempt 2; the candidate that failed CI is never published again.
+    assert [(a["n"], a["result"]) for a in records] == [(1, "verified"), (2, "infra"), (2, "verified")]
+    assert "publish_resumed" not in _event_kinds(outcome_id)
+
+
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_a_restart_before_publication_publishes_the_verified_candidate(factory, monkeypatch, recoverable):
+    original = delivery.publish
+    interrupted = []
+
+    async def publish_after_a_restart(*args, **kwargs):
+        if not interrupted:
+            interrupted.append(True)
+            raise asyncio.CancelledError()  # the server stops while the verified candidate is being pushed
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(delivery, "publish", publish_after_a_restart)
+    if not recoverable:  # e.g. a diff too large to keep in full: the attempt is redone, still uncharged
+        monkeypatch.setattr(delivery.TaskRunner, "_restore_verified_candidate", lambda self: False)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=90)
+    assert interrupted
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert task.attempt == 1
+        assert [(a["n"], a["result"]) for a in task.evidence["attempts"]] == [(1, "verified")] * (1 if recoverable else 2)
+        builds = s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count()
+    assert builds == (1 if recoverable else 2)
+    kinds = _event_kinds(outcome_id)
+    assert ("publish_resumed" in kinds) is recoverable and ("attempt_resumed" in kinds) is not recoverable
+
+
+@pytest.mark.parametrize("result, failing, ends", [
+    ("checks_preexisting", "verify", False),  # checks also failing on base: the verifier has not recovered
+    ("checks_failed", "verify", False),
+    ("verification_failed", "verify", True),
+    ("verified", "verify", True),
+    ("checks_preexisting", "build", True),  # the builder ran again and reached the checks
+    ("builder_failed", "prepare", True),
+    ("infra", None, False),
+    ("attempt_resumed", "build", False),
+])
+def test_only_completing_the_failed_phase_ends_a_run_of_infrastructure_retries(result, failing, ends):
+    assert delivery.recovered_from_infra(result, failing) is ends
+
+
+def test_a_run_of_infrastructure_retries_keeps_the_furthest_phase_that_failed(factory):
+    _, task_id, _ = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.status, task.stage, task.attempt = "running", "verify", 1
+    runner = _runner(task_id)
+
+    def fail(phase):
+        with pytest.raises(delivery.Stop):
+            runner._infrastructure(1, phase, "MindsHub error 503: upstream unavailable", "transient")
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            return task.status, task.attempt, task.evidence.get("infra_retries"), task.evidence.get("infra_phase")
+
+    assert fail("verify") == ("queued", 0, 1, "verify")
+    # The retry's sandbox fails next. That is an earlier phase, and it must not replace the one the run waits for.
+    assert fail("prepare") == ("queued", 0, 2, "verify")
+    # The next retry builds again and its checks fail as they do on the base commit: the verifier has still not run.
+    runner.evidence("attempts", {"n": 1, "result": "checks_preexisting"})
+    assert (runner.task.evidence["infra_retries"], runner.task.evidence["infra_phase"]) == (2, "verify")
+    assert fail("verify") == ("queued", 0, 3, "verify")
+    # So a verifier that keeps failing reaches a person instead of being retried without limit.
+    assert fail("verify") == ("blocked", 0, 0, None)
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.task_id == task_id, Decision.kind == "unblock",
+                                            Decision.status == "open").one()
+        assert decision.title == "T1: infrastructure problem"
+        assert "Independent verification failed 4 times in a row" in decision.body
+
+
+def test_base_check_results_are_cached_per_workspace_and_configuration():
+    from types import SimpleNamespace
+
+    def key(ws, cfg):
+        runner = delivery.TaskRunner.__new__(delivery.TaskRunner)
+        runner.ws, runner.cfg = ws, cfg
+        runner.repo, runner.task = SimpleNamespace(full_name="acme/demo"), SimpleNamespace(base_sha="b" * 40)
+        return runner._base_key()
+
+    assert key("ws1", {"setup": ["npm ci"]}) == key("ws1", {"setup": ["npm ci"]})
+    assert key("ws1", {"setup": ["npm ci"]}) != key("ws1", {"setup": ["pip install -e ."]})
+    assert key("ws1", {"setup": ["npm ci"]}) != key("ws2", {"setup": ["npm ci"]})
+    assert key("ws1", {"build": {"isolation": "vm"}}) != key("ws1", {})
+
+
 @pytest.mark.parametrize(('candidate', 'main', 'overlap'), [
     (['pkg/a.py'], ['pkg/a.py'], True),
     (['pkg/a.py'], ['pkg/b.py'], True),
@@ -2002,6 +2510,46 @@ def test_revalidation_rejection_rebuilds_with_feedback_even_if_summary_fails(fac
         assert len(FakeGitHub.pulls[number]['body']) < 8000
     else:
         assert any('Missing interaction test' in f for f in seen)
+
+
+def test_an_infrastructure_failure_while_revalidating_keeps_the_attempt_and_resumes(factory, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    task_id, _ = _revalidation_candidate(factory)
+    main = _land_on_main(factory, "other.txt", "new main\n")
+
+    def unavailable(messages):
+        raise InferenceError("MindsHub unreachable: ConnectTimeout", retryable=True)
+
+    ScriptedModel.scripts["verifier"] = unavailable
+    with pytest.raises(delivery.Stop):
+        asyncio.run(_runner(task_id)._refresh_onto_main("token", FakeGitHub("t"), main))
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        # The candidate's attempt ended when it was first verified, so its number is not handed back, and the
+        # revalidation is still where it stopped.
+        assert (task.status, task.stage, task.attempt) == ("queued", "verify", 1)
+        assert task.evidence["revalidation"]["phase"] == "verify"
+        assert (task.evidence["infra_retries"], task.evidence["infra_phase"]) == (1, "verify")
+        assert [(a["n"], a["result"], a["phase"]) for a in task.evidence["attempts"]] == [(1, "infra", "verify")]
+        task.status = "running"  # the orchestrator picks the task up again once the backoff has passed
+
+    seen = []
+
+    async def ci(self):
+        seen.append("ci")
+    monkeypatch.setattr(delivery.TaskRunner, "ci_then_merge", ci)
+    ScriptedModel.scripts["verifier"] = passing_verifier
+    asyncio.run(_runner(task_id).run())
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert seen == ["ci"] and task.evidence["revalidation"]["phase"] == "complete"
+        assert (task.stage, task.attempt) == ("ci", 1)
+        # A passing revalidation writes no attempt record, and still ends the run of retries.
+        assert not task.evidence.get("infra_retries") and not task.evidence.get("infra_phase")
+        assert [a["result"] for a in task.evidence["attempts"]] == ["infra"]
+    assert not FakeGitHub.merged
 
 
 def test_revalidation_summary_bounds_unicode_commands_reports_and_paths():

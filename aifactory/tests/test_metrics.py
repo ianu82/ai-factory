@@ -93,6 +93,10 @@ def test_autonomy_production_approvals_and_task_only_links(client, signed_in, ac
     ([{"n": 1, "result": "verified"}], False, (0, 0, 1, 0)),
     ([{"n": 1, "result": "builder_blocked"}], False, (0, 0, 0, 1)),
     ([], False, (0, 0, 0, 1)),
+    # Infrastructure failures redo the same attempt: they are neither failures nor attempts.
+    ([{"n": 1, "result": "infra"}, passed()], False, (1, 1, 0, 0)),
+    ([{"n": 1, "result": "infra", "cause": "provider"}, {"n": 1, "result": "infra"}, passed()], False, (1, 1, 0, 0)),
+    ([{"n": 1, "result": "infra"}, {"n": 1, "result": "checks_failed"}, passed(2)], False, (0, 1, 0, 0)),
 ])
 def test_first_attempt_uses_conclusive_history_not_counter(client, signed_in, attempts, check_failure, expected):
     ws = signed_in["workspaces"][0]["id"]
@@ -102,6 +106,23 @@ def test_first_attempt_uses_conclusive_history_not_counter(client, signed_in, at
             t.status = "needs_input"
         if check_failure:
             event(s, ws, t, "check_result", exit_code=1)
+    m = measure(ws)["first_attempt_pass_rate"]
+    assert tuple(m[k] for k in ("numerator", "denominator", "unknown_count", "excluded_count")) == expected
+
+
+@pytest.mark.parametrize("shared_with_base,expected", [(True, (0, 0, 1, 0)), (False, (0, 1, 0, 0))])
+def test_check_failures_the_base_commit_shares_are_not_first_attempt_failures(client, signed_in, shared_with_base,
+                                                                              expected):
+    ws = signed_in["workspaces"][0]["id"]
+    failing = {"command": "pytest -q", "ok": False, "exit_code": 1}
+    if shared_with_base:  # not the candidate's failure, but the configured checks did not pass either: unknown
+        attempts = [{"n": 1, "result": "checks_preexisting", "checks": [{**failing, "preexisting": True}]},
+                    passed(checks=[{**failing, "preexisting": True}])]
+    else:
+        attempts = [{"n": 1, "result": "checks_failed", "checks": [failing]}, passed(2)]
+    with session_scope() as s:
+        _, _, t = seed(s, ws, evidence={"attempts": attempts}, attempt=1)
+        event(s, ws, t, "check_result", attempt=1, command="pytest -q", exit_code=1)
     m = measure(ws)["first_attempt_pass_rate"]
     assert tuple(m[k] for k in ("numerator", "denominator", "unknown_count", "excluded_count")) == expected
 
