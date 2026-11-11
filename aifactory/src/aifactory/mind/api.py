@@ -24,7 +24,8 @@ from starlette.responses import StreamingResponse
 from ..auth import current_user, require_member
 from ..db import SessionLocal, get_db, utcnow
 from ..models import MindAction, MindCharge, MindMessage, MindThread, Secret, User
-from ..security import decrypt, _SECRET_PATTERNS
+from ..preview_config import redaction_values
+from ..security import _SECRET_PATTERNS
 from . import store
 from .contracts import CreateThread, SubmitMessage, TurnContext
 from .routing import PrivateRoute  # noqa: F401 - also re-exported for callers of mind.api
@@ -41,7 +42,8 @@ def secrets_for(db, user_id, scoped=()):
     # Reads can target newly joined workspaces outside the creation snapshot.
     # Include those credentials as well as the original scope on every egress.
     ids = set(store.memberships(db, user_id)) | set(scoped)
-    return tuple(filter(None, (decrypt(s.ciphertext) for s in db.query(Secret).filter(Secret.workspace_id.in_(ids)))))
+    return tuple(value for s in db.query(Secret).filter(Secret.workspace_id.in_(ids))
+                 for value in redaction_values(s) if value)
 
 
 # Field names of the Mind wire format (threads, messages, contexts, citations, cards, stream envelopes and
