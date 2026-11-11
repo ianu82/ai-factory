@@ -248,3 +248,20 @@ def test_one_live_alert_per_condition_even_from_two_schedulers(world):
     with db.session_scope() as s:
         s.query(Alert).filter_by(key="quiet:x").one().status = "cleared"
     alert("open")  # once it has cleared, the same condition can be raised again
+
+
+def test_an_alerts_table_from_before_the_index_keeps_the_first_alert_raised(world):
+    from sqlalchemy import text
+
+    with db.engine().begin() as conn:  # as it was before one live alert per condition was enforced
+        conn.execute(text("DROP INDEX ux_alerts_live_key"))
+    with db.session_scope() as s:  # a dismissed alert, then a duplicate a second scheduler raised later
+        s.add_all([Alert(id="f" * 32, workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet",
+                         status="dismissed", created_at=now() - timedelta(hours=1)),
+                   Alert(id="0" * 32, workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet",
+                         status="open", created_at=now())])
+    db._migrate_alert_live_key(db.engine())
+    assert live(world) == {"quiet": "dismissed"}  # what a person dismissed stays dismissed
+    with pytest.raises(IntegrityError):  # and the index is back
+        with db.session_scope() as s:
+            s.add(Alert(workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet", status="open"))

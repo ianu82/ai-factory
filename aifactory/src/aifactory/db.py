@@ -273,8 +273,8 @@ def get_db() -> Iterator[Session]:
 
 def _migrate_alert_live_key(engine: Engine) -> None:
     """create_all doesn't add an index to an existing table: an alerts table from before ux_alerts_live_key gets it
-    here. Any duplicate live alerts are cleared first (the earliest per condition stays), since the index can't be
-    built over them. Idempotent; never stops the app."""
+    here. Any duplicate live alerts are cleared first (the earliest raised per condition stays), since the index
+    can't be built over them. Idempotent; never stops the app."""
     from sqlalchemy import inspect, text
 
     from .models import Alert
@@ -283,11 +283,12 @@ def _migrate_alert_live_key(engine: Engine) -> None:
         return
     try:
         with engine.begin() as conn:
+            # Ids are random: the survivor is the first raised (then the lowest id, so it is always the same one).
             conn.execute(text(
-                "UPDATE alerts SET status = 'cleared', cleared_at = :now "
-                "WHERE status IN ('watching', 'open', 'dismissed') AND id NOT IN ("
-                "SELECT MIN(id) FROM alerts WHERE status IN ('watching', 'open', 'dismissed') "
-                "GROUP BY workspace_id, key)"), {"now": utcnow()})
+                "UPDATE alerts SET status = 'cleared', cleared_at = :now WHERE id IN ("
+                "SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY workspace_id, key ORDER BY created_at, id) "
+                "AS n FROM alerts WHERE status IN ('watching', 'open', 'dismissed')) ranked WHERE n > 1)"),
+                {"now": utcnow()})
             for index in Alert.__table__.indexes:
                 if index.name == "ux_alerts_live_key":
                     index.create(conn, checkfirst=True)
