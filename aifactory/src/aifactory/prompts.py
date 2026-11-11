@@ -290,11 +290,14 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
     if checks:
         lines += ["", "## Configured checks already run by the factory on this candidate"]
         for check in checks:
+            first = check.get("first") or {}
             lines.append(f"- `{check['command']}` → {'passed' if check['ok'] else 'FAILED'}"
                          + (" on a second run (it failed on the first, in the same sandbox: flaky, or made "
                             "intermittent by this change)" if check.get("cause") == "flaky" else "")
                          + (f" (timed out after {float(check.get('duration') or 0):.0f}s"
-                            + (f"; the limit is {float(check['limit']):.0f}s" if check.get("limit") else "") + ")"
+                            + (" on a second run" if first else "")
+                            + (f"; the limit is {float(check['limit']):.0f}s" if check.get("limit") else "")
+                            + (f"; the first run failed, exit {first.get('exit_code')}" if first else "") + ")"
                             if check.get("timed_out") else "")
                          + (" (pre-existing, see below)" if check.get("preexisting") else ""))
         preexisting = [c for c in checks if not c["ok"] and c.get("preexisting")]
@@ -305,7 +308,7 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
                       "for them alone. Do fail it if the change adds failures of its own, or if an acceptance "
                       "criterion depends on one of these tests passing."]
             for c in preexisting:
-                ids = c.get("failures") or []
+                ids = sorted({*(c.get("failures") or []), *((c.get("first") or {}).get("failures") or [])})
                 listed = ", ".join(ids[:30]) + (f" and {len(ids) - 30} more" if len(ids) > 30 else "")
                 unlisted = "times out" if c.get("timed_out") else "exits non-zero"
                 lines.append(f"- `{c['command']}`: {listed or unlisted + ' on the base commit too'}")
