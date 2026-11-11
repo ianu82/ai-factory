@@ -736,3 +736,18 @@ def test_a_mind_conversation_that_became_the_outcome_continues_with_its_lead(wor
         s.add(other)
         s.flush()
         assert conversation(s, other, world["uid"])["started_in_mind"] is None
+
+
+def test_a_spent_outcome_that_just_finished_still_posts_its_closing_update(world, model):
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "budgets": {**w.settings["budgets"], "outcome_usd": 1}}
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
+                  status="succeeded", cost_usd=1.5, cost_known=True))
+        o = s.get(Outcome, world["outcome"])
+        o.status, o.completed_at = "completed", db.utcnow() - timedelta(minutes=5)
+    milestone(world, "outcome_completed", task=False)
+    assert world["outcome"] in woken()  # the budget stops work, not the closing report
+    model.scripts = {"lead": lambda messages: {"content": "", "tool_calls": [call("finish", {"summary": "Done"})]}}
+    row = asyncio.run(lead.run_lead(world["ws"], world["outcome"], ["the outcome has ended"], {}))
+    assert row.status == "succeeded"  # within the Lead's own run cap
