@@ -39,6 +39,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # fresh budget before asking a person: relaying findings into a retry is not a decision.
     "auto_retry_rounds": 1,
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
+    # "patch": a merge approval covers the same change when it is published again on a newer base. "head": every new
+    # head is approved again. A repository's merge.approval overrides it (TaskRunner._approved).
+    "merge": {"approval": "patch"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
                "run_minutes": 60,
