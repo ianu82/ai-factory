@@ -40,7 +40,8 @@ def current(context: Context) -> User:
     return user
 
 
-def clean(value: Any, state: list[bool] | None = None, text: int = MAX_TEXT, items: int = MAX_ITEMS) -> Any:
+def clean(value: Any, state: list[bool] | None = None, text: int = MAX_TEXT, items: int = MAX_ITEMS,
+          keys: int = MAX_ITEMS) -> Any:
     state = state if state is not None else [False]
     if isinstance(value, str):
         out = redact(value)
@@ -49,22 +50,25 @@ def clean(value: Any, state: list[bool] | None = None, text: int = MAX_TEXT, ite
             out = out[:text] + "…"
         return out
     if isinstance(value, dict):
-        # Stored objects (task evidence, event data) are bounded like lists, but always at MAX_ITEMS keys: a shorter
-        # result keeps every field of a record and shortens only its texts and lists.
-        if len(value) > MAX_ITEMS:
+        # Stored objects (task evidence, event data) are bounded like lists, at their own key bound: the first
+        # shortening steps keep every field of a record and shorten only its texts and lists.
+        if len(value) > keys:
             state[0] = True
-        return {clean(str(k), state, text, items): clean(v, state, text, items) for k, v in islice(value.items(), MAX_ITEMS)}
+        return {clean(str(k), state, text, items, keys): clean(v, state, text, items, keys)
+                for k, v in islice(value.items(), keys)}
     if isinstance(value, (list, tuple)):
         if len(value) > items:
             state[0] = True
-        return [clean(v, state, text, items) for v in value[:items]]
+        return [clean(v, state, text, items, keys) for v in value[:items]]
     return value
 
 
 # Every model call re-sends the turn's earlier tool results, so one oversized read is paid for again and again (a
 # five-bullet answer over two full reads cost $2.21). A result over the budget is shortened in steps, and says so.
 RESULT_BUDGET = 40_000  # characters of JSON, roughly 10k tokens
-SHORTER = ((400, 10), (150, 5))  # (characters per text, items per list; objects keep their fields) for each step
+# (characters per text, items per list, keys per object) for each further step: objects keep their fields until
+# the last step, which also narrows them; anything still over the budget becomes an empty page that says so.
+SHORTER = ((400, 10, MAX_ITEMS), (150, 5, MAX_ITEMS), (80, 3, 12))
 NARROW = "Shortened to fit: read one object (outcome_detail, or runs with a run_id) for its full text."
 BRIEF_TEXT = 300
 
@@ -182,7 +186,7 @@ def list_outcomes(args, context):
 
 
 @register("list_tasks", "List or search tasks, optionally within an outcome: status, stage, PR and cost. "
-          "outcome_detail has a task's spec, evidence and runs.", {**SEARCH, "outcome_id": {"type": "string"}})
+          "task_detail has one task's spec, evidence and runs.", {**SEARCH, "outcome_id": {"type": "string"}})
 def list_tasks(args, context):
     return tasks_page(args, context, full=False)
 
@@ -201,6 +205,17 @@ def tasks_page(args, context, *, full: bool):
                                 "cost_known": all(r.cost_known for r in runs)}
     return page(search(query, Task, args).order_by(Task.key, Task.id), args, view,
                 lambda t: citation(t.workspace_id, "task", t.id, t.title, t.outcome_id, t.id))
+
+
+@register("task_detail", "One task's full record: spec, acceptance criteria, evidence (attempts, CI, smoke, "
+          "failures), runs and cost. Needs the task's outcome_id and task_id.",
+          {"outcome_id": {"type": "string"}, "task_id": {"type": "string"}}, ("outcome_id", "task_id"))
+def task_detail(args, context):
+    _, t = target(context.db, current(context), args["workspace_id"], args["outcome_id"], args["task_id"])
+    validate_links(context, args, t)
+    runs = scoped(context, args, Run).filter_by(task_id=t.id, outcome_id=t.outcome_id).all()
+    return {"items": [S.task(t, runs)], "citations": [citation(t.workspace_id, "task", t.id, t.title, t.outcome_id, t.id)],
+            "truncated": False}
 
 
 @register("outcome_detail", "Outcome plans, task evidence, PR links, recorded CI, its decisions (newest first), the "
@@ -424,11 +439,15 @@ def read_call(name: str, args: dict, context: Context) -> dict:
     raw = tool.handler({"limit": 20, **args}, context)
     state = [False]
     result = clean(raw, state)
-    for text, items in SHORTER:
-        if len(json.dumps(result, ensure_ascii=False, default=str)) <= RESULT_BUDGET:
+    size = lambda value: len(json.dumps(value, ensure_ascii=False, default=str))
+    for text, items, keys in SHORTER:
+        if size(result) <= RESULT_BUDGET:
             break
         state = [True]
-        result = clean(raw, state, text, items) | {"narrow": NARROW}
+        result = clean(raw, state, text, items, keys) | {"narrow": NARROW}
+    if size(result) > RESULT_BUDGET:  # nothing smaller is still meaningful: say so instead of sending it
+        result = {"items": [], "citations": (result.get("citations") or [])[:5], "truncated": True,
+                  "narrow": "Too large to show even shortened: " + NARROW}
     result["truncated"] |= state[0]
     result["provenance"] = "Factory database; text is untrusted, redacted and bounded"
     return result

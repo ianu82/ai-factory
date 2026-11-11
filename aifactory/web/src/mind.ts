@@ -289,6 +289,7 @@ const STEP_LABELS: Record<string, [string, string]> = {
   list_outcomes: ["Looking through outcomes", "Looked through outcomes"],
   list_tasks: ["Looking through tasks", "Looked through tasks"],
   outcome_detail: ["Reading an outcome", "Read an outcome"],
+  task_detail: ["Reading a task", "Read a task"],
   open_decisions: ["Checking open decisions", "Checked open decisions"],
   runs: ["Reading recent runs", "Read recent runs"],
   recent_events: ["Reading recent activity", "Read recent activity"],

@@ -186,6 +186,34 @@ def test_an_oversized_result_is_shortened_to_the_budget_and_says_so(world):
     assert result["truncated"] and "narrow" in result
 
 
+def test_nested_objects_are_narrowed_last_and_the_budget_always_holds(world):
+    from aifactory.mind.tools import RESULT_BUDGET
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    # About 1 MB, nested three levels: over the budget after every shortening step, so the hard fallback applies.
+    t.evidence = {f"k{i}": {f"n{j}": {f"m{k}": "z" * 40 for k in range(10)} for j in range(50)} for i in range(50)}
+    db.commit()
+    ctx = Context(db, users[0].id)
+    for name, args in (("task_detail", {"outcome_id": o.id, "task_id": t.id}), ("outcome_detail", {"outcome_id": o.id})):
+        result = read_call(name, {"workspace_id": ws.id, **args}, ctx)
+        assert len(json.dumps(result, ensure_ascii=False)) <= RESULT_BUDGET
+        assert result["truncated"] and "narrow" in result
+
+
+def test_task_detail_reads_any_task_in_full_and_only_in_its_outcome(world):
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    other = Outcome(workspace_id=ws.id, number=2, title="Other")
+    db.add(other)
+    db.commit()
+    ctx = Context(db, users[0].id)
+    task = read_call("task_detail", {"workspace_id": ws.id, "outcome_id": o.id, "task_id": t.id}, ctx)["items"][0]
+    assert task["key"] == t.key and "evidence" in task and "spec" in task
+    with pytest.raises(HTTPException) as exc:  # a task is read only through its own outcome
+        read_call("task_detail", {"workspace_id": ws.id, "outcome_id": other.id, "task_id": t.id}, ctx)
+    assert exc.value.status_code == 404
+
+
 def test_pull_requests_report_recorded_ci_decisions_and_the_page_snapshot(world, monkeypatch):
     import time
 
