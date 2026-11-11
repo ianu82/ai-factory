@@ -7,9 +7,9 @@ cannot see images, and provider error text must never reach the API or logs.
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Any
 
+from .image_input import rejects_image_input
 from .inference import InferenceError, ModelClient, resolve_provider, workspace_models
 
 # A valid 1 x 1 RGB PNG, embedded so checks need no filesystem or external URL.
@@ -18,39 +18,6 @@ TEST_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe
 CHECK_TIMEOUT = 15.0
 CHECK_TOKENS = 32
 ROLES = ("planner", "plan_reviewer", "builder", "verifier")
-
-
-def rejects_image_input(exc: Exception) -> bool:
-    """Only an explicit capability rejection, not a representation error, is proof.
-
-    Match a complete capability clause: an optional 'input' must not backtrack
-    to 'image' and leave a format/type/size qualifier behind. A later sentence
-    suggesting a different format does not undo an explicit capability rejection.
-    """
-    if not isinstance(exc, InferenceError) or exc.status not in (400, 422):
-        return False
-    image = r"(?:image(?:\s+input)?|images|vision|image_url)"
-    # The boundary after the capability is intentionally stronger than \b.
-    end = r"(?=\s*$)"
-    capability = re.compile(
-        rf"\b(?:does not|doesn't|do not|cannot|can't)\s+support\s+{image}{end}"
-        rf"|\b{image}\s+(?:is|are)\s+not\s+supported(?:\s+(?:by|for)\s+(?:this|the)\s+model)?{end}",
-        re.IGNORECASE,
-    )
-    representation = re.compile(
-        r"\b(?:format|encoding|encoded|base64|data[\s-]+(?:urls?|uris?)|inline|"
-        r"mime|type|size|large|resolution|dimensions|tiff|png|jpe?g|gif|webp)\b",
-        re.IGNORECASE,
-    )
-    for clause in re.split(r"[.;!\n]", str(exc)):
-        # A representation qualifier in this clause takes precedence, even if
-        # its trailing words resemble a capability rejection (e.g. data URL
-        # images are not supported). Separate advice in a later clause does not.
-        if representation.search(clause):
-            continue
-        if capability.search(clause):
-            return True
-    return False
 
 
 async def check_workspace_models(workspace_id: str, settings: dict[str, Any]) -> dict[str, Any]:

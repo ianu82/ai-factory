@@ -1514,7 +1514,8 @@ def test_all_agent_roles_receive_attachments_and_publish_only_code(factory):
 
     def wrap(role, script):
         def checked(messages):
-            prompt = messages[1]["content"]
+            content = messages[1]["content"]
+            prompt = content[0]["text"] if isinstance(content, list) else content
             for aid, name, raw, mime in rows:
                 path = f".factory/attachments/{aid}-{name}"
                 assert name in prompt

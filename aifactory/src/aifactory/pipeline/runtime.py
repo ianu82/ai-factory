@@ -235,7 +235,8 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                 return
             last_progress["t"] = now
             record(spec.workspace_id, f"agent_{kind}", message, outcome_id=spec.outcome_id, task_id=spec.task_id,
-                   run_id=run_id, data={"role": spec.role, **data})
+                   run_id=run_id, level="warn" if kind == "warning" else "info",
+                   data={"role": spec.role, **data})
 
         session = HarnessSession(
             run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,

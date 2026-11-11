@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from .image_input import ImagePayloadRedactor, rejects_image_input
 from .config import get_settings
 from .inference_limits import admission
 from .db import session_scope
@@ -232,7 +233,14 @@ def to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif role == "system":
             items.append({"role": "developer", "content": m.get("content") or ""})
         else:
-            items.append({"role": role or "user", "content": m.get("content") or ""})
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content = [({"type": "input_text", "text": part["text"]} if part["type"] == "text"
+                            else {"type": "input_image", **part["image_url"]}) for part in content]
+                for part in content:
+                    if part["type"] == "input_image":
+                        part["image_url"] = part.pop("url")
+            items.append({"role": role or "user", "content": content})
     return items
 
 
@@ -275,6 +283,7 @@ class ModelClient:
         self.max_retries = max_retries
         self.session_id = session_id
         self.log_errors = log_errors
+        self.image_redactor: ImagePayloadRedactor | None = None
         # The Responses API is the common denominator: OpenAI's newest models only support function tools
         # with reasoning there, and MindsHub serves it for every model family (Anton and Codex use it too).
         self.wire = wire or "responses"
@@ -334,6 +343,15 @@ class ModelClient:
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         url = self.provider.base_url + path
+        images = []
+        for message in body.get("input", body.get("messages", [])):
+            content = message.get("content")
+            for part in content if isinstance(content, list) else []:
+                image_url = part.get("image_url", "")
+                image_url = image_url.get("url", "") if isinstance(image_url, dict) else image_url
+                if image_url.startswith("data:image/") and "," in image_url:
+                    images.append({"content": image_url.split(",", 1)[1]})
+        redactor = self.image_redactor or ImagePayloadRedactor(images)
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -343,7 +361,7 @@ class ModelClient:
                                                      content=json.dumps(body))
                 if response.status_code == 200:
                     return response.json()
-                detail = _error_detail(response)
+                detail = _error_detail(response, redactor)
                 if response.status_code == 402:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
                 if response.headers.get("x-should-retry", "").lower() == "false":
@@ -351,10 +369,12 @@ class ModelClient:
                                          status=response.status_code)
                 if response.status_code in (401, 403):
                     raise InferenceError(f"{self.provider.label} refused the credential ({response.status_code}): {detail}", status=response.status_code)
-                if response.status_code in (400, 404, 422):
+                if response.status_code in (400, 404, 415, 422):
                     last = InferenceError(
                         f"{self.provider.label} rejected the request ({response.status_code}): {detail}",
                         status=response.status_code)
+                    if rejects_image_input(last):
+                        raise last
                     if self.log_errors:
                         log.warning("%s %s rejected (%s): %s", self.provider.label, path, response.status_code, detail[:400])
                     if attempt == self.max_retries:
@@ -434,12 +454,13 @@ class ModelClient:
         return sorted(set(names))
 
 
-def _error_detail(response: httpx.Response) -> str:
+def _error_detail(response: httpx.Response, redactor: ImagePayloadRedactor | None = None) -> str:
+    redactor = redactor or ImagePayloadRedactor()
     try:
         data = response.json()
         err = data.get("error", data)
         if isinstance(err, dict):
-            return str(err.get("message") or err.get("detail") or err)[:500]
-        return str(err)[:500]
+            return redactor.text(str(err.get("message") or err.get("detail") or err))[:500]
+        return redactor.text(str(err))[:500]
     except Exception:
-        return response.text[:300]
+        return redactor.text(response.text)[:300]
