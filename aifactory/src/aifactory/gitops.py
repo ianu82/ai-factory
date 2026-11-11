@@ -282,6 +282,30 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     return Patch(diff=diff, files=files, additions=adds, deletions=dels)
 
 
+_TREE_ID = re.compile(r"[0-9a-f]{40,64}")
+
+
+async def tree_id(sandbox: LocalSandbox) -> str | None:
+    """The id of a git tree holding every file of the checkout as it is now, committed or not, or None when git
+    could not say. Two equal ids mean the same files with the same content. Ignored files (caches, a local
+    database) and the scratch directory are not part of it. The files are added to a copy of the index, so the
+    checkout's own index is left as it was."""
+    script = ('index="$(mktemp -d)/index"; cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null; '
+              "GIT_INDEX_FILE=\"$index\" git add -A -- . ':(top,exclude).factory' ':(top,exclude).factory/**' "
+              '>/dev/null 2>&1 && GIT_INDEX_FILE="$index" git write-tree; rm -rf "$(dirname "$index")"')
+    result = await sandbox.exec(script, timeout=120)
+    last = result.output.strip().rpartition("\n")[2].strip()
+    return last if _TREE_ID.fullmatch(last) else None
+
+
+async def tree_changes(sandbox: LocalSandbox, before: str, after: str, limit: int = 5) -> list[str]:
+    """The first ``limit`` paths that differ between two trees from ``tree_id``, and "…" when there are more."""
+    result = await sandbox.exec(f'names="$(git -c core.quotepath=off diff-tree -r --name-only --no-renames {before} '
+                                f'{after})" && printf \'%s\\n\' "$names" | head -n {limit + 1}', timeout=60)
+    names = [line.strip()[:200] for line in result.output.splitlines() if line.strip()] if result.ok else []
+    return names[:limit] + ["…"] * (len(names) > limit)
+
+
 _CONFLICT_MARKER = re.compile(rb"^\+(<{7}|>{7})( |$)")
 
 

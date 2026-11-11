@@ -2251,6 +2251,15 @@ RETRIED_CHECK = ('echo run >> "$TMPDIR/runs"\n'
                  'echo "$n failed in 0.01s"\n'
                  "exit 1\n")
 
+# A check that fixes what it finds and fails for having found it, as a formatter or a lock-file check does: with
+# fixme.txt in the checkout it rewrites the file and fails, and it passes once the file says "fixed".
+REWRITING_CHECK = ('echo run >> "$TMPDIR/runs"\n'
+                   'n=$(grep -c run "$TMPDIR/runs")\n'
+                   'if [ -f fixme.txt ] && [ "$(cat fixme.txt)" != fixed ]; then\n'
+                   '  echo fixed > fixme.txt; echo "run $n: rewrote fixme.txt"; exit 1\n'
+                   "fi\n"
+                   'echo "run $n"\n')
+
 
 def _counted_check(factory, leave, prompts, briefs, script=COUNTED_CHECK):
     """Add ``script`` to the repository's checks. The builder's first attempt leaves the file ``leave`` in the
@@ -2339,6 +2348,52 @@ def test_a_check_that_fails_twice_is_real_and_uses_the_attempt(factory):
     limit = delivery.COMMAND_TIMEOUT
     assert f"Each may take up to {limit // 60} minutes ({limit} seconds)" in prompts[0]
     assert len(briefs) == 1 and "`sh counted.sh` → passed" in briefs[0] and "second run" not in briefs[0]
+
+
+def test_a_failed_check_that_changed_the_checkout_is_not_run_again(factory):
+    from aifactory.models import Artifact
+
+    prompts, briefs = [], []
+    _counted_check(factory, "fixme.txt", prompts, briefs, script=REWRITING_CHECK)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # A second run would have passed, but on the file the first run rewrote, not on the candidate: a fresh
+        # checkout of the candidate still fails. So the failure stands and the attempt is used.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "verified")]
+        check = _counted(records[0])
+        assert (check["ok"], check["cause"], check["not_rerun"], check["changed_files"]) == (
+            False, "real", "changed", ["fixme.txt"])
+        assert check["tail"].strip() == "run 1: rewrote fixme.txt" and "first" not in check
+        assert "not_rerun" not in _counted(records[1]) and "cause" not in _counted(records[1])
+        kept = [a.name for a in s.query(Artifact).filter(Artifact.task_id == task.id, Artifact.kind == "check")]
+        messages = [e.message for e in s.query(Event).filter(
+            Event.task_id == task.id, Event.kind == "check_result", Event.level == "warn").order_by(Event.id)]
+    assert "check_flaky" not in _event_kinds(outcome_id)
+    assert kept.count("sh counted.sh") == 2 and "first run (failed): sh counted.sh" not in kept
+    how = "failed (exit 1) and changed files in the checkout (fixme.txt), so it was not run again"
+    assert messages == [f"✗ sh counted.sh — {how}"]
+    assert f"Check `sh counted.sh` {how} (it passes on the base commit):\n```\nrun 1: rewrote fixme.txt" in prompts[1]
+
+
+def test_a_check_that_was_not_run_again_says_why():
+    changed = {"command": "ruff format --check", "ok": False, "exit_code": 1, "duration": 0.4, "cause": "real",
+               "tail": "1 file reformatted", "not_rerun": "changed", "changed_files": ["a.py", "b/c.py", "…"]}
+    unknown = {**changed, "not_rerun": "unknown", "changed_files": []}
+    assert delivery._how_failed(changed) == ("failed (exit 1) and changed files in the checkout (a.py, b/c.py, …), so "
+                                             "it was not run again")
+    assert delivery._how_failed(unknown) == ("failed (exit 1) and was not run again, because the state of the "
+                                             "checkout could not be read")
+    assert delivery._whose_output(changed) == ""
+    # The attempt record keeps why, so the row reads the same after a restart.
+    assert delivery._brief([changed, unknown]) == [
+        {"command": "ruff format --check", "ok": False, "exit_code": 1, "duration": 0.4, "cause": "real",
+         "not_rerun": "changed", "changed_files": ["a.py", "b/c.py", "…"], "tail": "1 file reformatted"},
+        {"command": "ruff format --check", "ok": False, "exit_code": 1, "duration": 0.4, "cause": "real",
+         "not_rerun": "unknown", "tail": "1 file reformatted"}]
 
 
 def test_a_failure_on_the_first_run_only_is_not_excused_by_the_base_commit(factory):

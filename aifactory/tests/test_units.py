@@ -299,6 +299,54 @@ def test_extract_patch_excludes_all_root_scratch_and_external_files(tmp_path, sc
     asyncio.run(sb.close())
 
 
+def test_tree_id_tells_when_the_files_of_a_checkout_changed_and_leaves_its_index_alone(tmp_path):
+    import subprocess
+
+    from aifactory.gitops import tree_changes, tree_id
+
+    sb = LocalSandbox("tree", root=tmp_path).create()
+    sb.work.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=sb.work, env=env, check=True, capture_output=True).stdout.decode()
+    git("init", "-q")
+    (sb.work / "source.py").write_text("before\n")
+    (sb.work / ".gitignore").write_text("cache/\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    (sb.work / "new.py").write_text("candidate\n")  # a candidate's file: in the checkout, not in the index
+    tracked = git("ls-files")
+
+    async def go():
+        start = await tree_id(sb)
+        assert start and await tree_id(sb) == start
+        # What git ignores, and the factory's scratch directory, are not part of the checkout's state.
+        assert (await sb.exec("mkdir -p cache .factory && echo x > cache/db && echo x > .factory/notes")).ok
+        assert await tree_id(sb) == start
+        assert (await sb.exec("echo after > source.py")).ok
+        edited = await tree_id(sb)
+        assert (await sb.exec("echo more >> new.py && echo x > 'made by a check.txt' && rm source.py")).ok
+        grown = await tree_id(sb)
+        assert edited and grown and len({start, edited, grown}) == 3
+        assert await tree_changes(sb, start, edited) == ["source.py"]
+        assert await tree_changes(sb, start, grown) == ["made by a check.txt", "new.py", "source.py"]
+        assert await tree_changes(sb, start, grown, limit=2) == ["made by a check.txt", "new.py", "…"]
+        # Putting the files back gives the first id again: the id depends on the files alone.
+        assert (await sb.exec("echo before > source.py && echo candidate > new.py && rm 'made by a check.txt'")).ok
+        assert await tree_id(sb) == start
+    asyncio.run(go())
+    assert git("ls-files") == tracked and git("diff", "--cached", "--name-only") == ""
+    assert "?? new.py\n" in git("status", "--porcelain")
+    # Where git cannot answer there is no id, rather than an id that would compare equal by accident.
+    broken = LocalSandbox("no-repository", root=tmp_path).create()
+    broken.work.mkdir()
+    (broken.work / ".git").write_text("gitdir: /nonexistent/repository\n")
+    assert asyncio.run(tree_id(broken)) is None
+    asyncio.run(sb.close())
+    asyncio.run(broken.close())
+
+
 def test_rate_limit_settings_parse_and_fall_back(monkeypatch):
     from aifactory.config import get_settings, reset_settings_cache
 

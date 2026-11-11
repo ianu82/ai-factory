@@ -25,7 +25,8 @@ from ..guided import README_TEMPLATE, outcome_guidance
 from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
-                      changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
+                      changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit,
+                      tree_changes, tree_id)
 from ..models import Artifact, Decision, Outcome, Repository, Run, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
 from ..sandbox import COMMAND_TIMEOUT, LocalSandbox, SandboxError
@@ -614,11 +615,23 @@ class TaskRunner:
         fails again, the row describes the second run and keeps the first under ``first``: the comparison with the
         base commit must hold for both, and the cause is "real" even when the second ran out of time. When the two
         did not fail the same way, ``tail`` is the first run's output, the failure that started it. A timeout is
-        not run again: a second wait of the same length teaches nothing."""
+        not run again: a second wait of the same length teaches nothing. Nor is a check whose failed run changed
+        the checkout's files (``not_rerun`` is "changed", with ``changed_files``): a second run would test what the
+        first run left behind, not the candidate, and could pass where a fresh checkout fails. Only files git can
+        see are compared; what a run leaves in ignored files or outside the checkout is not noticed."""
         results = []
         for command in commands:
+            before = await tree_id(sandbox) if kind == "check" else None
             row, output = await self._run_command(sandbox, command, timeout)
-            if kind == "check" and not row["ok"] and not row["timed_out"]:
+            rerun = kind == "check" and not row["ok"] and not row["timed_out"]
+            if rerun:
+                after = await tree_id(sandbox)
+                if not before or not after:
+                    rerun, row["not_rerun"] = False, "unknown"
+                elif after != before:
+                    rerun = False
+                    row |= {"not_rerun": "changed", "changed_files": await tree_changes(sandbox, before, after)}
+            if rerun:
                 first, first_output = row, output
                 row, output = await self._run_command(sandbox, command, timeout)
                 if row["ok"]:
@@ -635,7 +648,7 @@ class TaskRunner:
                     self.artifact(kind, f"first run (failed): {command}"[:300], first_output, ok=False,
                                   exit_code=first["exit_code"])
             results.append(row)
-            note = (f" — {_how_failed(row)}" if row["timed_out"] else
+            note = (f" — {_how_failed(row)}" if row["timed_out"] or row.get("not_rerun") else
                     " — on a second run" if row.get("cause") == "flaky" else "")
             self.event(f"{kind}_result", f"{'✓' if row['ok'] else '✗'} {command}{note}",
                        level="success" if row["ok"] else "warn", command=command, exit_code=row["exit_code"],
@@ -1852,9 +1865,11 @@ def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     to a later attempt even after a restart. ``cause`` says what kind of failure it was: "timeout" (with the
     ``limit``), "flaky" (passed on a second run; the first run's tail is ``first_failure``), "preexisting" or "real".
     A check that failed on two runs has ``first``: the first run's exit code, and whether the second failed the
-    ``same`` way. When it did not, ``tail`` is the first run's output and the other fields describe the second."""
+    ``same`` way. When it did not, ``tail`` is the first run's output and the other fields describe the second.
+    A failed check that was run only once because its run changed the checkout has ``not_rerun`` ("changed") and
+    the ``changed_files``."""
     return [{k: c[k] for k in ("command", "ok", "exit_code", "duration")}
-            | {k: c[k] for k in ("cause", "timed_out", "limit") if c.get(k)}
+            | {k: c[k] for k in ("cause", "timed_out", "limit", "not_rerun", "changed_files") if c.get(k)}
             | ({} if c["ok"] else {"tail": str(c.get("tail") or "")[-1500:]})
             | ({"first_failure": str(c["first_failure"])[-1500:]} if c.get("first_failure") else {})
             | ({"first": {k: c["first"].get(k) for k in ("exit_code", "same")}} if c.get("first") else {})
@@ -1863,10 +1878,17 @@ def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _how_failed(check: dict[str, Any]) -> str:
     """How a failed command ended, in words: a timeout is a timeout, not "exit 124". A check that failed on two
-    runs says how each ended, and "in a row" only when both failed the same way."""
+    runs says how each ended, and "in a row" only when both failed the same way. A check that was not run again
+    after failing says why not."""
     first, limit = check.get("first") or {}, check.get("limit")
     last = (f"timed out after {float(check.get('duration') or 0):.0f}s"
             + (f" (the limit is {float(limit):.0f}s)" if limit else "")) if check.get("timed_out") else ""
+    if not first and check.get("not_rerun"):
+        names = ", ".join(str(name) for name in check.get("changed_files") or [])
+        return f"failed (exit {check.get('exit_code')}) " + (
+            f"and changed files in the checkout{f' ({names})' if names else ''}, so it was not run again"
+            if check["not_rerun"] == "changed" else
+            "and was not run again, because the state of the checkout could not be read")
     if not first:
         return last or f"failed (exit {check.get('exit_code')})"
     if first.get("same"):
