@@ -176,8 +176,13 @@ class AntonHarness:
                            max_tokens=16000)
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="factory-anton-") as temporary:
+            # Anton's per-turn token ceiling (max_turn_tokens, 1.25M with cache reads at full weight) protects an
+            # interactive user's allowance: it pauses to ask them whether to go on. A Factory run has nobody to
+            # ask, so it only cost a hand-back call and interrupted the agent mid-task until we said "Continue".
+            # The run's ledger already bounds its tokens, cost, calls and time.
             settings = CoreSettings.model_construct(max_tool_rounds=session.max_turns, max_continuations=2,
-                                                    verify_min_tool_rounds=session.max_turns + 1, verifier_jev="off")
+                                                    verify_min_tool_rounds=session.max_turns + 1, verifier_jev="off",
+                                                    max_turn_tokens=0)
             settings = settings.model_copy(update={
                 "analytics_enabled": False, "skills_root": Path(temporary) / "skills", "skills_extra_roots": [],
                 "skills_artifact_roots": [], "skill_drafts_root": None})

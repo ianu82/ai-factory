@@ -28,7 +28,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _fake_server(port: int, requests: list, web_enabled=False):
+def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100, cached_tokens=0):
     import uvicorn
 
     app = FastAPI()
@@ -36,8 +36,9 @@ def _fake_server(port: int, requests: list, web_enabled=False):
     def response(output, n):
         return {"id": f"resp_{n}", "object": "response", "created_at": int(time.time()), "status": "completed",
                 "model": "fake-model", "output": output, "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
-                "usage": {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110,
-                          "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}}}
+                "usage": {"input_tokens": input_tokens, "output_tokens": 10, "total_tokens": input_tokens + 10,
+                          "input_tokens_details": {"cached_tokens": cached_tokens},
+                          "output_tokens_details": {"reasoning_tokens": 0}}}
 
     @app.post("/v1/responses")
     async def responses(request: Request):
@@ -74,6 +75,19 @@ def _fake_server(port: int, requests: list, web_enabled=False):
     return server
 
 
+def _sandbox(tmp_path):
+    import io
+    from PIL import Image
+
+    sb = LocalSandbox("anton", root=tmp_path).create()
+    sb.work.mkdir()
+    image = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+    (sb.work / ".factory").mkdir()
+    (sb.work / ".factory" / "screen.jpg").write_bytes(image.getvalue())
+    return sb
+
+
 @pytest.mark.parametrize("web_enabled", [False, True])
 def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path, monkeypatch, web_enabled):
     monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
@@ -82,15 +96,7 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     server = _fake_server(port, requests, web_enabled)
     progress = []
     try:
-        sb = LocalSandbox("anton", root=tmp_path).create()
-        sb.work.mkdir()
-        import io
-        from PIL import Image
-
-        image = io.BytesIO()
-        Image.new("RGB", (2, 2), "red").save(image, format="PNG")
-        (sb.work / ".factory").mkdir()
-        (sb.work / ".factory" / "screen.jpg").write_bytes(image.getvalue())
+        sb = _sandbox(tmp_path)
         provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
         ledger = UsageLedger(run_id="r", workspace_settings={})
         session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
@@ -122,3 +128,28 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     # The actual ChatSession dispatch must use the replacement and pass vision
     # content to the provider, not just advertise an otherwise unreachable tool.
     assert any("data:image/png;base64," in json.dumps(body) for body in requests[2:])
+
+
+def test_a_run_is_not_paused_by_antons_per_turn_token_ceiling(tmp_path, monkeypatch):
+    # Reworks of large PRs reread a big cached context on every call. Anton's own ceiling (1.25M tokens a turn, cache
+    # reads at full weight) stopped those turns to ask a user who isn't there; the run's ledger bounds spend instead.
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    port = _free_port()
+    requests: list = []
+    # 600k a call, nearly all cached: past Anton's ceiling by the second call. gpt-4.1's 1M window keeps Anton's
+    # context-pressure compaction (0.7 of the window) out of the way.
+    server = _fake_server(port, requests, input_tokens=600_000, cached_tokens=590_000)
+    try:
+        provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
+        ledger = UsageLedger(run_id="r", workspace_settings={}, max_tokens=6_000_000)
+        session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
+                                 sandbox=_sandbox(tmp_path), model="gpt-4.1", client=ModelClient(provider),
+                                 ledger=ledger, report_schema=BUILDER_REPORT, writable=True, max_turns=10)
+        result = asyncio.run(AntonHarness().run(session))
+    finally:
+        server.should_exit = True
+    assert result.report == {"status": "done", "summary": "Wrote hello.txt"}
+    assert ledger.input_tokens >= 1_800_000
+    sent = json.dumps(requests)
+    assert "counts against the user's plan" not in sent  # Anton's hand-back notice at the ceiling
+    assert "Continue. When the work is complete" not in sent  # the agent never stopped short of finishing
