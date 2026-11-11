@@ -155,7 +155,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retri
             await checkout(sandbox, repo.full_name, token, repo.default_branch, f"factory/plan-{outcome_id[:8]}",
                            subdir=repo.full_name.replace("/", "__"), adopt=False)
         sandbox.adopt_work()
-        decisions = precedents(workspace_id)
+        decisions = precedents(workspace_id, repo_ids=[r.id for r in repos])
         work = other_work(workspace_id, outcome_id)
         repositories = {r.full_name: r.config or {} for r in repos}
         revision = None

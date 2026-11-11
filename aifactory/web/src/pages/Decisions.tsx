@@ -7,7 +7,7 @@ import { ago, DECISION_KIND } from "../format";
 import { Empty, Skeleton, useToast } from "../ui";
 
 export function DecisionsPage() {
-  const { ws } = useWs();
+  const { ws, me } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
   const navigate = useNavigate();
@@ -15,15 +15,27 @@ export function DecisionsPage() {
   const metrics = useQuery({ queryKey: ["stats", ws.id], queryFn: () => api<{ decision_judges: Record<string, { decided: number; sent_back: number; held: number; overruled: number; overrule_rate: number }> }>(`/api/workspaces/${ws.id}/stats`) });
   const corrected = () => {
     qc.invalidateQueries({ queryKey: ["decisions", ws.id] });
+    qc.invalidateQueries({ queryKey: ["rulings", ws.id] });
     qc.invalidateQueries({ queryKey: ["stats", ws.id] });
   };
   const toggle = async (d: Decision) => {
     try {
-      await api(`/api/workspaces/${ws.id}/decisions/${d.id}`, { method: "PATCH", json: { reusable: !d.reusable, scope: "workspace" } });
+      if (d.kind === "ruling" && d.reusable) await api(`/api/workspaces/${ws.id}/rulings/${d.id}`, { method: "DELETE" });
+      else await api(`/api/workspaces/${ws.id}/decisions/${d.id}`, { method: "PATCH", json: { reusable: !d.reusable, scope: d.scope === "repository" ? "repository" : "workspace" } });
       qc.invalidateQueries({ queryKey: ["decisions", ws.id] });
     } catch (err) {
       toast((err as Error).message, true);
     }
+  };
+  // Rulings come from their own uncapped list, so an old rule is always shown (and can be retired).
+  const rulings = useQuery({ queryKey: ["rulings", ws.id], queryFn: () => api<{ rulings: { id: string; title: string; text: string; scope: string; by: string; by_id: string | null; at: string | null; kind: string }[] }>(`/api/workspaces/${ws.id}/rulings`) });
+  const listed = new Set((q.data || []).map((d) => d.id));
+  const older = (rulings.data?.rulings || []).filter((r) => r.kind === "ruling" && !listed.has(r.id));
+  const retire = async (id: string) => {
+    try {
+      await api(`/api/workspaces/${ws.id}/rulings/${id}`, { method: "DELETE" });
+      corrected();
+    } catch (err) { toast((err as Error).message, true); }
   };
   const precedents = (q.data || []).filter((d) => d.reusable && d.status !== "superseded");
   const history = (q.data || []).filter((d) => !d.reusable || d.status === "superseded");
@@ -44,12 +56,22 @@ export function DecisionsPage() {
           <p className="muted">UTC cohorts by review completion. Overrule rate: corrected automatic verdicts from the cohort / decided and sent back verdicts. Suggest counts as held.</p>
         </section>}
 
+        {ws.role !== "viewer" && <AddRule onAdded={corrected} />}
         {q.isLoading ? <Skeleton /> : !q.data?.length ? (
           <Empty title="No decisions yet">Approvals, answers and unblocks are recorded here with who made them. Tick "Remember for future work" to turn one into a standing precedent.</Empty>
         ) : (
           <>
-            <div className="list-section">Precedents the Factory follows · {precedents.length}</div>
+            <div className="list-section">Team rules and precedents the Factory follows · {precedents.length}</div>
             {precedents.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>None yet.</div>}
+            {older.length > 0 && <ul className="rows">{older.map((r) => (
+              <li key={r.id} className="row">
+                <span className="dot good" />
+                <div style={{ minWidth: 0 }}><div className="title">{r.title}</div><div className="sub"><span>Team rule · {r.scope}</span></div><p style={{ whiteSpace: "pre-wrap", margin: "4px 0 0" }}>{r.text}</p></div>
+                <div className="meta">
+                  <span>{r.by || "—"} · {ago(r.at)}</span>
+                  {(admin || r.by_id === me.user.id) && <button className="btn sm ghost" onClick={() => retire(r.id)}>Retire</button>}
+                </div>
+              </li>))}</ul>}
             <ul className="rows">{precedents.map((d) => <Row key={d.id} d={d} admin={admin} toggle={toggle} corrected={corrected} open={() => d.outcome_id && navigate(`/w/${ws.id}/outcomes/${d.outcome_id}`)} />)}</ul>
             <div className="list-section">History · {history.length}</div>
             {history.length === 0 && <div className="muted" style={{ padding: "12px 22px", fontSize: 12.5 }}>Other resolved decisions will appear here, with who made them.</div>}
@@ -62,7 +84,7 @@ export function DecisionsPage() {
 }
 
 function Row({ d, admin, toggle, open, corrected }: { d: Decision; admin: boolean; toggle: (d: Decision) => void; open: () => void; corrected: () => void }) {
-  const { ws } = useWs();
+  const { ws, me } = useWs();
   const toast = useToast();
   const [editing, setEditing] = useState(false);
   const [answer, setAnswer] = useState("");
@@ -109,10 +131,36 @@ function Row({ d, admin, toggle, open, corrected }: { d: Decision; admin: boolea
       <div className="meta">
         <span>{d.resolved_by_name || "—"} · {ago(d.resolved_at)}</span>
         {canOverrule && <button className="btn sm ghost" onClick={e => { e.stopPropagation(); setEditing(true); }}>Overrule</button>}
-        {admin && d.comment && d.status !== "superseded" && (
+        {(admin || (d.kind === "ruling" && d.reusable && d.resolved_by === me.user.id)) && d.comment && d.status !== "superseded" && (
           <button className="btn sm ghost" onClick={(e) => { e.stopPropagation(); toggle(d); }}>{d.reusable ? "Retire" : "Make precedent"}</button>
         )}
       </div>
     </li>
+  );
+}
+
+/** State a rule every agent in the workspace follows: planners, builders, verifiers and Leads are all given it. */
+function AddRule({ onAdded }: { onAdded: () => void }) {
+  const { ws } = useWs();
+  const toast = useToast();
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await api(`/api/workspaces/${ws.id}/rulings`, { method: "POST", json: { text, scope: "workspace" } });
+      setText("");
+      onAdded();
+    } catch (err) { toast((err as Error).message, true); }
+    finally { setSaving(false); }
+  };
+  return (
+    <form className="add-rule" onSubmit={submit} style={{ display: "flex", gap: 8, padding: "12px 22px", alignItems: "flex-start" }}>
+      <label htmlFor="new-rule" className="sr-only">New team rule</label>
+      <textarea id="new-rule" rows={1} maxLength={4000} value={text} onChange={e => setText(e.target.value)} style={{ flex: 1 }}
+        placeholder="Add a team rule every agent follows, e.g. “Build token-shaped test strings at runtime, never as literals”" />
+      <button className="btn sm" disabled={saving || !text.trim()}>Add rule</button>
+    </form>
   );
 }
