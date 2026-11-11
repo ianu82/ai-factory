@@ -18,6 +18,15 @@ from .tools import ToolBox, clip, finish_tool, tool_specs
 CONTEXT_CHAR_BUDGET = 500_000
 
 
+def budget_warning(session: HarnessSession, turns: int) -> str:
+    """What to tell the agent once under 10 minutes or 10 turns are left of its session; empty before that."""
+    seconds, left = session.remaining(), session.max_turns - turns
+    if seconds >= 600 and left >= 10:
+        return ""
+    return (f"Budget: about {max(int(seconds // 60), 0)} min and {max(left, 0)} turns are left in this session. "
+            "Wrap up what you are doing and call finish with an honest report before either runs out.")
+
+
 class NativeHarness:
     name = "native"
     label = "Native"
@@ -48,6 +57,8 @@ class NativeHarness:
             if final_turn:
                 messages.append({"role": "user", "content": (
                     "You are out of turns or time. Call finish now with an honest report of what is done and what is not.")})
+            elif warning := budget_warning(session, turns):
+                messages.append({"role": "user", "content": warning})
             self._trim(messages)
             try:
                 message = await session.client.chat(

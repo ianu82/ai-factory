@@ -72,6 +72,30 @@ def test_native_delivers_team_guidance_mid_run(tmp_path, monkeypatch):
     assert any("Prefer small functions" in str(m.get("content")) for m in client.seen[0])
 
 
+def test_native_warns_once_under_ten_turns_or_ten_minutes_are_left(tmp_path, monkeypatch):
+    from time import monotonic
+
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+
+    def fn(messages):
+        if step(messages) < 2:
+            return {"content": "", "tool_calls": [call("run", {"command": "true"}, step(messages))]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "ok"})]}
+
+    def warnings(**limits):
+        """Per model call of a three-call session: the budget warning the agent was sent just before it, if any."""
+        session, client, _ = make_session(tmp_path / "-".join(limits), fn, **limits)
+        asyncio.run(NativeHarness().run(session))
+        last = [str(messages[-1].get("content")) for messages in client.seen]
+        return [text.split(" in this session.")[0] if text.startswith("Budget: ") else "" for text in last]
+
+    assert warnings() == ["", "", ""]  # 80 turns and an hour: nothing to say
+    by_turns = warnings(max_turns=11)
+    assert by_turns[:2] == ["", ""] and by_turns[2].endswith(" min and 9 turns are left")
+    by_time = warnings(deadline=monotonic() + 300)
+    assert by_time == [f"Budget: about 4 min and {n} turns are left" for n in (80, 79, 78)]
+
+
 def test_native_forces_a_final_report_when_out_of_turns(tmp_path, monkeypatch):
     monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
     seen_tools = []

@@ -38,6 +38,8 @@ class ScriptedModel:
             ledger.add(model, (1000, 200))
         if role == "plan_reviewer" and role not in self.scripts:
             return approving_plan_review(messages)
+        if role == "lead" and role not in self.scripts:
+            return quiet_lead(messages)
         return self.scripts[role](messages)
 
     async def session_cost(self, _session_id):
@@ -51,6 +53,13 @@ def approving_plan_review(_messages: list[dict[str, Any]]) -> dict[str, Any]:
     """The plan reviewer's default in tests: approve without findings."""
     return {"content": "", "tool_calls": [call("finish", {"verdict": "approve", "summary": "The plan covers the request.",
                                                           "findings": []})]}
+
+
+def quiet_lead(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """The Lead's default in tests: post a short update, then finish."""
+    if step(messages) == 0:
+        return {"content": "", "tool_calls": [call("post_update", {"text": "Following this outcome."})]}
+    return {"content": "", "tool_calls": [call("finish", {"summary": "Posted an update."})]}
 
 
 def step(messages: list[dict[str, Any]]) -> int:
