@@ -77,8 +77,13 @@ def task_brief(t: Task) -> dict:
     """A task in a list: what it is and where it stands. outcome_detail has its spec, acceptance, evidence and runs."""
     return {"id": t.id, "outcome_id": t.outcome_id, "key": t.key, "title": t.title, "status": t.status,
             "stage": t.stage, "attempt": t.attempt, "pr_number": t.pr_number, "pr_url": t.pr_url,
-            "head_sha": t.head_sha, "blocked_reason": (t.blocked_reason or "")[:BRIEF_TEXT],
-            "summary": (t.summary or "")[:BRIEF_TEXT], "updated_at": S.ts(t.updated_at)}
+            "head_sha": t.head_sha, "blocked_reason": brief(t.blocked_reason), "summary": brief(t.summary),
+            "updated_at": S.ts(t.updated_at)}
+
+
+def brief(text: str | None) -> str:
+    # Redact the whole text first: cutting first could leave a credential's prefix that no pattern recognises.
+    return redact(text or "")[:BRIEF_TEXT]
 
 
 def citation(workspace_id: str, kind: str, id: str | int, label: str,
@@ -448,6 +453,14 @@ def read_call(name: str, args: dict, context: Context) -> dict:
     if size(result) > RESULT_BUDGET:  # nothing smaller is still meaningful: say so instead of sending it
         result = {"items": [], "citations": (result.get("citations") or [])[:5], "truncated": True,
                   "narrow": "Too large to show even shortened: " + NARROW}
+    if "cursor" in tool.schema["properties"] and isinstance(raw.get("items"), list):
+        kept = result.get("items") or []
+        if len(kept) < len(raw["items"]):
+            # Shortening dropped items: the next page starts after the last one shown, not the last one read.
+            if kept and isinstance(kept[-1], dict) and "id" in kept[-1]:
+                result["next_cursor"] = kept[-1]["id"]
+            else:
+                result.pop("next_cursor", None)
     result["truncated"] |= state[0]
     result["provenance"] = "Factory database; text is untrusted, redacted and bounded"
     return result

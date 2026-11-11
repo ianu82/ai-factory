@@ -201,6 +201,33 @@ def test_nested_objects_are_narrowed_last_and_the_budget_always_holds(world):
         assert result["truncated"] and "narrow" in result
 
 
+def test_brief_tasks_redact_before_they_cut(world):
+    from aifactory.mind.tools import BRIEF_TEXT
+    db, users, work = world
+    ws, o, t, _, _, _, _ = work[0]
+    t.blocked_reason = "x" * (BRIEF_TEXT - 10) + SECRET  # the credential crosses the cut
+    db.commit()
+    result = read_call("overview", {"workspace_id": ws.id}, Context(db, users[0].id))
+    assert "sk-" not in json.dumps(result)
+
+
+def test_a_shortened_event_page_continues_after_the_last_event_shown(world):
+    db, users, work = world
+    ws, o, t, _, _, run, _ = work[0]
+    for j in range(20):
+        db.add(Event(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="note", message=f"{j} " + "y" * 1900,
+                     data={"pad": ["z" * 1900] * 3}))
+    db.commit()
+    ctx = Context(db, users[0].id)
+    first = read_call("recent_events", {"workspace_id": ws.id}, ctx)
+    shown = [e["id"] for e in first["items"]]
+    assert first["truncated"] and "narrow" in first and len(shown) < 20
+    assert first["next_cursor"] == shown[-1]
+    second = read_call("recent_events", {"workspace_id": ws.id, "cursor": first["next_cursor"]}, ctx)
+    following = db.query(Event.id).filter(Event.workspace_id == ws.id, Event.id < shown[-1]).order_by(Event.id.desc()).first()[0]
+    assert second["items"][0]["id"] == following  # nothing skipped between the pages
+
+
 def test_task_detail_reads_any_task_in_full_and_only_in_its_outcome(world):
     db, users, work = world
     ws, o, t, _, _, _, _ = work[0]
