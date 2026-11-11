@@ -50,6 +50,7 @@ class Orchestrator:
         self._stopping = False
         self._last_signal_sync = float("-inf")
         self._linear_task: asyncio.Task | None = None
+        self._review_task: asyncio.Task | None = None
         from ..operator_relay import Relay
 
         self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
@@ -70,6 +71,9 @@ class Orchestrator:
 
             self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
             self._relay_task = asyncio.create_task(self._relay.run(), name="operator-relay")
+            from ..review_watch import ReviewWatcher
+
+            self._review_task = asyncio.create_task(ReviewWatcher().run(), name="review-watch")
 
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
@@ -90,6 +94,9 @@ class Orchestrator:
         if self._vm_sweep_task:
             self._vm_sweep_task.cancel()
             await asyncio.gather(self._vm_sweep_task, return_exceptions=True)
+        if self._review_task:
+            self._review_task.cancel()
+            await asyncio.gather(self._review_task, return_exceptions=True)
         await asyncio.sleep(0)
 
     def wake(self) -> None:

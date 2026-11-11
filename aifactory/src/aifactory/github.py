@@ -136,6 +136,9 @@ class GitHub:
             raise GitHubError("Installation headers require refreshable authentication")
         return self._headers_for(self.token)
 
+    def observe_response(self, response: httpx.Response) -> None:
+        """Optional response hook for background observers; delivery never reserves quota."""
+
     async def request(self, method: str, path: str, *, json: Any = None, params: dict | None = None,
                       ok: tuple[int, ...] = (200, 201, 204), retries: int = 3) -> Any:
         url = path if path.startswith("http") else API + path
@@ -144,6 +147,7 @@ class GitHub:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.request(method, url, headers=await self._fresh_headers(), json=json, params=params)
+                self.observe_response(response)
                 if response.status_code in ok:
                     if response.status_code == 204 or not response.content:
                         return {}
