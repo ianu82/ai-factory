@@ -30,6 +30,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "decision_judges": "decide",
     # One agent per outcome, responsible for delivering it (pipeline/lead.py).
     "lead": {"enabled": True, "run_usd": 2.0, "turns": 30},
+    # Alerts show in the app's Inbox. Slack and email are delivery options that aren't available yet: both stay off.
+    "alerts": {"after_minutes": 120, "slack": False, "email": False},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
@@ -39,6 +41,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # fresh budget before asking a person: relaying findings into a retry is not a decision.
     "auto_retry_rounds": 1,
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
+    # "patch": a merge approval covers the same change when it is published again on a newer base. "head": every new
+    # head is approved again. A repository's merge.approval overrides it (TaskRunner._approved).
+    "merge": {"approval": "patch"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
                "run_minutes": 60,

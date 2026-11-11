@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from .. import merge_manager
@@ -69,6 +70,7 @@ class Orchestrator:
         self._lead_check = float("-inf")
         self._review_watch = float("-inf")
         self._review_task: asyncio.Task | None = None
+        self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -306,6 +308,7 @@ class Orchestrator:
                 await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
                 await self._maybe_sweep_vms()
+                await self._maybe_watch()
                 await self._maybe_run_leads()
                 self._maybe_watch_reviews()
             except Exception:  # never let the scheduler die
@@ -444,6 +447,21 @@ class Orchestrator:
             priced += 1
         if priced:
             log.info("priced %d run(s) from provider usage", priced)
+
+    async def _maybe_watch(self) -> None:
+        """Every few minutes, look for stuck work and repeated failures: wake Leads, raise alerts (watch.py)."""
+        from .watch import WATCH_EVERY, run as watch
+
+        if time.monotonic() - self._last_watch < WATCH_EVERY.total_seconds():
+            return
+        self._last_watch = time.monotonic()
+        try:
+            counts = await asyncio.to_thread(watch)
+        except Exception:  # the watch must never stop scheduling
+            log.exception("watch failed")
+            return
+        if any(counts.values()):
+            log.info("watch %s", counts)
 
     def _maybe_analyze(self) -> None:
         """Refresh improvement proposals from delivery history (every 30 minutes by default)."""
