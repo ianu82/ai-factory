@@ -282,6 +282,25 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
     return Patch(diff=diff, files=files, additions=adds, deletions=dels)
 
 
+async def patch_id(sandbox: LocalSandbox, base_sha: str, head_sha: str) -> str:
+    """Identity of what ``head_sha`` changes since its merge base with ``base_sha``: the same change rebased onto a
+    newer base keeps its id. "" when there is no change or it cannot be read (never raises)."""
+    if not all(re.fullmatch(r"[0-9a-f]{7,64}", sha or "") for sha in (base_sha, head_sha)):
+        return ""
+    # The candidate diff's flags (extract_patch). The id ignores where in a file each hunk lands but not whitespace:
+    # --verbatim implies --stable and hashes each line as it is (a git without the option fails: no id).
+    script = (f"set -e -o pipefail; base=$(git merge-base {base_sha} {head_sha}); "
+              f"git -c core.quotepath=off diff --binary --no-renames --no-color \"$base\" {head_sha} 2>/dev/null "
+              "| git patch-id --verbatim 2>/dev/null")
+    try:
+        result = await sandbox.exec(script, timeout=60)
+    except (SandboxError, OSError):
+        return ""
+    # Exactly one line, "<patch id> <commit id>" (zeros for a bare diff); no line at all for an empty diff.
+    found = re.fullmatch(r"([0-9a-f]{40,64}) [0-9a-f]{40,64}", result.output.strip()) if result.ok else None
+    return found.group(1) if found else ""
+
+
 _CONFLICT_MARKER = re.compile(rb"^\+(<{7}|>{7})( |$)")
 
 
