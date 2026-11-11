@@ -10,10 +10,17 @@ from aifactory.pipeline.check_slots import check_slot, check_slot_count, check_s
 
 def test_slots_follow_the_cpus_the_host_allows(monkeypatch):
     monkeypatch.delenv("AIFACTORY_CHECK_CONCURRENCY", raising=False)
+    monkeypatch.setattr(check_slots, "_cpu_set", lambda: 48)
     monkeypatch.setattr(check_slots, "host_capacity", lambda: {"cpus": 48, "cpu_quota": 24.0})
     assert check_slot_count() == 4  # the cgroup quota, not the CPUs the container can see
+    monkeypatch.setattr(check_slots, "_cpu_set", lambda: 12)
+    assert check_slot_count() == 2  # a CPU set narrower than the quota
+    monkeypatch.setattr(check_slots, "host_capacity", lambda: {"cpus": 48})
+    monkeypatch.setattr(check_slots, "_cpu_set", lambda: 13)
+    assert check_slot_count() == 2  # no quota: the CPUs this process may run on, not all the host has
+    monkeypatch.setattr(check_slots, "_cpu_set", lambda: None)
     monkeypatch.setattr(check_slots, "host_capacity", lambda: {"cpus": 13})
-    assert check_slot_count() == 2
+    assert check_slot_count() == 2  # no CPU set to read: the CPU count
     monkeypatch.setattr(check_slots, "host_capacity", lambda: {"cpus": 4})
     assert check_slot_count() == 1  # never zero
     monkeypatch.setenv("AIFACTORY_CHECK_CONCURRENCY", "3")

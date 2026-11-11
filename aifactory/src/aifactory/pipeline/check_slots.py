@@ -8,7 +8,7 @@ nothing. A check holds a slot instead, and the extra checks wait their turn. A c
 its check holds a slot.
 
 ``AIFACTORY_CHECK_CONCURRENCY`` sets the number of slots. By default there is one per ``CPUS_PER_CHECK`` CPUs the
-host lets the Factory use (its cgroup quota, else its CPU count), and at least one.
+Factory may use (the lower of its cgroup quota and the CPUs it may run on), and at least one.
 """
 
 from __future__ import annotations
@@ -31,8 +31,16 @@ def check_slot_count() -> int:
         except ValueError:
             pass
     capacity = host_capacity()
-    cpus = capacity.get("cpu_quota") or capacity.get("cpus") or 1
-    return max(1, int(cpus // CPUS_PER_CHECK))
+    limits = [cpus for cpus in (capacity.get("cpu_quota"), _cpu_set() or capacity.get("cpus")) if cpus]
+    return max(1, int(min(limits, default=1) // CPUS_PER_CHECK))
+
+
+def _cpu_set() -> int | None:
+    """The CPUs this process may run on (its affinity or cpuset), which can be fewer than the host has."""
+    try:
+        return len(os.sched_getaffinity(0)) or None
+    except (AttributeError, OSError):
+        return None
 
 
 class _Slots:
