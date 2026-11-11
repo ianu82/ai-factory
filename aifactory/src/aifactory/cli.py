@@ -59,8 +59,11 @@ def main(argv: list[str] | None = None) -> None:
 
         from .app import create_app
 
+        # On SIGTERM uvicorn waits for open connections before it runs the app's shutdown, and event streams never
+        # close on their own. Bound that wait: the platform's drain (railway.json) is for the orchestrator's stop().
         uvicorn.run(create_app(), host=args.host, port=args.port, proxy_headers=True, forwarded_allow_ips="*",
-                    log_level=os.environ.get("LOG_LEVEL", "info").lower(), timeout_keep_alive=30)
+                    log_level=os.environ.get("LOG_LEVEL", "info").lower(), timeout_keep_alive=30,
+                    timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":

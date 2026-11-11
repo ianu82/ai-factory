@@ -110,10 +110,14 @@ class Stop(Exception):
 
 
 class TaskRunner:
-    def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock]):
+    def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock],
+                 owner: str | None = None):
         self.task_id = task_id
         self.cancelled = cancelled
         self.repo_lock = repo_lock
+        # The instance whose lease this runner works under: once another instance holds the task, its writes stop
+        # (see lifecycle.transition). None: no check (CI polling, which is not leased).
+        self.owner = owner
         self.builder: LocalSandbox | None = None
         self.feedback: list[str] = []
         self.patch: Patch | None = None
@@ -180,7 +184,8 @@ class TaskRunner:
     def update(self, **fields: Any) -> None:
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if (task.status, task.stage) != (self.task.status, self.task.stage) or not transition(s, task, **fields):
+            if (task.status, task.stage) != (self.task.status, self.task.stage) or not transition(
+                    s, task, owner=self.owner, **fields):
                 raise Stop()
             for key, value in fields.items():
                 setattr(self.task, key, value)
@@ -212,7 +217,11 @@ class TaskRunner:
                     ev.setdefault("failure_facts", []).append({"kind": key, **value,
                                                               "attempt": task.attempt, "at": utcnow().isoformat()})
                 ev[key] = value
-            task.evidence = ev
+            if self.owner is None:
+                task.evidence = ev
+            elif not s.query(Task).filter(Task.id == self.task_id, Task.lease_owner.in_(("", self.owner))).update(
+                    {Task.evidence: ev}, synchronize_session=False):
+                raise Stop()  # another instance holds the task now: its evidence is not this runner's to write
             self.task.evidence = ev
 
     def artifact(self, kind: str, name: str, content: str = "", run_id: str | None = None, **data: Any) -> str:
@@ -232,7 +241,7 @@ class TaskRunner:
               options: list[dict[str, Any]] | None = None) -> None:
         with session_scope() as s:
             task = s.get(Task, self.task_id)
-            if not transition(s, task, status=status, blocked_reason=body[:2000], lease_owner=""):
+            if not transition(s, task, owner=self.owner, status=status, blocked_reason=body[:2000], lease_owner=""):
                 raise Stop()
             # The decision and state transition commit together; no second transaction
             # can create a retry decision after a concurrent stop.
