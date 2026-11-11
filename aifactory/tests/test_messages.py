@@ -5,7 +5,7 @@ from __future__ import annotations
 from aifactory.db import SessionLocal
 from aifactory.events import record
 from aifactory.messages import message_data, party
-from aifactory.models import Outcome, Plan, Repository, Task
+from aifactory.models import Outcome, Plan, Repository, Task, User
 
 
 def world(signed_in):
@@ -72,6 +72,23 @@ def test_a_plan_worked_out_with_a_mind_is_handed_to_the_factory(client, signed_i
     said = [(m["from"]["label"], m["to"]["label"], m["intent"]) for m in messages(client, ws)["items"]]
     assert said == [("Plan reviewer", "Planner", "answer"), ("Ian's Mind", "Factory", "answer"),
                     ("Ian's Mind", "Factory", "handoff")]
+
+
+def test_an_operator_decision_is_one_answer_from_the_operator(client, signed_in):
+    ws, _, outcome, task = world(signed_in)
+    with SessionLocal() as db:
+        operator = User(email="operator+abc@factory.local", name="Operator (delegated by Ian)", is_system=True)
+        db.add(operator); db.commit()
+        operator_id = operator.id
+    # A relayed resolve records the decision as the operator's system user, then the relay's own receipt.
+    record(ws, "decision_resolved", "Operator (delegated by Ian): retry — T1 did not pass", outcome_id=outcome,
+           task_id=task, actor=operator_id, data={"decision_id": "d1", "resolution": "retry"})
+    record(ws, "operator_decision", "Operator (delegated by Ian) resolved 'T1 did not pass': retry",
+           outcome_id=outcome, actor="operator", data={"nonce": "n1", "decision_id": "d1"})
+    items = messages(client, ws)["items"]
+    assert [(m["kind"], m["from"]["label"], m["to"]["label"], m["intent"]) for m in items] == [
+        ("decision_resolved", "Operator", "Factory", "answer")]
+    assert items[0]["about"]["task"] == {"id": task, "key": "T1"}
 
 
 def test_filters_by_party_intent_and_outcome(client, signed_in):

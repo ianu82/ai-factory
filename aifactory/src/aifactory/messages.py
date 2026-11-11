@@ -11,7 +11,7 @@ New agents (the Supervisor, the Merge Manager, and later Mind-to-Mind) join by r
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
@@ -61,18 +61,19 @@ def message_data(sender: dict[str, Any], receiver: dict[str, Any], intent: str) 
 class Context:
     names: dict[str, str]  # user id -> display name, for the page's actors
     tasks: dict[str, Task]
+    operators: set[str] = field(default_factory=set)  # system users that operator relays act as
 
 
 def _who(event: Event, ctx: Context) -> dict[str, Any]:
     """The person (or their Mind, or the operator relay, or policy) behind an event that a person caused."""
     data = event.data or {}
+    if event.actor == "operator" or (event.actor or "") in ctx.operators:
+        return OPERATOR
     name = ctx.names.get(event.actor or "")
     if name and data.get("source") == "mind":
         return party("mind", f"{name}'s Mind", name)
     if name:
         return party("person", name)
-    if event.actor == "operator":
-        return OPERATOR
     if data.get("source") in ("judge", "decision_judge"):
         return party("judge", "Decision judge")
     if event.actor == "policy":
@@ -120,7 +121,9 @@ def _plan_approved(event: Event, ctx: Context) -> Ends:
     return _who(event, ctx), FACTORY, "answer"
 
 
-# Recorded events that are messages between parties. Everything else in the journal stays activity.
+# Recorded events that are messages between parties. Everything else in the journal stays activity. An operator's
+# relayed decision is its decision_resolved event (recorded as the operator's system user); the operator_decision
+# event recorded beside it is the relay's receipt, so it stays activity rather than a second answer.
 RULES: dict[str, Rule] = {
     "plan_proposed": _plan_proposed,
     "plan_reviewed": fixed(_const(PLAN_REVIEWER), _const(PLANNER), "answer"),
@@ -134,7 +137,6 @@ RULES: dict[str, Rule] = {
     "ci_failed": fixed(_task_party("ci", "CI"), _task_party("builder", "Builder"), "inform"),
     "guidance": fixed(_who, _task_party("builder", "Builders"), "inform"),
     "operator_relay": fixed(_const(OPERATOR), _const(FACTORY), "request"),
-    "operator_decision": fixed(_const(OPERATOR), _const(FACTORY), "answer"),
     "operator_retry": fixed(_const(OPERATOR), _const(FACTORY), "request"),
     "task_handed_over": fixed(_who, _const(FACTORY), "handoff"),
 }
@@ -195,10 +197,12 @@ def log(db: Session, workspace_id: str, *, before: int | None = None, limit: int
         query = query.filter(Event.id < before)
     events = query.order_by(Event.id.desc()).limit(SCAN).all()
     actors = {e.actor for e in events if e.actor and e.actor not in ("factory", "operator", "policy")}
-    names = {u.id: u.name or u.email or "Someone" for u in db.query(User).filter(User.id.in_(actors))} if actors else {}
+    users = db.query(User).filter(User.id.in_(actors)).all() if actors else []
+    names = {u.id: u.name or u.email or "Someone" for u in users}
+    operators = {u.id for u in users if u.is_system}
     task_ids = {e.task_id for e in events if e.task_id}
     tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_(task_ids))} if task_ids else {}
-    ctx = Context(names, tasks)
+    ctx = Context(names, tasks, operators)
     items: list[dict[str, Any]] = []
     last_read: int | None = None
     for event in events:

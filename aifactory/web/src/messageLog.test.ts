@@ -42,3 +42,16 @@ test("messages group under Today, Yesterday or their date, in order", () => {
   assert.deepEqual(groups.map((g) => [g.day === "Today" || g.day === "Yesterday" ? g.day : "date", g.messages.map((m) => m.id)]),
     [["Today", [4, 3]], ["Yesterday", [2]], ["date", [1]]]);
 });
+
+test("yesterday is the previous calendar date, even the day after a clock change", () => {
+  const zone = process.env.TZ;
+  process.env.TZ = "America/New_York"; // clocks went forward on 8 March 2026, so that day was 23 hours long
+  try {
+    const now = new Date(2026, 2, 9, 12, 0);
+    assert.equal(dayLabel(new Date(2026, 2, 8, 0, 30).toISOString(), now), "Yesterday");
+    assert.equal(dayLabel(new Date(2026, 2, 8, 23, 30).toISOString(), now), "Yesterday");
+    assert.notEqual(dayLabel(new Date(2026, 2, 7, 23, 30).toISOString(), now), "Yesterday");
+  } finally {
+    if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone;
+  }
+});

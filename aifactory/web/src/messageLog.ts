@@ -46,9 +46,9 @@ function startOfDay(date: Date): number {
 /** "Today", "Yesterday", or a short date, in the reader's own time zone. */
 export function dayLabel(iso: string, now = new Date()): string {
   const day = startOfDay(new Date(iso));
-  const today = startOfDay(now);
-  if (day === today) return "Today";
-  if (day === today - 86_400_000) return "Yesterday";
+  if (day === startOfDay(now)) return "Today";
+  // The previous calendar date, not 24 hours back: a day with a clock change is 23 or 25 hours long.
+  if (day === startOfDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) return "Yesterday";
   return new Date(iso).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
 }
 
