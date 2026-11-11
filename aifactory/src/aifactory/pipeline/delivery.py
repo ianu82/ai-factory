@@ -367,9 +367,19 @@ class TaskRunner:
             # The recorded base can belong to an attempt that was never published: a restart begins the attempt
             # again from the latest code and records that base, while the branch still sits on an older one.
             # Trusting it would skip this rebase, and every newer commit on the base branch would then count as
-            # this task's change (reverting main's protected files, for one).
-            merged = await sb.exec(f"git merge-base HEAD {main}", timeout=60)
-            actual = merged.output.strip() if merged.ok else ""
+            # this task's change (reverting main's protected files, for one). The base recorded when the branch was
+            # last published is the branch's real base. Branches published before it was recorded fall back to
+            # where the branch meets the recorded base (a later commit of the same history), then main.
+            actual = ""
+            published = str(((self.task.evidence or {}).get("published") or {}).get("base") or "")
+            if published and (await sb.exec(f"git merge-base --is-ancestor {shlex.quote(published)} HEAD",
+                                             timeout=60)).ok:
+                actual = published
+            for other in (recorded, main):
+                if actual or not other:
+                    continue
+                merged = await sb.exec(f"git merge-base HEAD {shlex.quote(other)}", timeout=60)
+                actual = merged.output.strip() if merged.ok else ""
             if not actual:
                 return
             self.event("branch_base_corrected", f"{branch} sits on {actual[:8]}, not the recorded base "
@@ -805,7 +815,8 @@ class TaskRunner:
         except GitHubError as exc:
             self.block("unblock", f"{self.task.key}: could not open the pull request", str(exc))
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
-        self.evidence("published", {"head": head, "at": utcnow().isoformat(), "pr": pr["number"]})
+        self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
+                                    "pr": pr["number"]})
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     def _pr_body(self) -> str:
@@ -1242,8 +1253,8 @@ class TaskRunner:
             if self.task.head_sha != state["head"]:
                 # A merge approval belongs to the published candidate, not its branch name.
                 # Persist the new publication before advancing the head, including on resume.
-                self.evidence("published", {"head": state["head"], "at": utcnow().isoformat(),
-                                            "pr": self.task.pr_number})
+                self.evidence("published", {"head": state["head"], "base": state["new_base"],
+                                            "at": utcnow().isoformat(), "pr": self.task.pr_number})
             self.update(head_sha=state["head"], base_sha=state["new_base"])
         if state["phase"] in ("checks", "verify"):
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()

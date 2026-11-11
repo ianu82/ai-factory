@@ -367,16 +367,23 @@ def test_a_revision_starts_from_the_branchs_real_base_when_the_recorded_one_was_
     """A restart begins an attempt again from the latest main and records that base, but the attempt is never
     published: the branch still sits on its older base. The revision must still be brought up to date, or main's
     newer commits count as the task's own change."""
+    published = {}
+
     def move():
         main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
         with session_scope() as s:
             task = s.query(Task).filter(Task.workspace_id == factory["ws"], Task.status == "awaiting_approval").one()
+            published["base"] = task.evidence["published"]["base"]
+            assert published["base"] == task.base_sha  # publishing records the branch's base
             task.base_sha = main  # what the unpublished fresh attempt recorded
         return main
 
     outcome_id, main = _request_changes_after_main_moves(factory, move)
     kinds = _event_kinds(outcome_id)
     assert "branch_base_corrected" in kinds and "rebased" in kinds, " ".join(kinds)
+    with session_scope() as s:
+        corrected = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "branch_base_corrected").one()
+        assert corrected.data["actual"] == published["base"]
     with session_scope() as s:
         assert s.query(Task).filter(Task.outcome_id == outcome_id).one().base_sha == main
     _approve_and_finish(factory, outcome_id)
