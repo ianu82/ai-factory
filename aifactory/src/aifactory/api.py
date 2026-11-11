@@ -1235,7 +1235,7 @@ def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = 
 @router.get("/workspaces/{workspace_id}/stats")
 def stats(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    from .metrics import benchmark, first_attempt_result, workspace_metrics
+    from .metrics import benchmark, first_attempt_result, human_message, workspace_metrics
     from .decision_judges import judge_metrics
 
     outcomes = [o for o in db.query(Outcome).filter(Outcome.workspace_id == workspace_id) if not benchmark(o)]
@@ -1285,8 +1285,8 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
                  "per_completed_task": round(total_cost / max(1, sum(t.status == "completed" for t in tasks)), 2)},
         "tokens": sum(r.input_tokens + r.output_tokens for r in runs) + score_tokens,
         "human": {"decisions": len(decisions), "open": sum(d.status == "open" for d in decisions),
-                  "interventions": db.query(Message).filter(Message.workspace_id == workspace_id,
-                                                            Message.author_kind == "user").count()},
+                  "interventions": sum(human_message(m) for m in db.query(Message).filter(
+                      Message.workspace_id == workspace_id, Message.author_kind == "user"))},
         "harnesses": {h: {"runs": sum(r.harness == h for r in runs),
                           "succeeded": sum(r.harness == h and r.status == "succeeded" for r in runs)}
                       for h in ("native", "codex", "anton")},
