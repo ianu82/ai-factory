@@ -289,7 +289,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
-            if limit is not None and outcome_committed(o.id)[0] >= limit and not continued_past_budget(s, o.id):
+            if (o.status not in FINISHED and limit is not None and outcome_committed(o.id)[0] >= limit
+                    and not continued_past_budget(s, o.id)):
                 # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
                 # and trying every 15 minutes would only fill the activity with failed runs.
                 continue
