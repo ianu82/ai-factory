@@ -28,7 +28,7 @@ TTL_SECONDS = 45  # the page's own cache, and how long pending CI is trusted
 SETTLED_TTL_SECONDS = 300  # finished CI and known mergeability can change too (reruns, a moving base branch)
 MAX_PAGES = 10  # GitHub pages of 100 per repository and state
 HUMAN_TASK = {"needs_input", "failed", "blocked", "smoke_failed"}
-SHIPPING_STAGES = {"ci", "merge", "publish", "smoke", "release"}  # Factory stages that ship the PR as it is
+SHIPPING_STAGES = {"ci", "review", "merge", "publish", "smoke", "release"}  # Factory stages that ship the PR as it is
 THREAD_PAGES = 10  # 100 review threads per page
 THREADS = """query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
