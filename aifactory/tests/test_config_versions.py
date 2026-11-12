@@ -329,3 +329,15 @@ async def test_runner_uses_loaded_repository_snapshot(tmp_path, monkeypatch):
                     harness=run.harness, provider=ProviderConfig("openai", "http://model.test", "k", "Test"),
                     model=run.model, settings=runner.settings, repositories={"acme/demo": loaded})
                 assert run.config_version == expected
+
+
+def test_waiting_for_a_vm_is_part_of_the_configuration_only_where_it_is_asked_for():
+    build, qa = versions.effective_build, versions.effective_qa
+    assert build({"isolation": "vm", "vm_fallback": "wait"})["vm_fallback"] == "wait"
+    # The default (work in the Factory container, and say so) is left out, so existing configurations keep their
+    # version.
+    assert "vm_fallback" not in build({"isolation": "vm", "vm_fallback": "container"})
+    assert "vm_fallback" not in build({"isolation": "vm"})
+    assert "vm_fallback" not in build({"vm_fallback": "wait"})  # no VM is asked for: there is nothing to wait for
+    assert qa({"isolation": "vm"}, {"vm_fallback": "wait"})["vm_fallback"] == "wait"  # the workspace's default
+    assert "vm_fallback" not in qa({"isolation": "vm", "vm_fallback": "container"}, {"vm_fallback": "wait"})

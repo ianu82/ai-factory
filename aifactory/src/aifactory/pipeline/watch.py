@@ -6,7 +6,8 @@ Every WATCH_EVERY the orchestrator calls run(), which looks in each workspace th
 - stalled: an outcome where nothing is moving and nothing asks a person (its open tasks wait on dropped ones);
 - quiet: an outcome with work marked active but no activity for QUIET, while the workspace runs nothing at all
   and isn't on a provider hold;
-- repeated: the same failure on REPEAT_TASKS tasks or REPEAT_OUTCOMES outcomes within REPEAT_WINDOW.
+- repeated: the same failure on REPEAT_TASKS tasks or REPEAT_OUTCOMES outcomes within REPEAT_WINDOW; and, shown
+  the same way, REPEAT_TASKS tasks that asked for VM isolation within REPEAT_WINDOW and had no VM.
 
 Each condition is one Alert row while it lasts, keyed by what it is about: raised once and cleared when the
 condition goes away, so a condition that lasts all day is one alert, not one per pass. Stuck work (unasked,
@@ -147,7 +148,25 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
                 f"The same failure on {f'{n} tasks across {where}' if n else where} in the last day", reason,
                 seen["first"], data={"tasks": sorted(seen["tasks"])[:20],
                                                                    "outcomes": sorted(seen["outcomes"])[:20]})
+    refused = _no_vm(s, workspace_id, now)
+    if len(refused["tasks"]) >= REPEAT_TASKS:
+        n = len(refused["tasks"])
+        add("isolation:vm", "repeated", f"No VM for {n} tasks in the last day, though VM isolation is asked for",
+            f"{refused['events']} times in the last day a build or a verification that asks for VM isolation had "
+            "no VM. It ran in a sandbox in the Factory container, or waited where the repository says to wait. "
+            f"The latest reason: {refused['why']}", refused["first"], data={"tasks": sorted(refused["tasks"])[:20]})
     return found
+
+
+def _no_vm(s, workspace_id: str, now: datetime) -> dict[str, Any]:
+    """Work in the window that asked for VM isolation and had no VM: the tasks, how often, since when, and the
+    latest reason (the pipeline's ``build_vm_unavailable`` and ``qa_vm_unavailable`` events)."""
+    rows = (s.query(Event.task_id, Event.message, Event.created_at)
+            .filter(Event.workspace_id == workspace_id, Event.created_at > now - REPEAT_WINDOW,
+                    Event.kind.in_(("build_vm_unavailable", "qa_vm_unavailable")))
+            .order_by(Event.created_at, Event.id).all())
+    return {"tasks": {task_id for task_id, _, _ in rows if task_id}, "events": len(rows),
+            "first": rows[0][2] if rows else now, "why": (rows[-1][1] if rows else "")[:400]}
 
 
 def _last_activity(s, outcome_id: str) -> datetime | None:

@@ -211,6 +211,10 @@ class Stop(Exception):
     """The task paused or ended for a recorded reason; the orchestrator should release its slot."""
 
 
+class NoVM(SandboxError):
+    """VM isolation is required and no VM is available: the work waits, it does not run in the Factory container."""
+
+
 class TaskRunner:
     def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock],
                  owner: str | None = None):
@@ -830,7 +834,8 @@ class TaskRunner:
                     await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
                 except (SandboxError, GitError, OSError) as exc:  # the environment, not the attempt
                     error = f"Sandbox setup failed: {exc}"
-                    self._infrastructure(attempt, "prepare", error, infrastructure_problem(error))
+                    self._infrastructure(attempt, "prepare", error, infrastructure_problem(
+                        error, "transient" if isinstance(exc, NoVM) else None))
             self._describe_tree(attempt)
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             sections = await self._sections()
@@ -1432,6 +1437,7 @@ class TaskRunner:
                     await self._prepare(sandbox)
                 except (SandboxError, GitError, OSError) as exc:  # the environment, not the candidate
                     error = f"Sandbox setup failed: {exc}"
+                    carried = "transient" if isinstance(exc, NoVM) else carried  # no VM: redone later
                 else:
                     brief = ""
                     if qa_cfg.get("start"):
@@ -1518,16 +1524,24 @@ class TaskRunner:
         except BaseException:
             await local.close()
             raise
-        wants_vm = (qa_cfg.get("isolation") or (self.settings.get("qa") or {}).get("isolation")) == "vm"
+        workspace_qa = self.settings.get("qa") or {}
+        wants_vm = (qa_cfg.get("isolation") or workspace_qa.get("isolation")) == "vm"
         if not wants_vm:
             return local
         from ..vm import RailwayVMSandbox, vm_available
 
+        async def without_vm(why: str) -> LocalSandbox:
+            try:
+                self._no_vm("verify", why, "verifying",
+                            {"vm_fallback": qa_cfg.get("vm_fallback") or workspace_qa.get("vm_fallback")})
+            except NoVM:
+                await local.close()
+                raise
+            return local
+
         ok, why = vm_available()
         if not ok:
-            self.event("qa_vm_unavailable", f"VM isolation requested but unavailable ({why}); verifying in a local sandbox",
-                       level="warn")
-            return local
+            return await without_vm(why)
         from ..vm import environment_key
 
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
@@ -1537,11 +1551,10 @@ class TaskRunner:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(qa_cfg.get("cpu", 4)),
                                                    memory_gb=float(qa_cfg.get("memory_gb", 8)))
         except Exception as exc:
-            self.event("qa_vm_unavailable", f"Could not start a QA VM ({str(exc)[:300]}); verifying in a local sandbox",
-                       level="warn")
-            return local
+            return await without_vm(f"could not start a VM: {str(exc)[:300]}")
         await local.close()
         vm.environment_key = key
+        self._isolation("verify", None)
         self.event("qa_vm_ready", f"Verification VM {vm.vm_id} ready" + (f" in {vm.region}" if vm.region else "")
                    + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
                    prepared=vm.prepared)
@@ -1671,7 +1684,12 @@ class TaskRunner:
         sandbox = LocalSandbox(f"task-{self.task_id[:12]}-base{self.task.attempt}").create()
         try:
             await checkout(sandbox, self.repo.full_name, token, self.task.base_sha, f"base-{self.task_id[:8]}")
-            sandbox = await self._isolate_builder(sandbox, "checking the base commit")
+            try:
+                sandbox = await self._isolate_builder(sandbox, "checking the base commit", "base")
+            except NoVM:
+                self.event("base_checks_unavailable", "No VM for the base commit's checks, and this repository "
+                           "waits for a VM; the failing checks count against this attempt", level="warn")
+                return None
             async with self._check_slot(sandbox):  # a second run of the suite on this host, like the candidate's
                 setup = await self._prepare(sandbox, "base_setup")
                 if any(not r["ok"] for r in setup):
@@ -1775,7 +1793,7 @@ class TaskRunner:
             if str(exc).startswith("Candidate patch does not apply"):
                 return self._drop_candidate(attempt, "its diff no longer applies to its base commit")
             error = f"Sandbox setup failed: {exc}"
-            cause = infrastructure_problem(error)
+            cause = infrastructure_problem(error, "transient" if isinstance(exc, NoVM) else None)
             if cause == "provider" or int((self.task.evidence or {}).get("infra_retries", 0)) < INFRA_RETRIES:
                 self._infrastructure(attempt, "prepare", error, cause)  # the candidate is kept for the retry
             # A candidate whose base commit can no longer be checked out must not hold the task for good.
@@ -1834,10 +1852,36 @@ class TaskRunner:
         self.event("rebuild_after_base_moved", f"The verified change {why}; rebuilding with a fresh attempt budget "
                    f"({rebuilds} of 2)")
 
-    async def _isolate_builder(self, local: LocalSandbox, doing: str = "building"):
+    def _isolation(self, phase: str, why: str | None) -> None:
+        """Keep ``evidence["isolation"]`` true: what ran in a sandbox in the Factory container although a VM was asked
+        for, by phase ("build", "base", "verify"), with the reason. A phase that got its VM is taken out again."""
+        record = dict((self.task.evidence or {}).get("isolation") or {})
+        if why is None and phase not in record:
+            return
+        record.pop(phase, None)
+        if why is not None:
+            record[phase] = {"wanted": "vm", "used": "container", "why": why[:300], "at": utcnow().isoformat()}
+        self.evidence("isolation", record)
+
+    def _no_vm(self, phase: str, why: str, doing: str, cfg: dict[str, Any]) -> None:
+        """VM isolation was asked for and there is no VM. Where the repository says to wait for one (``vm_fallback:
+        "wait"`` beside ``isolation``), nothing runs in the Factory container: NoVM, a sandbox that is unavailable,
+        for which the attempt is redone later. Otherwise the work goes on in a sandbox in the container and says so:
+        the event, and a record that the pull request shows (``_isolation``)."""
+        kind = "qa_vm_unavailable" if phase == "verify" else "build_vm_unavailable"
+        if cfg.get("vm_fallback") == "wait":
+            self.event(kind, f"VM isolation requested but unavailable ({why}); this repository waits for a VM, so "
+                       f"{doing} is put off", level="warn", fallback="wait", phase=phase)
+            raise NoVM(f"VM isolation is required for this repository and no VM is available ({why})")
+        self.event(kind, f"VM isolation requested but unavailable ({why}); {doing} in a sandbox in the Factory "
+                   "container", level="warn", fallback="container", phase=phase)
+        self._isolation(phase, why)
+
+    async def _isolate_builder(self, local: LocalSandbox, doing: str = "building", phase: str = "build"):
         """With ``build.isolation: "vm"`` the builder works in its own Railway VM (checkout uploaded, no Factory
-        credentials inside); otherwise, or when VMs are unavailable, in the local per-job sandbox. Checks of the base
-        commit run in the same kind of sandbox."""
+        credentials inside); otherwise in the local per-job sandbox. When no VM is available it works there too, and
+        says so, unless the repository waits for a VM (``_no_vm``). Checks of the base commit run in the same kind of
+        sandbox."""
         build_cfg = self.cfg.get("build") or {}
         if build_cfg.get("isolation") != "vm":
             return local
@@ -1845,8 +1889,7 @@ class TaskRunner:
 
         ok, why = vm_available()
         if not ok:
-            self.event("build_vm_unavailable", f"VM isolation requested but unavailable ({why}); {doing} locally",
-                       level="warn")
+            self._no_vm(phase, why, doing, build_cfg)
             return local
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
             if self.cfg.get("setup") else None
@@ -1854,11 +1897,11 @@ class TaskRunner:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(build_cfg.get("cpu", 4)),
                                                    memory_gb=float(build_cfg.get("memory_gb", 8)))
         except Exception as exc:
-            self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); {doing} locally",
-                       level="warn")
+            self._no_vm(phase, f"could not start a VM: {str(exc)[:300]}", doing, build_cfg)
             return local
         await local.close()
         vm.environment_key = key
+        self._isolation(phase, None)
         self.event("build_vm_ready", f"{doing.capitalize()} in VM {vm.vm_id}"
                    + (" from the prepared environment" if vm.prepared else ""),
                    level="success", vm=vm.vm_id, prepared=vm.prepared)
@@ -2047,6 +2090,14 @@ class TaskRunner:
                                                                 if f.get("location") else "") for f in notes[:10]]
             if len(notes) > 10:
                 lines.append(f"- … and {len(notes) - 10} more in the verification report")
+        fell_back = (self.task.evidence or {}).get("isolation") or {}
+        if fell_back:  # said on the pull request: a reviewer must not take VM isolation for granted
+            names = {"build": "The build", "base": "Checks of the base commit",
+                     "verify": "Independent verification and runtime QA"}
+            lines += ["", "### Isolation", "This repository asks for VM isolation. No VM was available, so this ran "
+                      "in a sandbox inside the Factory container instead:"]
+            lines += [f"- {names.get(phase, phase)}: {_one_line(entry.get('why'), 200)}"
+                      for phase, entry in fell_back.items() if isinstance(entry, dict)]
         if self.app_summary:
             a = self.app_summary
             where = a.get("isolation") or "a fresh sandbox"

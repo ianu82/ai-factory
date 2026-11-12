@@ -187,3 +187,31 @@ def test_a_failure_reason_drops_what_differs_between_occurrences():
     assert watch.reason_of("T3: could not push the branch") == "could not push the branch"
     assert watch.reason_of("\n  Sandbox 4f3a2b1c9d timed out after 600s\nmore") == "Sandbox … timed out after #s"
     assert watch.reason_of("") == ""
+
+
+def test_work_that_keeps_running_without_its_vm_is_one_alert(world, client):
+    def refused(task_id, kind="build_vm_unavailable", why="no credentials", age=timedelta(0)):
+        with db.session_scope() as s:
+            s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=task_id, level="warn", kind=kind,
+                        message=f"VM isolation requested but unavailable ({why})", created_at=now() - age))
+
+    with db.session_scope() as s:
+        tasks = [world["task"]]
+        for key in ("T2", "T3"):
+            t = Task(workspace_id=world["ws"], outcome_id=world["outcome"], plan_id=world["plan"],
+                     repo_id=world["repo"], key=key, title=key, status="running", stage="build")
+            s.add(t)
+            s.flush()
+            tasks.append(t.id)
+    refused(tasks[0], age=timedelta(days=2))  # before the day began: not counted
+    refused(tasks[0], age=timedelta(minutes=3))
+    refused(tasks[1], age=timedelta(minutes=2))
+    assert watch.run()["shown"] == 0  # two tasks are not yet a pattern
+    refused(tasks[2], "qa_vm_unavailable", "the VM limit is reached")
+    assert watch.run()["shown"] == 1
+    [shown] = alerts(client, world)
+    assert shown["kind"] == "repeated"
+    assert shown["title"] == "No VM for 3 tasks in the last day, though VM isolation is asked for"
+    assert shown["body"].startswith("3 times in the last day") and "the VM limit is reached" in shown["body"]
+    watch.run()
+    assert len(alerts(client, world)) == 1  # one alert while it lasts
