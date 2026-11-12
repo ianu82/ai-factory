@@ -228,5 +228,6 @@ class FakeGitHub:
             git("push", "-q", "origin", "main", cwd=tmp)
             merged_sha = git("rev-parse", "HEAD", cwd=tmp)
         pr["merged"], pr["state"], pr["merge_commit_sha"] = True, "closed", merged_sha
+        pr["merged_at"] = "2026-11-11T16:00:00Z"
         self.merged.append(number)
         return {"sha": merged_sha, "merged": True}
