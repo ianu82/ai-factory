@@ -91,6 +91,8 @@ _SECRET_PATTERNS = [
     re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
     re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bxoxe(?:[.-](?:xox[baprs]|[0-9]))?-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bxapp-[A-Za-z0-9-]{10,}"),
     re.compile(r"\bmdb_[A-Za-z0-9_.-]{8,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
     re.compile(r"lin_(?:api|oauth)_[A-Za-z0-9_-]+"),

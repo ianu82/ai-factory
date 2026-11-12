@@ -1604,6 +1604,8 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
     if sig.outcome_id:
         db.commit()
         return S.signal(sig)  # accepting again must not create duplicate work
+    from .connectors.core import signal_priority
+
     worker = (sig.data or {}).get("worker") if sig.source == "github_issue" else None
     if worker not in ("native", "codex", "anton"):
         worker = None
@@ -1611,7 +1613,8 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         Repository.workspace_id == workspace_id).limit(1)]
     outcome = outcome_from_text(db, workspace_id, user, body.title or sig.title,
                                 (body.brief or sig.body or "") + (f"\n\nSource: {sig.url}" if sig.url else ""),
-                                repo_ids, source="signal", signal_id=sig.id, harness=worker)
+                                repo_ids, source="signal", signal_id=sig.id, harness=worker,
+                                priority=signal_priority(sig))
     sig.status, sig.outcome_id = "accepted", outcome.id
     db.commit()
     orchestrator.wake()
