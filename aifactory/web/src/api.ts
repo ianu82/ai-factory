@@ -115,8 +115,11 @@ export interface Settings {
   max_attempts: number;
   auto_retry_rounds?: number;
   autonomy: { plan: "auto" | "approval"; merge: "auto" | "approval"; release: "auto" | "approval" };
-  budgets: { run_usd: number; outcome_usd: number; run_tokens: number };
-  limits: { open_outcomes?: number | null; [key: string]: number | null | undefined };
+  /** task_usd and limits.task_attempts_total: a task's lifetime limit; 0 or missing: no limit. */
+  budgets: { run_usd: number; outcome_usd: number; run_tokens: number; task_usd?: number | null };
+  limits: {
+    open_outcomes?: number | null; task_attempts_total?: number | null; [key: string]: number | null | undefined;
+  };
   reasoning_effort?: string;
   linear?: LinearConfig;
   mind?: { daily_budget_usd: number };
@@ -125,6 +128,24 @@ export interface Settings {
   alerts?: { after_minutes: number; slack: boolean; email: boolean; stopped_minutes?: number; webhook_url?: string };
   /** The stand-in for people while they're away (pipeline/director.py). Off by default. */
   director?: DirectorSettings;
+  /** The workspace's review policy (aifactory/review.py); a repository's own review config overrides it key by key. */
+  review?: ReviewPolicy;
+  /** While a provider hold is open, how often the provider is tested (0: never). */
+  holds?: { test_minutes: number };
+  lead?: { enabled: boolean; run_usd: number; turns: number };
+}
+
+export interface ReviewPolicy {
+  address: "unresolved" | "changes_requested" | "off";
+  reviewers: "people" | "bots" | "all";
+  trust: "collaborators" | "anyone";
+  block_on: "p1" | "all" | "none";
+  on_timeout: "proceed" | "ask";
+  wait_seconds: number;
+  max_rounds: number;
+  /** The comment that asks for a review of each head after the pull request's first; "" never asks. */
+  request: string;
+  ignore: string[];
 }
 
 export interface DirectorSettings {
