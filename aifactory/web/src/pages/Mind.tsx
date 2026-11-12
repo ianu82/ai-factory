@@ -77,7 +77,7 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
     if (!state.userId) return;
     controller.leave();
     void controller.checkStatus(workspaceId);
-    void controller.list();
+    void controller.list(workspaceId);
   }, [controller, state.userId, workspaceId]);
   const reason = blockedReason(state.status);
   const recheck = useCallback(() => void controller.checkStatus(workspaceId), [controller, workspaceId]);
@@ -94,7 +94,7 @@ export function MindHome({ workspaceId }: { workspaceId: string }) {
   const [params] = useSearchParams();
   const [showAll, setShowAll] = useState(params.has("all"));
   useEffect(() => { if (params.has("all")) setShowAll(true); }, [params]);
-  const titled = state.threads.filter((t) => t.title); // a conversation without a first message is not one yet
+  const titled = state.threads.filter((t) => t.workspace_id === workspaceId && t.title); // a conversation without a first message is not one yet
   const recent = showAll ? titled : titled.slice(0, RECENT);
   return <div className="mind-home">
     <div className="mind-home-column">
@@ -135,6 +135,12 @@ export function MindConversation({ workspaceId, threadId }: { workspaceId: strin
     // Never while a reply runs (a new conversation's first message): the check would contend for its accounting claim.
     else if (!state.busy) void controller.checkStatus(state.active.workspace_id);
   }, [controller, state.userId, threadId]);
+  useEffect(() => {
+    const active = state.active;
+    if (active?.id === threadId && active.workspace_id !== workspaceId) {
+      navigate(`/w/${active.workspace_id}/mind/${threadId}`, { replace: true });
+    }
+  }, [state.active, threadId, workspaceId, navigate]);
   useEffect(() => { scroll.current = new MindScroll(); setUnseen(false); }, [threadId]);
   useLayoutEffect(() => { if (pane.current) setUnseen(scroll.current.onOutput(pane.current)); }, [state.messages, state.draft, state.steps]);
   // A conversation that could not be opened (deleted, no longer yours, offline) says so instead of loading forever.
