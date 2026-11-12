@@ -34,6 +34,7 @@ from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .model_checks import check_workspace_models
+from .network_policy import validate_network
 from .models import (Alert, Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
@@ -676,12 +677,18 @@ class RepoReleaseSelection(BaseModel):
 
 
 class RepoCommands(BaseModel):
+    network: Any = None
     preview_qa: Any = None
     review: dict[str, Any] | None = None
     setup: list[str] | None = None
     checks: list[str] | None = None
     qa: RepoQACommands | None = None
     release: RepoReleaseSelection | None = None
+
+    @field_validator("network")
+    @classmethod
+    def valid_network(cls, value):
+        return validate_network(value)
 
     @field_validator("review")
     @classmethod
@@ -727,6 +734,11 @@ async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depend
 
 def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(current)
+    if "network" in patch:
+        try:
+            cfg["network"] = validate_network(patch["network"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
     if "preview_qa" in patch:
         try:
             cfg["preview_qa"] = preview_config.validate_config(patch["preview_qa"], current.get("preview_qa"))

@@ -163,3 +163,67 @@ Model admission is shared across native, Anton and gateway calls in the Factory 
 including retries and credentials reused by multiple workspaces. Each provider/base URL and
 full credential digest shares a 16-request concurrency cap; gateway streams hold capacity
 until cleanup. Waiting emits run activity with elapsed time, never credential material.
+
+## Repository egress policy
+
+Workspace owners/admins can store a `network` object in `Repository.config` when
+connecting a repository (`POST /api/workspaces/{workspace_id}/repositories`, under
+`config`) or updating it (`PATCH .../repositories/{repo_id}`, also under `config`):
+
+```json
+{
+  "config": {
+    "network": {
+      "mode": "restricted",
+      "registries": [
+        {"host": "registry.npmjs.org", "port": 443},
+        {"host": "pypi.org", "port": 443},
+        {"host": "files.pythonhosted.org", "port": 443}
+      ]
+    }
+  }
+}
+```
+
+Omitting `network` preserves unrestricted ordinary delivery. Explicit
+`{"mode": "unrestricted", "registries": []}` selects that same default. Registry
+entries require an explicit integer port (1–65535); DNS names and literal IPv4/IPv6
+addresses are supported (IPv6 has no brackets in `host`). Hosts are normalized,
+sorted and deduplicated; at most 128 entries are accepted. URLs, credentials,
+wildcards, CIDRs, scoped addresses and unknown fields are rejected with 422.
+Updates replace the whole network object; unrelated config edits preserve it.
+`AIFACTORY_BOOTSTRAP` repository config uses the same validation and canonical
+form; malformed network overrides raise an error rather than being persisted or
+falling back to unrestricted mode. There is no implicit registry list and no host
+discovery from setup commands, lockfiles, prompts or sandbox-written files.
+
+Allow both the registry index and the hosts actually serving its artifacts:
+PyPI commonly needs **pypi.org and files.pythonhosted.org**; npm commonly uses
+**registry.npmjs.org** for metadata and tarballs. Custom registries, lockfiles with
+alternate tarball URLs, package-manager bootstrap downloads, browser binaries,
+OS mirrors, and redirects may require additional explicit artifact hosts/ports.
+Review these administratively rather than automatically trusting downloaded URLs.
+Git dependencies hosted on GitHub will not work unless explicitly allowed; do not
+allow GitHub for benchmarks that must not read the reference solution.
+
+`network_policy.select_policy` always selects restricted mode for benchmarks,
+even if the repository explicitly selects unrestricted. It allows only configured
+registries plus the Factory model gateway. The gateway comes exclusively from
+trusted Settings: `AIFACTORY_INTERNAL_URL` for local sandboxes and
+`AIFACTORY_PUBLIC_URL` for VMs, matching the runtime gateway routing. Only its
+host/port is included; HTTP/HTTPS default to 80/443. Invalid settings (including
+credentials) fail closed. No upstream model-provider hosts are added.
+
+**Implementation scope:** this section documents the policy/configuration layer.
+It does not yet enforce egress in running sandboxes or wire benchmark execution;
+local/VM packet filtering and pipeline integration are separate follow-up tasks.
+The backend contract in `network_policy.py` requires trusted pre-launch A/AAAA
+resolution, pinned hostname→IP mappings and TCP IP/port pairs, default denial of
+all other egress for both IP families, tamper-resistant rules, and readiness matching the resolved policy's
+SHA-256 fingerprint before any setup or agent execution. DNS failures, unsupported
+isolation, or incomplete readiness must refuse launch, never downgrade. Cleanup
+must be idempotent and verified on success, failure and cancellation. The selected
+policy fingerprint identifies normalized inputs; the resolved fingerprint also
+identifies the exact hostname→IP DNS snapshot, including which host produced each
+answer. Backends must install those pinned mappings without permitting sandbox DNS.
+Resolution alone is not enforcement evidence.
