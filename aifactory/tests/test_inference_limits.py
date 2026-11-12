@@ -294,6 +294,7 @@ async def test_a_provider_refusal_is_never_retried(provider, clocked, monkeypatc
     (503, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
     (529, "Overloaded"),
     (429, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+    (422, "The model is temporarily unavailable, try again shortly."),  # not a rejected request either
 ])
 async def test_an_overload_the_provider_gave_up_on_is_retried_like_any_outage_not_refused(provider, clocked,
                                                                                           monkeypatch, status, message):
@@ -328,6 +329,11 @@ def test_do_not_send_this_again_is_a_refusal_only_on_a_limit():
                                    never)) == "transient"
     assert failure_cause(sdk_error("RateLimitError", 429, "The model provider is momentarily overloaded. It did not "
                                    "recover after 3 attempts.", never)) == "transient"
+    assert failure_cause(sdk_error("UnprocessableEntityError", 422, "The model is temporarily unavailable, try "
+                                   "again shortly.", never)) == "transient"
+    # A spent quota stays a refusal, even where its wording says to try again.
+    assert failure_cause(sdk_error("RateLimitError", 429, "Quota exceeded, try again next month",
+                                   never)) == "provider"
 
 
 async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):

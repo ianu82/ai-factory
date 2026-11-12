@@ -489,13 +489,14 @@ class ModelClient:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
                 # "Do not send this again" on a limit is a limit a person lifts. On a server error, or an answer that
                 # says its trouble is momentary, the provider only gave up for now: retried below like any outage.
-                if (response.headers.get("x-should-retry", "").lower() == "false" and response.status_code < 500
-                        and not momentary(detail)):
+                never = response.headers.get("x-should-retry", "").lower() == "false"
+                passing = never and (response.status_code >= 500 or momentary(detail))
+                if never and not passing:
                     raise InferenceError(f"{self.provider.label} limit reached ({response.status_code}): {detail}",
                                          status=response.status_code, cause="provider")
                 if response.status_code in (401, 403):
                     raise InferenceError(f"{self.provider.label} refused the credential ({response.status_code}): {detail}", status=response.status_code)
-                if response.status_code in (400, 404, 422):
+                if response.status_code in (400, 404, 422) and not passing:
                     rejected = InferenceError(
                         f"{self.provider.label} rejected the request ({response.status_code}): {detail}",
                         status=response.status_code)

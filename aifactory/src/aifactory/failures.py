@@ -106,13 +106,15 @@ def failure_cause(exc: BaseException) -> str:
     if isinstance(status, int) and not isinstance(status, bool):
         if status in (401, 402, 403):
             return "provider"
-        if status not in (408, 409, 429) and status < 500:
-            return ""
         if status == 429 and quota_exhausted(str(exc)):
             return "provider"
         # "Do not send this again" on a limit is a limit a person lifts. On a server error, or on an answer that says
-        # its trouble is momentary, the provider only gave up for now: the work is tried again, by nobody.
-        if _never_retry(exc) and status < 500 and not momentary(str(exc)):
+        # its trouble is momentary (whatever its status), the provider only gave up for now: tried again, by nobody.
+        if _never_retry(exc) and momentary(str(exc)):
+            return "transient"
+        if status not in (408, 409, 429) and status < 500:
+            return ""
+        if _never_retry(exc) and status < 500:
             return "provider"
         return "transient"
     if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
