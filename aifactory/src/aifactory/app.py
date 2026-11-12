@@ -27,6 +27,7 @@ from .mind.api import router as mind_router
 from .mind.runtime import EngineRuntime
 from .onboarding import router as onboarding_router
 from .pulls import router as pulls_router
+from .previews import router as previews_router
 from .pipeline.orchestrator import orchestrator
 
 log = logging.getLogger("aifactory")
@@ -70,6 +71,9 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
             return JSONResponse({"detail": "Invalid Linear configuration request"}, status_code=422)
         if request.url.path.startswith("/api/workspaces/") and "/repositories" in request.url.path:
             return JSONResponse({"detail": "Invalid repository request"}, status_code=422)
+        if request.url.path.startswith("/api/workspaces/") and "/previews/" in request.url.path:
+            # Reject nonfinite values without echoing unencodable NaN/Infinity in errors.
+            return JSONResponse({"detail": "Invalid preview request"}, status_code=422)
         return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
@@ -87,6 +91,7 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
     app.include_router(gateway_router)
     app.include_router(onboarding_router)
     app.include_router(pulls_router)
+    app.include_router(previews_router)
     app.include_router(merge_queue_router)
     app.include_router(coordination_router)
     app.include_router(rulings_router)

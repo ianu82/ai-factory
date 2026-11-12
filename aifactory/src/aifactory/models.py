@@ -1069,3 +1069,98 @@ def _scrub_release_evidence(_mapper, connection, target) -> None:
         value = getattr(target, field)
         if value is not None:
             setattr(target, field, release_redacted(value, secrets))
+
+
+class PreviewPolicy(Base):
+    """Factory-wide singleton, deliberately not Workspace.settings."""
+    __tablename__ = "preview_policy"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    active_cap: Mapped[int] = mapped_column(Integer, default=5)
+    idle_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    lifetime_hours: Mapped[int] = mapped_column(Integer, default=72)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    __table_args__ = (CheckConstraint("id = 1"), CheckConstraint("active_cap > 0"),
+                      CheckConstraint("idle_minutes > 0"), CheckConstraint("lifetime_hours > 0"))
+
+
+class WorkspacePreviewPolicy(Base):
+    __tablename__ = "workspace_preview_policy"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    idle_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lifetime_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    __table_args__ = (CheckConstraint("idle_minutes IS NULL OR idle_minutes > 0"),
+                      CheckConstraint("lifetime_hours IS NULL OR lifetime_hours > 0"))
+
+
+class Preview(Base):
+    """One durable resource per PR or outcome, independent of delivery slots."""
+    __tablename__ = "previews"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repository_id: Mapped[str | None] = mapped_column(ForeignKey("repositories.id"), nullable=True)
+    pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True, unique=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    desired_manifest: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    running_manifest: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    vm_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    claim: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_human_visit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    state_changed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    destroyed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "repository_id", "pr_number"),
+        CheckConstraint("(repository_id IS NOT NULL AND pr_number IS NOT NULL AND pr_number > 0 AND outcome_id IS NULL) OR "
+                        "(repository_id IS NULL AND pr_number IS NULL AND outcome_id IS NOT NULL)"),
+        CheckConstraint("generation > 0"),
+        CheckConstraint("state IN ('queued','waking','starting','running','asleep','stopped','failed')"),
+    )
+
+
+@event.listens_for(Preview, "before_update")
+def _immutable_preview_identity(_mapper, _connection, preview: Preview) -> None:
+    for key in ("workspace_id", "repository_id", "pr_number", "outcome_id", "expires_at", "created_at"):
+        if inspect(preview).attrs[key].history.has_changes():
+            raise ValueError(f"Preview {key} is immutable")
+
+
+class PreviewAllocation(Base):
+    """Durable allocation intent, committed before calling the VM provider."""
+    __tablename__ = "preview_allocations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    preview_id: Mapped[str] = mapped_column(ForeignKey("previews.id"), index=True)
+    generation: Mapped[int] = mapped_column(Integer)
+    provider: Mapped[str] = mapped_column(String(40))
+    vm_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="pending")
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    allocated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (UniqueConstraint("preview_id", "generation"),)
+
+
+class PreviewUsageInterval(Base):
+    """VM usage only; NULL cost means unknown, never free."""
+    __tablename__ = "preview_usage_intervals"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    allocation_id: Mapped[str] = mapped_column(ForeignKey("preview_allocations.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=1)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hourly_rate_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    __table_args__ = (UniqueConstraint("allocation_id", "sequence"),
+                      CheckConstraint("ended_at IS NULL OR ended_at >= started_at"),
+                      CheckConstraint("cost_usd IS NULL OR cost_usd >= 0"),
+                      CheckConstraint("hourly_rate_usd IS NULL OR hourly_rate_usd >= 0"))
