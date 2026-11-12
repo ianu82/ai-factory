@@ -21,7 +21,7 @@ import os
 from . import definitions
 from .db import session_scope
 from .models import Organization, Repository, Workspace
-from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+from .pipeline.runtime import merged_settings, new_settings
 from .steward_policy import validate_steward
 
 log = logging.getLogger(__name__)
@@ -101,7 +101,7 @@ def apply_bootstrap() -> str | None:
                 slug = next(c for c in ("default", "factory", *(f"factory-{n}" for n in range(2, 1000)))
                             if c not in taken)
                 ws = Workspace(org_id=org.id, name=cfg.get("workspace", "Factory"), slug=slug,
-                               settings=json.loads(json.dumps(DEFAULT_SETTINGS)))
+                               settings=new_settings())
                 s.add(ws)
                 s.flush()
         from .onboarding_policy import lock_workspace
