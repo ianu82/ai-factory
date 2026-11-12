@@ -38,6 +38,7 @@ DEFAULT_PRICING: dict[str, tuple[float, float]] = {}
 # failure, before the session fails and the pipeline's own infrastructure retries take over.
 RETRY_BUDGET_SECONDS = 300
 RETRY_WAIT_CAP_SECONDS = 60.0
+RESEND_MIN_TIMEOUT_SECONDS = 1.0  # a resend's timeout is cut to the time its retries have left, never below this
 # Resends of a request the provider rejected for an optional parameter (400/404/422), each without that parameter.
 COMPAT_RETRIES = 4
 _clock = time.monotonic
@@ -290,7 +291,8 @@ class Retries:
     """One request's in-place retries while the provider is briefly unavailable: capped exponential backoff (a
     ``retry-after`` is honoured) until RETRY_BUDGET_SECONDS have passed since the request's first failure, never past
     the session's ``deadline`` (time.monotonic), ended at once by its ``cancelled`` event. A wait that would last
-    until either end is not taken, so nothing is sent at the deadline itself. ``limit`` replaces the
+    until either end is not taken, so nothing is sent at the deadline itself, and a resend is given only the time
+    that is left (``timeout``), so it cannot run past either end. ``limit`` replaces the
     time budget with a fixed number of resends (0: fail on the first error). A request that was retried is reported
     once, when it ends: to ``notice`` when given, else in the log."""
 
@@ -318,9 +320,7 @@ class Retries:
         if self.first is None:
             self.first = now
         self.what = what
-        ends = [end for end in (self.deadline, None if self.limit is not None else self.first + RETRY_BUDGET_SECONDS)
-                if end is not None]
-        left = min(ends) - now if ends else float("inf")
+        left = self._left(now)
         if left <= 0 or (self.limit is not None and self.waits + self.resends >= self.limit):
             return False
         if self.cancelled is not None and self.cancelled.is_set():
@@ -342,6 +342,23 @@ class Retries:
         if sleeper in done:
             sleeper.result()  # a sleep that failed is raised, as it would be without the race
         return not self.cancelled.is_set()
+
+    def _left(self, now: float) -> float:
+        """Seconds until the retries end: the session's deadline, or the retry budget since the first failure."""
+        budget = None if self.limit is not None or self.first is None else self.first + RETRY_BUDGET_SECONDS
+        ends = [end for end in (self.deadline, budget) if end is not None]
+        return min(ends) - now if ends else float("inf")
+
+    def timeout(self, default: float) -> float:
+        """How long the next send may take. A request that has not failed keeps ``default``; a resend gets no more
+        than the time its retries have left, so one sent just before the end cannot run its whole timeout past it."""
+        if self.first is None:
+            return default
+        return max(RESEND_MIN_TIMEOUT_SECONDS, min(default, self._left(_clock())))
+
+    def spent(self) -> bool:
+        """Whether a request that has failed has no time left for another send (see ``timeout``)."""
+        return self.first is not None and self._left(_clock()) <= 0
 
     def report(self, ok: bool) -> None:
         """One line for a request that was retried: what the provider answered, for how long, and how it ended."""
@@ -450,12 +467,21 @@ class ModelClient:
 
     async def _send(self, path: str, body: dict[str, Any], retries: Retries) -> dict[str, Any]:
         url = self.provider.base_url + path
+        last: InferenceError | None = None
+        what, delay = "", None
         while True:
+            timeout = self.timeout
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=20.0)) as client:
+                async with httpx.AsyncClient() as client:
                     async with admission(self.provider, self.session_id):
-                        response = await client.post(url, headers=self.provider.headers(self.session_id),
-                                                     content=json.dumps(body))
+                        # Measured with the permit in hand: a resend's wait for it uses up the time that is left
+                        # too, and one that used it all is not sent.
+                        if last is not None and retries.spent():
+                            raise last
+                        timeout = retries.timeout(self.timeout)
+                        response = await client.post(
+                            url, headers=self.provider.headers(self.session_id), content=json.dumps(body),
+                            timeout=httpx.Timeout(timeout, connect=min(20.0, timeout)))
                 if response.status_code == 200:
                     return response.json()
                 detail = _error_detail(response)
@@ -467,13 +493,13 @@ class ModelClient:
                 if response.status_code in (401, 403):
                     raise InferenceError(f"{self.provider.label} refused the credential ({response.status_code}): {detail}", status=response.status_code)
                 if response.status_code in (400, 404, 422):
-                    last = InferenceError(
+                    rejected = InferenceError(
                         f"{self.provider.label} rejected the request ({response.status_code}): {detail}",
                         status=response.status_code)
                     if self.log_errors:
                         log.warning("%s %s rejected (%s): %s", self.provider.label, path, response.status_code, detail[:400])
                     if not retries.resend():
-                        raise last
+                        raise rejected
                     if "max_completion_tokens" in detail and "max_completion_tokens" in body:
                         body = {**body, "max_tokens": body.pop("max_completion_tokens")}
                         continue
@@ -496,8 +522,13 @@ class ModelClient:
                 last = InferenceError(f"{self.provider.label} error {response.status_code}: {detail}", retryable=True, status=response.status_code)
                 what, delay = str(response.status_code), _seconds(response.headers.get("retry-after"))
             except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last = InferenceError(f"{self.provider.label} unreachable: {type(exc).__name__}", retryable=True)
-                what, delay = "unreachable", None
+                cut = timeout < self.timeout and isinstance(exc, httpx.TimeoutException)
+                if last is None or not cut:
+                    last = InferenceError(f"{self.provider.label} unreachable: {type(exc).__name__}", retryable=True)
+                    what = "unreachable"
+                # Else a resend ran out of the little time it was given: that says nothing new about the provider,
+                # so the request ends with the answer that was being retried.
+                delay = None
             if not await retries.wait(what, delay):
                 raise last
 
