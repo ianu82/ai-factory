@@ -151,6 +151,7 @@ class AntonHarness:
                     failed(str(exc))
                     raise _Stop() from exc
                 state["calls"] += 1
+                toolbox.begin_turn()
                 try:
                     response = await _create_admitted_response(
                         provider_cfg, session.run_id, OpenAIProvider._create_response, provider, body, retries)

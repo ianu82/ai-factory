@@ -21,6 +21,7 @@ from aifactory.harness.base import HarnessFailed, HarnessSession  # noqa: E402
 from aifactory.harness.schemas import BUILDER_REPORT  # noqa: E402
 from aifactory.inference import ModelClient, ProviderConfig, UsageLedger  # noqa: E402
 from aifactory.sandbox import LocalSandbox  # noqa: E402
+from .test_harness import definition_context  # noqa: E402
 
 
 def _free_port() -> int:
@@ -29,8 +30,9 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100, cached_tokens=0, errors=None):
-    """``errors``: HTTP statuses the provider answers with first, one per request, before it serves any."""
+def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100, cached_tokens=0, errors=None,
+                 *, definitions_enabled=False):
+    """Opt in to definition reads; ``errors`` are HTTP statuses served before the normal tool sequence."""
     import uvicorn
 
     app = FastAPI()
@@ -57,7 +59,13 @@ def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100,
         elif len(outputs) == 1:
             call = {"type": "function_call", "id": "fc_image", "call_id": "call_image", "name": "read_image",
                     "status": "completed", "arguments": json.dumps({"file_path": ".factory/screen.jpg"})}
-        elif web_enabled and len(outputs) == 2:
+        elif definitions_enabled and len(outputs) == 2:
+            call = {"type": "function_call", "id": "fc_skill", "call_id": "call_skill", "name": "read_skill",
+                    "status": "completed", "arguments": json.dumps({"skill_id": "w/skill/test"})}
+        elif definitions_enabled and len(outputs) == 3:
+            call = {"type": "function_call", "id": "fc_knowledge", "call_id": "call_knowledge", "name": "search_knowledge",
+                    "status": "completed", "arguments": json.dumps({"page_id": "w/knowledge/notes"})}
+        elif web_enabled and len(outputs) == (4 if definitions_enabled else 2):
             call = {"type": "function_call", "id": "fc_web", "call_id": "call_web", "name": "web_fetch",
                     "status": "completed", "arguments": json.dumps({"url": f"http://127.0.0.1:{port}/page"})}
         else:
@@ -98,7 +106,7 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
     port = _free_port()
     requests: list = []
-    server = _fake_server(port, requests, web_enabled)
+    server = _fake_server(port, requests, web_enabled, definitions_enabled=True)
     progress = []
     try:
         sb = _sandbox(tmp_path)
@@ -107,6 +115,7 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
         session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
                                  sandbox=sb, model="fake-model", client=ModelClient(provider), ledger=ledger,
                                  report_schema=BUILDER_REPORT, writable=True, max_turns=10,
+                                 definition_context=json.dumps(definition_context()), definition_revision=4,
                                  tool_policy={"web": web_enabled},
                                  on_progress=lambda *event: progress.append(event))
         result = asyncio.run(AntonHarness().run(session))
@@ -120,7 +129,12 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     assert len(guard._sends) == len(requests)
     tool_names = {t.get("name") for t in requests[0].get("tools", [])}
     assert {"write_file", "finish", "run", "read_image"} <= tool_names
-    assert "scratchpad" not in tool_names
+    assert {"read_skill", "search_knowledge"} <= tool_names
+    assert not tool_names & {"scratchpad", "memorize", "recall", "recall_skill", "list_skills"}
+    assert any("x" * 65536 in json.dumps(body) for body in requests)
+    assert any("notes" * 100 in json.dumps(body) for body in requests)
+    assert len(session.loaded_skills) == 1
+    assert len([event for event in progress if event[0] == "skill_loaded"]) == 1
     if web_enabled:
         assert {"web_search", "web_fetch"} <= tool_names
         assert any(event[0] == "web_request" and event[2]["outcome"] == "success" for event in progress)
@@ -237,7 +251,8 @@ def test_a_run_is_not_paused_by_antons_per_turn_token_ceiling(tmp_path, monkeypa
         ledger = UsageLedger(run_id="r", workspace_settings={}, max_tokens=6_000_000)
         session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
                                  sandbox=_sandbox(tmp_path), model="gpt-4.1", client=ModelClient(provider),
-                                 ledger=ledger, report_schema=BUILDER_REPORT, writable=True, max_turns=10)
+                                 ledger=ledger, report_schema=BUILDER_REPORT, writable=True, max_turns=10,
+                                 definition_context=json.dumps(definition_context()), definition_revision=4)
         result = asyncio.run(AntonHarness().run(session))
     finally:
         server.should_exit = True

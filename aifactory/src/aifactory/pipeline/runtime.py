@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from datetime import timedelta
@@ -14,13 +15,14 @@ from typing import Any
 from ..config import concurrency_limit, get_settings
 from ..config_versions import canonical_json, configuration_version
 from ..db import session_scope, utcnow
+from ..definitions.sessions import append_instructions, catalogue, pin_definitions
 from ..events import notify, record
 from ..failures import failure_cause, failure_status
 from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessFailed, HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
 from ..inference import InferenceError, ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
+from ..models import Decision, DecisionReview, Message, Outcome, Run, RunDefinition, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from ..review import DEFAULT_REVIEW
 from .attachments import prepare_attachments
@@ -236,6 +238,9 @@ class SessionSpec:
     expected_criteria: list[str] | None = None  # the task's acceptance criteria, for a verifier's report
     expected_findings: list[str] | None = None  # ids of the review findings a builder's report must answer
 
+    # Trusted callers only; never supplied by an agent tool.
+    excluded_skill_ids: tuple[str, ...] = ()
+
     def __post_init__(self) -> None:
         # Own a recursively immutable snapshot, not a reference to mutable workspace/repo JSON.
         def freeze(value):
@@ -244,6 +249,7 @@ class SessionSpec:
             if isinstance(value, (list, tuple)):
                 return tuple(freeze(v) for v in value)
             return value
+        object.__setattr__(self, "excluded_skill_ids", tuple(self.excluded_skill_ids))
         for key in ("effective_settings", "repositories"):
             value = getattr(self, key)
             if value is not None:
@@ -271,9 +277,17 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     model = {"planner": models.planner, "builder": models.builder, "verifier": models.verifier,
              "plan_reviewer": models.plan_reviewer}[spec.role]
     model = spec.model_override or provider.model_override or model
+    with session_scope() as s:
+        definitions = pin_definitions(s, spec)
+    system = append_instructions(spec.system, definitions, spec.harness)
     version, snapshot = configuration_version(
         role=spec.role, system=spec.system, harness=spec.harness, provider=provider, model=model,
         settings=settings, repositories=spec.repositories, sandbox_kind=getattr(spec.sandbox, "kind", "local"))
+    # Keep verifier base-SHA normalization in configuration_version; hash all
+    # effective tool content and exclusions separately, not only the appended prompt.
+    snapshot["definitions"] = {"revision": definitions["revision"],
+                               "digest": hashlib.sha256(canonical_json(definitions).encode()).hexdigest()}
+    version = hashlib.sha256(canonical_json(snapshot).encode()).hexdigest()[:16]
     limits = settings["limits"]
     budgets = settings["budgets"]
     with session_scope() as s:
@@ -283,6 +297,12 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         s.add(run)
         s.flush()
         run_id = run.id
+        s.add(RunDefinition(run_id=run_id, revision=definitions["revision"], snapshot=definitions,
+                            applicable_skills=catalogue(definitions), instructions=definitions["instructions"],
+                            instruction_metadata=[{k: v for k, v in item.items() if k != "body"}
+                                                  for item in definitions["instructions"]],
+                            provenance={k: definitions[k] for k in ("workspace_id", "role", "repository_ids",
+                                                                   "excluded_skill_ids", "warnings")}))
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings, max_cost_usd=budgets.get("run_usd"),
                          max_tokens=budgets.get("run_tokens"))
     client = ModelClient(provider, session_id=run_id)
@@ -306,6 +326,19 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         last_progress = {"t": 0.0}
 
         def on_progress(kind: str, message: str, data: dict[str, Any]) -> None:
+            if kind == "skill_loaded":
+                # A body read is evidence, not progress chatter. Persist every load,
+                # while maintaining a separate unique list for run/API summaries.
+                with session_scope() as s:
+                    pinned = s.get(RunDefinition, run_id)
+                    if not any(item["id"] == data["id"] for item in pinned.loaded_skills):
+                        pinned.loaded_skills = [*pinned.loaded_skills, data]
+                    payload = record(spec.workspace_id, "agent_skill_loaded", message,
+                                     outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
+                                     data={"role": spec.role, **data}, session=s, publish=False)
+                from ..events import bus
+                bus.publish({"type": "event", **payload})
+                return
             # Commands, edits and guidance are always journaled; chatter is rate-limited.
             now = time.monotonic()
             if kind in ("thought", "tool") and now - last_progress["t"] < 4:
@@ -315,7 +348,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                    run_id=run_id, level="warn" if kind == "warn" else "info", data={"role": spec.role, **data})
 
         session = HarnessSession(
-            run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
+            run_id=run_id, role=spec.role, system=system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
             client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
             expected_criteria=spec.expected_criteria, expected_findings=spec.expected_findings,
             deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
@@ -324,6 +357,8 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
             gateway_token=gateway_token,
             reasoning_effort=settings.get("reasoning_effort"),
+            definition_context=canonical_json(definitions), definition_revision=definitions["revision"],
+            applicable_skills=catalogue(definitions), applied_instructions=definitions["instructions"],
         )
         context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
         session.prompt += context
@@ -374,7 +409,10 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                 import logging
                 logging.getLogger(__name__).exception("could not reserve automatic scorers")
             s.flush()
+            pinned = row.definition
+            _ = pinned.instructions  # detail serialization may happen after this session closes
             run_snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
+            run_snapshot.definition = pinned
         level = "success" if status == "succeeded" else ("warn" if status == "cancelled" else "error")
         tokens = ledger.input_tokens + ledger.output_tokens
         spend = (f"${run_snapshot.cost_usd:.2f}" if run_snapshot.cost_known else "cost unknown")

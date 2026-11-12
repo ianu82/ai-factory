@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from . import definitions
 from . import attachments as A
@@ -977,7 +977,7 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     if o is None or o.workspace_id != workspace_id:
         raise HTTPException(404, "Outcome not found")
     tasks = db.query(Task).filter(Task.outcome_id == o.id).order_by(Task.key).all()
-    runs = db.query(Run).filter(Run.outcome_id == o.id).order_by(Run.started_at).all()
+    runs = db.query(Run).options(selectinload(Run.definition)).filter(Run.outcome_id == o.id).order_by(Run.started_at).all()
     repos = {r.id: r.full_name for r in db.query(Repository).filter(Repository.workspace_id == workspace_id)}
     plans = db.query(Plan).filter(Plan.outcome_id == o.id).order_by(Plan.version).all()
     decisions = db.query(Decision).filter(Decision.outcome_id == o.id).order_by(Decision.created_at).all()
@@ -1393,7 +1393,7 @@ def reconcile_scorer_cost(workspace_id: str, run_id: str, score_id: str, attempt
 @router.get("/workspaces/{workspace_id}/runs")
 def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
-    query = db.query(Run).filter(Run.workspace_id == workspace_id)
+    query = db.query(Run).options(selectinload(Run.definition)).filter(Run.workspace_id == workspace_id)
     if config_version is not None:
         query = query.filter(Run.config_version == config_version)
     rows = query.order_by(Run.started_at.desc()).limit(max(1, min(limit, 500))).all()
@@ -1406,6 +1406,18 @@ def list_runs(workspace_id: str, limit: int = 100, config_version: str | None = 
                         "outcome_number": outcomes[r.outcome_id].number if r.outcome_id in outcomes else None,
                         "outcome_title": outcomes[r.outcome_id].title if r.outcome_id in outcomes else "",
                         "task_key": tasks[r.task_id].key if r.task_id in tasks else None} for r in rows]
+
+
+@router.get("/workspaces/{workspace_id}/runs/{run_id}")
+def get_run(workspace_id: str, run_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id)
+    from .models import RunDefinition
+
+    row = db.query(Run).options(selectinload(Run.definition).undefer(RunDefinition.instructions)).filter(
+        Run.workspace_id == workspace_id, Run.id == run_id).one_or_none()
+    if row is None:
+        raise HTTPException(404, "Run not found")
+    return S.run(row, include_instruction_content=True)
 
 
 @router.get("/workspaces/{workspace_id}/stats")
