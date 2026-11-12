@@ -8,9 +8,11 @@ next attempt; only genuine decisions or provider/access problems reach a person.
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import logging
+import posixpath
 import re
 import shlex
 import time
@@ -62,6 +64,114 @@ _PHASE_ORDER = {"prepare": 0, "build": 1, "checks": 2, "verify": 3}
 _COMPLETED_PHASE = {"builder_failed": "build", "builder_blocked": "build", "policy": "checks",
                     "checks_failed": "checks", "checks_preexisting": "checks", "verification_failed": "verify",
                     "verified": "verify"}
+
+
+# These criteria supplement every steward task, including fix-forward repairs. Authorization
+# to repair a red build is deliberately separate from approval to weaken its tests.
+STEWARD_TEST_CRITERION = (
+    "Do not disable, skip, remove or weaken existing tests or check configuration without an "
+    "attributed human approval for this exact steward episode and candidate."
+)
+
+
+def _check_paths(commands: list[str]) -> tuple[set[str], bool]:
+    """Resolve simple shell command paths; unsupported shell syntax fails closed.
+
+    This is not a shell interpreter. Subshells, expansions and directory stacks need
+    human review rather than an optimistic guess about which check script runs.
+    """
+    paths: set[str] = set()
+    unresolved = False
+    for command in commands:
+        cwd = ""
+        try:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+            lexer.whitespace_split = True
+            words = list(lexer)
+        except ValueError:
+            unresolved = True
+            continue
+        segment: list[str] = []
+        if any(word in ("pushd", "popd", "eval", "source", ".", "if", "for", "while") for word in words):
+            unresolved = True
+        for word in [*words, ";"]:
+            if any(c in word for c in "$`\\") or word in ("(", ")", "||", "|", "&"):
+                unresolved = True
+            if word in ("&&", ";"):
+                if segment and segment[0] == "cd":
+                    if word != "&&":
+                        unresolved = True  # a failed cd followed by ; executes in the old directory
+                    if len(segment) != 2 or segment[1].startswith(("-", "/", "~")):
+                        unresolved = True
+                    else:
+                        cwd = posixpath.normpath(posixpath.join(cwd, segment[1]))
+                else:
+                    if segment and segment[0] not in {"bash", "sh", "python", "python3", "node", "npm", "npx",
+                                                       "yarn", "pnpm", "pytest", "uv", "poetry", "make", "cargo",
+                                                       "go", "dotnet", "mvn", "gradle", "bundle", "ruby"}:
+                        # A bare command may be a repository script reached through PATH.
+                        unresolved = True
+                    for part in segment:
+                        if "/" in part or re.search(r"\.(?:sh|py|js|ts|mjs|cjs)$", part):
+                            path = posixpath.normpath(posixpath.join(cwd, part))
+                            if path.startswith(("/", "../")):
+                                unresolved = True
+                            else:
+                                paths.add(path)
+                segment = []
+            else:
+                segment.append(word)
+    return paths, unresolved
+
+
+def _test_path(path: str) -> bool:
+    return bool(re.search(r"(^|/)(?:tests?|__tests__|specs?)(/|[_.-])|(?:^|/)(?:test_|conftest\.)|"
+                          r"(?:[._-](?:test|spec)\.|_test\.)", path, re.I))
+
+
+def _check_config(path: str) -> bool:
+    name = posixpath.basename(path).lower()
+    return (name in {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "package.json", "makefile",
+                     ".coveragerc", "conftest.py", "noxfile.py", "setup.py"}
+            or bool(re.search(r"(?:jest|vitest|playwright|cypress|karma|mocha|nyc|ava|pytest|coverage|test).*"
+                              r"(?:config|rc)|^(?:\.mocharc|\.nycrc|\.taprc)", name))
+            or path.startswith(".github/workflows/"))
+
+
+def _only_new_python_tests(before: str, after: str) -> bool:
+    """Only additions of new test definitions are unattended. Module/class directives,
+    decorators and every existing function body must remain structurally identical."""
+    try:
+        old, new = ast.parse(before), ast.parse(after)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+    def strip_added(old_body, new_body):
+        names = {n.name for n in old_body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        kept = []
+        for node in new_body:
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name.startswith("test") and node.name not in names):
+                # These expressions execute at definition/import time, outside the new
+                # test body. Only literal defaults/annotations are safe to ignore.
+                annotations = [arg.annotation for arg in [*node.args.posonlyargs, *node.args.args,
+                                                          *node.args.kwonlyargs,
+                                                          *([node.args.vararg] if node.args.vararg else []),
+                                                          *([node.args.kwarg] if node.args.kwarg else [])]]
+                expressions = [*node.args.defaults, *node.args.kw_defaults, *annotations, node.returns]
+                if (node.decorator_list or getattr(node, "type_params", [])
+                        or any(expr is not None and not isinstance(expr, ast.Constant) for expr in expressions)):
+                    kept.append(node)  # executable additions must be reviewed, not stripped
+                continue
+            if isinstance(node, ast.ClassDef):
+                prior = next((n for n in old_body if isinstance(n, ast.ClassDef) and n.name == node.name), None)
+                if prior:
+                    node.body = strip_added(prior.body, node.body)
+            kept.append(node)
+        return kept
+
+    new.body = strip_added(old.body, new.body)
+    return ast.dump(old) == ast.dump(new)
 
 
 def recovered_from_infra(result: str, failing_phase: str | None) -> bool:
@@ -295,7 +405,8 @@ class TaskRunner:
             self.event("stage", message, stage=stage)
 
     def block(self, kind: str, title: str, body: str, *, status: str = "blocked",
-              options: list[dict[str, Any]] | None = None) -> None:
+              options: list[dict[str, Any]] | None = None,
+              metadata: dict[str, Any] | None = None) -> None:
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             if not transition(s, task, owner=self.owner, status=status, blocked_reason=body[:2000], lease_owner=""):
@@ -303,7 +414,7 @@ class TaskRunner:
             # The decision and state transition commit together; no second transaction
             # can create a retry decision after a concurrent stop.
             decision = Decision(workspace_id=self.ws, kind=kind, title=title, body=body,
-                                outcome_id=self.task.outcome_id, task_id=self.task_id,
+                                outcome_id=self.task.outcome_id, task_id=self.task_id, metadata_json=metadata,
                                 options=options or [{"value": "retry", "label": "Retry"},
                                                     {"value": "abandon", "label": "Abandon task"}])
             s.add(decision)
@@ -313,12 +424,231 @@ class TaskRunner:
         notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
         raise Stop()
 
+    # steward candidates ---------------------------------------------------------
+    def _steward_question(self, title: str, body: str, *, status: str = "needs_input",
+                          options: list[dict[str, Any]] | None = None,
+                          metadata: dict[str, Any] | None = None) -> None:
+        """Task questions resume on ``answer``, not the default ``unblock`` retry.
+
+        Keep test approval's explicit, candidate-scoped answer separate from repair
+        authorization. Other steward questions let a person give guidance and
+        requeue delivery through its existing rebuild/verification gates.
+        """
+        self.block("question", title, body, status=status,
+                   options=options or [{"value": "answer", "label": "Answer and continue"},
+                                       {"value": "abandon", "label": "Abandon task"}],
+                   metadata=metadata)
+
+    def _steward_identity(self) -> dict[str, Any] | None:
+        """T5/T6 contract: persist evidence.steward with episode_id, action (fix/revert),
+        authorized=True and an exact culprit_sha (mandatory for revert). A merge revert
+        additionally needs confirmed first_parent_sha evidence. Never use merge_sha here.
+        """
+        with session_scope() as s:
+            ev = s.get(Task, self.task_id).evidence or {}
+            meta = ev.get("steward")
+        if meta is None:
+            return None
+        if not (isinstance(meta, dict) and meta.get("episode_id") and meta.get("authorized") is True
+                and meta.get("action") in ("fix", "revert")
+                and (meta.get("action") != "revert" or re.fullmatch(r"[0-9a-f]{40,64}", str(meta.get("culprit_sha", ""))))):
+            self._steward_question("Steward authorization is incomplete",
+                       "Record an authorized episode_id, action and exact culprit SHA before delivery.",
+                       status="needs_input")
+        return {k: meta.get(k) for k in ("episode_id", "action", "culprit_sha", "first_parent_sha",
+                                        "first_parent_confirmed")}
+
+    def _bind_steward_candidate(self, patch: Patch) -> None:
+        identity = self._steward_identity()
+        if identity is not None:
+            self.evidence("steward_candidate", {"identity": identity, "base": self.task.base_sha,
+                                                 "patch_sha256": hashlib.sha256(patch.diff).hexdigest()})
+
+    def _guard_steward_candidate(self) -> None:
+        identity = self._steward_identity()
+        with session_scope() as s:
+            candidate = (s.get(Task, self.task_id).evidence or {}).get("steward_candidate")
+        if identity is None and not candidate:
+            return
+        if not candidate or candidate.get("identity") != identity:
+            self._set_evidence({"steward_rejection": {"reason": "authorization changed", "candidate": candidate},
+                                "candidate": None, "steward_candidate": None, "steward_test_gate": None,
+                                "revalidation": None, "fix_round": ""})
+            self.update(stage="prepare")
+            self._steward_question("Steward candidate authorization changed",
+                       "Discard this reviewed candidate and rebuild for the current episode/action/culprit; "
+                       "it was not published or merged.", status="needs_input")
+        gate = (self.task.evidence or {}).get("steward_test_gate") or {}
+        scope = gate.get("scope") or gate
+        if gate and (scope.get("checks") != list(self.cfg.get("checks") or [])
+                     or scope.get("setup") != list(self.cfg.get("setup") or [])):
+            self._set_evidence({"steward_rejection": {"reason": "check configuration changed",
+                                                       "candidate": candidate},
+                                "candidate": None, "steward_candidate": None, "steward_test_gate": None,
+                                "revalidation": None, "fix_round": ""})
+            self.update(stage="prepare")
+            self._steward_question("Steward check configuration changed",
+                       "Rebuild and rerun checks and independent verification with the current configuration.",
+                       status="needs_input")
+        if self.patch is not None and candidate.get("patch_sha256") != hashlib.sha256(self.patch.diff).hexdigest():
+            self._set_evidence({"candidate": None, "steward_candidate": None, "steward_test_gate": None,
+                                "revalidation": None, "fix_round": ""})
+            self.update(stage="prepare")
+            self._steward_question("Steward candidate changed", "Rebuild and independently verify the exact patch.",
+                       status="needs_input")
+
+    async def _steward_merge_policy_gate(self, token: str) -> None:
+        """Evaluate today's path/size policy against the exact published head, in isolation."""
+        if self._steward_identity() is None:
+            return
+        sandbox = LocalSandbox(f"task-{self.task_id[:12]}-merge-policy").create()
+        try:
+            await checkout(sandbox, self.repo.full_name, token, self.task.head_sha, self.task.branch)
+            patch = await extract_patch(sandbox, self.task.base_sha)
+            candidate = (self.task.evidence or {}).get("steward_candidate") or {}
+            # Git may serialize the same tree differently after a rebase; the binding is refreshed
+            # only by the revalidation verifier, never here at the merge boundary.
+            if candidate.get("patch_sha256") != hashlib.sha256(patch.diff).hexdigest():
+                self._steward_question("Published steward candidate changed",
+                           "The published patch differs from the reviewed candidate. Rebuild and verify it.",
+                           status="needs_input")
+            problem = await self._policy_problem(patch)
+            if problem:
+                self._steward_question("Steward candidate violates current policy", problem, status="needs_input")
+            previous, self.builder = self.builder, sandbox
+            try:
+                await self._steward_test_gate(patch)
+            finally:
+                self.builder = previous
+        except (GitError, SandboxError, OSError) as exc:
+            self._steward_question("Steward candidate could not be rechecked",
+                       f"No merge was attempted. Rebuild or retry after restoring sandbox access: {exc}",
+                       status="needs_input")
+        finally:
+            await sandbox.close()
+
+    async def _prepare_steward_revert(self, identity: dict[str, Any]) -> None:
+        sha = identity["culprit_sha"]
+        if not (await extract_patch(self.builder, self.task.base_sha)).empty:
+            self._steward_question("Steward revert checkout is not clean",
+                       "Repository setup changed tracked files. A deterministic inverse must start from the exact "
+                       "default-branch base; review setup before retrying.", status="needs_input")
+
+        async def checked(command: str):
+            result = await self.builder.exec(command, timeout=120)
+            if not result.ok:
+                self.evidence("steward_rejection", {"identity": identity, "base": self.task.base_sha,
+                                                    "reason": result.output[-1500:]})
+                self._steward_question("Steward revert needs a human decision",
+                           f"Cannot revert {sha} on {self.task.base_sha}: nonancestor, already reverted, empty or "
+                           f"conflicting candidate. Inspect the culprit and choose a fix or a new revert.\n{result.output[-1500:]}",
+                           status="needs_input")
+            return result.output.strip()
+        await checked(f"git merge-base --is-ancestor {sha} HEAD")
+        parents = (await checked(f"git rev-list --parents -n 1 {sha}")).split()
+        mainline = ""
+        if len(parents) > 2:
+            if not (len(parents) == 3 and identity.get("first_parent_confirmed") is True
+                    and identity.get("first_parent_sha") == parents[1]):
+                self._steward_question("Merge revert mainline is unconfirmed",
+                           f"Confirm first-parent evidence for {sha} (actual first parent {parents[1]}) or choose "
+                           "a fix-forward repair. No mainline was guessed.", status="needs_input")
+            mainline = "-m 1 "
+        await checked(f"git revert --no-commit {mainline}{sha}")
+        patch = await extract_patch(self.builder, self.task.base_sha)
+        if patch.empty:
+            self._steward_question("Steward revert is empty", f"{sha} has no inverse change on the latest default "
+                       "branch; it may already be reverted. Choose a different repair.", status="needs_input")
+        self.builder_report = {"summary": f"Deterministic revert of {sha}", "tests": []}
+        self.evidence("builder_report", self.builder_report)
+
+    async def _steward_test_gate(self, patch: Patch) -> None:
+        identity = self._steward_identity()
+        if identity is None:
+            return
+        paths, unresolved = _check_paths(list(self.cfg.get("checks") or []) + list(self.cfg.get("setup") or []))
+        risky = []
+        # Read trusted base blobs from the mirror, bounded before crossing the sandbox boundary.
+        for path in patch.files:
+            if _check_config(path) or path in paths or unresolved:
+                risky.append(path)
+                continue
+            if not _test_path(path):
+                continue
+            try:
+                spec = self.task.base_sha + ":" + path
+                # The mirror is trusted, and the size is established before loading the blob.
+                size = int((await git("cat-file", "-s", spec, cwd=_mirror_path(self.repo.full_name))).strip())
+            except GitError:
+                # Distinguish a genuinely new test from an unreadable/missing base.
+                try:
+                    tree = await git("--literal-pathspecs", "ls-tree", self.task.base_sha, "--", path,
+                                     cwd=_mirror_path(self.repo.full_name))
+                except GitError:
+                    risky.append(path)
+                else:
+                    if tree.strip():
+                        risky.append(path)
+                    elif path.endswith(".py"):
+                        from ..sandbox import read_text
+                        try:
+                            if not _only_new_python_tests("", await read_text(self.builder, path)):
+                                risky.append(path)
+                        except (SandboxError, OSError, UnicodeError):
+                            risky.append(path)
+                    else:
+                        risky.append(path)
+                continue
+            except ValueError:
+                risky.append(path)
+                continue
+            if size > 400_000 or not path.endswith(".py"):
+                risky.append(path)
+                continue
+            from ..sandbox import read_text
+            try:
+                before = await git("show", spec, cwd=_mirror_path(self.repo.full_name))
+                if not _only_new_python_tests(before, await read_text(self.builder, path)):
+                    risky.append(path)
+            except (GitError, SandboxError, OSError, UnicodeError):
+                risky.append(path)
+        if not risky:
+            self.evidence("steward_test_gate", {
+                "approved": True, "patch_sha256": hashlib.sha256(patch.diff).hexdigest(),
+                "checks": list(self.cfg.get("checks") or []), "setup": list(self.cfg.get("setup") or [])})
+            return
+        scope = {"episode_id": identity["episode_id"], "identity": identity, "base": self.task.base_sha,
+                 "patch_sha256": hashlib.sha256(patch.diff).hexdigest(), "paths": sorted(risky),
+                 "checks": list(self.cfg.get("checks") or []), "setup": list(self.cfg.get("setup") or [])}
+        with session_scope() as s:
+            rows = s.query(Decision).filter_by(task_id=self.task_id, kind="question", status="resolved",
+                                               resolution="answer").all()
+            approved = any(row.resolved_by and row.resolved_at and row.metadata_json == {"steward_test_approval": scope}
+                           and (not row.attribution or row.attribution.get("source") in ("human", "mind")) for row in rows)
+        self.evidence("steward_test_gate", {"scope": scope, "approved": approved})
+        if not approved:
+            self._steward_question("Approve test/check changes for this steward candidate",
+                       "This repair changes existing tests or check configuration: " + ", ".join(risky)
+                       + ". Auto fix/revert authorization does not approve disabling tests. Review the exact diff "
+                       "before approving; approval covers only this episode, base and patch.", status="needs_input",
+                       options=[{"value": "answer", "label": "Approve these test/check changes"},
+                                {"value": "abandon", "label": "Abandon task"}],
+                       metadata={"steward_test_approval": scope})
+
     # entry ---------------------------------------------------------------------
     async def run(self) -> None:
         try:
             if not self.task.started_at:
                 self.update(started_at=utcnow())
+            identity = self._steward_identity()
+            if identity is not None and STEWARD_TEST_CRITERION not in self.task.acceptance:
+                self.update(acceptance=[*self.task.acceptance, STEWARD_TEST_CRITERION])
             stage = self.task.stage
+            if identity is not None and self.task.merge_sha and stage not in ("smoke", "release"):
+                self._steward_question("Steward repair task already has a merge record",
+                           "Use a new repair task rather than overwriting a completed merge.", status="needs_input")
+            if stage in ("merge", "ci", "ci_refresh", "ci_repair"):
+                self._guard_steward_candidate()
             phase = ((self.task.evidence or {}).get("revalidation") or {}).get("phase")
             if phase not in (None, "complete", "handled"):
                 await self.merge()  # checks for an outside merge before resuming missing gates
@@ -353,7 +683,10 @@ class TaskRunner:
             elif stage == "revise":
                 await self.deliver(continue_from_branch=True)
             elif stage == "revert":
-                await self.revert()
+                if identity is not None:
+                    await self.deliver()
+                else:
+                    await self.revert()
             else:
                 await self.deliver()
         except Stop:
@@ -365,6 +698,13 @@ class TaskRunner:
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
+        identity = self._steward_identity()
+        if identity is not None and identity["action"] == "revert":
+            if self.task.merge_sha:
+                self._steward_question("A steward repair requires a separate task",
+                           "This task already records a completed merge. Create a new repair task; its merge "
+                           "record must not be overwritten.", status="needs_input")
+            continue_from_branch = False  # regenerate the inverse, never replay or revise a prior inverse
         merge_manager.leave(self)  # a rebuild re-enters the merge queue at the back when it is ready again
         max_attempts = int(self.settings.get("max_attempts", 3))
         token = resolve_token(self.ws)
@@ -426,13 +766,32 @@ class TaskRunner:
                            options=[{"value": "retry", "label": f"Continue with ${more} more"},
                                     {"value": "abandon", "label": "Stop"}])
             if saved:
+                self._guard_steward_candidate()
+                identity = self._steward_identity()
+                if identity is not None and identity["action"] == "revert":
+                    main_sha = await GitHub(token).branch_sha(self.repo.full_name, self.repo.default_branch)
+                    if main_sha != self.task.base_sha:
+                        await self._refresh_onto_main(token, GitHub(token), main_sha)
                 candidate, saved = saved, None
                 patch = await self._resume_candidate(token, attempt, candidate)
                 if patch is not None:
+                    if self._steward_identity() is not None:
+                        # Setup is rerun on restoration. Check the actual tree, not just the saved diff.
+                        self.patch = await extract_patch(self.builder, self.task.base_sha)
+                        self._guard_steward_candidate()
+                        problem = await self._policy_problem(self.patch)
+                        if problem:
+                            self._steward_question("Resumed steward candidate violates policy", problem)
+                        await self._steward_test_gate(self.patch)
                     if await self._check_and_verify(token, attempt, patch, candidate["diff_artifact_id"],
                                                     candidate.get("checks")):
                         break
                     continue
+            identity = self._steward_identity()
+            if self.builder is not None and identity is not None and identity["action"] == "revert":
+                await self.builder.close()
+                self.builder = None
+
             if self.builder is None:
                 try:
                     await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
@@ -442,54 +801,61 @@ class TaskRunner:
             self._describe_tree(attempt)
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             sections = await self._sections()
-            findings, unlisted = self._round_findings()
-            run, result, error = await self._session(attempt, "build", SessionSpec(
-                workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
-                effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
-                harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
-                expected_findings=[f["id"] for f in findings] or None,
-                prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
-                                    precedents(self.ws, self.repo.id),
-                                    guidance_history(self.task.outcome_id, self.task_id), sections,
-                                    review_findings(findings, unlisted))))
-            if result is None:
-                cause = infrastructure_problem(error, carried_cause(run))
-                if cause:
-                    self._infrastructure(attempt, "build", error, cause)
-                # A session stopped by its own cap (time, turns, tokens, cost) may have left the work done, so its
-                # tree is checked as it stands: unless it is empty or the candidate this runner already judged.
-                left = None
-                if any(cap.lower() in error.lower() for cap in RUN_CAPS):
-                    try:
-                        left = await extract_patch(self.builder, self.task.base_sha)
-                    except SandboxError:
-                        pass
-                if left is None or left.empty or (self.patch is not None and left.diff == self.patch.diff):
-                    self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
-                    self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
-                    continue
-                from ..harness import HarnessResult
+            if identity != self._steward_identity():
+                self._steward_question("Steward authorization changed during preparation",
+                           "Rebuild for the current episode, action and culprit.", status="needs_input")
+            run = None
+            if identity is not None and identity["action"] == "revert":
+                await self._prepare_steward_revert(identity)
+            else:
+                findings, unlisted = self._round_findings()
+                run, result, error = await self._session(attempt, "build", SessionSpec(
+                    workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
+                    effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
+                    harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
+                    expected_findings=[f["id"] for f in findings] or None,
+                    prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
+                                        precedents(self.ws, self.repo.id),
+                                        guidance_history(self.task.outcome_id, self.task_id), sections,
+                                        review_findings(findings, unlisted))))
+                if result is None:
+                    cause = infrastructure_problem(error, carried_cause(run))
+                    if cause:
+                        self._infrastructure(attempt, "build", error, cause)
+                    # A session stopped by its own cap (time, turns, tokens, cost) may have left the work done, so its
+                    # tree is checked as it stands: unless it is empty or the candidate this runner already judged.
+                    left = None
+                    if any(cap.lower() in error.lower() for cap in RUN_CAPS):
+                        try:
+                            left = await extract_patch(self.builder, self.task.base_sha)
+                        except SandboxError:
+                            pass
+                    if left is None or left.empty or (self.patch is not None and left.diff == self.patch.diff):
+                        self.feedback.append(f"- The previous builder session ended without a report: {error[:500]}")
+                        self.evidence("attempts", {"n": attempt, "result": "builder_failed", "error": error[:500]})
+                        continue
+                    from ..harness import HarnessResult
 
-                self.feedback.append(f"- The previous builder session reached its limit before it reported "
-                                     f"({error[:300]}). The factory checked the change as that session left it. Work "
-                                     "in small complete steps and finish with your report before the limit.")
-                self.event("builder_unreported", f"The builder session reached its limit before it reported "
-                           f"({error[:200]}); checking the {len(left.files)} file(s) it changed as they stand",
-                           level="warn", error=error[:300], files=len(left.files))
-                # A stand-in for the report, shown to the verifier and on the pull request in place of a summary.
-                result = HarnessResult(turns=run.turns or 0, report={"status": "unreported", "summary": (
-                    f"The builder session reached its limit before it reported ({error[:200]}), so there is no "
-                    "builder summary. This change is the working tree as that session left it; the Factory checks "
-                    "and verifies it as it stood.")})
-            self.builder_report = result.report
-            self.evidence("builder_report", self.builder_report)
-            if result.report.get("status") == "blocked":
-                reason = result.report.get("blocked_reason") or result.report.get("summary", "")
-                self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
-                self.update(attempt=attempt - 1)  # a question is not a failed attempt
-                self.block("question", f"{self.task.key} needs a decision", reason, status="needs_input",
-                           options=[{"value": "answer", "label": "Answer and continue"},
-                                    {"value": "abandon", "label": "Abandon task"}])
+                    self.feedback.append(f"- The previous builder session reached its limit before it reported "
+                                         f"({error[:300]}). The factory checked the change as that session left it. Work "
+                                         "in small complete steps and finish with your report before the limit.")
+                    self.event("builder_unreported", f"The builder session reached its limit before it reported "
+                               f"({error[:200]}); checking the {len(left.files)} file(s) it changed as they stand",
+                               level="warn", error=error[:300], files=len(left.files))
+                    # A stand-in for the report, shown to the verifier and on the pull request in place of a summary.
+                    result = HarnessResult(turns=run.turns or 0, report={"status": "unreported", "summary": (
+                        f"The builder session reached its limit before it reported ({error[:200]}), so there is no "
+                        "builder summary. This change is the working tree as that session left it; the Factory checks "
+                        "and verifies it as it stood.")})
+                self.builder_report = result.report
+                self.evidence("builder_report", self.builder_report)
+                if result.report.get("status") == "blocked":
+                    reason = result.report.get("blocked_reason") or result.report.get("summary", "")
+                    self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
+                    self.update(attempt=attempt - 1)  # a question is not a failed attempt
+                    self.block("question", f"{self.task.key} needs a decision", reason, status="needs_input",
+                               options=[{"value": "answer", "label": "Answer and continue"},
+                                        {"value": "abandon", "label": "Abandon task"}])
 
             # candidate gate
             self.stage("checks", "Checking the candidate change")
@@ -500,19 +866,27 @@ class TaskRunner:
                 continue
             problem = await self._policy_problem(patch)
             if problem:
+                if identity is not None and identity["action"] == "revert":
+                    self._steward_question("Steward revert violates candidate policy", problem, status="needs_input")
                 self.feedback.append(problem)
                 self.evidence("attempts", {"n": attempt, "result": "policy", "detail": problem,
                                            "files": len(patch.files)})
                 self.event("candidate_rejected", problem, level="warn")
                 continue
+            if identity != self._steward_identity():
+                self._steward_question("Steward authorization changed during building",
+                           "Discard the candidate and rebuild for the current authorization.", status="needs_input")
+            self._bind_steward_candidate(patch)
+            diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"),
+                                    run_id=run.id if run else None, files=patch.files,
+                                    additions=patch.additions, deletions=patch.deletions)
+            await self._steward_test_gate(patch)
             self.patch = patch
-            diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
-                          files=patch.files, additions=patch.additions, deletions=patch.deletions)
             # Saved as soon as it exists: a stop from here on resumes this candidate instead of building it again.
             self.evidence("candidate", {
                 "n": attempt, "epoch": int((self.task.evidence or {}).get("budget_epoch", 0)),
                 "diff_artifact_id": diff_id, "patch_sha256": hashlib.sha256(patch.diff).hexdigest(),
-                "base_sha": self.task.base_sha, "run_id": run.id, "files": patch.files,
+                "base_sha": self.task.base_sha, "run_id": run.id if run else None, "files": patch.files,
                 "additions": patch.additions, "deletions": patch.deletions, "fix_round": fix_round, "checks": None})
             if await self._check_and_verify(token, attempt, patch, diff_id):
                 break
@@ -524,6 +898,7 @@ class TaskRunner:
                                 checks: list[dict[str, Any]] | None = None) -> bool:
         """The candidate gate from the configured checks on; True once the candidate is verified. ``checks`` are the
         results a resumed candidate's checks had before the task stopped: they are not run again."""
+        identity = self._steward_identity()
         seen = {"diff_artifact_id": diff_id, "patch_sha256": hashlib.sha256(patch.diff).hexdigest()}
         if checks is None:
             commands = self.cfg.get("checks") or []
@@ -545,6 +920,10 @@ class TaskRunner:
                                commands=[c["command"] for c in failed])
                     failed = []
             if failed:
+                if identity is not None and identity["action"] == "revert":
+                    self._steward_question("Steward revert failed configured checks",
+                               "The exact inverse failed checks. Inspect the check artifacts and choose a repair.",
+                               status="needs_input")
                 self.feedback += [f"- Check `{c['command']}` {_how_failed(c)}{c.get('vs_base', '')}"
                                   f"{_whose_output(c)}:\n```\n{c['tail']}\n```" for c in failed]
                 # With its diff: a new sandbox for the next attempt starts from these changes (_earlier_changes).
@@ -562,6 +941,10 @@ class TaskRunner:
         self.stage("verify", f"Independent verification by a fresh {self.task.verifier_harness} session")
         verdict = await self._verify(token, patch, attempt)
         if verdict is None:
+            if identity is not None and identity["action"] == "revert":
+                self._steward_question("Steward revert failed independent verification",
+                           "Review verifier findings and choose a fix-forward repair or a different culprit.",
+                           status="needs_input")
             return False
         # A restart before publication reloads exactly this candidate from the diff.
         self.evidence("attempts", {"n": attempt, "result": "verified", "checks": _brief(self.checks),
@@ -583,7 +966,10 @@ class TaskRunner:
             self.stage("prepare", f"Preparing a fresh checkout of {self.repo.full_name}")
             base_sha = await checkout(self.builder, self.repo.full_name, token, self.repo.default_branch, branch)
             self.update(base_sha=base_sha, branch=branch)
-            self._tree = {"from": "default", **await self._earlier_changes()}
+            identity = self._steward_identity()
+            # A revert is always generated from pristine main, never a previous attempt's inverse.
+            earlier = {} if identity is not None and identity["action"] == "revert" else await self._earlier_changes()
+            self._tree = {"from": "default", **earlier}
         await self._set_up_builder()
 
     async def _set_up_builder(self) -> None:
@@ -873,6 +1259,11 @@ class TaskRunner:
         return row, result.output
 
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
+        self._guard_steward_candidate()
+        if self._steward_identity() is not None:
+            problem = await self._policy_problem(patch)
+            if problem:
+                self._steward_question("Steward candidate violates policy", problem, status="needs_input")
         qa_cfg = self.cfg.get("qa") or {}
         error = ""
         previous = self._previous_review(patch)
@@ -903,6 +1294,7 @@ class TaskRunner:
                                              precedents(self.ws, self.repo.id),
                                              guidance_history(self.task.outcome_id, self.task_id),
                                              outcome=self.outcome, sections=sections, previous=previous)
+                        + ("\nExplicit verification criterion: " + STEWARD_TEST_CRITERION if self._steward_identity() else "")
                         + brief))
                     carried = carried_cause(run)
                     if app is not None:
@@ -1158,6 +1550,11 @@ class TaskRunner:
         """After a restart between independent verification and publication, reload the candidate exactly as it was
         verified, so it is published rather than rebuilt in a new, charged attempt. False when it cannot be reloaded
         byte for byte (a diff stored only in part); the attempt is then redone, uncharged (see deliver())."""
+        candidate = (self.task.evidence or {}).get("steward_candidate")
+        identity = self._steward_identity()
+        if (candidate or identity) and (not candidate or candidate.get("identity") != identity):
+            self._set_evidence({"steward_candidate": None, "fix_round": "", "revalidation": None})
+            return False
         last = self._unpublished_candidate()
         found = self._stored_candidate(last)
         if found is None:
@@ -1407,6 +1804,19 @@ class TaskRunner:
     # publication ---------------------------------------------------------------
     async def _publish(self, token: str) -> None:
         assert self.patch is not None
+        self._guard_steward_candidate()
+        if self._steward_identity() is not None:
+            problem = await self._policy_problem(self.patch)
+            if problem:
+                self._steward_question("Steward candidate violates policy", problem, status="needs_input")
+            # Publication after restart has no builder. The exact gated hash is durable.
+            gate = (self.task.evidence or {}).get("steward_test_gate") or {}
+            scope = gate.get("scope") or {}
+            digest = scope.get("patch_sha256") or gate.get("patch_sha256")
+            if (not gate.get("approved") or digest != hashlib.sha256(self.patch.diff).hexdigest()
+                    or (scope and scope.get("checks") != list(self.cfg.get("checks") or []))):
+                self._steward_question("Steward test approval is missing", "Review the candidate test/check changes.",
+                           status="needs_input")
         self.stage("publish", "Publishing the verified change")
         message = f"{self.task.title}\n\nFactory outcome #{self.outcome.number}, task {self.task.key}."
         try:
@@ -1594,6 +2004,7 @@ class TaskRunner:
         comment or a merge, so a runner whose task is no longer its own stops here as well."""
         if self.cancelled.is_set():
             raise Stop()
+        self._guard_steward_candidate()
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             if (status and task.status != status) or not self._holds(s, task):
@@ -1713,6 +2124,11 @@ class TaskRunner:
             self.event("ci_status", f"CI {summary.state}", state=summary.state, checks=summary.checks)
 
     async def _fix_ci(self, gh: GitHub) -> None:
+        identity = self._steward_identity()
+        if identity is not None and identity["action"] == "revert":
+            self._steward_question("Steward revert failed CI",
+                       "The deterministic inverse failed CI. Choose fix-forward or a different culprit; "
+                       "a builder may not alter the authorized inverse.", status="needs_input")
         summary = CheckSummary("failure", (self.task.evidence or {}).get("ci", {}).get("checks", []))
         details = []
         for check in (summary.failing if summary else [])[:3]:
@@ -2097,6 +2513,8 @@ class TaskRunner:
             if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
                 return None
 
+            self._guard_steward_candidate()
+
             async def merge():
                 return await asyncio.wait_for(
                     gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
@@ -2138,6 +2556,7 @@ class TaskRunner:
         return own and mode == "patch"
 
     async def merge(self) -> None:
+        self._guard_steward_candidate()
         token = resolve_token(self.ws)
         gh = GitHub(token)
         if self.task.pr_number:
@@ -2156,10 +2575,27 @@ class TaskRunner:
         if pending.get("phase") not in (None, "complete", "handled"):
             await self._refresh_onto_main(token, gh, pending["new_base"])
             return
+        if self._steward_identity() is not None:
+            if not self.task.pr_number:
+                self._steward_question("Steward candidate has no PR", "Publish and verify a repair PR before merging.",
+                           status="needs_input")
+            if current.get("head", {}).get("sha") != self.task.head_sha:
+                self._steward_question("Steward PR head changed", "The verified head is stale; rebuild the candidate.",
+                           status="needs_input")
+        await self._steward_merge_policy_gate(token)
         self._require_merge_approval()
         # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
         await merge_manager.take_turn(self, gh)
-        revalidate = (self.cfg.get("merge") or {}).get("revalidate", True)
+        revalidate = bool(self._steward_identity()) or (self.cfg.get("merge") or {}).get("revalidate", True)
+        if self._steward_identity() is not None:
+            pr = await gh.pull(self.repo.full_name, self.task.pr_number)
+            summary = await gh.checks(self.repo.full_name, self.task.head_sha)
+            self._guard()
+            if pr.get("head", {}).get("sha") != self.task.head_sha:
+                self._steward_question("Steward PR head changed", "The verified head is stale; rebuild the candidate.",
+                           status="needs_input")
+            if summary.state != "success" and not (summary.state == "none" and not self.cfg.get("require_ci", False)):
+                await self._wait_ci()
         github_queue = await merge_manager.github_queue_state(gh, self)
         if github_queue is not None:
             if revalidate and not github_queue["entry"] and not (self.task.evidence or {}).get(
@@ -2170,6 +2606,7 @@ class TaskRunner:
                 if main_sha != self.task.base_sha:
                     await self._refresh_onto_main(token, gh, main_sha)
                     return
+            self._guard()
             await merge_manager.merge_via_github_queue(self, gh, github_queue)
         self.stage("merge", f"Merging PR #{self.task.pr_number}")
         refresh_onto: str | None = None
@@ -2193,6 +2630,11 @@ class TaskRunner:
                 if revalidate and main_sha != self.task.base_sha:
                     refresh_onto = main_sha
                 else:
+                    if self._steward_identity() is not None:
+                        summary = await gh.checks(self.repo.full_name, self.task.head_sha)
+                        self._guard()
+                        if summary.state != "success" and not (summary.state == "none" and not self.cfg.get("require_ci", False)):
+                            await self._wait_ci()
                     try:
                         await self._claim_issues_before_merge(gh, pr)
                         self._guard()
@@ -2217,6 +2659,16 @@ class TaskRunner:
 
     async def _refresh_onto_main(self, token: str, gh: GitHub, main_sha: str) -> None:
         """Durable gates for the exact rebased candidate; no checks/QA/CI hold repo_lock."""
+        self._guard_steward_candidate()
+        identity = self._steward_identity()
+        if identity is not None and identity["action"] == "revert":
+            self._set_evidence({"candidate": None, "steward_candidate": None, "steward_test_gate": None,
+                                "revalidation": None, "fix_round": ""})
+            self.update(stage="prepare")
+            self._steward_question("Steward revert base moved",
+                       "Rebuild the exact culprit inverse against the latest default branch, then rerun all gates; "
+                       "the old revert was not rebased or merged. Answer to approve rebuilding through all gates.",
+                       status="needs_input")
         state = dict((self.task.evidence or {}).get("revalidation") or {})
         if state.get("phase") in (None, "complete", "handled"):
             old_base, old_head = self.task.base_sha, self.task.head_sha
@@ -2227,7 +2679,7 @@ class TaskRunner:
             decision = {"mode": mode, "old_base": old_base, "old_head": old_head, "new_base": main_sha,
                         "candidate_paths": candidate[:20], "main_paths": main[:20],
                         "candidate_paths_count": len(candidate), "main_paths_count": len(main), **overlap,
-                        "run": mode == "always" or (mode != "never" and overlap["overlap"])}
+                        "run": bool(identity) or mode == "always" or (mode != "never" and overlap["overlap"])}
             self.artifact("report", "Revalidation changed paths", json.dumps({"candidate": candidate, "main": main}))
             state = {**decision, "phase": "rebasing"}
             self.evidence("revalidation", state)
@@ -2268,6 +2720,21 @@ class TaskRunner:
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
             try:
                 await checkout(sandbox, self.repo.full_name, token, state["head"], self.task.branch)
+                if identity is not None:
+                    if identity != self._steward_identity():
+                        self._guard_steward_candidate()
+                    patch = await extract_patch(sandbox, state["new_base"])
+                    problem = await self._policy_problem(patch)
+                    if problem:
+                        self._steward_question("Rebased steward candidate violates policy", problem,
+                                   status="needs_input")
+                    self.patch = patch
+                    self._bind_steward_candidate(patch)
+                    previous, self.builder = self.builder, sandbox
+                    try:
+                        await self._steward_test_gate(patch)
+                    finally:
+                        self.builder = previous
                 if state["phase"] == "checks":
                     async with self._check_slot(sandbox, bool(self.cfg.get("setup") or self.cfg.get("checks"))):
                         setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
