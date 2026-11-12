@@ -21,7 +21,7 @@ test("filters map to the API's party and intent values, with 'everyone' and 'all
   assert.equal(PARTY_FILTERS[0].key, "");
   // Every party the API filters by (messages.GROUPS) has a chip, so no sender or receiver is unreachable.
   assert.deepEqual(PARTY_FILTERS.slice(1).map((f) => f.key),
-    ["minds", "lead", "people", "planning", "builders", "verifier", "ci", "judges", "supervisor", "merge_manager", "factory"]);
+    ["minds", "lead", "director", "people", "planning", "builders", "verifier", "ci", "judges", "supervisor", "merge_manager", "factory"]);
   assert.deepEqual(INTENT_FILTERS.map((f) => f.key), ["", "request", "propose", "answer", "inform", "handoff"]);
 });
 

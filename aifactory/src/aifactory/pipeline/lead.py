@@ -21,7 +21,7 @@ import logging
 import math
 import os
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func, or_
 
@@ -77,12 +77,14 @@ class _Budget:
     stops once what is left would no longer cover a typical request.
     """
 
-    def __init__(self, client, run_id: str, ledger: UsageLedger, cap: float, price: tuple[float, float] | None):
+    def __init__(self, client, run_id: str, ledger: UsageLedger, cap: float, price: tuple[float, float] | None,
+                 who: str = "The Lead"):
         self.client, self.run_id, self.ledger, self.cap, self.price = client, run_id, ledger, cap, price
+        self.who = who  # the agent this budget belongs to, as its failures name it
         self.reading: list[float] = []  # MindsHub's latest estimate of the run's cost
         self.attempts = 0  # requests sent, including any that failed before their usage was recorded
         if price is None and cap < UNPRICED_MIN:
-            raise BudgetExceeded(f"The Lead needs at least ${UNPRICED_MIN:.2f} to run a model whose price isn't known")
+            raise BudgetExceeded(f"{who} needs at least ${UNPRICED_MIN:.2f} to run a model whose price isn't known")
 
     def before(self, messages: list[dict[str, Any]]) -> int:
         """The output limit for the next request; BudgetExceeded when what is left can't cover one."""
@@ -92,12 +94,12 @@ class _Budget:
             left = self.cap - self.ledger.cost_usd - (prompt + 64 * len(messages)) * p_in / 1e6
             limit = MAX_OUTPUT if p_out <= 0 else min(MAX_OUTPUT, int(max(0.0, left) * 1e6 / p_out))
             if left <= 0 or limit < MIN_OUTPUT:
-                raise BudgetExceeded(f"The Lead's budget of ${self.cap:.2f} can't cover another request")
+                raise BudgetExceeded(f"{self.who}'s budget of ${self.cap:.2f} can't cover another request")
             limit_out = limit
         else:
             spent = self.reading[0] if self.reading else 0.0
             if self.cap - spent < self.cap * UNPRICED_FLOOR:
-                raise BudgetExceeded(f"The Lead's budget of ${self.cap:.2f} is nearly spent")
+                raise BudgetExceeded(f"{self.who}'s budget of ${self.cap:.2f} is nearly spent")
             limit_out = UNPRICED_OUTPUT
         self.attempts += 1
         return limit_out
@@ -108,10 +110,10 @@ class _Budget:
             return
         spent = await self.client.session_cost(self.run_id)
         if spent is None or not math.isfinite(spent) or spent < 0:
-            raise BudgetExceeded("The Lead's spend couldn't be measured, so it stopped")
+            raise BudgetExceeded(f"{self.who}'s spend couldn't be measured, so it stopped")
         self.reading[:] = [spent]
         if spent >= self.cap:
-            raise BudgetExceeded(f"The Lead's budget of ${self.cap:.2f} is spent")
+            raise BudgetExceeded(f"{self.who}'s budget of ${self.cap:.2f} is spent")
 
 SYSTEM = """You are the Lead for one outcome in the AI Factory: the agent responsible for delivering it end to end.
 The Factory's planner, builders and verifier do the work; the orchestrator schedules it. You make sure it gets
@@ -362,7 +364,9 @@ def _bounded(value: Any) -> str:
     return text if len(text) <= RESULT_CHARS else text[:RESULT_CHARS] + "…"
 
 
-def outcome_record(outcome_id: str) -> dict[str, Any]:
+def outcome_record(outcome_id: str, choose: Callable[[Any, Decision], list[str]] | None = None) -> dict[str, Any]:
+    """The outcome's record for an agent. ``choose(session, decision)`` lists the options the reading agent may pick
+    on each open decision: by default the Lead's delegated set."""
     from .. import serializers as S
 
     with session_scope() as s:
@@ -405,8 +409,8 @@ def outcome_record(outcome_id: str) -> dict[str, Any]:
                        "depends_on": t.depends_on} for t in tasks],
             "open_decisions": [{**S.decision(d), "task_key": keys.get(d.task_id),
                                 "under_judge_review": not S.actionable(d),
-                                "you_may_choose": sorted(o_["value"] for o_ in d.options or []
-                                                          if (d.kind, o_.get("value")) in ACTIONS)}
+                                "you_may_choose": sorted(choose(s, d) if choose else (
+                                    o_["value"] for o_ in d.options or [] if (d.kind, o_.get("value")) in ACTIONS))}
                                for d in decisions],
             "recent_posts": [{"author": names.get(m.author_id or "", "Factory"), "kind": m.author_kind,
                               "task_key": keys.get(m.task_id), "body": m.body, "at": m.created_at.isoformat()}
@@ -769,13 +773,24 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
         {"role": "user", "content": f"You are the Lead for outcome #{number}. You were woken because: "
                                     f"{'; '.join(reasons)}.\n\nThe outcome's record:\n{record_now}"},
     ]
+    return await converse(client, model, ledger, budget, settings, messages, TOOLS, tools.call, turns,
+                          failed=LeadFailed, who="The Lead")
+
+
+async def converse(client, model: str, ledger: UsageLedger, budget: _Budget, settings: dict[str, Any],
+                   messages: list[dict[str, Any]], schema: list[dict], call: Callable[[str, Any], str], turns: int, *,
+                   failed: type[Exception], who: str, on_loop: frozenset[str] = frozenset({"resolve_decision"}),
+                   after_call: Callable[[], Any] | None = None) -> str:
+    """A control-plane agent's tool loop: the model acts through ``call`` until it calls finish (the last tool in
+    ``schema``) or runs out of turns, the last of which only writes the summary. ``on_loop`` tools run on this event
+    loop, the rest in a worker thread; ``after_call`` (a coroutine function) runs after each tool call."""
     nudges = 0
     for turn in range(turns):
         final = turn == turns - 1  # the last allowed call is the summary
         if final:
             messages.append({"role": "user", "content": "You are out of turns. Call finish now with your summary."})
         limit = budget.before(messages)
-        message = await client.chat(model=model, messages=messages, tools=[TOOLS[-1]] if final else TOOLS,
+        message = await client.chat(model=model, messages=messages, tools=[schema[-1]] if final else schema,
                                     tool_choice="required" if final else None, ledger=ledger, max_tokens=limit,
                                     reasoning_effort=settings.get("reasoning_effort"))
         await budget.after()
@@ -789,11 +804,11 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
         if not calls:
             nudges += 1
             if nudges > 3:  # it never acted: fail, so a later run revisits what woke it
-                raise LeadFailed("The Lead replied without using its tools")
+                raise failed(f"{who} replied without using its tools")
             messages.append({"role": "user", "content": "Use the tools to act, then call finish with your summary."})
             continue
-        for call in calls:
-            fn = call.get("function") or {}
+        for tool_call in calls:
+            fn = tool_call.get("function") or {}
             name, raw = fn.get("name", ""), fn.get("arguments") or "{}"
             try:
                 args = json.loads(raw) if isinstance(raw, str) else dict(raw)
@@ -804,6 +819,8 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
                 return (summary if isinstance(summary, str) and summary.strip() else "Finished").strip()[:2000]
             # A resolution runs on this loop, as the operator relay's do: resolve() wakes the orchestrator and can
             # touch this loop's work. Everything else is reading or writing rows: a worker thread keeps the loop free.
-            output = tools.call(name, args) if name == "resolve_decision" else await asyncio.to_thread(tools.call, name, args)
-            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": output})
+            output = call(name, args) if name in on_loop else await asyncio.to_thread(call, name, args)
+            if after_call is not None:
+                await after_call()
+            messages.append({"role": "tool", "tool_call_id": tool_call.get("id", ""), "content": output})
     return "Out of turns"

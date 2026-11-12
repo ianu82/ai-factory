@@ -122,6 +122,16 @@ export interface Settings {
   mind?: { daily_budget_usd: number };
   /** Slack and email aren't available yet and are always off; alerts show in the Inbox. */
   alerts?: { after_minutes: number; slack: boolean; email: boolean };
+  /** The stand-in for people while they're away (pipeline/director.py). Off by default. */
+  director?: DirectorSettings;
+}
+
+export interface DirectorSettings {
+  mode: "off" | "on";
+  run_usd: number;
+  daily_usd: number;
+  max_outcome_usd: number;
+  after_minutes: number;
 }
 
 export interface ModelCheckResult {
@@ -382,6 +392,7 @@ export interface Decision {
   pr_number?: number | null;
   priority?: number;
   lead_note?: { text: string; created_at: string; run_id?: string | null } | null;
+  director_note?: { text: string; created_at: string } | null;
 }
 
 /** An outcome as a conversation (GET …/outcomes/{id}/conversation). */
