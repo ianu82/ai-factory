@@ -1284,7 +1284,9 @@ def test_allowing_more_lets_exactly_one_more_set_of_attempts_run_before_asking_a
     with session_scope() as s:
         second = s.get(Decision, _open_decision(outcome_id, "unblock"))
         assert second.title == "T1: reached its lifetime limit"
-        assert second.options[0] == {"value": "retry", "label": "Allow 1 more attempt"}
+        assert second.options[0] == {"value": "retry", "label": "Allow 1 more attempt",
+                                     "effect": "Lets the task go on with a fresh set of attempts: up to 14 attempts in "
+                                               "all and $45.00 more on its builder and verifier sessions."}
         assert second.metadata_json["lifetime_limit"] == {
             "attempts": 13, "attempts_limit": 13, "usd": 0.0, "usd_limit": 30.0,
             "allow": {"attempts": 14, "usd": 45.0}}
@@ -3623,7 +3625,8 @@ def test_a_provider_hold_is_listed_without_an_outcome_and_can_only_be_resumed(fa
     [item] = r.json()["decisions"]
     assert (item["id"], item["kind"], item["actionable"]) == (hold_id, "provider_hold", True)
     assert (item["outcome_id"], item["task_id"], item["outcome_number"], item["task_key"]) == (None, None, None, None)
-    assert item["options"] == [{"value": "retry", "label": "Resume work"}]
+    assert [(o["value"], o["label"]) for o in item["options"]] == [("retry", "Resume work")]
+    assert item["options"][0]["effect"].startswith("Lets planning and tasks start again")
     assert "planning outcome #3" in item["body"] and "another refusal" not in item["body"]
     # Why the provider refused, and what lifts the hold: on the decision for every screen that shows the hold.
     assert item["hold"] == {"cause": "credit", "label": "the model provider account is out of credit",
