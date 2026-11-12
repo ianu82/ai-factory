@@ -63,7 +63,8 @@ class DirectorFailed(Exception):
 
 
 class SwitchedOff(DirectorFailed):
-    """The workspace turned the Director off (or paused) during the run: it stops before its next change."""
+    """During the run the workspace turned the Director off, paused, or a provider hold opened (every model request
+    would fail the same way): it stops before its next change."""
 
 
 CHANGES = frozenset({"resolve_decision", "triage_signal", "dismiss_alert", "post_guidance", "note_for_people"})
@@ -420,7 +421,8 @@ class Tools:
         if not isinstance(args, dict):
             return "Arguments must be a JSON object."
         if name in CHANGES and not self._still_on():
-            raise SwitchedOff("The Director was switched off during the run")
+            raise SwitchedOff("The Director was switched off, the workspace paused or a provider hold opened "
+                              "during the run")
         if name in PER_RUN:
             if self.used.get(name, 0) >= PER_RUN[name]:
                 return f"You have used {name} {PER_RUN[name]} times this run, the limit. Finish, and say what is left."
@@ -434,10 +436,12 @@ class Tools:
             return f"Invalid arguments for {name}."
 
     def _still_on(self) -> bool:
-        """Read fresh before every change: a person may have turned the Director off or paused the workspace."""
+        """Read fresh before every change: a person may have turned the Director off or paused the workspace, or a
+        provider hold may have opened."""
         with session_scope() as s:
             ws = s.get(Workspace, self.ws)
-            return ws is not None and not ws.paused and settings_for(merged_settings(ws.settings))["mode"] == "on"
+            return (ws is not None and not ws.paused and settings_for(merged_settings(ws.settings))["mode"] == "on"
+                    and self.ws not in held_workspaces(s))
 
     async def after_call(self) -> None:
         """Follow-ups a resolution leaves for after its commit, as the app's own resolve runs them."""

@@ -355,19 +355,23 @@ def test_a_run_decides_what_waits_and_leaves_the_rest_to_people_with_a_note(worl
     assert woken(db.utcnow() + timedelta(minutes=6))[world["ws"]]["new"] == [f"d:{world['fresh']}"]  # now it's ripe
 
 
-def test_switching_it_off_stops_a_run_before_its_next_change(world, model):
+@pytest.mark.parametrize("change", ["off", "hold"])
+def test_switching_it_off_or_a_provider_hold_stops_a_run_before_its_next_change(world, model, change):
     def script(messages):
         if step(messages) == 0:
-            with db.session_scope() as s:  # a person switches it off while the model is thinking
-                w = s.get(Workspace, world["ws"])
-                w.settings = {**w.settings, "director": {**ON, "mode": "off"}}
+            if change == "hold":  # another task's model request was refused while the Director was thinking
+                open_provider_hold(world["ws"], "402 Payment Required", "a test")
+            else:
+                with db.session_scope() as s:  # a person switches it off while the model is thinking
+                    w = s.get(Workspace, world["ws"])
+                    w.settings = {**w.settings, "director": {**ON, "mode": "off"}}
             return {"content": "", "tool_calls": [
                 call("resolve_decision", {"decision_id": world["merge"], "option": "approve", "comment": "Green."})]}
         return {"content": "", "tool_calls": [call("finish", {"summary": "Done."})]}
 
     model.scripts = {"director": script}
     result = asyncio.run(director.run_director(woken()[world["ws"]]))
-    assert result["status"] == "stopped" and "switched off" in result["reason"]
+    assert result["status"] == "stopped" and "during the run" in result["reason"]
     with db.session_scope() as s:
         assert s.get(Decision, world["merge"]).status == "open"  # decisions wait for a person again
 
