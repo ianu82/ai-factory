@@ -451,6 +451,9 @@ def test_what_it_left_to_people_it_decides_itself_once_no_one_has_answered_in_ti
     tools = director.Tools(world["ws"], "r", ON, set(due["new"]), set(due["overdue"]))
     page = json.loads(tools._inbox())
     assert page["items"][0]["decision_id"] == world["stuck"] and page["items"][0]["decide_now"] is True
+    # What it recommended when it left the item to people, so it can follow it now.
+    assert page["items"][0]["your_note"].startswith("Retry T2 with a smaller index")
+    assert json.loads(tools._inbox_item("decision", world["stuck"]))["your_note"].startswith("Retry T2")
     assert page["decide_now_not_yet_handled"] == 1 and page["limits"]["decide_after_hours"] == 4
     assert not any(row.get("decide_now") for row in page["items"][1:])
 
@@ -468,12 +471,18 @@ def test_what_it_left_to_people_it_decides_itself_once_no_one_has_answered_in_ti
     assert woken(later + timedelta(minutes=5))[world["ws"]]["new"] == [stuck]
 
 
-def test_a_decision_it_noted_raises_no_waiting_alert_while_it_is_on(world):
+def test_a_decision_it_noted_raises_no_waiting_alert_until_its_turn_to_decide_has_passed(world):
     from aifactory.pipeline import watch
+    from aifactory.pipeline.runtime import merged_settings
 
     def overdue():
         with db.session_scope() as s:
             return [a.status for a in s.query(Alert).filter_by(key=f"overdue:{world['merge']}").order_by(Alert.id)]
+
+    def raised():
+        with db.session_scope() as s:
+            settings = merged_settings(s.get(Workspace, world["ws"]).settings)
+            return f"overdue:{world['merge']}" in watch.find(s, world["ws"], settings, db.utcnow())
 
     with db.session_scope() as s:
         s.get(Decision, world["merge"]).created_at = db.utcnow() - timedelta(hours=6)
@@ -486,8 +495,14 @@ def test_a_decision_it_noted_raises_no_waiting_alert_while_it_is_on(world):
                           "text": "Only a rebase since a person approved; approve once CI is green."}))
     watch.run()
     assert overdue() == ["cleared"]
-    with db.session_scope() as s:  # it had its turn and the decision still waits: only a person can answer it
-        aged = db.utcnow() - timedelta(hours=5, minutes=1)  # past decide_after_hours and its turn
+    # It had its turn to decide it and noted it again: only a person can answer it now.
+    past_run(world, seen={"marks": {}, "skips": {}, "final": {f"d:{world['merge']}": "its mark"}})
+    assert raised()
+    with db.session_scope() as s:
+        s.query(Event).filter(Event.kind.like("director_run%")).delete(synchronize_session=False)
+    assert not raised()
+    with db.session_scope() as s:  # its turn never came (the workspace was held, say), and the time has passed
+        aged = db.utcnow() - timedelta(hours=5, minutes=1)  # past decide_after_hours and its run
         s.query(Event).filter_by(kind="director_note").update({"created_at": aged})
     watch.run()
     assert sorted(overdue()) == ["cleared", "open"]

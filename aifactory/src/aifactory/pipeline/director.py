@@ -233,6 +233,24 @@ def _overdue(db, workspace_id: str, now: datetime, cfg: dict[str, Any], marks: d
     return sorted(waiting)
 
 
+def _my_notes(db, workspace_id: str, keys: set[str]) -> dict[str, str]:
+    """The Director's latest note on each item (key d:/a:/s: + id): what it found and recommended when it left the
+    item to people, for its turn to decide the item itself."""
+    notes: dict[str, str] = {}
+    if not keys:
+        return notes
+    for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == "director_note") \
+            .order_by(Event.id.desc()).limit(2000):
+        data = e.data or {}
+        for field, prefix in (("decision_id", "d"), ("alert_id", "a"), ("signal_id", "s")):
+            key = f"{prefix}:{data.get(field)}"
+            if key in keys and key not in notes:
+                notes[key] = str(data.get("text") or e.message or "")
+        if len(notes) == len(keys):
+            break
+    return notes
+
+
 def _history(db, workspace_id: str, now: datetime) -> list[dict[str, Any]]:
     """The Director's runs in the last day, newest first: when each started, what it reserved, and how it ended
     (None while running, or when a restart cut it off)."""
@@ -379,6 +397,7 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
         task_ids = {d.task_id for d in decisions if d.task_id} | {a.task_id for a in alerts if a.task_id}
         tasks = {t.id: t for t in s.query(Task).filter(Task.id.in_(task_ids))} if task_ids else {}
         notes = notes_for(s, decisions)
+        mine = _my_notes(s, workspace_id, set(overdue))  # what it recommended, for what it decides now
         signals = s.query(Signal).filter(Signal.workspace_id == workspace_id, Signal.status.in_(("new", "proposed")),
                                          Signal.source.in_(TRIAGE_SOURCES)).all()
 
@@ -397,7 +416,8 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
             o = outcomes.get(outcome_id or "")
             group = 3 if key in handled else 2 if key in shown else 0 if key in new or key in overdue else 1
             rows.append(((group, o.priority if o else 2, at or now), key,
-                         {"new": key in new, **({"decide_now": True} if key in overdue else {}), **row}))
+                         {"new": key in new, **({"decide_now": True} if key in overdue else {}),
+                          **({"your_note": _short(mine[key], 600)} if key in mine else {}), **row}))
 
         for d in decisions:
             allowed, why = choices(s, d, cfg)
@@ -457,8 +477,10 @@ def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: s
 
 
 def inbox_item(workspace_id: str, cfg: dict[str, Any], kind: str, item_id: str) -> dict[str, Any] | None:
-    """One inbox item in full: a decision's whole question and the Lead's note, an alert's or a signal's whole text."""
+    """One inbox item in full: a decision's whole question and the Lead's note, an alert's or a signal's whole text,
+    and the Director's own latest note on it."""
     with session_scope() as s:
+        mine = _my_notes(s, workspace_id, {f"{kind[0]}:{item_id}"}).get(f"{kind[0]}:{item_id}")
         if kind == "decision":
             d = s.query(Decision).filter(Decision.id == item_id, Decision.workspace_id == workspace_id).first()
             if d is None:
@@ -466,15 +488,16 @@ def inbox_item(workspace_id: str, cfg: dict[str, Any], kind: str, item_id: str) 
             allowed, why = choices(s, d, cfg)
             return {"decision_id": d.id, "status": d.status, "kind": d.kind, "title": d.title, "body": d.body,
                     "options": d.options, "metadata": d.metadata_json, "you_may_choose": allowed,
-                    "left_to_people": why or None, "lead_note": (notes_for(s, [d]).get(d.id) or {}).get("text")}
+                    "left_to_people": why or None, "lead_note": (notes_for(s, [d]).get(d.id) or {}).get("text"),
+                    "your_note": mine}
         if kind == "alert":
             a = s.query(Alert).filter(Alert.id == item_id, Alert.workspace_id == workspace_id).first()
             return {"alert_id": a.id, "status": a.status, "kind": a.kind, "title": a.title, "body": a.body,
-                    "data": a.data, "decision_id": a.decision_id} if a else None
+                    "data": a.data, "decision_id": a.decision_id, "your_note": mine} if a else None
         if kind == "signal":
             sig = s.query(Signal).filter(Signal.id == item_id, Signal.workspace_id == workspace_id).first()
             return {"signal_id": sig.id, "status": sig.status, "source": sig.source, "title": sig.title,
-                    "body": sig.body, "url": sig.url, "times_seen": sig.count} if sig else None
+                    "body": sig.body, "url": sig.url, "times_seen": sig.count, "your_note": mine} if sig else None
     return None
 
 
@@ -858,7 +881,7 @@ call it again once you have decided or noted what it showed.
   needs such a note, or it comes back on your next run.
 - Items marked decide_now were left for a person, by your note or passed over, and no one has answered in
   limits.decide_after_hours: the people are away, and delivery must keep going. Decide each one now. Choose what
-  your note recommended; without one, the choice a careful lead would make to keep delivery moving safely (answer a
+  your note recommended (your_note); without one, the choice a careful lead would make to keep delivery moving safely (answer a
   question with the conservative option that fits the brief; retry blocked work with a new approach, or drop work
   that a person cancelled or that is no longer needed). For an alert, act on its cause where you can, then dismiss it
   saying what you found. Never pick an option only because the one you would choose is outside you_may_choose: note

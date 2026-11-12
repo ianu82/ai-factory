@@ -3,8 +3,8 @@
 Every WATCH_EVERY the orchestrator calls run(), which looks in each workspace that isn't paused for:
 - overdue: a decision that has waited on a person longer than the workspace's alert time (alerts.after_minutes).
   Not while the Director has a note on it and will still decide it itself (decide_after_hours, plus DIRECTOR_TURN for
-  its run): the note on the decision says why it waits. If the decision still waits after that, only a person can
-  answer it, and it alerts;
+  its run): the note on the decision says why it waits. Once it has had that turn (its ``final``) or the time has
+  passed and the decision still waits, only a person can answer it, and it alerts;
 - unasked: a task waiting on a person with no open decision, so there is nothing anyone can answer;
 - stalled: an outcome where nothing is moving and nothing asks a person (its open tasks wait on dropped ones);
 - quiet: an outcome with work marked active but no activity for QUIET, while the workspace runs nothing at all
@@ -96,14 +96,16 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
                                                          Outcome.status.in_(ACTIVE_OUTCOME))}
     decisions = s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "open").all()
     tasks = s.query(Task).filter(Task.outcome_id.in_(list(outcomes))).all() if outcomes else []
-    from .director import latest_notes, settings_for as director_settings
+    from .director import last_seen, latest_notes, settings_for as director_settings
 
     director = director_settings(settings)
     noted: set[str] = set()
     if director["mode"] == "on" and director["decide_after_hours"]:
         waits = timedelta(hours=director["decide_after_hours"]) + DIRECTOR_TURN
+        final = last_seen(s, workspace_id).get("final")
+        had_turn = set(final) if isinstance(final, dict) else set()
         noted = {decision_id for decision_id, note in latest_notes(s, decisions).items()
-                 if note.created_at and now - note.created_at < waits}
+                 if f"d:{decision_id}" not in had_turn and note.created_at and now - note.created_at < waits}
     keys = {t.id: t.key for t in tasks}
     found: dict[str, dict[str, Any]] = {}
 
