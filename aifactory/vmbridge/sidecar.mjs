@@ -5,6 +5,17 @@ import readline from 'node:readline';
 import {randomUUID} from 'node:crypto';
 import {DEFAULT_RAILWAY_GRAPHQL_ENDPOINT, ExecNotStartedError, Sandbox} from 'railway';
 import WebSocket from 'ws';
+import {previewCapabilities, createPreview, PrivateTunnel} from './preview.mjs';
+
+// Separate ownership from verifier boxes: a verifier/checkpoint id can never be
+// promoted to a preview. Currently empty because this provider cannot deny egress.
+const previews = new Map();
+const tunnels = new Map();
+function preview(id) {
+  const sandbox = previews.get(id);
+  if (!sandbox) throw new Error('Preview VM missing or isolation unproven; rebuild required');
+  return sandbox;
+}
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 // The railway SDK retries a connection that failed before the command started once (connectWithRetry), so a
@@ -57,6 +68,53 @@ function template(spec) {
 }
 
 const ops = {
+  async previewCapabilities() { return previewCapabilities(); },
+  async previewCreate() { return createPreview(); },
+  async previewReconnect(a) {
+    const sandbox = preview(a.id);
+    await sandbox.refresh();
+    if (sandbox.status !== 'RUNNING') throw new Error('Preview VM no longer running; rebuild required');
+    return {id: sandbox.id};
+  },
+  async previewOpen(a) {
+    if (tunnels.size >= 32) throw new Error('Preview transport capacity reached');
+    const sandbox = preview(a.id);
+    const token = randomUUID();
+    tunnels.set(token, {id: a.id, tunnel: new PrivateTunnel(sandbox, a.port)});
+    return {tunnel: token};
+  },
+  async previewWrite(a) {
+    const entry = tunnels.get(a.tunnel);
+    if (!entry || entry.id !== a.id) throw new Error('Preview tunnel missing; never replay a request');
+    await entry.tunnel.write(a.base64);
+    return {};
+  },
+  async previewRead(a) {
+    const entry = tunnels.get(a.tunnel);
+    if (!entry || entry.id !== a.id) throw new Error('Preview tunnel missing; never replay a request');
+    return entry.tunnel.read();
+  },
+  async previewClose(a) {
+    const entry = tunnels.get(a.tunnel);
+    if (entry && entry.id === a.id) {
+      tunnels.delete(a.tunnel);
+      await entry.tunnel.close();
+    }
+    return {};
+  },
+  async previewDestroy(a) {
+    const sandbox = preview(a.id);
+    for (const [token, entry] of tunnels) {
+      if (entry.id === a.id) {
+        tunnels.delete(token);
+        await entry.tunnel.close().catch(() => {});
+      }
+    }
+    await sandbox.destroy();
+    previews.delete(a.id);
+    boxes.delete(a.id);
+    return {destroyed: true};
+  },
   async ping() { return {ok: true, configured: Boolean(client.token && client.environmentId)}; },
   async sandboxes() {
     const items = [];
