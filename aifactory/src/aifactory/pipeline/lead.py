@@ -1,9 +1,11 @@
 """The Lead: one agent responsible for one outcome, from acceptance to delivery.
 
-Whatever needs judgement on its outcome wakes it: a decision waiting on someone, or a person posting on the
-outcome. It reads the outcome's record (plan, tasks, attempts and evidence, runs, events, guidance) and acts
-within the set delegated operators have: answer an agent's question, retry or acknowledge a blocked task, request
-changes on a pull request, and post guidance to the outcome's agents. Everything else stays with people:
+Whatever needs judgement on its outcome wakes it: a decision waiting on someone, a person posting on the outcome,
+work the watch found stuck, or the outcome ending. Progress alone does not: it is told as a digest that needs no
+model (``_post_digest``). It reads the outcome's record (plan, tasks, attempts and evidence, runs, events,
+guidance) and acts within the set delegated operators have: answer an agent's question, retry or acknowledge a
+blocked task, request changes on a pull request, and post guidance to the outcome's agents. Everything else stays
+with people:
 approving a plan, a merge or a release, budgets, cancelling, abandoning and taking over. For those, the Lead
 leaves a note saying what it found and what it recommends.
 
@@ -46,11 +48,13 @@ COOLDOWN = timedelta(seconds=60)  # its own actions can open the next decision: 
 RETRY_AFTER = timedelta(minutes=15)  # after a failed run (model unavailable, budget, timeout), before trying again
 STALE = timedelta(minutes=30)  # a run still marked running after this was cut off by a restart
 DAILY_RUNS = 24
-# Progress the Lead tells people about in the outcome's conversation, at most every NARRATE_EVERY when nothing
-# else needs it: a finished run's update covers everything since its last one.
+# Progress people are told about in the outcome's conversation. When something else wakes the Lead, its update
+# covers the progress since the last one. Progress alone wakes nobody: at most every DIGEST_EVERY it is posted as a
+# digest, written from these events without a model.
 MILESTONES = ("plan_approved", "published", "verification_failed", "ci_failed", "merged", "task_completed",
               "smoke_failed", "revert_opened", "released", "outcome_completed", "work_overlap")
-NARRATE_EVERY = timedelta(minutes=10)
+DIGEST_EVERY = timedelta(minutes=30)
+DIGEST_LINES = 12
 JUST_FINISHED = timedelta(hours=1)  # a finished outcome's Lead still reports how it ended
 FIRST_LOOK = timedelta(days=1)  # posts older than this predate the Lead: its first run reads them, not wakes for them
 MAX_MINUTES = 15
@@ -145,8 +149,8 @@ You were woken because something on your outcome needs judgement. Read the outco
   moves, or no activity for a long time), find out why from the record. If a decision lets you unstick it, do;
   otherwise leave a note for people: what is stuck, the likely cause and what a person should do. If it stays
   stuck, people also get an alert in the app.
-- Keep the outcome's conversation current. When you first join an outcome, when progress woke you, and when the
-  outcome has ended, post one short
+- Keep the outcome's conversation current. When you first join an outcome, when you were woken with progress to
+  report, and when the outcome has ended, post one short
   update with post_update: what happened since your last update and what it means, then what happens next. People
   see each agent step under your update, so don't list them; say what they add up to. Two to four sentences.
 Finish with a short summary of what you did and what is still waiting, then call finish.
@@ -243,6 +247,7 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
     coordination.maybe_sync()  # new overlaps between outcomes become milestones that wake both Leads
     now = now or utcnow()
     woken: list[dict[str, Any]] = []
+    digests: list[tuple[str, str, list[int]]] = []
     with session_scope() as s:
         paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
         # Cancelled outcomes have no completed_at: when they ended is their last update.
@@ -262,23 +267,28 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 continue
             runs = s.query(Run).filter(Run.outcome_id == o.id, Run.role == "lead")
             last = runs.order_by(Run.started_at.desc()).first()
+            may_run = True
             if last is not None:
                 if last.status == "running" and now - last.started_at < STALE:
                     continue
-                if now - last.started_at < (COOLDOWN if last.status == "succeeded" else RETRY_AFTER):
-                    continue
-                if runs.filter(Run.started_at > now - timedelta(days=1)).count() >= DAILY_RUNS:
-                    continue
+                # Between runs, after a failed one, and once the day's runs are used, the Lead waits.
+                may_run = not (now - last.started_at < (COOLDOWN if last.status == "succeeded" else RETRY_AFTER)
+                               or runs.filter(Run.started_at > now - timedelta(days=1)).count() >= DAILY_RUNS)
             # Only a run that finished has seen what it was woken for: a failed one leaves it waiting.
             done = runs.filter(Run.status == "succeeded").order_by(Run.started_at.desc()).first()
             seen = ((done.config_snapshot or {}).get("seen") if done else None) or {}
             finished = o.status in FINISHED  # only how it ended is left to report
+            progress, digested = ([], None) if finished else _progress(s, o.id, seen.get("event_id"), now)
+            if not may_run:
+                # A digest starts no run, so the Lead's own limits do not keep progress from being told.
+                if progress and (digested is None or now - digested >= DIGEST_EVERY):
+                    digests.append((o.workspace_id, o.id, progress))
+                continue
             marks = {} if finished else _marks(s, o.id)
             known = seen.get("decisions") or {}
             changed = [d for d, mark in marks.items() if known.get(d) != mark]
             since = _parse(seen.get("posts_until")) if done is not None else now - FIRST_LOOK
             posts = [] if finished else _people_posts(s, o.id, since)
-            progress = [] if finished else _progress(s, o.id, seen.get("event_id"), now)
             # Durable markers, so a run that didn't post the update is retried: an introduction until the Lead has
             # posted one on this outcome, and the ending until a run that succeeded started after it.
             introduced = s.query(Message.id).filter(Message.outcome_id == o.id, Message.author_kind == "lead").first()
@@ -295,8 +305,11 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             stuck = [] if finished else [e.message for e in s.query(Event).filter(
                 Event.outcome_id == o.id, Event.kind == "lead_watch",
                 Event.created_at > (done.started_at if done is not None else now - FIRST_LOOK))]
-            if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
-                progress = []  # batch progress into one update
+            if progress and not (changed or posts or joined or ending or stuck):
+                # Nothing here needs judgement, so the Lead is not run for it: the steps are told as a digest.
+                if digested is None or now - digested >= DIGEST_EVERY:
+                    digests.append((o.workspace_id, o.id, progress))
+                progress = []
             reasons = []
             if changed:
                 reasons.append(f"{len(changed)} decision{'s' if len(changed) != 1 else ''} waiting on someone")
@@ -325,6 +338,11 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                                                          # Progress, joining and ending each need a posted update.
                                                          "update_due": bool(progress or joined or ending),
                                                          "closing": ending}})
+    for workspace_id, outcome_id, ids in digests:  # after the read above has ended: each is its own short write
+        try:
+            _post_digest(workspace_id, outcome_id, ids)
+        except Exception:
+            log.exception("Could not post the progress digest for outcome %s", outcome_id)
     return woken
 
 
@@ -342,11 +360,39 @@ def continued_past_budget(db, outcome_id: str) -> bool:
     return bool(granted) and within_ceiling(db, granted[0])
 
 
-def _progress(db, outcome_id: str, after: Any, now: datetime) -> list[int]:
-    """Milestone events the Lead hasn't reported yet: after its last finished run's mark, or from the last day."""
+def _progress(db, outcome_id: str, after: Any, now: datetime) -> tuple[list[int], datetime | None]:
+    """Milestone events nobody has been told about yet, and when the last digest was posted: those after the mark
+    of the Lead's last finished run and of the last digest, or from the last day."""
+    digest = db.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "progress_digest").order_by(
+        Event.id.desc()).first()
+    marks = [m for m in (after, (digest.data or {}).get("event_id") if digest else None) if isinstance(m, int)]
     query = db.query(Event.id).filter(Event.outcome_id == outcome_id, Event.kind.in_(MILESTONES))
-    query = query.filter(Event.id > after) if isinstance(after, int) else query.filter(Event.created_at > now - FIRST_LOOK)
-    return [row.id for row in query.order_by(Event.id)]
+    query = query.filter(Event.id > max(marks)) if marks else query.filter(Event.created_at > now - FIRST_LOOK)
+    return [row.id for row in query.order_by(Event.id)], digest.created_at if digest else None
+
+
+def _post_digest(workspace_id: str, outcome_id: str, ids: list[int]) -> None:
+    """Progress that needs no judgement, told without a model: the milestones since the last update as one message
+    from the Factory in the outcome's conversation. Its event carries the mark the next digest starts after."""
+    with session_scope() as s:
+        events = s.query(Event).filter(Event.id.in_(ids)).order_by(Event.id).all()
+        if not events:
+            return
+        keys = dict(s.query(Task.id, Task.key).filter(Task.id.in_({e.task_id for e in events if e.task_id})))
+        lines = []
+        for e in events[-DIGEST_LINES:]:
+            text = " ".join((e.message or e.kind).split())[:240]
+            key = keys.get(e.task_id)
+            lines.append(f"- {key}: {text}" if key and not text.startswith(key) else f"- {text}")
+        earlier = len(events) - len(lines)
+        body = "Progress since the last update:\n" + (
+            f"- {earlier} earlier step{'s' if earlier != 1 else ''}\n" if earlier else "") + "\n".join(lines)
+        data = {"source": "factory", "kind": "digest", "event_id": events[-1].id, "steps": len(events)}
+        s.add(Message(workspace_id=workspace_id, outcome_id=outcome_id, author_kind="factory", body=body,
+                      attribution=data))
+        record(workspace_id, "progress_digest", f"Progress: {len(events)} step{'s' if len(events) != 1 else ''} "
+               "since the last update", outcome_id=outcome_id, data=data, session=s)
+    notify(workspace_id, "outcome", outcome_id)
 
 
 def _parse(value: Any) -> datetime | None:
