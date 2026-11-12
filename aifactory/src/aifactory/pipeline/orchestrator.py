@@ -112,6 +112,8 @@ class Orchestrator:
         self._lead_check = float("-inf")
         self._directors: dict[str, asyncio.Task] = {}  # workspace id -> its Director's run
         self._director_check = float("-inf")
+        self._hold_probes: dict[str, asyncio.Task] = {}  # workspace id -> the test of its provider hold in flight
+        self._hold_check = float("-inf")
         self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
         self._unasked: dict[str, float] = {}  # task id -> when it was first seen waiting on a person with no decision
 
@@ -149,6 +151,9 @@ class Orchestrator:
         for job in list(self._leads.values()) + list(self._directors.values()):
             job.cancel()
         await asyncio.gather(*list(self._leads.values()), *list(self._directors.values()), return_exceptions=True)
+        for job in list(self._hold_probes.values()):
+            job.cancel()
+        await asyncio.gather(*list(self._hold_probes.values()), return_exceptions=True)
         if self._loop_task:
             self._loop_task.cancel()
         await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
@@ -356,6 +361,7 @@ class Orchestrator:
                 await self._maybe_watch()
                 await self._maybe_run_leads()
                 await self._maybe_run_directors()
+                await self._maybe_probe_holds()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -643,6 +649,32 @@ class Orchestrator:
                 self._directors.pop(workspace_id, None)
                 if not finished.cancelled() and finished.exception() is not None:
                     log.error("Director of %s failed: %r", workspace_id, finished.exception())
+                self.wake()
+
+            job.add_done_callback(done)
+
+    async def _maybe_probe_holds(self) -> None:
+        """Test the provider of each workspace on a provider hold every ``holds.test_minutes``, and lift the hold once
+        every model answers (pipeline/holds.py). It runs beside the scheduler, never inside its tick, one test at a
+        time per workspace. When each was last tested is kept in memory (holds.PROBED): after a restart it is simply
+        tested again."""
+        from .holds import PROBED, due_probes, probe_provider
+
+        now = time.monotonic()
+        if self._stopping or now - self._hold_check < 10:
+            return
+        self._hold_check = now
+        for item in await asyncio.to_thread(due_probes, dict(PROBED), frozenset(self._hold_probes)):
+            workspace_id = item["workspace_id"]
+            PROBED[workspace_id] = utcnow()
+            job = asyncio.create_task(probe_provider(workspace_id, item["decision_id"]),
+                                      name=f"hold-test-{workspace_id[:8]}")
+            self._hold_probes[workspace_id] = job
+
+            def done(finished: asyncio.Task, workspace_id: str = workspace_id) -> None:
+                self._hold_probes.pop(workspace_id, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    log.error("provider hold test of %s failed: %r", workspace_id, finished.exception())
                 self.wake()
 
             job.add_done_callback(done)

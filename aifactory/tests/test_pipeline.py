@@ -3271,7 +3271,8 @@ def test_a_provider_hold_is_listed_without_an_outcome_and_can_only_be_resumed(fa
     # Why the provider refused, and what lifts the hold: on the decision for every screen that shows the hold.
     assert item["hold"] == {"cause": "credit", "label": "the model provider account is out of credit",
                             "advice": "Add credit to the model provider account, then resume work.",
-                            "source": "planning outcome #3", "error": "Error code: 402 - Payment Required"}
+                            "source": "planning outcome #3", "error": "Error code: 402 - Payment Required",
+                            "tests_every_minutes": 5, "last_tested_at": None}  # not tested yet
     assert "Cause: the model provider account is out of credit." in item["body"]
     assert "What to do: Add credit to the model provider account" in item["body"]
     for refused in ("dismiss", "abandon"):

@@ -214,23 +214,42 @@ def _director_settings(value: Any) -> dict[str, Any]:
 
 
 def _alert_settings(value: Any) -> dict[str, Any]:
-    """Alerts: how long a decision may wait before it alerts, and the outside channels. Slack and email aren't
-    available yet, so they can only be off: alerts show in the app's Inbox."""
+    """Alerts: how long a decision may wait before it alerts, how long nothing may run while work waits, and the
+    outside channels. Slack and email aren't available yet, so they can only be off: alerts show in the app's Inbox.
+    The webhook (alerts.webhook_url) is a secret kept apart (update_workspace), shown as the workspace's
+    ``alert_webhook``."""
     default = DEFAULT_SETTINGS["alerts"]
     if value is None:
         return dict(default)
     if not isinstance(value, dict) or set(value) - set(default):
-        raise HTTPException(422, "alerts accepts only after_minutes, slack and email")
+        raise HTTPException(422, "alerts accepts only after_minutes, stopped_minutes, webhook_url, slack and email")
     after = value.get("after_minutes", default["after_minutes"])
     if type(after) is not int or not 15 <= after <= 1440:
         raise HTTPException(422, "alerts.after_minutes must be a whole number from 15 to 1440")
+    stopped = value.get("stopped_minutes", default["stopped_minutes"])
+    if type(stopped) is not int or not 5 <= stopped <= 240:
+        raise HTTPException(422, "alerts.stopped_minutes must be a whole number from 5 to 240")
     for channel, name in (("slack", "Slack"), ("email", "Email")):
         on = value.get(channel, False)
         if type(on) is not bool:
             raise HTTPException(422, f"alerts.{channel} must be true or false")
         if on:
             raise HTTPException(422, f"{name} alerts aren't available yet: alerts show in the Inbox")
-    return {"after_minutes": after, "slack": False, "email": False}
+    return {"after_minutes": after, "slack": False, "email": False,
+            "stopped_minutes": stopped}
+
+
+def _hold_settings(value: Any) -> dict[str, Any]:
+    """Provider holds: how often the Factory tests the provider while one is open (0: never)."""
+    default = DEFAULT_SETTINGS["holds"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "holds accepts only test_minutes")
+    minutes = value.get("test_minutes", default["test_minutes"])
+    if type(minutes) is not int or not 0 <= minutes <= 60:
+        raise HTTPException(422, "holds.test_minutes must be a whole number from 0 to 60")
+    return {"test_minutes": minutes}
 
 
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
@@ -247,6 +266,7 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
     alerts = _alert_settings(raw.get("alerts"))
     director = _director_settings(raw.get("director"))
+    holds = _hold_settings(raw.get("holds"))
     merged = merged_settings({**raw, "lead": lead, "alerts": alerts, "director": director})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
@@ -256,6 +276,7 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     merged["lead"] = lead
     merged["alerts"] = alerts
     merged["director"] = director
+    merged["holds"] = holds
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     cap = merged["limits"].get("open_outcomes")
@@ -299,6 +320,18 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
         if onboarding_policy.KEY in patch:
             raise HTTPException(422, "Learning lifecycle is managed by the onboarding policy endpoint")
         before = merged_settings(ws.settings)
+        webhook = None
+        if isinstance(patch.get("alerts"), dict):
+            # Alerts are patched key by key. The webhook URL is a secret: kept encrypted, never in the settings.
+            alerts = {k: v for k, v in patch["alerts"].items() if k != "webhook_url"}
+            if "webhook_url" in patch["alerts"]:
+                from . import alert_webhook
+
+                try:
+                    webhook = alert_webhook.save(db, workspace_id, patch["alerts"]["webhook_url"], user.id)
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from None
+            patch = {**patch, "alerts": {**before["alerts"], **alerts}}
         updated = {**before, **patch}
         if "review" in patch:
             try:
@@ -314,6 +347,8 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
             updated = onboarding_policy.patch_autonomy({**updated, "autonomy": before["autonomy"]}, autonomy)
         ws.settings = _clean_settings(updated)
         changes = {k: ws.settings[k] for k in patch if before.get(k) != ws.settings.get(k)}
+        if webhook is not None:
+            changes["alert_webhook"] = webhook
     if body.paused is not None:
         ws.paused = body.paused
         changes["paused"] = body.paused
@@ -511,7 +546,7 @@ async def test_credential(workspace_id: str, kind: str,
                                                         pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"),
                           user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    if kind.startswith("preview_"):
+    if kind.startswith("preview_") or kind == "alert_webhook":
         raise HTTPException(404, "Unknown credential")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec is None:

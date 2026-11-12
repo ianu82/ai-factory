@@ -21,10 +21,19 @@ def user(u: User) -> dict[str, Any]:
 
 
 def workspace(w: Workspace, role: str | None = None, org_name: str = "") -> dict[str, Any]:
+    from sqlalchemy.orm import object_session
+
     from .pipeline.runtime import merged_settings
 
+    db = object_session(w)
+    webhook = {"set": False, "host": ""}
+    if db is not None:  # the alert webhook is a secret, kept apart from the settings: whether it is set, its host
+        from .alert_webhook import view
+
+        webhook = view(db, w.id)
     return {"id": w.id, "name": w.name, "slug": w.slug, "description": w.description, "org_id": w.org_id,
             "org_name": org_name, "role": role, "paused": w.paused, "settings": merged_settings(w.settings),
+            "alert_webhook": webhook,
             "mindshub_workspace_id": w.mindshub_workspace_id, "created_at": ts(w.created_at)}
 
 
@@ -174,9 +183,14 @@ def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, An
         person = db.get(User, d.resolved_by) if db and d.resolved_by else None
         context["resolved_by_name"] = ((person.name or person.email) if person else "Person") + " via Mind"
     if d.kind == "provider_hold":
-        from .pipeline.holds import hold_details
+        from .pipeline.holds import hold_details, probe_status
 
         context["hold"] = hold_details(d)  # why the provider refused, and what lifts the hold
+        if d.status == "open" and db is not None:  # and how often the Factory tests the provider meanwhile
+            from .pipeline.runtime import merged_settings
+
+            ws = db.get(Workspace, d.workspace_id)
+            context["hold"].update(probe_status(d.workspace_id, merged_settings(ws.settings if ws else {})))
     return {"attribution": attribution, "actionable": actionable(d), "correction": correction,
             "supersedes": attribution.get("supersedes"), "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,

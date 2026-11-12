@@ -1,20 +1,31 @@
 """The provider hold: when the model provider refuses a workspace (billing, quota or its credential), every task and
 plan of that workspace would fail the same way. One open ``provider_hold`` decision, with no outcome and no task, is
 the hold: the scheduler starts nothing in the workspace while it is open, and resolving it lets work start again.
-The hold keeps why the provider refused (hold_details), and every screen that shows the hold names it."""
+The hold keeps why the provider refused (hold_details), and every screen that shows the hold names it.
+
+While a hold is open the orchestrator tests the provider every ``holds.test_minutes`` (probe_provider): when every
+model the workspace works with answers, the Factory lifts the hold itself, as a person's Resume work would. A refusal
+for billing, quota or the credential leaves it for a person."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..db import session_scope
-from ..failures import _PAYMENT_REQUIRED, quota_exhausted, rate_limited
-from ..models import Decision
+from ..db import SessionLocal, session_scope, utcnow
+from ..events import record
+from ..failures import _PAYMENT_REQUIRED, failure_cause, quota_exhausted, rate_limited
+from ..inference import ModelClient, resolve_provider, workspace_models
+from ..models import Decision, Event, User, Workspace
 from ..onboarding_policy import lock_workspace
-from .runtime import publish_decision
+from .runtime import DEFAULT_SETTINGS, merged_settings, publish_decision, workspace_settings
+
+log = logging.getLogger(__name__)
 
 PROVIDER_HOLD = "provider_hold"
 TITLE = "Model provider refused: work is on hold"
@@ -43,6 +54,12 @@ _SERVER = re.compile(r"(?:\b(?:returned|error(?: code)?|status(?: code)?|http)\W
 # The text of a hold opened before its cause was kept: what was refused, then the provider's words.
 _BODY = re.compile(r"^The model provider refused a request \((?P<source>.*?)\):\n\n(?P<error>.*?)"
                    r"\n\n(?:Cause: |Nothing new)", re.DOTALL)
+FACTORY_EMAIL = "factory@factory.local"
+TEST_AFTER = timedelta(minutes=2)  # a hold is first tested this long after it opened
+TEST_TIMEOUT = 30.0
+TEST_TOKENS = 16
+# When each workspace's hold was last tested, in memory: after a restart it is simply tested again.
+PROBED: dict[str, datetime] = {}
 
 
 def hold_cause(error: str) -> str:
@@ -108,3 +125,125 @@ def held_workspaces(session: Session) -> set[str]:
     """The workspaces with an open provider hold."""
     return {workspace_id for (workspace_id,) in session.query(Decision.workspace_id).filter(
         Decision.kind == PROVIDER_HOLD, Decision.status == "open")}
+
+
+def every_minutes(settings: dict[str, Any]) -> int:
+    """How often a held workspace's provider is tested, in minutes; 0: never."""
+    raw = settings.get("holds") if isinstance(settings.get("holds"), dict) else {}
+    value = raw.get("test_minutes")
+    return value if type(value) is int and 0 <= value <= 60 else DEFAULT_SETTINGS["holds"]["test_minutes"]
+
+
+def probe_status(workspace_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+    """For the screens that show a hold: how often the Factory tests the provider (0: never), and when it last did."""
+    last = PROBED.get(workspace_id)
+    return {"tests_every_minutes": every_minutes(settings), "last_tested_at": last.isoformat() + "Z" if last else None}
+
+
+def due_probes(tested: dict[str, datetime], running: frozenset[str] = frozenset(),
+              now: datetime | None = None) -> list[dict[str, str]]:
+    """The holds to test now: open for TEST_AFTER, in a workspace that isn't paused, isn't being tested and wasn't
+    tested (``tested``: when each workspace last was) in its last ``holds.test_minutes``."""
+    now = now or utcnow()
+    due: dict[str, dict[str, str]] = {}
+    with session_scope() as s:
+        rows = (s.query(Decision.id, Decision.workspace_id, Decision.created_at, Workspace.settings)
+                .join(Workspace, Workspace.id == Decision.workspace_id)
+                .filter(Decision.kind == PROVIDER_HOLD, Decision.status == "open", Workspace.paused.isnot(True))
+                .order_by(Decision.created_at).all())
+    for decision_id, workspace_id, opened, settings in rows:
+        every = every_minutes(merged_settings(settings))
+        last = tested.get(workspace_id)
+        if (not every or workspace_id in running or workspace_id in due or now - opened < TEST_AFTER
+                or (last is not None and now - last < timedelta(minutes=every))):
+            continue
+        due[workspace_id] = {"workspace_id": workspace_id, "decision_id": decision_id}
+    return list(due.values())
+
+
+def factory_user(db) -> User:
+    """The system identity the Factory acts as when it lifts a hold itself; the resolution carries
+    ``{"source": "factory"}``."""
+    user = db.query(User).filter(User.is_system.is_(True), User.email == FACTORY_EMAIL).first()
+    if user is None:
+        user = User(email=FACTORY_EMAIL, name="Factory", is_system=True)
+        db.add(user)
+        db.flush()
+    return user
+
+
+async def probe_provider(workspace_id: str, decision_id: str) -> str:
+    """Test a held workspace's provider: one minimal request (no tools, no retries) to each distinct model its
+    planner, plan reviewer, builder and verifier use. Every model answered: the hold is lifted ("lifted"), or a person resumed it
+    meanwhile ("resolved"). A refusal for billing, quota or the credential leaves the hold to a person and says why
+    once per reason ("refused"). Any other failure is tried again at the next interval, silently ("failed")."""
+    models: list[str] = []
+    try:
+        settings = workspace_settings(workspace_id)
+        provider = resolve_provider(workspace_id)
+        chosen = workspace_models(settings, provider=provider.provider)
+        # Every model a session of the workspace may be refused on, the plan reviewer's included: a hold lifted
+        # while one of them still refuses would only open again.
+        models = list(dict.fromkeys(provider.model_override or model for model in (
+            chosen.planner, chosen.plan_reviewer, chosen.builder, chosen.verifier)))
+        client = ModelClient(provider, timeout=TEST_TIMEOUT, max_retries=0, log_errors=False)
+        for model in models:
+            await asyncio.wait_for(client._post("/responses", {
+                "model": model, "input": "Reply with OK.", "store": False, "max_output_tokens": TEST_TOKENS,
+            }), timeout=TEST_TIMEOUT)
+    except Exception as exc:
+        if failure_cause(exc) != "provider":
+            log.info("provider hold test for %s failed: %s", workspace_id[:6], type(exc).__name__)
+            return "failed"
+        try:
+            await asyncio.to_thread(_still_refused, workspace_id, decision_id, str(exc))
+        except Exception:
+            log.exception("could not record the provider hold test for %s", workspace_id[:6])
+        return "refused"
+    try:
+        # On the loop, as the Lead's resolutions are: resolve() wakes the orchestrator.
+        return _lift(workspace_id, decision_id, models)
+    except Exception:
+        log.exception("could not lift the provider hold of %s", workspace_id[:6])
+        return "failed"
+
+
+def _still_refused(workspace_id: str, decision_id: str, error: str) -> None:
+    """Say why the provider still refuses, once per hold and reason."""
+    cause = hold_cause(error)
+    with session_scope() as s:
+        last = (s.query(Event.data).filter(Event.workspace_id == workspace_id, Event.kind == "provider_hold_tested")
+                .order_by(Event.id.desc()).first())
+    said = last[0] if last and isinstance(last[0], dict) else {}
+    if said.get("decision_id") == decision_id and said.get("cause") == cause:
+        return
+    label = CAUSES[cause][0]
+    record(workspace_id, "provider_hold_tested",
+           f"The Factory tested the model provider: {label}. The hold stays until a person resumes work.",
+           level="warn", data={"decision_id": decision_id, "cause": cause, "reason": label, "error": error[:500]})
+
+
+def _lift(workspace_id: str, decision_id: str, models: list[str]) -> str:
+    """Lift the hold through the same path as a person's Resume work, attributed to the Factory."""
+    from ..decisions import DecisionError, resolve
+
+    names = ", ".join(models)
+    db = SessionLocal()
+    try:
+        decision = db.query(Decision).filter(Decision.id == decision_id, Decision.workspace_id == workspace_id,
+                                             Decision.kind == PROVIDER_HOLD).first()
+        if decision is None or decision.status != "open":
+            return "resolved"
+        try:
+            resolve(db, decision, factory_user(db), "retry",
+                    f"The provider answered a test request ({names}). Resumed by the Factory.",
+                    attribution={"source": "factory"})
+        except DecisionError:  # a person resumed it while the test ran: theirs stands
+            db.rollback()
+            return "resolved"
+    finally:
+        db.close()
+    record(workspace_id, "provider_hold_lifted",
+           f"The model provider answered a test request ({names}): the hold is lifted and work resumes.",
+           level="success", data={"decision_id": decision_id, "models": models, "source": "factory"})
+    return "lifted"
