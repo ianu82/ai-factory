@@ -11,7 +11,8 @@ from .events import record
 from .linear import Linear, LinearProvider, resolve_token
 from .models import Repository, Secret, Workspace
 from .pipeline.runtime import merged_settings
-from .security import decrypt, redact
+from .preview_config import redaction_values
+from .security import redact
 
 Identifier = Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=200)]
 
@@ -87,8 +88,8 @@ def save_config(db: Session, workspace: Workspace, config: LinearConfig, actor: 
     value = config.model_dump()
     if (workspace.settings or {}).get("linear") == value:
         return
-    secrets = tuple(decrypt(secret.ciphertext) for secret in db.query(Secret).filter(
-        Secret.workspace_id == workspace.id))
+    secrets = tuple(value for secret in db.query(Secret).filter(Secret.workspace_id == workspace.id)
+                    for value in redaction_values(secret))
     changes = _sanitize_changes({"linear": value}, secrets)
     workspace.settings = {**merged_settings(workspace.settings), "linear": value}
     record(workspace.id, "settings_changed", "Updated workspace Linear configuration", actor=actor,

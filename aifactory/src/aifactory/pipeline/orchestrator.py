@@ -729,7 +729,9 @@ class Orchestrator:
             due = [t.id for t in s.query(Task).join(Workspace, Task.workspace_id == Workspace.id)
                    .filter(Task.status == "waiting_ci", Workspace.paused.is_(False))
                    .order_by(Task.updated_at, Task.id)
-                   if ((t.evidence or {}).get("ci_wait") or {}).get("next_poll_at", "") <= now
+                   # A head waiting for its review (stage "review") is polled on the review wait's own clock.
+                   if ((t.evidence or {}).get("review" if t.stage == "review" else "ci_wait") or {}).get(
+                       "next_poll_at", "") <= now
                    and t.id not in self._ci_polls and t.id not in self._tasks][:4 - len(self._ci_polls)]
         for task_id in due:
             async def poll(tid=task_id):

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from . import definitions
 from . import attachments as A
-from . import insights, linear_config, onboarding_policy, workstreams
+from . import insights, linear_config, onboarding_policy, preview_config, workstreams
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
@@ -475,6 +475,8 @@ async def test_credential(workspace_id: str, kind: str,
                                                         pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"),
                           user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
+    if kind.startswith("preview_"):
+        raise HTTPException(404, "Unknown credential")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec is None:
         raise HTTPException(404, "Not configured")
@@ -502,6 +504,8 @@ async def test_credential(workspace_id: str, kind: str,
 @router.delete("/workspaces/{workspace_id}/credentials/{kind}")
 def delete_credential(workspace_id: str, kind: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
+    if kind.startswith("preview_"):
+        raise HTTPException(404, "Unknown credential")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec:
         db.delete(sec)
@@ -589,6 +593,7 @@ class RepoReleaseSelection(BaseModel):
 
 
 class RepoCommands(BaseModel):
+    preview_qa: Any = None
     review: dict[str, Any] | None = None
     setup: list[str] | None = None
     checks: list[str] | None = None
@@ -639,6 +644,11 @@ async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depend
 
 def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(current)
+    if "preview_qa" in patch:
+        try:
+            cfg["preview_qa"] = preview_config.validate_config(patch["preview_qa"], current.get("preview_qa"))
+        except ValueError:
+            raise HTTPException(422, "Invalid Preview QA configuration") from None
     if "require_trusted_issue_author" in patch:
         if type(patch["require_trusted_issue_author"]) is not bool:
             raise HTTPException(422, "require_trusted_issue_author must be a boolean")
@@ -747,12 +757,67 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     return S.repository(repo)
 
 
+def _preview_repository(db: Session, user: User, workspace_id: str, repo_id: str,
+                        minimum: str = "viewer") -> Repository:
+    _ws(db, user, workspace_id, minimum)
+    # Always query again after the workspace lock: db.get may reuse a cached
+    # repository that a concurrent disconnect has already removed.
+    repo = db.query(Repository).filter_by(id=repo_id, workspace_id=workspace_id).populate_existing().one_or_none()
+    if repo is None:
+        raise HTTPException(404, "Repository not found")
+    return repo
+
+
+@router.get("/workspaces/{workspace_id}/repositories/{repo_id}/preview-qa/account")
+def preview_account_metadata(workspace_id: str, repo_id: str, user: User = Depends(current_user),
+                             db: Session = Depends(get_db)):
+    _preview_repository(db, user, workspace_id, repo_id)
+    return preview_config.account_metadata(preview_config.account(db, workspace_id, repo_id))
+
+
+@router.put("/workspaces/{workspace_id}/repositories/{repo_id}/preview-qa/account")
+async def put_preview_account(workspace_id: str, repo_id: str, request: Request,
+                              user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    # Bound bytes before decoding. Never let framework validation echo input values.
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > preview_config.MAX_ACCOUNT_BYTES:
+            raise HTTPException(422, "Invalid preview account request")
+        raw.extend(chunk)
+    try:
+        fields = preview_config.validate_account(json.loads(raw))
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise HTTPException(422, "Invalid preview account request") from None
+    definitions.lock_workspace(db, workspace_id)
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    sec = preview_config.save_account(db, workspace_id, repo_id, fields, user.id)
+    db.commit()
+    record(workspace_id, "preview_account_saved", "Updated Preview QA account", actor=user.id)
+    return preview_config.account_metadata(sec)
+
+
+@router.delete("/workspaces/{workspace_id}/repositories/{repo_id}/preview-qa/account")
+def delete_preview_account(workspace_id: str, repo_id: str, user: User = Depends(current_user),
+                           db: Session = Depends(get_db)):
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    definitions.lock_workspace(db, workspace_id)
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    sec = preview_config.account(db, workspace_id, repo_id)
+    if sec is not None:
+        db.delete(sec)
+    db.commit()
+    record(workspace_id, "preview_account_deleted", "Deleted Preview QA account", actor=user.id)
+    return preview_config.account_metadata(None)
+
+
 @router.delete("/workspaces/{workspace_id}/repositories/{repo_id}")
 def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    repo = db.get(Repository, repo_id)
-    if repo is None or repo.workspace_id != workspace_id:
-        raise HTTPException(404, "Repository not found")
+    # Use the same serialization point as account PUT/DELETE before reading
+    # repository state, so a late account write cannot leave an orphan secret.
+    definitions.lock_workspace(db, workspace_id)
+    repo = _preview_repository(db, user, workspace_id, repo_id, "admin")
     if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running", "waiting_ci"])).first():
         raise HTTPException(409, "Work is running on this repository")
     try:
@@ -769,6 +834,9 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
             config["enabled"] = False
         linear_config.save_config(db, workspace, linear_config.LinearConfig.model_validate(config), user.id,
                                   commit=False)
+    preview_account = preview_config.account(db, workspace_id, repo_id)
+    if preview_account is not None:
+        db.delete(preview_account)
     workstream_events = workstreams.remove_repository_defaults(db, workspace_id, repo_id, user)
     db.delete(repo)
     db.commit()
