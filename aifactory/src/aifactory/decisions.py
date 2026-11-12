@@ -211,9 +211,13 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         if resolution != "retry":
             raise DecisionError("Choose one of: retry")
         decision.reusable = False
+    # Flush lifecycle observations first so the decision points at the new queue episode.
+    db.flush()
+    correlation = dict((task.evidence or {}).get("telemetry", {})) if task else {}
     payload = record(decision.workspace_id, "decision_resolved", f"{author}: {resolution} — {decision.title}",
                      outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
-                     data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
+                     data={**correlation, "decision_kind": decision.kind,
+                           "decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
                            "reusable": decision.reusable, "scope": decision.scope, **(decision.attribution or {})},
                      session=db, publish=False)
     if pending_events is not None:

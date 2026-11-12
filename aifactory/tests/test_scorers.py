@@ -418,6 +418,15 @@ async def test_openai_missing_price_retries_recorded_model_with_known_usage(judg
         row = s.get(ScorerResult, rid)
         assert row.cost_known and row.cost_usd == .0014
     assert outcome_cost(judge['outcome']) == (1.0014, True)
+    from aifactory.models import Event
+
+    with session_scope() as s:
+        adjustment = s.query(Event).filter_by(kind='cost_adjusted').one()
+        assert adjustment.data['old_cost_usd'] == 0
+        assert adjustment.data['cost_usd'] == .0014
+        assert adjustment.data['old_cost_known'] is False
+        assert adjustment.data['source'] == 'configured_pricing'
+        assert adjustment.outcome_id == judge['outcome']
 
 
 @pytest.mark.parametrize('cost,evidence', [(-1, 'bill'), (1, ''), (1, '   ')])

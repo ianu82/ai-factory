@@ -85,7 +85,7 @@ def init_engine(url: str | None = None) -> Engine:
     if url.startswith("sqlite"):
         _configure_sqlite(_engine)
     _session_factory = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
-    from . import models  # noqa: F401  (register tables)
+    from . import models, telemetry  # noqa: F401  (register tables and lifecycle listeners)
 
     Base.metadata.create_all(_engine)
     _add_missing_columns(_engine)

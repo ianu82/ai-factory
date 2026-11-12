@@ -138,7 +138,9 @@ def test_repaired_false_accepts_are_unique_and_durable(client, signed_in, failur
             t.evidence = {**t.evidence, "failure_facts": [{"kind": "ci", "state": "failure", "at": END.isoformat()}]}
         else:
             for _ in range(2):
-                event(s, ws, t, failure, exit_code=1, state="failure")
+                data = ({"state": "failed", "ok": False, "checks_total": 2, "checks_failed": 1}
+                        if failure == "smoke_result" else {"exit_code": 1, "state": "failure"})
+                event(s, ws, t, failure, **data)
         event(s, ws, t, "ci_status", state="success")
     m = measure(ws)["verifier_false_accept_rate"]
     assert (m["value"], m["numerator"], m["denominator"]) == (1, 1, 1)
@@ -302,7 +304,9 @@ def test_false_accept_events_require_subsequent_failure(client, signed_in, kind,
         _, _, t = seed(s, ws, pr_number=1, evidence={"attempts": [passed()]})
         if after:
             event(s, ws, t, "published")
-        event(s, ws, t, kind, exit_code=1)
+        data = ({"state": "failed", "ok": False, "checks_total": 2, "checks_failed": 1}
+                if kind == "smoke_result" else {"exit_code": 1})
+        event(s, ws, t, kind, **data)
         if not after:
             event(s, ws, t, "published")
     m = measure(ws)["verifier_false_accept_rate"]

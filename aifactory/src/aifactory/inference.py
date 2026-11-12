@@ -447,14 +447,25 @@ class ModelClient:
 
     async def _send(self, path: str, body: dict[str, Any], retries: Retries) -> dict[str, Any]:
         url = self.provider.base_url + path
+        from .telemetry import ProviderAttempt, http_category
+
         while True:
+            measurement = None
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=20.0)) as client:
                     async with admission(self.provider, self.session_id):
+                        measurement = ProviderAttempt(self.session_id, self.provider.provider, body.get("model", ""), "native")
                         response = await client.post(url, headers=self.provider.headers(self.session_id),
                                                      content=json.dumps(body))
                 if response.status_code == 200:
-                    return response.json()
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        measurement.finish("invalid_response", response.status_code)
+                        raise
+                    measurement.finish(status=response.status_code)
+                    return data
+                measurement.finish(http_category(response.status_code), response.status_code)
                 detail = _error_detail(response)
                 if response.status_code == 402:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
@@ -493,8 +504,14 @@ class ModelClient:
                 last = InferenceError(f"{self.provider.label} error {response.status_code}: {detail}", retryable=True, status=response.status_code)
                 what, delay = str(response.status_code), _seconds(response.headers.get("retry-after"))
             except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if measurement:
+                    measurement.finish("timeout" if isinstance(exc, httpx.TimeoutException) else "transport")
                 last = InferenceError(f"{self.provider.label} unreachable: {type(exc).__name__}", retryable=True)
                 what, delay = "unreachable", None
+            except asyncio.CancelledError:
+                if measurement:
+                    measurement.finish("cancelled")
+                raise
             if not await retries.wait(what, delay):
                 raise last
 

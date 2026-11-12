@@ -249,7 +249,10 @@ def test_a_run_answers_the_question_and_recommends_on_the_merge(world, model):
         assert resolved.data["source"] == "lead" and resolved.data["run_id"] == row.id
         note = next(m for m in s.query(Message).filter_by(author_kind="lead") if (m.attribution or {}).get("decision_id"))
         assert note.attribution == {"source": "lead", "run_id": row.id, "decision_id": world["merge"]}
-        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == world["outcome"]).order_by(Event.id)]
+        from aifactory.telemetry import METRIC_ONLY
+
+        kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == world["outcome"],
+                                                     Event.kind.notin_(METRIC_ONLY)).order_by(Event.id)]
         assert kinds[0] == "run_started" and kinds[-1] == "run_finished"
         assert "decision_resolved" in kinds and "lead_note" in kinds
         assert s.get(Run, row.id).config_snapshot["seen"] == due["seen"]

@@ -6,8 +6,10 @@ predicate belongs on the UPDATE, not just on the preceding ORM read.
 from __future__ import annotations
 
 from sqlalchemy import exists, update
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..models import Outcome, Task, Workspace
+from ..telemetry import task_change
 
 
 STOPPED = {"cancelled", "abandoned", "handed_over", "completed", "reverted"}
@@ -22,6 +24,10 @@ def transition(session, task: Task, *, owner: str | None = None, exclusive: bool
     if fields.get("lease_owner") == "":
         fields["lease_expires_at"] = None  # an expiry never outlives its owner
     held = () if owner is None else (Task.lease_owner.in_((owner,) if exclusive else ("", owner)),)
+    # Evidence from detached runners cannot overwrite current internal correlation IDs.
+    if "evidence" in fields:
+        fields["evidence"] = {**fields["evidence"],
+                              "telemetry": (task.evidence or {}).get("telemetry", {})}
     result = session.execute(
         update(Task).where(
             Task.id == task.id, Task.status == task.status, Task.stage == task.stage,
@@ -31,7 +37,14 @@ def transition(session, task: Task, *, owner: str | None = None, exclusive: bool
             *held,
         ).values(**fields).execution_options(synchronize_session=False)
     )
-    return result.rowcount == 1
+    if result.rowcount != 1:
+        return False
+    fields = task_change(session, task, fields)
+    session.execute(update(Task).where(Task.id == task.id).values(evidence=fields["evidence"])
+                    .execution_options(synchronize_session=False))
+    for key, value in fields.items():
+        set_committed_value(task, key, value)
+    return True
 
 
 # A person acknowledging a failed post-merge check, or opening a fix outcome for it, accepts the merged change.

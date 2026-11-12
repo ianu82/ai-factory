@@ -689,8 +689,16 @@ def test_a_reviewers_finding_is_fixed_answered_and_reviewed_again_before_a_perso
     assert FakeGitHub.replies == [(1, "501", f"Fixed in {second[:10]}: Quoted the path.")]
     assert FakeGitHub.resolved == ["PRRT_501"]
     assert FakeGitHub.comments == [(1, "@codex review")]
-    assert [k for k in _event_kinds(outcome_id) if k.startswith("review_")] == [
+    from aifactory.telemetry import METRIC_ONLY
+
+    kinds = _event_kinds(outcome_id)
+    assert [k for k in kinds if k.startswith("review_") and k not in METRIC_ONLY] == [
         "review_received", "review_round", "review_requested", "review_received"]
+    # Entering revise records one revision; starting its builder attempt is not another.
+    with session_scope() as s:
+        revision = s.query(Event).filter_by(outcome_id=outcome_id, kind="review_revision").one()
+        assert revision.data["stage"] == "revise"
+        assert revision.data["stage_id"] and revision.data["queue_id"]
     with session_scope() as s:
         review = s.query(Task).filter(Task.outcome_id == outcome_id).one().evidence["review"]
         assert (review["rounds"], review["round"], review["answered"]["comment:501"]["action"]) == (1, None, "fixed")
