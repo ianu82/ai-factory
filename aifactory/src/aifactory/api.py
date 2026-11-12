@@ -37,7 +37,7 @@ from .model_checks import check_workspace_models
 from .models import (Alert, Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
-from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings, new_settings
 from .review import review_policy, validate_review
 from .repo_detect import detect
 from .sandbox import isolation_available
@@ -142,7 +142,7 @@ def create_workspace(body: WorkspaceCreate, user: User = Depends(current_user), 
     while db.query(Workspace).filter(Workspace.org_id == body.org_id, Workspace.slug == slug).first():
         slug, n = f"{base}-{n}", n + 1
     ws = Workspace(org_id=body.org_id, name=body.name, slug=slug, description=body.description,
-                   settings=onboarding_policy.begin(DEFAULT_SETTINGS))
+                   settings=onboarding_policy.begin(new_settings()))
     db.add(ws)
     db.flush()
     db.add(Membership(workspace_id=ws.id, user_id=user.id, role="owner"))
@@ -910,6 +910,10 @@ class OutcomeCreate(BaseModel):
     template: Literal["readme-contributing"] | None = None
 
 
+class OutcomeUpdate(BaseModel):
+    priority: int = Field(strict=True, ge=0, le=3)
+
+
 def _outcome_rows(db: Session, workspace_id: str, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
     from .work_services import outcome_rows
 
@@ -1004,6 +1008,36 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
         "messages": [S.message(m, users.get(m.author_id or "", "Factory")) for m in messages],
         "events": [event_dict(e) for e in events],
     }
+
+
+@router.patch("/workspaces/{workspace_id}/outcomes/{outcome_id}")
+def update_outcome(workspace_id: str, outcome_id: str, body: OutcomeUpdate, user: User = Depends(current_user),
+                   db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    # Serialize edits before reading the old priority, on SQLite as well as Postgres.
+    # Preserve updated_at here so a replay is a no-op, including its timestamp.
+    locked = db.execute(update(Outcome).where(Outcome.id == outcome_id, Outcome.workspace_id == workspace_id)
+                        .values(priority=Outcome.priority, updated_at=Outcome.updated_at))
+    if not locked.rowcount:
+        raise HTTPException(404, "Outcome not found")
+    o = db.get(Outcome, outcome_id)
+    payload = None
+    if o.priority != body.priority:
+        old_priority = o.priority
+        o.priority = body.priority
+        payload = record(workspace_id, "outcome_priority_changed",
+                         f"{user.name or user.email} changed priority of #{o.number} from {old_priority} to {o.priority}",
+                         outcome_id=o.id, actor=user.id, data={"from": old_priority, "to": o.priority},
+                         session=db, publish=False)
+    tasks, runs, decisions = _outcome_rows(db, workspace_id, [o.id])
+    result = S.outcome(o, tasks.get(o.id, []), runs.get(o.id, []), decisions.get(o.id, 0),
+                       S.outcome_sources(db, [o]).get(o.signal_id))
+    db.commit()
+    if payload is not None:
+        bus.publish({"type": "event", **payload})
+        notify(workspace_id, "outcome", o.id)
+        orchestrator.wake()
+    return result
 
 
 def _creator(db: Session, name: str, outcome: Outcome) -> str:

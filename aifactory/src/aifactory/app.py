@@ -41,7 +41,12 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
     async def lifespan(_app: FastAPI):
         run = settings.orchestrator_enabled if start_orchestrator is None else start_orchestrator
         from .bootstrap import apply_bootstrap
+        from .pipeline.runtime import refresh_copied_defaults
 
+        try:
+            refresh_copied_defaults()
+        except Exception:  # stale defaults are worse settings, never a reason not to start
+            log.exception("Could not refresh the workspaces' copies of the default settings")
         apply_bootstrap()
         if run:
             orchestrator.start()

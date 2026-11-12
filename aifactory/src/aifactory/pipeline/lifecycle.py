@@ -11,6 +11,35 @@ from ..models import Outcome, Task, Workspace
 
 
 STOPPED = {"cancelled", "abandoned", "handed_over", "completed", "reverted"}
+# Ended without being delivered by the Factory: a task that depends on one of these never starts by itself.
+ENDED = ("abandoned", "cancelled", "reverted", "handed_over")
+ENDED_AS = {"abandoned": "was abandoned", "cancelled": "was cancelled", "reverted": "was merged and then reverted",
+            "handed_over": "was handed over to a person"}
+
+
+def stranded(tasks: list[Task]) -> tuple[list[Task], list[Task]]:
+    """The pending tasks that can never start, because something they depend on (directly, or through another such
+    task) ended without being delivered; and the ended tasks they wait behind. A task behind one that waits on a
+    person is not stranded: that person's answer moves it."""
+    by_key = {t.key: t for t in tasks}
+    waiting: dict[str, Task] = {}
+    changed = True
+    while changed:
+        changed = False
+        for t in tasks:
+            if t.status != "pending" or t.key in waiting:
+                continue
+            behind = [by_key[k] for k in t.depends_on or [] if k in by_key]
+            if any(b.status in ENDED or b.key in waiting for b in behind):
+                waiting[t.key] = t
+                changed = True
+    ended = {k: by_key[k] for t in waiting.values() for k in t.depends_on or []
+             if k in by_key and by_key[k].status in ENDED}
+
+    def order(t: Task) -> tuple[int, str]:
+        return len(t.key), t.key  # T2 before T10
+
+    return sorted(waiting.values(), key=order), sorted(ended.values(), key=order)
 
 
 def transition(session, task: Task, *, owner: str | None = None, exclusive: bool = False, **fields) -> bool:

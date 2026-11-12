@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Ban, X } from "lucide-react";
@@ -11,6 +11,7 @@ import { TaskCard } from "./TaskCard";
 import { LinearIssueLink } from "./LinearIssueLink";
 
 import { OutcomeAttachments } from "./Attachments";
+import { OUTCOME_PRIORITIES, priorityLabel } from "../outcomePriority";
 
 const QUIET = new Set(["agent_thought", "agent_tool"]);
 
@@ -23,6 +24,8 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
     queryFn: () => api<Detail>(`/api/workspaces/${ws.id}/outcomes/${outcomeId}`),
     refetchInterval: (query) => (["completed", "cancelled"].includes(query.state.data?.outcome.status || "") ? false : 15_000),
   });
+  const [savingPriority, setSavingPriority] = useState(false);
+  const priorityPending = useRef(false);
   const [guided, setGuided] = useState(true);
   const [showAll, setShowAll] = useState(false);
   const { hash } = useLocation();
@@ -35,6 +38,24 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
   const plan = [...plans].reverse().find((p) => p.status !== "superseded") || plans[plans.length - 1];
   const active = !["completed", "cancelled", "partially_completed"].includes(outcome.status);
   const timeline = (showAll ? events : events.filter((e) => !QUIET.has(e.kind))).slice(-160);
+
+  const changePriority = async (value: string) => {
+    if (ws.role === "viewer" || priorityPending.current || Number(value) === outcome.priority) return;
+    priorityPending.current = true;
+    setSavingPriority(true);
+    try {
+      await api(`/api/workspaces/${ws.id}/outcomes/${outcomeId}`, { method: "PATCH", json: { priority: Number(value) } });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["outcome", ws.id, outcomeId] }),
+        qc.invalidateQueries({ queryKey: ["outcomes", ws.id] }),
+      ]);
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      priorityPending.current = false;
+      setSavingPriority(false);
+    }
+  };
 
   const cancel = async () => {
     if (!confirm(`Cancel #${outcome.number}? Running sessions stop and nothing further is merged.`)) return;
@@ -64,6 +85,15 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
         <h2>{outcome.title}</h2>
         <div className="facts">
           <Status status={outcome.status} />
+          {ws.role !== "viewer" ? (
+            <label className="outcome-priority-control">
+              Priority
+              <select className="select" value={outcome.priority} disabled={savingPriority} aria-busy={savingPriority}
+                onChange={(e) => changePriority(e.target.value)}>
+                {OUTCOME_PRIORITIES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </label>
+          ) : <span>Priority <b>{priorityLabel(outcome.priority)}</b></span>}
           {outcome.progress.total > 0 && <span><b className="num">{outcome.progress.done}/{outcome.progress.total}</b> tasks delivered</span>}
           <span>Cost <b className="num">{money(outcome.cost_usd, outcome.cost_known)}</b></span>
           {outcome.harness && <span>Worker <b>{HARNESS_LABEL[outcome.harness]}</b></span>}
