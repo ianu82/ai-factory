@@ -16,16 +16,17 @@ from sqlalchemy.orm import Session
 
 from ..db import session_scope, utcnow
 from ..events import notify, record
+from ..failures import failure_cause
 from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
-from ..models import Decision, Outcome, Plan, Repository, Run, Task
+from ..models import Decision, Event, Outcome, Plan, Repository, Run, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
 from . import delivery
 from .holds import open_provider_hold
-from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, precedents, run_agent, set_outcome,
-                      merged_settings, workspace_settings)
+from .runtime import (SessionSpec, carried_cause, guidance_history, open_decision, outcome_committed, precedents,
+                      run_agent, set_outcome, merged_settings, workspace_settings)
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ PLAN_REVIEW_ROUNDS = 2  # revisions the reviewer may ask for before a person dec
 ACTIVE_OUTCOME = ("planning", "running", "attention", "blocked", "needs_input", "awaiting_approval")
 OTHER_OUTCOMES = 20
 OTHER_TASKS = 8
+# The outcome's own events that say where its planning stands with infrastructure retries (_infra_retries).
+_RETRY_STATE = ("infra_retry", "plan_proposed", "provider_hold", "decision_requested")
 
 
 def other_work(workspace_id: str, outcome_id: str) -> list[str]:
@@ -113,7 +116,31 @@ def _save_plan(workspace_id: str, outcome_id: str, version: int, report: dict[st
     return plan_id
 
 
-async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retries: int = 0) -> None:
+def _infra_retries(outcome_id: str) -> tuple[int, float]:
+    """Planning's infrastructure retries in a row so far, and the seconds left before the next one may start. Both
+    are read from the outcome's last ``infra_retry`` event (an outcome has no evidence field as a task has), so a
+    restart during a backoff continues the count and the wait. A plan, a decision or the provider hold ends the row."""
+    with session_scope() as s:
+        last = (s.query(Event).filter(Event.outcome_id == outcome_id, Event.task_id.is_(None),
+                                      Event.kind.in_(_RETRY_STATE)).order_by(Event.id.desc()).first())
+        if last is None or last.kind != "infra_retry":
+            return 0, 0.0
+        data = last.data or {}
+        due = last.created_at + timedelta(seconds=float(data.get("delay") or 0))
+        return int(data.get("retries") or 1), max((due - utcnow()).total_seconds(), 0.0)
+
+
+async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
+    # A retry after an infrastructure failure (below) waits out its backoff here. The outcome stays in planning and
+    # keeps its slot; cancelling it ends the wait at once.
+    infra_retries, wait = _infra_retries(outcome_id)
+    if wait > 0:
+        try:
+            await asyncio.wait_for(cancelled.wait(), wait)
+        except asyncio.TimeoutError:
+            pass
+        if cancelled.is_set():
+            return
     with session_scope() as s:
         outcome = s.get(Outcome, outcome_id)
         if outcome.source == "review":
@@ -148,6 +175,8 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retri
     sandbox = LocalSandbox(f"plan-{outcome_id[:12]}-{version}").create()
     result = review = last = None
     error, problems, stopped, setup_failed = "", [], "", False
+    cause: str | None = None  # what the failed session said it was (runtime.carried_cause); None: read the wording
+    who = "the planner"
     try:
         token = resolve_token(workspace_id)
         sandbox.work.mkdir(parents=True, exist_ok=True)
@@ -168,6 +197,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retri
                 prompt=prompt, system=PLANNER, sandbox=sandbox, effective_settings=settings,
                 repositories=repositories), cancelled)
             if result is None:
+                cause = carried_cause(run)
                 break
             report = result.report
             problems = _check_repos(report, repos)
@@ -176,8 +206,13 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retri
                 if over := over_budget():
                     review = {"verdict": "error", "summary": f"{over}, so the plan was not reviewed.", "findings": []}
                 else:
-                    review = await _review(snapshot, repos, decisions, work, report, harness_name, sandbox,
-                                           settings, repositories, cancelled)
+                    review, refused = await _review(snapshot, repos, decisions, work, report, harness_name, sandbox,
+                                                    settings, repositories, cancelled)
+                    if refused and (refused[1] == "provider" or infra_retries < delivery.INFRA_RETRIES):
+                        # The provider failed the review, not the plan. Nobody is asked to approve a plan that could
+                        # not be reviewed: it is not saved, and planning starts again once the provider answers.
+                        result, (error, cause), who = None, refused, "the plan reviewer"
+                        break
             plan_id = _save_plan(workspace_id, outcome_id, version, report, run, review)
             last = (plan_id, report, review)
             if review:
@@ -190,35 +225,35 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retri
         raise
     except Exception as exc:
         log.exception("planning setup failed")
-        result, error, setup_failed = None, str(exc), True
+        # A provider that refuses before a session starts (no valid credential) says so itself and is handled as a
+        # refusal inside a session. Anything else raised here is this outcome's own setup: a checkout, the sandbox.
+        cause = "provider" if failure_cause(exc) == "provider" else None
+        result, error, setup_failed = None, str(exc), cause is None
     finally:
         await sandbox.close()
     if cancelled.is_set():
         return
 
-    if last is None:
-        # As for a task (delivery.infrastructure_problem): the provider or the sandbox failed, not the plan.
-        cause = delivery.infrastructure_problem(error)
+    if result is None:
+        # As for a task (delivery.infrastructure_problem): the provider or the sandbox failed, not the plan. Every
+        # planning session is read this way: the first plan, a revision and the plan review.
+        cause = delivery.infrastructure_problem(error, cause)
         if cause == "provider" and not setup_failed:
-            # The provider refused the planner as it would every model session of the workspace: the outcome stays in
+            # The provider refused this session as it would every model session of the workspace: the outcome stays in
             # planning under the workspace's one hold, and is planned again when a person resumes it. An access
             # problem while setting up (a repository, the GitHub credential) is this outcome's own and blocks it.
-            open_provider_hold(workspace_id, error, f"planning outcome #{snapshot.number}")
-            record(workspace_id, "provider_hold", f"The model provider refused the planner ({error[:200]}). Planning "
+            open_provider_hold(workspace_id, error, f"planning outcome #{snapshot.number}, {who}")
+            record(workspace_id, "provider_hold", f"The model provider refused {who} ({error[:200]}). Planning "
                    "waits until the provider hold in the inbox is resumed", outcome_id=outcome_id, level="warn")
             return
         if cause == "transient" and infra_retries < delivery.INFRA_RETRIES:
             delay = delivery.INFRA_BACKOFF_SECONDS[min(infra_retries, len(delivery.INFRA_BACKOFF_SECONDS) - 1)]
+            # This event is the durable count and retry time: the next call waits out the backoff (_infra_retries).
             record(workspace_id, "infra_retry", f"Planning hit an infrastructure problem ({error[:200]}); retrying in "
                    f"{delay // 60} min ({infra_retries + 1} of {delivery.INFRA_RETRIES})", outcome_id=outcome_id,
-                   level="warn", data={"delay": delay})
-            try:  # the outcome stays in planning and keeps its slot; cancelling it ends the wait at once
-                await asyncio.wait_for(cancelled.wait(), delay)
-            except asyncio.TimeoutError:
-                pass
-            if cancelled.is_set():
-                return
-            return await plan_outcome(outcome_id, cancelled, infra_retries=infra_retries + 1)
+                   level="warn", data={"delay": delay, "retries": infra_retries + 1})
+            return await plan_outcome(outcome_id, cancelled)
+    if last is None:
         failed = "The planner could not produce a plan."
         if cause == "transient":
             failed = (f"Planning failed {infra_retries + 1} times in a row for reasons outside the plan (the model "
@@ -273,21 +308,27 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retri
 
 async def _review(outcome: Outcome, repos: list[Repository], decisions: list[Any], work: list[str],
                   report: dict[str, Any], harness_name: str, sandbox: LocalSandbox, settings: dict[str, Any],
-                  repositories: dict[str, Any], cancelled: asyncio.Event) -> dict[str, Any]:
-    """Review one plan in the planner's checkout. A review that cannot finish never approves."""
+                  repositories: dict[str, Any], cancelled: asyncio.Event
+                  ) -> tuple[dict[str, Any], tuple[str, str] | None]:
+    """Review one plan in the planner's checkout. A review that cannot finish never approves. Also returns the error
+    and its cause ("provider" or "transient") when the provider or the sandbox failed the review session, as
+    delivery.infrastructure_problem reads it; None when the review finished or failed on its own."""
     prompt = plan_review_prompt(outcome, repos, decisions, guidance_history(outcome.id), work, report)
     try:
         run, result, error = await run_agent(SessionSpec(
             workspace_id=outcome.workspace_id, outcome_id=outcome.id, task_id=None, role="plan_reviewer",
             harness=harness_name, prompt=prompt, system=PLAN_REVIEWER, sandbox=sandbox, effective_settings=settings,
             repositories=repositories), cancelled)
-    except Exception as exc:  # setup failed before a session started (e.g. no model provider): keep the plan
+    except Exception as exc:  # setup failed before a session started: keep the plan, unless the provider refused
         log.exception("plan review could not start")
-        return {"verdict": "error", "summary": f"The plan review could not start: {str(exc)[:1000]}", "findings": []}
+        review = {"verdict": "error", "summary": f"The plan review could not start: {str(exc)[:1000]}", "findings": []}
+        return review, ((str(exc), "provider") if failure_cause(exc) == "provider" else None)
     if result is None:
-        return {"verdict": "error", "summary": f"The plan review failed: {error[:1000]}", "findings": [],
-                "run_id": run.id, "model": run.model}
-    return {**result.report, "run_id": run.id, "model": run.model}
+        cause = delivery.infrastructure_problem(error, carried_cause(run))
+        review = {"verdict": "error", "summary": f"The plan review failed: {error[:1000]}", "findings": [],
+                  "run_id": run.id, "model": run.model}
+        return review, ((error, cause) if cause else None)
+    return {**result.report, "run_id": run.id, "model": run.model}, None
 
 
 def _record_review(workspace_id: str, outcome_id: str, version: int, review: dict[str, Any]) -> None:

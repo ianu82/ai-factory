@@ -2467,6 +2467,52 @@ def test_a_builder_is_told_its_turn_and_time_budget(factory, tmp_path, monkeypat
     assert prompts["verifier"] == "the task"  # only a builder's unreported work is checked, so only it is told
 
 
+def test_a_failed_run_keeps_what_failed_it(factory, tmp_path, monkeypatch):
+    from aifactory.harness import HarnessFailed
+    from aifactory.inference import InferenceError
+    from aifactory.pipeline.runtime import SessionSpec, carried_cause, run_agent
+    from aifactory.sandbox import LocalSandbox, SandboxError
+
+    outcome_id = new_outcome(factory)
+    sb = LocalSandbox("failing", root=tmp_path / "failing").create()
+    sb.work.mkdir()
+    outage = InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
+    # (what the harness raises, what it was raised from): the cause the caller is handed and the row keeps.
+    failures = [
+        ((HarnessFailed(f"Model request failed: {outage}", cause="transient"), outage),
+         ("transient", {"cause": "transient", "status": 503})),
+        # The session's own failure says so, whatever its wording: a known "", not a missing answer.
+        ((HarnessFailed("Error code: 503 - rate limit exceeded, try again later"), None),
+         ("", {"cause": "", "status": None})),
+        ((InferenceError("MindsHub refused the credential (401): invalid key", status=401), None),
+         ("provider", {"cause": "provider", "status": 401})),
+        # A failure that says nothing (the sandbox) keeps nothing: its wording is read (infrastructure_problem).
+        ((SandboxError("VM bridge stopped"), None), (None, None)),
+    ]
+    raised = iter(failures)
+
+    class FailingHarness:
+        label = "Failing"
+
+        async def run(self, session):
+            (exc, origin), _ = next(raised)
+            raise exc from origin
+
+    monkeypatch.setattr(runtime, "get_harness", lambda _: FailingHarness())
+
+    async def go():
+        kept = []
+        for (exc, _), _ in failures:
+            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "native",
+                                                            "the task", "system", sb), asyncio.Event())
+            assert (run.status, result, error) == ("failed", None, str(exc))
+            with session_scope() as s:
+                kept.append((carried_cause(run), (s.get(Run, run.id).config_snapshot or {}).get("failure")))
+        return kept
+
+    assert asyncio.run(go()) == [expected for _, expected in failures]
+
+
 @pytest.mark.parametrize("transition", ["snapshot", "lock", "pull", "branch", "claim"])
 def test_learning_is_rechecked_immediately_before_merge(factory, monkeypatch, transition):
     from aifactory.models import Plan
@@ -2826,6 +2872,72 @@ def test_provider_and_infrastructure_failures_are_recognised_for_every_harness(e
     assert delivery.infrastructure_problem(error) == expected
 
 
+def _sdk_error(name, status=None, message="", headers=None):
+    """An exception shaped like a provider SDK's (its class name, a status_code, the response's headers), without the
+    SDK."""
+    from types import SimpleNamespace
+
+    exc = type(name, (Exception,), {})(message or f"Error code: {status}")
+    if status is not None:
+        exc.status_code, exc.response = status, SimpleNamespace(headers=headers or {})
+    return exc
+
+
+def test_a_failure_says_its_own_cause_where_it_happens():
+    import httpx
+
+    from aifactory.failures import failure_cause
+    from aifactory.github import GitHubError
+    from aifactory.harness import HarnessFailed
+    from aifactory.inference import BudgetExceeded, InferenceError
+    from aifactory.sandbox import SandboxError
+
+    quota = "You exceeded your current quota, please check your plan and billing details."
+    unfamiliar = "The model would not answer, in words no rule here knows"
+    table = [
+        # The model client: the status decides, unless the raise site knows better.
+        (InferenceError("MindsHub: no credit remaining (insufficient balance)", status=402), "provider"),
+        (InferenceError("MindsHub refused the credential (401): invalid key", status=401), "provider"),
+        (InferenceError("MindsHub refused the credential (403): no access", status=403), "provider"),
+        (InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503), "transient"),
+        (InferenceError("MindsHub error 429: Rate limit reached", retryable=True, status=429), "transient"),
+        (InferenceError(f"MindsHub error 429: {quota}", status=429, cause="provider"), "provider"),
+        (InferenceError("MindsHub unreachable: ConnectTimeout", retryable=True), "transient"),
+        (InferenceError("MindsHub error 400: unknown parameter", status=400), ""),
+        (InferenceError("No model provider is configured for this workspace.", cause="provider"), "provider"),
+        (BudgetExceeded("Cost budget of $5.00 reached"), ""),
+        # A harness: a failure carries a cause only when the provider caused it, whatever its message says.
+        (HarnessFailed("Stopped after 83 turns without a valid final report"), ""),
+        (HarnessFailed("Error code: 503 - rate limit reached"), ""),
+        (HarnessFailed("Model request failed: MindsHub error 503: unavailable", cause="transient"), "transient"),
+        (HarnessFailed(unfamiliar, cause="provider"), "provider"),
+        # Transport and SDK exceptions, by type and status.
+        (httpx.ConnectError("offline"), "transient"),
+        (httpx.ReadTimeout("slow"), "transient"),
+        (_sdk_error("APIConnectionError", message="Connection error."), "transient"),
+        (_sdk_error("APITimeoutError", message="Request timed out."), "transient"),
+        (_sdk_error("InternalServerError", 503), "transient"),
+        (_sdk_error("ConflictError", 409), "transient"),
+        (_sdk_error("RateLimitError", 429, "Rate limit reached for gpt-terra"), "transient"),
+        (_sdk_error("RateLimitError", 429, quota), "provider"),
+        (_sdk_error("RateLimitError", 429, "Too many requests", {"x-should-retry": "false"}), "provider"),
+        (_sdk_error("APIStatusError", 402), "provider"),
+        (_sdk_error("AuthenticationError", 401), "provider"),
+        (_sdk_error("PermissionDeniedError", 403), "provider"),
+        (_sdk_error("BadRequestError", 400), ""),
+        # Anything else says nothing, and its wording is read instead (infrastructure_problem without a cause).
+        (RuntimeError("Error code: 503 - Service temporarily unavailable"), ""),
+        (GitHubError("Bad credentials", 401), ""),
+        (SandboxError("VM bridge stopped"), ""),
+    ]
+    assert [(str(exc), failure_cause(exc)) for exc, _ in table] == [(str(exc), cause) for exc, cause in table]
+    # What the failure said decides, whatever its wording; only a failure that said nothing is read from its text.
+    assert delivery.infrastructure_problem("Error code: 503 - rate limit reached", "") == ""
+    assert delivery.infrastructure_problem(unfamiliar, "provider") == "provider"
+    assert delivery.infrastructure_problem(unfamiliar) == ""
+    assert delivery.infrastructure_problem("Error code: 503 - Service temporarily unavailable") == "transient"
+
+
 def test_a_provider_billing_problem_holds_the_workspace_without_using_an_attempt(factory):
     from aifactory.inference import InferenceError
 
@@ -2850,6 +2962,9 @@ def test_a_provider_billing_problem_holds_the_workspace_without_using_an_attempt
         assert (hold.outcome_id, hold.task_id, hold.title) == (None, None, "Model provider refused: work is on hold")
         assert "credits are used up" in hold.body and "T1 of outcome #1, the builder session" in hold.body
         assert hold.options == [{"value": "retry", "label": "Resume work"}]
+        # The failed run keeps what the model client said failed it: the cause and the provider's status.
+        failed = s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "builder").one()
+        assert failed.config_snapshot["failure"] == {"cause": "provider", "status": 402}
     assert outcome_status(outcome_id) == "running"
     # Nothing starts while the hold is open.
     assert not drive(lambda: len(_attempt_records(outcome_id)) > 1, timeout=2)
@@ -2899,6 +3014,123 @@ def test_a_verifier_the_provider_refuses_holds_the_workspace_too(factory):
     with session_scope() as s:
         assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
     assert _holds(factory["ws"]) == []
+
+
+def test_a_refusal_in_words_no_rule_knows_still_holds_the_workspace(factory):
+    from aifactory.harness import HarnessFailed
+
+    # The harness knew the provider refused and says so on the failure; the wording alone would say nothing.
+    error = "The model would not answer, in words no rule here knows"
+    assert delivery.infrastructure_problem(error) == ""
+    refusing = [1]
+
+    def builder(messages):
+        if refusing:
+            raise HarnessFailed(error, cause="provider")
+        return good_builder(messages)
+
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: len(_attempt_records(outcome_id)) == 1 and _task_state(outcome_id)[0] == "queued")
+    [hold_id] = _holds(factory["ws"])
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert (task.status, task.attempt) == ("queued", 0) and error in s.get(Decision, hold_id).body
+        assert [(a["n"], a["result"], a["cause"], a["phase"]) for a in task.evidence["attempts"]] == [
+            (1, "infra", "provider", "build")]
+        failed = s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "builder").one()
+        assert failed.config_snapshot["failure"] == {"cause": "provider", "status": None}
+
+    refusing.clear()
+    _resume(factory, hold_id)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [(1, "infra"), (1, "verified")]
+    assert _holds(factory["ws"]) == []
+
+
+def test_planning_without_a_provider_credential_holds_the_workspace(factory, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    missing = [True]
+
+    def provider(workspace_id, **_):
+        if missing:
+            raise InferenceError("No model provider is configured for this workspace. Add a MindsHub Inference key "
+                                 "in Settings.", cause="provider")
+        return ProviderConfig("openai", "http://model.test", "k", "Test")
+
+    def planning_events():
+        return [k for k in _event_kinds(outcome_id) if k in ("provider_hold", "infra_retry", "decision_requested")]
+
+    monkeypatch.setattr(runtime, "resolve_provider", provider)
+    ws, outcome_id = factory["ws"], new_outcome(factory)
+    assert drive(lambda: planning_events() == ["provider_hold"]), "planning did not hold the workspace"
+    [hold_id] = _holds(ws)
+    with session_scope() as s:
+        hold = s.get(Decision, hold_id)
+        assert "planning outcome #1, the planner" in hold.body and "No model provider is configured" in hold.body
+        # The provider refused before a session started: planning has no run (the Lead records its own on the
+        # outcome), and the outcome has no decision of its own.
+        assert s.query(Run).filter(Run.outcome_id == outcome_id, Run.role != "lead").count() == 0
+        assert s.query(Decision).filter(Decision.outcome_id == outcome_id).count() == 0
+        assert s.get(Outcome, outcome_id).status == "planning"
+    # While the hold is open, planning is not started again.
+    assert not drive(lambda: planning_events() != ["provider_hold"] or _holds(ws) != [hold_id], timeout=2)
+    missing.clear()
+    _resume(factory, hold_id)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked")), "pipeline did not finish"
+    assert outcome_status(outcome_id) == "completed"
+    assert _holds(ws) == [] and _holds(ws, "resolved") == [hold_id]
+
+
+def test_a_workspace_without_a_credential_holds_before_any_session_starts(factory, monkeypatch):
+    from aifactory.inference import InferenceError
+
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        return {"content": "", "tool_calls": [call("finish", {"summary": "Two files", "questions": [], "tasks": [
+            {"key": key, "title": f"Add {name}", "repo": "acme/demo", "spec": name, "acceptance": [f"{name} exists"],
+             "depends_on": []} for key, name in (("T1", "a.txt"), ("T2", "b.txt"))]})]}
+
+    def provider(workspace_id, **_):
+        # The credential is gone by the time the plan's tasks exist: planning had it, no builder does.
+        with session_scope() as s:
+            planned = s.query(Task).filter(Task.workspace_id == workspace_id).count()
+        if planned:
+            raise InferenceError("No model provider is configured for this workspace. Add a MindsHub Inference key "
+                                 "in Settings.", cause="provider")
+        return ProviderConfig("openai", "http://model.test", "k", "Test")
+
+    def tasks():
+        with session_scope() as s:
+            return sorted((len((t.evidence or {}).get("attempts", [])), t.status, t.attempt, t.started_at is not None)
+                          for t in s.query(Task).filter(Task.outcome_id == outcome_id))
+
+    ScriptedModel.scripts["planner"] = planner
+    monkeypatch.setattr(runtime, "resolve_provider", provider)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "concurrency": 1}  # one task at a time: the other waits for the slot
+    outcome_id = new_outcome(factory)
+    # One task started and was refused before its session began; the other is still as it was planned.
+    held = [(0, "queued", 0, False), (1, "queued", 0, True)]
+    assert drive(lambda: tasks() == held)
+    [hold_id] = _holds(factory["ws"])
+    with session_scope() as s:
+        planned = s.query(Task).filter(Task.outcome_id == outcome_id).all()
+        [refused] = [t for t in planned if t.started_at]
+        hold = s.get(Decision, hold_id)
+        assert "No model provider is configured" in hold.body
+        assert f"{refused.key} of outcome #1, the builder session" in hold.body
+        # No session ran, so there is no run; the attempt was not used and neither task has a decision of its own.
+        assert s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "builder").count() == 0
+        assert [(a["n"], a["result"], a["cause"], a["phase"]) for a in refused.evidence["attempts"]] == [
+            (1, "infra", "provider", "build")]
+        assert s.query(Decision).filter(Decision.task_id.in_([t.id for t in planned])).count() == 0
+    # While the hold is open the other task does not start, and the refused one is not tried again.
+    assert not drive(lambda: tasks() != held, timeout=2)
+    assert _holds(factory["ws"]) == [hold_id] and "builder" not in ScriptedModel.calls
 
 
 def _running_tasks(factory, *stages):
@@ -3284,6 +3516,24 @@ def test_a_builder_stopped_by_its_cap_with_nothing_changed_is_a_failed_attempt(f
     assert f"ended without a report: {error}" in prompts[1]
     with session_scope() as s:
         assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 2
+
+
+def test_a_session_failure_worded_like_an_outage_is_still_the_attempts_own(factory):
+    # The harness said this failure was the session's own (it carries no cause), so its wording is not read: there
+    # is no infrastructure retry, the attempt is charged and the next one follows at once.
+    error = "Error code: 503 - rate limit exceeded, try again later"
+    assert delivery.infrastructure_problem(error) == "transient"  # what the wording alone would say
+    builder, _ = _in_turn(_cut_off(error, write=False), good_builder)
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    records = _attempt_records(outcome_id)
+    assert [(a["n"], a["result"]) for a in records] == [(1, "builder_failed"), (2, "verified")]
+    assert records[0]["error"] == error and "infra_retry" not in _event_kinds(outcome_id)
+    assert _holds(factory["ws"]) == _holds(factory["ws"], "resolved") == []
+    with session_scope() as s:
+        failed = s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "builder", Run.status == "failed").one()
+        assert failed.config_snapshot["failure"] == {"cause": "", "status": None}
 
 
 def test_a_provider_problem_after_the_builder_wrote_code_is_still_infrastructure(factory):
