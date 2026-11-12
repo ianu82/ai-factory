@@ -12,6 +12,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from ..onboarding_policy import check_merge_reservation
 from ..models import DefinitionRevision, DefinitionState, Repository, Workspace
 from .schema import Bundle, KnowledgePage, Source
 from .validation import DefinitionError, validate_bundle
@@ -40,9 +41,14 @@ def lock_workspace(db: Session, workspace_id: str) -> None:
             found = db.scalar(select(Workspace).where(Workspace.id == workspace_id).with_for_update())
     if not found:
         raise DefinitionError("Workspace not found")
+    ws = db.get(Workspace, workspace_id, populate_existing=True)
+    check_merge_reservation(ws)
 
 
 def lock_repositories(db: Session, workspace_id: str) -> list[Repository]:
+    # Workspace first, even for direct callers: row locks alone cannot fence a
+    # concurrent authorization or serialize repository insertion on SQLite.
+    lock_workspace(db, workspace_id)
     # Lock all owned rows in stable order, including source-only references.
     return list(db.scalars(select(Repository).where(Repository.workspace_id == workspace_id)
                            .order_by(Repository.id).with_for_update().execution_options(populate_existing=True)))

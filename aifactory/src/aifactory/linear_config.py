@@ -85,6 +85,11 @@ def save_config(db: Session, workspace: Workspace, config: LinearConfig, actor: 
     from .onboarding_policy import lock_workspace
 
     workspace = lock_workspace(db, workspace.id)
+    # Discovery ran before the lock. A disconnect may have raced it; recheck
+    # ownership without repeating any provider request inside this transaction.
+    owned = {r.id for r in db.query(Repository).filter_by(workspace_id=workspace.id)}
+    if not set(config.repo_ids) <= owned:
+        raise LinearConfigError("Linear repositories must belong to this workspace")
     value = config.model_dump()
     if (workspace.settings or {}).get("linear") == value:
         return

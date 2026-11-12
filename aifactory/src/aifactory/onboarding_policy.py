@@ -8,6 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -17,7 +18,25 @@ KEY = "learning"
 POLICIES = ("plan", "merge", "release")
 
 
-def lock_workspace(db: Session, workspace_id: str) -> Workspace:
+class MergeReservationConflict(HTTPException):
+    """A short-lived transaction must not invalidate an authorized external effect.
+
+    The fence is durable, not a lease: an uncertain request needs reconciliation,
+    never a timeout-based takeover. HTTP callers can retry after reconciliation.
+    """
+
+    def __init__(self):
+        super().__init__(409, "A merge is authorized or awaiting reconciliation; retry after it settles",
+                         headers={"Retry-After": "1"})
+
+
+def check_merge_reservation(ws: Workspace, *, token: str | None = None) -> None:
+    reservation = ws.merge_reservation
+    if reservation and (token is None or reservation.get("token") != token):
+        raise MergeReservationConflict()
+
+
+def lock_workspace(db: Session, workspace_id: str, *, reservation_token: str | None = None) -> Workspace:
     """Serialize policy gates and settings writes, then discard any stale snapshot.
 
     A no-op UPDATE locks the row on PostgreSQL and acquires SQLite's write lock
@@ -28,8 +47,10 @@ def lock_workspace(db: Session, workspace_id: str) -> Workspace:
         db.execute(update(Workspace).where(Workspace.id == workspace_id)
                    .values(outcome_seq=Workspace.outcome_seq)
                    .execution_options(synchronize_session=False))
-        return (db.query(Workspace).filter(Workspace.id == workspace_id)
-                .populate_existing().one())
+        ws = (db.query(Workspace).filter(Workspace.id == workspace_id)
+              .populate_existing().one())
+        check_merge_reservation(ws, token=reservation_token)
+        return ws
 
 
 def active(raw: dict[str, Any] | None) -> bool:

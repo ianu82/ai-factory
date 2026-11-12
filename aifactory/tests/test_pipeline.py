@@ -1853,7 +1853,7 @@ def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
     for owner, status in ((second.instance, "running"), ("", "running"), ("", "waiting_ci")):
         hold(owner, status)
         for stale in (runner._guard, lambda: runner._guard("running"),
-                      lambda: runner._merge_under_workspace_lock(GitHub(), "squash")):
+                      lambda: asyncio.run(runner._serialized_merge(GitHub(), "squash"))):
             with pytest.raises(delivery.Stop):
                 stale()
         assert lease(runner.task_id)[:2] == (status, owner)  # a refused guard changes nothing
@@ -1861,7 +1861,7 @@ def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
 
     hold(first.instance)
     runner._guard()
-    assert runner._merge_under_workspace_lock(GitHub(), "squash") == {"sha": "merged"}
+    assert asyncio.run(runner._serialized_merge(GitHub(), "squash")) == {"sha": "merged"}
     assert (merged, lease(runner.task_id)[:2]) == ([(1, "head")], ("running", first.instance))
 
     runner.owner = None  # a CI poll works on a parked task that nobody leases, and is not asked
@@ -2617,60 +2617,48 @@ def merge_gate_runner(factory):
     return delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
 
 
-def test_onboarding_activation_waits_for_final_merge_transaction(factory):
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event as ThreadEvent
-
-    from sqlalchemy import event
-    from aifactory import db
+def test_onboarding_activation_conflicts_with_reserved_merge_without_holding_sql_lock(factory):
     from aifactory.onboarding import start_onboarding
+    from aifactory.onboarding_policy import MergeReservationConflict
 
     runner = merge_gate_runner(factory)
-    merging, release, attempting, activated = (ThreadEvent() for _ in range(4))
 
-    class GitHub:
-        async def merge(self, *args, **kwargs):
-            merging.set()
-            while not release.is_set():
-                await asyncio.sleep(0.01)
-            assert not activated.is_set()
-            return {"sha": "merged"}
+    async def go():
+        merging, release = asyncio.Event(), asyncio.Event()
 
-    def activate():
-        with session_scope() as s:
-            start_onboarding(factory["ws"], s.get(User, factory["user"]), s)
-        activated.set()
+        class GitHub:
+            async def merge(self, *args, **kwargs):
+                assert kwargs["sha"] == "head"
+                merging.set()
+                await release.wait()
+                return {"sha": "merged"}
 
-    def observe_lock(conn, cursor, statement, parameters, context, executemany):
-        if statement.startswith("UPDATE workspaces") and merging.is_set():
-            attempting.set()
+        def concurrent_write():
+            # A distinct connection can acquire SQLite's global write lock while
+            # GitHub is paused. Same-workspace task writes are not fenced either.
+            with session_scope() as s:
+                s.get(Task, runner.task_id).summary = "unrelated update"
+            with session_scope() as s:
+                with pytest.raises(MergeReservationConflict) as conflict:
+                    start_onboarding(factory["ws"], s.get(User, factory["user"]), s)
+                assert conflict.value.status_code == 409
+                assert conflict.value.headers["Retry-After"] == "1"
+            with session_scope() as s:
+                assert "learning" not in s.get(Workspace, factory["ws"]).settings
+                assert s.get(Workspace, factory["ws"]).merge_reservation
 
+        merge = asyncio.create_task(runner._serialized_merge(GitHub(), "squash"))
+        try:
+            await merging.wait()
+            await asyncio.wait_for(asyncio.to_thread(concurrent_write), timeout=5)
+        finally:
+            release.set()
+            assert await merge == {"sha": "merged"}
+
+    asyncio.run(go())
     with session_scope() as s:
-        engine = s.get_bind()
-    event.listen(engine, "before_cursor_execute", observe_lock)
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            async def go():
-                merge = asyncio.create_task(runner._serialized_merge(GitHub(), "squash"))
-                activation = None
-                try:
-                    assert await asyncio.to_thread(merging.wait, 5)
-                    activation = pool.submit(activate)
-                    assert await asyncio.to_thread(attempting.wait, 5)
-                    # The UPDATE has reached the DB, but /start must not commit
-                    # learning while GitHub's merge is still in flight.
-                    assert not await asyncio.to_thread(activated.wait, 0.2)
-                finally:
-                    release.set()
-                    result = await merge
-                assert result == {"sha": "merged"}
-                if activation:
-                    await asyncio.wrap_future(activation)
-            asyncio.run(go())
-    finally:
-        release.set()
-        event.remove(engine, "before_cursor_execute", observe_lock)
-    assert activated.is_set()
+        assert s.get(Workspace, factory["ws"]).merge_reservation is None
+        start_onboarding(factory["ws"], s.get(User, factory["user"]), s)
     with session_scope() as s:
         assert s.get(Workspace, factory["ws"]).settings["learning"]["status"] == "learning"
 
@@ -2699,29 +2687,37 @@ def test_learning_committed_before_final_merge_lock_opens_approval(factory, monk
         assert s.query(Decision).filter_by(task_id=runner.task_id, kind="approve_merge", status="open").count() == 1
 
 
-def test_final_merge_timeout_releases_workspace_lock(factory, monkeypatch):
-    from aifactory.onboarding_policy import begin, lock_workspace
+def test_final_merge_timeout_retains_fence_until_reconciled(factory, monkeypatch):
+    from aifactory.onboarding_policy import MergeReservationConflict, lock_workspace
 
     runner = merge_gate_runner(factory)
-    wait_for = asyncio.wait_for
     timeouts = []
 
-    async def short_timeout(awaitable, *, timeout):
+    async def timeout_without_sleep(awaitable, *, timeout):
         timeouts.append(timeout)
-        return await wait_for(awaitable, timeout=0.01)
+        awaitable.close()
+        raise asyncio.TimeoutError()
 
     class GitHub:
         async def merge(self, *args, **kwargs):
-            await asyncio.sleep(10)
+            pytest.fail("The injected timeout must prevent this call")
 
-    monkeypatch.setattr(delivery.asyncio, "wait_for", short_timeout)
+        async def pull(self, *args):
+            return {"state": "open", "merged": False, "head": {"sha": "head"}}
+
+    monkeypatch.setattr(delivery.asyncio, "wait_for", timeout_without_sleep)
     with pytest.raises(delivery.GitHubError, match="merge timed out"):
         asyncio.run(runner._serialized_merge(GitHub(), "squash"))
     assert timeouts == [60]
-    # A failed network request must not strand the onboarding lock.
     with session_scope() as s:
-        ws = lock_workspace(s, factory["ws"])
-        ws.settings = begin(ws.settings)
+        assert s.get(Workspace, factory["ws"]).merge_reservation
+        with pytest.raises(MergeReservationConflict):
+            lock_workspace(s, factory["ws"])
+    # A new runner must reconcile, not send another merge PUT.
+    restarted = delivery.TaskRunner(runner.task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    with pytest.raises(delivery.GitHubError, match="uncertain"):
+        asyncio.run(restarted._serialized_merge(GitHub(), "squash"))
+    assert timeouts == [60]
 
 
 def test_cancelling_final_merge_waits_for_bounded_transaction(factory):
@@ -4752,3 +4748,178 @@ def test_checks_and_smoke_run_holding_a_host_check_slot(factory, monkeypatch):
     assert outcome_status(outcome_id) == "completed"
     assert ("check", 1) in held and ("smoke", 1) in held, held
     assert all(running == 1 for kind, running in held if kind in ("check", "smoke")), held
+
+
+@pytest.mark.parametrize("response", ["refused", "false", "transport", "server", "empty"])
+def test_merge_reservation_response_cleanup_and_restart(factory, response):
+    runner = merge_gate_runner(factory)
+    calls = []
+
+    class GitHub:
+        merged = False
+
+        async def merge(self, *args, **kwargs):
+            calls.append(kwargs["sha"])
+            if response == "refused":
+                raise delivery.GitHubError("branch protection", status=405)
+            if response == "false":
+                return {"merged": False, "message": "branch protection"}
+            if response == "transport":
+                raise OSError("connection lost")
+            if response == "server":
+                raise delivery.GitHubError("gateway lost response", status=502)
+            return {}
+
+        async def pull(self, *args):
+            return {"state": "closed" if self.merged else "open", "merged": self.merged,
+                    "merge_commit_sha": "merged" if self.merged else None, "head": {"sha": "head"}}
+
+    gh = GitHub()
+    with pytest.raises(delivery.GitHubError):
+        asyncio.run(runner._serialized_merge(gh, "squash"))
+    with session_scope() as s:
+        reservation = s.get(Workspace, factory["ws"]).merge_reservation
+        assert bool(reservation) == (response not in ("refused", "false"))
+    assert calls == ["head"]
+    if reservation:
+        # Even after lease takeover/restart, an open PR never licenses a duplicate
+        # PUT. Reconciliation is read-only until the exact pinned head is merged.
+        restarted = delivery.TaskRunner(runner.task_id, asyncio.Event(), lambda _: asyncio.Lock())
+        with pytest.raises(delivery.GitHubError, match="uncertain"):
+            asyncio.run(restarted._serialized_merge(gh, "squash"))
+        gh.merged = True
+        assert asyncio.run(restarted._serialized_merge(gh, "squash")) == {"sha": "merged", "merged": True}
+        # A later retry observes the durable merge result even after releasing the fence.
+        assert asyncio.run(restarted._serialized_merge(gh, "squash")) == {"sha": "merged"}
+        assert calls == ["head"]
+        with session_scope() as s:
+            assert s.get(Workspace, factory["ws"]).merge_reservation is None
+            assert s.get(Task, runner.task_id).merge_sha == "merged"
+
+
+def test_merge_lost_response_reconciles_before_releasing_fence(factory):
+    runner = merge_gate_runner(factory)
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            raise delivery.GitHubError("lost response", status=502)
+
+        async def pull(self, *args):
+            # Prove both the merge request and recovery have no SQL write lock.
+            with session_scope() as s:
+                s.get(Task, runner.task_id).summary = "reconciled outside transaction"
+            return {"merged": True, "merge_commit_sha": "merged", "head": {"sha": "head"}}
+
+    assert asyncio.run(runner._serialized_merge(GitHub(), "squash")) == {"sha": "merged", "merged": True}
+    with session_scope() as s:
+        assert s.get(Workspace, factory["ws"]).merge_reservation is None
+        assert s.get(Task, runner.task_id).merge_sha == "merged"
+
+
+def test_merge_reservation_token_cannot_clear_newer_owner(factory):
+    runner = merge_gate_runner(factory)
+    old = runner._merge_under_workspace_lock()
+    with session_scope() as s:
+        s.get(Workspace, factory["ws"]).merge_reservation = {**old, "token": "new-owner"}
+    assert runner._finish_merge_reservation(old, "must-not-land") is False
+    with session_scope() as s:
+        assert s.get(Workspace, factory["ws"]).merge_reservation["token"] == "new-owner"
+        assert not s.get(Task, runner.task_id).merge_sha
+
+
+@pytest.mark.parametrize("change", ["head", "pr", "lease", "approval", "config"])
+def test_merge_authorization_refreshes_candidate_policy_and_approval(factory, change):
+    from datetime import timedelta
+    from aifactory.db import utcnow
+
+    runner = merge_gate_runner(factory)
+    owner = Orchestrator().instance
+    if change == "lease":
+        runner.owner = owner
+    with session_scope() as s:
+        task = s.get(Task, runner.task_id)
+        if change == "head":
+            task.head_sha = "a-new-unverified-head"
+        elif change == "pr":
+            task.pr_number = 2
+        elif change == "lease":
+            task.lease_owner, task.lease_expires_at = owner, utcnow() - timedelta(seconds=1)
+        elif change == "approval":
+            s.get(Workspace, factory["ws"]).settings = {**runner.settings,
+                                                       "autonomy": {"merge": "approval"}}
+            s.add(Decision(workspace_id=runner.ws, outcome_id=task.outcome_id, task_id=task.id,
+                           kind="approve_merge", title="Merge?", status="resolved", resolution="reject",
+                           resolved_at=utcnow()))
+        else:
+            s.get(Repository, factory["repo"]).config = {"merge": {"mode": "approval"}}
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            pytest.fail("Stale snapshots must not authorize a merge")
+
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner._serialized_merge(GitHub(), "squash"))
+    with session_scope() as s:
+        assert s.get(Workspace, factory["ws"]).merge_reservation is None
+
+
+def test_repeated_cancellation_retains_repository_turn_until_merge_settles(factory):
+    runner = merge_gate_runner(factory)
+
+    async def go():
+        entered, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        lock = asyncio.Lock()
+
+        class GitHub:
+            async def merge(self, *args, **kwargs):
+                entered.set()
+                await release.wait()
+                return {"sha": "merged"}
+
+        async def first():
+            async with lock:
+                return await runner._serialized_merge(GitHub(), "squash")
+
+        async def second():
+            async with lock:
+                queued.set()
+
+        merge = asyncio.create_task(first())
+        await entered.wait()
+        next_turn = asyncio.create_task(second())
+        for _ in range(3):
+            merge.cancel()
+            await asyncio.sleep(0)  # deterministic scheduler turn, not a wall-clock delay
+            assert not merge.done() and not queued.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await merge
+        await next_turn
+        assert queued.is_set()
+
+    asyncio.run(go())
+    with session_scope() as s:
+        assert s.get(Workspace, factory["ws"]).merge_reservation is None
+        assert s.get(Task, runner.task_id).merge_sha == "merged"
+
+
+@pytest.mark.parametrize("state", ["unreadable", "different-head", "open"])
+def test_merge_reconciliation_never_releases_unproven_intent(factory, state):
+    runner = merge_gate_runner(factory)
+    intent = runner._merge_under_workspace_lock()
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            pytest.fail("Recovery must never replay an uncertain PUT")
+
+        async def pull(self, *args):
+            if state == "unreadable":
+                raise delivery.GitHubError("offline")
+            return {"merged": state != "open", "merge_commit_sha": "merged",
+                    "head": {"sha": "another-head" if state == "different-head" else "head"}}
+
+    with pytest.raises(delivery.GitHubError, match="uncertain"):
+        asyncio.run(runner._serialized_merge(GitHub(), "squash"))
+    with session_scope() as s:
+        assert s.get(Workspace, factory["ws"]).merge_reservation == intent
+        assert not s.get(Task, runner.task_id).merge_sha

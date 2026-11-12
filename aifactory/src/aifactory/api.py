@@ -342,7 +342,11 @@ async def put_linear_config(workspace_id: str, body: linear_config.LinearConfig,
         raise HTTPException(422, str(exc)) from None
     except LinearError as exc:
         raise HTTPException(503, str(exc)) from None
-    linear_config.save_config(db, ws, body, user.id)
+    try:
+        linear_config.save_config(db, ws, body, user.id)
+    except linear_config.LinearConfigError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from None
     return body
 
 
@@ -727,7 +731,9 @@ async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depend
                       description=info.get("description") or "", config=config)
     try:
         definitions.lock_workspace(db, workspace_id)
-        definitions.lock_repositories(db, workspace_id)
+        owned = definitions.lock_repositories(db, workspace_id)
+        if any(r.full_name == repo.full_name for r in owned):
+            raise HTTPException(409, "Already connected")
         db.add(repo)
         definitions.validate_repository_change(db, workspace_id, author=user.id)
         db.commit()

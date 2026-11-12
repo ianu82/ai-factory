@@ -65,6 +65,8 @@ class Workspace(Base):
     settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     onboarding: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     outcome_seq: Mapped[int] = mapped_column(Integer, default=0)
+    # Durable authorization fence. Never expire an uncertain external merge by time.
+    merge_reservation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

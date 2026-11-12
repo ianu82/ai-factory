@@ -2048,11 +2048,11 @@ class TaskRunner:
         return "\n\n" + "\n".join(lines)
 
     # merge ---------------------------------------------------------------------
-    def _merge_needs_approval(self, settings: dict[str, Any] | None = None) -> bool:
+    def _merge_needs_approval(self, settings: dict[str, Any] | None = None, *, task: Task | None = None) -> bool:
         from ..onboarding_policy import active
 
         settings = workspace_settings(self.ws) if settings is None else settings
-        if active(settings) or _review_asks(getattr(self, "task", None), settings, self.cfg):
+        if active(settings) or _review_asks(task or getattr(self, "task", None), settings, self.cfg):
             return True
         merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
         release_cfg = self.cfg.get("release") or {}
@@ -2074,63 +2074,170 @@ class TaskRunner:
                    options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
 
     async def _serialized_merge(self, gh: GitHub, method: str) -> dict[str, Any]:
-        # The synchronous DB lock may wait for another merge or settings writer.
-        # Keep that wait off the event loop so the lock owner can finish its I/O.
-        merge = asyncio.create_task(asyncio.to_thread(self._merge_under_workspace_lock, gh, method))
-        try:
-            result = await asyncio.shield(merge)
-        except asyncio.CancelledError:
-            # A thread cannot be cancelled. Keep the caller's repository lock
-            # until this bounded transaction exits, even during shutdown.
+        # Shield the entire authorization/effect/finalization sequence. Cancellation
+        # must not release the caller's repository turn while the effect can land.
+        merge = asyncio.create_task(self._reserved_merge(gh, method))
+        cancelled = False
+        while True:
             try:
-                await merge
-            finally:
+                result = await asyncio.shield(merge)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if merge.done():
+                    # Retrieve an exception too; no orphaned background operation.
+                    break
+            except Exception:
+                if cancelled:
+                    raise asyncio.CancelledError() from None
                 raise
+        if cancelled:
+            if not merge.cancelled():
+                merge.exception()
+            raise asyncio.CancelledError()
         if result is None:
-            # Open the decision only after releasing the lock: block/update use
-            # their own transactions, which would otherwise deadlock on SQLite.
             self._open_merge_approval()
         return result
 
-    def _merge_under_workspace_lock(self, gh: GitHub, method: str) -> dict[str, Any] | None:
+    async def _reserved_merge(self, gh: GitHub, method: str) -> dict[str, Any] | None:
+        recovered = await self._reconcile_merge_reservation(gh)
+        if recovered is not None:
+            return recovered
+        reservation = await asyncio.to_thread(self._merge_under_workspace_lock)
+        if reservation is None:
+            return None
+        if "sha" in reservation:
+            return reservation
+        try:
+            result = await asyncio.wait_for(
+                gh.merge(reservation["repository"], reservation["pr"], sha=reservation["head"],
+                         method=reservation["method"], title=reservation["title"]), timeout=60)
+        except GitHubError as exc:
+            # A definite refusal is safe to release. Transport errors, server errors
+            # and request timeouts do not prove the merge did not happen.
+            if exc.status in (400, 401, 403, 404, 405, 409, 422):
+                await asyncio.to_thread(self._finish_merge_reservation, reservation)
+                raise
+            recovered = await self._reconcile_merge_reservation(gh, reservation)
+            if recovered is not None:
+                return recovered
+            raise
+        except Exception as exc:
+            try:
+                recovered = await self._reconcile_merge_reservation(gh, reservation)
+            except GitHubError:
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise GitHubError("GitHub merge timed out after 60 seconds; authorization is retained "
+                                      "until the PR can be reconciled.") from exc
+                raise
+            if recovered is not None:
+                return recovered
+            raise
+        if result.get("merged") is False:
+            await asyncio.to_thread(self._finish_merge_reservation, reservation)
+            raise GitHubError("GitHub refused the merge: " + str(result.get("message") or "not merged"))
+        if not result.get("sha"):
+            return await self._reconcile_merge_reservation(gh, reservation)
+        if not await asyncio.to_thread(self._finish_merge_reservation, reservation, result["sha"]):
+            raise GitHubError("Merge ownership changed; reconcile before continuing")
+        return result
+
+    def _merge_under_workspace_lock(self) -> dict[str, Any] | None:
+        """Authorize only: commit and return a pinned intent, never do I/O here."""
+        from uuid import uuid4
+
         from ..onboarding_policy import lock_workspace
         from .runtime import merged_settings
 
         with session_scope() as s:
             ws = lock_workspace(s, self.ws)
-            task = s.get(Task, self.task_id)
-            # The last check before the merge, which cannot be taken back: the task must still be this runner's.
+            task = s.get(Task, self.task_id, populate_existing=True)
             if self.cancelled.is_set() or not self._holds(s, task):
                 raise Stop()
-            if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
+            if (task.head_sha, task.pr_number, task.repo_id) != (
+                    self.task.head_sha, self.task.pr_number, self.repo.id) or not task.head_sha:
+                raise Stop()
+            if task.lease_expires_at is not None and self.owner is not None and task.lease_expires_at <= utcnow():
+                raise Stop()
+            if task.merge_sha:
+                return {"sha": task.merge_sha}
+            repo = s.get(Repository, task.repo_id, populate_existing=True)
+            if repo is None or repo.workspace_id != self.ws:
+                raise Stop()
+            # Approval and policy must use the refreshed candidate/config in this
+            # same transaction, not a separate session or the runner's old snapshot.
+            self.cfg = repo.config or {}
+            settings = merged_settings(ws.settings)
+            if self._merge_needs_approval(settings, task=task) and not self._approved(
+                    "approve_merge", session=s, task=task, settings=settings):
                 return None
+            reservation = {"token": uuid4().hex, "task_id": task.id, "repo_id": repo.id,
+                           "repository": repo.full_name, "pr": task.pr_number, "head": task.head_sha,
+                           "owner": self.owner, "at": utcnow().isoformat(),
+                           "method": (self.cfg.get("merge") or {}).get("method", "squash"),
+                           "title": f"{task.title} (#{task.pr_number})"}
+            ws.merge_reservation = reservation
+        return reservation
 
-            async def merge():
-                return await asyncio.wait_for(
-                    gh.merge(self.repo.full_name, self.task.pr_number, sha=self.task.head_sha,
-                             method=method, title=f"{self.task.title} (#{self.task.pr_number})"),
-                    timeout=60,
-                )
+    def _finish_merge_reservation(self, reservation: dict, sha: str = "") -> bool:
+        """Release only this token, recording a confirmed effect atomically."""
+        from ..onboarding_policy import MergeReservationConflict, lock_workspace
 
+        with session_scope() as s:
             try:
-                # Hold the same workspace lock as onboarding/start and all
-                # settings writers through the external side effect, not just
-                # the policy read. The network wait is explicitly bounded.
-                return asyncio.run(merge())
-            except asyncio.TimeoutError as exc:
-                raise GitHubError("GitHub merge timed out after 60 seconds; check the PR before retrying.") from exc
+                ws = lock_workspace(s, self.ws, reservation_token=reservation["token"])
+            except MergeReservationConflict:
+                return False
+            if not ws.merge_reservation or ws.merge_reservation.get("token") != reservation["token"]:
+                return False
+            if sha:
+                task = s.get(Task, reservation["task_id"], populate_existing=True)
+                if task is None or (task.head_sha, task.pr_number) != (reservation["head"], reservation["pr"]):
+                    raise GitHubError("Merged candidate changed locally; reconciliation requires a person")
+                task.merge_sha = sha
+            ws.merge_reservation = None
+        return True
 
-    def _approved(self, kind: str) -> bool:
+    async def _reconcile_merge_reservation(self, gh: GitHub, reservation: dict | None = None) -> dict | None:
+        from ..onboarding_policy import MergeReservationConflict
+
+        if reservation is None:
+            def read():
+                from ..models import Workspace
+                with session_scope() as s:
+                    return s.get(Workspace, self.ws).merge_reservation
+            reservation = await asyncio.to_thread(read)
+        if not reservation:
+            return None
+        if reservation["task_id"] != self.task_id or reservation["repo_id"] != self.repo.id:
+            raise MergeReservationConflict()
+        # No DB session survives this request. An open PR is NOT proof a timed-out
+        # PUT cannot still land. Never expire the fence or resend that PUT blindly.
+        try:
+            pr = await gh.pull(reservation["repository"], reservation["pr"])
+        except Exception as exc:
+            raise GitHubError("Merge outcome is uncertain; authorization retained for reconciliation") from exc
+        if (pr.get("merged") and pr.get("merge_commit_sha")
+                and pr.get("head", {}).get("sha") == reservation["head"]):
+            sha = pr["merge_commit_sha"]
+            if await asyncio.to_thread(self._finish_merge_reservation, reservation, sha):
+                return {"sha": sha, "merged": True}
+        raise GitHubError("Merge outcome is uncertain; authorization retained. Check the reserved PR before retrying")
+
+    def _approved(self, kind: str, *, session=None, task=None, settings=None) -> bool:
         """An approval covers the candidate that was published before it was given. A merge approval also covers
         the same patch published again later, at a new head on a newer base, unless ``merge.approval`` is "head".
         Read only: the merge consults it again while it holds the workspace lock."""
-        with session_scope() as s:
-            row = (s.query(Decision).filter(Decision.task_id == self.task_id, Decision.kind == kind,
-                                            Decision.status == "resolved").order_by(Decision.resolved_at.desc()).first())
-            if not (row and row.resolution == "approve" and row.resolved_at):
-                return False
-            given = row.resolved_at
-        evidence = self.task.evidence or {}
+        if session is None:
+            with session_scope() as s:
+                return self._approved(kind, session=s, task=task, settings=settings)
+        row = (session.query(Decision).filter(Decision.task_id == self.task_id, Decision.kind == kind,
+                                             Decision.status == "resolved")
+               .order_by(Decision.resolved_at.desc()).populate_existing().first())
+        if not (row and row.resolution == "approve" and row.resolved_at):
+            return False
+        given = row.resolved_at
+        evidence = (task or self.task).evidence or {}
         published, approved = evidence.get("published") or {}, evidence.get("approved") or {}
         if not published.get("at") or given >= datetime.fromisoformat(published["at"]):
             return True
@@ -2141,13 +2248,17 @@ class TaskRunner:
             own = datetime.fromisoformat(approved.get("at") or "") >= given
         except (TypeError, ValueError):
             return False
-        mode = (self.cfg.get("merge") or {}).get("approval") or (workspace_settings(self.ws).get("merge") or {}).get(
-            "approval")
+        settings = settings if settings is not None else workspace_settings(self.ws)
+        mode = (self.cfg.get("merge") or {}).get("approval") or (settings.get("merge") or {}).get("approval")
         return own and mode == "patch"
 
     async def merge(self) -> None:
         token = resolve_token(self.ws)
         gh = GitHub(token)
+        async with self.repo_lock(self.repo.id):
+            recovered = await self._reconcile_merge_reservation(gh)
+        if recovered is not None:
+            self.update(merge_sha=recovered["sha"])
         if self.task.pr_number:
             current = await gh.pull(self.repo.full_name, self.task.pr_number)
             self._guard()
