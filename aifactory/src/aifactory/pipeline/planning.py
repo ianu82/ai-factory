@@ -26,7 +26,7 @@ from ..sandbox import LocalSandbox
 from . import delivery
 from .holds import open_provider_hold
 from .runtime import (SessionSpec, carried_cause, guidance_history, open_decision, outcome_committed, precedents,
-                      run_agent, set_outcome, merged_settings, workspace_settings)
+                      question_metadata, run_agent, set_outcome, merged_settings, workspace_settings)
 
 log = logging.getLogger(__name__)
 
@@ -293,7 +293,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
             options.insert(0, {"value": "approve", "label": "Approve plan as proposed"})
         options.append({"value": "cancel", "label": "Cancel"})
         open_decision(workspace_id, "question", f"Planner needs a decision for #{snapshot.number}", body,
-                      outcome_id=outcome_id, options=options)
+                      outcome_id=outcome_id, options=options, metadata=question_metadata("planner"))
         return
     if not note and review and review["verdict"] == "approve" and approve_plan(
             plan_id, approved_by=None, reviewer=review.get("model") or "the plan reviewer"):

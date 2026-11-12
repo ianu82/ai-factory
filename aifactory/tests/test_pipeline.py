@@ -98,6 +98,7 @@ def factory(tmp_path, monkeypatch):
         s.flush()
         # These scenarios exercise an established operational workspace, not first-run learning.
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
+        settings["decision_judges"] = "off"
         settings["limits"]["ci_minutes"] = 1
         # No scenario waits for pull request reviews unless it turns them on (see review_on in test_ci_parking.py).
         settings["review"]["address"] = "off"
@@ -373,7 +374,7 @@ def test_builder_question_reaches_a_person_and_answer_resumes(factory):
     def listening_verifier(messages):
         if step(messages) == 0:
             prompt = messages[1]["content"]
-            verifier_heard.append("## What people decided or asked for on this work" in prompt
+            verifier_heard.append("## Guidance recorded on this work" in prompt
                                   and "Use 'Hello, Factory!'" in prompt)
         return passing_verifier(messages)
 
@@ -5002,3 +5003,60 @@ def test_checks_and_smoke_run_holding_a_host_check_slot(factory, monkeypatch):
     assert outcome_status(outcome_id) == "completed"
     assert ("check", 1) in held and ("smoke", 1) in held, held
     assert all(running == 1 for kind, running in held if kind in ("check", "smoke")), held
+
+
+@pytest.mark.parametrize("origin", ["planner", "builder", "verifier"])
+def test_agent_entry_routes_through_judge_and_resumes(factory, monkeypatch, origin):
+    """Exercise actual planner/builder/verifier gates, not only synthetic runtime calls."""
+    from aifactory import decision_judge_runner as judge
+    from aifactory.models import DecisionReview, Message
+    monkeypatch.setattr(judge, "ModelClient", ScriptedModel)
+    monkeypatch.setattr(judge, "resolve_provider", lambda _: ProviderConfig("openai", "http://model.test", "k", "Test"))
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "decision_judges": "decide", "lead": {"enabled": False},
+                       "pricing": {"gpt-terra": {"input": 1, "output": 2}}}
+    ScriptedModel.judge_calls = []
+    received = []
+    if origin == "planner":
+        def asking(messages):
+            report = json.loads(planner_script([{"role": "assistant"}])["tool_calls"][0]["function"]["arguments"])
+            report["questions"] = [{"question": "Which greeting?", "why": "Need wording"}]
+            return {"content": "", "tool_calls": [call("finish", report)]}
+        ScriptedModel.scripts["planner"] = asking
+    elif origin == "builder":
+        ScriptedModel.scripts["builder"] = lambda _: {"content": "", "tool_calls": [call("finish", {
+            "status": "blocked", "summary": "Need wording", "blocked_reason": "Which greeting?"})]}
+    else:
+        ScriptedModel.scripts["verifier"] = lambda _: {"content": "Not a verdict", "tool_calls": []}
+
+    def judge_script(messages):
+        ScriptedModel.scripts["planner"] = planner_script
+        def hearing(messages):
+            received.append(("builder", str(messages)))
+            return good_builder(messages)
+        def verifying(messages):
+            received.append(("verifier", str(messages)))
+            return passing_verifier(messages)
+        ScriptedModel.scripts["builder"] = hearing
+        ScriptedModel.scripts["verifier"] = verifying
+        return {"content": json.dumps({"verdict": "send_back", "answer": "Use the greeting specified in the task.",
+            "summary": "The specification already supplies the greeting.", "citations": [], "closest_decisions": []})}
+    ScriptedModel.scripts["judge"] = judge_script
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert len(ScriptedModel.judge_calls) == 1
+    context = json.loads(ScriptedModel.judge_calls[0]["messages"][1]["content"])["context"]
+    assert context["question"]["kind"] == ("unblock" if origin == "verifier" else "question")
+    with session_scope() as s:
+        decision = s.query(Decision).filter_by(outcome_id=outcome_id).one()
+        assert decision.metadata_json["origin"]["role"] == origin
+        assert decision.status == "resolved" and decision.resolution == "send_back"
+        assert s.query(DecisionReview).filter_by(decision_id=decision.id).one().finished_at
+        assert s.query(Message).filter_by(outcome_id=outcome_id, author_kind="factory").count() == 1
+    if origin != "planner":
+        # A verifier unblock resumes main's saved candidate at verification, not
+        # by rebuilding already completed work. Both resume paths must hear it.
+        resumed_role = "verifier" if origin == "verifier" else "builder"
+        assert any(role == resumed_role and "Use the greeting specified in the task." in text
+                   for role, text in received)

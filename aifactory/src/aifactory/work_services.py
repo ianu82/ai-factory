@@ -126,7 +126,7 @@ def cancel_outcome(db: Session, user: User, workspace_id: str, outcome_id: str, 
         t.status = "cancelled"
         if t.pr_number:
             later.append(("close_pull", t.id, "Cancelled"))
-    for d in db.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status == "open"):
+    for d in db.query(Decision).filter(Decision.outcome_id == outcome.id, Decision.status.in_(("open", "judging"))):
         d.status = "superseded"
     payload = events.record(workspace_id, "outcome_cancelled", f"{author(user, action_id)} cancelled #{outcome.number}",
                             outcome_id=outcome.id, actor=user.id, level="warn", data=attribution(action_id),
@@ -144,6 +144,8 @@ def cancel_task(db: Session, user: User, workspace_id: str, task_id: str, *,
         raise HTTPException(404, "Task not found")
     if t.status not in ("completed",):
         t.status = "cancelled"
+    for d in db.query(Decision).filter(Decision.task_id == t.id, Decision.status.in_(("open", "judging"))):
+        d.status = "superseded"
     payload = events.record(workspace_id, "task_cancelled", f"{author(user, action_id)} stopped {t.key}",
                             outcome_id=t.outcome_id, task_id=t.id, actor=user.id, level="warn",
                             data=attribution(action_id), session=db, publish=False)

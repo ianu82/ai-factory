@@ -156,7 +156,7 @@ def test_corrections_in_input_and_validation(data, model):
     with db.session_scope() as s:
         q = s.get(Decision, data[-1])
         corrected = Decision(workspace_id=data[0], outcome_id=data[3], kind="question", title="Correction",
-                             status="resolved", resolution="answer", comment="Use a database.",
+                             status="resolved", resolution="answer", comment="Use a database.", scope="workspace",
                              created_at=q.created_at - timedelta(hours=3), resolved_at=q.created_at - timedelta(hours=2))
         s.add(corrected)
         s.flush()
