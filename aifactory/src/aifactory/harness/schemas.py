@@ -66,6 +66,16 @@ BUILDER_REPORT: dict[str, Any] = {
         },
         "runtime_pages": {"type": "array", "items": {"type": "string"},
                           "description": "Up to 4 page paths worth a screenshot because this change affects them."},
+        "review_responses": {
+            "type": "array",
+            "description": "Only when the task lists review findings: one answer for every finding id listed.",
+            "items": {"type": "object", "properties": {
+                "id": {"type": "string", "description": "The finding's id, copied exactly"},
+                "action": {"type": "string", "enum": ["fixed", "disputed", "deferred"]},
+                "note": {"type": "string", "description": "One or two sentences for the reviewer: what you changed, "
+                                                          "or why you did not"}},
+                "required": ["id", "action", "note"]},
+        },
     },
     "required": ["status", "summary"],
 }
@@ -163,10 +173,11 @@ def uncovered_criteria(expected: Sequence[str], criteria: list[dict[str, Any]]) 
     return [(n, " ".join(str(expected[n - 1]).split())) for n in missing]
 
 
-def validate_report(role: str, report: Any,
-                    expected_criteria: Sequence[str] | None = None) -> tuple[dict[str, Any] | None, str]:
+def validate_report(role: str, report: Any, expected_criteria: Sequence[str] | None = None,
+                    expected_findings: Sequence[str] | None = None) -> tuple[dict[str, Any] | None, str]:
     """Light, forgiving validation: returns (normalized_report, error). ``expected_criteria`` are the task's
-    acceptance criteria, when the caller knows them: a verifier's report needs a result of its own for each."""
+    acceptance criteria, when the caller knows them: a verifier's report needs a result of its own for each.
+    ``expected_findings`` are the ids of the review findings a builder was given: its report answers each."""
     if not isinstance(report, dict):
         return None, "The report must be a JSON object."
     schema = SCHEMAS[role]
@@ -232,6 +243,15 @@ def validate_report(role: str, report: Any,
                           "it is; or use pass and keep the findings as advice.")
     if role == "builder" and report.get("status") not in ("done", "blocked"):
         return None, "status must be done or blocked."
+    if role == "builder" and report["status"] == "done" and expected_findings:
+        answers = report.get("review_responses")
+        answered = {a.get("id") for a in (answers if isinstance(answers, list) else []) if isinstance(a, dict)
+                    and a.get("action") in ("fixed", "disputed", "deferred") and str(a.get("note") or "").strip()}
+        if unanswered := [f for f in expected_findings if f not in answered]:
+            more = f" (and {len(unanswered) - 10} more)" if len(unanswered) > 10 else ""
+            return None, (f"review_responses must answer every review finding you were given. Not answered: "
+                          f"{', '.join(unanswered[:10])}{more}. Give each its id copied exactly, an action (fixed, "
+                          "disputed or deferred) and a short note.")
     if role == "plan_reviewer":
         if report.get("verdict") not in ("approve", "revise", "escalate"):
             return None, "verdict must be approve, revise or escalate."

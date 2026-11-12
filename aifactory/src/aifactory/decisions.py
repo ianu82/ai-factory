@@ -13,6 +13,7 @@ from .models import Decision, Message, Outcome, Plan, Task, User
 from .pipeline.orchestrator import ACTIVE_TASK, HUMAN_TASK, orchestrator
 from .pipeline.lifecycle import ACCEPTING, accepted_after_merge, complete_accepted
 from .pipeline.planning import approve_plan
+from .review import requested_round
 
 
 class DecisionError(ValueError):
@@ -128,7 +129,8 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             guidance(comment or "A reviewer requested changes before merging.")
             task.status, task.stage, task.attempt = "queued", "revise", 0
             # A requested revision is a fresh budget: earlier rounds' offsets and automatic retries do not carry over.
-            task.evidence = fresh_budget(task.evidence)
+            # It is a review round too: it counts, and the builder answers what the head's review left open.
+            task.evidence = requested_round(fresh_budget(task.evidence), task.head_sha)
     elif kind == "budget" and task:
         if resolution == "retry":
             from .pipeline.runtime import budget_extension, outcome_committed, workspace_settings

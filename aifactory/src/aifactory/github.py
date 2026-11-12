@@ -368,8 +368,9 @@ class GitHub:
     async def pull(self, full_name: str, number: int) -> dict[str, Any]:
         return await self.request("GET", f"/repos/{full_name}/pulls/{number}")
 
-    async def comment(self, full_name: str, number: int, body: str) -> None:
-        await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body})
+    async def comment(self, full_name: str, number: int, body: str, *, retries: int = 3) -> None:
+        await self.request("POST", f"/repos/{full_name}/issues/{number}/comments", json={"body": body},
+                           retries=retries)
 
     async def _deployment_pages(self, path: str, *, params: dict | None = None,
                                 deadline: float, clock=time.monotonic) -> list[dict[str, Any]]:
@@ -431,7 +432,7 @@ class GitHub:
         owner, name = full_name.split("/", 1)
         comment_fields = """id fullDatabaseId databaseId body url createdAt updatedAt path line originalLine diffHunk
             author { login __typename } pullRequestReview { fullDatabaseId databaseId state }
-            replyTo { fullDatabaseId databaseId }"""
+            replyTo { fullDatabaseId databaseId } authorAssociation"""
         connection = "pageInfo { hasNextPage endCursor }"
         query = """query($owner:String!, $name:String!, $number:Int!, $after:String) {
             repository(owner:$owner, name:$name) { pullRequest(number:$number) {
@@ -492,7 +493,7 @@ class GitHub:
         from .review import FACTORY_REPLY_MARKER
 
         return await self.request("POST", f"/repos/{full_name}/pulls/{number}/comments/{comment_id}/replies",
-                                  json={"body": f"{body}\n\n{FACTORY_REPLY_MARKER}"}, retries=0)
+                                  json={"body": f"{FACTORY_REPLY_MARKER}\n{body}"}, retries=0)
 
     async def resolve_review_thread(self, thread_id: str) -> dict[str, Any]:
         data = await self.graphql("""mutation($id:ID!) {
@@ -503,23 +504,28 @@ class GitHub:
             raise GitHubError("GitHub did not confirm review thread resolution")
         return thread
 
-    async def review_feedback(self, full_name: str, number: int, policy: dict) -> list[dict[str, Any]]:
+    async def review_snapshot(self, full_name: str, number: int) -> dict[str, Any]:
         """Collect a complete authenticated snapshot; never swallow provider errors."""
-        from .review import normalize_feedback, review_policy
-
-        policy = review_policy({"review": policy})
-        if policy["address"] == "off":
-            return []
         # Installation tokens have no /user identity. The PR author is already
         # excluded by normalization; bot comments are filtered independently.
         identity = {"login": ""} if self.installation_bound else await self.user()
         pull = await self.pull(full_name, number)
         if (not self.installation_bound and not identity.get("login")) or not (pull.get("user") or {}).get("login"):
             raise GitHubError("GitHub review identity is unavailable")
-        return normalize_feedback(reviews=await self.reviews(full_name, number),
-                                  threads=await self.review_threads(full_name, number),
-                                  comments=await self.issue_comments(full_name, number),
-                                  policy=policy, identity=identity, pull_author=pull["user"])
+        # Read in the order a reviewer writes: Codex marks its review complete in a comment after it has submitted
+        # its findings, so the comments are read first and every review they announce is in what is read after.
+        comments = await self.issue_comments(full_name, number)
+        reviews = await self.reviews(full_name, number)
+        return {"identity": identity, "pull_author": pull["user"], "reviews": reviews,
+                "threads": await self.review_threads(full_name, number), "comments": comments}
+
+    async def review_feedback(self, full_name: str, number: int, policy: dict) -> list[dict[str, Any]]:
+        from .review import normalize_feedback, review_policy
+
+        policy = review_policy({"review": policy})
+        if policy["address"] == "off":
+            return []
+        return normalize_feedback(policy=policy, **await self.review_snapshot(full_name, number))
 
     async def _actions_checks(self, full_name: str, sha: str) -> list[dict[str, Any]]:
         """Fine-grained tokens often lack the Checks permission; Actions read covers workflow jobs."""
