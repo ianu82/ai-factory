@@ -59,12 +59,20 @@ TRIAGE = ("accept", "ignore")
 
 
 def triage(db: Session, sig: Signal, user: User, action: str, *, title: str | None = None,
-           brief: str | None = None) -> Signal:
+           brief: str | None = None, pending_only: bool = False) -> Signal:
     """Accept a signal as work or ignore it, as the Signals page does: accepting creates one outcome, never a second.
     Linear issues (Linear intake owns them) and improvement proposals (they change settings) have their own paths.
-    The caller commits, then wakes the orchestrator when an outcome was created."""
+    The workspace's row lock serializes triage, and the signal is read again under it, so two people (or a person
+    and the Director) accepting at once create one outcome. ``pending_only`` refuses (ValueError) a signal someone
+    has triaged meanwhile. The caller commits, then wakes the orchestrator when an outcome was created."""
+    from .onboarding_policy import lock_workspace
+
     if action not in TRIAGE:
         raise ValueError("Unknown action")
+    lock_workspace(db, sig.workspace_id)
+    db.refresh(sig)
+    if pending_only and sig.status not in ("new", "proposed"):
+        raise ValueError("Someone has triaged this signal already")
     sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
     if action == "ignore":
         sig.status = "ignored"

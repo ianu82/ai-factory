@@ -277,7 +277,7 @@ def claim(item: dict[str, Any]) -> tuple[str, float] | None:
         if history and (now - history[0]["started_at"] < COOLDOWN
                         or any(run["finished"] is None and now - run["started_at"] < CLAIMED for run in history)):
             return None
-        usd = min(float(item.get("usd") or 0.0), cfg["daily_usd"] - _spent(history))
+        usd = min(float(item.get("usd") or 0.0), cfg["run_usd"], cfg["daily_usd"] - _spent(history))
         if usd < UNPRICED_MIN:
             return None
         run_id = new_id()
@@ -539,9 +539,13 @@ class Tools:
             sig = s.query(Signal).filter(Signal.id == signal_id, Signal.workspace_id == self.ws).first()
             if sig is None or sig.status not in ("new", "proposed") or sig.source not in TRIAGE_SOURCES:
                 return "No signal awaiting triage with that id in this workspace."
-            created = action == "accept" and sig.outcome_id is None
             user = director_user(s)
-            triage(s, sig, user, action, title=(title or "").strip() or None, brief=(brief or "").strip() or None)
+            try:
+                triage(s, sig, user, action, title=(title or "").strip() or None,
+                       brief=(brief or "").strip() or None, pending_only=True)
+            except ValueError as exc:
+                return f"Not applied: {exc}."
+            created = sig.status == "accepted"
             number = s.get(Outcome, sig.outcome_id).number if sig.outcome_id else None
             record(self.ws, "director_triage", f"Director {'accepted' if action == 'accept' else 'ignored'} a signal: "
                    f"{sig.title[:200]}", outcome_id=sig.outcome_id, actor=user.id,

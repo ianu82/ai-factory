@@ -174,6 +174,29 @@ def test_two_scheduler_instances_never_both_start_a_run(world):
     assert world["ws"] not in woken()
 
 
+def test_a_claim_uses_the_per_run_cap_saved_since_due(world):
+    item = woken()[world["ws"]]
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "director": {**ON, "run_usd": 1.5}}
+    assert director.claim(item)[1] == 1.5
+
+
+def test_triage_creates_one_outcome_and_the_director_never_overrides_a_persons_triage(world):
+    from aifactory.signals import triage
+
+    with db.session_scope() as s:
+        person = s.get(User, world["uid"])
+        triage(s, s.get(Signal, world["smoke"]), person, "accept")
+    with db.session_scope() as s:
+        sig = s.get(Signal, world["smoke"])
+        first = sig.outcome_id
+        triage(s, sig, s.get(User, world["uid"]), "accept")  # accepting again creates nothing
+        assert sig.outcome_id == first and s.query(Outcome).filter_by(signal_id=sig.id).count() == 1
+        with pytest.raises(ValueError, match="triaged this signal already"):
+            triage(s, sig, director.director_user(s), "ignore", pending_only=True)
+
+
 @pytest.mark.parametrize("change", ["paused", "off", "hold"])
 def test_a_claim_rechecks_what_may_have_changed_since_due(world, change):
     item = woken()[world["ws"]]
