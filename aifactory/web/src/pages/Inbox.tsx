@@ -160,7 +160,7 @@ export function InboxPage() {
               </div>
               <div className="meta">
                 {inline && (
-                  <button className="btn sm primary ib-act" disabled={busy !== null}
+                  <button className="btn sm primary ib-act" disabled={busy !== null} title={inline.effect}
                     onClick={(e) => { e.stopPropagation(); quick(d, inline.value); }}>
                     {busy === `${d.id}:${inline.value}` ? "…" : inline.label}
                   </button>

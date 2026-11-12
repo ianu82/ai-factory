@@ -369,7 +369,8 @@ def test_a_failure_the_base_commit_has_too_waits_for_main_to_move_and_the_builde
     with session_scope() as s:
         decision = s.query(Decision).filter(Decision.task_id == tid).one()
         assert "CI did not finish" in decision.title and "base branch too (ci)" in decision.body
-        assert decision.options[0] == {"value": "retry", "label": "Keep waiting"}
+        assert decision.options[0] == {"value": "retry", "label": "Keep waiting",
+                                       "effect": "Waits up to 1 more minute for CI on PR #1."}
 
 
 @pytest.mark.parametrize("on_base,unreadable", [(["lint"], False), ([], False), (["ci"], True)])
@@ -704,6 +705,73 @@ def test_a_blocking_finding_with_no_rounds_left_asks_a_person_even_when_merges_a
     status, stage, ev, _ = snapshot(tid)
     assert (status, stage) == ("queued", "revise")
     assert (ev["review"]["rounds"], ev["review"]["round"]["findings"]) == (3, [fid])
+
+
+def merge_facts(tid):
+    """The open merge approval's facts (metadata_json["merge"])."""
+    with session_scope() as s:
+        return s.query(Decision).filter(Decision.task_id == tid, Decision.kind == "approve_merge",
+                                        Decision.status == "open").one().metadata_json["merge"]
+
+
+@pytest.mark.parametrize("case", ["timeout", "rounds"])
+def test_a_merge_approval_says_which_review_rule_asked_for_a_person(factory, case):
+    tid, head = awaiting_review(factory, autonomy="auto", on_timeout="ask", max_rounds=2)
+    if case == "timeout":
+        expire_review(tid)
+    else:
+        set_review(tid, rounds=2)
+        finding(head)
+    assert poll(tid)[:2] == ("queued", "merge")
+    body = approval(tid)
+    facts = merge_facts(tid)
+    because = {"timeout": "review_timeout", "rounds": "review_rounds"}[case]
+    assert facts["asked"] == {"because": because, "text": delivery.MERGE_ASKS[because]}
+    assert facts["review"] == ({"state": "unavailable", "reviewers": [], "round": 0, "open": 0, "blocking": 0}
+                               if case == "timeout" else
+                               {"state": "reviewed", "reviewers": [CODEX["login"]], "round": 2, "open": 1,
+                                "blocking": 1})
+    assert facts["ci"] == {"state": "success", "checks": 1}
+    review_line = ("Review: no review of this head; 0 findings open; 0 review rounds so far" if case == "timeout"
+                   else f"Review: reviewed by {CODEX['login']}; 1 finding open (1 blocking); 2 review rounds so far")
+    # The facts follow today's sentence, the review's own summary still closes the text.
+    assert f"\nCI: success (1 check)\n{review_line}\n" in body
+    assert f"\n{delivery.MERGE_ASKS[because]}\n\n" in body
+
+
+@pytest.mark.parametrize("case", ["workspace", "repository", "release", "learning"])
+def test_a_merge_approval_says_which_setting_asked_for_a_person(factory, case):
+    from aifactory.onboarding_policy import begin
+
+    with session_scope() as s:
+        ws, repo = s.get(Workspace, factory["ws"]), s.get(Repository, factory["repo"])
+        settings = json.loads(json.dumps(ws.settings))
+        settings["autonomy"]["release"] = "approval" if case == "release" else "auto"
+        if case == "workspace":
+            settings["autonomy"]["merge"] = "approval"
+        elif case == "repository":
+            repo.config = {**repo.config, "merge": {"mode": "approval"}}
+        elif case == "release":
+            repo.config = {**repo.config, "release": {"mode": "on_merge"}}
+        else:
+            settings = begin(settings)
+        ws.settings = settings
+    tid = candidate(factory)
+    body = approval(tid)
+    facts = merge_facts(tid)
+    assert facts["asked"] == {"because": case, "text": delivery.MERGE_ASKS[case]}
+    assert body.endswith(f"\n{delivery.MERGE_ASKS[case]}")  # reviews are off: no review summary follows
+    # A candidate with no attempt or diff on record says what it knows and leaves the rest out.
+    assert facts["cost"] == {"usd": 0.0, "attempts": 0}
+    assert not {"change", "verifier", "checks", "ci", "review"} & set(facts)
+
+
+def test_a_merge_that_waits_for_nobody_has_no_reason_to_give(factory):
+    tid = candidate(factory)
+    assert approval(tid) is None
+    from aifactory.pipeline.runtime import DEFAULT_SETTINGS
+
+    assert delivery._merge_asks(None, json.loads(json.dumps(DEFAULT_SETTINGS)), {}) == ("", "")
 
 
 def test_reviews_that_cannot_be_read_are_tried_again_and_after_the_deadline_the_approval_says_so(factory):
@@ -1554,7 +1622,8 @@ def test_slow_poll_is_retried_and_the_deadline_opens_durable_decision(factory, m
         return
     with session_scope() as s:
         decision = s.query(Decision).filter(Decision.task_id == tid).one()
-        assert decision.options[0] == {"value": "retry", "label": "Keep waiting"}
+        assert decision.options[0] == {"value": "retry", "label": "Keep waiting",
+                                       "effect": "Waits up to 1 more minute for CI on PR #1."}
         assert ev["ci_wait"]["timed_out"] is True
         resolve(s, decision, s.get(User, factory["user"]), "retry")
     reset = snapshot(tid)[2]["ci_wait"]["deadline"]
@@ -1608,8 +1677,10 @@ def test_failed_observation_after_restart_honors_deadline(factory, monkeypatch, 
     if expired:
         with session_scope() as s:
             decision = s.query(Decision).filter(Decision.task_id == tid).one()
-            assert decision.options == [{"value": "retry", "label": "Keep waiting"},
-                                        {"value": "abandon", "label": "Abandon"}]
+            assert decision.options == [
+                {"value": "retry", "label": "Keep waiting", "effect": "Waits up to 1 more minute for CI on PR #1."},
+                {"value": "abandon", "label": "Abandon",
+                 "effect": "Ends the task undelivered and closes its pull request, if it has one."}]
             assert ev["ci_wait"]["timed_out"] is True
         return
     # One failed look is noise: the task keeps waiting, says so once, and looks again.

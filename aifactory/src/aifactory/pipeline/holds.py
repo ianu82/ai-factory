@@ -116,7 +116,9 @@ def open_provider_hold(workspace_id: str, error: str, source: str) -> str:
                  "Nothing new starts in this workspace, neither planning nor tasks, until someone chooses Resume "
                  "work. Work that is refused the same way waits in the queue; no task is charged an attempt for "
                  f"it.\n\nWhat to do: {advice} If the provider still refuses, this hold opens again.",
-            options=[{"value": "retry", "label": "Resume work"}],
+            options=[{"value": "retry", "label": "Resume work",
+                      "effect": "Lets planning and tasks start again; if the provider still refuses, the hold opens "
+                                "again."}],
             metadata_json={"cause": cause, "source": source[:300], "error": error[:1500]})
         s.add(decision)
         s.flush()

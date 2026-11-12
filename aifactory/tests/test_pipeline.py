@@ -319,6 +319,11 @@ def test_plan_approval_policy_waits_for_a_person(factory, client):
     with session_scope() as s:
         decision = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.status == "open").one()
         assert decision.kind == "approve_plan"
+        assert decision.options == [
+            {"value": "approve", "label": "Approve", "effect": "Approves the plan; building starts."},
+            {"value": "replan", "label": "Revise",
+             "effect": "Sends your comment to the planner, which proposes a new plan."},
+            {"value": "cancel", "label": "Cancel", "effect": "Cancels the outcome and stops all of its work."}]
         user = s.get(User, factory["user"])
     from aifactory.decisions import resolve
     from aifactory.db import SessionLocal
@@ -343,6 +348,70 @@ def test_plan_approval_policy_waits_for_a_person(factory, client):
     assert FakeGitHub.merged == [1]
 
 
+def test_a_merge_approval_carries_the_change_its_checks_its_cost_and_why_a_person_is_asked(factory):
+    from aifactory import serializers
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {"plan": "auto", "merge": "approval", "release": "auto"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    with session_scope() as s:
+        decision = s.get(Decision, _open_decision(outcome_id, "approve_merge"))
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        spent = round(sum(r.cost_usd or 0 for r in s.query(Run).filter(
+            Run.task_id == task.id, Run.role.in_(("builder", "verifier")), Run.cost_known.is_(True))), 2)
+        text = "\n".join([
+            "Change: 1 file, +1 -1: greet.sh",
+            "Verifier: pass — Greeting verified.",
+            "Repository checks: 1 of 1 passed",
+            "CI: success (1 check)",
+            f"Cost so far: ${spent:.2f} on builder and verifier sessions, 1 charged attempt",
+            "Asked because merges in this workspace wait for a person (Settings → Autonomy)."])
+        facts = decision.metadata_json["merge"]
+        assert facts == {"pr": 1, "head": task.head_sha,
+                         "change": {"files": 1, "additions": 1, "deletions": 1, "paths": ["greet.sh"]},
+                         "verifier": {"verdict": "pass", "summary": "Greeting verified."},
+                         "checks": {"passed": 1, "total": 1, "preexisting": 0},
+                         "ci": {"state": "success", "checks": 1}, "cost": {"usd": spent, "attempts": 1},
+                         "asked": {"because": "workspace", "text": delivery.MERGE_ASKS["workspace"]}, "text": text}
+        assert "review" not in facts  # reviews are off in this workspace
+        # Today's sentence first, then the facts as short lines: the Lead, the Director and Mind read the text.
+        assert decision.body == (f"PR #1 passed independent verification and CI at {task.head_sha[:10]}. "
+                                 f"{task.pr_url}\n{text}")
+        assert decision.options == [
+            {"value": "approve", "label": "Merge",
+             "effect": "Merges PR #1 into main; the release follows the repository's release rule."},
+            {"value": "reject", "label": "Request changes",
+             "effect": "Sends your comment to the builder for another attempt; the pull request stays open."}]
+        shown = serializers.decision(decision)
+        assert shown["merge"] == facts and shown["options"] == decision.options
+    db = SessionLocal()  # the options' effects change nothing about answering: the value alone decides
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]),
+            "approve")
+    db.close()
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert FakeGitHub.merged == [1]
+
+
+def test_only_a_merge_approval_carries_merge_facts_to_the_app(factory):
+    from aifactory import serializers
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plain = Decision(workspace_id=factory["ws"], outcome_id=outcome_id, kind="approve_merge", title="Old",
+                         body="Approve", options=[{"value": "approve", "label": "Merge"}])
+        other = Decision(workspace_id=factory["ws"], outcome_id=outcome_id, kind="unblock", title="Stuck", body="",
+                         options=[{"value": "retry", "label": "Retry"}], metadata_json={"merge": {"pr": 1}})
+        s.add_all([plain, other])
+        s.flush()
+        # An approval opened before merge facts were recorded, and any other kind, show as they did.
+        assert "merge" not in serializers.decision(plain) and "merge" not in serializers.decision(other)
+        assert serializers.decision(plain)["options"] == [{"value": "approve", "label": "Merge"}]
+
+
 def test_builder_question_reaches_a_person_and_answer_resumes(factory):
     def blocked_builder(messages):
         return {"content": "", "tool_calls": [call("finish", {"status": "blocked", "summary": "Need wording",
@@ -361,6 +430,8 @@ def test_builder_question_reaches_a_person_and_answer_resumes(factory):
         decision_id = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.kind == "question").one().id
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         assert task.status == "needs_input" and task.attempt == 0
+        assert s.get(Decision, decision_id).options == [delivery.ANSWER, delivery.ABANDON]
+        assert all(o["effect"] for o in s.get(Decision, decision_id).options)
     from aifactory.db import SessionLocal
     from aifactory.decisions import resolve
 
@@ -1117,8 +1188,18 @@ def _task_with_history(factory, results, runs=(), **fields):
 
 
 LIFETIME_OPTIONS = [{"value": "retry", "label": "Allow 3 more attempts"},
-                    {"value": "take_over", "label": "I'll take it from here"},
-                    {"value": "abandon", "label": "Abandon task"}]
+                    {"value": "take_over", "label": "I'll take it from here",
+                     "effect": "Stops the Factory on this task; its latest change waits for you on its branch or pull "
+                               "request."},
+                    {"value": "abandon", "label": "Abandon task",
+                     "effect": "Ends the task undelivered and closes its pull request, if it has one."}]
+
+
+def _lifetime_options(more):
+    """LIFETIME_OPTIONS with what allowing more lets the task spend."""
+    return [{**LIFETIME_OPTIONS[0], "effect": f"Lets the task go on with a fresh set of attempts: up to 15 attempts in "
+                                              f"all and {more} more on its builder and verifier sessions."},
+            *LIFETIME_OPTIONS[1:]]
 
 
 def test_a_task_at_its_lifetime_attempt_limit_asks_a_person_before_another_builder_session(factory):
@@ -1136,7 +1217,7 @@ def test_a_task_at_its_lifetime_attempt_limit_asks_a_person_before_another_build
             "The last attempt ended in verification_failed: Greeting still wrong.",
             "Recommended: this task has gone round the loop too often to be worth another round as it is. Abandon "
             "it and plan the work again as smaller tasks, or take it over."]
-        assert decision.options == LIFETIME_OPTIONS
+        assert decision.options == _lifetime_options("$30.00")
         assert decision.metadata_json == {
             "people_only": "A task at its lifetime limit goes on only when a person says so",
             "lifetime_limit": {"attempts": 12, "attempts_limit": 12, "usd": 0.0, "usd_limit": 15.0,
@@ -1174,7 +1255,7 @@ def test_a_task_that_has_spent_its_lifetime_dollars_asks_a_person_before_another
         assert decision.body.split("\n\n")[0] == (
             "T1 has used 2 attempts (lifetime limit: 12) and $15.50 on its builder and verifier sessions "
             "(lifetime limit: $15.00). It has reached its dollar limit.")
-        assert decision.options == LIFETIME_OPTIONS
+        assert decision.options == _lifetime_options("$15.00")
         assert decision.metadata_json["lifetime_limit"] == {
             "attempts": 2, "attempts_limit": 12, "usd": 15.5, "usd_limit": 15.0,
             "allow": {"attempts": 15, "usd": 30.5}}
@@ -1203,7 +1284,9 @@ def test_allowing_more_lets_exactly_one_more_set_of_attempts_run_before_asking_a
     with session_scope() as s:
         second = s.get(Decision, _open_decision(outcome_id, "unblock"))
         assert second.title == "T1: reached its lifetime limit"
-        assert second.options[0] == {"value": "retry", "label": "Allow 1 more attempt"}
+        assert second.options[0] == {"value": "retry", "label": "Allow 1 more attempt",
+                                     "effect": "Lets the task go on with a fresh set of attempts: up to 14 attempts in "
+                                               "all and $45.00 more on its builder and verifier sessions."}
         assert second.metadata_json["lifetime_limit"] == {
             "attempts": 13, "attempts_limit": 13, "usd": 0.0, "usd_limit": 30.0,
             "allow": {"attempts": 14, "usd": 45.0}}
@@ -1632,8 +1715,10 @@ def test_a_change_to_a_rail_asks_a_person_to_merge_even_when_merging_is_automati
         assert settings["autonomy"]["merge"] == "auto"
         assert decision.body.startswith("This change touches the Factory's rails (greet.sh), so a person approves "
                                         "its merge.\n\nPR #1 passed independent verification")
-        assert decision.metadata_json == {
-            "people_only": "A change to the Factory's rails merges only when a person approves it"}
+        assert decision.metadata_json["people_only"] == (
+            "A change to the Factory's rails merges only when a person approves it")
+        assert decision.metadata_json["merge"]["asked"] == {"because": "rails", "text": delivery.MERGE_ASKS["rails"]}
+        assert delivery.MERGE_ASKS["rails"] in decision.body
         assert task.evidence["rails"] == {"head": task.head_sha, "base": task.base_sha, "paths": ["greet.sh"]}
         assert director.choices(s, decision, director.settings_for(settings))[0] == []  # only a person answers
     assert FakeGitHub.merged == []
@@ -3299,7 +3384,9 @@ def test_a_provider_billing_problem_holds_the_workspace_without_using_an_attempt
             (1, "infra", "provider", "build")]
         assert (hold.outcome_id, hold.task_id, hold.title) == (None, None, "Model provider refused: work is on hold")
         assert "credits are used up" in hold.body and "T1 of outcome #1, the builder session" in hold.body
-        assert hold.options == [{"value": "retry", "label": "Resume work"}]
+        assert hold.options == [{"value": "retry", "label": "Resume work",
+                                 "effect": "Lets planning and tasks start again; if the provider still refuses, the "
+                                           "hold opens again."}]
         # The failed run keeps what the model client said failed it: the cause and the provider's status.
         failed = s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "builder").one()
         assert failed.config_snapshot["failure"] == {"cause": "provider", "status": 402}
@@ -3538,7 +3625,8 @@ def test_a_provider_hold_is_listed_without_an_outcome_and_can_only_be_resumed(fa
     [item] = r.json()["decisions"]
     assert (item["id"], item["kind"], item["actionable"]) == (hold_id, "provider_hold", True)
     assert (item["outcome_id"], item["task_id"], item["outcome_number"], item["task_key"]) == (None, None, None, None)
-    assert item["options"] == [{"value": "retry", "label": "Resume work"}]
+    assert [(o["value"], o["label"]) for o in item["options"]] == [("retry", "Resume work")]
+    assert item["options"][0]["effect"].startswith("Lets planning and tasks start again")
     assert "planning outcome #3" in item["body"] and "another refusal" not in item["body"]
     # Why the provider refused, and what lifts the hold: on the decision for every screen that shows the hold.
     assert item["hold"] == {"cause": "credit", "label": "the model provider account is out of credit",
@@ -3599,6 +3687,7 @@ def test_infrastructure_failures_are_retried_after_a_backoff_without_using_attem
         assert task.status == "blocked" and task.attempt == 0
         assert decision.title == "T1: infrastructure problem" and "upstream unavailable" in decision.body
         assert [o["value"] for o in decision.options] == ["retry", "abandon"]
+        assert [o["effect"] for o in decision.options] == [delivery.RETRY_STEP, delivery.ABANDON["effect"]]
         assert {a["phase"] for a in task.evidence["attempts"]} == {"build"}
         task.evidence = {**task.evidence, "auto_retries": 1}  # an unrelated budget the retry must keep
         decision_id, epoch = decision.id, task.evidence.get("budget_epoch", 0)
@@ -3683,8 +3772,10 @@ def test_known_spending_alone_stops_a_task_at_the_outcome_budget(factory, contin
         assert decision.title == f"Outcome #{s.get(Outcome, outcome_id).number} reached its $40 budget"
         assert decision.body == ("Spent $41.25; the limit was $40.00. Raise the budget in Settings, or continue with "
                                  f"${amount} more than is spent now.")
-        assert decision.options == [{"value": "retry", "label": f"Continue with ${amount} more"},
-                                    {"value": "abandon", "label": "Stop"}]
+        assert decision.options == [{"value": "retry", "label": f"Continue with ${amount} more",
+                                     "effect": f"Allows the outcome up to ${amount} more than it has spent now; the "
+                                               "task goes on."},
+                                    {"value": "abandon", "label": "Stop", "effect": "Ends this task undelivered."}]
     assert _continue_past_budget(factory, decision_id) == ("queued", 41.25 + float(amount))
 
 

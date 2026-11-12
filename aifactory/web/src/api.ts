@@ -411,7 +411,7 @@ export interface Decision {
   kind: string;
   title: string;
   body: string;
-  options: { value: string; label: string }[];
+  options: DecisionOption[];
   status: string;
   resolution: string;
   comment: string;
@@ -432,6 +432,25 @@ export interface Decision {
   lead_note?: { text: string; created_at: string; run_id?: string | null } | null;
   director_note?: { text: string; created_at: string } | null;
   hold?: HoldDetails;
+  merge?: MergeFacts;
+}
+
+/** One answer to a decision; `effect` says what choosing it does (absent on older decisions). */
+export interface DecisionOption { value: string; label: string; effect?: string }
+
+/** What a merge approval records for a person (pipeline/delivery.py TaskRunner._merge_facts). */
+export interface MergeFacts {
+  pr: number | null;
+  head: string;
+  change?: { files: number; additions: number; deletions: number; paths: string[] };
+  verifier?: { verdict: string; summary: string };
+  checks?: { passed: number; total: number; preexisting: number };
+  ci?: { state: string; checks: number };
+  review?: { state: string; reviewers: string[]; round: number; open: number; blocking: number };
+  cost?: { usd: number; attempts: number };
+  asked?: { because: string; text: string };
+  /** The same facts as lines of the decision's text. */
+  text?: string;
 }
 
 /** An outcome as a conversation (GET …/outcomes/{id}/conversation). */
