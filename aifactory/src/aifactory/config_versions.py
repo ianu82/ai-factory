@@ -102,7 +102,15 @@ def effective_build(raw: Mapping | None) -> dict:
     else:
         cfg.pop("cpu", None)
         cfg.pop("memory_gb", None)
+    _vm_fallback(cfg)
     return cfg
+
+
+def _vm_fallback(cfg: dict) -> None:
+    """``vm_fallback: "wait"``: without a VM the work waits for one. Anything else is the default and is left out:
+    the work then runs in a sandbox in the Factory container, and says so."""
+    if cfg.get("isolation") != "vm" or cfg.get("vm_fallback") != "wait":
+        cfg.pop("vm_fallback", None)
 
 
 def effective_qa(raw: Mapping | None, workspace_qa: Mapping | None = None) -> dict:
@@ -114,6 +122,9 @@ def effective_qa(raw: Mapping | None, workspace_qa: Mapping | None = None) -> di
     else:
         for key in ("cpu", "memory_gb", "prepared"):
             cfg.pop(key, None)
+    if cfg.get("vm_fallback") is None and (workspace_qa or {}).get("vm_fallback") is not None:
+        cfg["vm_fallback"] = (workspace_qa or {})["vm_fallback"]
+    _vm_fallback(cfg)
     if cfg.get("start"):
         cfg["env"] = {k: str(v) for k, v in (cfg.get("env") or {}).items()}
         cfg["env"].setdefault("NODE_ENV", "production")

@@ -84,6 +84,8 @@ def factory(tmp_path, monkeypatch):
     FakeGitHub.pulls = {}
     FakeGitHub.merged = []
     FakeGitHub.check_state = "success"
+    FakeGitHub.check_conclusion, FakeGitHub.check_run_id, FakeGitHub.workflows = None, None, False
+    FakeGitHub.reruns, FakeGitHub.base_failing = [], []
     FakeGitHub.comments, FakeGitHub.failures, FakeGitHub.reviewer = [], {}, None
     FakeGitHub.reviews, FakeGitHub.threads, FakeGitHub.issue_comments = [], [], []
     FakeGitHub.replies, FakeGitHub.resolved = [], []
@@ -2002,6 +2004,54 @@ def test_builder_can_work_in_an_isolated_vm(factory, monkeypatch, tmp_path):
     assert "create" in bridge.calls and "destroy" in bridge.calls
     # The builder's edit happened inside the VM and still reached main through the normal publish path.
     assert git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git").strip() == "echo 'Hello, Factory!'"
+
+
+def test_work_that_asks_for_a_vm_and_gets_none_runs_in_the_factory_container_and_says_so(factory, monkeypatch):
+    from aifactory import vm as vm_module
+
+    monkeypatch.setattr(vm_module, "vm_available", lambda: (False, "the VM limit is reached"))
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "build": {"isolation": "vm"}, "qa": {"isolation": "vm"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        said = s.query(Event).filter(Event.task_id == task.id,
+                                     Event.kind.in_(("build_vm_unavailable", "qa_vm_unavailable"))).all()
+        assert {(e.kind, e.data.get("fallback")) for e in said} == {("build_vm_unavailable", "container"),
+                                                                    ("qa_vm_unavailable", "container")}
+        record = task.evidence["isolation"]
+        assert {phase: (r["wanted"], r["used"], r["why"]) for phase, r in record.items()} == {
+            "build": ("vm", "container", "the VM limit is reached"),
+            "verify": ("vm", "container", "the VM limit is reached")}
+        body = FakeGitHub.pulls[task.pr_number]["body"]
+    # The pull request says it: a reviewer must not take the isolation the repository asks for as given.
+    assert "### Isolation" in body and "- The build: the VM limit is reached" in body
+    assert "- Independent verification and runtime QA: the VM limit is reached" in body
+
+
+def test_a_repository_that_waits_for_a_vm_runs_nothing_in_the_factory_container(factory, monkeypatch):
+    from aifactory import vm as vm_module
+
+    # Worded like a provider's limit: a missing VM is still the environment being unavailable, not an access problem.
+    monkeypatch.setattr(vm_module, "vm_available", lambda: (False, "VM limit reached"))
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "build": {"isolation": "vm", "vm_fallback": "wait"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: "infra_retry" in _event_kinds(outcome_id), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        # Not an attempt and not yet a question: the task is tried again later, and nothing ran outside a VM.
+        assert (task.status, task.attempt) == ("queued", 0) and "isolation" not in task.evidence
+        assert task.evidence["attempts"][-1]["cause"] == "transient"
+        assert not s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count()
+        [said] = s.query(Event).filter(Event.task_id == task.id, Event.kind == "build_vm_unavailable").all()
+        assert said.data["fallback"] == "wait"
+        retry = s.query(Event).filter(Event.task_id == task.id, Event.kind == "infra_retry").one()
+        assert "no VM is available (VM limit reached)" in retry.message
 
 
 def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
@@ -4845,6 +4895,26 @@ def test_the_work_in_progress_is_saved_once_more_when_the_service_stops_the_sess
     assert stored == ([(saved["artifact_id"], change.diff.decode())] if saves else []) and bool(saved) is saves
 
 
+@pytest.mark.parametrize("fix_round, by_a_person, saves", [("", False, True), ("", True, False),
+                                                           ("revise", False, False)])
+def test_the_work_in_progress_is_saved_once_more_when_the_session_returns(factory, monkeypatch, fix_round,
+                                                                          by_a_person, saves):
+    outcome_id, runner = _building(factory)
+    change = _change("Hello, Factory!")
+    taken = _snapshots(monkeypatch, change)
+
+    async def session():
+        async with runner._checkpoints(fix_round):
+            if by_a_person:  # a person's cancel ends the task: there is nothing to continue
+                runner.cancelled.set()
+
+    asyncio.run(session())
+    # Reading the candidate can take minutes: a restart before it is recorded continues from what the session left.
+    saved, stored = _saved_work(outcome_id)
+    assert len(taken) == (1 if saves else 0)
+    assert stored == ([(saved["artifact_id"], change.diff.decode())] if saves else []) and bool(saved) is saves
+
+
 @pytest.mark.parametrize("write, cleared", [
     ({"attempts": {"n": 1, "result": "builder_failed", "error": "ended without a report"}}, True),
     ({"attempts": {"n": 1, "result": "policy", "detail": "- over the line limit", "files": 1}}, True),
@@ -4973,18 +5043,27 @@ def test_base_check_results_are_cached_per_workspace_and_configuration():
 
 @pytest.mark.parametrize(('candidate', 'main', 'overlap'), [
     (['pkg/a.py'], ['pkg/a.py'], True),
-    (['pkg/a.py'], ['pkg/b.py'], True),
-    (['README.md'], ['settings.json'], True),
+    (['pkg/a.py', 'docs/x.md'], ['one/b.py', 'pkg/a.py'], True),
+    (['pkg/a.py'], ['pkg/b.py'], False),  # the same directory, different files
+    (['README.md'], ['settings.json'], False),
     (['one/a.py'], ['two/b.py'], False),
 ])
-def test_reverify_overlap_uses_immediate_parent(candidate, main, overlap):
+def test_reverify_overlap_is_a_shared_file_not_a_shared_directory(candidate, main, overlap):
     assert gitops.path_overlap(candidate, main)['overlap'] is overlap
+
+
+def test_reverify_overlap_keeps_shared_directories_as_information():
+    result = gitops.path_overlap(['pkg/a.py', 'README.md'], ['pkg/b.py', 'one/c.py'])
+    assert not result['overlap'] and (result['shared_files'], result['shared_files_count']) == ([], 0)
+    assert result['shared_directories_count'] == 1 and result['matching_pairs'] == [['pkg/a.py', 'pkg/b.py']]
+    result = gitops.path_overlap(['pkg/a.py', 'pkg/b.py'], ['pkg/b.py'])
+    assert result['overlap'] and (result['shared_files'], result['shared_files_count']) == (['pkg/b.py'], 1)
 
 
 def test_reverify_overlap_is_bounded_for_large_packages():
     result = gitops.path_overlap([f'pkg/a{i}.py' for i in range(1000)],
                                 [f'pkg/b{i}.py' for i in range(1000)])
-    assert result['overlap'] and result['shared_directories_count'] == 1
+    assert not result['overlap'] and result['shared_directories_count'] == 1
     assert len(result['matching_pairs']) == 1
 
 
@@ -5006,7 +5085,7 @@ def _runner(task_id):
 
 
 @pytest.mark.parametrize(('mode', 'path', 'run'), [
-    (None, 'other.txt', True), ('overlap', 'other.txt', True),
+    (None, 'other.txt', False), ('overlap', 'other.txt', False),  # the same directory is not the same file
     ('overlap', 'elsewhere/new.txt', False), ('always', 'elsewhere/new.txt', True),
     ('never', 'other.txt', False),
 ])
@@ -5035,7 +5114,8 @@ def test_revalidation_modes_record_decision_in_event_and_actual_pr(factory, monk
         task = s.get(Task, task_id)
         state = task.evidence['revalidation']
         assert state['run'] is run and state['phase'] == 'complete'
-        assert state['checks'][0]['ok']  # never/disjoint still run checks
+        assert state['checks'][0]['ok']  # never/disjoint still run checks where CI is not required
+        assert 'local_checks' not in state
         event = s.query(Event).filter_by(task_id=task_id, kind='reverify_decision').one()
         assert event.data['run'] is run and event.data['main_paths'] == [path]
     body = FakeGitHub.pulls[number]['body']
@@ -5044,9 +5124,70 @@ def test_revalidation_modes_record_decision_in_event_and_actual_pr(factory, monk
     assert details['candidate_paths'] == ['greet.sh'] and body.startswith('b')
 
 
+def _land_mode_change(factory, path):
+    """Land a change to ``path`` on main that no edit of its content conflicts with: the file becomes executable."""
+    seed = factory['remotes'] / 'seed/acme/demo'
+    (seed / path).chmod(0o755)
+    git('update-index', '--chmod=+x', path, cwd=seed)
+    git('commit', '-qm', f'make {path} executable', cwd=seed)
+    git('push', '-q', str(factory['remotes'] / 'acme/demo.git'), 'main', cwd=seed)
+    return git('rev-parse', 'HEAD', cwd=seed)
+
+
+@pytest.mark.parametrize(('require_ci', 'workflows', 'shared', 'skipped'), [
+    (True, False, False, True), (None, True, False, True), ('auto', True, False, True),
+    (None, False, False, False), (False, True, False, False),  # CI is not required: the checks run here
+    (True, False, True, False),  # a shared file: checks and verifier run whatever CI does
+])
+def test_a_rebase_sharing_no_file_leaves_its_checks_to_required_ci_which_is_awaited_on_the_new_head(
+        factory, monkeypatch, require_ci, workflows, shared, skipped):
+    task_id, number = _revalidation_candidate(factory)
+    if require_ci is not None:
+        with session_scope() as s:
+            repo = s.get(Repository, factory['repo'])
+            repo.config = {**repo.config, 'require_ci': require_ci}
+    FakeGitHub.workflows = workflows
+    main = _land_mode_change(factory, 'greet.sh') if shared else _land_on_main(factory, 'other.txt', 'new main\n')
+    sandboxes, verified = [], []
+    create = delivery.LocalSandbox.create
+
+    def created(self):
+        sandboxes.append(self.job_id)
+        return create(self)
+
+    async def verify(self, token, patch, attempt):
+        verified.append(patch.files)
+        self.verifier_report = {'verdict': 'pass', 'summary': 'ok'}
+        return self.verifier_report
+    monkeypatch.setattr(delivery.LocalSandbox, 'create', created)
+    monkeypatch.setattr(delivery.TaskRunner, '_verify', verify)
+    FakeGitHub.check_state = 'pending'
+    with pytest.raises(delivery.Stop):  # parked: the pull request's CI on the rebased commit comes before any merge
+        asyncio.run(_runner(task_id)._refresh_onto_main('token', FakeGitHub('t'), main))
+    revalidating = [job for job in sandboxes if job.endswith('-r')]  # ("-p" only reads what the new head changes)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        state, wait = task.evidence['revalidation'], task.evidence['ci_wait']
+        event = s.query(Event).filter_by(task_id=task_id, kind='reverify_decision').one()
+        assert (task.status, task.stage, state['phase']) == ('waiting_ci', 'ci', 'complete')
+        assert wait['head'] == task.head_sha == state['head'] != state['old_head'] and not FakeGitHub.merged
+        assert state['overlap'] is shared and state['run'] is shared
+        assert verified == ([['greet.sh']] if shared else [])
+        if skipped:
+            assert not revalidating and 'checks' not in state and 'setup' not in state
+            assert state['local_checks'] == event.data['local_checks'] == 'skipped'
+            assert 'CI on the rebased commit is the gate' in state['local_checks_reason']
+            assert event.message.endswith("its checks are left to the pull request's CI")
+        else:
+            assert len(revalidating) == 1 and state['checks'][0]['ok']
+            assert 'local_checks' not in state and 'local_checks' not in event.data
+    details = json.loads(FakeGitHub.pulls[number]['body'].split('```json\n')[1].split('\n```')[0])
+    assert details.get('local_checks') == ('skipped' if skipped else None)
+
+
 @pytest.mark.parametrize('failure', ['verifier', 'unicode_checks', 'formatting'])
 def test_revalidation_rejection_rebuilds_with_feedback_even_if_summary_fails(factory, monkeypatch, failure):
-    task_id, number = _revalidation_candidate(factory)
+    task_id, number = _revalidation_candidate(factory, 'always')
     main = _land_on_main(factory, 'other.txt', 'new main\n')
     runner = _runner(task_id)
     seen = []
@@ -5092,7 +5233,7 @@ def test_an_infrastructure_failure_while_revalidating_keeps_the_attempt_and_resu
     from aifactory.inference import InferenceError
 
     monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
-    task_id, _ = _revalidation_candidate(factory)
+    task_id, _ = _revalidation_candidate(factory, 'always')
     main = _land_on_main(factory, "other.txt", "new main\n")
 
     def unavailable(messages):
@@ -5161,7 +5302,7 @@ def test_outside_merge_takes_precedence_over_pending_revalidation(factory, monke
 
 
 def test_revalidation_push_interruption_resumes_verification_and_status_failure_is_auxiliary(factory, monkeypatch):
-    task_id, _ = _revalidation_candidate(factory)
+    task_id, _ = _revalidation_candidate(factory, 'always')
     main = _land_on_main(factory, 'other.txt', 'new main\n')
     runner = _runner(task_id)
     original = delivery.rebase_branch
@@ -5189,7 +5330,7 @@ def test_revalidation_push_interruption_resumes_verification_and_status_failure_
 
 
 def test_revalidation_missing_verifier_gate_resumes_original_runtime_path(factory, monkeypatch):
-    task_id, _ = _revalidation_candidate(factory)
+    task_id, _ = _revalidation_candidate(factory, 'always')
     main = _land_on_main(factory, 'other.txt', 'new main\n')
     original = delivery.TaskRunner._verify
     async def interrupt(*args):
@@ -5272,7 +5413,7 @@ def test_republication_preserves_human_and_revalidation_sections(factory, monkey
 
 
 def test_rebased_rejection_cannot_merge_until_subsequent_scripted_verification_passes(factory, monkeypatch):
-    task_id, _ = _revalidation_candidate(factory)
+    task_id, _ = _revalidation_candidate(factory, 'always')
     main = _land_on_main(factory, 'other.txt', 'new main\n')
     verified = []
     feedback_seen = []
@@ -5347,7 +5488,7 @@ def test_rebase_uses_observed_sha_even_if_main_moves_again(factory, monkeypatch)
 
 
 def test_revalidation_checks_and_verifier_do_not_hold_repository_lock(factory, monkeypatch):
-    task_id, _ = _revalidation_candidate(factory)
+    task_id, _ = _revalidation_candidate(factory, 'always')
     _land_on_main(factory, 'other.txt', 'new main\n')
     lock = asyncio.Lock()
     checks = delivery.TaskRunner._run_commands

@@ -40,6 +40,9 @@ _EXHAUSTED = ("insufficient_quota", "quota exceeded", "exceeded your current quo
               "no credit", "wallet", "billing", "allowance_exhausted", "spend_fuse")
 # A rate limit: the provider asks for requests to slow down, and waiting lifts it.
 _RATE_LIMITS = ("rate limit", "rate_limit", "ratelimit", "too many requests")
+# Wording of an answer whose trouble passes by itself. A provider that adds "do not send this again" to such an
+# answer (it already retried on its side) has given up for the moment, not set a limit.
+_MOMENTARY = ("overloaded", "momentarily", "temporarily")
 # The Anton SDK's own failures, by class name: its retries ended on an overload or outage, or it stopped on billing
 # or on the credential.
 _ANTON_TRANSIENT = ("ProviderOverloadedError", "TransientProviderError")
@@ -73,6 +76,12 @@ def quota_exhausted(text: str) -> bool:
     return any(p in text for p in _EXHAUSTED)
 
 
+def momentary(text: str) -> bool:
+    """Whether a provider's answer says its trouble passes by itself (an overload, a brief outage)."""
+    text = (text or "").lower()
+    return any(p in text for p in _MOMENTARY)
+
+
 def _status(exc: BaseException | None) -> int | None:
     for name in ("status", "status_code"):
         value = getattr(exc, name, None)
@@ -88,9 +97,9 @@ def failure_status(exc: BaseException) -> int | None:
 
 
 def _never_retry(exc: BaseException) -> bool:
-    """The provider marked its answer as not worth retrying (``x-should-retry: false``). On a 429 that isn't a rate
-    limit, that is a limit a person lifts (a monthly spend limit). On an overload or a server error it isn't: a
-    gateway sends it once its own retries are spent, and the provider recovers on its own."""
+    """The provider marked its answer as not to be sent again (``x-should-retry: false``). On a limit that isn't a
+    rate limit, that is a limit a person lifts (a monthly spend limit). On an overload, a rate limit or a server error
+    it isn't: a gateway sends it once its own retries are spent, and the provider recovers on its own."""
     headers: Any = getattr(getattr(exc, "response", None), "headers", None)
     try:
         return str(headers.get("x-should-retry", "")).lower() == "false"
@@ -107,7 +116,9 @@ def failure_cause(exc: BaseException) -> str:
     provider SDK's exceptions are read by shape (``status_code``, class name), so no SDK is imported here."""
     cause = getattr(exc, "cause", None)
     if isinstance(cause, str) and cause in CAUSES:
-        return cause
+        # A refusal whose own words say it passes by itself is not one a person has to lift: on 12 November a session
+        # ended with "The model provider is momentarily overloaded", carried as a refusal, and held the workspace.
+        return "transient" if cause == "provider" and momentary(str(exc)) else cause
     names = {c.__name__ for c in type(exc).__mro__}
     if names & set(_ANTON_PROVIDER):
         return "provider"
@@ -117,9 +128,15 @@ def failure_cause(exc: BaseException) -> str:
     if isinstance(status, int) and not isinstance(status, bool):
         if status in (401, 402, 403):
             return "provider"
+        if status == 429 and quota_exhausted(str(exc)):
+            return "provider"
+        # "Do not send this again" on a limit is a limit a person lifts. On a server error, or on an answer that says
+        # its trouble is momentary (whatever its status), the provider only gave up for now: tried again, by nobody.
+        if _never_retry(exc) and momentary(str(exc)):
+            return "transient"
         if status not in (408, 409, 429) and status < 500:
             return ""
-        if status == 429 and (quota_exhausted(str(exc)) or (_never_retry(exc) and not rate_limited(str(exc)))):
+        if _never_retry(exc) and status < 500 and not rate_limited(str(exc)):
             return "provider"
         return "transient"  # an overload, a server error or a rate limit: the provider recovers on its own
     if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):

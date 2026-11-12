@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -309,6 +310,65 @@ async def test_a_provider_refusal_is_never_retried(provider, clocked, monkeypatc
     assert (failed.value.status, failed.value.cause) == (status, "provider") and said in str(failed.value)
 
 
+@pytest.mark.parametrize("status, message", [
+    (503, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+    (529, "Overloaded"),
+    (429, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+    (422, "The model is temporarily unavailable, try again shortly."),  # not a rejected request either
+])
+async def test_an_overload_the_provider_gave_up_on_is_retried_like_any_outage_not_refused(provider, clocked,
+                                                                                          monkeypatch, status, message):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(now[0])
+        if len(sends) != 2:  # "do not send this again": the provider retried on its side and gave up for now
+            return httpx.Response(status, headers={"x-should-retry": "false"}, json={"error": {"message": message}})
+        return httpx.Response(200, json={"ok": True})
+
+    fake_http(monkeypatch, upstream)
+    assert await ModelClient(provider)._post("/responses", {}) == {"ok": True}
+    assert sends == [0, 1] and waits == [1] and guard.active == 0
+    # Where it does not pass in time, the failure is the provider being unavailable: work that is redone later,
+    # never a refusal that holds the workspace until a person resumes it.
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider, max_retries=0)._post("/responses", {})
+    assert (failed.value.status, failed.value.cause) == (status, "transient")
+    assert "limit reached" not in str(failed.value)
+
+
+def test_do_not_send_this_again_is_a_refusal_only_on_a_limit():
+    from aifactory.failures import failure_cause
+
+    never = {"x-should-retry": "false"}
+    # A rate limit lifts by itself once requests slow down: never a hold a person has to lift.
+    assert failure_cause(sdk_error("RateLimitError", 429, "Too many requests", never)) == "transient"
+    # About an overload the provider retried itself, it means "not now": no limit a person lifts.
+    assert failure_cause(sdk_error("InternalServerError", 503, "Error code: 503 - upstream failed",
+                                   never)) == "transient"
+    assert failure_cause(sdk_error("RateLimitError", 429, "The model provider is momentarily overloaded. It did not "
+                                   "recover after 3 attempts.", never)) == "transient"
+    assert failure_cause(sdk_error("UnprocessableEntityError", 422, "The model is temporarily unavailable, try "
+                                   "again shortly.", never)) == "transient"
+    # A spent quota and a monthly limit stay refusals, even where their wording says to try again.
+    assert failure_cause(sdk_error("RateLimitError", 429, "Quota exceeded, try again next month",
+                                   never)) == "provider"
+    assert failure_cause(sdk_error("RateLimitError", 429, "Monthly limit reached; try again next month",
+                                   never)) == "provider"
+
+
+def test_a_session_that_ended_on_an_overload_is_not_a_refusal_whatever_cause_it_carried():
+    from aifactory.failures import failure_cause
+    from aifactory.harness.base import HarnessFailed
+
+    # What production recorded on 12 November: the session's failure carried "provider", and held the workspace.
+    overload = "The model provider is momentarily overloaded. It did not recover after 3 attempts."
+    assert failure_cause(HarnessFailed(overload, cause="provider")) == "transient"
+    assert failure_cause(HarnessFailed("MindsHub: no credit remaining", cause="provider")) == "provider"
+
+
 async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):
     now, guard = clocked
     waits = retry_clock(monkeypatch, now, guard)
@@ -329,6 +389,98 @@ async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(pro
     with pytest.raises(inference.InferenceError):
         await client._post("/responses", {}, cancelled=stopped)
     assert len(sends) == 5 and len(waits) == 3  # a cancelled session sends once and never waits
+
+
+async def test_a_resend_is_given_only_the_time_its_retries_have_left(provider, clocked, monkeypatch):
+    now, guard = clocked
+    retry_clock(monkeypatch, now, guard)
+    allowed = []
+
+    def upstream(req):
+        allowed.append((now[0], req.extensions["timeout"]["read"], req.extensions["timeout"]["connect"]))
+        return httpx.Response(503, json={})
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError):
+        await ModelClient(provider)._post("/responses", {}, deadline=now[0] + 10)
+    # The first send has the client's whole timeout; each resend only what is left of the session's 10 s, so one
+    # sent 3 s before the end cannot run for five minutes past it.
+    assert allowed == [(0, 300, 20), (1, 9, 9), (3, 7, 7), (7, 3, 3)]
+    del allowed[:]
+    now[0] = 1000.0
+    with pytest.raises(inference.InferenceError):
+        await ModelClient(provider)._post("/responses", {})
+    # Without a session the end is the retry budget, counted from the request's first failure.
+    assert allowed[0] == (1000, 300, 20) and allowed[1] == (1001, 299, 20) and allowed[-1] == (1243, 57, 20)
+    del allowed[:]
+    with pytest.raises(inference.InferenceError):
+        await ModelClient(provider, max_retries=2)._post("/responses", {})
+    # A client with a fixed number of resends has no such end: every send keeps the whole timeout.
+    assert [read for _, read, _ in allowed] == [300, 300, 300]
+
+
+async def test_a_resend_cut_short_fails_with_the_answer_that_was_being_retried(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends, notes = [], []
+
+    def upstream(req):
+        sends.append(now[0])
+        if len(sends) == 1:
+            return httpx.Response(503, json={"error": {"message": "Service temporarily unavailable"}})
+        now[0] += req.extensions["timeout"]["read"]  # no answer: the request runs out the time it was given
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider)._post("/responses", {}, deadline=now[0] + 10, notice=notes.append)
+    # The resend at 1 s had the 9 s that were left and used them all: the session's time is up, nothing more is
+    # sent, and the failure is the provider's 503, not a provider that could not be reached.
+    assert sends == [0, 1] and waits == [1] and now[0] == 10
+    assert failed.value.status == 503 and "unreachable" not in str(failed.value)
+    assert notes == ["Model provider unavailable (503); gave up after 10 s"]
+
+
+async def test_a_resends_wait_for_its_permit_counts_against_the_time_that_is_left(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    queued = [0, 4, 20]  # how long each send waits for its permit
+    allowed, notes = [], []
+
+    @asynccontextmanager
+    async def admitted(provider, run_id=None):
+        now[0] += queued.pop(0)
+        yield
+
+    def upstream(req):
+        allowed.append((now[0], req.extensions["timeout"]["read"]))
+        return httpx.Response(503, json={})
+
+    monkeypatch.setattr(inference, "admission", admitted)
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider)._post("/responses", {}, deadline=now[0] + 10, notice=notes.append)
+    # The resend at 1 s waited 4 s for its permit, so it is given the 5 s left then, not the 9 s left when it
+    # queued. The next one's permit comes after the session's time is up: it is not sent at all.
+    assert allowed == [(0, 300), (5, 5)] and waits == [1, 2] and not queued
+    assert failed.value.status == 503
+    assert notes == ["Model provider unavailable (503); gave up after 27 s"]
+
+
+async def test_a_request_that_times_out_with_its_whole_timeout_is_an_unreachable_provider(provider, clocked,
+                                                                                         monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(req.extensions["timeout"]["read"])
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider, max_retries=1)._post("/responses", {})
+    assert sends == [300, 300] and waits == [1] and "unreachable: ReadTimeout" in str(failed.value)
 
 
 async def test_cancelling_the_session_ends_a_retry_wait(provider, clocked, monkeypatch):

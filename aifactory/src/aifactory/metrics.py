@@ -17,9 +17,15 @@ from .models import Artifact, Decision, Event, Message, Outcome, Plan, Repositor
 AUTOMATED_ACTORS = {None, "", "factory", "policy", "system", "scheduler", "supervisor"}
 
 
+# Factory agents that post guidance as a user message, so agents receive it: the post is theirs, not a person's.
+AGENT_SOURCES = {"lead", "director"}
+
+
 def human_message(m) -> bool:
-    """A person's post. The Lead posts guidance as a user message so agents receive it, but it is the Factory's."""
-    return m.author_kind == "user" and (m.attribution or {}).get("source") != "lead"
+    """A person's post. The Lead and the Director post guidance as user messages, but those are the Factory's."""
+    return m.author_kind == "user" and (m.attribution or {}).get("source") not in AGENT_SOURCES
+
+
 APPROVALS = {"approve_plan", "approve_merge", "approve_release"}
 # Neither failures nor passes: "infra" (the model provider or the sandbox failed; the same attempt is redone) and
 # "checks_preexisting" (the configured checks fail on the base commit too; the attempt goes on to verification).
@@ -167,18 +173,10 @@ def _size(task, artifacts, runs):
     return "small" if lines <= 100 else "medium" if lines <= 400 else "large"
 
 
-def workspace_metrics(db: Session, workspace_id: str) -> dict:
-    def rows(model):
-        return db.query(model).filter(model.workspace_id == workspace_id).all()
-
-    all_outcomes, all_tasks, all_runs = rows(Outcome), rows(Task), rows(Run)
-    outcomes = {o.id: o for o in all_outcomes if not benchmark(o)}
-    tasks = {t.id: t for t in all_tasks if t.outcome_id in outcomes and not benchmark(t)}
-    runs = [r for r in all_runs if r.outcome_id in outcomes and not benchmark(r)
-            and (not r.task_id or r.task_id in tasks)]
-    events, messages, decisions = rows(Event), rows(Message), rows(Decision)
-    system_users = {u.id for u in db.query(User).filter(User.is_system.is_(True))}
-
+def autonomy(outcomes: dict, tasks: dict, events, messages, decisions, system_users: set, plans: dict) -> dict[str, str]:
+    """Each completed outcome's delivery, from its durable history: "unattended" (no person took part), "assisted"
+    or "unverified" (the evidence can't tell). Benchmarks are the caller's to leave out of ``outcomes``/``tasks``.
+    Factory agents are not people: the Lead and the Director act as system users with their own attribution."""
     def human(actor):
         return actor not in AUTOMATED_ACTORS and actor not in system_users
 
@@ -211,12 +209,12 @@ def workspace_metrics(db: Session, workspace_id: str) -> dict:
         at = _timestamp(at)
         return at is not None and _timestamp(outcome.created_at) <= at <= _timestamp(outcome.completed_at)
 
-    autonomous = unknown_autonomy = 0
-    completed = [o for o in outcomes.values() if o.status == "completed"]
-    plans = {p.id: p for p in db.query(Plan).join(Outcome).filter(Outcome.workspace_id == workspace_id)}
-    for o in completed:
+    classes = {}
+    for o in outcomes.values():
+        if o.status != "completed":
+            continue
         if o.completed_at is None:
-            unknown_autonomy += 1
+            classes[o.id] = "unverified"
             continue
         ds = [d for d in outcome_decisions[o.id] if human(d.resolved_by) and within(d.resolved_at, o)]
         approvals = {d.id for d in ds if approval(d)}
@@ -255,10 +253,26 @@ def workspace_metrics(db: Session, workspace_id: str) -> dict:
                 exempt = bool(plan and plan.outcome_id == o.id and e.actor in plan_approvers)
             if not exempt:
                 assisted = True
-        if unknown_external_merge and not assisted:
-            unknown_autonomy += 1
-        else:
-            autonomous += not assisted
+        classes[o.id] = ("assisted" if assisted else "unverified" if unknown_external_merge else "unattended")
+    return classes
+
+
+def workspace_metrics(db: Session, workspace_id: str) -> dict:
+    def rows(model):
+        return db.query(model).filter(model.workspace_id == workspace_id).all()
+
+    all_outcomes, all_tasks, all_runs = rows(Outcome), rows(Task), rows(Run)
+    outcomes = {o.id: o for o in all_outcomes if not benchmark(o)}
+    tasks = {t.id: t for t in all_tasks if t.outcome_id in outcomes and not benchmark(t)}
+    runs = [r for r in all_runs if r.outcome_id in outcomes and not benchmark(r)
+            and (not r.task_id or r.task_id in tasks)]
+    events, messages, decisions = rows(Event), rows(Message), rows(Decision)
+    system_users = {u.id for u in db.query(User).filter(User.is_system.is_(True))}
+    plans = {p.id: p for p in db.query(Plan).join(Outcome).filter(Outcome.workspace_id == workspace_id)}
+    classes = autonomy(outcomes, tasks, events, messages, decisions, system_users, plans)
+    completed = list(classes)
+    autonomous = sum(c == "unattended" for c in classes.values())
+    unknown_autonomy = sum(c == "unverified" for c in classes.values())
 
     by_events, by_runs, by_artifacts = defaultdict(list), defaultdict(list), defaultdict(list)
     for e in sorted(events, key=lambda e: e.id):

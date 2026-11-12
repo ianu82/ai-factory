@@ -48,6 +48,11 @@ from .lifecycle import transition
 log = logging.getLogger(__name__)
 
 CI_POLL_TIMEOUT_SECONDS = 90
+CI_ERROR_BACKOFF_SECONDS = (30, 60, 120)  # then 120: a failed look at CI is tried again before a person is asked
+CI_ERROR_LIMIT_SECONDS = 600
+CI_RERUN_SETTLE_SECONDS = 60  # GitHub may still show the failed conclusions for a moment after a rerun request
+CI_BASE_POLL_SECONDS = 120
+CI_NO_CHECKS_SECONDS = 600  # a busy GitHub starts runs late: only then is a pull request without checks a question
 REVIEW_POLL_SECONDS = 60
 REVIEW_REPLY_TRIES = 3  # polls that may fail to post a round's answers on their threads before the Factory gives up
 CHECKPOINT_SECONDS = 300  # between saves of the builder's work in progress while its session runs
@@ -204,6 +209,10 @@ def infrastructure_problem(error: str, cause: str | None = None) -> str:
 
 class Stop(Exception):
     """The task paused or ended for a recorded reason; the orchestrator should release its slot."""
+
+
+class NoVM(SandboxError):
+    """VM isolation is required and no VM is available: the work waits, it does not run in the Factory container."""
 
 
 class TaskRunner:
@@ -825,7 +834,8 @@ class TaskRunner:
                     await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
                 except (SandboxError, GitError, OSError) as exc:  # the environment, not the attempt
                     error = f"Sandbox setup failed: {exc}"
-                    self._infrastructure(attempt, "prepare", error, infrastructure_problem(error))
+                    self._infrastructure(attempt, "prepare", error, infrastructure_problem(
+                        error, "transient" if isinstance(exc, NoVM) else None))
             self._describe_tree(attempt)
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             sections = await self._sections()
@@ -927,7 +937,8 @@ class TaskRunner:
     @asynccontextmanager
     async def _checkpoints(self, fix_round: str):
         """While the builder's session runs, save its work in progress every ``CHECKPOINT_SECONDS``, and once more
-        when the service stops the session, so a restart continues from the save (see ``_earlier_changes``). Not in
+        when the session returns or the service stops it, so a restart continues from the save (see
+        ``_earlier_changes``). Not in
         a fix round: its checkout of the pull request's branch restores nothing. No save starts or is stored once
         this returns; a snapshot cut off at that moment only ever wrote files of its own (see ``snapshot_patch``)."""
         async def periodically() -> None:
@@ -950,6 +961,12 @@ class TaskRunner:
             if not fix_round and not self.cancelled.is_set():
                 await self._save_progress(timeout=5)
             raise
+        else:
+            await stopped(saving)
+            # The session returned. Reading its candidate can take minutes, and until that is recorded a restart
+            # goes back to the last save: so what the session left is saved first. Not after a person's cancel.
+            if not fix_round and not self.cancelled.is_set():
+                await self._save_progress(timeout=30)
         finally:
             await stopped(saving)
 
@@ -1420,6 +1437,7 @@ class TaskRunner:
                     await self._prepare(sandbox)
                 except (SandboxError, GitError, OSError) as exc:  # the environment, not the candidate
                     error = f"Sandbox setup failed: {exc}"
+                    carried = "transient" if isinstance(exc, NoVM) else carried  # no VM: redone later
                 else:
                     brief = ""
                     if qa_cfg.get("start"):
@@ -1506,16 +1524,24 @@ class TaskRunner:
         except BaseException:
             await local.close()
             raise
-        wants_vm = (qa_cfg.get("isolation") or (self.settings.get("qa") or {}).get("isolation")) == "vm"
+        workspace_qa = self.settings.get("qa") or {}
+        wants_vm = (qa_cfg.get("isolation") or workspace_qa.get("isolation")) == "vm"
         if not wants_vm:
             return local
         from ..vm import RailwayVMSandbox, vm_available
 
+        async def without_vm(why: str) -> LocalSandbox:
+            try:
+                self._no_vm("verify", why, "verifying",
+                            {"vm_fallback": qa_cfg.get("vm_fallback") or workspace_qa.get("vm_fallback")})
+            except NoVM:
+                await local.close()
+                raise
+            return local
+
         ok, why = vm_available()
         if not ok:
-            self.event("qa_vm_unavailable", f"VM isolation requested but unavailable ({why}); verifying in a local sandbox",
-                       level="warn")
-            return local
+            return await without_vm(why)
         from ..vm import environment_key
 
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
@@ -1525,11 +1551,10 @@ class TaskRunner:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(qa_cfg.get("cpu", 4)),
                                                    memory_gb=float(qa_cfg.get("memory_gb", 8)))
         except Exception as exc:
-            self.event("qa_vm_unavailable", f"Could not start a QA VM ({str(exc)[:300]}); verifying in a local sandbox",
-                       level="warn")
-            return local
+            return await without_vm(f"could not start a VM: {str(exc)[:300]}")
         await local.close()
         vm.environment_key = key
+        self._isolation("verify", None)
         self.event("qa_vm_ready", f"Verification VM {vm.vm_id} ready" + (f" in {vm.region}" if vm.region else "")
                    + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
                    prepared=vm.prepared)
@@ -1659,7 +1684,12 @@ class TaskRunner:
         sandbox = LocalSandbox(f"task-{self.task_id[:12]}-base{self.task.attempt}").create()
         try:
             await checkout(sandbox, self.repo.full_name, token, self.task.base_sha, f"base-{self.task_id[:8]}")
-            sandbox = await self._isolate_builder(sandbox, "checking the base commit")
+            try:
+                sandbox = await self._isolate_builder(sandbox, "checking the base commit", "base")
+            except NoVM:
+                self.event("base_checks_unavailable", "No VM for the base commit's checks, and this repository "
+                           "waits for a VM; the failing checks count against this attempt", level="warn")
+                return None
             async with self._check_slot(sandbox):  # a second run of the suite on this host, like the candidate's
                 setup = await self._prepare(sandbox, "base_setup")
                 if any(not r["ok"] for r in setup):
@@ -1763,7 +1793,7 @@ class TaskRunner:
             if str(exc).startswith("Candidate patch does not apply"):
                 return self._drop_candidate(attempt, "its diff no longer applies to its base commit")
             error = f"Sandbox setup failed: {exc}"
-            cause = infrastructure_problem(error)
+            cause = infrastructure_problem(error, "transient" if isinstance(exc, NoVM) else None)
             if cause == "provider" or int((self.task.evidence or {}).get("infra_retries", 0)) < INFRA_RETRIES:
                 self._infrastructure(attempt, "prepare", error, cause)  # the candidate is kept for the retry
             # A candidate whose base commit can no longer be checked out must not hold the task for good.
@@ -1822,10 +1852,36 @@ class TaskRunner:
         self.event("rebuild_after_base_moved", f"The verified change {why}; rebuilding with a fresh attempt budget "
                    f"({rebuilds} of 2)")
 
-    async def _isolate_builder(self, local: LocalSandbox, doing: str = "building"):
+    def _isolation(self, phase: str, why: str | None) -> None:
+        """Keep ``evidence["isolation"]`` true: what ran in a sandbox in the Factory container although a VM was asked
+        for, by phase ("build", "base", "verify"), with the reason. A phase that got its VM is taken out again."""
+        record = dict((self.task.evidence or {}).get("isolation") or {})
+        if why is None and phase not in record:
+            return
+        record.pop(phase, None)
+        if why is not None:
+            record[phase] = {"wanted": "vm", "used": "container", "why": why[:300], "at": utcnow().isoformat()}
+        self.evidence("isolation", record)
+
+    def _no_vm(self, phase: str, why: str, doing: str, cfg: dict[str, Any]) -> None:
+        """VM isolation was asked for and there is no VM. Where the repository says to wait for one (``vm_fallback:
+        "wait"`` beside ``isolation``), nothing runs in the Factory container: NoVM, a sandbox that is unavailable,
+        for which the attempt is redone later. Otherwise the work goes on in a sandbox in the container and says so:
+        the event, and a record that the pull request shows (``_isolation``)."""
+        kind = "qa_vm_unavailable" if phase == "verify" else "build_vm_unavailable"
+        if cfg.get("vm_fallback") == "wait":
+            self.event(kind, f"VM isolation requested but unavailable ({why}); this repository waits for a VM, so "
+                       f"{doing} is put off", level="warn", fallback="wait", phase=phase)
+            raise NoVM(f"VM isolation is required for this repository and no VM is available ({why})")
+        self.event(kind, f"VM isolation requested but unavailable ({why}); {doing} in a sandbox in the Factory "
+                   "container", level="warn", fallback="container", phase=phase)
+        self._isolation(phase, why)
+
+    async def _isolate_builder(self, local: LocalSandbox, doing: str = "building", phase: str = "build"):
         """With ``build.isolation: "vm"`` the builder works in its own Railway VM (checkout uploaded, no Factory
-        credentials inside); otherwise, or when VMs are unavailable, in the local per-job sandbox. Checks of the base
-        commit run in the same kind of sandbox."""
+        credentials inside); otherwise in the local per-job sandbox. When no VM is available it works there too, and
+        says so, unless the repository waits for a VM (``_no_vm``). Checks of the base commit run in the same kind of
+        sandbox."""
         build_cfg = self.cfg.get("build") or {}
         if build_cfg.get("isolation") != "vm":
             return local
@@ -1833,8 +1889,7 @@ class TaskRunner:
 
         ok, why = vm_available()
         if not ok:
-            self.event("build_vm_unavailable", f"VM isolation requested but unavailable ({why}); {doing} locally",
-                       level="warn")
+            self._no_vm(phase, why, doing, build_cfg)
             return local
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
             if self.cfg.get("setup") else None
@@ -1842,11 +1897,11 @@ class TaskRunner:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(build_cfg.get("cpu", 4)),
                                                    memory_gb=float(build_cfg.get("memory_gb", 8)))
         except Exception as exc:
-            self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); {doing} locally",
-                       level="warn")
+            self._no_vm(phase, f"could not start a VM: {str(exc)[:300]}", doing, build_cfg)
             return local
         await local.close()
         vm.environment_key = key
+        self._isolation(phase, None)
         self.event("build_vm_ready", f"{doing.capitalize()} in VM {vm.vm_id}"
                    + (" from the prepared environment" if vm.prepared else ""),
                    level="success", vm=vm.vm_id, prepared=vm.prepared)
@@ -2035,6 +2090,14 @@ class TaskRunner:
                                                                 if f.get("location") else "") for f in notes[:10]]
             if len(notes) > 10:
                 lines.append(f"- … and {len(notes) - 10} more in the verification report")
+        fell_back = (self.task.evidence or {}).get("isolation") or {}
+        if fell_back:  # said on the pull request: a reviewer must not take VM isolation for granted
+            names = {"build": "The build", "base": "Checks of the base commit",
+                     "verify": "Independent verification and runtime QA"}
+            lines += ["", "### Isolation", "This repository asks for VM isolation. No VM was available, so this ran "
+                      "in a sandbox inside the Factory container instead:"]
+            lines += [f"- {names.get(phase, phase)}: {_one_line(entry.get('why'), 200)}"
+                      for phase, entry in fell_back.items() if isinstance(entry, dict)]
         if self.app_summary:
             a = self.app_summary
             where = a.get("isolation") or "a fresh sandbox"
@@ -2202,20 +2265,121 @@ class TaskRunner:
             # Neither a slow request nor an access error may leave an expired
             # candidate retrying forever (or reset its durable waiting budget).
             self._guard("waiting_ci")
-            self._check_ci_deadline(self.task.evidence["ci_wait"])
+            wait = dict(self.task.evidence["ci_wait"])
+            self._check_ci_deadline(wait)
             detail = (f"GitHub CI observation timed out after {CI_POLL_TIMEOUT_SECONDS} seconds."
-                      if isinstance(exc, asyncio.TimeoutError) else str(exc))
-            self.block("unblock", f"{self.task.key}: could not check CI", detail)
+                      if isinstance(exc, asyncio.TimeoutError) else str(exc))[:300]
+            # One failed look is noise, not a question: look again, and ask only after ten minutes of failures.
+            now = utcnow()
+            errors, since = int(wait.get("errors", 0)) + 1, wait.get("error_since") or now.isoformat()
+            failing_for = (now - datetime.fromisoformat(since)).total_seconds()
+            if failing_for >= CI_ERROR_LIMIT_SECONDS:
+                for key in ("errors", "error", "error_since"):  # "Retry" starts a new streak
+                    wait.pop(key, None)
+                self.update(evidence={**self.task.evidence, "ci_wait": wait})
+                self.block("unblock", f"{self.task.key}: could not check CI",
+                           f"{errors} looks at CI on PR #{wait['pr']} failed over {int(failing_for // 60)} minutes. "
+                           f"The last error: {detail}")
+            backoff = CI_ERROR_BACKOFF_SECONDS[min(errors, len(CI_ERROR_BACKOFF_SECONDS)) - 1]
+            wait.update(errors=errors, error=detail, error_since=since,
+                        next_poll_at=(now + timedelta(seconds=backoff)).isoformat())
+            self.update(evidence={**self.task.evidence, "ci_wait": wait})
+            if errors == 1:
+                self.event("ci_unavailable", f"Could not check CI on PR #{wait['pr']}; looking again", level="warn",
+                           error=detail)
 
     def _check_ci_deadline(self, wait: dict[str, Any]) -> None:
         if utcnow() > datetime.fromisoformat(wait["deadline"]):
             wait = {**wait, "timed_out": True}
             self.update(evidence={**self.task.evidence, "ci_wait": wait})
-            self.block("unblock", f"{self.task.key}: CI did not finish",
-                       f"CI on PR #{wait['pr']} was still running after "
-                       f"{self.settings['limits'].get('ci_minutes', 45)} minutes.",
+            minutes = self.settings["limits"].get("ci_minutes", 45)
+            detail = f"CI on PR #{wait['pr']} was still running after {minutes} minutes."
+            broken = (wait.get("broken_on_base") or {}).get("checks")
+            if broken:
+                detail = (f"CI on PR #{wait['pr']} fails, and the same checks fail on the base branch too "
+                          f"({', '.join(broken[:5])}), so the builder was not sent. The base branch did not move "
+                          f"within {minutes} minutes.")
+            self.block("unblock", f"{self.task.key}: CI did not finish", detail,
                        options=[{"value": "retry", "label": "Keep waiting"},
                                 {"value": "abandon", "label": "Abandon"}])
+
+    async def _ci_required(self, gh: GitHub, wait: dict[str, Any] | None = None) -> tuple[bool, str]:
+        """Whether a head must show CI checks before it merges, and why: "setting" (`require_ci` true or false),
+        "workflows" (no setting or "auto": required when the repository runs workflows on pull requests), "unknown"
+        (that could not be read: required, the safe side) or "skipped" (this head's own checks were left to its CI
+        after a rebase). `wait` remembers the workflows answer for its head."""
+        reval = (self.task.evidence or {}).get("revalidation") or {}
+        if wait is not None and reval.get("local_checks") == "skipped" and reval.get("head") == wait["head"]:
+            return True, "skipped"
+        setting = self.cfg.get("require_ci")
+        if setting not in (None, "auto"):
+            return bool(setting), "setting"
+        known = (wait or {}).get("workflows")
+        if known is None:
+            try:
+                known = await gh.has_pull_request_workflows(self.repo.full_name)
+            except Exception:
+                return True, "unknown"
+            if wait is not None:
+                wait["workflows"] = known
+        return known, "workflows"
+
+    async def _ci_failure(self, gh: GitHub, wait: dict[str, Any], failing: list[dict[str, Any]],
+                          now: datetime) -> tuple[str | None, str, int | None, tuple | None]:
+        """What a failing head does next: (stage, the state this look counts as, seconds to the next look, event).
+
+        Its failed jobs are rerun once before anyone is blamed. A failure the commit it is built on has too is not
+        the builder's to fix: the task waits for the base branch to move instead."""
+        names = sorted({c["name"] for c in failing})
+        rerun = wait.get("rerun")
+        if rerun is None:
+            runs = sorted({c["run_id"] for c in failing if c.get("run_id")})
+            if runs and not any(c["conclusion"] == "action_required" for c in failing):
+                rerun = {"head": wait["head"], "at": now.isoformat(), "runs": runs, "checks": names}
+                extended = now + timedelta(minutes=self.settings["limits"].get("ci_minutes", 45))
+                wait.update(rerun=rerun, deadline=max(datetime.fromisoformat(wait["deadline"]), extended).isoformat())
+                # Recorded before the request: a restart in between never asks twice.
+                self.update(evidence={**self.task.evidence, "ci_wait": {**wait, "rerun": dict(rerun)}})
+                try:
+                    for run in runs:
+                        await gh.rerun_failed_jobs(self.repo.full_name, run)
+                    rerun["ok"] = True
+                except Exception as exc:  # 403 (the token cannot write Actions), 404, anything: go on as before
+                    rerun["failed"] = str(exc)[:300]
+                self._guard("waiting_ci")
+                if rerun.get("ok"):
+                    return None, "pending", None, ("ci_rerun", f"CI failed on PR #{wait['pr']}; rerunning the failed "
+                                                   f"jobs once ({', '.join(names[:5])})", "warn",
+                                                   {"checks": names, "runs": self._run_links(runs)})
+        elif "failed" not in rerun and set(names) <= set(rerun["checks"]) and (
+                now - datetime.fromisoformat(rerun["at"])).total_seconds() < CI_RERUN_SETTLE_SECONDS:
+            return None, "pending", None, None
+        base, broken = self.task.base_sha, wait.get("broken_on_base")
+        # Not for a repair of a broken base branch: the failure the base has too is the one it is there to fix.
+        if base and base != wait["head"] and not merge_manager._is_repair(self):
+            if broken and set(names) <= set(broken["checks"]):
+                main = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
+                self._guard("waiting_ci")
+                if main and main != base:
+                    wait["stale_main"] = main
+                    return "ci_refresh", "failure", None, None
+                return None, "failure", CI_BASE_POLL_SECONDS, None
+            try:
+                on_base = set(await gh.failing_checks(self.repo.full_name, base))
+            except Exception:
+                on_base = set()  # unknown: the failure is treated as the candidate's own
+            self._guard("waiting_ci")
+            if set(names) <= on_base:
+                wait["broken_on_base"] = {"base": base, "checks": names, "at": now.isoformat()}
+                note = None if broken else (
+                    "ci_broken_on_base", f"CI fails on PR #{wait['pr']}, and on the commit it is built on too "
+                    f"({', '.join(names[:5])}); waiting for {self.repo.default_branch} to move instead of sending "
+                    "the builder", "warn", {"checks": names, "base": base})
+                return None, "failure", CI_BASE_POLL_SECONDS, note
+        return "ci_repair", "failure", None, None
+
+    def _run_links(self, runs: list[int]) -> list[str]:
+        return [f"https://github.com/{self.repo.full_name}/actions/runs/{run}" for run in runs]
 
     async def _poll_ci(self, gh: GitHub | None) -> None:
         self._guard("waiting_ci")
@@ -2224,46 +2388,68 @@ class TaskRunner:
         wait = dict(self.task.evidence["ci_wait"])
         summary = await gh.checks(self.repo.full_name, wait["head"])
         self._guard("waiting_ci")
+        for key in ("errors", "error", "error_since"):  # a look that worked ends a streak of failed ones
+            wait.pop(key, None)
         now = utcnow()
         elapsed = (now - datetime.fromisoformat(wait["first_wait_at"])).total_seconds()
         grace = int(self.cfg.get("ci_grace_seconds", 150))
-        stage = None
-        if summary.state == "success":
-            stage = "revert_merge" if wait["continuation"] == "revert" else "merge"
-        elif summary.state == "failure":
-            if wait["continuation"] == "revert":
+        revert = wait["continuation"] == "revert"
+        # `state` is what this look counts as: a failure whose jobs were just rerun is still pending.
+        stage, state, pause, note = None, summary.state, None, None
+        if state == "success":
+            stage = "revert_merge" if revert else "merge"
+            rerun = wait.get("rerun") or {}
+            if rerun.get("ok") and not rerun.get("flaky"):
+                wait["rerun"] = {**rerun, "flaky": True}
+                note = ("ci_flaky", f"CI passed on PR #{wait['pr']} once its failed jobs were rerun "
+                        f"({', '.join(rerun['checks'][:5])})", "warn",
+                        {"checks": rerun["checks"], "runs": self._run_links(rerun["runs"])})
+        elif state == "failure":
+            if revert:
                 self.block("unblock", f"{self.task.key}: the revert failed CI",
                            f"Revert PR #{wait['pr']} did not pass CI; the original change is still merged.",
                            status="smoke_failed", options=[{"value": "acknowledge", "label": "Acknowledge"}])
-            stage = "ci_repair"
-        elif summary.state == "none" and elapsed > grace:
-            if self.cfg.get("require_ci", False):
+            stage, state, pause, note = await self._ci_failure(gh, wait, summary.failing, now)
+        elif state == "none" and elapsed > grace:
+            required, why = await self._ci_required(gh, wait)
+            self._guard("waiting_ci")
+            if required:
                 main = await gh.branch_sha(self.repo.full_name, self.repo.default_branch)
                 self._guard("waiting_ci")
-                if wait["continuation"] == "delivery" and main and main != self.task.base_sha:
+                if not revert and main and main != self.task.base_sha:
                     wait["stale_main"] = main
                     stage = "ci_refresh"
-                else:
+                elif elapsed > max(grace, CI_NO_CHECKS_SECONDS):
+                    # No checks is unknown, not a pass: a person decides, and is told which case this is.
+                    case = {"setting": "this repository requires CI before merging",
+                            "workflows": "this repository runs workflows on pull requests, but none ran for this one "
+                                         "(a path filter?)",
+                            "unknown": "this repository's workflows could not be read, so CI is taken as required",
+                            "skipped": "its checks were left to CI after the rebase, so this commit needs CI"}[why]
+                    self.update(evidence={**self.task.evidence, "ci_wait": wait})
                     self.block("unblock", f"{self.task.key}: no CI checks reported",
-                               f"PR #{wait['pr']} received no CI checks within {grace}s, and this repository "
-                               "requires CI before merging.")
+                               f"PR #{wait['pr']} received no CI checks within {int(elapsed // 60)} minutes: {case}. "
+                               "Retry once checks have started" + ("." if why == "skipped" else ", or turn off "
+                               "required CI for the repository to merge without them."))
             else:
-                stage = "revert_merge" if wait["continuation"] == "revert" else "merge"
+                stage = "revert_merge" if revert else "merge"
         if stage is None:
             self._check_ci_deadline(wait)
-        changed = summary.state != wait.get("last_state")
-        wait.update(last_state=summary.state, next_poll_at=(now + timedelta(
-            seconds=15 if elapsed < 300 else 30)).isoformat())
-        ci = {"state": summary.state, "head": wait["head"], "checks": summary.checks, "at": now.isoformat()}
+        changed = state != wait.get("last_state")
+        wait.update(last_state=state, next_poll_at=(now + timedelta(
+            seconds=pause or (15 if elapsed < 300 else 30))).isoformat())
+        ci = {"state": state, "head": wait["head"], "checks": summary.checks, "at": now.isoformat()}
         ev = {**self.task.evidence, "ci_wait": wait, "ci": ci}
-        if summary.state == "failure":
+        if state == "failure" and (changed or stage == "ci_repair"):  # once per failure, not per look at it
             ev["failure_facts"] = [*ev.get("failure_facts", []), {"kind": "ci", **ci}]
         # A green head waits for its reviewers before the merge (never a revert, which goes straight in).
         review = stage == "merge" and self._enter_review(ev, wait["head"], now)
         self.update(status="queued" if stage and not review else "waiting_ci",
                     stage="review" if review else stage or "ci", evidence=ev, lease_owner="", blocked_reason="")
         if changed:
-            self.event("ci_status", f"CI {summary.state}", state=summary.state, checks=summary.checks)
+            self.event("ci_status", f"CI {state}", state=state, checks=summary.checks)
+        if note:
+            self.event(note[0], note[1], level=note[2], **note[3])
 
     async def _fix_ci(self, gh: GitHub) -> None:
         identity = self._steward_identity()
@@ -2278,6 +2464,9 @@ class TaskRunner:
             details.append(f"- CI check `{check['name']}` failed ({check['url']}):\n```\n{tail[-3500:]}\n```")
         self._guard()
         self.feedback += details or ["- CI failed on the pull request (no logs available)."]
+        rerun = ((self.task.evidence or {}).get("ci_wait") or {}).get("rerun") or {}
+        if rerun.get("ok") and rerun.get("head") == self.task.head_sha:
+            self.feedback.append("- These checks failed twice on this commit.")
         self.event("ci_failed", f"CI failed on PR #{self.task.pr_number}; sending the failure back to the builder",
                    level="warn")
         self._ci_repairing = True  # a restart inside this round fetches the CI logs again (see run())
@@ -2822,12 +3011,23 @@ class TaskRunner:
                         "candidate_paths": candidate[:20], "main_paths": main[:20],
                         "candidate_paths_count": len(candidate), "main_paths_count": len(main), **overlap,
                         "run": bool(identity) or mode == "always" or (mode != "never" and overlap["overlap"])}
+            if identity is None and mode != "always" and not overlap["overlap"]:
+                # No shared file, and the pull request's own CI gates the new head: do not repeat it in a sandbox.
+                required, why = await self._ci_required(gh)
+                if required and why != "unknown":
+                    decision.update(local_checks="skipped", local_checks_reason=(
+                        "No file is shared with the commits that landed, and "
+                        + ("this repository requires CI" if why == "setting"
+                           else "this repository runs workflows on pull requests")
+                        + ": the pull request's CI on the rebased commit is the gate."))
             self.artifact("report", "Revalidation changed paths", json.dumps({"candidate": candidate, "main": main}))
             state = {**decision, "phase": "rebasing"}
             self.evidence("revalidation", state)
             self.event("revalidate", "The base branch moved; rebasing and revalidating before merge")
             self.event("reverify_decision", "Rebased candidate: " + ("run" if decision["run"] else "skip")
-                       + " independent verification", **decision)
+                       + " independent verification"
+                       + ("; its checks are left to the pull request's CI" if "local_checks" in decision else ""),
+                       **decision)
         if state["phase"] == "rebasing":
             def before_push(head: str) -> None:
                 state["expected_head"] = head
@@ -2858,6 +3058,9 @@ class TaskRunner:
                                             "patch_id": change_id})
                 self._carry_approval()
             self.update(head_sha=state["head"], base_sha=state["new_base"])
+        if state["phase"] == "checks" and state.get("local_checks") == "skipped":
+            state["phase"] = "passed"  # no checkout, setup or checks: the wait for CI on this head follows
+            self.evidence("revalidation", state)
         if state["phase"] in ("checks", "verify"):
             sandbox = LocalSandbox(f"task-{self.task_id[:12]}-r").create()
             try:
@@ -3110,8 +3313,9 @@ def _replace_factory_block(body: str, block: str) -> str:
 
 def _revalidation_section(state: dict[str, Any]) -> str:
     """Bound serialized JSON *before* wrapping: even escaped Unicode must fit a closed fence."""
-    summary = {k: state[k] for k in ("mode", "old_base", "new_base", "run", "overlap", "phase",
-                                     "shared_files_count", "shared_directories_count") if k in state}
+    summary = {k: state[k] for k in ("mode", "old_base", "new_base", "run", "overlap", "phase", "local_checks",
+                                     "local_checks_reason", "shared_files_count", "shared_directories_count")
+               if k in state}
     for key in ("candidate_paths", "main_paths", "shared_files", "matching_pairs"):
         values = state.get(key) or []
         summary[key + "_count"] = state.get(key + "_count", len(values))

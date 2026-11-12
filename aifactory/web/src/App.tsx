@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import { Activity, GitPullRequest, Inbox as InboxIcon, Library, ListChecks, LogOut, Menu, MessagesSquare, Plus, Radio, Settings as SettingsIcon, Target } from "lucide-react";
+import { Activity, GitPullRequest, Inbox as InboxIcon, LayoutDashboard, Library, ListChecks, LogOut, Menu, MessagesSquare, Plus, Radio, Settings as SettingsIcon, Target } from "lucide-react";
 import { api, ApiError, type Me, type Meta, type Workspace } from "./api";
 import { useLive } from "./live";
 import { Avatar } from "./ui";
@@ -9,6 +9,7 @@ import { SignIn } from "./pages/SignIn";
 import { InboxPage } from "./pages/Inbox";
 import { OutcomesPage } from "./pages/Outcomes";
 import { RunsPage } from "./pages/Runs";
+import { DashboardPage } from "./pages/Dashboard";
 import { MessageLogPage } from "./pages/MessageLog";
 import { SignalsPage } from "./pages/Signals";
 import { PullRequestsPage, usePulls } from "./pages/PullRequests";
@@ -68,7 +69,7 @@ function Loading({ error }: { error?: unknown }) {
 /** Stable deep links (used by runtime QA and docs): /go/outcomes → the first workspace's Outcomes. */
 function GoTo({ workspaceId }: { workspaceId: string }) {
   const { section = "inbox" } = useParams();
-  const allowed = ["mind", "inbox", "outcomes", "pulls", "runs", "signals", "decisions", "messages", "settings", "onboarding"];
+  const allowed = ["mind", "inbox", "outcomes", "pulls", "runs", "signals", "decisions", "dashboard", "messages", "settings", "onboarding"];
   return <Navigate to={`/w/${workspaceId}/${allowed.includes(section) ? section : "inbox"}`} replace />;
 }
 
@@ -140,6 +141,7 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
             <Route path="outcomes/:outcomeId" element={<OutcomesPage />} />
             <Route path="pulls" element={<PullRequestsPage />} />
             <Route path="runs" element={<RunsPage />} />
+            <Route path="dashboard" element={<DashboardPage />} />
             <Route path="messages" element={<MessageLogPage />} />
             <Route path="signals" element={<SignalsPage />} />
             <Route path="decisions" element={<DecisionsPage />} />
@@ -229,6 +231,7 @@ function Sidebar() {
             <span className="count" aria-label={`${setupLeft} setup ${setupLeft === 1 ? "step" : "steps"} left`}>{setupLeft}</span>
           </NavLink>
         )}
+        <NavLink to={`${base}/dashboard`} className="nav-item"><LayoutDashboard /> Dashboard</NavLink>
         <NavLink to={`${base}/messages`} className="nav-item"><MessagesSquare /> Message Log</NavLink>
         <NavLink to={`${base}/settings`} className="nav-item"><SettingsIcon /> Settings</NavLink>
         <div className="nav-sep" />

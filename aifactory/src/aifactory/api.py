@@ -721,9 +721,15 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
     for key in ("release", "qa", "recovery", "build"):
         if key in patch and isinstance(patch[key], dict):
             cfg[key] = patch[key]
-    for key in ("require_ci", "max_changed_lines"):
-        if key in patch:
-            cfg[key] = patch[key]
+    if "require_ci" in patch:
+        value = patch["require_ci"]
+        if type(value) is not bool and value != "auto":
+            raise HTTPException(422, "require_ci must be true, false or auto")
+        cfg.pop("require_ci", None)  # no setting is "auto": required when its pull requests run workflows
+        if value != "auto":
+            cfg["require_ci"] = value
+    if "max_changed_lines" in patch:
+        cfg["max_changed_lines"] = patch["max_changed_lines"]
     return cfg
 
 
@@ -1560,6 +1566,20 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
                           "succeeded": sum(r.harness == h and r.status == "succeeded" for r in runs)}
                       for h in ("native", "codex", "anton")},
     }
+
+
+@router.get("/workspaces/{workspace_id}/dashboard")
+def dashboard(workspace_id: str, period: str = Query("week", pattern="^(day|week|month)$"),
+              buckets: int | None = Query(None, ge=1), user: User = Depends(current_user),
+              db: Session = Depends(get_db)):
+    """Delivery performance over time (dashboard.py): the Runs strip's definitions, per day, week or month."""
+    from . import dashboard as board
+
+    _ws(db, user, workspace_id)
+    try:
+        return board.series(db, workspace_id, period, buckets)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
 
 
 @router.get("/workspaces/{workspace_id}/events")
