@@ -4651,11 +4651,11 @@ def test_an_infrastructure_failure_during_the_build_keeps_the_saved_work_in_prog
     monkeypatch.setattr(delivery, "CHECKPOINT_SECONDS", 0)  # the interval has always passed: nothing waits for it
     seen = []
 
-    def loses_its_provider(messages):  # once its work is saved, or after a minute of turns without a save
+    def loses_its_provider(messages):  # once its change is saved, or after a minute of turns without a save
         n = step(messages)
         if n == 0:
             return _fix_greeting()
-        if (_saved_work(outcome_id)[0] or {}).get("artifact_id") or n > 60:
+        if (_saved_work(outcome_id)[0] or {}).get("additions") or n > 60:
             raise InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
         return {"content": "", "tool_calls": [call("run", {"command": "sleep 0.2"}, n)]}
 

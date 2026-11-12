@@ -544,20 +544,24 @@ def test_a_snapshot_reads_what_extract_patch_would_and_leaves_the_index_and_the_
         return git("diff", "--cached", "--name-only"), git("status", "--porcelain"), git("ls-files", "--stage")
     before = state()
     assert before[0] == "staged.py\n" and "?? new.py\n" in before[1] and " M source.py\n" in before[1]
-    # The job's own git command holds the index lock, and a snapshot that was killed left its copy and lock behind.
-    lock, copy = sb.work / ".git" / "index.lock", sb.work / ".git" / "factory-wip-index"
+    # The job's own git command holds the index lock, and a snapshot that was killed left its files behind: its
+    # copy of the index, that copy's lock and half a result.
+    lock, scratch = sb.work / ".git" / "index.lock", sb.work / ".factory"
     lock.write_bytes(b"")
-    copy.write_bytes(b"half a copy")
-    copy.with_name("factory-wip-index.lock").write_bytes(b"")
+    left = [sb.work / ".git" / "factory-wip-0000", sb.work / ".git" / "factory-wip-0000.lock",
+            scratch / "wip-0000.patch"]
+    for path in left:
+        path.write_bytes(b"half a file")
 
     async def go():
         snapshot = await snapshot_patch(sb, base)
-        assert lock.exists() and not copy.exists() and not copy.with_name("factory-wip-index.lock").exists()
+        assert lock.exists() and not any(path.exists() for path in left)
+        assert not list((sb.work / ".git").glob("factory-wip-*"))  # its own copy of the index is gone too
         lock.unlink()
         assert state() == before
         # Its result is in scratch files of its own: the candidate's are written by extract_patch alone.
-        assert (sb.work / ".factory" / "wip.patch").read_bytes() == snapshot.diff
-        assert not (sb.work / ".factory" / "candidate.patch").exists()
+        assert [path.read_bytes() for path in scratch.glob("wip-*.patch")] == [snapshot.diff]
+        assert not (scratch / "candidate.patch").exists()
         return snapshot, await extract_patch(sb, base)
     snapshot, candidate = asyncio.run(go())
     assert snapshot == candidate and not snapshot.empty

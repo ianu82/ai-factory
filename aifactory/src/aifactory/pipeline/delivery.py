@@ -928,8 +928,8 @@ class TaskRunner:
     async def _checkpoints(self, fix_round: str):
         """While the builder's session runs, save its work in progress every ``CHECKPOINT_SECONDS``, and once more
         when the service stops the session, so a restart continues from the save (see ``_earlier_changes``). Not in
-        a fix round: its checkout of the pull request's branch restores nothing. No save runs or starts once this
-        returns, so none reads the tree while the candidate is read from it."""
+        a fix round: its checkout of the pull request's branch restores nothing. No save starts or is stored once
+        this returns; a snapshot cut off at that moment only ever wrote files of its own (see ``snapshot_patch``)."""
         async def periodically() -> None:
             while True:
                 await asyncio.sleep(CHECKPOINT_SECONDS)

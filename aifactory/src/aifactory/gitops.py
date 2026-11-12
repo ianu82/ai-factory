@@ -294,19 +294,22 @@ async def snapshot_patch(sandbox: LocalSandbox, base_sha: str, timeout: float = 
     scratch files of its own, never the candidate's."""
     # The copy lives in the git directory, not the scratch directory: that is in the working tree, where the copy's
     # lock file would come and go as an untracked file under the job's own git commands. No pathspec for `git add`:
-    # where the checkout ignores the scratch directory, one that names it fails (see tree_id). A snapshot killed
-    # half way leaves its copy and that copy's lock behind; both are removed first. The copy keeps the index's time
-    # (cp -p): git compares a file's content when it changed in the second its index was written, and a newer
-    # index would take such a file as unchanged.
-    script = (f'set -e; mkdir -p {SCRATCH}; index="$(git rev-parse --absolute-git-dir)/factory-wip-index"; '
-              'rm -f "$index" "$index.lock"; '
+    # where the checkout ignores the scratch directory, one that names it fails (see tree_id). The copy keeps the
+    # index's time (cp -p): git compares a file's content when it changed in the second its index was written, and
+    # a newer index would take such a file as unchanged.
+    # Every snapshot has names of its own. One that was cancelled is killed in a local sandbox but runs on in a VM,
+    # beside the next one: it then writes only its own files. What earlier snapshots left is removed first, and a
+    # snapshot whose index was removed under it fails (an index that is gone reads as "every file deleted").
+    stem = f"wip-{os.urandom(4).hex()}"
+    script = (f'set -e; mkdir -p {SCRATCH}; dir="$(git rev-parse --absolute-git-dir)"; index="$dir/factory-{stem}"; '
+              f'rm -f "$dir"/factory-wip-* {SCRATCH}/wip-*; '
               'cp -p "$(git rev-parse --git-path index)" "$index" 2>/dev/null || true; '
-              f'export GIT_INDEX_FILE="$index"; git add -A >/dev/null; {_diff_commands(base_sha, "wip")}; '
-              'rm -f "$index"')
+              f'export GIT_INDEX_FILE="$index"; git add -A >/dev/null; {_diff_commands(base_sha, stem)}; '
+              'test -s "$index"; rm -f "$index"')
     result = await sandbox.exec(script, timeout=timeout)
     if not result.ok:
         raise SandboxError(f"Could not read the changes in progress: {result.output[-800:]}")
-    return await _read_patch(sandbox, "wip")
+    return await _read_patch(sandbox, stem)
 
 
 _TREE_ID = re.compile(r"[0-9a-f]{40,64}")
