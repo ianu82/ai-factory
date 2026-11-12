@@ -471,7 +471,7 @@ def test_a_decision_it_noted_raises_no_waiting_alert_while_it_is_on(world):
             return [a.status for a in s.query(Alert).filter_by(key=f"overdue:{world['merge']}").order_by(Alert.id)]
 
     with db.session_scope() as s:
-        s.get(Decision, world["merge"]).created_at = db.utcnow() - timedelta(hours=3)
+        s.get(Decision, world["merge"]).created_at = db.utcnow() - timedelta(hours=6)
     watch.run()
     assert overdue() == ["open"]
     with db.session_scope() as s:  # the note on the decision says why it waits: the alert would repeat it
@@ -481,9 +481,9 @@ def test_a_decision_it_noted_raises_no_waiting_alert_while_it_is_on(world):
                           "text": "Only a rebase since a person approved; approve once CI is green."}))
     watch.run()
     assert overdue() == ["cleared"]
-    with db.session_scope() as s:  # switched off, the decision waits for a person alone: it alerts again
-        w = s.get(Workspace, world["ws"])
-        w.settings = {**w.settings, "director": {**ON, "mode": "off"}}
+    with db.session_scope() as s:  # it had its turn and the decision still waits: only a person can answer it
+        aged = db.utcnow() - timedelta(hours=5, minutes=1)  # past decide_after_hours and its turn
+        s.query(Event).filter_by(kind="director_note").update({"created_at": aged})
     watch.run()
     assert sorted(overdue()) == ["cleared", "open"]
 

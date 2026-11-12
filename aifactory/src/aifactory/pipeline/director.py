@@ -942,10 +942,8 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def director_notes(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
-    """The Director's latest note on each decision: what it found and recommends, shown where people decide."""
-    from ..serializers import ts
-
+def latest_notes(db, decisions: list[Decision]) -> dict[str, Event]:
+    """The Director's latest note on each decision, as its event."""
     wanted = {d.id for d in decisions}
     if not wanted:
         return {}
@@ -953,10 +951,18 @@ def director_notes(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
     query = db.query(Event).filter(Event.workspace_id == decisions[0].workspace_id, Event.kind == "director_note")
     if oldest is not None:
         query = query.filter(Event.created_at >= oldest)
-    notes: dict[str, dict[str, Any]] = {}
+    notes: dict[str, Event] = {}
     for e in query.order_by(Event.id.desc()).limit(500):
         decision_id = (e.data or {}).get("decision_id")
         if decision_id in wanted and decision_id not in notes:
-            notes[decision_id] = {"text": (e.data or {}).get("text") or e.message, "created_at": ts(e.created_at)}
+            notes[decision_id] = e
     return notes
+
+
+def director_notes(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
+    """The Director's latest note on each decision: what it found and recommends, shown where people decide."""
+    from ..serializers import ts
+
+    return {decision_id: {"text": (e.data or {}).get("text") or e.message, "created_at": ts(e.created_at)}
+            for decision_id, e in latest_notes(db, decisions).items()}
 
