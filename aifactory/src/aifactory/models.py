@@ -102,6 +102,46 @@ class Secret(Base):
     __table_args__ = (UniqueConstraint("workspace_id", "kind"),)
 
 
+class Connector(Base):
+    """One connector of each kind per workspace; never store credentials here.
+
+    config and runtime_state are non-secret, connector-specific allowlisted JSON.
+    Credentials belong exclusively in encrypted Secret rows.
+    """
+
+    __tablename__ = "connectors"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    provider: Mapped[str] = mapped_column(String(20), default="workspace")
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30), default="untested")
+    status_detail: Mapped[str] = mapped_column(Text, default="")
+    tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    runtime_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "kind"),
+        CheckConstraint("kind IN ('slack', 'sentry', 'incident')"),
+        CheckConstraint("provider IN ('workspace', 'mindshub')"),
+    )
+
+
+class ConnectorReceipt(Base):
+    """Claimed and committed in the same transaction as the ingestion effect."""
+
+    __tablename__ = "connector_receipts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    connector_id: Mapped[str] = mapped_column(ForeignKey("connectors.id"), index=True)
+    delivery_key: Mapped[str] = mapped_column(String(64))  # hash; no raw webhook contents
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("connector_id", "delivery_key"),)
+
+
 class Repository(Base):
     __tablename__ = "repositories"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
