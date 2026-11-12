@@ -1098,3 +1098,21 @@ def test_a_merge_note_stands_until_review_is_seen_to_differ_from_what_it_was_wri
                       "head": HEAD, "settled": True, "fingerprint": "a-p1-arrived",
                       "read_at": (db.utcnow() + timedelta(seconds=1)).isoformat()}}}))
     assert shown() is None
+
+
+def test_the_lead_is_given_every_blocking_finding_however_many_others(world, monkeypatch):
+    merge_ready(world)
+    found = [{"id": f"t{i}", "severity": "P2", "path": "a.py", "line": i, "by": lead.CODEX, "text": f"Nit {i}"}
+             for i in range(20)] + [{"id": "t-p1", "severity": "P1", "path": "b.py", "line": 7, "by": lead.CODEX,
+                                     "text": "The lock is never released"}]
+
+    async def state(ws, repo, number, head):
+        return {"head": head, "live_head": head, "checked": True, "reviewed": True, "open": found,
+                "changes_requested_by": []}
+
+    monkeypatch.setattr(lead, "review_state", state)
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    record = tools._outcome_record()
+    assert "The lock is never released" in record  # the 21st finding, and the one to cite
+    assert '"lower_severity_not_listed": 5' in record

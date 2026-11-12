@@ -779,15 +779,24 @@ class Tools:
         from ..mind.tools import clean
 
         record_ = outcome_record(self.outcome_id)
-        if self.reviews:
-            record_["merge_reviews"] = {d: {"line": self.lines[d], "open_findings": state["open"][:15],
-                                            "changes_requested_by": state["changes_requested_by"]}
-                                        for d, state in self.reviews.items()}
         rules = record_.pop("team_rules", [])
+        text = _bounded(record_)
+        if self.reviews:
+            # Never shortened with the rest of the record: every P0/P1 is here, for the Lead to cite. Lower-severity
+            # findings are capped, and the count left out is given.
+            reviews = {}
+            for d, state in self.reviews.items():
+                blocking = [f for f in state["open"] if f.get("severity") in BLOCKING]
+                others = [f for f in state["open"] if f.get("severity") not in BLOCKING]
+                reviews[d] = {"line": self.lines[d], "open_findings": blocking + others[:15],
+                              "lower_severity_not_listed": max(0, len(others) - 15),
+                              "changes_requested_by": state["changes_requested_by"]}
+            text += "\n\nmerge_reviews (every P0/P1 finding is listed):\n" + json.dumps(
+                clean(reviews, None, 400, 10_000, 10_000), ensure_ascii=False, default=str)
         # Rules are never shortened away with the rest of the record: every one applies.
         lines = [f"- [{r['scope']}] {clean(r['rule'], None, 4000)}: {clean(r['detail'], None, 8000)}" for r in rules]
-        return _bounded(record_) + ("\n\nteam_rules (all of them; follow every one):\n" + "\n".join(lines)
-                                    if lines else "\n\nteam_rules: none")
+        return text + ("\n\nteam_rules (all of them; follow every one):\n" + "\n".join(lines)
+                       if lines else "\n\nteam_rules: none")
 
     def _task_detail(self, task: str) -> str:
         from .. import serializers as S
