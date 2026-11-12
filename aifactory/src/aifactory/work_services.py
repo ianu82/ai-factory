@@ -134,23 +134,44 @@ def cancel_outcome(db: Session, user: User, workspace_id: str, outcome_id: str, 
     return payload, later
 
 
-def cancel_task(db: Session, user: User, workspace_id: str, task_id: str, *,
-                action_id: str | None = None) -> tuple[dict, list[tuple]]:
+def task_dependents(db: Session, task: Task) -> list[Task]:
+    """The unfinished tasks of the task's outcome that wait for it, directly or through other tasks."""
+    from .pipeline.lifecycle import dependents
+
+    return dependents(db.query(Task).filter(Task.outcome_id == task.outcome_id).all(), task.key)
+
+
+def cancel_task(db: Session, user: User, workspace_id: str, task_id: str, *, dependents: str = "keep",
+                action_id: str | None = None) -> tuple[list[dict], list[tuple]]:
     """POST /tasks/{id}/cancel and a confirmed Mind card: the task is cancelled unless it has completed. Returns the
-    audit event and the follow-ups: stop its job, then close its pull request."""
+    audit events and the follow-ups: stop its job, then close its pull request.
+
+    ``dependents``: "drop" cancels the tasks that wait for it as well, each with an event that says why; "keep"
+    leaves them waiting, and the scheduler asks a person what to do with them."""
     require_member(db, user, workspace_id, "member")
     t = db.query(Task).filter_by(id=task_id, workspace_id=workspace_id).populate_existing().one_or_none()
     if t is None:
         raise HTTPException(404, "Task not found")
+    if dependents not in ("keep", "drop"):
+        raise HTTPException(422, "dependents is keep or drop")
+    waiting = task_dependents(db, t) if dependents == "drop" else []
     if t.status not in ("completed",):
         t.status = "cancelled"
-    payload = events.record(workspace_id, "task_cancelled", f"{author(user, action_id)} stopped {t.key}",
-                            outcome_id=t.outcome_id, task_id=t.id, actor=user.id, level="warn",
-                            data=attribution(action_id), session=db, publish=False)
+    payloads = [events.record(workspace_id, "task_cancelled", f"{author(user, action_id)} stopped {t.key}",
+                              outcome_id=t.outcome_id, task_id=t.id, actor=user.id, level="warn",
+                              data=attribution(action_id), session=db, publish=False)]
     later: list[tuple] = [("stop_task", t.id, workspace_id, t.outcome_id)]
     if t.status == "cancelled" and t.pr_number:
         later.append(("close_pull", t.id, "Cancelled"))
-    return payload, later
+    for w in waiting:
+        w.status = "cancelled"
+        payloads.append(events.record(
+            workspace_id, "task_cancelled", f"{author(user, action_id)} dropped {w.key}: it waits for {t.key}, "
+            "which was cancelled", outcome_id=w.outcome_id, task_id=w.id, actor=user.id, level="warn",
+            data={**attribution(action_id), "with": t.key}, session=db, publish=False))
+        if w.pr_number:
+            later.append(("close_pull", w.id, "Cancelled"))
+    return payloads, later
 
 
 async def finish(steps: list[tuple], user: User, action_id: str | None = None) -> dict[str, Any]:

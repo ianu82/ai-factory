@@ -194,6 +194,9 @@ def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, An
     merge = (d.metadata_json or {}).get("merge") if isinstance(d.metadata_json, dict) else None
     if d.kind == "approve_merge" and isinstance(merge, dict):
         context["merge"] = merge  # the change, what checked it, what it cost and why a person is asked
+    stuck = (d.metadata_json or {}).get("stuck") if isinstance(d.metadata_json, dict) else None
+    if d.status == "open" and isinstance(stuck, dict):
+        context["stuck"] = stuck  # the Supervisor found its task stuck (supervisor.attach)
     return {"attribution": attribution, "actionable": actionable(d), "correction": correction,
             "supersedes": attribution.get("supersedes"), "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,

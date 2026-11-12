@@ -10,6 +10,7 @@ import { DecisionCard } from "../components/DecisionCard";
 import { OutcomeDetail } from "../components/OutcomeDetail";
 import { SetupNotice, useSetupState } from "../components/Setup";
 import { RecoveryGuide } from "../components/RecoveryGuide";
+import { type GroupResult, groupDecisions, groupReport, sharedTitle, sortDecisions, waiting } from "../inboxGroups";
 
 import { type LearningPolicy, policyLabel } from "../learningPolicy";
 
@@ -75,9 +76,7 @@ export function InboxPage() {
     setOrderState(next);
     try { localStorage.setItem("factory:inbox:order", next); } catch { /* per-viewer convenience only */ }
   };
-  const decisions = [...(q.data?.decisions || [])].sort((a, b) => order === "newest"
-    ? b.created_at.localeCompare(a.created_at)
-    : (a.priority ?? 2) - (b.priority ?? 2) || a.created_at.localeCompare(b.created_at));
+  const decisions = sortDecisions(q.data?.decisions || [], order);
   const selected = decisions.find((d) => d.id === decisionId) || null;
   const select = (d: Decision) => navigate(`/w/${ws.id}/inbox/${d.id}`);
   const close = () => navigate(`/w/${ws.id}/inbox`);
@@ -117,6 +116,26 @@ export function InboxPage() {
     }
   };
 
+  // One question asked of several pieces of work: each member is resolved on its own, and each says how it went.
+  const answerAll = async (rows: Decision[], value: string) => {
+    setBusy(`group:${rows[0].id}:${value}`);
+    try {
+      const r = await api<{ results: GroupResult[] }>(`/api/workspaces/${ws.id}/decisions/resolve`, {
+        method: "POST", json: { decision_ids: rows.map((d) => d.id), resolution: value, comment: "" },
+      });
+      const report = groupReport(r.results);
+      toast(report.text, report.failed);
+      qc.invalidateQueries({ queryKey: ["inbox", ws.id] });
+      qc.invalidateQueries({ queryKey: ["outcome", ws.id] });
+      qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });
+      if (rows.some((d) => d.id === decisionId)) close();
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   // A hold stops all work: it shows first, in either order. Priority groups the rest by what they ask for; Newest
   // is one chronological list.
   const holds = decisions.filter((d) => d.kind === "provider_hold");
@@ -141,7 +160,34 @@ export function InboxPage() {
     <section key={g.key} aria-label={g.label}>
       <div className="list-section">{g.label} · {g.rows.length}</div>
       <ul className="rows">
-        {g.rows.map((d) => {
+        {groupDecisions(g.rows).flatMap(({ key, rows }) => rows.length > 1 ? [(
+          <li key={key} className="row ib-row" tabIndex={0}
+            aria-label={`${rows.length} decisions: ${sharedTitle(rows)}`} onKeyDown={(e) => onRowKey(e, rows[0])}>
+            <Dot tone={["unblock", "budget"].includes(rows[0].kind) ? "bad" : "human"} />
+            <div style={{ minWidth: 0 }}>
+              <div className="title">
+                <span className="ib-kind">{DECISION_KIND[rows[0].kind] || rows[0].kind} · {rows.length}</span>
+                {sharedTitle(rows)}
+              </div>
+              <div className="sub" style={{ flexWrap: "wrap" }}>
+                {rows.map((d) => (
+                  <button key={d.id} className="linkish" onClick={() => select(d)}>
+                    {d.outcome_number != null ? `#${d.outcome_number}` : ""}{d.task_key ? ` ${d.task_key}` : ""}
+                    {" · "}{d.overdue ? waiting(d.waited_minutes ?? 0) : ago(d.created_at)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="meta">
+              {canAct && rows[0].options.map((o, i) => (
+                <button key={o.value} className={`btn sm ib-act ${i === 0 ? "primary" : ""}`} disabled={busy !== null}
+                  title={o.effect} onClick={(e) => { e.stopPropagation(); answerAll(rows, o.value); }}>
+                  {busy === `group:${rows[0].id}:${o.value}` ? "…" : `${o.label} for all ${rows.length}`}
+                </button>
+              ))}
+            </div>
+          </li>
+        )] : rows.map((d) => {
           const primary = d.options[0];
           const inline = canAct && primary && !NEEDS_TEXT.has(primary.value) ? primary : null;
           return (
@@ -170,11 +216,14 @@ export function InboxPage() {
                     {d.options.find((o) => o !== inline && NEEDS_TEXT.has(o.value))?.label || "More"}
                   </button>
                 )}
-                <span className="num" style={{ minWidth: 52 }}>{ago(d.created_at)}</span>
+                <span className="num" title={d.overdue?.title}
+                  style={{ minWidth: 52, color: d.overdue ? "var(--bad)" : undefined }}>
+                  {d.overdue ? waiting(d.waited_minutes ?? 0) : ago(d.created_at)}
+                </span>
               </div>
             </li>
           );
-        })}
+        }))}
       </ul>
     </section>
   );

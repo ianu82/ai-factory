@@ -41,6 +41,8 @@ class Finding:
     body: str
     evidence: dict
     confidence: Literal["observed", "inferred"] = "observed"
+    # The open decision a person can answer about the same task: the finding is recorded on it, not raised again.
+    about: str | None = None
 
     def __post_init__(self):
         if self.confidence not in ("observed", "inferred"):
@@ -60,6 +62,14 @@ def detect(db: Session, workspace_id: str, now: datetime, policy: dict) -> list[
     signals = db.query(Signal).filter(Signal.workspace_id == workspace_id).all()
     events = db.query(Event).filter(Event.workspace_id == workspace_id).all()
     repos = {r.id: r for r in db.query(Repository).filter(Repository.workspace_id == workspace_id)}
+    from .serializers import actionable
+
+    answerable = {}  # task id -> the oldest open decision about it that a person can answer now
+    for d in (db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "open",
+                                        Decision.kind != "supervisor", Decision.task_id.isnot(None))
+              .order_by(Decision.created_at, Decision.id)):
+        if actionable(d):
+            answerable.setdefault(d.task_id, d.id)
     findings = []
     for task in tasks:
         expired = (task.status == "running" and timestamp(task.lease_expires_at) is not None
@@ -78,7 +88,8 @@ def detect(db: Session, workspace_id: str, now: datetime, policy: dict) -> list[
         findings.append(Finding("push_protection" if protection else "stuck_task", task.id,
             f"{task.key}: GitHub push protection" if protection else f"{task.key}: task is stuck",
             "A person must remove the secret or explicitly allow it on GitHub before the push can proceed."
-            if protection else f"Task {task.key} remains {task.status} beyond the stuck threshold.", evidence))
+            if protection else f"Task {task.key} remains {task.status} beyond the stuck threshold.", evidence,
+            about=None if protection else answerable.get(task.id)))
 
     open_tasks = {d.task_id for d in db.query(Decision).filter(
         Decision.workspace_id == workspace_id, Decision.status == "open", Decision.kind != "supervisor")}
@@ -189,8 +200,35 @@ def surface(workspace_id: str, finding: Finding) -> str:
     return open_decision(workspace_id, kind="supervisor", title=redact(finding.title)[:300], body=redact(body),
                          task_id=finding.evidence.get("task_id"), metadata=metadata,
                          dedup_key=finding.fingerprint,
-                         options=[{"value": "acknowledge", "label": "Acknowledge"},
-                                  {"value": "dismiss", "label": "Dismiss"}])
+                         options=SMOKE_OPTIONS if finding.kind == "untriaged_smoke" else
+                         [{"value": "acknowledge", "label": "Acknowledge"}, {"value": "dismiss", "label": "Dismiss"}])
+
+
+# A smoke failure nobody has triaged: the choice is the one the Signals page offers (decisions.resolve, signals.triage).
+SMOKE_OPTIONS = [{"value": "fix", "label": "Create the fix",
+                  "effect": "Accepts the smoke failure as work, as the Signals page does: a new outcome is opened to "
+                            "fix it."},
+                 {"value": "dismiss", "label": "Ignore",
+                  "effect": "Closes this item without creating work; the failure stays on the Signals page."}]
+
+
+def attach(workspace_id: str, finding: Finding, now: datetime) -> bool:
+    """Record a stuck task's finding on the open decision about it, which already asks a person, instead of raising
+    a second item; an item raised for the same finding before is superseded. Returns whether it was recorded."""
+    with session_scope() as db:
+        decision = db.get(Decision, finding.about)
+        if decision is None or decision.workspace_id != workspace_id or decision.status != "open":
+            return False
+        meta = decision.metadata_json if isinstance(decision.metadata_json, dict) else {}
+        since = timestamp(finding.evidence.get("updated_at"))
+        stuck = {"since": since.isoformat() if since else None, "status": finding.evidence.get("status")}
+        if {k: (meta.get("stuck") or {}).get(k) for k in stuck} != stuck:
+            decision.metadata_json = {**meta, "stuck": {**stuck, "flagged_at": timestamp(now).isoformat()}}
+        for item in db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == "supervisor",
+                                              Decision.status == "open", Decision.task_id == decision.task_id):
+            if (item.metadata_json or {}).get("fingerprint") == finding.fingerprint:
+                item.status, item.comment = "superseded", "Recorded on the open decision about this task."
+    return True
 
 
 def sweep(workspace_id: str, now: datetime) -> list[Finding]:
@@ -214,6 +252,8 @@ def sweep(workspace_id: str, now: datetime) -> list[Finding]:
             # A transient push block should not interrupt a person. Confirm the
             # identical incident in the immediately preceding sweep first.
             if finding.kind == "push_protection" and finding.fingerprint not in previous_fingerprints:
+                continue
+            if finding.about and attach(workspace_id, finding, now):
                 continue
             surface(workspace_id, finding)
             surfaced += 1
