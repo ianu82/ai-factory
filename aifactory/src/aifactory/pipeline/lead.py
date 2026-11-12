@@ -249,7 +249,7 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
 
 def _review_seen(db, merges: list[Decision]) -> dict[str, tuple[datetime, str | None]]:
     """What was last seen of each merge approval's review, and when: by the watcher (its latest lead_review_changed)
-    or by a Lead run (the snapshot its result keeps, read at read_at), whichever is later."""
+    or by a Lead run that finished in any way (the snapshot its result keeps, read at read_at), whichever is later."""
     seen: dict[str, tuple[datetime, str | None]] = {}
     if not merges:
         return seen
@@ -263,12 +263,13 @@ def _review_seen(db, merges: list[Decision]) -> dict[str, tuple[datetime, str | 
             .filter(Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed"):
         seen[(e.data or {})["decision_id"]] = (e.created_at, (e.data or {}).get("fingerprint"))
     for outcome_id in outcome_ids:
-        run = db.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status == "succeeded") \
-            .order_by(Run.started_at.desc()).first()
-        for decision_id, review in (((run.result or {}).get("reviews") or {}) if run else {}).items():
-            at = _parse(review.get("read_at")) if isinstance(review, dict) else None
-            if decision_id in ids and at is not None and (decision_id not in seen or at > seen[decision_id][0]):
-                seen[decision_id] = (at, review.get("fingerprint"))
+        # Finished in any way: a run that failed after reading review (and perhaps writing a note) still read it.
+        for run in db.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status != "running") \
+                .order_by(Run.started_at.desc()).limit(5):
+            for decision_id, review in ((run.result or {}).get("reviews") or {}).items():
+                at = _parse(review.get("read_at")) if isinstance(review, dict) else None
+                if decision_id in ids and at is not None and (decision_id not in seen or at > seen[decision_id][0]):
+                    seen[decision_id] = (at, review.get("fingerprint"))
     return seen
 
 
@@ -459,65 +460,82 @@ async def watch_reviews() -> int:
 
 
 def _last_review(db, decision: Decision) -> dict[str, Any] | None:
-    """What was last seen of a merge approval's review: by the Lead's latest finished run, or by the watcher since."""
+    """What was last seen of a merge approval's review: by a Lead run (finished in any way: one that failed after
+    writing a note still read review), by a Lead note (what review said when it was written), or by the watcher."""
     seen: tuple[datetime, dict[str, Any]] | None = None
+
+    def consider(at: datetime | None, review: dict[str, Any]) -> None:
+        nonlocal seen
+        if at is not None and (seen is None or at > seen[0]):
+            seen = (at, review)
+
     for run in db.query(Run).filter(Run.outcome_id == decision.outcome_id, Run.role == "lead",
-                                    Run.status == "succeeded").order_by(Run.started_at.desc()).limit(5):
+                                    Run.status != "running").order_by(Run.started_at.desc()).limit(5):
         review = ((run.result or {}).get("reviews") or {}).get(decision.id)
         if isinstance(review, dict):
-            seen = (run.started_at, review)
+            consider(_parse(review.get("read_at")) or run.started_at, review)
             break
-    for event in db.query(Event).filter(Event.outcome_id == decision.outcome_id, Event.kind == "lead_review_changed") \
-            .order_by(Event.id.desc()).limit(20):
-        if (event.data or {}).get("decision_id") == decision.id:
-            if seen is None or event.created_at > seen[0]:
-                seen = (event.created_at, event.data)
-            break
+    note = _latest_note(db, decision)
+    if note is not None and (note.attribution or {}).get("review_fingerprint"):
+        consider(_parse(note.attribution.get("review_read_at")) or note.created_at,
+                 {"fingerprint": note.attribution["review_fingerprint"]})
+    event = db.query(Event).filter(Event.outcome_id == decision.outcome_id, Event.kind == "lead_review_changed",
+                                   Event.data["decision_id"].as_string() == decision.id) \
+        .order_by(Event.created_at.desc(), Event.id.desc()).first()
+    if event is not None:
+        consider(event.created_at, event.data or {})
     return seen[1] if seen else None
+
+
+def _latest_note(db, decision: Decision) -> Message | None:
+    for m in db.query(Message).filter(Message.outcome_id == decision.outcome_id, Message.author_kind == "lead") \
+            .order_by(Message.created_at.desc(), Message.id.desc()).limit(200):
+        if (m.attribution or {}).get("decision_id") == decision.id:
+            return m
+    return None
 
 
 async def review_state(workspace_id: str, repo: str, number: int, head: str) -> dict[str, Any]:
     """What review says about this exact commit of a pull request, read from GitHub: whether a reviewer has
     reported on it, who requests changes, and the review threads still open on the code (neither resolved nor
-    outdated), with their severity. Unreadable means unknown, never clean."""
+    outdated), with their severity. Only reviewers the repository's review policy trusts count, read the way the
+    review stage reads them (review.py): not the PR's author or the Factory, not ignored logins, and on the default
+    policy only collaborators and installed bots. Unreadable means unknown, never clean."""
     from ..github import GitHub, resolve_credential
+    from ..review import findings_unseen, normalize_feedback, reviewed_by
 
     state: dict[str, Any] = {"head": head, "checked": False, "reviewed": False, "open": [],
                              "changes_requested_by": []}
     try:
+        policy = _review_policy(workspace_id, repo)
         # The client's helpers read every page and refuse partial GraphQL data: a partial read is never clean.
         gh = GitHub(resolve_credential(workspace_id))
         # The PR as it is now: a commit pushed straight to it isn't what the Factory put up for merging, and nothing
         # else here would notice (the task keeps the commit it published).
-        pr = await gh.pull(repo, number)
-        state["live_head"] = _head_of(pr)
-        author = (pr.get("user") or {}).get("login")  # whoever opened the PR doesn't review it
-        latest: dict[str, str] = {}
-        for review in await gh.reviews(repo, number):
-            if review.get("commit_id") == head and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED") \
-                    and (review.get("user") or {}).get("login") != author:
-                state["reviewed"] = True
-            if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-                latest[(review.get("user") or {}).get("login", "")] = review["state"]
-        state["changes_requested_by"] = sorted(u for u, st in latest.items() if st == "CHANGES_REQUESTED" and u)
-        # Codex reports each commit it reviewed in a PR comment naming it.
-        if any((c.get("user") or {}).get("login") == CODEX and head[:10] in (c.get("body") or "")
-               for c in await gh.issue_comments(repo, number)):
-            state["reviewed"] = True
-        for t in await gh.review_threads(repo, number):
-            # Outdated is GitHub's own flag: a comment on a whole file has no line and is still current.
-            if t.get("isResolved") or t.get("isOutdated") is True:
+        state["live_head"] = _head_of(await gh.pull(repo, number))
+        snapshot = await gh.review_snapshot(repo, number)
+        seen = {"reviews": snapshot["reviews"], "comments": snapshot["comments"], "policy": policy,
+                "identity": snapshot["identity"], "pull_author": snapshot["pull_author"]}
+        # Reviewed: a trusted reviewer submitted a review of this commit, or Codex says it found nothing in it; and
+        # no reviewer reports findings on it that aren't in what was read.
+        state["reviewed"] = bool(reviewed_by(head, **seen)) and not findings_unseen(head, **seen)
+        # The findings that count, whatever the policy says the Factory addresses itself.
+        findings = normalize_feedback(threads=snapshot["threads"],
+                                      **{**seen, "policy": {**policy, "address": "unresolved"}})
+        state["changes_requested_by"] = sorted({f["author"] for f in findings
+                                                if f.get("review_state") == "CHANGES_REQUESTED" and f["author"]})
+        # Outdated is GitHub's own flag: a comment on a whole file has no line and is still current.
+        outdated = {t.get("id") for t in snapshot["threads"] if t.get("isOutdated") is True}
+        shown: set[str] = set()
+        for f in findings:  # one per open thread: its first comment that counts
+            thread = f.get("thread_id")
+            if f["kind"] != "inline" or not thread or thread in outdated or thread in shown:
                 continue
-            first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
-            author = (first.get("author") or {}).get("login") or ""
-            of = ((first.get("pullRequestReview") or {}).get("state") or "").upper()
-            if of == "DISMISSED" or (of == "CHANGES_REQUESTED" and latest.get(author) != "CHANGES_REQUESTED"):
-                continue  # not active: dismissed, or a change request its reviewer since replaced (review.py does too)
-            body = first.get("body") or ""
+            shown.add(thread)
+            body = f.get("body") or ""
             found = SEVERITY.search(body)
-            state["open"].append({"id": t.get("id") or "", "severity": found.group(1) if found else "",
-                                  "path": t.get("path") or "",
-                                  "line": t.get("line"), "by": author,
+            state["open"].append({"id": thread, "severity": found.group(1) if found else "",
+                                  "path": f.get("path") or "", "line": f.get("line"), "by": f["author"],
                                   "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
         # And again after: a commit pushed while review was being read makes this a snapshot of the old one.
         state["live_head"] = _head_of(await gh.pull(repo, number))
@@ -526,6 +544,19 @@ async def review_state(workspace_id: str, repo: str, number: int, head: str) -> 
         log.warning("review state of %s#%s unreadable: %r", repo, number, exc)
         state["checked"] = False
     return state
+
+
+def _review_policy(workspace_id: str, repo: str) -> dict[str, Any]:
+    """The review policy the review stage applies to this repository: the workspace's, with the repository's on top."""
+    from ..review import review_policy
+
+    with session_scope() as s:
+        row = s.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.full_name == repo).first()
+        config = dict(row.config or {}) if row is not None else {}
+    try:
+        return review_policy(workspace_settings(workspace_id), config)
+    except ValueError:  # a stored policy that no longer validates: the defaults apply, as in delivery
+        return review_policy()
 
 
 def _head_of(pr: dict[str, Any]) -> str:

@@ -786,7 +786,13 @@ class FakeGitHub:
         pass
 
     async def pull(self, repo, number):
-        return {"head": {"sha": FakeGitHub.live_head}, "user": {"login": "factory-bot"}}
+        return {"head": {"sha": FakeGitHub.live_head}, "user": {"login": "factory-bot", "type": "Bot"}}
+
+    async def review_snapshot(self, repo, number):  # what GitHub.review_snapshot returns
+        comments = await self.issue_comments(repo, number)
+        reviews = await self.reviews(repo, number)
+        return {"identity": {"login": "factory-bot"}, "pull_author": {"login": "factory-bot", "type": "Bot"},
+                "reviews": reviews, "threads": await self.review_threads(repo, number), "comments": comments}
 
     async def reviews(self, repo, number):
         return FakeGitHub.reviews_data
@@ -798,10 +804,19 @@ class FakeGitHub:
         return FakeGitHub.threads_data
 
 
-def thread(body, *, resolved=False, outdated=False, line=3, path="a.py", review="COMMENTED", by=lead.CODEX):
+def submitted(n, state, by=lead.CODEX, *, commit=HEAD, association="NONE"):
+    """A review as GitHub's REST API lists it. Bots are trusted; people only as collaborators (the default policy)."""
+    return {"id": n, "commit_id": commit, "state": state, "body": "", "author_association": association,
+            "user": {"login": by, "type": "Bot" if by.endswith("[bot]") else "User"},
+            "submitted_at": f"2026-11-11T10:00:{n:02d}Z"}
+
+
+def thread(body, *, resolved=False, outdated=False, line=3, path="a.py", review=1, by=lead.CODEX, association="NONE"):
+    """A review thread as GitHub's GraphQL API reads it, its first comment part of review ``review``."""
     return {"id": f"t-{path}-{line}", "isResolved": resolved, "isOutdated": outdated, "path": path, "line": line,
-            "comments": {"nodes": [{"author": {"login": by}, "body": body,
-                                    "pullRequestReview": {"state": review}}]}}
+            "comments": {"nodes": [{"id": f"c-{path}-{line}", "body": body, "authorAssociation": association,
+                                    "author": {"login": by, "__typename": "Bot" if by.endswith("[bot]") else "User"},
+                                    "path": path, "line": line, "pullRequestReview": {"databaseId": review}}]}}
 
 
 def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
@@ -809,21 +824,26 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
 
     monkeypatch.setattr(github, "GitHub", FakeGitHub)
     monkeypatch.setattr(github, "resolve_credential", lambda ws: "token")
-    FakeGitHub.reviews_data = [{"commit_id": "an-older-commit", "state": "COMMENTED", "user": {"login": lead.CODEX}},
-                               {"commit_id": "an-older-commit", "state": "CHANGES_REQUESTED", "user": {"login": "pat"}},
-                               {"commit_id": HEAD, "state": "APPROVED", "user": {"login": "pat"}}]
-    FakeGitHub.comments_data = [{"user": {"login": lead.CODEX}, "body": f"Codex Review: Reviewed commit `{HEAD[:10]}`"}]
-    FakeGitHub.threads_data = [thread("**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**"),
-                               thread("P1 Badge", resolved=True, path="b.py"),
-                               thread("P0 Badge", outdated=True, path="c.py"),
-                               thread("P1 Badge  Don't ship this file", line=None, path="d.py"),  # a file comment
-                               thread("P1 Badge  Withdrawn", path="e.py", review="DISMISSED"),  # its review dismissed
-                               # pat requested changes, then approved: that change request is replaced
-                               thread("P1 Badge  Rename it", path="f.py", review="CHANGES_REQUESTED", by="pat")]
+    monkeypatch.setattr(FakeGitHub, "reviews_data", [
+        submitted(1, "COMMENTED", commit="an-older-commit"),
+        submitted(2, "COMMENTED"),  # Codex reviewed this commit
+        submitted(5, "DISMISSED", commit="an-older-commit"),
+        submitted(6, "CHANGES_REQUESTED", "pat", commit="an-older-commit", association="MEMBER"),
+        submitted(7, "APPROVED", "pat", association="MEMBER"),  # pat's change request is replaced
+        submitted(8, "COMMENTED", "stranger", commit="an-older-commit")])  # not a collaborator: doesn't count
+    monkeypatch.setattr(FakeGitHub, "comments_data", [])
+    monkeypatch.setattr(FakeGitHub, "threads_data", [
+        thread("**<sub><sub>![P1 Badge](https://x)</sub></sub>  Fix the lock**", review=2),
+        thread("P1 Badge", resolved=True, path="b.py", review=2),
+        thread("P0 Badge", outdated=True, path="c.py", review=1),
+        thread("P1 Badge  Don't ship this file", line=None, path="d.py", review=2),  # a comment on a whole file
+        thread("P1 Badge  Withdrawn", path="e.py", review=5),  # its review was dismissed
+        thread("P1 Badge  Rename it", path="f.py", review=6, by="pat", association="MEMBER"),
+        thread("P0 Badge  Merge nothing", path="g.py", review=8, by="stranger")])
     state = asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))
-    assert state["checked"] and state["reviewed"]  # Codex's receipt names this commit
+    assert state["checked"] and state["reviewed"]
     assert [(f["severity"], f["path"]) for f in state["open"]] == [("P1", "a.py"), ("P1", "d.py")]
-    assert state["open"][0]["text"] == "Fix the lock"
+    assert state["open"][0]["text"] == "Fix the lock" and state["changes_requested_by"] == []
     assert lead.review_line(state, 12) == "Review of PR #12 at abcdef1: 2 open review findings, 2 of them P0/P1."
 
     monkeypatch.setattr(FakeGitHub, "live_head", "f" * 40)  # pushed to directly: the task keeps the commit it published
@@ -843,12 +863,14 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     assert not lead.settled(asyncio.run(lead.review_state("ws", "team/app", 12, HEAD)))
     monkeypatch.setattr(github, "GitHub", FakeGitHub)
 
-    # The PR's own author commenting on their commit isn't a review of it.
-    monkeypatch.setattr(FakeGitHub, "reviews_data", [{"commit_id": HEAD, "state": "COMMENTED",
-                                                      "user": {"login": "factory-bot"}}])
     monkeypatch.setattr(FakeGitHub, "comments_data", [])
     monkeypatch.setattr(FakeGitHub, "threads_data", [])
-    assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["reviewed"] is False
+    for who in ({"by": "factory-bot"},  # the PR's own author on their commit
+                {"by": "stranger"}):  # someone who isn't a collaborator, on the default trust policy
+        monkeypatch.setattr(FakeGitHub, "reviews_data", [submitted(9, "COMMENTED", **who)])
+        assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["reviewed"] is False, who
+    monkeypatch.setattr(FakeGitHub, "reviews_data", [submitted(9, "COMMENTED", "sam", association="COLLABORATOR")])
+    assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["reviewed"] is True
 
     class Partial(FakeGitHub):
         async def review_threads(self, repo, number):  # the helper refuses partial GraphQL data
@@ -863,6 +885,7 @@ def test_review_state_reads_receipts_and_open_threads_from_github(monkeypatch):
     monkeypatch.setattr(github, "GitHub", FakeGitHub)
     monkeypatch.setattr(github, "resolve_credential", undecryptable)
     assert asyncio.run(lead.review_state("ws", "team/app", 12, HEAD))["checked"] is False
+
 
 def unreviewed(*_args):
     async def state(ws, repo, number, head):
@@ -1116,3 +1139,22 @@ def test_the_lead_is_given_every_blocking_finding_however_many_others(world, mon
     record = tools._outcome_record()
     assert "The lock is never released" in record  # the 21st finding, and the one to cite
     assert '"lower_severity_not_listed": 5' in record
+
+
+def test_a_note_from_a_run_that_failed_is_still_watched(world, client, monkeypatch):
+    merge_ready(world)
+    monkeypatch.setattr(lead, "review_state", unreviewed())
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    asyncio.run(tools.read_reviews())
+    tools.call("note_for_people", {"decision_id": world["merge"], "text": "No findings so far."})
+    # The run then failed (its model timed out) and left no review snapshot: the note is what the watcher compares.
+
+    async def p1(ws, repo, number, head):
+        return {"head": head, "live_head": head, "checked": True, "reviewed": True, "changes_requested_by": [],
+                "open": [{"id": "t1", "severity": "P1", "path": "a.py", "line": 3, "by": lead.CODEX,
+                          "text": "Fix the lock"}]}
+
+    monkeypatch.setattr(lead, "review_state", p1)
+    assert asyncio.run(lead.watch_reviews()) == 1
+    inbox = {d["id"]: d for d in client.get(f"/api/workspaces/{world['ws']}/inbox").json()["decisions"]}
+    assert inbox[world["merge"]]["lead_note"] is None
