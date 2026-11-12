@@ -279,6 +279,13 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     merged["holds"] = holds
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
+    total = merged["limits"].get("task_attempts_total")
+    if total is not None and (type(total) is not int or not 0 <= total <= 100):
+        raise HTTPException(422, "limits.task_attempts_total must be a whole number from 0 to 100 (0: no limit)")
+    task_usd = merged["budgets"].get("task_usd")
+    if task_usd is not None and (type(task_usd) not in (int, float) or not math.isfinite(task_usd)
+                                 or not 0 <= task_usd <= 1000):
+        raise HTTPException(422, "budgets.task_usd must be a number from 0 to 1000 (0: no limit)")
     cap = merged["limits"].get("open_outcomes")
     if cap is not None and (type(cap) is not int or not 0 <= cap <= 1000):
         raise HTTPException(422, "limits.open_outcomes must be a whole number from 0 to 1000 (0: no limit)")
@@ -332,6 +339,10 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
                 except ValueError as exc:
                     raise HTTPException(422, str(exc)) from None
             patch = {**patch, "alerts": {**before["alerts"], **alerts}}
+        for section in ("limits", "budgets"):
+            # Patched key by key too: setting one limit or budget must not put the others back to their defaults.
+            if isinstance(patch.get(section), dict) and isinstance(before.get(section), dict):
+                patch = {**patch, section: {**before[section], **patch[section]}}
         updated = {**before, **patch}
         if "review" in patch:
             try:

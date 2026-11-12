@@ -158,6 +158,14 @@ def test_missing_or_malformed_safety_is_ineligible(data, meta):
         assert not eligible(q)
 
 
+def test_a_decision_marked_for_people_is_never_judged(data):
+    with db.session_scope() as s:
+        q = s.get(Decision, data[-1])
+        assert eligible(q)
+        q.metadata_json = {**metadata(), "people_only": "A person decides this"}
+        assert not eligible(q)
+
+
 def report(prior):
     return {"verdict": "decide", "answer": "Use the durable queue.", "resolution": "answer",
             "summary": "The team answered this.", "citations": [{"decision_id": prior, "passage": "durable queue"}],

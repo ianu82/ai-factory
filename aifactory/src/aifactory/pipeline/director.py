@@ -116,8 +116,9 @@ def director_user(db) -> User:
 def choices(db, decision: Decision, cfg: dict[str, Any]) -> tuple[list[str], str]:
     """The options the Director may choose on a decision, and why any others are left to people."""
     offered = [o.get("value") for o in decision.options or [] if isinstance(o, dict) and o.get("value")] or ["dismiss"]
-    if decision.kind in PEOPLE_ONLY:
-        return [], PEOPLE_ONLY[decision.kind]
+    why = people_only(decision)
+    if why:
+        return [], why
     allowed = [value for value in offered if value not in NEVER]
     why = "Taking work over is left to people" if len(allowed) < len(offered) else ""
     if decision.kind == "budget" and "retry" in allowed and decision.outcome_id:
@@ -129,6 +130,13 @@ def choices(db, decision: Decision, cfg: dict[str, Any]) -> tuple[list[str], str
             why = (f"Continuing would take the outcome to ${after:.2f} (${committed:.2f} committed), past the "
                    f"Director's ceiling of ${cfg['max_outcome_usd']:.2f}: only a person lets it spend more")
     return allowed, why
+
+
+def people_only(decision: Decision) -> str:
+    """Why only a person may answer a decision: by its kind (PEOPLE_ONLY), or as the decision itself is marked
+    (``metadata_json["people_only"]``, e.g. a merge that touches the rails). "" when the Director may answer it."""
+    meta = decision.metadata_json if isinstance(decision.metadata_json, dict) else {}
+    return PEOPLE_ONLY.get(decision.kind) or str(meta.get("people_only") or "")
 
 
 def continuation_usd(decision: Decision, settings: dict[str, Any]) -> float:
@@ -183,7 +191,7 @@ def _waiting(db, workspace_id: str, now: datetime, cfg: dict[str, Any]) -> tuple
     busy = _busy(db, workspace_id, now)
     held: set[str] = set()
     for d in db.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "open"):
-        if d.kind in PEOPLE_ONLY or not actionable(d) or not _ripe(d, now, cfg):
+        if people_only(d) or not actionable(d) or not _ripe(d, now, cfg):
             continue
         marks[f"d:{d.id}"] = question_fingerprint(d)[:16]
         if d.outcome_id in busy:

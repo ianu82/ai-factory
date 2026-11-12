@@ -45,6 +45,11 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         raise DecisionError("A Mind resolution leaves its events and follow-up work to its confirmation")
     if decision.status != "open":
         raise DecisionError("This decision is already resolved")
+    for_people = (decision.metadata_json or {}).get("people_only") if isinstance(decision.metadata_json, dict) else ""
+    if for_people and user.is_system:
+        # Refused before anything is claimed: an answer from the Lead, the Director or an operator relay would be
+        # spent without effect (a merge onto the rails counts only a person's approval), and the question asked again.
+        raise DecisionError(f"Only a person answers this decision, in the app: {for_people}")
     # A decision that offers choices is answered with one of them: dismissing it would leave the work it is about
     # waiting with nothing asking. "dismiss" closes a decision that offers none, or one that lists it.
     valid = {o.get("value") for o in decision.options or []} or {"dismiss"}
@@ -176,6 +181,9 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                             "deadline": (now + timedelta(minutes=workspace_settings(task.workspace_id)[
                                 "limits"].get("ci_minutes", 45))).isoformat(), "next_poll_at": now.isoformat()}
                     task.evidence = {**task.evidence, "ci_wait": wait}
+                allow = ((decision.metadata_json or {}).get("lifetime_limit") or {}).get("allow")
+                if isinstance(allow, dict):  # "Allow more" at a task's lifetime limit (TaskRunner._check_lifetime)
+                    task.evidence = {**(task.evidence or {}), "lifetime_allowance": allow}
                 if task.status == "failed":
                     task.attempt = 0
                     task.evidence = fresh_budget(task.evidence)

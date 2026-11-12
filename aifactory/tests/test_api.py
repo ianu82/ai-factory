@@ -775,6 +775,41 @@ def test_workspace_rejects_repository_only_review_options(client, signed_in, fie
         assert db.get(Workspace, wid).settings == before
 
 
+def test_task_lifetime_limits_are_validated(client, signed_in):
+    wid = signed_in["workspaces"][0]["id"]
+    settings = next(w for w in client.get("/api/me").json()["workspaces"] if w["id"] == wid)["settings"]
+    assert (settings["limits"]["task_attempts_total"], settings["budgets"]["task_usd"]) == (12, 15.0)
+    path = f"/api/workspaces/{wid}"
+    for attempts, usd in ((20, 7.5), (0, 0), (None, None), (100, 1000)):
+        r = client.patch(path, json={"settings": {"limits": {"task_attempts_total": attempts},
+                                                  "budgets": {"task_usd": usd}}})
+        assert r.status_code == 200, r.text
+        saved = r.json()["settings"]
+        assert (saved["limits"]["task_attempts_total"], saved["budgets"]["task_usd"]) == (attempts, usd)
+    for bad in ({"limits": {"task_attempts_total": -1}}, {"limits": {"task_attempts_total": 101}},
+                {"limits": {"task_attempts_total": 2.5}}, {"limits": {"task_attempts_total": "12"}},
+                {"limits": {"task_attempts_total": True}}, {"budgets": {"task_usd": -0.5}},
+                {"budgets": {"task_usd": 1000.5}}, {"budgets": {"task_usd": "15"}}, {"budgets": {"task_usd": True}}):
+        assert client.patch(path, json={"settings": bad}).status_code == 422, bad
+    with session_scope() as db:  # the refused changes left the saved settings alone
+        stored = db.get(Workspace, wid).settings
+        assert (stored["limits"]["task_attempts_total"], stored["budgets"]["task_usd"]) == (100, 1000)
+
+
+def test_setting_one_limit_or_budget_leaves_the_others_as_they_were(client, signed_in):
+    wid = signed_in["workspaces"][0]["id"]
+    path = f"/api/workspaces/{wid}"
+    custom = {"limits": {"ci_minutes": 90, "builder_turns": 77}, "budgets": {"outcome_usd": 123.0, "run_usd": 3.5}}
+    assert client.patch(path, json={"settings": custom}).status_code == 200
+    r = client.patch(path, json={"settings": {"limits": {"task_attempts_total": 5}, "budgets": {"task_usd": 7.5}}})
+    assert r.status_code == 200, r.text
+    saved = r.json()["settings"]
+    assert (saved["limits"]["task_attempts_total"], saved["budgets"]["task_usd"]) == (5, 7.5)
+    # A patch of one key is not a replacement of its section: the workspace's own values stay.
+    assert (saved["limits"]["ci_minutes"], saved["limits"]["builder_turns"]) == (90, 77)
+    assert (saved["budgets"]["outcome_usd"], saved["budgets"]["run_usd"]) == (123.0, 3.5)
+
+
 def test_disconnect_repository_deletes_review_history_and_keeps_costs(client, signed_in):
     # Uses foreign-key-enforcing SQLite by default, or Postgres through
     # AIFACTORY_TEST_DATABASE_URL, exactly like the rest of the API suite.
