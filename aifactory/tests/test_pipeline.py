@@ -3069,8 +3069,9 @@ def test_planning_without_a_provider_credential_holds_the_workspace(factory, mon
     with session_scope() as s:
         hold = s.get(Decision, hold_id)
         assert "planning outcome #1, the planner" in hold.body and "No model provider is configured" in hold.body
-        # The provider refused before a session started: there is no run, and the outcome has no decision of its own.
-        assert s.query(Run).filter(Run.outcome_id == outcome_id).count() == 0
+        # The provider refused before a session started: planning has no run (the Lead records its own on the
+        # outcome), and the outcome has no decision of its own.
+        assert s.query(Run).filter(Run.outcome_id == outcome_id, Run.role != "lead").count() == 0
         assert s.query(Decision).filter(Decision.outcome_id == outcome_id).count() == 0
         assert s.get(Outcome, outcome_id).status == "planning"
     # While the hold is open, planning is not started again.
