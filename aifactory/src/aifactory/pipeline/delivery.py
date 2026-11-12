@@ -20,6 +20,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from sqlalchemy import func
+
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
@@ -64,6 +66,10 @@ _PHASES = {"prepare": "Preparing the sandbox", "build": "The builder session",
 # Attempt records that do not end an attempt: an infrastructure failure (the same attempt is redone) and checks that
 # fail on the base commit too (the attempt goes on to verification).
 NOT_ATTEMPTS = ("infra", "checks_preexisting")
+# A repository's rails: changes to the files it lists always need a person's approval to merge (_check_rails).
+RAILS_FILE = ".factory/rails"
+LIFETIME_RECOMMENDATION = ("Recommended: this task has gone round the loop too often to be worth another round as it "
+                           "is. Abandon it and plan the work again as smaller tasks, or take it over.")
 # How far an attempt got: a record ends a run of infrastructure retries only when it shows that the phase which
 # failed (or a later one) has since completed.
 _PHASE_ORDER = {"prepare": 0, "build": 1, "checks": 2, "verify": 3}
@@ -765,6 +771,8 @@ class TaskRunner:
             self.update(attempt=self.task.attempt - 1)
         while True:
             attempt = self.task.attempt + 1
+            if not saved and not (identity is not None and identity["action"] == "revert"):
+                self._check_lifetime(max_attempts)  # before a builder session, never inside an attempt
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
                 attempt = self.task.attempt + 1
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts:
@@ -1834,6 +1842,56 @@ class TaskRunner:
                    f"before asking a person ({used + 1} of {rounds})", level="warn")
         return True
 
+    def _check_lifetime(self, max_attempts: int) -> None:
+        """Stop before the next builder session once the task has used up its lifetime limits: charged attempts in
+        every budget (``limits.task_attempts_total``) or the cost of its builder and verifier runs
+        (``budgets.task_usd``; runs of unknown cost count as nothing). A person's "allow more" raises both in
+        ``evidence["lifetime_allowance"]`` (decisions.resolve)."""
+        cap_attempts = _positive(self.settings["limits"].get("task_attempts_total"))
+        cap_usd = _positive(self.settings["budgets"].get("task_usd"))
+        if not (cap_attempts or cap_usd):
+            return
+        ev = self.task.evidence or {}
+        allowance = ev.get("lifetime_allowance") if isinstance(ev.get("lifetime_allowance"), dict) else {}
+        charged = [a for a in ev.get("attempts", []) if isinstance(a, dict) and a.get("result")
+                   and a["result"] not in NOT_ATTEMPTS and a["result"] != "builder_blocked"]
+        attempts_limit = int(max(cap_attempts, _positive(allowance.get("attempts")))) if cap_attempts else 0
+        usd_limit = max(cap_usd, _positive(allowance.get("usd"))) if cap_usd else 0.0
+        used, spent = len(charged), 0.0
+        if cap_usd:
+            with session_scope() as s:
+                spent = float(s.query(func.coalesce(func.sum(Run.cost_usd), 0)).filter(
+                    Run.task_id == self.task_id, Run.role.in_(("builder", "verifier")),
+                    Run.cost_known.is_(True)).scalar() or 0)
+        reached = [w for w, hit in (("attempt", attempts_limit and used >= attempts_limit),
+                                    ("dollar", usd_limit and spent >= usd_limit)) if hit]
+        if not reached:
+            return
+        lines = [f"{self.task.key} has used {used} attempt{'' if used == 1 else 's'} "
+                 + (f"(lifetime limit: {attempts_limit})" if attempts_limit else "(no limit)")
+                 + f" and ${spent:.2f} on its builder and verifier sessions "
+                 + (f"(lifetime limit: ${usd_limit:.2f})" if usd_limit else "(no limit)")
+                 + ". It has reached " + " and ".join(f"its {w} limit" for w in reached) + "."]
+        if charged:
+            last = charged[-1]
+            reason = _attempt_reason(last).strip().partition("\n")[0][:300]
+            lines.append(f"The last attempt ended in {last['result']}" + (f": {reason}" if reason else "."))
+        lines.append(LIFETIME_RECOMMENDATION)
+        numbers = {"attempts": used, "attempts_limit": attempts_limit or None, "usd": round(spent, 2),
+                   "usd_limit": round(usd_limit, 2) or None}
+        # "Allow more": one more set of attempts and one more task_usd on top of what is used or allowed now.
+        allow = {"attempts": max(attempts_limit, used) + max_attempts if attempts_limit else None,
+                 "usd": round(max(usd_limit, spent) + cap_usd, 2) if usd_limit else None}
+        self.event("task_limit_reached", f"{self.task.key} reached its lifetime limit: {used} attempts, "
+                   f"${spent:.2f}", level="warn", **numbers)
+        self.block("unblock", f"{self.task.key}: reached its lifetime limit", "\n\n".join(lines), status="failed",
+                   options=[{"value": "retry",
+                             "label": f"Allow {max_attempts} more attempt" + ("" if max_attempts == 1 else "s")},
+                            {"value": "take_over", "label": "I'll take it from here"},
+                            {"value": "abandon", "label": "Abandon task"}],
+                   metadata={"people_only": "A task at its lifetime limit goes on only when a person says so",
+                             "lifetime_limit": {**numbers, "allow": allow}})
+
     def _fresh_budget_after_base_moved(self, why: str) -> None:
         """A verified change that other work overtook is not the builder's failure: rebuilding it gets a fresh
         attempt budget, at most twice per task, after which a person decides."""
@@ -2791,7 +2849,8 @@ class TaskRunner:
         from ..onboarding_policy import active
 
         settings = workspace_settings(self.ws) if settings is None else settings
-        if active(settings) or _review_asks(getattr(self, "task", None), settings, self.cfg):
+        task = getattr(self, "task", None)
+        if active(settings) or _review_asks(task, settings, self.cfg) or _rails_touched(task):
             return True
         merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
         release_cfg = self.cfg.get("release") or {}
@@ -2806,11 +2865,41 @@ class TaskRunner:
 
     def _open_merge_approval(self) -> None:
         self.update(stage="merge")
+        rails, why, metadata = _rails_touched(self.task), "", None
+        if rails:
+            paths = rails.get("paths") or []
+            why = (f"This change touches the Factory's rails ({', '.join(paths[:5])}{', …' if len(paths) > 5 else ''}"
+                   "), so a person approves its merge.\n\n" if paths else
+                   f"The Factory could not read this change's rails ({rails.get('unreadable')}), so a person approves "
+                   "its merge.\n\n")
+            metadata = {"people_only": "A change to the Factory's rails merges only when a person approves it"}
         self.block("approve_merge", f"Approve merge: {self.task.title}",
-                   f"PR #{self.task.pr_number} passed independent verification and CI at "
+                   f"{why}PR #{self.task.pr_number} passed independent verification and CI at "
                    f"{self.task.head_sha[:10]}. {self.task.pr_url}{self._review_summary()}",
-                   status="awaiting_approval",
+                   status="awaiting_approval", metadata=metadata,
                    options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
+
+    async def _check_rails(self, token: str) -> None:
+        """Record in ``evidence["rails"]`` which files the published candidate changes that match the repository's
+        rails: ``RAILS_FILE`` as it is at the task's base commit, and the rails file itself. The base commit is the
+        only source, so the answer for a head and its base cannot change while the candidate waits, and a change
+        cannot remove its own rail. Read once per head and base."""
+        head, base = self.task.head_sha, self.task.base_sha
+        known = (self.task.evidence or {}).get("rails") or {}
+        if known.get("head") == head and known.get("base") == base:
+            return
+        record: dict[str, Any] = {"head": head, "base": base, "paths": []}
+        try:
+            files = await changed_paths(self.repo.full_name, token, base, head)
+            mirror_path = _mirror_path(self.repo.full_name)
+            listed = ""
+            if (await git("ls-tree", "--name-only", base, "--", RAILS_FILE, cwd=mirror_path)).strip():
+                listed = await git("show", f"{base}:{RAILS_FILE}", cwd=mirror_path)
+            patterns = [RAILS_FILE, *(line.strip() for line in listed.splitlines())]
+            record["paths"] = protected_violations(files, [p for p in patterns if p and not p.startswith("#")])
+        except GitError as exc:  # unknown rails ask a person, as rails do
+            record["unreadable"] = str(exc)[:300]
+        self.evidence("rails", record)
 
     async def _serialized_merge(self, gh: GitHub, method: str) -> dict[str, Any]:
         # The synchronous DB lock may wait for another merge or settings writer.
@@ -2870,6 +2959,15 @@ class TaskRunner:
                                             Decision.status == "resolved").order_by(Decision.resolved_at.desc()).first())
             if not (row and row.resolution == "approve" and row.resolved_at):
                 return False
+            if kind == "approve_merge" and _rails_touched(self.task):
+                # On the rails only an approval that was asked as one (it says so, and is marked for people) and
+                # that a person gave counts: the Director's, or one given before the change was known to touch a
+                # rail (the same patch on an older base), does not carry it in.
+                from ..models import User
+
+                by = s.get(User, row.resolved_by) if row.resolved_by else None
+                if by is None or by.is_system or not (row.metadata_json or {}).get("people_only"):
+                    return False
             given = row.resolved_at
         evidence = self.task.evidence or {}
         published, approved = evidence.get("published") or {}, evidence.get("approved") or {}
@@ -2914,6 +3012,7 @@ class TaskRunner:
                 self._steward_question("Steward PR head changed", "The verified head is stale; rebuild the candidate.",
                            status="needs_input")
         await self._steward_merge_policy_gate(token)
+        await self._check_rails(token)
         self._require_merge_approval()
         # One merge turn per repository: wait in the merge queue (parked, no slot) until this task is at its head.
         await merge_manager.take_turn(self, gh)
@@ -3339,6 +3438,28 @@ def _revalidation_section(state: dict[str, Any]) -> str:
         payload = json.dumps(summary, indent=2)
     return (f"{REVALIDATION_BEGIN}\n### Revalidation after base moved\n"
             f"```json\n{payload}\n```\n{REVALIDATION_END}")
+
+
+def _rails_touched(task: Task | None) -> dict[str, Any]:
+    """The task's rails record (TaskRunner._check_rails) for its current head when that needs a person, else {}."""
+    rails = ((task.evidence or {}).get("rails") or {}) if task is not None else {}
+    if not rails or rails.get("head") != task.head_sha or not (rails.get("paths") or rails.get("unreadable")):
+        return {}
+    return rails
+
+
+def _positive(value: Any) -> float:
+    """A limit from settings or evidence: a positive finite number, else 0.0 (no limit)."""
+    number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return float(value) if number and 0 < value < float("inf") else 0.0
+
+
+def _attempt_reason(attempt: dict[str, Any]) -> str:
+    """Why an attempt record ended, in its own words."""
+    verdict = attempt.get("verdict") if isinstance(attempt.get("verdict"), dict) else {}
+    failed = [c for c in _objects(attempt.get("checks")) if not c.get("ok")]
+    check = f"`{failed[0].get('command')}` failed (exit {failed[0].get('exit_code')})" if failed else ""
+    return str(attempt.get("error") or attempt.get("detail") or verdict.get("summary") or check or "")
 
 
 def _objects(items: Any) -> list[dict[str, Any]]:

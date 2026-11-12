@@ -38,7 +38,7 @@ def eligible(decision: Decision, repositories: list[Repository] | None = None) -
     if decision.kind not in ("question", "unblock"):
         return False
     meta = decision.metadata_json
-    if not isinstance(meta, dict):
+    if not isinstance(meta, dict) or meta.get("people_only"):
         return False
     origin, safety = meta.get("origin"), meta.get("safety")
     if not isinstance(origin, dict) or origin.get("role") not in ("planner", "builder", "verifier"):

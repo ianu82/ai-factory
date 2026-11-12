@@ -1085,6 +1085,161 @@ def test_automatic_retries_can_be_turned_off(factory):
     assert "auto_retry" not in _event_kinds(outcome_id)
 
 
+# A task's lifetime limit ---------------------------------------------------------------------------------------------
+
+def _task_with_history(factory, results, runs=(), **fields):
+    """A queued task whose earlier budgets each left one attempt record, with ``results``, and whose own agent runs
+    cost ``runs`` ((role, cost, known) each). The outcome's Lead is off."""
+    from aifactory.db import utcnow
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    failed = {"verdict": {"verdict": "fail", "summary": "Greeting still wrong.\nMore detail."}}
+    records = [{"n": 1, "epoch": i, "result": result,
+                **(failed if result == "verification_failed" else {"error": "sandbox went away"})}
+               for i, result in enumerate(results)]
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "lead": {"enabled": False}}
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1",
+                    title="Update greeting", spec="Make greet.sh print Hello, Factory!", acceptance=[CRITERION],
+                    repo_id=factory["repo"], started_at=utcnow(),
+                    evidence={"attempts": records, "budget_epoch": len(records)}, **{"status": "queued", **fields})
+        s.add(task)
+        s.flush()
+        s.add_all(Run(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, role=role, harness="native",
+                      status="succeeded", cost_usd=cost, cost_known=known) for role, cost, known in runs)
+        s.get(Outcome, outcome_id).status = "running"
+        return outcome_id, task.id
+
+
+LIFETIME_OPTIONS = [{"value": "retry", "label": "Allow 3 more attempts"},
+                    {"value": "take_over", "label": "I'll take it from here"},
+                    {"value": "abandon", "label": "Abandon task"}]
+
+
+def test_a_task_at_its_lifetime_attempt_limit_asks_a_person_before_another_builder_session(factory):
+    # Infrastructure failures, checks that fail on the base too and questions are not attempts: 12 of these 15 are.
+    history = ["verification_failed"] * 6 + ["infra", "checks_preexisting", "builder_blocked"] + [
+        "verification_failed"] * 6
+    outcome_id, task_id = _task_with_history(factory, history)
+    assert drive(lambda: _open_decision(outcome_id, "unblock") is not None)
+    with session_scope() as s:
+        decision, task = s.get(Decision, _open_decision(outcome_id, "unblock")), s.get(Task, task_id)
+        assert decision.title == "T1: reached its lifetime limit" and task.status == "failed"
+        assert decision.body.split("\n\n") == [
+            "T1 has used 12 attempts (lifetime limit: 12) and $0.00 on its builder and verifier sessions "
+            "(lifetime limit: $15.00). It has reached its attempt limit.",
+            "The last attempt ended in verification_failed: Greeting still wrong.",
+            "Recommended: this task has gone round the loop too often to be worth another round as it is. Abandon "
+            "it and plan the work again as smaller tasks, or take it over."]
+        assert decision.options == LIFETIME_OPTIONS
+        assert decision.metadata_json == {
+            "people_only": "A task at its lifetime limit goes on only when a person says so",
+            "lifetime_limit": {"attempts": 12, "attempts_limit": 12, "usd": 0.0, "usd_limit": 15.0,
+                               "allow": {"attempts": 15, "usd": 30.0}}}
+        assert s.query(Run).filter(Run.task_id == task_id).count() == 0  # no builder session started
+        reached = s.query(Event).filter(Event.task_id == task_id, Event.kind == "task_limit_reached").one()
+        assert {k: reached.data[k] for k in ("attempts", "attempts_limit", "usd", "usd_limit")} == {
+            "attempts": 12, "attempts_limit": 12, "usd": 0.0, "usd_limit": 15.0}
+    assert "builder" not in ScriptedModel.calls
+
+
+def test_records_that_are_not_attempts_leave_a_task_under_its_lifetime_limit(factory):
+    outcome_id, task_id = _task_with_history(
+        factory, ["verification_failed"] * 11 + ["infra"] * 3 + ["builder_blocked", "checks_preexisting"])
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "needs_input"))
+    with session_scope() as s:
+        assert s.get(Task, task_id).status == "completed", s.get(Task, task_id).blocked_reason
+        assert s.query(Decision).filter(Decision.task_id == task_id, Decision.kind == "unblock").count() == 0
+
+
+def test_a_task_that_has_spent_its_lifetime_dollars_asks_a_person_before_another_builder_session(factory):
+    # Only the task's own builder and verifier runs count, and a run of unknown cost counts as nothing.
+    outcome_id, task_id = _task_with_history(
+        factory, ["verification_failed"] * 2,
+        runs=[("builder", 9.0, True), ("verifier", 6.5, True), ("builder", 50.0, False)])
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "budgets": {**ws.settings["budgets"], "outcome_usd": 1000}}
+        s.add(Run(workspace_id=factory["ws"], outcome_id=outcome_id, role="planner", harness="native",
+                  status="succeeded", cost_usd=100.0))
+    assert drive(lambda: _open_decision(outcome_id, "unblock") is not None)
+    with session_scope() as s:
+        decision = s.get(Decision, _open_decision(outcome_id, "unblock"))
+        assert decision.title == "T1: reached its lifetime limit"
+        assert decision.body.split("\n\n")[0] == (
+            "T1 has used 2 attempts (lifetime limit: 12) and $15.50 on its builder and verifier sessions "
+            "(lifetime limit: $15.00). It has reached its dollar limit.")
+        assert decision.options == LIFETIME_OPTIONS
+        assert decision.metadata_json["lifetime_limit"] == {
+            "attempts": 2, "attempts_limit": 12, "usd": 15.5, "usd_limit": 15.0,
+            "allow": {"attempts": 15, "usd": 30.5}}
+        assert s.query(Run).filter(Run.task_id == task_id).count() == 3  # only the runs it started with
+    assert "builder" not in ScriptedModel.calls
+
+
+def test_allowing_more_lets_exactly_one_more_set_of_attempts_run_before_asking_again(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    ScriptedModel.scripts["verifier"] = _always_failing_verifier
+    outcome_id, task_id = _task_with_history(factory, ["verification_failed"] * 12)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 0}
+    assert drive(lambda: _open_decision(outcome_id, "unblock") is not None)
+    first = _open_decision(outcome_id, "unblock")
+    db = SessionLocal()
+    resolve(db, db.get(Decision, first), db.get(User, factory["user"]), "retry")
+    db.close()
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "queued" and task.evidence["lifetime_allowance"] == {"attempts": 13, "usd": 30.0}
+    assert drive(lambda: _open_decision(outcome_id, "unblock") not in (None, first))
+    with session_scope() as s:
+        second = s.get(Decision, _open_decision(outcome_id, "unblock"))
+        assert second.title == "T1: reached its lifetime limit"
+        assert second.options[0] == {"value": "retry", "label": "Allow 1 more attempt"}
+        assert second.metadata_json["lifetime_limit"] == {
+            "attempts": 13, "attempts_limit": 13, "usd": 0.0, "usd_limit": 30.0,
+            "allow": {"attempts": 14, "usd": 45.0}}
+        assert s.query(Run).filter(Run.task_id == task_id, Run.role == "builder").count() == 1
+    assert [a["result"] for a in _attempt_records(outcome_id)][12:] == ["verification_failed"]
+
+
+@pytest.mark.parametrize("off", [0, None])
+def test_lifetime_limits_of_zero_or_none_are_no_limit(factory, off):
+    outcome_id, task_id = _task_with_history(factory, ["verification_failed"] * 12, runs=[("builder", 20.0, True)])
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "limits": {**ws.settings["limits"], "task_attempts_total": off},
+                       "budgets": {**ws.settings["budgets"], "task_usd": off}}
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "needs_input"))
+    with session_scope() as s:
+        assert s.get(Task, task_id).status == "completed", s.get(Task, task_id).blocked_reason
+
+
+@pytest.mark.parametrize("stage,method", [("ci", "ci_then_merge"), ("revert", "revert")])
+def test_a_ci_wait_or_a_revert_is_not_stopped_by_the_lifetime_limit(factory, monkeypatch, stage, method):
+    outcome_id, task_id = _task_with_history(factory, ["verification_failed"] * 12, status="running", stage=stage,
+                                             pr_number=1)
+    went_on = []
+
+    async def go_on(self):
+        went_on.append(self.task.stage)
+
+    monkeypatch.setattr(delivery.TaskRunner, method, go_on)
+    asyncio.run(delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock()).run())
+    assert went_on == [stage]
+    with session_scope() as s:
+        assert s.query(Decision).filter(Decision.task_id == task_id).count() == 0
+    assert "task_limit_reached" not in _event_kinds(outcome_id)
+
+
 def test_an_attempt_interrupted_after_a_retry_is_redone_not_counted(factory):
     """Attempt numbers restart after a person's retry; old records with the same numbers must not make an
     interrupted attempt look finished (seen live: a restart skipped attempt 1 of a fresh budget)."""
@@ -1453,6 +1608,118 @@ def test_approving_a_merge_records_the_head_and_patch_that_were_approved(factory
         assert task.evidence["approved"] == {"head": head, "patch_id": "a" * 40 if recorded else "",
                                              "at": decision.resolved_at.isoformat()}
         assert task.evidence.get("published") == (published if recorded else None)
+
+
+# The rails: changes to the files a repository lists always need a person to merge -----------------------------------
+
+def _land_rails(factory, content):
+    (factory["remotes"] / "seed" / "acme" / "demo" / ".factory").mkdir(exist_ok=True)
+    return _land_on_main(factory, ".factory/rails", content)
+
+
+def test_a_change_to_a_rail_asks_a_person_to_merge_even_when_merging_is_automatic(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+    from aifactory.pipeline import director
+
+    _land_rails(factory, "# Changes to these always need a person.\n\nscripts/**\ngreet.sh\n")
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    with session_scope() as s:
+        settings = s.get(Workspace, factory["ws"]).settings
+        decision = s.get(Decision, _open_decision(outcome_id, "approve_merge"))
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert settings["autonomy"]["merge"] == "auto"
+        assert decision.body.startswith("This change touches the Factory's rails (greet.sh), so a person approves "
+                                        "its merge.\n\nPR #1 passed independent verification")
+        assert decision.metadata_json == {
+            "people_only": "A change to the Factory's rails merges only when a person approves it"}
+        assert task.evidence["rails"] == {"head": task.head_sha, "base": task.base_sha, "paths": ["greet.sh"]}
+        assert director.choices(s, decision, director.settings_for(settings))[0] == []  # only a person answers
+    assert FakeGitHub.merged == []
+
+    db = SessionLocal()
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]),
+            "approve")
+    db.close()
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert FakeGitHub.merged == [1]
+
+
+def test_a_change_that_touches_no_rail_merges_automatically_as_before(factory):
+    _land_rails(factory, "scripts/**\nother.sh\n")
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert task.evidence["rails"]["paths"] == []
+        assert s.query(Decision).filter(Decision.task_id == task.id, Decision.kind == "approve_merge").count() == 0
+    assert FakeGitHub.merged == [1]
+
+
+def test_on_the_rails_only_an_approval_asked_as_one_and_given_by_a_person_counts(factory):
+    from aifactory.db import utcnow
+    from aifactory.pipeline import director
+
+    _land_rails(factory, "greet.sh\n")
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    with session_scope() as s:
+        decision = s.get(Decision, _open_decision(outcome_id, "approve_merge"))
+        asked_as = dict(decision.metadata_json)
+        decision_id, task_id = decision.id, s.query(Task).filter(Task.outcome_id == outcome_id).one().id
+
+    def answered(by, metadata):
+        with session_scope() as s:
+            d = s.get(Decision, decision_id)
+            d.status, d.resolution, d.resolved_at = "resolved", "approve", utcnow()
+            d.resolved_by = director.director_user(s).id if by == "director" else factory["user"]
+            d.metadata_json = metadata
+        return delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge")
+
+    assert asked_as["people_only"]
+    with session_scope() as s:  # a system identity (the Lead, the Director, an operator relay) is refused up front
+        from aifactory.decisions import DecisionError, resolve
+
+        with pytest.raises(DecisionError, match="Only a person answers this decision"):
+            resolve(s, s.get(Decision, decision_id), director.director_user(s), "approve")
+        assert s.get(Decision, decision_id).status == "open"  # nothing was spent: the question still stands
+    assert answered("director", asked_as) is False  # the Director's approval does not carry a change onto the rails
+    # Nor does a person's approval that was not asked as a rails approval (the same patch, before it touched one).
+    assert answered("person", {}) is False
+    assert answered("person", asked_as) is True
+
+
+def test_the_rails_are_read_at_the_base_commit_so_a_candidate_cannot_remove_its_own(factory):
+    from aifactory.models import Plan
+
+    base = _land_rails(factory, "greet.sh\n")
+    seed = factory["remotes"] / "seed" / "acme" / "demo"
+    git("checkout", "-q", "-b", "drop-rails", cwd=seed)
+    (seed / "greet.sh").write_text("echo 'Hello, Factory!'\n")
+    git("rm", "-q", ".factory/rails", cwd=seed)
+    git("commit", "-qam", "Change the greeting and drop the rails", cwd=seed)
+    git("push", "-q", str(factory["remotes"] / "acme/demo.git"), "drop-rails", cwd=seed)
+    head = git("rev-parse", "HEAD", cwd=seed)
+    git("checkout", "-q", "main", cwd=seed)
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="running", stage="merge", pr_number=1, branch="drop-rails",
+                    head_sha=head, base_sha=base)
+        s.add(task)
+        s.flush()
+        task_id = task.id
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    asyncio.run(runner._check_rails("token"))
+    assert runner.task.evidence["rails"] == {"head": head, "base": base, "paths": [".factory/rails", "greet.sh"]}
+    assert runner._merge_needs_approval() is True
+    with session_scope() as s:
+        assert s.get(Task, task_id).evidence["rails"]["paths"] == [".factory/rails", "greet.sh"]
 
 
 def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
@@ -2621,6 +2888,11 @@ def test_learning_is_rechecked_immediately_before_merge(factory, monkeypatch, tr
         if transition == "claim":
             start_learning()
     monkeypatch.setattr(runner, "_claim_issues_before_merge", claim)
+
+    async def no_rails(token):  # "head" and "base" are not commits: unreadable rails would ask a person first
+        pass
+
+    monkeypatch.setattr(runner, "_check_rails", no_rails)
     monkeypatch.setattr(delivery, "GitHub", GitHub)
     if transition == "snapshot":
         start_learning()

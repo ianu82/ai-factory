@@ -190,6 +190,17 @@ def test_the_lead_acts_only_within_the_safe_set_and_its_own_outcome(world):
         assert s.get(User, posted.author_id).is_system
 
 
+def test_the_lead_leaves_a_decision_marked_for_people_alone(world):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    with db.session_scope() as s:
+        s.get(Decision, world["merge"]).metadata_json = {"people_only": "A person approves changes to the rails"}
+    out = tools.call("resolve_decision", {"decision_id": world["merge"], "option": "reject",
+                                          "comment": "Keep the old rule."})
+    assert "may not choose" in out
+    with db.session_scope() as s:
+        assert s.get(Decision, world["merge"]).status == "open"
+
+
 def test_each_tool_has_a_limit_per_run(world):
     tools = lead.Tools(world["ws"], world["outcome"], "run-1")
     for _ in range(lead.PER_RUN["note_for_people"]):
