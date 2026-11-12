@@ -25,7 +25,8 @@ from .db import session_scope, utcnow
 from .events import record
 from .linear import LinearError
 from .models import Decision, Event, LinearOperation as Operation, LinearWarningOperation, Outcome, Plan, Run, Secret, Signal, Task, Workspace
-from .security import SecretError, decrypt, redact
+from .preview_config import redaction_values
+from .security import SecretError, redact
 
 
 def _key(*parts: str) -> str:
@@ -57,7 +58,7 @@ def _body(db, workspace_id, body):
     secrets = []
     for secret in db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind != "feedback_key"):
         try:
-            secrets.append(decrypt(secret.ciphertext))
+            secrets.extend(redaction_values(secret))
         except SecretError:
             return "[redacted]"
     return redact(body, tuple(secrets))
