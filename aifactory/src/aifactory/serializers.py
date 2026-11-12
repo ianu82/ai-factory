@@ -173,6 +173,10 @@ def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, An
     if attribution.get("source") == "mind":
         person = db.get(User, d.resolved_by) if db and d.resolved_by else None
         context["resolved_by_name"] = ((person.name or person.email) if person else "Person") + " via Mind"
+    if d.kind == "provider_hold":
+        from .pipeline.holds import hold_details
+
+        context["hold"] = hold_details(d)  # why the provider refused, and what lifts the hold
     return {"attribution": attribution, "actionable": actionable(d), "correction": correction,
             "supersedes": attribution.get("supersedes"), "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,

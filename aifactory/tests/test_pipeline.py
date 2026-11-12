@@ -2971,7 +2971,18 @@ def test_a_failure_says_its_own_cause_where_it_happens():
         (_sdk_error("ConflictError", 409), "transient"),
         (_sdk_error("RateLimitError", 429, "Rate limit reached for gpt-terra"), "transient"),
         (_sdk_error("RateLimitError", 429, quota), "provider"),
-        (_sdk_error("RateLimitError", 429, "Too many requests", {"x-should-retry": "false"}), "provider"),
+        # Marked not worth retrying: a spend limit waits for a person; a rate limit or an overload doesn't (a gateway
+        # marks those once its own retries are spent, 12 Nov 2026).
+        (_sdk_error("RateLimitError", 429, "Monthly spend limit reached", {"x-should-retry": "false"}), "provider"),
+        (_sdk_error("RateLimitError", 429, "Too many requests", {"x-should-retry": "false"}), "transient"),
+        (_sdk_error("RateLimitError", 429, "Rate limit reached for gpt-terra", {"x-should-retry": "false"}), "transient"),
+        (_sdk_error("InternalServerError", 529, "Overloaded", {"x-should-retry": "false"}), "transient"),
+        (_sdk_error("InternalServerError", 503, "Service unavailable", {"x-should-retry": "false"}), "transient"),
+        # The Anton SDK's own verdicts, by class: its retries ended on an overload, or it stopped on billing.
+        (_sdk_error("ProviderOverloadedError",
+                    message="The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+         "transient"),
+        (type("WalletEmptyError", (type("MindsHubBillingStop", (Exception,), {}),), {})("Wallet empty"), "provider"),
         (_sdk_error("APIStatusError", 402), "provider"),
         (_sdk_error("AuthenticationError", 401), "provider"),
         (_sdk_error("PermissionDeniedError", 403), "provider"),
@@ -2987,6 +2998,10 @@ def test_a_failure_says_its_own_cause_where_it_happens():
     assert delivery.infrastructure_problem(unfamiliar, "provider") == "provider"
     assert delivery.infrastructure_problem(unfamiliar) == ""
     assert delivery.infrastructure_problem("Error code: 503 - Service temporarily unavailable") == "transient"
+    # Read from wording: a rate limit lifts on its own; a spent limit or quota waits for a person.
+    assert delivery.infrastructure_problem("Codex: Rate limit reached for gpt-terra, retry in 20s") == "transient"
+    assert delivery.infrastructure_problem("Codex: Monthly limit reached") == "provider"
+    assert delivery.infrastructure_problem("Rate limit: You exceeded your current quota, check billing") == "provider"
 
 
 def test_a_provider_billing_problem_holds_the_workspace_without_using_an_attempt(factory):
@@ -3253,6 +3268,12 @@ def test_a_provider_hold_is_listed_without_an_outcome_and_can_only_be_resumed(fa
     assert (item["outcome_id"], item["task_id"], item["outcome_number"], item["task_key"]) == (None, None, None, None)
     assert item["options"] == [{"value": "retry", "label": "Resume work"}]
     assert "planning outcome #3" in item["body"] and "another refusal" not in item["body"]
+    # Why the provider refused, and what lifts the hold: on the decision for every screen that shows the hold.
+    assert item["hold"] == {"cause": "credit", "label": "the model provider account is out of credit",
+                            "advice": "Add credit to the model provider account, then resume work.",
+                            "source": "planning outcome #3", "error": "Error code: 402 - Payment Required"}
+    assert "Cause: the model provider account is out of credit." in item["body"]
+    assert "What to do: Add credit to the model provider account" in item["body"]
     for refused in ("dismiss", "abandon"):
         r = client.post(f"/api/workspaces/{ws}/decisions/{hold_id}/resolve", json={"resolution": refused})
         assert r.status_code == 400, r.text
