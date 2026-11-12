@@ -81,6 +81,11 @@ SETTINGS_REVISION = 1
 FORMER_DEFAULTS = ((1, "review", "wait_seconds", 120), (1, "review", "max_rounds", 2))
 
 
+def new_settings() -> dict[str, Any]:
+    """A new workspace's own copy of the defaults, marked current: a restart has nothing to refresh in it."""
+    return {**json.loads(json.dumps(DEFAULT_SETTINGS)), "_defaults": SETTINGS_REVISION}
+
+
 def refreshed_defaults(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     """The settings with copies of former defaults moved to the current ones; None when they are up to date."""
     raw = raw or {}

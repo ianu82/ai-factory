@@ -86,11 +86,15 @@ def test_a_workspaces_copies_of_former_review_defaults_are_refreshed_at_startup_
     from aifactory.models import Workspace
 
     ws_id = signed_in["workspaces"][0]["id"]
+    # A workspace made now is current from its first moment: a restart writes nothing to it.
+    assert refresh_copied_defaults() == 0
     with session_scope() as s:
         ws = s.get(Workspace, ws_id)
-        ws.settings = {**ws.settings, "review": {**DEFAULT_REVIEW, "wait_seconds": 120, "max_rounds": 2,
-                                                  "block_on": "all"}}
-    assert refresh_copied_defaults() >= 1
+        assert ws.settings["_defaults"] == SETTINGS_REVISION
+        # One from before the review wait changed: no revision, and the copies of the former defaults.
+        ws.settings = {**{k: v for k, v in ws.settings.items() if k != "_defaults"},
+                       "review": {**DEFAULT_REVIEW, "wait_seconds": 120, "max_rounds": 2, "block_on": "all"}}
+    assert refresh_copied_defaults() == 1
     with session_scope() as s:
         settings = s.get(Workspace, ws_id).settings
         assert settings["review"] == {**DEFAULT_REVIEW, "block_on": "all"}

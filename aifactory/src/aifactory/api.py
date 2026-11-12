@@ -37,7 +37,7 @@ from .model_checks import check_workspace_models
 from .models import (Alert, Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
-from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
+from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings, new_settings
 from .review import review_policy, validate_review
 from .repo_detect import detect
 from .sandbox import isolation_available
@@ -142,7 +142,7 @@ def create_workspace(body: WorkspaceCreate, user: User = Depends(current_user), 
     while db.query(Workspace).filter(Workspace.org_id == body.org_id, Workspace.slug == slug).first():
         slug, n = f"{base}-{n}", n + 1
     ws = Workspace(org_id=body.org_id, name=body.name, slug=slug, description=body.description,
-                   settings=onboarding_policy.begin(DEFAULT_SETTINGS))
+                   settings=onboarding_policy.begin(new_settings()))
     db.add(ws)
     db.flush()
     db.add(Membership(workspace_id=ws.id, user_id=user.id, role="owner"))
