@@ -466,7 +466,7 @@ def apply(db: Session, sig: Signal, user: User, *, note: str | None = None) -> s
         # validation error and continue using this transaction.
         with db.begin_nested():
             repo.config = cfg
-            definitions.validate_repository_change(db, sig.workspace_id)
+            definitions.validate_repository_change(db, sig.workspace_id, author=user.id)
     sig.status = "accepted"
     sig.last_seen_at = utcnow()
     record(sig.workspace_id, "improvement_applied", f"Applied “{sig.title}” ({summary})", actor=user.id,

@@ -340,6 +340,38 @@ def test_verifiers_are_told_to_separate_pre_existing_failures_from_the_change():
     assert "pre-existing" in BUILDER
 
 
+def test_the_builder_is_told_what_its_checkout_holds_not_that_it_is_always_fresh():
+    from aifactory.prompts import BUILDER, working_tree
+
+    assert "fresh checkout" not in BUILDER and '"State of your working tree" in the task' in BUILDER
+    main = {"from": "default", "default": "main", "sha": "0123456789abcdef0123", "branch": "factory/1-t1-abc123"}
+    assert working_tree(main) == ("A fresh checkout of the default branch `main` at `0123456789ab`. Nothing from an "
+                                  "earlier attempt is in it.")
+    left = working_tree({**main, "changes": "left", "attempt": 1})
+    assert left.startswith("A checkout of the default branch `main` at `0123456789ab`. What attempt 1 changed is still")
+    assert "uncommitted (staged or not): run `git status` and `git diff HEAD` to see it." in left
+    restored = working_tree({**main, "changes": "restored", "attempt": 2})
+    assert restored.startswith("A fresh checkout of the default branch `main` at `0123456789ab`. The whole change of "
+                               "attempt 2 was restored into it from a saved copy, staged but not committed")
+    lost = working_tree({**main, "changes": "lost", "attempt": 2})
+    assert lost == ("A fresh checkout of the default branch `main` at `0123456789ab`. What attempt 2 changed could not "
+                    "be restored and is not in it; the feedback below is what remains of it.")
+    assert "Nothing from an earlier attempt" not in left + restored + lost
+    branch = {**main, "from": "branch"}
+    on = "The pull request's branch `factory/1-t1-abc123`, on top of the default branch `main` at `0123456789ab`"
+    assert working_tree({**branch, "pushed": "commits"}) == (
+        on + ": everything already pushed to the pull request is in it as commits (see `git diff 0123456789ab`).")
+    assert working_tree({**branch, "pushed": "uncommitted"}) == (
+        on + ": the pull request's earlier change is in it as uncommitted changes, not as commits.")
+    assert working_tree({**branch, "pushed": ""}) == on + ": nothing of the pull request's earlier change is in it."
+    assert working_tree({**branch, "pushed": None}) == on + "."  # git could not say
+    assert working_tree({**branch, "pushed": "commits", "changes": "lost", "attempt": 1}).endswith(
+        " What attempt 1 changed was never pushed and is not in it; the feedback below is what remains of it.")
+    assert working_tree({**branch, "pushed": "commits", "changes": "left", "attempt": 1}).endswith(
+        " What attempt 1 changed is still in it, uncommitted (staged or not): run `git status` and `git diff HEAD` to "
+        "see it.")
+
+
 def test_review_findings_reach_the_builder_as_quoted_claims_that_cannot_forge_a_line_of_the_prompt():
     import json
 

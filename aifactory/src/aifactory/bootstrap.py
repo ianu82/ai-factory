@@ -139,7 +139,7 @@ def apply_bootstrap() -> str | None:
                         # so the operator's intent can be retried after quota is freed.
                         with s.begin_nested():
                             existing[name].config = current
-                            definitions.validate_repository_change(s, ws.id)
+                            definitions.validate_repository_change(s, ws.id, author="bootstrap")
                     except definitions.DefinitionError as exc:
                         log.error("Bootstrap skipped configuration for %s: %s", name, exc)
                 if branch:
@@ -560,7 +560,7 @@ async def _connect(workspace_id: str, names: list[tuple[str, dict]]) -> None:
                 if not any(r.full_name == info["full_name"] for r in repositories):
                     s.add(Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=branch,
                                      description=info.get("description") or "", config=config))
-                    definitions.validate_repository_change(s, workspace_id)
+                    definitions.validate_repository_change(s, workspace_id, author="bootstrap")
         except definitions.DefinitionError as exc:
             log.error("Bootstrap could not connect %s: %s", name, exc)
             continue
