@@ -1,4 +1,5 @@
-# Changes to these files always need a person's approval before they merge.
+# Changes to these files always need a person's approval before they merge. The one exception is the Factory's own
+# revert of a merge whose smoke run failed: it puts back what was there before.
 # They decide what may merge, release or spend, or they are how the Factory deploys itself.
 .factory/**
 .github/**

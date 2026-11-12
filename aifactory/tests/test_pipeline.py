@@ -1679,6 +1679,12 @@ def test_on_the_rails_only_an_approval_asked_as_one_and_given_by_a_person_counts
         return delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge")
 
     assert asked_as["people_only"]
+    with session_scope() as s:  # a system identity (the Lead, the Director, an operator relay) is refused up front
+        from aifactory.decisions import DecisionError, resolve
+
+        with pytest.raises(DecisionError, match="Only a person answers this decision"):
+            resolve(s, s.get(Decision, decision_id), director.director_user(s), "approve")
+        assert s.get(Decision, decision_id).status == "open"  # nothing was spent: the question still stands
     assert answered("director", asked_as) is False  # the Director's approval does not carry a change onto the rails
     # Nor does a person's approval that was not asked as a rails approval (the same patch, before it touched one).
     assert answered("person", {}) is False
