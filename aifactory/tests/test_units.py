@@ -367,6 +367,26 @@ def test_the_builder_is_told_what_its_checkout_holds_not_that_it_is_always_fresh
     assert working_tree({**branch, "pushed": "commits", "changes": "left", "attempt": 1}).endswith(
         " What attempt 1 changed is still in it, uncommitted (staged or not): run `git status` and `git diff HEAD` to "
         "see it.")
+    # A session of this same attempt was interrupted: the builder is told whether the work saved from it is back in
+    # the checkout, and what is lost either way.
+    saved = {"restored": True, "at": "2026-11-12 09:30 UTC", "files": 2, "additions": 14, "deletions": 3}
+    assert working_tree({**main, "wip": saved}) == (
+        "A fresh checkout of the default branch `main` at `0123456789ab`. Your previous session on this attempt was "
+        "interrupted (the service restarted, or its infrastructure failed). The changes in its checkout were last "
+        "saved at 2026-11-12 09:30 UTC (2 file(s), +14 -3 against the base commit) and have been restored into this "
+        "one, staged but not committed. Anything done after that save is lost, and so is the earlier conversation. "
+        "Run `git status` and `git diff HEAD` to see the restored work, and continue from it rather than starting "
+        "again.")
+    gone = {"restored": False, "why": "they no longer apply to main at 01234567"}
+    assert working_tree({**main, "wip": gone}) == (
+        "A fresh checkout of the default branch `main` at `0123456789ab`. Nothing from an earlier attempt is in it. "
+        "Your previous session on this attempt was interrupted, and what it had changed could not be restored (they "
+        "no longer apply to main at 01234567): that work is lost, and so is the earlier conversation.")
+    # What an earlier attempt changed is described as before when the interrupted session's work is not back.
+    assert working_tree({**main, "changes": "restored", "attempt": 1, "wip": gone}) == restored.replace(
+        "attempt 2", "attempt 1") + (" Your previous session on this attempt was interrupted, and what it had "
+                                     "changed could not be restored (they no longer apply to main at 01234567): that "
+                                     "work is lost, and so is the earlier conversation.")
 
 
 def test_review_findings_reach_the_builder_as_quoted_claims_that_cannot_forge_a_line_of_the_prompt():
@@ -483,6 +503,64 @@ def test_extract_patch_excludes_all_root_scratch_and_external_files(tmp_path, sc
     assert (clean / "cell.py").read_text() == "new source\n"
     assert (clean / "source.py").read_text() == "after\n"
     assert not (clean / ".factory").exists()
+    asyncio.run(sb.close())
+
+
+@pytest.mark.parametrize("scratch_ignored", [False, True])
+def test_a_snapshot_reads_what_extract_patch_would_and_leaves_the_index_and_the_files_alone(tmp_path, scratch_ignored):
+    import subprocess
+
+    from aifactory.gitops import extract_patch, snapshot_patch
+
+    sb = LocalSandbox("snapshot", root=tmp_path).create()
+    sb.work.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=sb.work, env=env, check=True, capture_output=True).stdout.decode()
+    git("init", "-q")
+    (sb.work / "source.py").write_text("before\n")
+    (sb.work / "old.py").write_text("removed by the job\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD").strip()
+    if scratch_ignored:  # as in a checkout the Factory made (.git/info/exclude)
+        (sb.work / ".git" / "info").mkdir(exist_ok=True)
+        with (sb.work / ".git" / "info" / "exclude").open("a") as exclude:
+            exclude.write("\n.factory/\n")
+    # A job at work: an edit and a deletion it has not staged, a file it staged, one it never added, and its notes.
+    (sb.work / "source.py").write_text("after\n")
+    (sb.work / "old.py").unlink()
+    (sb.work / "staged.py").write_text("staged by the job\n")
+    git("add", "staged.py")
+    (sb.work / "new.py").write_text("not added\n")
+    (sb.work / ".factory").mkdir()
+    (sb.work / ".factory" / "notes.txt").write_text("private note\n")
+
+    def state():
+        return git("diff", "--cached", "--name-only"), git("status", "--porcelain"), git("ls-files", "--stage")
+    before = state()
+    assert before[0] == "staged.py\n" and "?? new.py\n" in before[1] and " M source.py\n" in before[1]
+    # The job's own git command holds the index lock, and a snapshot that was killed left its copy and lock behind.
+    lock, copy = sb.work / ".git" / "index.lock", sb.work / ".git" / "factory-wip-index"
+    lock.write_bytes(b"")
+    copy.write_bytes(b"half a copy")
+    copy.with_name("factory-wip-index.lock").write_bytes(b"")
+
+    async def go():
+        snapshot = await snapshot_patch(sb, base)
+        assert lock.exists() and not copy.exists() and not copy.with_name("factory-wip-index.lock").exists()
+        lock.unlink()
+        assert state() == before
+        # Its result is in scratch files of its own: the candidate's are written by extract_patch alone.
+        assert (sb.work / ".factory" / "wip.patch").read_bytes() == snapshot.diff
+        assert not (sb.work / ".factory" / "candidate.patch").exists()
+        return snapshot, await extract_patch(sb, base)
+    snapshot, candidate = asyncio.run(go())
+    assert snapshot == candidate and not snapshot.empty
+    assert snapshot.files == ["new.py", "old.py", "source.py", "staged.py"]
+    assert (snapshot.additions, snapshot.deletions) == (3, 2)
+    assert b"private note" not in snapshot.diff and b".factory" not in snapshot.diff
     asyncio.run(sb.close())
 
 

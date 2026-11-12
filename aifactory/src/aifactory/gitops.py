@@ -295,9 +295,12 @@ async def snapshot_patch(sandbox: LocalSandbox, base_sha: str, timeout: float = 
     # The copy lives in the git directory, not the scratch directory: that is in the working tree, where the copy's
     # lock file would come and go as an untracked file under the job's own git commands. No pathspec for `git add`:
     # where the checkout ignores the scratch directory, one that names it fails (see tree_id). A snapshot killed
-    # half way leaves its copy and that copy's lock behind; both are removed first.
+    # half way leaves its copy and that copy's lock behind; both are removed first. The copy keeps the index's time
+    # (cp -p): git compares a file's content when it changed in the second its index was written, and a newer
+    # index would take such a file as unchanged.
     script = (f'set -e; mkdir -p {SCRATCH}; index="$(git rev-parse --absolute-git-dir)/factory-wip-index"; '
-              'rm -f "$index" "$index.lock"; cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null || true; '
+              'rm -f "$index" "$index.lock"; '
+              'cp -p "$(git rev-parse --git-path index)" "$index" 2>/dev/null || true; '
               f'export GIT_INDEX_FILE="$index"; git add -A >/dev/null; {_diff_commands(base_sha, "wip")}; '
               'rm -f "$index"')
     result = await sandbox.exec(script, timeout=timeout)
