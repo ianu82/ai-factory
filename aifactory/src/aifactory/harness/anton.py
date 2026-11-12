@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..inference import BudgetExceeded
+from ..failures import failure_cause, failure_status
+from ..inference import BudgetExceeded, Retries, _seconds
 from ..inference_limits import admission
 from .anton_tools import replace_session_tools
 from .anton_web import sandbox_web_tools
@@ -49,27 +50,43 @@ def _usage(response: Any) -> tuple[int, int] | None:
 
 
 class _AdmittedResponses:
-    """Keep SDK compatibility retries inside the hook individually admitted."""
+    """Keep SDK compatibility retries inside the hook individually admitted, and retry a provider that is briefly
+    unavailable the way the native client does (inference.Retries): each send takes its own permit and every wait is
+    outside it. Only a request that failed before it answered is retried; once ``create`` has returned, a failure
+    while its stream is read belongs to the SDK and ends the session."""
 
-    def __init__(self, responses, config, run_id):
+    def __init__(self, responses, config, run_id, retries=None):
         self.responses = responses
         self.config = config
         self.run_id = run_id
+        self.retries = retries or Retries  # called once per request
 
     def __getattr__(self, name):
         return getattr(self.responses, name)
 
     async def create(self, **body):
-        async with admission(self.config, self.run_id):
-            return await self.responses.create(**body)
+        retries = self.retries()
+        while True:
+            try:
+                async with admission(self.config, self.run_id):
+                    response = await self.responses.create(**body)
+            except Exception as exc:
+                headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+                if failure_cause(exc) != "transient" or not await retries.wait(
+                        str(failure_status(exc) or type(exc).__name__), _seconds(headers.get("retry-after"))):
+                    retries.report(False)
+                    raise
+                continue
+            retries.report(True)
+            return response
 
 
-async def _create_admitted_response(config, run_id, create, provider, body):
+async def _create_admitted_response(config, run_id, create, provider, body, retries=None):
     # The SDK hook can send again directly when an optional parameter is refused.
     # Wrap its resource, not the whole hook, so every actual send is admitted and
     # recursive hook retries never hold a permit while waiting for another one.
     if not isinstance(provider._client.responses, _AdmittedResponses):
-        provider._client.responses = _AdmittedResponses(provider._client.responses, config, run_id)
+        provider._client.responses = _AdmittedResponses(provider._client.responses, config, run_id, retries)
     return await create(provider, body)
 
 
@@ -111,23 +128,37 @@ class AntonHarness:
 
         toolbox = ToolBox(session)
         provider_cfg = session.client.provider
-        state: dict[str, Any] = {"report": None, "calls": 0, "error": ""}
+        state: dict[str, Any] = {"report": None, "calls": 0, "error": "", "cause": ""}
+
+        def failed(error: str, cause: str = "") -> None:
+            # Why the session is ending, and whether the model provider did it (failures.failure_cause).
+            state["error"], state["cause"] = error, cause
+
+        def retries() -> Retries:
+            return Retries(deadline=session.deadline, cancelled=session.cancelled,
+                           notice=lambda text: session.on_progress("warn", text, {}))
 
         class Provider(OpenAIProvider):
             async def _create_response(provider, body):  # noqa: N805 - SDK hook signature
                 if session.cancelled.is_set():
                     raise _Stop()
                 if state["calls"] >= session.max_turns + 3 or session.remaining() <= 0:
-                    state["error"] = "Anton exhausted its turn or time budget"
+                    failed("Anton exhausted its turn or time budget")
                     raise _Stop()
                 try:
                     session.ledger.check()
                 except BudgetExceeded as exc:
-                    state["error"] = str(exc)
+                    failed(str(exc))
                     raise _Stop() from exc
                 state["calls"] += 1
-                response = await _create_admitted_response(
-                    provider_cfg, session.run_id, OpenAIProvider._create_response, provider, body)
+                try:
+                    response = await _create_admitted_response(
+                        provider_cfg, session.run_id, OpenAIProvider._create_response, provider, body, retries)
+                except Exception as exc:
+                    # Kept beside the error: the SDK may wrap the exception, or end the turn without raising it.
+                    failed(f"Model request failed: {exc}", failure_cause(exc))
+                    raise
+                failed("")
                 session.ledger.add(session.model, _usage(response))
                 return response
 
@@ -246,7 +277,11 @@ class AntonHarness:
             except _Stop:
                 pass
             except TimeoutError:
-                state["error"] = "Anton exceeded its time budget"
+                failed("Anton exceeded its time budget")
+            except Exception as exc:
+                if state["cause"]:  # the model provider failed the session: say so by type, with the SDK's wording
+                    raise HarnessFailed(str(exc) or type(exc).__name__, cause=state["cause"]) from exc
+                raise
             finally:
                 try:
                     await chat.close()
@@ -254,6 +289,6 @@ class AntonHarness:
                     pass
                 await client.aclose()
         if state["report"] is None:
-            raise HarnessFailed(state["error"] or "Anton ended without a valid report")
+            raise HarnessFailed(state["error"] or "Anton ended without a valid report", cause=state["cause"])
         session.on_progress("harness", f"Anton finished in {time.monotonic() - started:.0f}s", {})
         return HarnessResult(report=state["report"], turns=state["calls"], log="\n".join(toolbox.log))

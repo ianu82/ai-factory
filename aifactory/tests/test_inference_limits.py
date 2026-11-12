@@ -194,6 +194,185 @@ async def test_native_and_gateway_retries_reacquire_without_holding_backoff(prov
     assert len(guard._sends) == 4 and guard.active == 0
 
 
+def retry_clock(monkeypatch, now, guard):
+    """Retry waits without waiting: each is recorded, moves the shared clock on, and must hold no permit."""
+    waits = []
+    real_sleep = asyncio.sleep
+
+    async def backoff(delay):
+        assert guard.active == 0
+        waits.append(delay)
+        now[0] += delay
+        await real_sleep(0)
+
+    monkeypatch.setattr(inference, "_clock", lambda: now[0])
+    monkeypatch.setattr(inference.random, "random", lambda: 0.0)
+    monkeypatch.setattr(asyncio, "sleep", backoff)
+    return waits
+
+
+async def test_a_short_provider_outage_is_retried_inside_the_request(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    answers = [(429, {"retry-after": "7"}, {"error": {"message": "Rate limit reached"}}), (502, {}, {}),
+               (200, {}, {"output": []})]
+    sends, notes = [], []
+
+    def upstream(req):
+        sends.append(guard.active)
+        status, headers, body = answers[len(sends) - 1]
+        return httpx.Response(status, headers=headers, json=body)
+
+    fake_http(monkeypatch, upstream)
+    assert await ModelClient(provider)._post("/responses", {}, notice=notes.append) == {"output": []}
+    # The provider's own retry-after is honoured, then the backoff; no permit is held during either wait.
+    assert sends == [1, 1, 1] and waits == [7, 2] and guard.active == 0
+    assert notes == ["Model provider unavailable (502); retried for 9 s, then succeeded"]
+
+
+async def test_an_outage_longer_than_the_retry_budget_fails_the_request(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends, notes = [], []
+
+    def upstream(req):
+        sends.append(now[0])
+        return httpx.Response(503, json={"error": {"message": "Service temporarily unavailable"}})
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider)._post("/responses", {}, notice=notes.append)
+    # Doubling, capped at a minute. With 57 s left the next wait would end at the budget, so it is not taken and
+    # nothing is sent there: such a request could run for its whole timeout past the budget.
+    assert waits == [1, 2, 4, 8, 16, 32, 60, 60, 60]
+    assert len(sends) == 10 and sends[-1] - sends[0] == 243 < inference.RETRY_BUDGET_SECONDS
+    assert (failed.value.status, failed.value.cause) == (503, "transient")
+    assert notes == ["Model provider unavailable (503); gave up after 243 s"]
+
+
+@pytest.mark.parametrize("limit, sent, waited", [(0, 1, []), (2, 3, [1, 2])])
+async def test_a_client_with_a_retry_limit_fails_fast(provider, clocked, monkeypatch, limit, sent, waited):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(guard.active)
+        return httpx.Response(503, json={})
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider, max_retries=limit)._post("/responses", {})
+    assert len(sends) == sent and waits == waited and failed.value.cause == "transient"
+
+
+@pytest.mark.parametrize("status, headers, message, said", [
+    (402, {}, "Payment required", "no credit remaining"),
+    (401, {}, "Invalid API key", "refused the credential"),
+    (403, {}, "Key disabled", "refused the credential"),
+    (429, {}, "You exceeded your current quota, please check your plan and billing details.", "error 429"),
+    (429, {"x-should-retry": "false"}, "Monthly limit reached", "limit reached"),
+])
+async def test_a_provider_refusal_is_never_retried(provider, clocked, monkeypatch, status, headers, message, said):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(guard.active)
+        return httpx.Response(status, headers=headers, json={"error": {"message": message}})
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider)._post("/responses", {})
+    assert len(sends) == 1 and waits == [] and guard.active == 0
+    assert (failed.value.status, failed.value.cause) == (status, "provider") and said in str(failed.value)
+
+
+async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(now[0])
+        return httpx.Response(503, json={})
+
+    fake_http(monkeypatch, upstream)
+    client = ModelClient(provider)
+    with pytest.raises(inference.InferenceError):
+        await client._post("/responses", {}, deadline=now[0] + 10)
+    # With 3 s of the session left the next wait (8 s) does not fit: the request fails, nothing is sent at the deadline.
+    assert waits == [1, 2, 4] and sends == [0, 1, 3, 7]
+    stopped = asyncio.Event()
+    stopped.set()
+    with pytest.raises(inference.InferenceError):
+        await client._post("/responses", {}, cancelled=stopped)
+    assert len(sends) == 5 and len(waits) == 3  # a cancelled session sends once and never waits
+
+
+async def test_cancelling_the_session_ends_a_retry_wait(provider, clocked, monkeypatch):
+    _, guard = clocked
+    sends, waiting, stopped = [], asyncio.Event(), asyncio.Event()
+
+    def upstream(req):
+        sends.append(guard.active)
+        return httpx.Response(503, json={})
+
+    async def backoff(delay):
+        waiting.set()
+        await asyncio.Event().wait()  # this wait ends only by being cancelled
+
+    fake_http(monkeypatch, upstream)
+    monkeypatch.setattr(asyncio, "sleep", backoff)
+    pending = asyncio.create_task(ModelClient(provider)._post("/responses", {}, cancelled=stopped))
+    await asyncio.wait_for(waiting.wait(), 1)
+    assert sends == [1] and not pending.done() and guard.active == 0
+    stopped.set()
+    with pytest.raises(inference.InferenceError):
+        await asyncio.wait_for(pending, 1)
+    assert sends == [1]
+
+
+def sdk_error(name, status, message="", headers=None):
+    """An exception shaped like the OpenAI SDK's (a status_code, the response's headers), without the SDK."""
+    exc = type(name, (Exception,), {})(message or f"Error code: {status}")
+    exc.status_code, exc.response = status, SimpleNamespace(headers=headers or {})
+    return exc
+
+
+async def test_anton_retries_a_short_outage_outside_the_permit_and_never_a_refusal(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    refusal = sdk_error("APIStatusError", 402, "Error code: 402 - {'error': {'message': 'Payment Required'}}")
+    answers = [sdk_error("InternalServerError", 503), sdk_error("RateLimitError", 429, headers={"retry-after": "5"}),
+               {"id": "resp_1"}, refusal]
+    sends, notes = [], []
+
+    class Responses:
+        async def create(self, **body):
+            sends.append(guard.active)
+            answer = answers[len(sends) - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    sdk = SimpleNamespace(_client=SimpleNamespace(responses=Responses()))
+
+    async def sdk_hook(p, body):
+        return await p._client.responses.create(**body)
+
+    def session_retries():
+        return inference.Retries(notice=notes.append)
+
+    assert await _create_admitted_response(provider, None, sdk_hook, sdk, {}, session_retries) == {"id": "resp_1"}
+    assert sends == [1, 1, 1] and waits == [1, 5] and guard.active == 0
+    assert notes == ["Model provider unavailable (429); retried for 6 s, then succeeded"]
+    with pytest.raises(type(refusal)) as failed:
+        await _create_admitted_response(provider, None, sdk_hook, sdk, {}, session_retries)
+    assert failed.value is refusal and len(sends) == 4 and waits == [1, 5] and len(notes) == 1
+
+
 @pytest.mark.parametrize("failure", ["send", "read", "close", "cancel"])
 async def test_gateway_failure_releases_capacity(provider, clocked, monkeypatch, failure):
     _, guard = clocked
