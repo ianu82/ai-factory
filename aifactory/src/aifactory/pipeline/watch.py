@@ -56,7 +56,8 @@ WAITING = {"needs_input": "waiting for an answer", "awaiting_approval": "waiting
 DROPPED = ("abandoned", "cancelled")
 # Not the work moving: the watch's own records, the Lead's posts and guidance, and session starts and ends (sessions
 # are read from runs, where the Lead's are left out).
-NOT_ACTIVITY = ("lead_watch", "alert_raised", "alert_dismissed", "lead_note", "lead_update", "guidance",
+NOT_ACTIVITY = ("lead_watch", "alert_raised", "alert_dismissed", "lead_note", "lead_update", "progress_digest",
+                "guidance",
                 "run_started", "run_finished")
 # A task out of attempts is the task's own failure, not the pipeline's; the failure classes of review item L2 will
 # tell them apart properly.
