@@ -67,7 +67,7 @@ export async function readMindSSE(response: Response, signal: AbortSignal, recei
 }
 
 export interface MindTransport {
-  list(signal: AbortSignal): Promise<MindThread[]>;
+  list(signal: AbortSignal, workspaceId?: string): Promise<MindThread[]>;
   create(workspace: string, signal: AbortSignal): Promise<MindHistory>;
   history(thread: string, signal: AbortSignal): Promise<MindHistory>;
   /** Whether Mind can answer for this workspace now (no thread needed). */
@@ -106,6 +106,7 @@ export class MindController {
   private roles: Record<string, Role> = {};
   private routeKey = "";
   private listFailure = ""; // the error a failed thread list left; only a later successful list clears it
+  private listWorkspaceId: string | undefined;
   private listRequest = 0; // only the newest thread-list request updates the list and its error
   constructor(privateTransport: MindTransport) { this.transport = privateTransport; }
   private transport: MindTransport;
@@ -115,7 +116,7 @@ export class MindController {
   setIdentity(userId: string | null, roles: Record<string, Role> = {}) {
     this.roles = roles;
     if (userId === this.state.userId) return;
-    this.cancel(); this.routeKey = ""; this.listFailure = ""; this.state = initial(userId); this.update({});
+    this.cancel(); this.routeKey = ""; this.listFailure = ""; this.listWorkspaceId = undefined; this.state = initial(userId); this.update({});
   }
   cancel() {
     this.generation++;
@@ -144,9 +145,15 @@ export class MindController {
       }
     } finally { this.controllers.delete(controller); }
   }
-  async list() {
+  async list(workspaceId?: string) {
     const request = ++this.listRequest;
-    await this.request((s) => this.transport.list(s), (threads) => {
+    if (workspaceId !== this.listWorkspaceId) {
+      this.listWorkspaceId = workspaceId;
+      // Do not leave another factory's conversations visible while the new list loads (or if it fails).
+      this.update({ threads: this.state.threads.filter((t) => workspaceId === undefined || t.workspace_id === workspaceId) });
+    }
+    await this.request((s) => this.transport.list(s, workspaceId), (threads) => {
+      threads = threads.filter((t) => workspaceId === undefined || t.workspace_id === workspaceId);
       // Clear only the error an earlier failed list left; a newer error from another action (send, confirm) stays.
       const stale = this.listFailure !== "" && this.state.error === this.listFailure;
       this.listFailure = "";
@@ -154,7 +161,9 @@ export class MindController {
     }, (message) => { this.listFailure = message; }, () => request === this.listRequest);
   }
   private load(history: MindHistory) {
-    this.update({ messages: history.messages, status: history.status, active: history.thread, threads: [history.thread, ...this.state.threads.filter((t) => t.id !== history.thread.id)], busy: false, error: "", draft: "", progress: "" });
+    const threads = this.listWorkspaceId === undefined || history.thread.workspace_id === this.listWorkspaceId
+      ? [history.thread, ...this.state.threads.filter((t) => t.id !== history.thread.id)] : this.state.threads;
+    this.update({ messages: history.messages, status: history.status, active: history.thread, threads, busy: false, error: "", draft: "", progress: "" });
   }
   async create(workspace: string) {
     if (!this.state.userId) return;
@@ -202,7 +211,7 @@ export class MindController {
     void this.send(content);
     return active.id;
   }
-  async reload() { if (this.state.active) await this.select(this.state.active.id); else await this.list(); }
+  async reload() { if (this.state.active) await this.select(this.state.active.id); else await this.list(this.listWorkspaceId); }
   async send(content: string) {
     const { active, context, status, busy } = this.state;
     if (!content.trim() || !active || busy || !status?.available || status.budget_state !== "ok") return;

@@ -53,7 +53,7 @@ test("abort cancels a blocked stream and releases its lock", async () => {
 function harness() {
   const calls: { name: string; args: unknown[] }[] = [];
   const transport: MindTransport = {
-    list: async () => { calls.push({ name: "list", args: [] }); return [history().thread]; },
+    list: async (...args) => { calls.push({ name: "list", args }); return [history().thread]; },
     create: async (...args) => { calls.push({ name: "create", args }); return history(); },
     history: async (...args) => { calls.push({ name: "history", args }); return history(); },
     send: async (...args) => {
@@ -71,6 +71,71 @@ function harness() {
   controller.setIdentity("person-a", { displayed: "owner", target: "member" });
   return { controller, transport, calls };
 }
+test("thread lists pass their workspace to the transport and filter even an unscoped response", async () => {
+  const { controller: c, transport } = harness();
+  const own = history().thread;
+  const other = { ...own, id: "other", workspace_id: "other" };
+  const scopes: (string | undefined)[] = [];
+  transport.list = async (signal, workspaceId) => {
+    assert.ok(signal instanceof AbortSignal);
+    scopes.push(workspaceId);
+    return [other, own]; // An older backend may ignore workspace_id.
+  };
+  await c.list("billing");
+  assert.deepEqual(c.getSnapshot().threads, [own]);
+  await c.reload();
+  assert.deepEqual(scopes, ["billing", "billing"]);
+  assert.deepEqual(c.getSnapshot().threads, [own]);
+  await c.list("other");
+  assert.deepEqual(c.getSnapshot().threads, [other]);
+  await c.list("empty");
+  assert.deepEqual(c.getSnapshot().threads, []);
+  await c.list();
+  assert.deepEqual(c.getSnapshot().threads, [other, own]);
+  assert.equal(scopes.at(-1), undefined);
+});
+test("opening another factory's thread loads it without adding it to the current list", async () => {
+  const { controller: c, transport } = harness();
+  const own = history().thread;
+  await c.list("billing");
+  const other = { ...own, id: "other-thread", workspace_id: "other" };
+  transport.history = async () => ({ ...history(), thread: other });
+  await c.select(other.id);
+  assert.deepEqual(c.getSnapshot().active, other);
+  assert.deepEqual(c.getSnapshot().messages, history().messages);
+  assert.deepEqual(c.getSnapshot().threads, [own]);
+  const sameWorkspace = { ...own, id: "own-thread" };
+  transport.history = async () => ({ ...history(), thread: sameWorkspace });
+  await c.select(sameWorkspace.id);
+  await c.select(sameWorkspace.id);
+  assert.deepEqual(c.getSnapshot().threads, [sameWorkspace, own]);
+});
+test("switching factories clears stale threads before loading and ignores an older list", async () => {
+  const { controller: c, transport } = harness();
+  await c.list("billing");
+  let release = () => {};
+  transport.list = () => new Promise((resolve) => { release = () => resolve([history().thread]); });
+  const older = c.list("billing");
+  const other = { ...history().thread, id: "other-thread", workspace_id: "other" };
+  transport.list = async () => {
+    assert.deepEqual(c.getSnapshot().threads, []);
+    throw new Error("Could not load other factory");
+  };
+  await c.list("other");
+  release(); await older;
+  assert.deepEqual(c.getSnapshot().threads, []);
+  assert.match(c.getSnapshot().error, /Could not load other factory/);
+  transport.history = async () => ({ ...history(), thread: other });
+  await c.select(other.id);
+  assert.deepEqual(c.getSnapshot().threads, [other]); // The latest scope applies even after a failed list.
+});
+test("identity changes reset the last listed factory", async () => {
+  const { controller: c } = harness();
+  await c.list("other");
+  c.setIdentity("person-b");
+  await c.select("t1");
+  assert.deepEqual(c.getSnapshot().threads, [history().thread]);
+});
 test("lifecycle, history, navigation and text submission never confirm; billing remains fixed", async () => {
   const { controller: c, calls } = harness();
   c.setOpen(true);
@@ -392,6 +457,20 @@ test("streaming preserves an intentional scroll-up and New reply jumps to latest
   assert.equal(scroll.onOutput(pane), true);
   pane.scrollTop = pane.scrollHeight - pane.clientHeight;
   assert.equal(scroll.onScroll(pane), false, "manually returning to bottom clears the button");
+});
+
+test("HTTP thread lists encode the optional workspace query and preserve the abort signal", async () => {
+  const { createMindHttpTransport } = await import("./mindHttp.ts");
+  const calls: { path: string; init: any }[] = [];
+  const request: any = async (path: string, init: any) => { calls.push({ path, init }); return []; };
+  const t = createMindHttpTransport(request, async () => { throw new Error("Unexpected stream"); }, readMindSSE);
+  const signal = new AbortController().signal;
+  await t.list(signal, "factory A/&?=🧠");
+  await t.list(signal);
+  assert.deepEqual(calls, [
+    { path: "/api/mind/threads?workspace_id=factory%20A%2F%26%3F%3D%F0%9F%A7%A0", init: { signal } },
+    { path: "/api/mind/threads", init: { signal } },
+  ]);
 });
 
 test("HTTP fixtures follow T1 thread/message/SSE and T3 edited action contracts", async () => {
