@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from . import serializers as S
 from .models import Decision, Event, Message, Outcome, Run, Signal, Task, User
+from .telemetry import METRIC_ONLY
 
 # Shown as their own items, or too fine-grained for the conversation (the full activity view keeps them).
 HIDDEN = ("agent_thought", "agent_tool", "agent_command", "decision_requested", "decision_resolved", "guidance",
@@ -36,7 +37,7 @@ def conversation(db: Session, outcome: Outcome, viewer_id: str | None = None) ->
     keys = {task_id: t.key for task_id, t in tasks.items()}
     messages = db.query(Message).filter(Message.outcome_id == outcome.id).order_by(Message.created_at, Message.id).all()
     decisions = db.query(Decision).filter(Decision.outcome_id == outcome.id).order_by(Decision.created_at, Decision.id).all()
-    events = db.query(Event).filter(Event.outcome_id == outcome.id, Event.kind.notin_(HIDDEN)) \
+    events = db.query(Event).filter(Event.outcome_id == outcome.id, Event.kind.notin_((*HIDDEN, *METRIC_ONLY))) \
         .order_by(Event.id.desc()).limit(MAX_EVENTS).all()[::-1]
     people = {m.author_id for m in messages} | {d.resolved_by for d in decisions} | {outcome.created_by}
     users = {u.id: u for u in db.query(User).filter(User.id.in_({p for p in people if p}))}

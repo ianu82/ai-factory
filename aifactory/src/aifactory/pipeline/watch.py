@@ -32,6 +32,7 @@ from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Alert, Decision, Event, Outcome, Run, Task, Workspace
 from ..serializers import actionable
+from ..telemetry import METRIC_ONLY
 from .holds import held_workspaces
 from .orchestrator import ACTIVE_TASK, HUMAN_TASK
 from .planning import ACTIVE_OUTCOME
@@ -49,10 +50,10 @@ DECISIONS = {"approve_merge": "Merge approval", "approve_plan": "Plan approval",
 WAITING = {"needs_input": "waiting for an answer", "awaiting_approval": "waiting for approval", "blocked": "blocked",
            "failed": "failed", "smoke_failed": "failed its post-merge check"}
 DROPPED = ("abandoned", "cancelled")
-# Not the work moving: the watch's own records, the Lead's posts and guidance, and session starts and ends (sessions
-# are read from runs, where the Lead's are left out).
+# Not the work moving: metric-only observations, the watch's own records, the Lead's posts and guidance, and
+# session starts and ends (sessions are read from runs, where the Lead's are left out).
 NOT_ACTIVITY = ("lead_watch", "alert_raised", "alert_dismissed", "lead_note", "lead_update", "guidance",
-                "run_started", "run_finished")
+                "run_started", "run_finished", *METRIC_ONLY)
 # A task out of attempts is the task's own failure, not the pipeline's; the failure classes of review item L2 will
 # tell them apart properly.
 OWN_FAILURE = re.compile(r"did not pass after", re.I)

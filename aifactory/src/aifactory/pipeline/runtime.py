@@ -283,6 +283,8 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         s.add(run)
         s.flush()
         run_id = run.id
+        task = s.get(Task, spec.task_id) if spec.task_id else None
+        correlation = dict((task.evidence or {}).get("telemetry", {})) if task else {}
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings, max_cost_usd=budgets.get("run_usd"),
                          max_tokens=budgets.get("run_tokens"))
     client = ModelClient(provider, session_id=run_id)
@@ -293,13 +295,14 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     error = ""
     status = "succeeded"
     failure: dict[str, Any] | None = None
+    operational_cause = None
     try:
         if spec.harness == "codex":
             gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
                                                provider=provider, ledger=ledger))
         record(spec.workspace_id, "run_started", f"{harness.label} {spec.role} started on {model}",
                outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id,
-               data={"role": spec.role, "harness": spec.harness, "model": model, "provider": provider.provider,
+               data={**correlation, "role": spec.role, "harness": spec.harness, "model": model, "provider": provider.provider,
                      "attempt": spec.attempt})
         notify(spec.workspace_id, "run", run_id)
 
@@ -340,6 +343,9 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         status, error = "cancelled", "Cancelled"
         raise
     except Exception as exc:  # harness failures are recorded, never hidden
+        from ..telemetry import error_cause
+
+        operational_cause = error_cause(exc)
         status, error = "failed", str(exc) or type(exc).__name__
         cause = failure_cause(exc)
         # A harness or model-client failure says what it was, even when that is "not the provider". Anything else
@@ -381,8 +387,10 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         record(spec.workspace_id, "run_finished",
                f"{harness.label} {spec.role} {status} · {tokens:,} tokens · {spend}" + (f": {error[:300]}" if error else ""),
                outcome_id=spec.outcome_id, task_id=spec.task_id, run_id=run_id, level=level,
-               data={"status": status, "tokens": ledger.input_tokens + ledger.output_tokens,
-                     "cost_usd": run_snapshot.cost_usd, "cost_known": run_snapshot.cost_known})
+               data={**correlation, "status": status, "tokens": ledger.input_tokens + ledger.output_tokens,
+                     "cost_usd": run_snapshot.cost_usd, "cost_known": run_snapshot.cost_known,
+                     "error_cause": operational_cause, "role": spec.role, "provider": provider.provider, "model": model,
+                     "attempt": spec.attempt})
         notify(spec.workspace_id, "run", run_id)
     return run_snapshot, result, error
 

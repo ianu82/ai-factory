@@ -353,12 +353,14 @@ class TaskRunner:
                     s, task, owner=self.owner, **fields):
                 raise Stop()
             for key, value in fields.items():
-                setattr(self.task, key, value)
+                setattr(self.task, key, getattr(task, key))
+            self.task.evidence = task.evidence
         notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
 
     def event(self, kind: str, message: str, level: str = "info", **data: Any) -> None:
         record(self.ws, kind, message, outcome_id=self.task.outcome_id, task_id=self.task_id, level=level,
-               data={"attempt": self.task.attempt, "head": self.task.head_sha, **data})
+               data={**(self.task.evidence or {}).get("telemetry", {}),
+                     "attempt": self.task.attempt, "head": self.task.head_sha, **data})
 
     def evidence(self, key: str, value: Any) -> None:
         self._set_evidence({key: value})
@@ -1329,7 +1331,7 @@ class TaskRunner:
                     # record would do it too, but a revalidation that passes writes no attempt record.
                     self._set_evidence({"infra_retries": 0, "infra_retry_at": None, "infra_phase": None})
                 self.event("verified", f"Independent verification passed: {report.get('summary', '')[:300]}",
-                           level="success")
+                           level="success", verdict="pass", rejection_categories=[], verifier_run_id=run.id)
                 self.feedback.clear()  # a passing review settles everything raised before it
                 self._results = slice(0, 0)
                 return report
@@ -1346,7 +1348,14 @@ class TaskRunner:
             flipped = {"flipped": _flipped(previous["verdict"], report)} if previous else {}
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
                                        "checks": _brief(self.checks), "app_run": self.app_summary, **seen, **flipped})
-            self.event("verification_failed", str(report.get("summary") or "")[:400], level="warn", **flipped)
+            failing = [c for c in _objects(report.get("criteria")) if c.get("status") != "pass"]
+            findings = [f for f in _objects(report.get("findings")) if f.get("severity") in ("blocker", "major")]
+            self.event("verification_failed", str(report.get("summary") or "")[:400], level="warn", **flipped,
+                       verdict="fail", verifier_run_id=run.id,
+                       rejection_categories=(["runtime_qa"] if runtime_problem else [])
+                       + (["criteria"] if failing else [])
+                       + sorted({f["severity"] for f in findings})
+                       + (["unspecified"] if not (runtime_problem or failing or findings) else []))
             return None
         if infrastructure_problem(error, carried) == "transient":
             self._infrastructure(attempt, "verify", error, "transient")
@@ -1378,19 +1387,23 @@ class TaskRunner:
 
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
             if qa_cfg.get("prepared", True) and self.cfg.get("setup") else None
+        boot_started = time.monotonic()
         try:
             self.event("qa_vm_starting", "Starting an isolated VM for verification and runtime QA")
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(qa_cfg.get("cpu", 4)),
                                                    memory_gb=float(qa_cfg.get("memory_gb", 8)))
         except Exception as exc:
             self.event("qa_vm_unavailable", f"Could not start a QA VM ({str(exc)[:300]}); verifying in a local sandbox",
-                       level="warn")
+                       level="warn", elapsed_boot_seconds=time.monotonic() - boot_started,
+                       prepared_eligible=bool(key), prepared_hit=False, success=False, error_cause="sandbox_vm")
             return local
+        boot_seconds = time.monotonic() - boot_started
         await local.close()
         vm.environment_key = key
         self.event("qa_vm_ready", f"Verification VM {vm.vm_id} ready" + (f" in {vm.region}" if vm.region else "")
                    + (" from the prepared environment" if vm.prepared else ""), level="success", vm=vm.vm_id,
-                   prepared=vm.prepared)
+                   prepared=vm.prepared, prepared_hit=bool(vm.prepared), prepared_eligible=bool(key),
+                   elapsed_boot_seconds=boot_seconds, success=True)
         return vm
 
     def _budget_attempts(self) -> list[dict[str, Any]]:
@@ -1696,18 +1709,22 @@ class TaskRunner:
             return local
         key = environment_key(local.work, self.repo.full_name, list(self.cfg.get("setup") or [])) \
             if self.cfg.get("setup") else None
+        boot_started = time.monotonic()
         try:
             vm = await RailwayVMSandbox.from_local(local, prepared=key, cpu=float(build_cfg.get("cpu", 4)),
                                                    memory_gb=float(build_cfg.get("memory_gb", 8)))
         except Exception as exc:
             self.event("build_vm_unavailable", f"Could not start a build VM ({str(exc)[:300]}); {doing} locally",
-                       level="warn")
+                       level="warn", elapsed_boot_seconds=time.monotonic() - boot_started,
+                       prepared_eligible=bool(key), prepared_hit=False, success=False, error_cause="sandbox_vm")
             return local
+        boot_seconds = time.monotonic() - boot_started
         await local.close()
         vm.environment_key = key
         self.event("build_vm_ready", f"{doing.capitalize()} in VM {vm.vm_id}"
                    + (" from the prepared environment" if vm.prepared else ""),
-                   level="success", vm=vm.vm_id, prepared=vm.prepared)
+                   level="success", vm=vm.vm_id, prepared=vm.prepared, prepared_hit=bool(vm.prepared), prepared_eligible=bool(key),
+                   elapsed_boot_seconds=boot_seconds, success=True)
         return vm
 
     async def _save_environment(self, sandbox, key: str) -> None:
@@ -2069,6 +2086,9 @@ class TaskRunner:
         if utcnow() > datetime.fromisoformat(wait["deadline"]):
             wait = {**wait, "timed_out": True}
             self.update(evidence={**self.task.evidence, "ci_wait": wait})
+            self.event("ci_result", "CI wait timed out", state="timeout", head=wait["head"],
+                       pr=wait["pr"], continuation=wait["continuation"],
+                       ci_id=f"{wait['pr']}:{wait['head']}:{wait['first_wait_at']}")
             self.block("unblock", f"{self.task.key}: CI did not finish",
                        f"CI on PR #{wait['pr']} was still running after "
                        f"{self.settings['limits'].get('ci_minutes', 45)} minutes.",
@@ -2121,7 +2141,12 @@ class TaskRunner:
         self.update(status="queued" if stage and not review else "waiting_ci",
                     stage="review" if review else stage or "ci", evidence=ev, lease_owner="", blocked_reason="")
         if changed:
-            self.event("ci_status", f"CI {summary.state}", state=summary.state, checks=summary.checks)
+            self.event("ci_status", f"CI {summary.state}", state=summary.state, checks=summary.checks, head=wait["head"],
+                       pr=wait["pr"], continuation=wait["continuation"])
+        if stage is not None:
+            self.event("ci_result", "CI polling reached a terminal result", state=summary.state,
+                       head=wait["head"], pr=wait["pr"], continuation=wait["continuation"],
+                       ci_id=f"{wait['pr']}:{wait['head']}:{wait['first_wait_at']}")
 
     async def _fix_ci(self, gh: GitHub) -> None:
         identity = self._steward_identity()
@@ -2809,6 +2834,8 @@ class TaskRunner:
         self.stage("smoke", "Running smoke checks on the merged result")
         commands = self.cfg.get("smoke") or self.cfg.get("checks") or []
         if not commands:
+            self.event("smoke_result", "Smoke checks not configured", state="not_configured",
+                       smoke_id=new_id(), ref=self.task.merge_sha)
             self.evidence("smoke", {"state": "not_configured"})
             self.event("smoke", "No smoke checks configured for this repository", level="warn")
             await self.release()
@@ -2825,6 +2852,11 @@ class TaskRunner:
         finally:
             await sandbox.close()
         ok = all(r["ok"] for r in results)
+        self.event("smoke_result", "Smoke checks finished", state="passed" if ok else "failed",
+                   smoke_id=new_id(), ref=ref, ok=ok,
+                   exit_code=next((r.get("exit_code") for r in results if not r["ok"]), 0),
+                   checks_total=len(results),
+                   checks_failed=sum(not r["ok"] for r in results))
         self.evidence("smoke", {"state": "passed" if ok else "failed", "ref": self.task.merge_sha, "checks": _brief(results)})
         if not ok:
             failed = [r for r in results if not r["ok"]]

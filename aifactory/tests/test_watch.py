@@ -134,6 +134,23 @@ def test_an_active_outcome_with_no_activity_is_quiet_only_when_nothing_runs(worl
     assert live(world) == {}  # the hold is what to answer, not each outcome it stopped
 
 
+def test_metric_only_records_do_not_reset_the_quiet_activity_clock(world):
+    from aifactory.telemetry import METRIC_ONLY
+
+    last_activity = now() - timedelta(hours=2)
+    with db.session_scope() as s:
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="stage", message="Building",
+                    created_at=last_activity))
+        for kind in sorted(METRIC_ONLY):
+            s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind=kind, data={}))
+    with db.session_scope() as s:
+        assert watch._last_activity(s, world["outcome"]) == last_activity
+    assert watch.run()["raised"] == 1
+    assert live(world) == {"quiet": "watching"}
+    assert watch.run()["cleared"] == 0
+    assert live(world) == {"quiet": "watching"}
+
+
 def test_the_same_failure_across_outcomes_is_one_alert(world, client):
     with db.session_scope() as s:
         other = Outcome(workspace_id=world["ws"], number=8, title="Other", status="running")

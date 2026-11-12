@@ -22,6 +22,7 @@ from .db import session_scope, utcnow
 from .inference import BudgetExceeded, ProviderConfig, UsageLedger, extract_usage
 from .inference_limits import acquire
 from .models import RunToken
+from .telemetry import ProviderAttempt, http_category
 from .security import new_token, token_hash
 
 router = APIRouter()
@@ -116,6 +117,7 @@ async def proxy(path: str, request: Request):
         upstream = None
         permit = None
         cleaned = False
+        measurement = None
 
         async def cleanup():
             nonlocal cleaned
@@ -138,9 +140,12 @@ async def proxy(path: str, request: Request):
         try:
             upstream_request = client.build_request("POST", url, headers=headers, content=payload)
             permit = await acquire(grant.provider, grant.run_id)
+            measurement = ProviderAttempt(grant.run_id, grant.provider.provider, grant.model, "gateway", grant.workspace_id)
             upstream = await client.send(upstream_request, stream=True)
             retry = (upstream.status_code == 429
                      and upstream.headers.get("x-should-retry", "").lower() != "false" and attempt < 2)
+            if upstream.status_code != 200:
+                measurement.finish(http_category(upstream.status_code), upstream.status_code)
             if retry:
                 retry_after = upstream.headers.get("retry-after", "5")
             elif upstream.status_code >= 400:
@@ -156,11 +161,15 @@ async def proxy(path: str, request: Request):
                     parsed = json.loads(data)
                 except json.JSONDecodeError:
                     parsed = {}
+                measurement.finish(status=upstream.status_code)
                 grant.ledger.add(grant.model, extract_usage(parsed))
                 return JSONResponse(parsed, status_code=200)
             else:
                 break  # Transfer the permit and upstream ownership to the response.
-        except BaseException:
+        except BaseException as exc:
+            if measurement:
+                measurement.finish("cancelled" if isinstance(exc, asyncio.CancelledError) else
+                                   "timeout" if isinstance(exc, httpx.TimeoutException) else "transport")
             await cleanup()
             raise
         finally:
@@ -172,20 +181,41 @@ async def proxy(path: str, request: Request):
     async def relay():
         usage = None
         buffer = b""
+        category = "incomplete"
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    if line.startswith(b"data:") and b"usage" in line:
+                    if line.startswith(b"data:"):
                         try:
-                            found = extract_usage(json.loads(line[5:].strip()))
+                            raw_event = line[5:].strip()
+                            if raw_event == b"[DONE]":
+                                if path == "chat/completions":
+                                    category = None
+                                continue
+                            event = json.loads(raw_event)
+                            if not isinstance(event, dict):
+                                continue
+                            event_type = event.get("type")
+                            if event_type == "response.completed":
+                                category = None
+                            elif event_type in ("error", "response.failed", "response.incomplete"):
+                                category = "stream_error"
+                            found = extract_usage(event)
                             if found:
                                 usage = found
                         except json.JSONDecodeError:
                             pass
+        except (asyncio.CancelledError, GeneratorExit):
+            category = "cancelled"
+            raise
+        except BaseException:
+            category = "transport"
+            raise
         finally:
+            measurement.finish(category, upstream.status_code)
             try:
                 await cleanup()
             finally:
@@ -202,6 +232,7 @@ async def proxy(path: str, request: Request):
                     try:
                         await self.body_iterator.aclose()
                     finally:
+                        measurement.finish("cancelled", upstream.status_code)
                         await cleanup()
 
     return GatewayStream(relay(), media_type=upstream.headers.get("content-type", "text/event-stream"))

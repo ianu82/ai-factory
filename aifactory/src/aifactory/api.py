@@ -981,7 +981,10 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
         User.id.in_({m.author_id for m in db.query(Message).filter(Message.outcome_id == o.id)} |
                     {d.resolved_by for d in decisions if d.resolved_by} | ({o.created_by} if o.created_by else set())))}
     messages = db.query(Message).filter(Message.outcome_id == o.id).order_by(Message.created_at).all()
-    events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
+    from .telemetry import METRIC_ONLY
+
+    events = (db.query(Event).filter(Event.outcome_id == o.id, Event.kind.notin_(METRIC_ONLY))
+              .order_by(Event.id.desc()).limit(400).all())[::-1]
     open_count = sum(S.actionable(d) for d in decisions)
     return {
         "guidance": outcome_guidance(db, workspace_id, o.id),

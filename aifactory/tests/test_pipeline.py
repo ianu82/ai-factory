@@ -206,6 +206,11 @@ def test_failed_verification_feeds_back_and_second_attempt_passes(factory):
         results = [a["result"] for a in task.evidence["attempts"]]
         assert results == ["verification_failed", "verified"]
     assert seen_feedback, "builder never saw the verifier's feedback"
+    with session_scope() as s:
+        rejection = s.query(Event).filter_by(outcome_id=outcome_id, kind="verification_failed").one()
+        assert rejection.data["rejection_categories"] == ["criteria", "major"]
+        assert rejection.data["verifier_run_id"]
+        assert rejection.data["attempt_id"]
 
 
 def _reviewing(report):
@@ -1807,9 +1812,10 @@ def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
             return (task.status, task.summary, task.blocked_reason, task.evidence, task.lease_owner,
                     s.query(Decision).filter(Decision.task_id == task_id).count())
 
+    correlation = row()[3]["telemetry"]
     runner.update(summary="mine")
     runner.evidence("note", "mine")
-    assert row() == ("running", "mine", "", {"note": "mine"}, first.instance, 0)
+    assert row() == ("running", "mine", "", {"note": "mine", "telemetry": correlation}, first.instance, 0)
 
     with session_scope() as s:
         s.get(Task, task_id).lease_owner = second.instance
@@ -1817,7 +1823,7 @@ def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
                   lambda: runner.block("unblock", "Stale", "stale")):
         with pytest.raises(delivery.Stop):
             write()
-        assert row() == ("running", "mine", "", {"note": "mine"}, second.instance, 0)
+        assert row() == ("running", "mine", "", {"note": "mine", "telemetry": correlation}, second.instance, 0)
 
     with session_scope() as s:
         s.get(Task, task_id).lease_owner = ""
@@ -1825,7 +1831,7 @@ def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
     runner.evidence("note", "released")
     with pytest.raises(delivery.Stop):  # block() always ends the runner; this time what it wrote is there
         runner.block("unblock", "Blocked", "needs a look")
-    assert row() == ("blocked", "released", "needs a look", {"note": "released"}, "", 1)
+    assert row() == ("blocked", "released", "needs a look", {"note": "released", "telemetry": correlation}, "", 1)
 
 
 def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
@@ -2502,12 +2508,14 @@ def test_a_failed_run_keeps_what_failed_it(factory, tmp_path, monkeypatch):
 
     async def go():
         kept = []
-        for (exc, _), _ in failures:
+        for ((exc, origin), _), operational_cause in zip(failures, ["provider", "unknown", "provider", "sandbox_vm"]):
             run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "native",
                                                             "the task", "system", sb), asyncio.Event())
             assert (run.status, result, error) == ("failed", None, str(exc))
             with session_scope() as s:
                 kept.append((carried_cause(run), (s.get(Run, run.id).config_snapshot or {}).get("failure")))
+                finished = s.query(Event).filter_by(run_id=run.id, kind="run_finished").one()
+                assert finished.data["error_cause"] == operational_cause
         return kept
 
     assert asyncio.run(go()) == [expected for _, expected in failures]

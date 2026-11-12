@@ -76,8 +76,11 @@ def _handle_merged(task_id: str, pr: dict) -> bool:
             return False
         _supersede(s, task_id, f"PR #{task.pr_number} was merged on GitHub by {who}")
         task.status, task.stage, task.blocked_reason = "queued", "merge", ""
+        s.flush()  # commit queue correlation with the reconciliation observation
         record(task.workspace_id, "merged_outside", f"PR #{task.pr_number} was merged on GitHub by {who}; "
-               "finishing the task (smoke checks)", outcome_id=task.outcome_id, task_id=task.id, session=s)
+               "finishing the task (smoke checks)", outcome_id=task.outcome_id, task_id=task.id,
+               data={**(task.evidence or {}).get("telemetry", {}), "pr": task.pr_number,
+                     "head": (pr.get("head") or {}).get("sha"), "merge_sha": pr.get("merge_commit_sha")}, session=s)
         ws, outcome_id = task.workspace_id, task.outcome_id
     notify(ws, "decision", task_id)
     notify(ws, "outcome", outcome_id)

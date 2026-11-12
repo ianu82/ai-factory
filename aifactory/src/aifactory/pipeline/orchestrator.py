@@ -167,9 +167,10 @@ class Orchestrator:
         when its heartbeat fell behind. Returns the ids of the tasks it requeued.
 
         Their owner died mid-session, so the sessions it left open are closed in the transaction that requeues the
-        tasks: once that is committed another server may claim one and start a session of its own, and a later look
-        could not tell the dead owner's session from that one. `start`: this server is starting, so the same
-        transaction closes every other session nobody is running too (a planning session has no task to requeue)."""
+        tasks, before assigning new queue IDs: once that is committed another server may claim one and start a
+        session of its own, and a later look could not tell the dead owner's session from that one. `start`: this
+        server is starting, so the same transaction closes every other session nobody is running too (a planning
+        session has no task to requeue)."""
         from sqlalchemy import or_
 
         now = utcnow()
@@ -185,6 +186,9 @@ class Orchestrator:
                         {Task.status: "queued", Task.lease_owner: "", Task.lease_expires_at: None},
                         synchronize_session=False):
                     continue
+                # Capture the old episode before the successful conditional requeue changes it.
+                self._close_interrupted_runs([task.id], session=s)
+                self._record_requeue(s, task, interrupted=True)
                 reclaimed.append(task.id)
                 if owner and owner != self.instance and expired:
                     log.info("reclaimed %s from instance %s: its lease ran out %.0fs ago", task.key, owner,
@@ -194,9 +198,27 @@ class Orchestrator:
                        outcome_id=task.outcome_id, task_id=task.id, session=s)
             if start:
                 self._close_interrupted_runs(session=s)
-            elif reclaimed:
-                self._close_interrupted_runs(reclaimed, session=s)
         return reclaimed
+
+    @staticmethod
+    def _record_requeue(session, task: Task, *, interrupted: bool = False) -> None:
+        """Journal a successful conditional bulk requeue, retaining its atomic lease predicate."""
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        from ..telemetry import emit, task_change
+
+        evidence = dict(task.evidence or {})
+        if interrupted:
+            flow = dict(evidence.get("telemetry") or {})
+            emit(session, task, "attempt_interrupted", {**flow, "stage": task.stage,
+                 "attempt": task.attempt, "reason": "restart"})
+            evidence["telemetry"] = {**flow, "interrupted": True}
+            set_committed_value(task, "evidence", evidence)
+        fields = task_change(session, task, {"status": "queued", "evidence": evidence})
+        session.query(Task).filter(Task.id == task.id).update(
+            {Task.evidence: fields["evidence"]}, synchronize_session=False)
+        for key, value in fields.items():
+            set_committed_value(task, key, value)
 
     def _maybe_reclaim(self) -> None:
         """A task whose owner died without releasing it is picked up once its lease has run out."""
@@ -247,6 +269,7 @@ class Orchestrator:
         from sqlalchemy import func, or_, select
 
         from ..models import Event, Run
+        from ..telemetry import emit
 
         open_runs = (Run.status == "running", Run.role != "lead")
         if tasks is not None:
@@ -262,6 +285,10 @@ class Orchestrator:
                 Event.run_id.in_(select(Run.id).where(*open_runs))).group_by(Event.run_id).all())
             closed: dict[str, int] = {}
             for run in s.query(Run).filter(*open_runs).all():
+                task = s.get(Task, run.task_id) if run.task_id else None
+                emit(s, run, "run_interrupted", {**((task.evidence or {}).get("telemetry", {}) if task else {}),
+                     "role": run.role, "attempt": run.attempt,
+                     "provider": run.provider, "model": run.model, "reason": "restart"})
                 run.status, run.error = "interrupted", "Interrupted by a restart"
                 # Not now: a session found days later would show a duration it never had.
                 run.finished_at = last_event.get(run.id) or run.started_at
@@ -372,7 +399,7 @@ class Orchestrator:
         if time.monotonic() - getattr(self, "_last_cost_reconcile", float("-inf")) < 600:
             return
         self._last_cost_reconcile = time.monotonic()
-        from ..inference import InferenceError, ModelClient, price_for, resolve_provider
+        from ..inference import ModelClient, price_for, resolve_provider
         from sqlalchemy import and_, func, or_
 
         from ..models import Run, ScorerAttempt
@@ -414,9 +441,13 @@ class Orchestrator:
                             ws = s.get(Workspace, workspace_id)
                             price = price_for(attempt.model, ws.settings or {})
                             if attempt.usage_known and price is not None:
+                                old_cost, old_known = attempt.cost_usd, attempt.cost_known
                                 attempt.cost_usd = round((attempt.input_tokens * price[0]
                                                           + attempt.output_tokens * price[1]) / 1e6, 6)
                                 attempt.cost_known = True
+                                from ..telemetry import cost_adjusted
+
+                                cost_adjusted(s, attempt, old_cost, old_known, "configured_pricing")
                                 aggregate(s, attempt.result_id)
                                 priced += 1
                             else:
@@ -430,7 +461,11 @@ class Orchestrator:
                         provider = resolve_provider(workspace_id)
                     clients[key] = ModelClient(provider)
                 cost = await clients[key].session_cost(run_id)
-            except (InferenceError, Exception):  # noqa: BLE001 - best effort
+            except Exception as exc:  # best effort; record a structured cause, never response text
+                from ..telemetry import error_cause
+
+                record(workspace_id, "cost_reconciliation_error", data={"entity_id": run_id,
+                       "entity_type": kind.__tablename__, "error_cause": error_cause(exc)})
                 if kind is ScorerAttempt:
                     log.info("scorer cost reconciliation deferred for %s: recorded provider unavailable", run_id)
                 continue
@@ -438,7 +473,11 @@ class Orchestrator:
                 continue
             with session_scope() as s:
                 run = s.get(kind, run_id)
+                from ..telemetry import cost_adjusted
+
+                old_cost, old_known = run.cost_usd, run.cost_known
                 run.cost_usd, run.cost_known = round(cost, 6), True
+                cost_adjusted(s, run, old_cost, old_known, "provider_usage")
                 if kind is ScorerAttempt:
                     aggregate(s, run.result_id)
                 else:
@@ -787,6 +826,10 @@ class Orchestrator:
                         outcome.status = "blocked"
                         outcome.blocked_reason = f"Planning crashed: {exc}"[:2000]
                         ws = outcome.workspace_id
+                        from ..telemetry import error_cause
+
+                        record(ws, "execution_error", outcome_id=outcome_id,
+                               data={"error_cause": error_cause(exc), "phase": "plan"}, session=s)
                     open_decision(ws, "unblock", "Planning crashed", str(exc)[:2000], outcome_id=outcome_id,
                                   options=[{"value": "retry", "label": "Retry planning"}, {"value": "cancel", "label": "Cancel"}])
                 except Exception:
@@ -828,7 +871,11 @@ class Orchestrator:
                                 blocked_reason=f"{type(exc).__name__}: {exc}"[:2000]):
                             return
                         from ..models import Decision
+                        from ..telemetry import error_cause
 
+                        record(ws, "execution_error", outcome_id=outcome_id, task_id=task_id,
+                               data={"error_cause": error_cause(exc), "phase": task.stage,
+                                     **(task.evidence or {}).get("telemetry", {})}, session=s)
                         decision = Decision(workspace_id=ws, kind="unblock", title="A task stopped unexpectedly",
                                             body=f"{type(exc).__name__}: {exc}"[:2000], outcome_id=outcome_id,
                                             task_id=task_id, options=[{"value": "retry", "label": "Retry"},
@@ -850,11 +897,13 @@ class Orchestrator:
                     if task and task.status == "running":
                         # A workspace pause stops continuation at the next gate;
                         # retain the stage for resumption when it is unpaused.
-                        s.query(Task).filter(Task.id == task_id, Task.status == "running",
-                                             Task.lease_owner.in_(("", self.instance)),
-                                             Task.stage == task.stage, Task.workspace_id.in_(
-                                                 s.query(Workspace.id).filter(Workspace.paused.is_(True)))).update(
+                        requeued = s.query(Task).filter(Task.id == task_id, Task.status == "running",
+                                                        Task.lease_owner.in_(("", self.instance)),
+                                                        Task.stage == task.stage, Task.workspace_id.in_(
+                                                            s.query(Workspace.id).filter(Workspace.paused.is_(True)))).update(
                             {Task.status: "queued"}, synchronize_session=False)
+                        if requeued:
+                            self._record_requeue(s, task)
                     if task:
                         # Leases are execution-only, including pause/stop/error exits.
                         s.query(Task).filter(Task.id == task_id, Task.lease_owner == self.instance).update(
