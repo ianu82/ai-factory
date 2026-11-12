@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from .db import utcnow
 from .events import notify, record
 from .github import GitHub
-from .models import Outcome, Repository, Signal, User, Workspace
+from .models import Event, Outcome, Repository, Signal, User, Workspace
 
 log = logging.getLogger(__name__)
 
@@ -161,21 +161,70 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                                     params={"branch": repo.default_branch, "status": "failure", "per_page": 5})
         except Exception:
             runs = {}
-        latest_ok = None
+        green_runs = []
         try:
             ok_runs = await gh.request("GET", f"/repos/{repo.full_name}/actions/runs",
-                                       params={"branch": repo.default_branch, "status": "success", "per_page": 1})
-            latest_ok = (ok_runs.get("workflow_runs") or [{}])[0].get("created_at")
+                                       params={"branch": repo.default_branch, "status": "success", "per_page": 100})
+            green_runs = (ok_runs.get("workflow_runs") or [])[:100]
         except Exception:
             pass
+        for green in green_runs:
+            # Match the workflow, not merely another workflow's successful run.
+            # Legacy signals use the workflow name as their external identity.
+            if not green.get("name") or not green.get("created_at"):
+                continue
+            from .supervisor import timestamp
+
+            green_at = timestamp(green["created_at"])
+            if green_at is None:
+                continue
+            observed_at = green_at.replace(tzinfo=None)
+            known = db.query(Event).filter(Event.workspace_id == workspace_id,
+                Event.kind == "ci_status", Event.task_id.is_(None), Event.created_at == observed_at)
+            if not any((e.data or {}).get("repo_id") == repo.id
+                       and (e.data or {}).get("workflow") == green["name"] for e in known):
+                payload = record(workspace_id, "ci_status", f"{green['name']} green on {repo.default_branch}",
+                    data={"repo_id": repo.id, "branch": repo.default_branch,
+                          "workflow": green["name"], "state": "success"}, session=db, publish=False)
+                db.get(Event, payload["id"]).created_at = observed_at
+            for signal in db.query(Signal).filter(Signal.workspace_id == workspace_id,
+                    Signal.repo_id == repo.id, Signal.source == "ci_failure",
+                    Signal.external_id == f"{repo.full_name}:ci:{green['name']}",
+                    Signal.status.in_(["new", "proposed", "accepted"])):
+                # Compare against the newest known failure, including every
+                # fetched run: this workflow may be beyond the upsert limit
+                # below. Persist that evidence so Supervisor also sees the red
+                # run rather than mistaking this success for recovery.
+                failure_times = [timestamp((signal.data or {}).get("failure_at"))]
+                failure_times += [timestamp(r.get("created_at")) for r in (runs or {}).get("workflow_runs", [])
+                                  if r.get("name") == green["name"]]
+                failure_times = [at for at in failure_times if at is not None]
+                failed_at = max(failure_times) if failure_times else timestamp(signal.last_seen_at)
+                if failure_times:
+                    signal.data = {**(signal.data or {}), "failure_at": failed_at.isoformat()}
+                if failed_at is not None and green_at > failed_at:
+                    signal.status = "resolved"
+        seen_workflows = set()
         for run in (runs or {}).get("workflow_runs", [])[:3]:
-            if latest_ok and run.get("created_at", "") < latest_ok:
-                continue  # already fixed by a later green run
-            _, new = upsert_signal(db, workspace_id, source="ci_failure",
+            # GitHub returns newest first. An older failure in the same poll
+            # must not overwrite the incident time used to establish recovery.
+            workflow = run.get("name")
+            if workflow in seen_workflows:
+                continue
+            seen_workflows.add(workflow)
+            if any(g.get("name") == run.get("name") and g.get("created_at", "") > run.get("created_at", "")
+                   for g in green_runs):
+                continue
+            signal, new = upsert_signal(db, workspace_id, source="ci_failure",
                                    title=f"{run.get('name', 'CI')} failing on {repo.default_branch} in {repo.full_name}",
                                    body=f"Run {run.get('html_url')} failed at {run.get('head_sha', '')[:8]}.",
                                    url=run.get("html_url", ""), external_id=f"{repo.full_name}:ci:{run.get('name')}",
                                    repo_id=repo.id)
+            signal.data = {**(signal.data or {}), "branch": repo.default_branch,
+                           "workflow": run.get("name"), "failure_at": run.get("created_at")}
+            if signal.status == "resolved":
+                signal.status = "new"
+                signal.first_seen_at = utcnow()
             created += new
             updated += not new
     db.commit()

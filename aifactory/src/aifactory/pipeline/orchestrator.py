@@ -302,6 +302,7 @@ class Orchestrator:
                 await asyncio.to_thread(self._promote)
                 self._schedule()
                 await self._maybe_sync_signals()
+                await asyncio.to_thread(self._maybe_supervise)
                 await asyncio.to_thread(self._maybe_analyze)
                 await self._maybe_reconcile_costs()
                 await self._maybe_reconcile_pulls()
@@ -481,6 +482,41 @@ class Orchestrator:
                     log.info("improvements %s %s", workspace_id[:6], result)
             except Exception:
                 log.exception("improvement analysis failed for %s", workspace_id)
+
+    def _maybe_supervise(self) -> None:
+        """Best-effort, environment and workspace-policy throttled DB-only pass."""
+        import time
+        from datetime import timedelta
+        from ..supervisor import sweep, timestamp
+        from ..supervisor_policy import supervisor_policy
+
+        try:
+            interval = int(os.environ.get("AIFACTORY_SUPERVISOR_INTERVAL_SECONDS", "180"))
+            tick = time.monotonic()
+            if interval <= 0 or tick - getattr(self, "_last_supervisor", float("-inf")) < interval:
+                return
+            self._last_supervisor = tick
+            with session_scope() as db:
+                targets = [(w.id, w.settings) for w in db.query(Workspace).filter(Workspace.paused.is_(False))]
+            now = utcnow()
+            for workspace_id, settings in targets:
+                try:
+                    policy = supervisor_policy(settings if isinstance(settings, dict) else {})
+                    state = settings.get("supervisor_state", {}) if isinstance(settings, dict) else {}
+                    last = timestamp(state.get("last_sweep_at")) if isinstance(state, dict) else None
+                    if last is None and not isinstance(settings, dict):
+                        from ..models import Event
+                        with session_scope() as db:
+                            event = (db.query(Event).filter(Event.workspace_id == workspace_id,
+                                Event.kind == "supervisor_sweep").order_by(Event.created_at.desc(), Event.id.desc()).first())
+                            last = timestamp(((event.data or {}).get("state") or {}).get("last_sweep_at")) if event else None
+                    if policy["mode"] == "off" or (last and timestamp(now) - last < timedelta(minutes=policy["interval_minutes"])):
+                        continue
+                    sweep(workspace_id, now)
+                except Exception:
+                    log.exception("supervisor sweep failed for %s", workspace_id)
+        except Exception:
+            log.exception("supervisor pass failed")
 
     async def _maybe_sync_signals(self) -> None:
         """Poll GitHub for issues and CI failures every few minutes (intake + feedback)."""
