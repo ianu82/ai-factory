@@ -54,8 +54,13 @@ async def git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = 
     try:
         out, err = await asyncio.wait_for(proc.communicate(input_bytes), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
         raise GitError(f"git {args[0]} timed out")
+    finally:
+        # communicate() already reaps a completed process. On cancellation or
+        # timeout, reap Git before releasing the shared mirror lock to another user.
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
     if proc.returncode != 0:
         from .security import redact
 
@@ -67,6 +72,45 @@ async def git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = 
             sensitive.extend((auth.split()[-1], decoded, decoded.removeprefix("x-access-token:")))
         raise GitError(f"git {' '.join(a for a in args[:3])} failed: {redact(err.decode(errors='replace'), extra=tuple(sensitive))[-1500:]}")
     return out.decode(errors="replace")
+
+
+async def read_object(*args: str, cwd: Path, limit: int) -> bytes:
+    """Bound read-only Git plumbing output before retaining/decoding it.
+
+    Used by definition ingestion for tree metadata and size-checked blobs. Never
+    runs filters or touches a worktree. Repository diagnostics are intentionally
+    not included in errors (they can contain untrusted/private object content).
+    """
+    if not args or args[0] not in {"ls-tree", "cat-file", "show"} or limit < 0:
+        raise GitError("Invalid bounded Git object read")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(get_settings().data_dir),
+           "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "LANG": "C.UTF-8",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    proc = await asyncio.create_subprocess_exec(
+        "git", *SAFE_GIT, *args, cwd=str(cwd), env=env,
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    async def read():
+        output = bytearray()
+        while True:
+            chunk = await proc.stdout.read(min(65_536, limit - len(output) + 1))
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > limit:
+                raise GitError("Git object exceeds definition read limit")
+        if await proc.wait() != 0:
+            raise GitError("Unable to read immutable Git object")
+        return bytes(output)
+
+    try:
+        return await asyncio.wait_for(read(), timeout=60)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
 
 
 def _mirror_path(full_name: str) -> Path:

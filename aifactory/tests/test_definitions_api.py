@@ -190,7 +190,8 @@ def test_repository_snapshot_provenance_links_and_restore_guard(client, signed_i
     assert client.delete(f"/api/workspaces/{ws}/repositories/{rid}").status_code == 409
     assert client.put(root, json={"expected_revision": 1, "bundle": bundle()}).status_code == 409
     assert client.put(root + "/source", json={"expected_revision": 1, "source": {"kind": "managed"}}).status_code == 200
-    assert client.get(root).json()["active_source"] == active["active_source"]
+    assert client.get(root).json()["active_source"] == {"kind": "managed"}
+    assert client.get(root).json()["bundle"] == {"schema_version": 1, "skills": [], "instructions": [], "knowledge": []}
     assert client.post(root + "/restore", json={"expected_revision": 2, "revision_id": active["revision_id"]}).status_code == 409
     saved = client.put(root, json={"expected_revision": 2, "bundle": bundle()})
     assert saved.status_code == 200, saved.text
