@@ -44,7 +44,7 @@ def test_guided_final_steps(client, signed_in, plan, merge):
     settings = response.json()["settings"]
     assert settings["autonomy"] == {"plan": "approval", "merge": "approval", "release": "approval"}
     assert settings["learning"]["preset"] == policy
-    assert settings["budgets"] == budgets
+    assert settings["budgets"] == {**budgets, "task_usd": 15.0}  # a default this stored copy predates fills in
     for key, value in before.items():
         if key not in ("autonomy", "budgets", "learning"):
             assert settings[key] == value
