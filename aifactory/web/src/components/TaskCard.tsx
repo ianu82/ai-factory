@@ -18,7 +18,10 @@ const STAGE_TEXT: Record<string, string> = {
 
 export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs: Run[]; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
-  const label = task.status === "running" ? STAGE_TEXT[task.stage] || "Running" : undefined;
+  // Parked at stage "review": CI passed and the pull request's reviewers are next.
+  const reviewWait = task.status === "waiting_ci" && task.stage === "review";
+  const label = task.status === "running" ? STAGE_TEXT[task.stage] || "Running"
+    : reviewWait ? "Waiting for review" : undefined;
   return (
     <div className="task">
       <div className="task-head" onClick={() => setOpen(!open)} role="button" tabIndex={0} aria-expanded={open}
@@ -60,6 +63,7 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
     queryFn: () => api<Artifact[]>(`/api/workspaces/${ws.id}/tasks/${task.id}/artifacts`),
   });
   const [view, setView] = useState<Artifact | null>(null);
+  const ciPending = task.status === "waiting_ci" && task.stage !== "review";
   const attempts = task.evidence.attempts || [];
   const lastVerdict = [...attempts].reverse().find((a) => a.verdict)?.verdict;
   const byCriterion = new Map((lastVerdict?.criteria || []).map((c) => [c.criterion, c]));
@@ -126,9 +130,11 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
           <>
             <dt>CI</dt>
             <dd>
-              {task.status === "waiting_ci" ? "pending" : task.evidence.ci.state === "none" ? "No CI checks reported for this repository" : task.evidence.ci.state}
+              {ciPending ? "pending" : task.evidence.ci.state === "none" ? "No CI checks reported for this repository"
+                : task.evidence.ci.state}
               {(task.evidence.ci.checks || []).map((c) => (
-                <div key={c.name} className="checkline"><Mark status={task.status === "waiting_ci" ? "none" : c.conclusion === "success" ? "pass" : c.conclusion ? "fail" : "none"} />
+                <div key={c.name} className="checkline">
+                  <Mark status={ciPending || !c.conclusion ? "none" : c.conclusion === "success" ? "pass" : "fail"} />
                   {c.url ? <a className="linkish" href={c.url} target="_blank" rel="noreferrer">{c.name} <ExternalLink /></a> : c.name}</div>
               ))}
             </dd>

@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
-from aifactory.github import CheckSummary
+from aifactory.db import utcnow
+from aifactory.github import CheckSummary, GitHubError
 from aifactory.inference import ProviderConfig
+from aifactory.review import FACTORY_REPLY_MARKER
 
 
 def call(name: str, args: dict[str, Any], n: int = 0) -> dict[str, Any]:
@@ -131,8 +134,59 @@ class FakeGitHub:
     comments: list[tuple[int, str]] = []
 
     async def comment(self, full_name=None, number=None, body="", *args, **kwargs):
+        self._fail("comment")
         FakeGitHub.comments.append((number, body))
+        FakeGitHub.issue_comments.append({
+            "id": 9000 + len(FakeGitHub.issue_comments), "body": body, "html_url": "",
+            "user": {"login": FakeGitHub.login, "type": "Bot"}, "author_association": "NONE",
+            "created_at": utcnow().isoformat() + "Z"})
         return None
+
+    # Reviews. A test fills ``reviews`` (REST reviews), ``threads`` (GraphQL review threads) and ``issue_comments``
+    # (REST issue comments), or sets ``reviewer``: called as reviewer(number, head) before each snapshot, it stands
+    # in for a reviewer reacting to the pull request. ``failures[name] = n`` makes the next n calls of a method fail.
+    login = "factory-app[bot]"
+    reviews: list[dict[str, Any]] = []
+    threads: list[dict[str, Any]] = []
+    issue_comments: list[dict[str, Any]] = []
+    replies: list[tuple[int, str, str]] = []
+    resolved: list[str] = []
+    failures: dict[str, int] = {}
+    reviewer: Callable[[int, str | None], None] | None = None
+
+    def _fail(self, name: str) -> None:
+        if FakeGitHub.failures.get(name, 0) > 0:
+            FakeGitHub.failures[name] -= 1
+            raise GitHubError(f"{name} failed", 503)
+
+    async def review_snapshot(self, full_name, number):
+        self._fail("review_snapshot")
+        if FakeGitHub.reviewer:
+            pr = self.pulls.get(number)
+            FakeGitHub.reviewer(number, await self.branch_sha(full_name, pr["head"]["ref"]) if pr else None)
+        return deepcopy({"identity": {"login": ""}, "pull_author": {"login": FakeGitHub.login, "type": "Bot"},
+                         "reviews": FakeGitHub.reviews, "threads": FakeGitHub.threads,
+                         "comments": FakeGitHub.issue_comments})
+
+    async def reply_review_comment(self, full_name, number, comment_id, body):
+        self._fail("reply_review_comment")
+        FakeGitHub.replies.append((number, str(comment_id), body))
+        for thread in FakeGitHub.threads:
+            nodes = thread["comments"]["nodes"]
+            if nodes and str(nodes[0].get("fullDatabaseId")) == str(comment_id):
+                nodes.append({"fullDatabaseId": str(9000 + len(FakeGitHub.replies)), "url": "",
+                              "body": f"{FACTORY_REPLY_MARKER}\n{body}", "authorAssociation": "NONE",
+                              "author": {"login": FakeGitHub.login.removesuffix("[bot]"), "__typename": "Bot"},
+                              "createdAt": utcnow().isoformat() + "Z", "updatedAt": utcnow().isoformat() + "Z"})
+        return {}
+
+    async def resolve_review_thread(self, thread_id):
+        self._fail("resolve_review_thread")
+        FakeGitHub.resolved.append(thread_id)
+        for thread in FakeGitHub.threads:
+            if thread["id"] == thread_id:
+                thread["isResolved"] = True
+        return {"id": thread_id, "isResolved": True}
 
     issues_state: dict[int, str] = {}
 

@@ -204,3 +204,9 @@ def test_parked_pr_without_checks_is_still_watched():
     row = {"factory": {"status": "waiting_ci", "stage": "ci"},
            "ci": {"state": "none", "total": 0}, "detail": {"mergeable_state": "clean"}}
     assert pulls.classify(row) == ("checks", "The Factory is watching CI")
+
+
+def test_a_pr_waiting_for_its_review_is_not_ready_although_its_checks_passed():
+    row = {"factory": {"status": "waiting_ci", "stage": "review"},
+           "ci": {"state": "success", "total": 4}, "detail": {"mergeable_state": "clean"}}
+    assert pulls.classify(row) == ("checks", "The Factory is waiting for a review")
