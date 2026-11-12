@@ -44,6 +44,9 @@ WAITS_AS = {"needs_input": "is waiting for an answer", "awaiting_approval": "is 
 RETRY_OR_ABANDON = [{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}]
 AFTER_SMOKE = [{"value": "revert", "label": "Revert the merge"}, {"value": "fix", "label": "Create a fix outcome"},
                {"value": "acknowledge", "label": "Acknowledge"}]
+# A revert that did not go through: accepting cannot complete the task (the merge is still in), so the answers are
+# to try the revert again or to end the task.
+REVERT_AGAIN = [{"value": "revert", "label": "Try the revert again"}, {"value": "abandon", "label": "Abandon task"}]
 STRANDED_OPTIONS = [{"value": "continue", "label": "Start the waiting tasks"},
                     {"value": "drop", "label": "Drop the waiting tasks"}]
 # A running task is leased to the instance that runs it. The instance extends the lease every HEARTBEAT_SECONDS;
@@ -729,7 +732,8 @@ class Orchestrator:
         # and the decision above do not: answering them moves no waiting task.
         if any(d is not current and d.kind != "supervisor" for d in whole):
             return opened
-        with_decision = {d.task_id for d in decisions if d.task_id}
+        # Nor does a supervisor's finding about one task ask what to do with it.
+        with_decision = {d.task_id for d in decisions if d.task_id and d.kind != "supervisor"}
         now = time.monotonic()
         for task in tasks:
             if task.status not in HUMAN_TASK or task.id in with_decision:
@@ -739,17 +743,20 @@ class Orchestrator:
                 continue
             if not locked:
                 return self._ask(s, outcome, tasks, self._open_decisions(s, outcome), unasked, locked=True)
-            title = f"{task.key} {WAITS_AS[task.status]}, and nothing was asking what to do"[:300]
-            body = (f"{task.key} ({task.title}) {WAITS_AS[task.status]}, with no open decision: nobody was being "
+            waits, options = WAITS_AS[task.status], RETRY_OR_ABANDON
+            if task.status == "smoke_failed" and accepted_after_merge(task):
+                options = AFTER_SMOKE
+            elif task.status == "smoke_failed":
+                waits, options = "was merged, and reverting it did not go through", REVERT_AGAIN
+            title = f"{task.key} {waits}, and nothing was asking what to do"[:300]
+            body = (f"{task.key} ({task.title}) {waits}, with no open decision: nobody was being "
                     f"asked what to do next.\n\nRecorded reason: {task.blocked_reason or 'none'}")
             decision = Decision(workspace_id=ws, kind="unblock", title=title, body=body, outcome_id=outcome.id,
-                                task_id=task.id, metadata_json={"unasked": task.status},
-                                options=AFTER_SMOKE if task.status == "smoke_failed" else RETRY_OR_ABANDON)
+                                task_id=task.id, metadata_json={"unasked": task.status}, options=options)
             s.add(decision)
             s.flush()
-            record(ws, "decision_missing", f"{task.key} {WAITS_AS[task.status]} with no open decision; one was "
-                   "opened", outcome_id=outcome.id, task_id=task.id, level="warn", data={"status": task.status},
-                   session=s)
+            record(ws, "decision_missing", f"{task.key} {waits} with no open decision; one was opened",
+                   outcome_id=outcome.id, task_id=task.id, level="warn", data={"status": task.status}, session=s)
             opened.append((ws, decision.id, title, outcome.id, task.id))
         return opened
 
