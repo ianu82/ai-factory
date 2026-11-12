@@ -213,12 +213,18 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         review = review_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+    from .supervisor_policy import supervisor_policy
+    try:
+        supervisor = supervisor_policy(raw)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     mind = _mind_settings(raw.get("mind"))
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
     alerts = _alert_settings(raw.get("alerts"))
     merged = merged_settings({**raw, "lead": lead, "alerts": alerts})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
+    merged["supervisor"] = supervisor
     merged["review"] = review
     merged["mind"] = mind
     merged["lead"] = lead
