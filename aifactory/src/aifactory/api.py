@@ -1131,6 +1131,11 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     messages = db.query(Message).filter(Message.outcome_id == o.id).order_by(Message.created_at).all()
     events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
     open_count = sum(S.actionable(d) for d in decisions)
+    from .pipeline.lifecycle import dependents
+
+    # What cancelling each task would strand, for the cancel's confirmation.
+    waiting = {t.id: [{"id": w.id, "key": w.key, "title": w.title} for w in dependents(tasks, t.key)] for t in tasks}
+    overdue = _overdue(db, workspace_id, [d for d in decisions if d.status == "open"])
     return {
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
@@ -1140,9 +1145,11 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
             Artifact.workspace_id == workspace_id, Artifact.outcome_id == o.id, Artifact.kind == "attachment")
             .order_by(Artifact.created_at, Artifact.id)],
         "plans": [S.plan(p) for p in plans],
-        "tasks": [S.task(t, [r for r in runs if r.task_id == t.id], repos.get(t.repo_id, "")) for t in tasks],
+        "tasks": [S.task(t, [r for r in runs if r.task_id == t.id], repos.get(t.repo_id, ""))
+                  | {"dependents": waiting[t.id]} for t in tasks],
         "runs": [S.run(r) for r in runs],
-        "decisions": [S.decision(d, {"resolved_by_name": users.get(d.resolved_by or "", "")}) for d in decisions],
+        "decisions": [S.decision(d, {"resolved_by_name": users.get(d.resolved_by or "", ""), **overdue.get(d.id, {})})
+                      for d in decisions],
         "messages": [S.message(m, users.get(m.author_id or "", "Factory")) for m in messages],
         "events": [event_dict(e) for e in events],
     }
@@ -1200,16 +1207,22 @@ async def cancel_outcome(workspace_id: str, outcome_id: str, user: User = Depend
     return {"ok": True}
 
 
+class CancelTask(BaseModel):
+    # The tasks that wait for this one: "drop" cancels them too; "keep" leaves them to ask what to do.
+    dependents: Literal["keep", "drop"] = "keep"
+
+
 @router.post("/workspaces/{workspace_id}/tasks/{task_id}/cancel")
-async def cancel_task(workspace_id: str, task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def cancel_task(workspace_id: str, task_id: str, body: CancelTask | None = None,
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
     from .work_services import cancel_task as cancel, finish, publish_changes
 
     _ws(db, user, workspace_id, "member")
-    payload, later = cancel(db, user, workspace_id, task_id)
+    payloads, later = cancel(db, user, workspace_id, task_id, dependents=(body or CancelTask()).dependents)
     db.commit()
-    publish_changes([payload])
+    publish_changes(payloads)
     await finish(later, user)
-    return {"ok": True}
+    return {"ok": True, "dropped": [p["task_id"] for p in payloads[1:]]}
 
 
 @router.post("/workspaces/{workspace_id}/tasks/{task_id}/take-over")
@@ -1278,6 +1291,34 @@ def artifact(workspace_id: str, artifact_id: str, user: User = Depends(current_u
 
 
 # --- attention & decisions -----------------------------------------------------------
+NEEDS_TEXT = frozenset({"answer", "replan", "reject"})  # options the app's decision card asks a comment for first
+
+
+def same_question(d: Decision) -> str | None:
+    """What open decisions asking the same question about different work share, so the Inbox can answer them in one
+    go: the kind, the option values, and the title without what differs between occurrences (task keys, numbers,
+    ids: the watch's reason_of). None for a decision never grouped: one answered in words, or one without options."""
+    from .pipeline.watch import reason_of
+
+    values = sorted(str(o.get("value") or "") for o in d.options or [] if isinstance(o, dict))
+    if not values or d.kind == "question" or NEEDS_TEXT.intersection(values):
+        return None
+    title = re.sub(r"\bT\d+(?:,\s*T\d+)*\b", "T#", d.title or "")  # "T2, T3 cannot start: T1 …" as one shape
+    return json.dumps([d.kind, values, reason_of(title)])
+
+
+def _overdue(db: Session, workspace_id: str, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
+    """For each open decision: how long it has waited, and the watch's open overdue alert about it, if any."""
+    ids = [d.id for d in decisions]
+    alerts = {a.decision_id: a for a in db.query(Alert).filter(
+        Alert.workspace_id == workspace_id, Alert.kind == "overdue", Alert.status == "open",
+        Alert.decision_id.in_(ids))} if ids else {}
+    now = utcnow()
+    return {d.id: {"waited_minutes": max(int((now - d.created_at).total_seconds() // 60), 0),
+                   "overdue": {"alert_id": alerts[d.id].id, "title": alerts[d.id].title} if d.id in alerts else None}
+            for d in decisions}
+
+
 @router.get("/workspaces/{workspace_id}/inbox")
 def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _, member = _ws(db, user, workspace_id)
@@ -1301,6 +1342,11 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
     director_said = director_notes(db, decisions)
     alerts = db.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.status == "open") \
         .order_by(Alert.opened_at.desc()).limit(50).all()
+    # A decision that has waited too long is one item: the decision, marked overdue, not a second alert about it.
+    listed = {d.id for d in decisions}
+    alerts = [a for a in alerts if not (a.kind == "overdue" and a.decision_id in listed)]
+    waits = _overdue(db, workspace_id, decisions)
+    decisions.sort(key=lambda d: not waits[d.id]["overdue"])  # stable: overdue first, each part oldest first
     about = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({a.outcome_id for a in alerts if a.outcome_id}))}
     alert_tasks = {t.id: t.key for t in db.query(Task).filter(Task.id.in_({a.task_id for a in alerts if a.task_id}))}
     return {
@@ -1318,6 +1364,8 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
             "priority": outcomes[d.outcome_id].priority if d.outcome_id in outcomes else 2,
             "lead_note": lead_notes.get(d.id),
             "director_note": director_said.get(d.id),
+            **waits[d.id],
+            "question": same_question(d),
         }) for d in decisions],
         "since": S.ts(since),
         "changes": [event_dict(e) | ({"outcome_number": change_outcomes[e.outcome_id].number,
@@ -1361,6 +1409,11 @@ async def resolve_decision(workspace_id: str, decision_id: str, body: Resolution
         result = resolve(db, d, user, body.resolution, body.comment, body.reusable, body.scope)
     except DecisionError as exc:
         raise HTTPException(400, str(exc))
+    return await _resolved(d, user, result)
+
+
+async def _resolved(d: Decision, user: User, result: dict) -> dict:
+    """What follows a committed resolution: publishing a hand-over's candidate, closing a dropped pull request."""
     info = result.pop("handover", None)
     if info:
         from .pipeline.handover import publish_candidate
@@ -1372,6 +1425,47 @@ async def resolve_decision(workspace_id: str, decision_id: str, body: Resolution
 
         result["pr_closed"] = await close_dropped_pull(dropped, user.name or user.email, "Abandoned")
     return result
+
+
+class GroupResolution(BaseModel):
+    decision_ids: list[str] = Field(min_length=1, max_length=100)
+    resolution: str
+    comment: str = ""
+
+
+@router.post("/workspaces/{workspace_id}/decisions/resolve")
+async def resolve_decisions(workspace_id: str, body: GroupResolution, user: User = Depends(current_user),
+                            db: Session = Depends(get_db)):
+    """Answer a group of decisions that ask the same question in one go: each is resolved on its own, one after
+    another, as if answered alone (its own record, event and attribution), and a refusal does not stop the rest."""
+    import logging
+
+    _ws(db, user, workspace_id, "member")
+    results = []
+    for decision_id in dict.fromkeys(body.decision_ids):
+        d = db.get(Decision, decision_id)
+        if d is None or d.workspace_id != workspace_id:
+            results.append({"id": decision_id, "status": "refused", "reason": "Decision not found"})
+            continue
+        if d.status != "open":
+            results.append({"id": decision_id, "status": "already_resolved"})
+            continue
+        try:
+            result = resolve(db, d, user, body.resolution, body.comment)
+        except DecisionError as exc:
+            db.rollback()
+            db.refresh(d)
+            gone = d.status != "open"  # another resolver answered it first
+            results.append({"id": decision_id, "status": "already_resolved" if gone else "refused",
+                            **({} if gone else {"reason": str(exc)})})
+            continue
+        except Exception:
+            db.rollback()
+            logging.getLogger(__name__).exception("Resolving decision %s in a group failed", decision_id)
+            results.append({"id": decision_id, "status": "refused", "reason": "It could not be resolved"})
+            continue
+        results.append({"id": decision_id, "status": "resolved", **await _resolved(d, user, result)})
+    return {"results": results}
 
 
 class Overrule(BaseModel):

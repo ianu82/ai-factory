@@ -206,6 +206,7 @@ function TaskBody({ task, runs }: { task: Task; runs: Run[] }) {
         </div>
       )}
       <TakeOver task={task} />
+      <CancelTask task={task} />
     </div>
   );
 }
@@ -246,6 +247,72 @@ function TakeOver({ task }: { task: Task }) {
         <>
           <span className="muted">Rather finish this yourself?</span>
           <button className="btn sm ghost" onClick={() => setAsking(true)}>Take over {task.key}</button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Cancel a task, saying first which tasks wait for it; the person drops them too or keeps them, and kept ones ask
+ * what to do once it is cancelled. With none waiting, it is a plain confirmation. */
+function CancelTask({ task }: { task: Task }) {
+  const { ws } = useWs();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  if (FINISHED.has(task.status) || ws.role === "viewer") return null;
+  const waiting = task.dependents || [];
+  const go = async (dependents: "keep" | "drop") => {
+    setBusy(dependents);
+    try {
+      await api(`/api/workspaces/${ws.id}/tasks/${task.id}/cancel`, { method: "POST", json: { dependents } });
+      const also = dependents === "drop" ? waiting.map((w) => w.key) : [];
+      toast(also.length ? `Cancelled ${task.key} and ${also.join(", ")}` : `Cancelled ${task.key}`);
+      qc.invalidateQueries({ queryKey: ["outcome", ws.id] });
+      qc.invalidateQueries({ queryKey: ["outcomes", ws.id] });
+      qc.invalidateQueries({ queryKey: ["inbox", ws.id] });
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(null);
+      setAsking(false);
+    }
+  };
+  return (
+    <div className="takeover">
+      {asking ? (
+        <>
+          <span>
+            The Factory stops {task.key} and closes its pull request, if any.
+            {waiting.length > 0 && (
+              <> {waiting.length === 1 ? "This task waits" : "These tasks wait"} for it:{" "}
+                {waiting.map((w) => `${w.key} ${w.title}`).join("; ")}.</>
+            )}
+          </span>
+          <span className="spacer" />
+          <button className="btn sm ghost" onClick={() => setAsking(false)} disabled={busy !== null}>
+            Don't cancel
+          </button>
+          {waiting.length > 0 ? (
+            <>
+              <button className="btn sm" onClick={() => go("keep")} disabled={busy !== null}>
+                {busy === "keep" ? "Cancelling…" : "Keep them: they will ask what to do"}
+              </button>
+              <button className="btn sm danger" onClick={() => go("drop")} disabled={busy !== null}>
+                {busy === "drop" ? "Cancelling…" : "Drop them too"}
+              </button>
+            </>
+          ) : (
+            <button className="btn sm danger" onClick={() => go("keep")} disabled={busy !== null}>
+              {busy ? "Cancelling…" : `Cancel ${task.key}`}
+            </button>
+          )}
+        </>
+      ) : (
+        <>
+          <span className="muted">No longer needed?</span>
+          <button className="btn sm ghost" onClick={() => setAsking(true)}>Cancel {task.key}</button>
         </>
       )}
     </div>

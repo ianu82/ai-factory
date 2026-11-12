@@ -317,6 +317,8 @@ export interface Task {
   started_at: string | null;
   finished_at: string | null;
   updated_at: string;
+  /** The unfinished tasks that wait for this one, directly or through others: what cancelling it strands. */
+  dependents?: { id: string; key: string; title: string }[];
 }
 
 export interface ScorerResult {
@@ -433,6 +435,13 @@ export interface Decision {
   director_note?: { text: string; created_at: string } | null;
   hold?: HoldDetails;
   merge?: MergeFacts;
+  /** Inbox only: how long it has waited, and the watch's alert when it has waited too long. */
+  waited_minutes?: number;
+  overdue?: { alert_id: string; title: string } | null;
+  /** Inbox only: the same question about different work shares this key; null is never grouped. */
+  question?: string | null;
+  /** The Supervisor found its task stuck. */
+  stuck?: { since?: string | null; status?: string | null; flagged_at?: string };
 }
 
 /** One answer to a decision; `effect` says what choosing it does (absent on older decisions). */

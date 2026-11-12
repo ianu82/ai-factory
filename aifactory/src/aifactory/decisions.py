@@ -102,6 +102,19 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     kind = decision.kind
     if kind == "supervisor" and resolution == "acknowledge":
         pass  # Surface-only: acknowledging never changes the linked work.
+    elif kind == "supervisor" and resolution == "fix":
+        # A smoke failure nobody has triaged: accepted as work exactly as the Signals page accepts it.
+        from .models import Signal
+        from .signals import triage
+
+        meta = decision.metadata_json if isinstance(decision.metadata_json, dict) else {}
+        sig = db.get(Signal, meta.get("subject") or "") if meta.get("finding_kind") == "untriaged_smoke" else None
+        if sig is None or sig.workspace_id != decision.workspace_id:
+            raise DecisionError("This item has no smoke failure to create a fix for")
+        try:  # one that is already accepted keeps its outcome; one someone ignored meanwhile is not revived
+            triage(db, sig, user, "accept", pending_only=not sig.outcome_id)
+        except ValueError as exc:
+            raise DecisionError(str(exc)) from None
     elif kind == "approve_plan" and outcome:
         plan = (db.query(Plan).filter(Plan.outcome_id == outcome.id, Plan.status == "proposed")
                 .order_by(Plan.version.desc()).first())
