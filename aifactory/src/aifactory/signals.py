@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from . import workstreams
 from .db import utcnow
 from .events import notify, record
 from .github import GitHub
@@ -23,19 +24,24 @@ from .models import Event, Outcome, Repository, Signal, User, Workspace
 log = logging.getLogger(__name__)
 
 
-def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: str, brief: str, repo_ids: list[str],
+def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: str, brief: str, repo_ids: list[str] | None,
                       *, acceptance: list[str] | None = None, harness: str | None = None, source: str = "user",
                       signal_id: str | None = None, priority: int = 2, status: str = "planning",
                       guidance: dict | None = None, action_id: str | None = None,
-                      pending_events: list[dict] | None = None) -> Outcome:
+                      pending_events: list[dict] | None = None, workstream_id: str | None = None) -> Outcome:
     """With pending_events (a confirmed Mind card), the creation event waits there until the caller has committed;
     with action_id it is attributed "<person> via Mind"."""
+    workstreams.lock_workspace(db, workspace_id)
+    # Legacy internal callers may declare repository-free placeholder outcomes.
+    # Public creation/intake validate repositories before calling; assignments always validate here.
+    if repo_ids is None or repo_ids or workstream_id is not None:
+        repo_ids = workstreams.creation_repositories(db, workspace_id, repo_ids, workstream_id)
     number = db.execute(update(Workspace).where(Workspace.id == workspace_id).values(
         outcome_seq=Workspace.outcome_seq + 1).returning(Workspace.outcome_seq)).scalar_one()
     outcome = Outcome(workspace_id=workspace_id, number=number, title=title.strip()[:300], brief=brief.strip(),
                       acceptance=[a.strip() for a in (acceptance or []) if a.strip()], repo_ids=repo_ids,
                       harness=harness or None, source=source, signal_id=signal_id, priority=priority,
-                      created_by=user.id if user else None, status=status)
+                      created_by=user.id if user else None, status=status, workstream_id=workstream_id)
     db.add(outcome)
     db.flush()
     message = f"#{outcome.number} {outcome.title}"
@@ -43,11 +49,12 @@ def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: 
         message = f"{user.name or user.email} via Mind created {message}"
     payload = record(workspace_id, "outcome_created", message, outcome_id=outcome.id,
                      actor=user.id if user else "factory",
-                     data={"source": source, **({"guidance": guidance} if guidance else {}),
+                     data={"source": source, **({"workstream_id": workstream_id} if workstream_id else {}),
+                           **({"guidance": guidance} if guidance else {}),
                            **({"source": "mind", "action_id": action_id} if action_id else {})},
                      session=db, publish=pending_events is None)
     if pending_events is None:
-        notify(workspace_id, "outcome", outcome.id)
+        notify(workspace_id, "outcome", outcome.id, session=db)
     else:
         pending_events.append(payload)
     return outcome
@@ -56,10 +63,12 @@ def outcome_from_text(db: Session, workspace_id: str, user: User | None, title: 
 
 
 TRIAGE = ("accept", "ignore")
+_UNSET = object()
 
 
 def triage(db: Session, sig: Signal, user: User, action: str, *, title: str | None = None,
-           brief: str | None = None, pending_only: bool = False) -> Signal:
+           brief: str | None = None, pending_only: bool = False,
+           workstream_id: str | None | object = _UNSET) -> Signal:
     """Accept a signal as work or ignore it, as the Signals page does: accepting creates one outcome, never a second.
     Linear issues (Linear intake owns them) and improvement proposals (they change settings) have their own paths.
     The workspace's row lock serializes triage, and the signal is read again under it, so two people (or a person
@@ -73,8 +82,8 @@ def triage(db: Session, sig: Signal, user: User, action: str, *, title: str | No
     db.refresh(sig)
     if pending_only and sig.status not in ("new", "proposed"):
         raise ValueError("Someone has triaged this signal already")
-    sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
     if action == "ignore":
+        sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
         sig.status = "ignored"
         return sig
     if sig.outcome_id:
@@ -84,14 +93,30 @@ def triage(db: Session, sig: Signal, user: User, action: str, *, title: str | No
     worker = (sig.data or {}).get("worker") if sig.source == "github_issue" else None
     if worker not in ("native", "codex", "anton"):
         worker = None
-    repo_ids = [sig.repo_id] if sig.repo_id else [r.id for r in db.query(Repository).filter(
-        Repository.workspace_id == sig.workspace_id).limit(1)]
+    if workstream_id is _UNSET:
+        if (sig.data or {}).get("workstream_assignment_reason"):
+            raise ValueError(sig.data["workstream_assignment_reason"])
+        workstream_id = (sig.data or {}).get("proposed_workstream_id")
+    repo_ids = [sig.repo_id] if sig.repo_id else None
+    if repo_ids is None and workstream_id is None:
+        repo_ids = [r.id for r in db.query(Repository).filter(
+            Repository.workspace_id == sig.workspace_id).limit(1)]
+    # Preserve repository-free connector triage; assigning a stream still requires valid defaults.
+    if repo_ids or workstream_id is not None:
+        repo_ids = workstreams.creation_repositories(db, sig.workspace_id, repo_ids, workstream_id)
     outcome = outcome_from_text(db, sig.workspace_id, user, title or sig.title,
                                 (brief or sig.body or "") + (f"\n\nSource: {sig.url}" if sig.url else ""),
                                 repo_ids, source="signal", signal_id=sig.id, harness=worker,
-                                priority=signal_priority(sig))
+                                priority=signal_priority(sig), workstream_id=workstream_id)
     sig.status, sig.outcome_id = "accepted", outcome.id
+    sig.data = {key: value for key, value in (sig.data or {}).items()
+                if key not in ("acceptance_reason", "workstream_assignment_reason")}
+    record(sig.workspace_id, "signal_accepted", f"Accepted {sig.title}", outcome_id=outcome.id, actor=user.id,
+           data={"signal_id": sig.id, "workstream_id": workstream_id}, session=db)
+    notify(sig.workspace_id, "signal", sig.id, session=db)
     return sig
+
+
 def fingerprint(*parts: str) -> str:
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:40]
 
@@ -99,7 +124,7 @@ def fingerprint(*parts: str) -> str:
 def upsert_signal(db: Session, workspace_id: str, *, source: str, title: str, body: str, url: str,
                   external_id: str, repo_id: str | None) -> tuple[Signal, bool]:
     fp = fingerprint(source, external_id or title)
-    row = db.query(Signal).filter(Signal.workspace_id == workspace_id, Signal.fingerprint == fp).one_or_none()
+    row = db.query(Signal).filter(Signal.workspace_id == workspace_id, Signal.fingerprint == fp).populate_existing().one_or_none()
     if row:
         row.count += 1
         row.last_seen_at = utcnow()
@@ -110,6 +135,30 @@ def upsert_signal(db: Session, workspace_id: str, *, source: str, title: str, bo
     db.add(row)
     db.flush()
     return row, True
+
+
+def _label_assignment(db: Session, workspace_id: str, names: set[str]) -> dict:
+    from .models import Workstream
+
+    slugs = sorted(n.split(":", 1)[1] for n in names if n.startswith("workstream:"))
+    proposal = {"workstream_labels": slugs, "proposed_workstream_id": None}
+    if not slugs:
+        return proposal
+    reason = None
+    if len(slugs) != 1:
+        reason = "Conflicting workstream labels"
+    else:
+        stream = db.query(Workstream).filter_by(workspace_id=workspace_id, slug=slugs[0]).first()
+        if stream is None:
+            reason = "Unknown workstream label"
+        elif stream.state != "active":
+            reason = "Archived workstream label"
+        else:
+            proposal["proposed_workstream_id"] = stream.id
+    if reason:
+        proposal["workstream_assignment_reason"] = (
+            f"{reason}: {', '.join(slugs)}. Choose an active workstream or No workstream before accepting.")
+    return proposal
 
 
 async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, Any]:
@@ -137,13 +186,30 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                 if issue["number"] in seen:
                     continue
                 seen.add(issue["number"])
+                workstreams.lock_workspace(db, workspace_id)
                 sig, new = upsert_signal(db, workspace_id, source="github_issue", title=issue["title"],
                                          body=issue.get("body") or "", url=issue["html_url"],
                                          external_id=f"{repo.full_name}#{issue['number']}", repo_id=repo.id)
+                db.flush()
+                db.refresh(sig)
+                names = {str(lbl.get("name") or "") if isinstance(lbl, dict) else str(lbl)
+                         for lbl in issue.get("labels") or []}
+                if sig.status == "new":
+                    data = dict(sig.data or {})
+                    data.pop("workstream_assignment_reason", None)
+                    worker = next((n.split(":", 1)[1] for n in names
+                                   if n in ("worker:native", "worker:codex", "worker:anton")), None)
+                    sig.data = {**data, **_label_assignment(db, workspace_id, names),
+                                "worker": data.get("worker") if data.get("acceptance_reason") else worker}
                 created += new
                 updated += not new
                 db.commit()  # never hold the database write lock across network calls
                 if auto and sig.status == "new":
+                    workstreams.lock_workspace(db, workspace_id)
+                    db.refresh(sig)
+                    if sig.status != "new" or sig.outcome_id:
+                        db.commit()
+                        continue
                     existing = (db.query(Outcome)
                                 .filter(Outcome.workspace_id == workspace_id, Outcome.status != "cancelled",
                                         Outcome.brief.contains(issue["html_url"])).first())
@@ -152,15 +218,13 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                         sig.status, sig.outcome_id = "accepted", existing.id
                         db.commit()
                         continue
-                    if (sig.data or {}).get("acceptance_reason"):
+                    if (sig.data or {}).get("acceptance_reason") or (sig.data or {}).get("workstream_assignment_reason"):
                         db.commit()
                         continue  # a held issue always needs a person, even after permissions change
                     author = (issue.get("user") or {}).get("login", "")
-                    names = {(lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in issue.get("labels") or []}
-                    worker = next((n.split(":", 1)[1] for n in names if n in ("worker:native", "worker:codex", "worker:anton")), None)
+                    db.commit()  # author permission is a network call, not part of the write transaction
                     # Persist the worker before holding a proposal so human acceptance
                     # uses the same worker as automatic acceptance would have used.
-                    sig.data = {**(sig.data or {}), "worker": worker}
                     if cfg.get("require_trusted_issue_author") is not False:
                         reason = ""
                         if not author:
@@ -173,14 +237,33 @@ async def sync_github(db: Session, workspace_id: str, token: str) -> dict[str, A
                             except Exception:
                                 # Never persist provider messages: they can contain credentials.
                                 reason = "Acceptance needed: the issue author's repository permission could not be verified."
+                        workstreams.lock_workspace(db, workspace_id)
+                        db.refresh(sig)
+                        if sig.status != "new" or sig.outcome_id:
+                            db.commit()
+                            continue
                         if reason:
                             sig.data = {**sig.data, "acceptance_reason": reason}
                             db.commit()
                             continue
+                    workstreams.lock_workspace(db, workspace_id)
+                    db.refresh(sig)
+                    if sig.status != "new" or sig.outcome_id or any((sig.data or {}).get(k) for k in
+                            ("workstream_assignment_reason", "acceptance_reason")):
+                        db.commit()
+                        continue
+                    # A stream may have been archived while author permission was checked.
+                    proposal = _label_assignment(db, workspace_id,
+                        {"workstream:" + slug for slug in (sig.data or {}).get("workstream_labels", [])})
+                    sig.data = {**(sig.data or {}), **proposal}
+                    if proposal.get("workstream_assignment_reason"):
+                        db.commit()
+                        continue
                     outcome = outcome_from_text(
                         db, workspace_id, None, issue["title"],
                         f"{issue.get('body') or ''}\n\nSource: {issue['html_url']} (opened by {author}, labelled {auto_label})",
-                        [repo.id], source="signal", signal_id=sig.id, harness=worker)
+                        [repo.id], source="signal", signal_id=sig.id, harness=(sig.data or {}).get("worker"),
+                        workstream_id=(sig.data or {}).get("proposed_workstream_id"))
                     sig.status, sig.outcome_id = "accepted", outcome.id
                     accepted += 1
                     record(workspace_id, "signal_accepted",

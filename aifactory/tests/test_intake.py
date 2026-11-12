@@ -769,3 +769,229 @@ def test_delegated_resolve_applies_only_to_the_head_it_was_judged_on(monkeypatch
         assert s.get(Task, ids["T1"]).status == "awaiting_approval"
         assert s.query(Decision).filter(Decision.task_id == ids["T1"]).one().status == "open"
         assert s.get(Task, ids["T2"]).status == "queued"
+
+
+def seed_stream(ws, owner, slug='platform', **extra):
+    from aifactory.models import Workstream
+    with session_scope() as db:
+        stream = Workstream(workspace_id=ws, owner_id=owner, slug=slug, name=slug, goal='Delivery', **extra)
+        db.add(stream)
+        db.flush()
+        return stream.id
+
+
+@pytest.mark.parametrize('auto', [False, True])
+def test_workstream_label_proposal_auto_and_no_later_reassignment(client, signed_in, monkeypatch, auto):
+    ws = signed_in['workspaces'][0]['id']
+    repo = seed_intake_repo(ws)
+    sid = seed_stream(ws, signed_in['user']['id'])
+    row = intake_issue()
+    row['labels'].append({'name': 'workstream:platform'})
+    gh = IntakeGitHub('t')
+    gh.permission = 'write'
+    gh.rows = {'acme/app': [row]}
+    async def issues(full_name, labels='', since=None):
+        return gh.rows[full_name] if labels == ('factory:auto' if auto else 'factory') else []
+    gh.issues = issues
+    monkeypatch.setattr(signals_module, 'GitHub', lambda token: gh)
+    assert sync_intake(ws)['accepted'] == int(auto)
+    with session_scope() as db:
+        sig = db.query(Signal).one()
+        sig_id = sig.id
+        assert sig.data['proposed_workstream_id'] == sid
+        if not auto:
+            assert sig.status == 'new' and db.query(Outcome).count() == 0
+    for _ in range(2):
+        response = client.post(f'/api/workspaces/{ws}/signals/{sig_id}', json={'action': 'accept'})
+        assert response.status_code == 200, response.text
+    row['labels'] = [{'name': 'workstream:missing'}]
+    sync_intake(ws)
+    with session_scope() as db:
+        outcome = db.query(Outcome).one()
+        assert outcome.workstream_id == sid and outcome.repo_ids == [repo]
+        assert db.query(Signal).one().data['proposed_workstream_id'] == sid
+
+
+@pytest.mark.parametrize('labels,reason', [(['missing'], 'Unknown'), (['platform', 'missing'], 'Conflicting'),
+                                          (['archived'], 'Archived')])
+@pytest.mark.parametrize('clear', [False, True])
+def test_invalid_label_held_until_explicit_assignment(client, signed_in, monkeypatch, labels, reason, clear):
+    ws = signed_in['workspaces'][0]['id']
+    repo = seed_intake_repo(ws)
+    sid = seed_stream(ws, signed_in['user']['id'])
+    seed_stream(ws, signed_in['user']['id'], 'archived', state='archived')
+    row = intake_issue()
+    row['labels'] += [{'name': 'workstream:' + slug} for slug in labels]
+    gh = IntakeGitHub('t')
+    gh.permission = 'write'
+    gh.rows = {'acme/app': [row]}
+    monkeypatch.setattr(signals_module, 'GitHub', lambda token: gh)
+    for _ in range(2):
+        assert sync_intake(ws)['accepted'] == 0
+    with session_scope() as db:
+        sig = db.query(Signal).one()
+        sig_id = sig.id
+        assert reason in sig.data['workstream_assignment_reason']
+        assert sig.status == 'new' and db.query(Outcome).count() == 0
+    path = f'/api/workspaces/{ws}/signals/{sig_id}'
+    assert client.post(path, json={'action': 'accept'}).status_code == 422
+    for _ in range(2):
+        assert client.post(path, json={'action': 'accept', 'workstream_id': None if clear else sid}).status_code == 200
+    with session_scope() as db:
+        outcome = db.query(Outcome).one()
+        assert outcome.workstream_id == (None if clear else sid)
+        assert outcome.repo_ids == [repo]
+
+
+def test_workstream_label_alone_is_not_admitted(signed_in, monkeypatch):
+    ws = signed_in['workspaces'][0]['id']
+    seed_intake_repo(ws)
+    seed_stream(ws, signed_in['user']['id'])
+    class GH(IntakeGitHub):
+        async def issues(self, full_name, labels='', since=None):
+            assert labels in ('factory', 'factory:auto')
+            return []  # the issue has only workstream:platform, so matches neither query
+    monkeypatch.setattr(signals_module, 'GitHub', GH)
+    assert sync_intake(ws) == {'created': 0, 'updated': 0, 'accepted': 0}
+    with session_scope() as db:
+        assert db.query(Signal).count() == db.query(Outcome).count() == 0
+
+
+@pytest.mark.parametrize('source_repo', [False, True])
+def test_signal_defaults_only_without_source_repo(client, signed_in, source_repo):
+    ws = signed_in['workspaces'][0]['id']
+    first = seed_intake_repo(ws)
+    second = seed_intake_repo(ws, 'acme/second')
+    sid = seed_stream(ws, signed_in['user']['id'], default_repo_ids=[second])
+    with session_scope() as db:
+        sig = Signal(workspace_id=ws, source='feedback', repo_id=first if source_repo else None,
+                     fingerprint='feedback', title='Feedback')
+        db.add(sig)
+        db.flush()
+        sig_id = sig.id
+    assert client.post(f'/api/workspaces/{ws}/signals/{sig_id}',
+                       json={'action': 'accept', 'workstream_id': sid}).status_code == 200
+    with session_scope() as db:
+        assert db.query(Outcome).one().repo_ids == ([first] if source_repo else [second])
+
+
+def test_acceptance_during_author_check_does_not_duplicate(client, signed_in, monkeypatch):
+    ws = signed_in['workspaces'][0]['id']
+    seed_intake_repo(ws)
+    sid = seed_stream(ws, signed_in['user']['id'])
+    gh = IntakeGitHub('t')
+    gh.rows = {'acme/app': [intake_issue()]}
+    async def permission(full_name, author):
+        with session_scope() as db:
+            sig_id = db.query(Signal).one().id
+        response = client.post(f'/api/workspaces/{ws}/signals/{sig_id}',
+                               json={'action': 'accept', 'workstream_id': sid})
+        assert response.status_code == 200, response.text
+        return 'write'
+    gh.repository_author_permission = permission
+    monkeypatch.setattr(signals_module, 'GitHub', lambda token: gh)
+    assert sync_intake(ws)['accepted'] == 0
+    with session_scope() as db:
+        assert db.query(Outcome).one().workstream_id == sid
+
+
+def test_later_sync_proposal_is_used_by_acceptance_during_permission_check(client, signed_in, monkeypatch):
+    """A poll cannot overwrite the accepted assignment using its older in-memory signal."""
+    ws = signed_in['workspaces'][0]['id']
+    seed_intake_repo(ws)
+    owner = signed_in['user']['id']
+    seed_stream(ws, owner)
+    second = seed_stream(ws, owner, 'second')
+    outer = IntakeGitHub('t')
+    row = intake_issue()
+    row['labels'].append({'name': 'workstream:platform'})
+    outer.rows = {'acme/app': [row]}
+    inner = IntakeGitHub('t')
+    changed = intake_issue()
+    changed['labels'] = [{'name': 'workstream:second'}]
+    async def proposed(full_name, labels='', since=None):
+        return [changed] if labels == 'factory' else []
+    inner.issues = proposed
+    async def permission(full_name, author):
+        monkeypatch.setattr(signals_module, 'GitHub', lambda token: inner)
+        with SessionLocal() as poll:
+            assert (await signals_module.sync_github(poll, ws, 'fake-token'))['accepted'] == 0
+        with session_scope() as db:
+            sig_id = db.query(Signal).one().id
+        response = client.post(f'/api/workspaces/{ws}/signals/{sig_id}', json={'action': 'accept'})
+        assert response.status_code == 200, response.text
+        return 'write'
+    outer.repository_author_permission = permission
+    monkeypatch.setattr(signals_module, 'GitHub', lambda token: outer)
+    assert sync_intake(ws)['accepted'] == 0
+    with session_scope() as db:
+        assert db.query(Outcome).one().workstream_id == second
+
+
+def test_foreign_workstream_label_is_unknown_in_source_workspace(client, signed_in, monkeypatch):
+    from fastapi.testclient import TestClient
+    ws = signed_in['workspaces'][0]['id']
+    seed_intake_repo(ws)
+    other = TestClient(client.app)
+    other.post('/auth/dev', json={'email': 'foreign-label@elsewhere.test', 'organization': 'Elsewhere'})
+    me = other.get('/api/me').json()
+    seed_stream(me['workspaces'][0]['id'], me['user']['id'], 'private')
+    gh = IntakeGitHub('t')
+    gh.permission = 'write'
+    row = intake_issue()
+    row['labels'].append({'name': 'workstream:private'})
+    gh.rows = {'acme/app': [row]}
+    monkeypatch.setattr(signals_module, 'GitHub', lambda token: gh)
+    assert sync_intake(ws)['accepted'] == 0
+    with session_scope() as db:
+        sig = db.query(Signal).filter_by(workspace_id=ws).one()
+        assert 'Unknown' in sig.data['workstream_assignment_reason']
+        assert sig.data['proposed_workstream_id'] is None
+        assert db.query(Outcome).count() == 0
+
+
+def test_concurrent_acceptance_creates_one_outcome(client, signed_in):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    ws = signed_in['workspaces'][0]['id']
+    repo = seed_intake_repo(ws)
+    with session_scope() as db:
+        sig = Signal(workspace_id=ws, repo_id=repo, source='feedback', title='Concurrent feedback', fingerprint='once')
+        db.add(sig)
+        db.flush()
+        sid = sig.id
+    barrier = Barrier(2)
+    def accept():
+        barrier.wait()
+        response = client.post(f'/api/workspaces/{ws}/signals/{sid}', json={'action': 'accept'})
+        assert response.status_code == 200, response.text
+        return response.json()['outcome_id']
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        ids = list(executor.map(lambda _: accept(), range(2)))
+    assert ids[0] == ids[1]
+    with session_scope() as db:
+        assert db.query(Outcome).count() == 1
+
+
+def test_shared_triage_preserves_priority_and_requires_assignment_for_held_signal(client, signed_in):
+    from aifactory.models import User
+    ws = signed_in["workspaces"][0]["id"]
+    repo = seed_intake_repo(ws)
+    sid = seed_stream(ws, signed_in["user"]["id"])
+    with session_scope() as db:
+        sig = Signal(workspace_id=ws, repo_id=repo, source="github_issue", fingerprint="shared-triage",
+                     title="Held proposal", data={"priority": 0, "proposed_workstream_id": sid,
+                     "workstream_assignment_reason": "Choose an active workstream or No workstream"})
+        db.add(sig)
+        db.flush()
+        signal_id = sig.id
+        user = db.get(User, signed_in["user"]["id"])
+        with pytest.raises(ValueError, match="Choose an active workstream"):
+            signals_module.triage(db, sig, user, "accept")
+        assert db.query(Outcome).count() == 0
+    response = client.post(f"/api/workspaces/{ws}/signals/{signal_id}",
+                           json={"action": "accept", "workstream_id": None})
+    assert response.status_code == 200, response.text
+    with session_scope() as db:
+        outcome = db.query(Outcome).one()
+        assert outcome.priority == 0 and outcome.workstream_id is None

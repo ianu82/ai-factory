@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
@@ -1040,7 +1040,8 @@ class OutcomeCreate(BaseModel):
     title: str = Field(min_length=3, max_length=300)
     brief: str = ""
     acceptance: list[str] = []
-    repo_ids: list[str] = Field(min_length=1)
+    repo_ids: list[str] | None = Field(default=None, min_length=1)
+    workstream_id: str | None = None
     harness: str | None = None
     priority: int = 2
     attachment_ids: list[str] = Field(default_factory=list)
@@ -1049,6 +1050,7 @@ class OutcomeCreate(BaseModel):
 
 
 class OutcomeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     priority: int = Field(strict=True, ge=0, le=3)
 
 
@@ -1094,7 +1096,8 @@ def create_outcome(workspace_id: str, body: OutcomeCreate, user: User = Depends(
     # The same service creates a confirmed Mind card's outcome.
     outcome = create(db, user, workspace_id, title=body.title, brief=body.brief, repo_ids=body.repo_ids,
                      acceptance=body.acceptance, harness=body.harness, priority=body.priority,
-                     attachment_ids=body.attachment_ids, template=body.template, signal_id=marker)
+                     attachment_ids=body.attachment_ids, template=body.template, signal_id=marker,
+                     workstream_id=body.workstream_id)
     db.commit()
     orchestrator.wake()
     return S.outcome(outcome, [], [])
@@ -1112,6 +1115,32 @@ def outcome_conversation(workspace_id: str, outcome_id: str, user: User = Depend
     if o is None or o.workspace_id != workspace_id:
         raise HTTPException(404, "Outcome not found")
     return conversation(db, o, user.id)
+
+
+class OutcomeAssignment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    workstream_id: str | None = Field(...)
+
+
+def assign_outcome(workspace_id: str, outcome_id: str, body: OutcomeAssignment,
+                   user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    workstreams.lock_workspace(db, workspace_id)
+    outcome = db.query(Outcome).filter_by(id=outcome_id, workspace_id=workspace_id).populate_existing().one_or_none()
+    if outcome is None:
+        raise HTTPException(404, "Outcome not found")
+    workstreams.assignment_target(db, workspace_id, body.workstream_id)
+    old = outcome.workstream_id
+    if old != body.workstream_id:
+        outcome.workstream_id = body.workstream_id
+        record(workspace_id, "outcome_workstream_changed", f"Changed workstream for #{outcome.number}",
+               outcome_id=outcome.id, actor=user.id,
+               data={"old_workstream_id": old, "new_workstream_id": body.workstream_id}, session=db)
+        notify(workspace_id, "outcome", outcome.id, session=db)
+    db.commit()
+    orchestrator.wake()
+    tasks, runs, decisions = _outcome_rows(db, workspace_id, [outcome.id])
+    return S.outcome(outcome, tasks.get(outcome.id, []), runs.get(outcome.id, []), decisions.get(outcome.id, 0))
 
 
 @router.get("/workspaces/{workspace_id}/outcomes/{outcome_id}")
@@ -1156,8 +1185,10 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
 
 
 @router.patch("/workspaces/{workspace_id}/outcomes/{outcome_id}")
-def update_outcome(workspace_id: str, outcome_id: str, body: OutcomeUpdate, user: User = Depends(current_user),
-                   db: Session = Depends(get_db)):
+def update_outcome(workspace_id: str, outcome_id: str, body: OutcomeUpdate | OutcomeAssignment,
+                   user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if isinstance(body, OutcomeAssignment):
+        return assign_outcome(workspace_id, outcome_id, body, user, db)
     _ws(db, user, workspace_id, "member")
     # Serialize edits before reading the old priority, on SQLite as well as Postgres.
     # Preserve updated_at here so a replay is a no-op, including its timestamp.
@@ -1769,6 +1800,7 @@ async def sync_signals(workspace_id: str, user: User = Depends(current_user), db
 
 
 class SignalAction(BaseModel):
+    workstream_id: str | None = None
     action: str  # accept|ignore
     title: str | None = None
     brief: str | None = None
@@ -1866,7 +1898,8 @@ def ingest_feedback(workspace_id: str, body: FeedbackIn, request: Request, db: S
 def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: User = Depends(current_user),
                   db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "member")
-    sig = db.get(Signal, signal_id)
+    workstreams.lock_workspace(db, workspace_id)
+    sig = db.query(Signal).filter_by(id=signal_id).populate_existing().one_or_none()
     if sig is None or sig.workspace_id != workspace_id:
         raise HTTPException(404, "Signal not found")
     if sig.source == "linear_issue":
@@ -1889,7 +1922,11 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         notify(workspace_id, "signal", sig.id)
         return S.signal(sig)
     created = sig.outcome_id is None
-    triage(db, sig, user, "accept", title=body.title, brief=body.brief)
+    assignment = {"workstream_id": body.workstream_id} if "workstream_id" in body.model_fields_set else {}
+    try:
+        triage(db, sig, user, "accept", title=body.title, brief=body.brief, **assignment)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     db.commit()
     if created:
         orchestrator.wake()

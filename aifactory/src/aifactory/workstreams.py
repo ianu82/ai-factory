@@ -7,11 +7,12 @@ from typing import Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from sqlalchemy import update as sql_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import events, serializers as S
-from .models import Membership, Repository, User, Workstream
+from .models import Membership, Repository, User, Workspace, Workstream
 
 
 class Overrides(BaseModel):
@@ -59,6 +60,32 @@ def get(db: Session, workspace_id: str, workstream_id: str) -> Workstream:
     if stream is None:
         raise HTTPException(404, "Workstream not found")
     return stream
+
+
+def lock_workspace(db: Session, workspace_id: str) -> None:
+    """Serialize intake/assignment on SQLite as well as PostgreSQL; callers own the transaction."""
+    db.execute(sql_update(Workspace).where(Workspace.id == workspace_id).values(
+        outcome_seq=Workspace.outcome_seq).execution_options(synchronize_session=False))
+
+
+def assignment_target(db: Session, workspace_id: str, workstream_id: str | None) -> Workstream | None:
+    if workstream_id is None:
+        return None
+    stream = get(db, workspace_id, workstream_id)
+    db.refresh(stream)
+    if stream.state != "active":
+        raise HTTPException(422, "Workstream is archived; choose an active workstream or No workstream")
+    return stream
+
+
+def creation_repositories(db: Session, workspace_id: str, repo_ids: list[str] | None,
+                          workstream_id: str | None) -> list[str]:
+    stream = assignment_target(db, workspace_id, workstream_id)
+    ids = list(dict.fromkeys(repo_ids if repo_ids is not None else (stream.default_repo_ids if stream else [])))
+    count = db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.id.in_(ids)).count()
+    if not ids or count != len(ids):
+        raise HTTPException(400, "Unknown repository")
+    return ids
 
 
 def _authorize(member: Membership, owner_id: str) -> None:
@@ -155,6 +182,8 @@ def create(db: Session, workspace_id: str, member: Membership, user: User, body:
 
 
 def update(db: Session, stream: Workstream, member: Membership, user: User, body: WorkstreamUpdate) -> dict:
+    lock_workspace(db, stream.workspace_id)
+    db.refresh(stream)
     _authorize(member, stream.owner_id)
     values = body.model_dump(exclude_unset=True)
     # Members cannot hand their streams to someone else to bypass ownership controls.

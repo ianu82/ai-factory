@@ -497,7 +497,7 @@ class Orchestrator:
                 if kind is ScorerAttempt:
                     aggregate(s, run.result_id)
                 else:
-                    notify(run.workspace_id, "outcome", run.outcome_id)
+                    notify(run.workspace_id, "outcome", run.outcome_id, session=s)
             priced += 1
         if priced:
             log.info("priced %d run(s) from provider usage", priced)
@@ -761,7 +761,7 @@ class Orchestrator:
                         deps = [by_key.get(k) for k in task.depends_on or []]
                         if all(d is not None and d.status in DONE_TASK for d in deps):
                             task.status = "queued"
-                            notify(outcome.workspace_id, "task", task.id, outcome_id=outcome.id)
+                            notify(outcome.workspace_id, "task", task.id, outcome_id=outcome.id, session=s)
                 self._rollup(outcome, tasks, s)
                 opened += self._ask(s, outcome, tasks, asked.get(outcome.id, []), unasked)
             for task_id in [k for k in self._unasked if k not in unasked]:
@@ -864,11 +864,11 @@ class Orchestrator:
             outcome.summary = f"All {len(tasks)} task(s) merged and verified."
             record(outcome.workspace_id, "outcome_completed", f"Outcome #{outcome.number} delivered",
                    outcome_id=outcome.id, level="success", session=session)
-            notify(outcome.workspace_id, "outcome", outcome.id)
+            notify(outcome.workspace_id, "outcome", outcome.id, session=session)
             return
         if statuses <= {"cancelled", "abandoned"}:
             outcome.status = "cancelled"
-            notify(outcome.workspace_id, "outcome", outcome.id)
+            notify(outcome.workspace_id, "outcome", outcome.id, session=session)
             return
         if statuses <= TERMINAL_TASK:
             outcome.status = "partially_completed"
@@ -876,7 +876,7 @@ class Orchestrator:
             handed = sum(t.status == "handed_over" for t in tasks)
             outcome.summary = (f"{sum(t.status == 'completed' for t in tasks)} of {len(tasks)} task(s) delivered"
                                + (f"; {handed} handed over to people." if handed else "."))
-            notify(outcome.workspace_id, "outcome", outcome.id)
+            notify(outcome.workspace_id, "outcome", outcome.id, session=session)
             return
         # A pending task is stalled when something it depends on is waiting on a person or ended undelivered.
         stalled: set[str] = {t.key for t in tasks if t.status in HUMAN_TASK | set(ENDED)}
@@ -891,7 +891,7 @@ class Orchestrator:
         wanted = "running" if moving else "attention"
         if outcome.status != wanted:
             outcome.status = wanted
-            notify(outcome.workspace_id, "outcome", outcome.id)
+            notify(outcome.workspace_id, "outcome", outcome.id, session=session)
 
     def _schedule(self) -> None:
         self._schedule_ci()

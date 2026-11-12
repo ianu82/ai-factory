@@ -13,6 +13,9 @@ const SOURCE: Record<string, string> = {
   feedback: "Product feedback", improvement: "Factory learning",
 };
 
+type Stream = { id: string; name: string };
+type SignalAct = (s: Signal, action: "accept" | "ignore", note?: string, workstream?: string | null) => Promise<void>;
+
 const RULE: Record<string, string> = {
   merge_autonomy: "Merge policy", plan_autonomy: "Plan policy", review_themes: "Review findings", check_failures: "Checks",
   qa_boot: "Runtime QA", run_budget: "Budget", builder_harness: "Workers", merge_feedback: "Reviewer feedback",
@@ -27,6 +30,7 @@ export function SignalsPage() {
   const [logging, setLogging] = useState(false);
   const q = useQuery({ queryKey: ["signals", ws.id], queryFn: () => api<Signal[]>(`/api/workspaces/${ws.id}/signals`) });
   const repos = useQuery({ queryKey: ["repos", ws.id], queryFn: () => api<Repo[]>(`/api/workspaces/${ws.id}/repositories`) });
+  const streams = useQuery({ queryKey: ["workstreams", ws.id], queryFn: () => api<Stream[]>(`/api/workspaces/${ws.id}/workstreams`) });
   const repoName = (id: string | null) => repos.data?.find((r) => r.id === id)?.full_name;
   const refresh = () => qc.invalidateQueries({ queryKey: ["signals", ws.id] });
 
@@ -44,9 +48,9 @@ export function SignalsPage() {
     refresh();
     setBusy(false);
   };
-  const act = async (s: Signal, action: "accept" | "ignore", note?: string) => {
+  const act: SignalAct = async (s, action, note, workstream) => {
     try {
-      const r = await api<Signal>(`/api/workspaces/${ws.id}/signals/${s.id}`, { method: "POST", json: { action, note } });
+      const r = await api<Signal>(`/api/workspaces/${ws.id}/signals/${s.id}`, { method: "POST", json: { action, note, ...(workstream !== undefined ? { workstream_id: workstream } : {}) } });
       refresh();
       if (s.source === "improvement" && action === "accept") {
         toast("Applied");
@@ -90,9 +94,9 @@ export function SignalsPage() {
               </>
             )}
             {fresh.length > 0 && <div className="list-section">New · {fresh.length}</div>}
-            <ul className="rows">{fresh.map((s) => <SignalRow key={s.id} s={s} repo={repoName(s.repo_id)} act={act} canAct={member} />)}</ul>
+            <ul className="rows">{fresh.map((s) => <SignalRow key={s.id} s={s} repo={repoName(s.repo_id)} act={act} canAct={member} streams={streams.data || []} />)}</ul>
             {rest.length > 0 && <div className="list-section">Handled</div>}
-            <ul className="rows">{rest.map((s) => <SignalRow key={s.id} s={s} repo={repoName(s.repo_id)} act={act} canAct={false} />)}</ul>
+            <ul className="rows">{rest.map((s) => <SignalRow key={s.id} s={s} repo={repoName(s.repo_id)} act={act} canAct={false} streams={[]} />)}</ul>
           </>
         )}
       </div>
@@ -161,7 +165,10 @@ function ProposalCard({ s, repo, act }: { s: Signal; repo?: string; act: (s: Sig
   );
 }
 
-function SignalRow({ s, repo, act, canAct }: { s: Signal; repo?: string; act: (s: Signal, a: "accept" | "ignore") => void; canAct: boolean }) {
+function SignalRow({ s, repo, act, canAct, streams }: { s: Signal; repo?: string; act: SignalAct; canAct: boolean; streams: Stream[] }) {
+  const [assignment, setAssignment] = useState("proposed");
+  const needsAssignment = !!s.data.workstream_assignment_reason;
+  const selected = assignment === "proposed" ? undefined : assignment || null;
   const acceptanceReason = signalAcceptanceReason(s);
   const handled = s.source === "improvement" ? ({ accepted: "applied", ignored: "set aside", resolved: "no longer supported by the evidence" } as Record<string, string>)[s.status] : s.status;
   return (
@@ -180,7 +187,14 @@ function SignalRow({ s, repo, act, canAct }: { s: Signal; repo?: string; act: (s
         </div>
       </div>
       <div className="meta">
-        {canAct && <><button className="btn sm ghost" onClick={() => act(s, "ignore")}>Ignore</button><button className="btn sm primary" onClick={() => act(s, "accept")}>Make it an outcome</button></>}
+        {canAct && <><label className="field">
+          <span>Workstream</span>
+          <select className="select" aria-label={`Workstream for ${s.title}`} value={assignment} onChange={(e) => setAssignment(e.target.value)}>
+            <option value="proposed">{needsAssignment ? "Choose assignment…" : s.data.proposed_workstream_id ? "Use proposed workstream" : "Use default assignment"}</option>
+            <option value="">No workstream</option>
+            {streams.map((stream) => <option key={stream.id} value={stream.id}>{stream.name}</option>)}
+          </select>
+        </label><button className="btn sm ghost" onClick={() => act(s, "ignore")}>Ignore</button><button className="btn sm primary" disabled={needsAssignment && assignment === "proposed"} onClick={() => act(s, "accept", undefined, selected)}>Make it an outcome</button></>}
       </div>
     </li>
   );
