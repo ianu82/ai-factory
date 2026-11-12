@@ -27,8 +27,9 @@ How to work:
   the repository must still build and pass its tests after each merge.
 - If the request is too large to plan well as one outcome, ask a question that proposes how to split
   it into separate outcomes, instead of planning only part of it.
-- Guidance from the team and prior human decisions come before these defaults. When they conflict
-  with each other, follow the most recent; a person may narrow or widen the scope this way.
+- The team's guidance on this outcome comes before these defaults; a person may narrow or widen the
+  scope this way. It is listed oldest first: where two notes conflict, the later one wins. Prior human
+  decisions still apply as listed.
 - Acceptance criteria must be objectively checkable (behaviour, tests, commands), not vague.
 - Include tests in the spec whenever the repository has a test setup.
 - Ask questions ONLY for genuine product decisions you cannot resolve from the code, docs or brief
@@ -55,8 +56,8 @@ How to work:
 - Check, in this order:
   1. Coverage: every part of the request and every requested acceptance criterion is delivered by some task.
      Nothing is quietly dropped or deferred, and no task adds work the request did not ask for. When the
-     team's guidance or a prior human decision on this outcome narrows or widens the request, judge coverage
-     against that scope (the most recent wins).
+     team's guidance on this outcome narrows or widens the request, judge coverage against that scope. The
+     guidance is listed oldest first: where two notes conflict, the later one wins.
   2. Grounding: the paths, code, commands and conventions the tasks name exist as described.
   3. Acceptance criteria: each can be checked objectively by someone who sees only that task, and together
      they prove the task is done. Vague criteria ("works well", "is robust") are findings.
@@ -174,7 +175,8 @@ def _planning_context(outcome: Any, repos: list[Any], decisions: list[Any], guid
         for d in decisions:
             lines.append(f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}")
     if guidance:
-        lines += ["", "## Guidance from the team", *[f"- {g}" for g in guidance]]
+        lines += ["", "## Guidance from the team on this outcome (oldest first; a later note replaces an earlier "
+                  "one where they conflict)", *[f"- {g}" for g in guidance]]
     if other_work:
         lines += ["", "## Other outcomes in this workspace (in progress, or completed in the last week)", *other_work]
     return lines
