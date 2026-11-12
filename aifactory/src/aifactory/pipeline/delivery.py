@@ -2884,18 +2884,20 @@ class TaskRunner:
         rails: ``RAILS_FILE`` as it is at the task's base commit (never the candidate's, so a change cannot remove
         its own rail), the repository's ``rails`` setting, and the rails file itself. Read once per head and base."""
         head, base = self.task.head_sha, self.task.base_sha
+        # The repository's own patterns are part of what the record answers for: a rail added in its settings while
+        # the candidate waits (for its merge turn, for a person) is read before it merges.
+        configured = sorted({str(p).strip() for p in self.cfg.get("rails") or [] if str(p).strip()})
         known = (self.task.evidence or {}).get("rails") or {}
-        if known.get("head") == head and known.get("base") == base:
+        if known.get("head") == head and known.get("base") == base and known.get("configured", []) == configured:
             return
-        record: dict[str, Any] = {"head": head, "base": base, "paths": []}
+        record: dict[str, Any] = {"head": head, "base": base, "configured": configured, "paths": []}
         try:
             files = await changed_paths(self.repo.full_name, token, base, head)
             mirror_path = _mirror_path(self.repo.full_name)
             listed = ""
             if (await git("ls-tree", "--name-only", base, "--", RAILS_FILE, cwd=mirror_path)).strip():
                 listed = await git("show", f"{base}:{RAILS_FILE}", cwd=mirror_path)
-            patterns = [RAILS_FILE, *(str(p).strip() for p in self.cfg.get("rails") or []),
-                        *(line.strip() for line in listed.splitlines())]
+            patterns = [RAILS_FILE, *configured, *(line.strip() for line in listed.splitlines())]
             record["paths"] = protected_violations(files, [p for p in patterns if p and not p.startswith("#")])
         except GitError as exc:  # unknown rails ask a person, as rails do
             record["unreadable"] = str(exc)[:300]

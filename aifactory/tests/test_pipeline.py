@@ -1640,7 +1640,8 @@ def test_a_change_to_a_rail_asks_a_person_to_merge_even_when_merging_is_automati
                                         "its merge.\n\nPR #1 passed independent verification")
         assert decision.metadata_json == {
             "people_only": "A change to the Factory's rails merges only when a person approves it"}
-        assert task.evidence["rails"] == {"head": task.head_sha, "base": task.base_sha, "paths": ["greet.sh"]}
+        assert task.evidence["rails"] == {"head": task.head_sha, "base": task.base_sha, "paths": ["greet.sh"],
+                                          "configured": [] if source == "file" else ["greet.sh"]}
         assert director.choices(s, decision, director.settings_for(settings))[0] == []  # only a person answers
     assert FakeGitHub.merged == []
 
@@ -1662,6 +1663,25 @@ def test_a_change_that_touches_no_rail_merges_automatically_as_before(factory):
         assert task.evidence["rails"]["paths"] == []
         assert s.query(Decision).filter(Decision.task_id == task.id, Decision.kind == "approve_merge").count() == 0
     assert FakeGitHub.merged == [1]
+
+
+def test_a_rail_added_in_the_repositorys_settings_while_a_candidate_waits_is_read_before_it_merges(factory):
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:  # merges wait for a person, so the candidate is checked and then waits
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {**ws.settings["autonomy"], "merge": "approval"}}
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        task_id, checked = task.id, dict(task.evidence["rails"])
+        assert (checked["paths"], checked["configured"]) == ([], [])
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "rails": ["greet.sh"]}
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    asyncio.run(runner._check_rails("token"))
+    # Same head and base, but the earlier answer was for other patterns: it is not reused.
+    assert runner.task.evidence["rails"] == {**checked, "configured": ["greet.sh"], "paths": ["greet.sh"]}
+    assert delivery._rails_touched(runner.task)["paths"] == ["greet.sh"]
 
 
 def test_the_rails_are_read_at_the_base_commit_so_a_candidate_cannot_remove_its_own(factory):
@@ -1689,7 +1709,8 @@ def test_the_rails_are_read_at_the_base_commit_so_a_candidate_cannot_remove_its_
         task_id = task.id
     runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
     asyncio.run(runner._check_rails("token"))
-    assert runner.task.evidence["rails"] == {"head": head, "base": base, "paths": [".factory/rails", "greet.sh"]}
+    assert runner.task.evidence["rails"] == {"head": head, "base": base, "configured": [],
+                                             "paths": [".factory/rails", "greet.sh"]}
     assert runner._merge_needs_approval() is True
     with session_scope() as s:
         assert s.get(Task, task_id).evidence["rails"]["paths"] == [".factory/rails", "greet.sh"]
