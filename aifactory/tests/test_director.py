@@ -455,6 +455,16 @@ def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request
     assert tools._inbox_item("alert", "nope") == "No alert with that id in this workspace."
 
 
+def test_an_inbox_brief_never_carries_part_of_a_credential(world):
+    token = "ghp_" + "A" * 36
+    with db.session_scope() as s:  # the token straddles the brief's cut: cutting first would leave "ghp_AAAAAA"
+        s.get(Decision, world["merge"]).body = "x" * (director.BRIEF - 10) + token + " and more context"
+        s.get(Decision, world["stuck"]).title = "y" * 190 + token
+    tools = director.Tools(world["ws"], "r", ON, set(woken()[world["ws"]]["new"]))
+    page = tools._inbox()
+    assert "ghp_" not in page and "[redacted]" in page
+
+
 def test_the_inbox_and_message_log_show_the_directors_note(world, client):
     with db.session_scope() as s:
         s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="director_note",

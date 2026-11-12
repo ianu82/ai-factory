@@ -33,6 +33,7 @@ from ..events import notify, record
 from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider,
                          workspace_models)
 from ..models import Alert, Decision, Event, Message, Outcome, Run, Signal, Task, User, Workspace, new_id
+from ..security import redact
 from .holds import held_workspaces
 from .lead import (FINISHED, RESULT_CHARS, STOPPED, UNPRICED_MIN, _bounded, _Budget, _fn, _task, converse,
                    notes_for, outcome_record)
@@ -304,7 +305,8 @@ def claim(item: dict[str, Any]) -> tuple[str, float] | None:
 # the inbox ---------------------------------------------------------------------------------------------------------
 
 def _short(text: Any, limit: int = BRIEF) -> str:
-    text = text if isinstance(text, str) else ""
+    # Redact the whole text first: cutting first could leave a credential's prefix that no pattern recognises.
+    text = redact(text) if isinstance(text, str) else ""
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -332,7 +334,7 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
 
         def about(outcome_id: str | None) -> str | None:
             o = outcomes.get(outcome_id or "")
-            return f"#{o.number} {o.title[:120]} ({o.status}, priority {o.priority})" if o else None
+            return f"#{o.number} {_short(o.title, 120)} ({o.status}, priority {o.priority})" if o else None
 
         def task(task_id: str | None) -> str | None:
             t = tasks.get(task_id or "")
