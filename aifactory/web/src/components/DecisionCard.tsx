@@ -53,6 +53,7 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
     <article ref={card} id={`decision-${d.id}`} tabIndex={-1} className={`decide ${focused ? "focused" : ""}`} aria-label={d.title}>
       <span className="kind-tag">{DECISION_KIND[d.kind] || d.kind} · {ago(d.created_at)}</span>
       <h4>{d.title}</h4>
+      {d.hold && <p className="muted" style={{ margin: "0 0 8px" }}><b>Cause:</b> {d.hold.label}{d.hold.source ? ` (${d.hold.source})` : ""}. {d.hold.advice}</p>}
       {showContext && d.outcome_number != null && (
         <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
           <button className="linkish" onClick={onOpen}>#{d.outcome_number} {d.outcome_title}{d.task_key ? ` · ${d.task_key}` : ""}</button>

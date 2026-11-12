@@ -132,6 +132,17 @@ export interface DirectorSettings {
   daily_usd: number;
   max_outcome_usd: number;
   after_minutes: number;
+  /** Hours what it left to people waits for them before it decides that itself; 0: always people's. */
+  decide_after_hours: number;
+}
+
+/** Why the model provider refused, on a provider hold (pipeline/holds.py). */
+export interface HoldDetails {
+  cause: "credit" | "credential" | "no_provider" | "limit" | "rate_limit" | "overloaded" | "unknown";
+  label: string;
+  advice: string;
+  source: string | null;
+  error: string;
 }
 
 export interface ModelCheckResult {
@@ -393,6 +404,7 @@ export interface Decision {
   priority?: number;
   lead_note?: { text: string; created_at: string; run_id?: string | null } | null;
   director_note?: { text: string; created_at: string } | null;
+  hold?: HoldDetails;
 }
 
 /** An outcome as a conversation (GET …/outcomes/{id}/conversation). */

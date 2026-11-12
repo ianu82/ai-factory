@@ -500,6 +500,8 @@ a { color: inherit; text-decoration: none; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .banner { display: flex; gap: 10px; align-items: center; padding: 9px 22px; background: var(--human-soft); color: var(--human); font-size: 12.5px; font-weight: 500; border-top: 1px solid #ecd2b0; }
 .banner.info { background: var(--teal-soft); color: var(--teal-dark); border-color: #c7e6ec; }
+.banner.hold { background: var(--bad-soft); color: var(--bad); border-color: #f1c4c4; flex-wrap: wrap; }
+.banner.hold .btn { flex: none; }
 
 /* diff */
 .diff { font: 11.5px/1.55 var(--mono); background: var(--sunken); border-radius: var(--r); padding: 10px 0; overflow: auto; max-height: 520px; }
