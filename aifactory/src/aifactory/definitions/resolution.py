@@ -45,9 +45,8 @@ def resolve_definitions(db: Session, workspace_id: str, role: str, *,
     else:
         if repository_ids:
             raise DefinitionError("Builder/verifier scope requires only task_repository_id")
-        if not task_repository_id:
-            raise DefinitionError("Builder/verifier requires a task repository")
-        selected = {task_repository_id}
+        # Without a task repository only workspace-scoped definitions apply.
+        selected = {task_repository_id} if task_repository_id else set()
     owned = set(db.scalars(select(Repository.id).where(Repository.workspace_id == workspace_id)))
     if not selected <= owned:
         raise DefinitionError("Selected repository does not belong to this workspace")

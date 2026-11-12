@@ -9,12 +9,16 @@ import shlex
 import time
 from typing import Any
 
+from ..definitions.validation import safe_path
 from ..sandbox import COMMAND_TIMEOUT, SandboxError
 from ..sandbox import read_text as sb_read_text
 from ..sandbox import write_text as sb_write_text
 from .base import HarnessSession
 
 MAX_TOOL_OUTPUT = 30_000
+# Two maximum-size bodies per model turn, leaving headroom in Native's context
+# for other tool results. Never spend this budget by partially returning a body.
+SKILL_BODY_TURN_BUDGET = 128 * 1024
 RUN_DEFAULT_TIMEOUT = 300
 RUN_TIMEOUT_HELP = (f"Seconds before the command is stopped. Default {RUN_DEFAULT_TIMEOUT}, max {COMMAND_TIMEOUT} "
                     f"({COMMAND_TIMEOUT // 60} minutes, the limit for one of the repository's checks); less when your "
@@ -63,14 +67,40 @@ def finish_tool(schema: dict[str, Any]) -> dict[str, Any]:
         "parameters": schema}}
 
 
+DEFINITION_TOOLS = [
+    _fn("read_skill", "Load a full skill body by qualified skill_id, or read a paginated supporting file. "
+        "Body loads share a per-turn output budget; retry deferred loads in the next turn.",
+        {"skill_id": {"type": "string"}, "path": {"type": "string"},
+         "offset": {"type": "integer", "description": "Supporting-file character offset (default 0)."},
+         "limit": {"type": "integer", "description": "Supporting-file characters, maximum 16000."}}, ["skill_id"]),
+    _fn("search_knowledge", "Search scoped knowledge metadata/body, or read a page by qualified page_id. Paginated.",
+        {"query": {"type": "string"}, "page_id": {"type": "string"},
+         "offset": {"type": "integer"}, "limit": {"type": "integer"}}, []),
+]
+
+
+def _page(text: str, args: dict) -> dict:
+    offset = max(0, int(args.get("offset", 0)))
+    limit = max(1, min(16000, int(args.get("limit", 16000))))
+    end = min(len(text), offset + limit)
+    return {"body": text[offset:end], "offset": offset, "total": len(text),
+            "next_offset": end if end < len(text) else None}
+
+
 def tool_specs(writable: bool) -> list[dict[str, Any]]:
-    return list(READ_TOOLS) + (WRITE_TOOLS if writable else [])
+    return list(READ_TOOLS) + list(DEFINITION_TOOLS) + (WRITE_TOOLS if writable else [])
 
 
 class ToolBox:
     def __init__(self, session: HarnessSession):
         self.session = session
         self.log: list[str] = []
+        self.definitions = json.loads(session.definition_context)
+        self.begin_turn()
+
+    def begin_turn(self) -> None:
+        """Called by the harness for each model response, never by an agent tool."""
+        self.skill_body_bytes = 0
 
     async def call(self, name: str, args: Any) -> str:
         output = await self._tool(self.session, name, args)
@@ -82,6 +112,62 @@ class ToolBox:
             return "Error: tool arguments were not valid JSON. Retry with a JSON object."
         sandbox = session.sandbox
         try:
+            if name in {"read_skill", "search_knowledge"}:
+                # No agent-selected workspace/revision and no fallback name lookup.
+                allowed = ({"skill_id", "path", "offset", "limit"} if name == "read_skill" else
+                           {"query", "page_id", "offset", "limit"})
+                if args.keys() - allowed:
+                    return "Error: unsupported definition tool arguments"
+                if name == "read_skill":
+                    skill = self.definitions.get("skills", {}).get(args["skill_id"])
+                    if skill is None:
+                        return "Error: skill not found in this session scope"
+                    if "path" in args:
+                        safe_path(args["path"])
+                        text = skill.get("files", {}).get(args["path"])
+                        if text is None:
+                            return "Error: supporting file not found in this skill"
+                        return json.dumps(_page(text, args), ensure_ascii=False)
+                    body = skill["body"]
+                    size = len(body.encode("utf-8"))
+                    if self.skill_body_bytes + size > SKILL_BODY_TURN_BUDGET:
+                        return ("Skill not loaded: output budget for this turn reached, "
+                                "call read_skill again in the next turn.")
+                    self.skill_body_bytes += size
+                    metadata = {k: skill[k] for k in ("id", "name", "source")}
+                    metadata["revision"] = session.definition_revision
+                    session.on_progress("skill_loaded", f"Loaded skill {skill['name']}", metadata)
+                    if not any(item["id"] == skill["id"] for item in session.loaded_skills):
+                        session.loaded_skills.append(metadata)
+                    # Intentional bypass of clip: validated bodies may be 64 KiB.
+                    return body
+                pages = self.definitions.get("knowledge", {})
+                if args.get("page_id"):
+                    page = pages.get(args["page_id"])
+                    if page is None:
+                        return "Error: knowledge page not found in this session scope"
+                    return json.dumps({"id": page["id"], "name": page["name"], "source": page["source"],
+                                       **_page(page["body"], args)}, ensure_ascii=False)
+                query = str(args.get("query", "")).casefold()
+                matches = [{k: page[k] for k in ("id", "name", "description", "source")}
+                           for page in pages.values()
+                           if query in "\n".join(page[k] for k in ("name", "description", "body")).casefold()]
+                offset = max(0, int(args.get("offset", 0)))
+                limit = max(1, min(50, int(args.get("limit", 20))))
+                # Bound search output as well: descriptions have a workspace-wide,
+                # not per-entry, quota. One oversized hit must not flood the model.
+                hits = []
+                size = 0
+                for hit in matches[offset:offset + limit]:
+                    hit = {**hit, "description": hit["description"][:1000]}
+                    width = len(json.dumps(hit, ensure_ascii=False))
+                    if size + width > 16000:
+                        break
+                    hits.append(hit)
+                    size += width
+                end = offset + len(hits)
+                return json.dumps({"pages": hits, "total": len(matches),
+                                   "next_offset": end if end < len(matches) else None}, ensure_ascii=False)
             if name == "list_files":
                 path = args.get("path") or "."
                 sandbox.resolve(path)
@@ -146,7 +232,7 @@ class ToolBox:
             return f"Error: {exc}"
         except KeyError as exc:
             return f"Error: missing argument {exc}"
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError) as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
 

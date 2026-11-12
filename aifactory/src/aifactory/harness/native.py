@@ -94,6 +94,7 @@ class NativeHarness:
                     raise HarnessFailed("The model stopped calling tools without submitting a report")
                 messages.append({"role": "user", "content": "Continue using the tools. When finished, call finish with your report."})
                 continue
+            toolbox.begin_turn()
             accepted: dict[str, Any] | None = None
             for call in calls:
                 fn = call.get("function") or {}
