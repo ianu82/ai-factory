@@ -904,6 +904,10 @@ class OutcomeCreate(BaseModel):
     template: Literal["readme-contributing"] | None = None
 
 
+class OutcomeUpdate(BaseModel):
+    priority: int = Field(strict=True, ge=0, le=3)
+
+
 def _outcome_rows(db: Session, workspace_id: str, outcome_ids: list[str]) -> tuple[dict, dict, dict]:
     from .work_services import outcome_rows
 
@@ -998,6 +1002,36 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
         "messages": [S.message(m, users.get(m.author_id or "", "Factory")) for m in messages],
         "events": [event_dict(e) for e in events],
     }
+
+
+@router.patch("/workspaces/{workspace_id}/outcomes/{outcome_id}")
+def update_outcome(workspace_id: str, outcome_id: str, body: OutcomeUpdate, user: User = Depends(current_user),
+                   db: Session = Depends(get_db)):
+    _ws(db, user, workspace_id, "member")
+    # Serialize edits before reading the old priority, on SQLite as well as Postgres.
+    # Preserve updated_at here so a replay is a no-op, including its timestamp.
+    locked = db.execute(update(Outcome).where(Outcome.id == outcome_id, Outcome.workspace_id == workspace_id)
+                        .values(priority=Outcome.priority, updated_at=Outcome.updated_at))
+    if not locked.rowcount:
+        raise HTTPException(404, "Outcome not found")
+    o = db.get(Outcome, outcome_id)
+    payload = None
+    if o.priority != body.priority:
+        old_priority = o.priority
+        o.priority = body.priority
+        payload = record(workspace_id, "outcome_priority_changed",
+                         f"{user.name or user.email} changed priority of #{o.number} from {old_priority} to {o.priority}",
+                         outcome_id=o.id, actor=user.id, data={"from": old_priority, "to": o.priority},
+                         session=db, publish=False)
+    tasks, runs, decisions = _outcome_rows(db, workspace_id, [o.id])
+    result = S.outcome(o, tasks.get(o.id, []), runs.get(o.id, []), decisions.get(o.id, 0),
+                       S.outcome_sources(db, [o]).get(o.signal_id))
+    db.commit()
+    if payload is not None:
+        bus.publish({"type": "event", **payload})
+        notify(workspace_id, "outcome", o.id)
+        orchestrator.wake()
+    return result
 
 
 def _creator(db: Session, name: str, outcome: Outcome) -> str:
