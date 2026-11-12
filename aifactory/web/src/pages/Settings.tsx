@@ -558,7 +558,10 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
             {supportsReverify && <label className="field"><span>Independent review after rebase</span>
               <select className="select" value={form.reverify} disabled={!admin} onChange={(e) => setForm({ ...form, reverify: e.target.value as "overlap" | "always" | "never" })}>
                 <option value="overlap">When changes overlap (default)</option><option value="always">Always</option><option value="never">Never</option>
-              </select><span className="hint">Overlap: review again when main changed the same files. Always: review every rebased candidate. Never: skip independent re-review. Review includes runtime QA when configured. Required CI still reruns; the repository’s checks rerun in the Factory too, unless no file is shared and CI is required (CI is then the gate).</span></label>}
+              </select><span className="hint">Overlap: review again when main changed the same files. Always:
+                review every rebased candidate. Never: skip independent re-review. Review includes runtime QA when
+                configured. Required CI still reruns; the repository’s checks rerun in the Factory too, unless no
+                file is shared and CI is required (CI is then the gate).</span></label>}
             <label className="field"><span>Releases</span>
               <select className="select" value={form.release_mode} disabled={!admin} onChange={(e) => setForm({ ...form, release_mode: e.target.value })}>
                 <option value="">Not managed by the Factory</option><option value="on_merge">Deploys when main changes</option>
@@ -576,9 +579,13 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
               <span className="hint">In Fix mode, consider reverting a revertible breaking commit if no fix passes checks within this many minutes (default 60).</span></label>
           </div>
           <label className="field"><span>GitHub CI checks before merging</span>
-            <select className="select" value={form.require_ci} disabled={!admin} onChange={(e) => setForm({ ...form, require_ci: e.target.value })}>
-              <option value="auto">Required when the repository has workflows (default)</option><option value="true">Always required</option><option value="false">Not required</option>
-            </select><span className="hint">A pull request that shows no checks is not merged while CI is required: after ten minutes the Factory asks. Not required: it merges once checks have had 150 seconds to appear.</span></label>
+            <select className="select" value={form.require_ci} disabled={!admin}
+              onChange={(e) => setForm({ ...form, require_ci: e.target.value })}>
+              <option value="auto">Required when the repository has workflows (default)</option>
+              <option value="true">Always required</option><option value="false">Not required</option>
+            </select><span className="hint">A pull request that shows no checks is not merged while CI is required:
+              after ten minutes the Factory asks. Not required: it merges once checks have had 150 seconds to
+              appear.</span></label>
           <label className="check"><input type="checkbox" checked={form.require_trusted_issue_author} disabled={!admin} onChange={(e) => setForm({ ...form, require_trusted_issue_author: e.target.checked })} /> Require trusted issue authors for automatic work</label>
           <p className="hint">Enabled by default: factory:auto issues start only when their author currently has write or admin access. Other issues, or permissions that cannot be verified, need a person to accept them in Signals. Turning this off allows the automatic label alone to start work in this repository. Held proposals still need acceptance.</p>
           {admin && <div style={{ display: "flex", gap: 8 }}><button className="btn primary" onClick={save}>Save</button><span style={{ flex: 1 }} /><button className="btn ghost danger" onClick={remove}>Disconnect</button></div>}
