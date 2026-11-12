@@ -243,9 +243,12 @@ def working_tree(tree: dict[str, Any]) -> str:
     """What the builder's checkout holds as its session starts, in a sentence or two. ``tree`` is what the runner
     recorded while preparing it: ``from`` ("default": a checkout of the default branch; "branch": the pull request's
     branch), ``sha`` (the default branch's commit under it), ``pushed`` (how the pull request's earlier change sits
-    in a branch checkout), and ``changes`` of ``attempt``: "left" by it in this same checkout, "restored" from its
-    saved diff, or "lost" with the sandbox it ran in."""
+    in a branch checkout), ``changes`` of ``attempt``: "left" by it in this same checkout, "restored" from its
+    saved diff, or "lost" with the sandbox it ran in, and ``wip`` when a session of this same attempt was
+    interrupted: whether the work in progress saved for it was ``restored`` (saved ``at``, its size), or ``why``
+    not."""
     sha, default, changes = str(tree.get("sha") or "")[:12], tree.get("default"), tree.get("changes")
+    wip = tree.get("wip") or {}
     branch = tree.get("from") == "branch"
     if branch:
         text = f"The pull request's branch `{tree.get('branch')}`, on top of the default branch `{default}` at `{sha}`"
@@ -256,7 +259,7 @@ def working_tree(tree: dict[str, Any]) -> str:
         }.get(tree.get("pushed"), ".")
     else:
         text = f"{'A' if changes == 'left' else 'A fresh'} checkout of the default branch `{default}` at `{sha}`."
-        if not changes:
+        if not changes and not wip.get("restored"):
             text += " Nothing from an earlier attempt is in it."
     of = f"attempt {tree['attempt']}" if tree.get("attempt") else "your previous attempt"
     see = "run `git status` and `git diff HEAD` to see it"
@@ -267,6 +270,16 @@ def working_tree(tree: dict[str, Any]) -> str:
     elif changes == "lost":
         text += (f" What {of} changed {'was never pushed' if branch else 'could not be restored'} and is not in it; "
                  "the feedback below is what remains of it.")
+    if wip.get("restored"):
+        text += (" Your previous session on this attempt was interrupted (the service restarted, or its "
+                 f"infrastructure failed). The changes in its checkout were last saved at {wip.get('at')} "
+                 f"({wip.get('files')} file(s), +{wip.get('additions')} -{wip.get('deletions')} against the base "
+                 "commit) and have been restored into this one, staged but not committed. Anything done after that "
+                 "save is lost, and so is the earlier conversation. Run `git status` and `git diff HEAD` to see the "
+                 "restored work, and continue from it rather than starting again.")
+    elif wip:
+        text += (" Your previous session on this attempt was interrupted, and what it had changed could not be "
+                 f"restored ({wip.get('why')}): that work is lost, and so is the earlier conversation.")
     return text
 
 

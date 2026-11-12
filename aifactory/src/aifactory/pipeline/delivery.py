@@ -30,7 +30,7 @@ from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as re
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit,
                       tree_changes, tree_id)
-from ..gitops import patch_id
+from ..gitops import patch_id, snapshot_patch
 from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
 from ..harness.schemas import _criterion_key
 from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
@@ -50,6 +50,7 @@ log = logging.getLogger(__name__)
 CI_POLL_TIMEOUT_SECONDS = 90
 REVIEW_POLL_SECONDS = 60
 REVIEW_REPLY_TRIES = 3  # polls that may fail to post a round's answers on their threads before the Factory gives up
+CHECKPOINT_SECONDS = 300  # between saves of the builder's work in progress while its session runs
 
 INFRA_RETRIES = 3  # consecutive automatic retries of an infrastructure failure before a person decides
 INFRA_BACKOFF_SECONDS = (120, 600)  # before the first retry, then before each later one
@@ -363,17 +364,20 @@ class TaskRunner:
     def evidence(self, key: str, value: Any) -> None:
         self._set_evidence({key: value})
 
-    def _set_evidence(self, values: dict[str, Any]) -> None:
-        """Record evidence keys in one transaction ("attempts" appends)."""
+    def _set_evidence(self, values: dict[str, Any], wip: Patch | None = None) -> None:
+        """Record evidence keys in one transaction ("attempts" appends). ``wip`` is the work in progress that a new
+        "wip" record describes: the task's one artifact of that kind holds it from this write on."""
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
             ev = json.loads(json.dumps(task.evidence or {}))
+            stored = (ev.get("wip") or {}).get("artifact_id")
             for key, value in values.items():
                 if key == "attempts":  # tagged with the budget it belongs to (attempt numbers restart per budget)
                     ev.setdefault("attempts", []).append({**value, "epoch": int(ev.get("budget_epoch", 0))})
                     if value.get("result") not in NOT_ATTEMPTS:
                         ev.pop("candidate", None)  # the attempt ended: its saved candidate is never resumed
+                        ev.pop("wip", None)  # and no later attempt starts from its work in progress
                     if recovered_from_infra(str(value.get("result")), ev.get("infra_phase")):
                         ev.pop("infra_retries", None)  # the phase that failed has since completed
                         ev.pop("infra_phase", None)
@@ -383,13 +387,37 @@ class TaskRunner:
                 if key in ("ci", "smoke") and value.get("state") in ("failure", "failed"):
                     ev.setdefault("failure_facts", []).append({"kind": key, **value,
                                                               "attempt": task.attempt, "at": utcnow().isoformat()})
+                if key == "candidate" and value:
+                    ev.pop("wip", None)  # built: a stop from here on resumes the candidate, not the work behind it
                 ev[key] = value
+            if wip is not None or (stored and not (ev.get("wip") or {}).get("artifact_id")):
+                self._store_wip(s, ev.get("wip"), wip)
             if self.owner is None:
                 task.evidence = ev
             elif not s.query(Task).filter(Task.id == self.task_id, Task.lease_owner.in_(("", self.owner))).update(
                     {Task.evidence: ev}, synchronize_session=False):
                 raise Stop()  # another instance holds the task now: its evidence is not this runner's to write
             self.task.evidence = ev
+
+    def _store_wip(self, s, saved: dict[str, Any] | None, patch: Patch | None) -> None:
+        """Keep the task's one work-in-progress artifact in step with its record (``evidence["wip"]``), in the
+        transaction that writes the record: a new save replaces the artifact's content in place, and a record that
+        no longer names an artifact leaves none behind."""
+        rows = s.query(Artifact).filter(Artifact.task_id == self.task_id, Artifact.kind == "wip")
+        if patch is None:
+            rows.delete(synchronize_session=False)
+            return
+        row, *extra = rows.order_by(Artifact.created_at).all() or [None]
+        for other in extra:
+            s.delete(other)
+        if row is None:
+            row = Artifact(id=new_id(), workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id,
+                           kind="wip")
+            s.add(row)
+        row.name, row.content = f"Attempt {saved['attempt']} work in progress", patch.diff.decode()
+        row.data = {"files": patch.files, "additions": patch.additions, "deletions": patch.deletions}
+        row.created_at = utcnow()
+        saved["artifact_id"] = row.id
 
     def artifact(self, kind: str, name: str, content: str = "", run_id: str | None = None, **data: Any) -> str:
         artifact_id = new_id()
@@ -809,7 +837,7 @@ class TaskRunner:
                 await self._prepare_steward_revert(identity)
             else:
                 findings, unlisted = self._round_findings()
-                run, result, error = await self._session(attempt, "build", SessionSpec(
+                spec = SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                     effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                     harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
@@ -817,7 +845,9 @@ class TaskRunner:
                     prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
                                         precedents(self.ws, self.repo.id),
                                         guidance_history(self.task.outcome_id, self.task_id), sections,
-                                        review_findings(findings, unlisted))))
+                                        review_findings(findings, unlisted)))
+                async with self._checkpoints(fix_round):
+                    run, result, error = await self._session(attempt, "build", spec)
                 if result is None:
                     cause = infrastructure_problem(error, carried_cause(run))
                     if cause:
@@ -893,6 +923,89 @@ class TaskRunner:
 
         await self._publish(token)
         await self.ci_then_merge()
+
+    @asynccontextmanager
+    async def _checkpoints(self, fix_round: str):
+        """While the builder's session runs, save its work in progress every ``CHECKPOINT_SECONDS``, and once more
+        when the service stops the session, so a restart continues from the save (see ``_earlier_changes``). Not in
+        a fix round: its checkout of the pull request's branch restores nothing. No save starts or is stored once
+        this returns; a snapshot cut off at that moment only ever wrote files of its own (see ``snapshot_patch``)."""
+        async def periodically() -> None:
+            while True:
+                await asyncio.sleep(CHECKPOINT_SECONDS)
+                await self._save_progress()
+
+        async def stopped(saving: asyncio.Task | None) -> None:
+            if saving is not None:
+                saving.cancel()
+                await asyncio.gather(saving, return_exceptions=True)
+
+        saving = None if fix_round else asyncio.create_task(periodically())
+        try:
+            yield
+        except asyncio.CancelledError:
+            await stopped(saving)
+            # The service is stopping (a person's cancel sets the event): the sandbox is there until run() closes
+            # it, and stop() waits a few seconds for this task. A second cancellation ends the save.
+            if not fix_round and not self.cancelled.is_set():
+                await self._save_progress(timeout=5)
+            raise
+        finally:
+            await stopped(saving)
+
+    async def _save_progress(self, timeout: float = 60) -> None:
+        """Save what the builder's tree holds beyond the base commit, read without touching its index: kept in the
+        task's one "wip" artifact and described in ``evidence["wip"]``. Only when the session has changed something
+        (the tree is not empty, and not the candidate this runner last judged, which an earlier attempt left in it)
+        and it differs from the last save. A diff that cannot be stored (see ``_unsaveable``) is not saved: the last
+        save stays, and the reason is recorded once. Never fails: the attempt goes on without the save."""
+        try:
+            async with asyncio.timeout(timeout):
+                patch = await snapshot_patch(self.builder, self.task.base_sha, timeout=timeout)
+            last = self._saved_progress() or {}  # another attempt's save is replaced by this attempt's first one
+            mine = {"attempt": self.task.attempt, "epoch": int((self.task.evidence or {}).get("budget_epoch", 0))}
+            digest = hashlib.sha256(patch.diff).hexdigest()
+            if (patch.empty or digest == last.get("patch_sha256")
+                    or (self.patch is not None and patch.diff == self.patch.diff)):
+                return
+            why = self._unsaveable(patch)
+            if why:
+                if not last.get("skipped"):
+                    self.evidence("wip", {**(last or mine), "skipped": why})
+                return
+            self._set_evidence({"wip": {
+                **mine, "artifact_id": None, "patch_sha256": digest, "base_sha": self.task.base_sha,
+                "saved_at": utcnow().isoformat(), "files": len(patch.files), "additions": patch.additions,
+                "deletions": patch.deletions}}, wip=patch)
+        except Exception as exc:
+            log.warning("Task %s: could not save the builder's work in progress: %s", self.task_id, str(exc)[:300])
+
+    def _unsaveable(self, patch: Patch) -> str:
+        """Why a snapshot of work in progress is not stored, or "". A save must reload byte for byte (see
+        ``_stored_candidate``). And it must hold nothing the candidate gate keeps out of a stored diff: of the
+        gate's rules only the protected paths do that (they include the files that hold secrets), the others
+        judge what may be published, which a save never is."""
+        bad = protected_violations(patch.files, list(self.cfg.get("protected_paths") or []) + DEFAULT_PROTECTED)
+        if bad:
+            return f"the changes include protected paths: {', '.join(bad[:5])}"[:300]
+        try:
+            text = patch.diff.decode()
+        except UnicodeDecodeError:
+            return "the diff is not all UTF-8 text"
+        if "\0" in text:
+            return "the diff is not all text"
+        return "the diff is larger than 400,000 characters" if len(text) > 400_000 else ""
+
+    def _saved_progress(self) -> dict[str, Any] | None:
+        """The record of the work in progress saved for the attempt this run is on (``evidence["wip"]``); the task
+        has that attempt's number from before its sandbox is prepared until it ends. A record of another attempt or
+        budget is never used."""
+        ev = self.task.evidence or {}
+        saved = ev.get("wip")
+        if (isinstance(saved, dict) and saved.get("attempt") == self.task.attempt
+                and saved.get("epoch") == int(ev.get("budget_epoch", 0))):
+            return saved
+        return None
 
     async def _check_and_verify(self, token: str, attempt: int, patch: Patch, diff_id: str,
                                 checks: list[dict[str, Any]] | None = None) -> bool:
@@ -1013,33 +1126,62 @@ class TaskRunner:
         return last
 
     async def _earlier_changes(self) -> dict[str, Any]:
-        """A new checkout starts from what the latest failed attempt of this budget changed, when that diff reloads
-        whole and still applies: the feedback the builder gets is about that code, as it is when the next attempt
-        runs in the same sandbox. Returns what to tell the builder about it (see prompts.working_tree)."""
-        last = self._left_behind()
+        """A new checkout starts from the work in progress saved for this attempt, when a session of it was
+        interrupted (see ``_save_progress``): that was read from a tree that already held what earlier attempts had
+        left. Otherwise from what the latest failed attempt of this budget changed: the feedback the builder gets is
+        about that code, as it is when the next attempt runs in the same sandbox. Either only when its stored diff
+        reloads whole and still applies. Returns what to tell the builder about it (see prompts.working_tree)."""
+        last, saved, told = self._left_behind(), self._saved_progress(), {}
+        if saved:
+            n, size = saved["attempt"], {key: saved.get(key) for key in ("files", "additions", "deletions")}
+            patch, why = await self._restore({"patch_sha256": saved.get("patch_sha256"),
+                                              "diff_artifact_id": saved.get("artifact_id")})
+            if patch is not None:
+                judged = self._stored_candidate(last) if last else None
+                if judged:
+                    self.patch = judged[0]  # what this runner last judged, as in the sandbox that was lost
+                at = f"{str(saved.get('saved_at'))[:16].replace('T', ' ')} UTC"
+                self.event("wip_restored", f"Attempt {n} was interrupted: restored the work in progress saved at {at} "
+                           f"({size['files']} file(s), +{size['additions']} -{size['deletions']}) into the new "
+                           "checkout, so the builder continues from it", saved_at=saved.get("saved_at"), **size)
+                return {"wip": {"restored": True, "at": at, **size}}
+            if not saved.get("artifact_id"):
+                why = f"they were not saved: {saved.get('skipped')}"
+            self.event("wip_not_restored", f"Attempt {n} was interrupted and the changes of its session could not be "
+                       f"restored into the new checkout ({why}); the builder starts without them", level="warn",
+                       reason=why)
+            told = {"wip": {"restored": False, "why": why}}
         if last is None:
-            return {}
-        found, why = self._stored_candidate(last), "no whole copy of them was saved"
-        if found:
-            try:
-                await apply_in_sandbox(self.builder, found[0])
-            except SandboxError:  # git applies all of a diff or none of it: the checkout is still clean
-                why = f"they no longer apply to {self.repo.default_branch} at {self.task.base_sha[:8]}"
-            else:
-                self.patch = found[0]  # what this runner last judged, as in the sandbox that was lost
-                self.event("changes_restored", f"Restored the changes of attempt {last.get('n')} into the new "
-                           "checkout, so the builder continues from them", files=len(found[0].files))
-                return {"changes": "restored", "attempt": last.get("n")}
+            return told
+        patch, why = await self._restore(last)
+        if patch is not None:
+            self.patch = patch  # what this runner last judged, as in the sandbox that was lost
+            self.event("changes_restored", f"Restored the changes of attempt {last.get('n')} into the new "
+                       "checkout, so the builder continues from them", files=len(patch.files))
+            return {**told, "changes": "restored", "attempt": last.get("n")}
         self.event("changes_not_restored", f"The changes of attempt {last.get('n')} could not be restored into the "
                    f"new checkout ({why}); the builder starts from a clean checkout", level="warn")
-        return {"changes": "lost", "attempt": last.get("n")}
+        return {**told, "changes": "lost", "attempt": last.get("n")}
+
+    async def _restore(self, record: dict[str, Any]) -> tuple[Patch | None, str]:
+        """Put the diff a record names (see ``_stored_candidate``) into the new checkout. The patch, or None and why
+        not: the checkout is then as it was, because git applies all of a diff or none of it."""
+        found = self._stored_candidate(record)
+        if found is None:
+            return None, "no whole copy of them was saved"
+        try:
+            await apply_in_sandbox(self.builder, found[0])
+        except SandboxError:
+            return None, f"they no longer apply to {self.repo.default_branch} at {self.task.base_sha[:8]}"
+        return found[0], ""
 
     def _describe_tree(self, attempt: int) -> None:
         """Record what the builder's working tree holds as its session starts, for its prompt. A later session in
-        the same sandbox finds this attempt's changes in it too."""
+        the same sandbox finds this attempt's changes in it too, and was not interrupted."""
         self.evidence("tree", {**self._tree, "sha": self.task.base_sha, "branch": self.task.branch,
                                "default": self.repo.default_branch})
-        self._tree = {**self._tree, "changes": "left", "attempt": attempt}
+        self._tree = {**{key: value for key, value in self._tree.items() if key != "wip"},
+                      "changes": "left", "attempt": attempt}
 
     async def _bring_branch_up_to_date(self, branch: str) -> None:
         """Revise on top of today's base branch. GitHub runs no pull-request checks while a branch conflicts, so a
