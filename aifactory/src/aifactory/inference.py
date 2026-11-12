@@ -356,6 +356,10 @@ class Retries:
             return default
         return max(RESEND_MIN_TIMEOUT_SECONDS, min(default, self._left(_clock())))
 
+    def spent(self) -> bool:
+        """Whether a request that has failed has no time left for another send (see ``timeout``)."""
+        return self.first is not None and self._left(_clock()) <= 0
+
     def report(self, ok: bool) -> None:
         """One line for a request that was retried: what the provider answered, for how long, and how it ended."""
         if not self.waits or self.first is None:
@@ -466,12 +470,18 @@ class ModelClient:
         last: InferenceError | None = None
         what, delay = "", None
         while True:
-            timeout = retries.timeout(self.timeout)
+            timeout = self.timeout
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(20.0, timeout))) as client:
+                async with httpx.AsyncClient() as client:
                     async with admission(self.provider, self.session_id):
-                        response = await client.post(url, headers=self.provider.headers(self.session_id),
-                                                     content=json.dumps(body))
+                        # Measured with the permit in hand: a resend's wait for it uses up the time that is left
+                        # too, and one that used it all is not sent.
+                        if last is not None and retries.spent():
+                            raise last
+                        timeout = retries.timeout(self.timeout)
+                        response = await client.post(
+                            url, headers=self.provider.headers(self.session_id), content=json.dumps(body),
+                            timeout=httpx.Timeout(timeout, connect=min(20.0, timeout)))
                 if response.status_code == 200:
                     return response.json()
                 detail = _error_detail(response)

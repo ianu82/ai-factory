@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -359,6 +360,32 @@ async def test_a_resend_cut_short_fails_with_the_answer_that_was_being_retried(p
     assert sends == [0, 1] and waits == [1] and now[0] == 10
     assert failed.value.status == 503 and "unreachable" not in str(failed.value)
     assert notes == ["Model provider unavailable (503); gave up after 10 s"]
+
+
+async def test_a_resends_wait_for_its_permit_counts_against_the_time_that_is_left(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    queued = [0, 4, 20]  # how long each send waits for its permit
+    allowed, notes = [], []
+
+    @asynccontextmanager
+    async def admitted(provider, run_id=None):
+        now[0] += queued.pop(0)
+        yield
+
+    def upstream(req):
+        allowed.append((now[0], req.extensions["timeout"]["read"]))
+        return httpx.Response(503, json={})
+
+    monkeypatch.setattr(inference, "admission", admitted)
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider)._post("/responses", {}, deadline=now[0] + 10, notice=notes.append)
+    # The resend at 1 s waited 4 s for its permit, so it is given the 5 s left then, not the 9 s left when it
+    # queued. The next one's permit comes after the session's time is up: it is not sent at all.
+    assert allowed == [(0, 300), (5, 5)] and waits == [1, 2] and not queued
+    assert failed.value.status == 503
+    assert notes == ["Model provider unavailable (503); gave up after 27 s"]
 
 
 async def test_a_request_that_times_out_with_its_whole_timeout_is_an_unreachable_provider(provider, clocked,
