@@ -346,8 +346,11 @@ def _deliver(workspace_id: str, now: datetime) -> None:
                 continue
             a.data = {**(a.data or {}), "webhook": sent}
             out.append(("alert", a.id, text + link))
-        for d in s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == PROVIDER_HOLD,
-                                          or_(Decision.status == "open", Decision.resolved_at > recent)):
+        holds = (s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == PROVIDER_HOLD,
+                                          or_(Decision.status == "open", Decision.resolved_at > recent))
+                 .order_by(Decision.created_at, Decision.id).all())  # told in the order they happened
+        held = any(d.status == "open" for d in holds)
+        for d in holds:
             meta = dict(d.metadata_json or {})
             sent = dict(meta.get("webhook") or {})
             if d.status == "open" and "raised" not in sent:
@@ -357,10 +360,11 @@ def _deliver(workspace_id: str, now: datetime) -> None:
                 sent["raised"] = now.isoformat()
             elif d.status != "open" and "raised" in sent and "cleared" not in sent:
                 text, sent["cleared"] = f"Work has resumed in {name}: the provider hold is lifted.", now.isoformat()
-            elif (d.status != "open" and not sent and d.resolved_at is not None
+            elif (d.status != "open" and not sent and not held and d.resolved_at is not None
                   and d.resolved_at > now - timedelta(minutes=30)):
                 # Opened and lifted between two passes of the watch (the Factory's own test lifts a hold within
-                # minutes): told once, as what happened.
+                # minutes): told once, as what happened. Not while another hold is open: "work has resumed" would
+                # then be false, and the open hold's own message says where things stand.
                 text = (f"Work was on hold in {name} from {_when(d.created_at)} to {_when(d.resolved_at)}: "
                         f"{hold_details(d)['label']}. The hold is lifted and work has resumed.")
                 sent["raised"] = sent["cleared"] = now.isoformat()
