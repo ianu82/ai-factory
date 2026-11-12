@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .sandbox import COMMAND_TIMEOUT
+
 PLANNER = """You are the planning engineer in an autonomous software factory.
 
 Your job: study the repositories and turn the requested outcome into a small set of precise,
@@ -296,7 +298,10 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
     if cfg.get("context"):
         lines += ["", "## Team notes", cfg["context"]]
     if cfg.get("checks"):
-        lines += ["", "## Checks the factory will run after you finish", *[f"- `{c}`" for c in cfg["checks"]]]
+        lines += ["", "## Checks the factory will run after you finish", *[f"- `{c}`" for c in cfg["checks"]],
+                  f"Each may take up to {COMMAND_TIMEOUT // 60} minutes ({COMMAND_TIMEOUT} seconds); one still running "
+                  "then is stopped and counts as failed. If your `run` tool takes `timeout_seconds`, it allows the "
+                  f"same: set it (up to {COMMAND_TIMEOUT}) to run a slow check yourself."]
     protected = cfg.get("protected_paths") or []
     if protected:
         lines += ["", "## Do not modify", *[f"- {p}" for p in protected]]
@@ -415,7 +420,15 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
     if checks:
         lines += ["", "## Configured checks already run by the factory on this candidate"]
         for check in checks:
+            first = check.get("first") or {}
             lines.append(f"- `{check['command']}` → {'passed' if check['ok'] else 'FAILED'}"
+                         + (" on a second run (it failed on the first, in the same sandbox: flaky, or made "
+                            "intermittent by this change)" if check.get("cause") == "flaky" else "")
+                         + (f" (timed out after {float(check.get('duration') or 0):.0f}s"
+                            + (" on a second run" if first else "")
+                            + (f"; the limit is {float(check['limit']):.0f}s" if check.get("limit") else "")
+                            + (f"; the first run failed, exit {first.get('exit_code')}" if first else "") + ")"
+                            if check.get("timed_out") else "")
                          + (" (pre-existing, see below)" if check.get("preexisting") else ""))
         preexisting = [c for c in checks if not c["ok"] and c.get("preexisting")]
         if preexisting:
@@ -425,9 +438,10 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
                       "for them alone. Do fail it if the change adds failures of its own, or if an acceptance "
                       "criterion depends on one of these tests passing."]
             for c in preexisting:
-                ids = c.get("failures") or []
+                ids = sorted({*(c.get("failures") or []), *((c.get("first") or {}).get("failures") or [])})
                 listed = ", ".join(ids[:30]) + (f" and {len(ids) - 30} more" if len(ids) > 30 else "")
-                lines.append(f"- `{c['command']}`: {listed or 'exits non-zero on the base commit too'}")
+                unlisted = "times out" if c.get("timed_out") else "exits non-zero"
+                lines.append(f"- `{c['command']}`: {listed or unlisted + ' on the base commit too'}")
     return "\n".join(lines)
 
 
