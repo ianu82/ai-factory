@@ -318,6 +318,18 @@ async def test_an_overload_the_provider_gave_up_on_is_retried_like_any_outage_no
     assert "limit reached" not in str(failed.value)
 
 
+def test_do_not_send_this_again_is_a_refusal_only_on_a_limit():
+    from aifactory.failures import failure_cause
+
+    never = {"x-should-retry": "false"}
+    assert failure_cause(sdk_error("RateLimitError", 429, "Too many requests", never)) == "provider"
+    # About an overload the provider retried itself, it means "not now": no limit a person lifts.
+    assert failure_cause(sdk_error("InternalServerError", 503, "Error code: 503 - upstream failed",
+                                   never)) == "transient"
+    assert failure_cause(sdk_error("RateLimitError", 429, "The model provider is momentarily overloaded. It did not "
+                                   "recover after 3 attempts.", never)) == "transient"
+
+
 async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):
     now, guard = clocked
     waits = retry_clock(monkeypatch, now, guard)

@@ -2922,11 +2922,6 @@ def test_a_failure_says_its_own_cause_where_it_happens():
         (_sdk_error("RateLimitError", 429, "Rate limit reached for gpt-terra"), "transient"),
         (_sdk_error("RateLimitError", 429, quota), "provider"),
         (_sdk_error("RateLimitError", 429, "Too many requests", {"x-should-retry": "false"}), "provider"),
-        # "Do not send this again" about an overload: the provider gave up for now, which is no limit a person lifts.
-        (_sdk_error("InternalServerError", 503, "Error code: 503 - upstream failed", {"x-should-retry": "false"}),
-         "transient"),
-        (_sdk_error("RateLimitError", 429, "The model provider is momentarily overloaded. It did not recover after "
-                    "3 attempts.", {"x-should-retry": "false"}), "transient"),
         (_sdk_error("APIStatusError", 402), "provider"),
         (_sdk_error("AuthenticationError", 401), "provider"),
         (_sdk_error("PermissionDeniedError", 403), "provider"),
