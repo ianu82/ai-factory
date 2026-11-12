@@ -51,7 +51,7 @@ export function createMindHttpTransport(request: typeof api, response: typeof ap
     return { thread, messages, status };
   };
   return {
-    list: async (signal) => (await request<MindWireThread[]>("/api/mind/threads", { signal })).map(mindThread),
+    list: async (signal, workspaceId) => (await request<MindWireThread[]>(`/api/mind/threads${workspaceId === undefined ? "" : `?workspace_id=${encodeURIComponent(workspaceId)}`}`, { signal })).map(mindThread),
     create: async (billing_workspace_id, signal) => {
       const t = await request<MindWireThread>("/api/mind/threads", { method: "POST", json: { billing_workspace_id }, signal });
       return load(t.id, signal);
