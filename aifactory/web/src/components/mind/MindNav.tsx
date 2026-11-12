@@ -7,14 +7,14 @@ const SHOWN = 6;
 
 /**
  * "My Mind" in the sidebar, above Inbox: one click (or ⌘K / Ctrl+K) starts a conversation, and the person's
- * recent conversations sit nested underneath it. Conversations are personal and span workspaces.
+ * recent conversations sit nested underneath it. Conversations are personal and belong to the current factory.
  */
 export function MindNav({ workspaceId }: { workspaceId: string }) {
   const { controller, state } = useMind();
   const navigate = useNavigate();
   const base = `/w/${workspaceId}`;
   const onHome = !!useMatch(`${base}/mind`);
-  useEffect(() => { if (state.userId) void controller.list(); }, [controller, state.userId, state.active?.id, state.announcementId]);
+  useEffect(() => { if (state.userId) void controller.list(workspaceId); }, [controller, state.userId, state.active?.id, state.announcementId, workspaceId]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || !(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "k") return;
@@ -26,7 +26,7 @@ export function MindNav({ workspaceId }: { workspaceId: string }) {
     return () => document.removeEventListener("keydown", onKey);
   }, [navigate, base]);
   if (!state.userId) return null;
-  const started = state.threads.filter((t) => t.title); // a conversation without a first message is not listed
+  const started = state.threads.filter((t) => t.workspace_id === workspaceId && t.title); // a conversation without a first message is not listed
   const threads = started.slice(0, SHOWN);
   return <div className="mind-nav">
     <div className="mind-nav-row">
