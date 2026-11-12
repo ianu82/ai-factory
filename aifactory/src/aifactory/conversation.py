@@ -19,7 +19,7 @@ from .models import Decision, Event, Message, Outcome, Run, Signal, Task, User
 
 # Shown as their own items, or too fine-grained for the conversation (the full activity view keeps them).
 HIDDEN = ("agent_thought", "agent_tool", "agent_command", "decision_requested", "decision_resolved", "guidance",
-          "lead_note", "lead_update", "check_slot", "check_slot_wait")
+          "lead_note", "lead_update", "progress_digest", "check_slot", "check_slot_wait")
 ROLES = {"planner": "Planner", "plan_reviewer": "Plan reviewer", "builder": "Builder", "verifier": "Verifier",
          "judge": "Decision judge", "scorer": "Scorer", "lead": "Lead"}
 SOURCES = {"user": "the app", "signal": "a signal", "linear_issue": "a Linear issue", "github_issue": "a GitHub issue",

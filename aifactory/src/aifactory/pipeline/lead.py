@@ -267,23 +267,28 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 continue
             runs = s.query(Run).filter(Run.outcome_id == o.id, Run.role == "lead")
             last = runs.order_by(Run.started_at.desc()).first()
+            may_run = True
             if last is not None:
                 if last.status == "running" and now - last.started_at < STALE:
                     continue
-                if now - last.started_at < (COOLDOWN if last.status == "succeeded" else RETRY_AFTER):
-                    continue
-                if runs.filter(Run.started_at > now - timedelta(days=1)).count() >= DAILY_RUNS:
-                    continue
+                # Between runs, after a failed one, and once the day's runs are used, the Lead waits.
+                may_run = not (now - last.started_at < (COOLDOWN if last.status == "succeeded" else RETRY_AFTER)
+                               or runs.filter(Run.started_at > now - timedelta(days=1)).count() >= DAILY_RUNS)
             # Only a run that finished has seen what it was woken for: a failed one leaves it waiting.
             done = runs.filter(Run.status == "succeeded").order_by(Run.started_at.desc()).first()
             seen = ((done.config_snapshot or {}).get("seen") if done else None) or {}
             finished = o.status in FINISHED  # only how it ended is left to report
+            progress, digested = ([], None) if finished else _progress(s, o.id, seen.get("event_id"), now)
+            if not may_run:
+                # A digest starts no run, so the Lead's own limits do not keep progress from being told.
+                if progress and (digested is None or now - digested >= DIGEST_EVERY):
+                    digests.append((o.workspace_id, o.id, progress))
+                continue
             marks = {} if finished else _marks(s, o.id)
             known = seen.get("decisions") or {}
             changed = [d for d, mark in marks.items() if known.get(d) != mark]
             since = _parse(seen.get("posts_until")) if done is not None else now - FIRST_LOOK
             posts = [] if finished else _people_posts(s, o.id, since)
-            progress, digested = ([], None) if finished else _progress(s, o.id, seen.get("event_id"), now)
             # Durable markers, so a run that didn't post the update is retried: an introduction until the Lead has
             # posted one on this outcome, and the ending until a run that succeeded started after it.
             introduced = s.query(Message.id).filter(Message.outcome_id == o.id, Message.author_kind == "lead").first()

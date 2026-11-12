@@ -605,6 +605,18 @@ def test_progress_alone_is_told_as_a_digest_and_does_not_wake_the_lead(world):
     assert world["outcome"] not in woken() and len(digests(world)) == 2  # told once
 
 
+def test_progress_is_still_told_when_the_lead_has_used_its_runs_for_the_day(world):
+    seen = woken()[world["outcome"]]["seen"]
+    for n in range(lead.DAILY_RUNS):
+        lead_run(world, seen, ago=timedelta(minutes=5 + n))
+    published = milestone(world, "published", message="Opened PR #12")
+    with db.session_scope() as s:  # a person's post would wake the Lead, had it a run left today
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
+                      author_kind="user", body="How is it going?"))
+    assert world["outcome"] not in woken()
+    assert digests(world) == [("Progress since the last update:\n- T1: Opened PR #12", published)]
+
+
 def test_a_lead_that_something_else_woke_reports_the_progress_too(world):
     lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
     published = milestone(world, "published", message="Opened PR #12")
