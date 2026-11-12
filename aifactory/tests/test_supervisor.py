@@ -425,7 +425,7 @@ def test_supervisor_resolution_not_assistance(world, signed_in, monkeypatch, res
         d = Decision(workspace_id=world[0], kind="supervisor", title="Notification",
                      task_id=t.id if link in {"task", "both"} else None,
                      outcome_id=o.id if link in {"outcome", "both"} else None,
-                     options=[{"value": "acknowledge"}])
+                     options=[{"value": "acknowledge"}, {"value": "dismiss"}])  # what the Supervisor offers
         db.add(d)
         db.flush()
         decisions.resolve(db, d, db.get(User, signed_in["user"]["id"]), resolution)
