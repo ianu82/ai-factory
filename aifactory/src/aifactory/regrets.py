@@ -279,3 +279,107 @@ def merge_gate_passes(db: Session, workspace_id: str) -> set[tuple[str, str]]:
                     GateVerdict.verdict == "pass", GateVerdict.head_sha != "",
                     GateVerdict.head_sha == Task.head_sha, Task.merge_sha != "").distinct())
     return set(rows.all())
+
+
+def normalized_diff_signature(diff: bytes | None, *, complete: bool = True) -> str | None:
+    """v1 exact-payload heuristic, shared by delivery and historical analytics.
+
+    Sort files and added/deleted payloads, removing whitespace and ignoring context,
+    hunk coordinates and transport headers. Renames and binary payloads are facts,
+    not headers. Missing, explicitly clipped or incomplete hunks stay unknown (None);
+    callers must never use that unknown value as an equality key.
+    """
+    import re
+
+    if not complete or not diff or len(diff) > 16_000_000 or not diff.endswith(b"\n"):
+        return None
+    # Git binary patches encode zlib streams. Validate them before hashing so a
+    # clipped stream (even one ending at a line boundary) cannot look complete.
+    if b"GIT binary patch\n" in diff:
+        import base64
+        import zlib
+
+        blocks = diff.split(b"GIT binary patch\n")[1:]
+        try:
+            for section in blocks:
+                body = section.split(b"diff --git ", 1)[0].strip()
+                for block in body.split(b"\n\n"):
+                    lines = block.splitlines()
+                    kind, size = lines[0].split()
+                    if kind not in (b"literal", b"delta"):
+                        return None
+                    compressed = bytearray()
+                    for line in lines[1:]:
+                        length = line[0] - 64 if 65 <= line[0] <= 90 else line[0] - 70
+                        if not 1 <= length <= 52 or len(line[1:]) != ((length + 3) // 4) * 5:
+                            return None
+                        compressed.extend(base64.b85decode(line[1:])[:length])
+                    stream = zlib.decompressobj()
+                    # Bound expansion independently of the untrusted size header.
+                    content = stream.decompress(bytes(compressed), 16_000_001)
+                    if not stream.eof or stream.unused_data or len(content) != int(size):
+                        return None
+        except (ValueError, IndexError, zlib.error):
+            return None
+    files: list[tuple[bytes, list[bytes]]] = []
+    path, payload = b"", []
+    old = new = 0
+    binary = False
+    saw_change = False
+    for line in diff.splitlines():
+        if line.startswith(b"diff --git "):
+            if old or new:
+                return None
+            if path:
+                files.append((path, sorted(payload)))
+            path, payload = line[11:], []
+            binary = False
+        elif not path:
+            return None
+        elif line.startswith(b"@@ "):
+            if old or new:
+                return None
+            hunk = re.match(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if not hunk:
+                return None
+            old = int(hunk[2] if hunk[2] is not None else b"1")
+            new = int(hunk[4] if hunk[4] is not None else b"1")
+        elif old or new:
+            if line.startswith(b"\\ No newline"):
+                continue
+            if line.startswith(b"+"):
+                new -= 1
+            elif line.startswith(b"-"):
+                old -= 1
+            elif line.startswith(b" "):
+                old -= 1
+                new -= 1
+            else:
+                return None
+            if old < 0 or new < 0:
+                return None
+            if line[:1] in (b"+", b"-"):
+                payload.append(line[:1] + re.sub(rb"\s+", b"", line[1:]))
+                saw_change = True
+        elif line.startswith(b"Binary files "):
+            # GitHub's binary-only marker omits the actual bytes. It cannot
+            # establish equivalence between two different binary changes.
+            return None
+        elif line.startswith((b"rename from ", b"rename to ", b"GIT binary patch")):
+            payload.append(line)
+            binary = line == b"GIT binary patch"
+            saw_change = True
+        elif binary and line:
+            payload.append(line)
+        elif line.startswith((b"--- ", b"+++ ", b"index ", b"similarity index ", b"dissimilarity index ",
+                              b"old mode ", b"new mode ", b"new file mode ", b"deleted file mode ",
+                              b"\\ No newline")) or not line:
+            continue
+        else:
+            # Includes truncation notices and payload outside a complete hunk.
+            return None
+    if old or new or not path or not saw_change:
+        return None
+    files.append((path, sorted(payload)))
+    canonical = [[p.hex(), [v.hex() for v in values]] for p, values in sorted(files)]
+    return "diff-v1:" + hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
