@@ -6,6 +6,7 @@ export const PARTY_FILTERS: { key: string; label: string }[] = [
   { key: "", label: "Everyone" },
   { key: "minds", label: "Minds" },
   { key: "lead", label: "Lead" },
+  { key: "director", label: "Director" },
   { key: "people", label: "People" },
   { key: "planning", label: "Planning" },
   { key: "builders", label: "Builders" },

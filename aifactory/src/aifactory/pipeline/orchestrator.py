@@ -44,6 +44,9 @@ WAITS_AS = {"needs_input": "is waiting for an answer", "awaiting_approval": "is 
 RETRY_OR_ABANDON = [{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}]
 AFTER_SMOKE = [{"value": "revert", "label": "Revert the merge"}, {"value": "fix", "label": "Create a fix outcome"},
                {"value": "acknowledge", "label": "Acknowledge"}]
+# A revert that did not go through: accepting cannot complete the task (the merge is still in), so the answers are
+# to try the revert again or to end the task.
+REVERT_AGAIN = [{"value": "revert", "label": "Try the revert again"}, {"value": "abandon", "label": "Abandon task"}]
 STRANDED_OPTIONS = [{"value": "continue", "label": "Start the waiting tasks"},
                     {"value": "drop", "label": "Drop the waiting tasks"}]
 # A running task is leased to the instance that runs it. The instance extends the lease every HEARTBEAT_SECONDS;
@@ -79,6 +82,8 @@ class Orchestrator:
         self._vm_sweep_task: asyncio.Task | None = None
         self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
         self._lead_check = float("-inf")
+        self._directors: dict[str, asyncio.Task] = {}  # workspace id -> its Director's run
+        self._director_check = float("-inf")
         self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
         self._unasked: dict[str, float] = {}  # task id -> when it was first seen waiting on a person with no decision
 
@@ -113,9 +118,9 @@ class Orchestrator:
         for job in list(self._ci_polls.values()):
             job.cancel()
         released = asyncio.create_task(self._release(jobs), name="release-leases")  # beside the rest of the shutdown
-        for job in list(self._leads.values()):
+        for job in list(self._leads.values()) + list(self._directors.values()):
             job.cancel()
-        await asyncio.gather(*list(self._leads.values()), return_exceptions=True)
+        await asyncio.gather(*list(self._leads.values()), *list(self._directors.values()), return_exceptions=True)
         if self._loop_task:
             self._loop_task.cancel()
         await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
@@ -160,7 +165,7 @@ class Orchestrator:
                                                         Task.status == "running")]
         return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
                 "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage(),
-                "leads": list(self._leads), "instance": self.instance}
+                "leads": list(self._leads), "directors": list(self._directors), "instance": self.instance}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
@@ -322,6 +327,7 @@ class Orchestrator:
                 await self._maybe_sweep_vms()
                 await self._maybe_watch()
                 await self._maybe_run_leads()
+                await self._maybe_run_directors()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -587,6 +593,32 @@ class Orchestrator:
 
             job.add_done_callback(done)
 
+    async def _maybe_run_directors(self) -> None:
+        """Start the Director of each workspace that turned it on and has something new waiting on a person
+        (pipeline/director.py), at most every 15 seconds and within the server's Director limit. It runs beside the
+        scheduler, never inside its tick."""
+        import time
+
+        from .director import concurrency, due, run_director
+
+        free = concurrency() - len(self._directors)
+        now = time.monotonic()
+        if self._stopping or free <= 0 or now - self._director_check < 15:
+            return
+        self._director_check = now
+        for item in (await asyncio.to_thread(due, frozenset(self._directors)))[:free]:
+            workspace_id = item["workspace_id"]
+            job = asyncio.create_task(run_director(item), name=f"director-{workspace_id[:8]}")
+            self._directors[workspace_id] = job
+
+            def done(finished: asyncio.Task, workspace_id: str = workspace_id) -> None:
+                self._directors.pop(workspace_id, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    log.error("Director of %s failed: %r", workspace_id, finished.exception())
+                self.wake()
+
+            job.add_done_callback(done)
+
     async def _maybe_sweep_vms(self) -> None:
         """Every 15 minutes, starting 10 minutes after startup (a deployment being replaced may still be closing its
         VMs): destroy sandbox VMs no job holds, and log how full the environment is. It runs beside the scheduler,
@@ -729,7 +761,8 @@ class Orchestrator:
         # and the decision above do not: answering them moves no waiting task.
         if any(d is not current and d.kind != "supervisor" for d in whole):
             return opened
-        with_decision = {d.task_id for d in decisions if d.task_id}
+        # Nor does a supervisor's finding about one task ask what to do with it.
+        with_decision = {d.task_id for d in decisions if d.task_id and d.kind != "supervisor"}
         now = time.monotonic()
         for task in tasks:
             if task.status not in HUMAN_TASK or task.id in with_decision:
@@ -739,17 +772,20 @@ class Orchestrator:
                 continue
             if not locked:
                 return self._ask(s, outcome, tasks, self._open_decisions(s, outcome), unasked, locked=True)
-            title = f"{task.key} {WAITS_AS[task.status]}, and nothing was asking what to do"[:300]
-            body = (f"{task.key} ({task.title}) {WAITS_AS[task.status]}, with no open decision: nobody was being "
+            waits, options = WAITS_AS[task.status], RETRY_OR_ABANDON
+            if task.status == "smoke_failed" and accepted_after_merge(task):
+                options = AFTER_SMOKE
+            elif task.status == "smoke_failed":
+                waits, options = "was merged, and reverting it did not go through", REVERT_AGAIN
+            title = f"{task.key} {waits}, and nothing was asking what to do"[:300]
+            body = (f"{task.key} ({task.title}) {waits}, with no open decision: nobody was being "
                     f"asked what to do next.\n\nRecorded reason: {task.blocked_reason or 'none'}")
             decision = Decision(workspace_id=ws, kind="unblock", title=title, body=body, outcome_id=outcome.id,
-                                task_id=task.id, metadata_json={"unasked": task.status},
-                                options=AFTER_SMOKE if task.status == "smoke_failed" else RETRY_OR_ABANDON)
+                                task_id=task.id, metadata_json={"unasked": task.status}, options=options)
             s.add(decision)
             s.flush()
-            record(ws, "decision_missing", f"{task.key} {WAITS_AS[task.status]} with no open decision; one was "
-                   "opened", outcome_id=outcome.id, task_id=task.id, level="warn", data={"status": task.status},
-                   session=s)
+            record(ws, "decision_missing", f"{task.key} {waits} with no open decision; one was opened",
+                   outcome_id=outcome.id, task_id=task.id, level="warn", data={"status": task.status}, session=s)
             opened.append((ws, decision.id, title, outcome.id, task.id))
         return opened
 
