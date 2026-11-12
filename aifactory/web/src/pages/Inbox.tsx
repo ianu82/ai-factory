@@ -19,8 +19,8 @@ const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
 const ALERT_KIND: Record<Alert["kind"], string> = {
   overdue: "Waiting", unasked: "Stuck", stalled: "Stalled", quiet: "Quiet", repeated: "Repeated failure",
 };
+// A provider hold isn't among them: it stops all work, so it shows first, above the alerts.
 const GROUPS: { key: string; label: string; kinds: string[] }[] = [
-  { key: "hold", label: "Work on hold", kinds: ["provider_hold"] },
   { key: "merge", label: "Merge approvals", kinds: ["approve_merge", "approve_release"] },
   { key: "plan", label: "Plans to approve", kinds: ["approve_plan"] },
   { key: "question", label: "Questions", kinds: ["question"] },
@@ -116,11 +116,15 @@ export function InboxPage() {
     }
   };
 
-  // Priority groups decisions by what they ask for; Newest is one chronological list.
-  const byKind = GROUPS.map((g) => ({ ...g, rows: decisions.filter((d) => g.kinds.includes(d.kind)) }))
-    .concat([{ key: "other", label: "Other", kinds: [], rows: decisions.filter((d) => !GROUPS.some((g) => g.kinds.includes(d.kind))) }]);
-  const groups = (order === "newest" ? [{ key: "newest", label: "Newest first", kinds: [] as string[], rows: decisions }] : byKind)
+  // A hold stops all work: it shows first, in either order. Priority groups the rest by what they ask for; Newest
+  // is one chronological list.
+  const holds = decisions.filter((d) => d.kind === "provider_hold");
+  const rest = decisions.filter((d) => d.kind !== "provider_hold");
+  const byKind = GROUPS.map((g) => ({ ...g, rows: rest.filter((d) => g.kinds.includes(d.kind)) }))
+    .concat([{ key: "other", label: "Other", kinds: [], rows: rest.filter((d) => !GROUPS.some((g) => g.kinds.includes(d.kind))) }]);
+  const groups = (order === "newest" ? [{ key: "newest", label: "Newest first", kinds: [] as string[], rows: rest }] : byKind)
     .filter((g) => g.rows.length);
+  const holdGroup = holds.length ? { key: "hold", label: "Work on hold", rows: holds } : null;
 
   const onRowKey = (e: React.KeyboardEvent<HTMLLIElement>, d: Decision) => {
     if (e.key === "Enter") select(d);
@@ -131,6 +135,48 @@ export function InboxPage() {
       rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))]?.focus();
     }
   };
+
+  const decisionGroup = (g: { key: string; label: string; rows: Decision[] }) => (
+    <section key={g.key} aria-label={g.label}>
+      <div className="list-section">{g.label} · {g.rows.length}</div>
+      <ul className="rows">
+        {g.rows.map((d) => {
+          const primary = d.options[0];
+          const inline = canAct && primary && !NEEDS_TEXT.has(primary.value) ? primary : null;
+          return (
+            <li key={d.id} className={`row ib-row ${d.id === decisionId ? "selected" : ""}`} tabIndex={0} aria-selected={d.id === decisionId}
+              onClick={() => select(d)} onKeyDown={(e) => onRowKey(e, d)}>
+              <Dot tone={["unblock", "budget", "provider_hold"].includes(d.kind) ? "bad" : "human"} />
+              <div style={{ minWidth: 0 }}>
+                <div className="title">
+                  <span className="ib-kind">{DECISION_KIND[d.kind] || d.kind}</span>{d.title.replace(/^Approve merge: /, "").replace(/^Approve plan for #\d+: /, "")}
+                </div>
+                <div className="sub">
+                  {d.outcome_number != null && <span className="ref">#{d.outcome_number}{d.task_key ? ` ${d.task_key}` : ""}</span>}
+                  {d.pr_number != null && <span className="num">PR #{d.pr_number}</span>}
+                  <span className="ib-why">{d.hold ? `${d.hold.label.charAt(0).toUpperCase()}${d.hold.label.slice(1)}. ${d.hold.advice}` : highlight(d) || d.outcome_title}</span>
+                </div>
+              </div>
+              <div className="meta">
+                {inline && (
+                  <button className="btn sm primary ib-act" disabled={busy !== null}
+                    onClick={(e) => { e.stopPropagation(); quick(d, inline.value); }}>
+                    {busy === `${d.id}:${inline.value}` ? "…" : inline.label}
+                  </button>
+                )}
+                {canAct && d.options.length > (inline ? 1 : 0) && (
+                  <button className="btn sm ib-act wide" onClick={(e) => { e.stopPropagation(); select(d); }}>
+                    {d.options.find((o) => o !== inline && NEEDS_TEXT.has(o.value))?.label || "More"}
+                  </button>
+                )}
+                <span className="num" style={{ minWidth: 52 }}>{ago(d.created_at)}</span>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
 
   return (
     <>
@@ -158,6 +204,7 @@ export function InboxPage() {
           {q.isLoading || setup.loading ? <Skeleton rows={4} /> : (
             <>
               {!setup.ready && <SetupNotice />}
+              {holdGroup && decisionGroup(holdGroup)}
               {alerts.length > 0 && (
                 <section aria-label="Alerts">
                   <div className="list-section">Alerts · {alerts.length}</div>
@@ -187,47 +234,7 @@ export function InboxPage() {
                   </ul>
                 </section>
               )}
-              {groups.map((g) => (
-                <section key={g.key} aria-label={g.label}>
-                  <div className="list-section">{g.label} · {g.rows.length}</div>
-                  <ul className="rows">
-                    {g.rows.map((d) => {
-                      const primary = d.options[0];
-                      const inline = canAct && primary && !NEEDS_TEXT.has(primary.value) ? primary : null;
-                      return (
-                        <li key={d.id} className={`row ib-row ${d.id === decisionId ? "selected" : ""}`} tabIndex={0} aria-selected={d.id === decisionId}
-                          onClick={() => select(d)} onKeyDown={(e) => onRowKey(e, d)}>
-                          <Dot tone={["unblock", "budget", "provider_hold"].includes(d.kind) ? "bad" : "human"} />
-                          <div style={{ minWidth: 0 }}>
-                            <div className="title">
-                              <span className="ib-kind">{DECISION_KIND[d.kind] || d.kind}</span>{d.title.replace(/^Approve merge: /, "").replace(/^Approve plan for #\d+: /, "")}
-                            </div>
-                            <div className="sub">
-                              {d.outcome_number != null && <span className="ref">#{d.outcome_number}{d.task_key ? ` ${d.task_key}` : ""}</span>}
-                              {d.pr_number != null && <span className="num">PR #{d.pr_number}</span>}
-                              <span className="ib-why">{highlight(d) || d.outcome_title}</span>
-                            </div>
-                          </div>
-                          <div className="meta">
-                            {inline && (
-                              <button className="btn sm primary ib-act" disabled={busy !== null}
-                                onClick={(e) => { e.stopPropagation(); quick(d, inline.value); }}>
-                                {busy === `${d.id}:${inline.value}` ? "…" : inline.label}
-                              </button>
-                            )}
-                            {canAct && d.options.length > (inline ? 1 : 0) && (
-                              <button className="btn sm ib-act wide" onClick={(e) => { e.stopPropagation(); select(d); }}>
-                                {d.options.find((o) => o !== inline && NEEDS_TEXT.has(o.value))?.label || "More"}
-                              </button>
-                            )}
-                            <span className="num" style={{ minWidth: 52 }}>{ago(d.created_at)}</span>
-                          </div>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </section>
-              ))}
+              {groups.map(decisionGroup)}
               {decisions.length === 0 && alerts.length === 0 && setup.ready && (
                 <Empty title="Nothing needs you">
                   Running work stays in Outcomes. Plan approvals, questions, merges that need a person and anything that got stuck land here.

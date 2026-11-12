@@ -279,8 +279,11 @@ class AntonHarness:
             except TimeoutError:
                 failed("Anton exceeded its time budget")
             except Exception as exc:
-                if state["cause"]:  # the model provider failed the session: say so by type, with the SDK's wording
-                    raise HarnessFailed(str(exc) or type(exc).__name__, cause=state["cause"]) from exc
+                # The model provider failed the session: say so by type, with the SDK's wording. The SDK's own verdict
+                # on how its retries ended (an overload, a billing stop) comes first, then the last refused request's.
+                cause = failure_cause(exc) or state["cause"]
+                if cause:
+                    raise HarnessFailed(str(exc) or type(exc).__name__, cause=cause) from exc
                 raise
             finally:
                 try:

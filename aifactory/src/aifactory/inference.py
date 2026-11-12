@@ -18,7 +18,7 @@ from typing import Any, Callable
 import httpx
 
 from .config import get_settings
-from .failures import momentary, quota_exhausted
+from .failures import momentary, quota_exhausted, rate_limited
 from .inference_limits import admission
 from .db import session_scope
 from .models import Run, Secret, Workspace
@@ -487,10 +487,11 @@ class ModelClient:
                 detail = _error_detail(response)
                 if response.status_code == 402:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
-                # "Do not send this again" on a limit is a limit a person lifts. On a server error, or an answer that
-                # says its trouble is momentary, the provider only gave up for now: retried below like any outage.
+                # "Do not send this again" on a limit is a limit a person lifts. On a server error, a rate limit, or an
+                # answer that says its trouble is momentary, the provider only gave up for now: retried below like any
+                # outage (a gateway marks it so once its own retries are spent).
                 never = response.headers.get("x-should-retry", "").lower() == "false"
-                passing = never and (response.status_code >= 500 or momentary(detail))
+                passing = never and (response.status_code >= 500 or momentary(detail) or rate_limited(detail))
                 if never and not passing:
                     raise InferenceError(f"{self.provider.label} limit reached ({response.status_code}): {detail}",
                                          status=response.status_code, cause="provider")

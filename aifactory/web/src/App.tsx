@@ -21,6 +21,7 @@ import { memberHasDeferred, STEP_LABELS, useOnboarding } from "./onboarding/stat
 import { MindProvider } from "./components/mind/MindProvider";
 import { MindNav } from "./components/mind/MindNav";
 import { MindConversation, MindHome } from "./pages/Mind";
+import { HoldBanner } from "./components/HoldBanner";
 
 type Ctx = { me: Me; meta: Meta; ws: Workspace; live: string; openCapture: () => void };
 const WorkspaceCtx = createContext<Ctx | null>(null);
@@ -129,6 +130,7 @@ function Shell({ me, meta }: { me: Me; meta: Meta }) {
             <button className="btn sm primary" onClick={() => setCapture(true)}><Plus /> New</button>
           </div>
           {ws.paused && <div className="banner">This workspace is paused. Running work finishes its current step; nothing new starts.</div>}
+          <HoldBanner />
           {live === "offline" && <div className="banner">Live updates disconnected. Reconnecting…</div>}
           <Routes>
             <Route path="mind" element={<MindHomeRoute />} />
