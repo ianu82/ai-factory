@@ -2004,6 +2004,54 @@ def test_builder_can_work_in_an_isolated_vm(factory, monkeypatch, tmp_path):
     assert git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git").strip() == "echo 'Hello, Factory!'"
 
 
+def test_work_that_asks_for_a_vm_and_gets_none_runs_in_the_factory_container_and_says_so(factory, monkeypatch):
+    from aifactory import vm as vm_module
+
+    monkeypatch.setattr(vm_module, "vm_available", lambda: (False, "the VM limit is reached"))
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "build": {"isolation": "vm"}, "qa": {"isolation": "vm"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        said = s.query(Event).filter(Event.task_id == task.id,
+                                     Event.kind.in_(("build_vm_unavailable", "qa_vm_unavailable"))).all()
+        assert {(e.kind, e.data.get("fallback")) for e in said} == {("build_vm_unavailable", "container"),
+                                                                    ("qa_vm_unavailable", "container")}
+        record = task.evidence["isolation"]
+        assert {phase: (r["wanted"], r["used"], r["why"]) for phase, r in record.items()} == {
+            "build": ("vm", "container", "the VM limit is reached"),
+            "verify": ("vm", "container", "the VM limit is reached")}
+        body = FakeGitHub.pulls[task.pr_number]["body"]
+    # The pull request says it: a reviewer must not take the isolation the repository asks for as given.
+    assert "### Isolation" in body and "- The build: the VM limit is reached" in body
+    assert "- Independent verification and runtime QA: the VM limit is reached" in body
+
+
+def test_a_repository_that_waits_for_a_vm_runs_nothing_in_the_factory_container(factory, monkeypatch):
+    from aifactory import vm as vm_module
+
+    # Worded like a provider's limit: a missing VM is still the environment being unavailable, not an access problem.
+    monkeypatch.setattr(vm_module, "vm_available", lambda: (False, "VM limit reached"))
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "build": {"isolation": "vm", "vm_fallback": "wait"}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: "infra_retry" in _event_kinds(outcome_id), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        # Not an attempt and not yet a question: the task is tried again later, and nothing ran outside a VM.
+        assert (task.status, task.attempt) == ("queued", 0) and "isolation" not in task.evidence
+        assert task.evidence["attempts"][-1]["cause"] == "transient"
+        assert not s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count()
+        [said] = s.query(Event).filter(Event.task_id == task.id, Event.kind == "build_vm_unavailable").all()
+        assert said.data["fallback"] == "wait"
+        retry = s.query(Event).filter(Event.task_id == task.id, Event.kind == "infra_retry").one()
+        assert "no VM is available (VM limit reached)" in retry.message
+
+
 def test_a_conflict_with_newer_work_gets_a_fresh_attempt_budget(factory):
     def planner(messages):
         if step(messages) == 0:
