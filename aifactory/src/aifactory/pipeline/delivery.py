@@ -29,8 +29,8 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
 from ..gitops import patch_id
 from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
 from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
-from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, headline, new_review_evidence,
-                      normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
+from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, findings_unseen, headline,
+                      new_review_evidence, normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
 from ..sandbox import LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
@@ -1543,8 +1543,10 @@ class TaskRunner:
         result = review.get("result") or {}
         published = ev.get("published") or {}
         patch = published.get("patch_id") if published.get("head") == head else None
-        if patch and result.get("patch_id") == patch and result.get("head") != head:
+        if (patch and result.get("patch_id") == patch and result.get("head") != head
+                and result.get("state") == "reviewed" and not result.get("unseen")):
             # The same change on a newer base: what its review found stands. Nothing is asked for or awaited.
+            # A head that went on without a review carries nothing: the new head waits for its own.
             result = review["result"] = {**result, "head": head, "of": result.get("of") or result.get("head")}
         ev["review"] = review
         if result.get("head") == head and not review.get("round"):
@@ -1584,16 +1586,20 @@ class TaskRunner:
         self._guard("waiting_ci")
         if review.get("round") and not await self._answer_round(gh, review, snapshot["threads"]):
             return self._review_later(review)
-        reviewers = reviewed_by(head, reviews=snapshot["reviews"], comments=snapshot["comments"], policy=policy,
-                                identity=snapshot["identity"], pull_author=snapshot["pull_author"])
+        seen = {"reviews": snapshot["reviews"], "comments": snapshot["comments"], "policy": policy,
+                "identity": snapshot["identity"], "pull_author": snapshot["pull_author"]}
+        reviewers = reviewed_by(head, **seen)
+        # Codex says it found something, and its review is not in what was read: wait for a reading that has it.
+        unseen = findings_unseen(head, **seen)
         standing = review.get("result") or {}
         carried = not reviewers and standing.get("head") == head and standing.get("state") == "reviewed"
         if carried:  # the same change as a head they reviewed (see _enter_review)
             reviewers = standing.get("reviewers") or []
-        if not reviewers and utcnow() < datetime.fromisoformat(review["deadline"]):
-            await self._request_review(gh, review, snapshot, policy)
+        if (not reviewers or unseen) and utcnow() < datetime.fromisoformat(review["deadline"]):
+            if not reviewers and not unseen:
+                await self._request_review(gh, review, snapshot, policy)
             return self._review_later(review)
-        self._review_result(review, snapshot, policy, reviewers, standing.get("of") if carried else None)
+        self._review_result(review, snapshot, policy, reviewers, standing.get("of") if carried else None, unseen)
 
     def _save_review(self, review: dict[str, Any]) -> None:
         # A copy: the caller goes on changing ``review``, which must not reach the stored evidence unsaved.
@@ -1721,7 +1727,7 @@ class TaskRunner:
         return heads == {head}
 
     def _review_result(self, review: dict[str, Any], snapshot: dict[str, Any], policy: dict[str, Any],
-                       reviewers: list[str], of: str | None = None) -> None:
+                       reviewers: list[str], of: str | None = None, unseen: bool = False) -> None:
         """Record what the review of this head left open, or that none arrived in time, and leave the wait."""
         head = review["head"]
         found = open_findings(normalize_feedback(policy=policy, **snapshot), policy, review.get("answered") or {})
@@ -1734,6 +1740,8 @@ class TaskRunner:
             result["of"] = of
         if not reviewers:
             result.update(reason="timeout", waited_seconds=policy["wait_seconds"])
+        if unseen:  # a reviewer reported findings that never became readable: a person decides the merge
+            result["unseen"] = True
         self._leave_review(review, policy, result)
 
     def _leave_review(self, review: dict[str, Any], policy: dict[str, Any], result: dict[str, Any]) -> None:
@@ -1757,7 +1765,7 @@ class TaskRunner:
         else:
             if blockers:  # a known blocking finding never merges on its own
                 result["ask"] = "limit" if reviewed else "open"
-            elif not reviewed and policy["on_timeout"] == "ask":
+            elif result.get("unseen") or (not reviewed and policy["on_timeout"] == "ask"):
                 result["ask"] = "unreviewed"
             self.update(status="queued", stage="merge", lease_owner="", blocked_reason="",
                         evidence={**self.task.evidence, "review": review})
@@ -1769,6 +1777,7 @@ class TaskRunner:
         else:
             self.event("review_unavailable", f"No review of {head[:10]} to go on: "
                        + ("the reviews could not be read" if result.get("reason") == "unreadable" else
+                          "a reviewer's findings could not be read" if result.get("unseen") else
                           f"none arrived within {policy['wait_seconds']} seconds"),
                        level="warn", head=head, reason=result.get("reason"))
         if again:
@@ -1811,6 +1820,9 @@ class TaskRunner:
             lines.append(f"- and {more} more")
         if review.get("unanswered"):
             lines.append("The Factory could not post its answer on: " + ", ".join(review["unanswered"][:MAX_FINDINGS]))
+        if result.get("unseen"):
+            lines.append(f"A reviewer reported findings on {head[:10]} that could not be read from GitHub. "
+                         "Read its review on the pull request before you approve.")
         if result.get("ask") == "limit":
             lines.append(f"The review rounds are used up ({int(review.get('rounds') or 0)}). "
                          "\"Request changes\" runs one more.")

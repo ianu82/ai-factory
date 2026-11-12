@@ -10,9 +10,9 @@ from aifactory.db import session_scope
 from aifactory.github import GitHub, GitHubError
 from aifactory.models import Repository
 from aifactory.pipeline.runtime import merged_settings
-from aifactory.review import (DEFAULT_REVIEW, FACTORY_REPLY_MARKER, SEVERITIES, blocking, codex_review_state, headline,
-                              new_review_evidence, normalize_feedback, open_findings, reply_text, requested_round,
-                              review_policy, reviewed_by, severity, validate_review)
+from aifactory.review import (DEFAULT_REVIEW, FACTORY_REPLY_MARKER, SEVERITIES, blocking, codex_review_state,
+                              findings_unseen, headline, new_review_evidence, normalize_feedback, open_findings,
+                              reply_text, requested_round, review_policy, reviewed_by, severity, validate_review)
 
 HEAD = "a" * 40
 
@@ -167,11 +167,31 @@ def test_a_head_is_reviewed_by_a_review_of_that_commit_or_a_codex_state_comment_
     stranger = {**at(), "author_association": "NONE"}
     assert by(reviews=[stranger]) == []
     assert by(reviews=[stranger], trust="anyone") == ["reviewer"]
-    assert by(comments=[codex_state()]) == by(comments=[codex_state(findings=True)]) == [
-        "chatgpt-codex-connector[bot]"]
+    assert by(comments=[codex_state()]) == ["chatgpt-codex-connector[bot]"]
     assert by(comments=[codex_state(sha="b" * 40)]) == by(comments=[codex_state(status="in_progress")]) == []
     assert by(comments=[codex_state(login="stranger", kind="User")]) == []  # anyone can paste that marker
     assert by(reviews=[at(), at(id=2)], comments=[codex_state()]) == ["reviewer", "chatgpt-codex-connector[bot]"]
+
+
+def test_a_codex_comment_that_reports_findings_is_a_review_only_once_its_review_of_the_commit_is_read():
+    def read(reviews=(), comments=()):
+        seen = {"reviews": list(reviews), "comments": list(comments), "policy": {},
+                "identity": user("FactoryAccount"), "pull_author": user("PRAuthor")}
+        return reviewed_by(HEAD, **seen), findings_unseen(HEAD, **seen)
+
+    codex = "chatgpt-codex-connector[bot]"
+    found = codex_state(findings=True)
+    submitted = {**review(id=3, login=codex, kind="Bot"), "commit_id": HEAD}
+    assert read() == ([], False)
+    assert read(comments=[codex_state()]) == ([codex], False)
+    # The comment was read, the review that carries the findings was not: nobody has reviewed this head yet.
+    assert read(comments=[found]) == ([], True)
+    assert read(reviews=[{**review()}, {**submitted, "commit_id": "b" * 40}], comments=[found]) == ([], True)
+    # Another reviewer's review does not stand in for the one that is missing.
+    assert read(reviews=[{**review(), "commit_id": HEAD}], comments=[found]) == (["reviewer"], True)
+    assert read(reviews=[submitted], comments=[found]) == ([codex], False)
+    assert read(comments=[codex_state(findings=True, sha="b" * 40)]) == ([], False)
+    assert read(comments=[codex_state(findings=True, login="stranger", kind="User")]) == ([], False)
 
 
 def test_open_findings_put_blockers_first_and_an_answered_finding_waits_for_its_reviewer():
@@ -292,11 +312,14 @@ def test_replies_use_root_rest_comment_and_resolution_uses_node_id():
 
 def test_authenticated_feedback_snapshot_and_off_mode():
     gh = GitHub("secret")
-    gh.request = AsyncMock(side_effect=[user("ServiceAccount"), {"user": user("PRAuthor")},
+    # The snapshot reads the comments first, then the reviews, then their threads.
+    gh.request = AsyncMock(side_effect=[user("ServiceAccount"), {"user": user("PRAuthor")}, [],
         [review()], {"data": {"repository": {"pullRequest": {"reviewThreads": connection([
-            {**thread(), "comments": connection([inline(), inline(11, login="SERVICEACCOUNT")])}])}}}}, []])
+            {**thread(), "comments": connection([inline(), inline(11, login="SERVICEACCOUNT")])}])}}}}])
     findings = asyncio.run(gh.review_feedback("owner/repo", 7, {}))
     assert [f["id"] for f in findings] == ["comment:10"]
+    assert [call.args[1] for call in gh.request.call_args_list][2:] == [
+        "/repos/owner/repo/issues/7/comments", "/repos/owner/repo/pulls/7/reviews", "/graphql"]
     gh.request.reset_mock()
     assert asyncio.run(gh.review_feedback("owner/repo", 7, {"address": "off"})) == []
     gh.request.assert_not_called()
@@ -418,12 +441,12 @@ def test_full_database_ids_match_change_requests_and_target_replies(legacy_id):
              "pullRequestReview": {"fullDatabaseId": str(review_id), "databaseId": legacy_id}}
     gh = GitHub("secret")
     gh.request = AsyncMock(side_effect=[
-        user("FactoryAccount"), {"user": user("PRAuthor")},
+        user("FactoryAccount"), {"user": user("PRAuthor")}, [],
         [{**review(state="CHANGES_REQUESTED"), "id": review_id}],
         {"data": {"repository": {"pullRequest": {"reviewThreads": connection([
             {**thread(), "comments": connection([root], "more-comments")}])}}}},
         {"data": {"node": {"comments": connection([reply])}}},
-        [], {"id": 99},
+        {"id": 99},
     ])
     findings = asyncio.run(gh.review_feedback("owner/repo", 7, {"address": "changes_requested"}))
     inline_findings = [f for f in findings if f["kind"] == "inline"]
@@ -436,7 +459,7 @@ def test_full_database_ids_match_change_requests_and_target_replies(legacy_id):
     assert gh.request.call_args.args == (
         "POST", f"/repos/owner/repo/pulls/7/comments/{comment_id}/replies")
     # Both the first thread page and nested comment pages request the modern IDs.
-    for call in gh.request.call_args_list[3:5]:
+    for call in gh.request.call_args_list[4:6]:
         query = call.kwargs["json"]["query"]
         assert "id fullDatabaseId databaseId body" in query
         assert "pullRequestReview { fullDatabaseId databaseId state }" in query

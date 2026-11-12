@@ -562,6 +562,55 @@ def test_a_refreshed_head_with_the_reviewed_change_is_neither_asked_for_nor_wait
                                   "which they reviewed): nothing open.")
 
 
+def test_a_refreshed_head_whose_change_went_on_without_a_review_waits_for_its_own(factory):
+    tid, head = awaiting_review(factory)
+    with session_scope() as s:
+        t = s.get(Task, tid)
+        t.evidence = {**t.evidence, "published": {"head": head, "patch_id": "p1"}}
+    expire_review(tid)
+    status, stage, ev, _ = poll(tid)
+    result = ev["review"]["result"]
+    assert (status, stage, result["state"], result["patch_id"]) == ("queued", "merge", "unavailable", "p1")
+    new = "e" * 40  # the same change, rebased onto a newer main: nobody reviewed it on either head
+    with session_scope() as s:
+        t = s.get(Task, tid)
+        t.status, t.stage, t.head_sha = "running", "ci", new
+        t.evidence = {**t.evidence, "published": {"head": new, "patch_id": "p1"}}
+    asyncio.run(park(tid))
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage, ev["review"]["head"]) == ("waiting_ci", "review", new)
+    assert ev["review"]["result"]["head"] == head
+    assert poll(tid)[:2] == ("waiting_ci", "review")
+    assert FakeGitHub.comments == [(1, "@codex review")]
+
+
+def test_codex_reporting_findings_is_no_review_until_the_findings_can_be_read(factory):
+    tid, head = awaiting_review(factory, autonomy="auto")
+    codex_reviewed(head, findings=True)  # its comment says it found something; the review itself is not read yet
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("waiting_ci", "review")
+    assert not ev["review"].get("result") and FakeGitHub.comments == []
+    fid = finding(head)
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage, ev["review"]["round"]["findings"]) == ("queued", "revise", [fid])
+
+
+def test_findings_that_never_become_readable_leave_the_merge_to_a_person(factory):
+    tid, head = awaiting_review(factory, autonomy="auto")
+    codex_reviewed(head, findings=True)
+    expire_review(tid)
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("queued", "merge")
+    result = ev["review"]["result"]
+    assert (result["state"], result["unseen"], result["ask"]) == ("unavailable", True, "unreviewed")
+    assert events(tid, "review_unavailable") == [
+        f"No review of {head[:10]} to go on: a reviewer's findings could not be read"]
+    assert approval(tid).endswith(
+        f"\n\nNo review of {head[:10]} arrived within 10 minutes.\n"
+        f"A reviewer reported findings on {head[:10]} that could not be read from GitHub. "
+        "Read its review on the pull request before you approve.")
+
+
 def test_an_approval_carried_to_the_rebased_change_meets_no_review_request_and_no_review_wait(factory, monkeypatch):
     review_on(factory)
     monkeypatch.setattr(delivery, "REVIEW_POLL_SECONDS", 0)

@@ -172,16 +172,38 @@ def codex_review_state(body: str) -> dict[str, Any] | None:
     return {"commit_sha": sha, "has_any_findings": bool(review.get("has_any_findings"))}
 
 
+def _head_reviews(head: str, reviews: list[dict], comments: list[dict], policy: dict, identity: dict,
+                  pull_author: dict) -> tuple[list[str], list[str]]:
+    """Who submitted a review of exactly this commit, and whose Codex state comment says its review of it is
+    complete: (login, whether it reports findings). Trusted reviewers only."""
+    policy = {**deepcopy(DEFAULT_REVIEW), **validate_review(policy)}
+    ignored = _ignored(policy, identity, pull_author)
+    submitted = [_author(r)[0] for r in reviews if r.get("commit_id") == head
+                 and str(r.get("state") or "").upper() not in ("PENDING", "DISMISSED") and _counted(r, policy, ignored)]
+    stated = []
+    for c in comments:
+        state = codex_review_state(c.get("body") or "") or {}
+        if state.get("commit_sha") == head and _counted(c, policy, ignored):
+            stated.append((_author(c)[0], state["has_any_findings"]))
+    return submitted, stated
+
+
 def reviewed_by(head: str, *, reviews: list[dict], comments: list[dict], policy: dict, identity: dict,
                 pull_author: dict) -> list[str]:
     """Logins of the trusted reviewers who reviewed exactly this head: a submitted review of that commit, or a
-    Codex state comment naming it."""
-    policy = {**deepcopy(DEFAULT_REVIEW), **validate_review(policy)}
-    ignored = _ignored(policy, identity, pull_author)
-    records = [r for r in reviews if r.get("commit_id") == head
-               and str(r.get("state") or "").upper() not in ("PENDING", "DISMISSED")]
-    records += [c for c in comments if (codex_review_state(c.get("body") or "") or {}).get("commit_sha") == head]
-    return list(dict.fromkeys(_author(r)[0] for r in records if _counted(r, policy, ignored)))
+    Codex state comment naming it that reports no findings (Codex submits no review then). A state comment that
+    reports findings is not a review by itself: the findings are in the review Codex submitted for the commit,
+    and until that review is read nothing is known about them (see findings_unseen)."""
+    submitted, stated = _head_reviews(head, reviews, comments, policy, identity, pull_author)
+    return list(dict.fromkeys(submitted + [login for login, findings in stated if not findings]))
+
+
+def findings_unseen(head: str, *, reviews: list[dict], comments: list[dict], policy: dict, identity: dict,
+                    pull_author: dict) -> bool:
+    """Whether a reviewer reports findings on this head whose review is not among ``reviews``: what was read of the
+    pull request is then not the whole review, and a head must never count as clean on it."""
+    submitted, stated = _head_reviews(head, reviews, comments, policy, identity, pull_author)
+    return any(findings and login not in submitted for login, findings in stated)
 
 
 def open_findings(findings: list[Finding], policy: dict, answered: dict[str, dict]) -> list[dict[str, Any]]:

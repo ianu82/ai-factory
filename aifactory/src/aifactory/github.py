@@ -512,9 +512,12 @@ class GitHub:
         pull = await self.pull(full_name, number)
         if (not self.installation_bound and not identity.get("login")) or not (pull.get("user") or {}).get("login"):
             raise GitHubError("GitHub review identity is unavailable")
-        return {"identity": identity, "pull_author": pull["user"], "reviews": await self.reviews(full_name, number),
-                "threads": await self.review_threads(full_name, number),
-                "comments": await self.issue_comments(full_name, number)}
+        # Read in the order a reviewer writes: Codex marks its review complete in a comment after it has submitted
+        # its findings, so the comments are read first and every review they announce is in what is read after.
+        comments = await self.issue_comments(full_name, number)
+        reviews = await self.reviews(full_name, number)
+        return {"identity": identity, "pull_author": pull["user"], "reviews": reviews,
+                "threads": await self.review_threads(full_name, number), "comments": comments}
 
     async def review_feedback(self, full_name: str, number: int, policy: dict) -> list[dict[str, Any]]:
         from .review import normalize_feedback, review_policy
