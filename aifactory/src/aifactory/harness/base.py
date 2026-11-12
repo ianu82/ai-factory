@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
 from ..inference import ModelClient, UsageLedger
-from ..sandbox import LocalSandbox
+from ..sandbox import COMMAND_TIMEOUT, LocalSandbox
 
 
 class HarnessUnavailable(RuntimeError):
@@ -44,7 +44,7 @@ class HarnessSession:
     writable: bool
     max_turns: int = 80
     deadline: float = field(default_factory=lambda: time.monotonic() + 3600)
-    command_timeout: float = 600
+    command_timeout: float = COMMAND_TIMEOUT
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     on_progress: Callable[[str, str, dict[str, Any]], None] = lambda kind, message, data: None
     take_guidance: Callable[[], list[str]] = lambda: []
@@ -58,6 +58,8 @@ class HarnessSession:
     tool_policy: dict[str, Any] = field(default_factory=dict)
     # The task's acceptance criteria: a verifier's report needs a result of its own for each (see validate_report).
     expected_criteria: list[str] | None = None
+    # Ids of the review findings a builder was given: its report answers each (see validate_report).
+    expected_findings: list[str] | None = None
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()

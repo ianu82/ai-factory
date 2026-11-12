@@ -1,18 +1,28 @@
 """Review policy, normalized GitHub findings and the durable review evidence contract.
 
-Delivery feedback callers persist ``new_review_evidence()`` under
-``task.evidence['review']`` (assign a new evidence dict when updating JSON).
+The delivery pipeline's review stage keeps its state under ``task.evidence['review']``
+(``ReviewEvidence``; assign a new evidence dict when updating JSON).
 GitHub collection errors must propagate; an unavailable snapshot is not an empty one.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from copy import deepcopy
 from typing import Any, TypedDict
 
+# ``request`` is the comment that asks for a review of a head after the pull request's first ("" never asks).
 DEFAULT_REVIEW = {"address": "unresolved", "reviewers": "all", "ignore": [],
-                  "wait_seconds": 120, "max_rounds": 2}
+                  "wait_seconds": 600, "max_rounds": 3, "request": "@codex review",
+                  "trust": "collaborators", "block_on": "p1", "on_timeout": "proceed"}
 FACTORY_REPLY_MARKER = "<!-- ai-factory:review-reply -->"
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+SEVERITIES = ("P0", "P1", "unrated", "P2", "P3")  # most severe first; an unrated finding ranks with a P1
+ACTIONS = ("fixed", "disputed", "deferred")  # a builder's answer to a finding
+BODY_CHARS, MAX_FINDINGS = 4000, 20  # what one review round carries: per finding body, and findings
+_BADGE = re.compile(r"!\[(P[0-3]) Badge\]\(")
+_CODEX_STATE = re.compile(r"<!--\s*codex-review-state:v1\s+(\{.*?\})\s*-->", re.S)
 
 
 def validate_review(raw: Any, *, repository: bool = False) -> dict[str, Any]:
@@ -25,9 +35,12 @@ def validate_review(raw: Any, *, repository: bool = False) -> dict[str, Any]:
     if raw.keys() - (DEFAULT_REVIEW.keys() | {"mode", "allow_untrusted_local"}):
         raise ValueError("Unknown review policy field")
     for key, choices in (("address", ("unresolved", "changes_requested", "off")),
-                         ("reviewers", ("people", "bots", "all"))):
+                         ("reviewers", ("people", "bots", "all")), ("trust", ("collaborators", "anyone")),
+                         ("block_on", ("p1", "all", "none")), ("on_timeout", ("proceed", "ask"))):
         if key in raw and raw[key] not in choices:
             raise ValueError(f"review.{key} must be one of {', '.join(choices)}")
+    if "request" in raw and (not isinstance(raw["request"], str) or len(raw["request"]) > 500):
+        raise ValueError("review.request must be a string of at most 500 characters")
     if "ignore" in raw:
         ignored = raw["ignore"]
         if not isinstance(ignored, list) or any(not isinstance(x, str) or not x.strip() for x in ignored):
@@ -42,6 +55,8 @@ def validate_review(raw: Any, *, repository: bool = False) -> dict[str, Any]:
     result = deepcopy(raw)
     if "ignore" in result:
         result["ignore"] = [login.strip() for login in result["ignore"]]
+    if "request" in result:
+        result["request"] = result["request"].strip()
     return result
 
 
@@ -72,32 +87,31 @@ class Finding(TypedDict):
     line: int | None
     original_line: int | None
     diff_hunk: str | None
+    severity: str  # P0..P3 from the reviewer's badge, otherwise unrated
 
 
-class FindingProgress(TypedDict):
-    """Keyed by stable finding id; retain entries across heads and polling cycles."""
-    finding: Finding  # retain location/thread IDs even after it leaves pending
-    head: str
-    round: int
-    status: str  # pending | addressed | disputed
-    commit: str | None
-    reply_id: str | None
-    replied_at: str | None
-    resolved_at: str | None  # only set after successful GitHub resolution
-
-
-class ReviewEvidence(TypedDict):
-    rounds: int  # completed review-driven revisions, independent of build attempts
-    pending: list[Finding]
-    wait_deadlines: dict[str, str]  # head SHA -> UTC ISO deadline; never reset on polling
-    active_round: int | None
-    active_head: str | None
-    findings: dict[str, FindingProgress]  # durable reply/resolution idempotency ledger
+class ReviewEvidence(TypedDict, total=False):
+    """``task.evidence['review']``: the review stage's durable state (pipeline/delivery.py)."""
+    rounds: int  # revisions made because of review: automatic rounds and a person's "request changes"
+    answered: dict[str, dict[str, Any]]  # finding id -> {action, note, updated_at}: the builder's latest answer
+    head: str  # the head whose review is awaited; the three times below belong to it and survive restarts
+    started_at: str
+    deadline: str
+    next_poll_at: str
+    # {head, state: first | intent | posted, at}: the request comment, once per head after the pull request's first
+    requested: dict[str, Any]
+    # {head, patch_id, state: reviewed | unavailable, reason: timeout | unreadable, waited_seconds, reviewers,
+    #  open: [open_findings()], more, counts: {severity: n}, ask: limit | open | unreviewed, of, at}. ``ask``: a
+    # person decides the merge; ``of``: the reviewed head this one carries the same change as.
+    result: dict[str, Any]
+    # {n, head, findings: [ids], replies: {id: {replied, resolved}}, tries}: the revision in progress, kept until
+    # its answers are posted on the threads
+    round: dict[str, Any] | None
+    unanswered: list[str]  # threads the Factory gave up replying on
 
 
 def new_review_evidence() -> ReviewEvidence:
-    return {"rounds": 0, "pending": [], "wait_deadlines": {}, "active_round": None,
-            "active_head": None, "findings": {}}
+    return {"rounds": 0, "answered": {}}
 
 
 def _author(record: dict) -> tuple[str, str]:
@@ -107,6 +121,132 @@ def _author(record: dict) -> tuple[str, str]:
 
 def _bot(login: str, kind: str) -> bool:
     return kind.casefold() == "bot" or login.casefold().endswith("[bot]")
+
+
+def _ignored(policy: dict, identity: dict, pull_author: dict) -> set[str]:
+    ignored = {s.casefold() for s in policy["ignore"]}
+    ignored.update(a.get("login", "").casefold() for a in (identity, pull_author))
+    return ignored
+
+
+def _counted(record: dict, policy: dict, ignored: set[str], *, human_only: bool = False) -> bool:
+    """Whether a review or comment counts: not the Factory's own, from an allowed kind of reviewer, and trusted (an
+    installed bot or a collaborator; the repository may be public, where anyone can comment)."""
+    login, kind = _author(record)
+    if not login or login.casefold() in ignored or FACTORY_REPLY_MARKER in (record.get("body") or ""):
+        return False
+    bot = _bot(login, kind)
+    association = str(record.get("author_association") or record.get("authorAssociation") or "").upper()
+    if policy["trust"] != "anyone" and not bot and association not in TRUSTED_ASSOCIATIONS:
+        return False
+    return (not human_only or not bot) and (policy["reviewers"] == "all"
+            or (policy["reviewers"] == "bots") == bot)
+
+
+def severity(body: str) -> str:
+    """Codex marks a finding with a badge image in its body (``![P1 Badge](…)``); anything else is unrated."""
+    found = _BADGE.search(body or "")
+    return found.group(1) if found else "unrated"
+
+
+def blocking(level: str, block_on: str) -> bool:
+    return block_on == "all" or (block_on == "p1" and level not in ("P2", "P3"))
+
+
+def codex_review_state(body: str) -> dict[str, Any] | None:
+    """The commit a completed Codex review covered, from the state comment Codex leaves on a pull request (it posts
+    no review when it finds nothing). None for anything that is not exactly that."""
+    found = _CODEX_STATE.search(body or "")
+    if not found:
+        return None
+    try:
+        state = json.loads(found.group(1))
+    except ValueError:
+        return None
+    review = state.get("code_review") if isinstance(state, dict) else None
+    if not isinstance(review, dict) or review.get("status") != "completed":
+        return None
+    sha = review.get("commit_sha")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return None
+    return {"commit_sha": sha, "has_any_findings": bool(review.get("has_any_findings"))}
+
+
+def _head_reviews(head: str, reviews: list[dict], comments: list[dict], policy: dict, identity: dict,
+                  pull_author: dict) -> tuple[list[str], list[str]]:
+    """Who submitted a review of exactly this commit, and whose Codex state comment says its review of it is
+    complete: (login, whether it reports findings). Trusted reviewers only."""
+    policy = {**deepcopy(DEFAULT_REVIEW), **validate_review(policy)}
+    ignored = _ignored(policy, identity, pull_author)
+    submitted = [_author(r)[0] for r in reviews if r.get("commit_id") == head
+                 and str(r.get("state") or "").upper() not in ("PENDING", "DISMISSED") and _counted(r, policy, ignored)]
+    stated = []
+    for c in comments:
+        state = codex_review_state(c.get("body") or "") or {}
+        if state.get("commit_sha") == head and _counted(c, policy, ignored):
+            stated.append((_author(c)[0], state["has_any_findings"]))
+    return submitted, stated
+
+
+def reviewed_by(head: str, *, reviews: list[dict], comments: list[dict], policy: dict, identity: dict,
+                pull_author: dict) -> list[str]:
+    """Logins of the trusted reviewers who reviewed exactly this head: a submitted review of that commit, or a
+    Codex state comment naming it that reports no findings (Codex submits no review then). A state comment that
+    reports findings is not a review by itself: the findings are in the review Codex submitted for the commit,
+    and until that review is read nothing is known about them (see findings_unseen)."""
+    submitted, stated = _head_reviews(head, reviews, comments, policy, identity, pull_author)
+    return list(dict.fromkeys(submitted + [login for login, findings in stated if not findings]))
+
+
+def findings_unseen(head: str, *, reviews: list[dict], comments: list[dict], policy: dict, identity: dict,
+                    pull_author: dict) -> bool:
+    """Whether a reviewer reports findings on this head whose review is not among ``reviews``: what was read of the
+    pull request is then not the whole review, and a head must never count as clean on it."""
+    submitted, stated = _head_reviews(head, reviews, comments, policy, identity, pull_author)
+    return any(findings and login not in submitted for login, findings in stated)
+
+
+def open_findings(findings: list[Finding], policy: dict, answered: dict[str, dict]) -> list[dict[str, Any]]:
+    """What the review stage keeps of each open finding, blocking ones first and then by severity. A finding the
+    builder answered keeps that answer and no longer blocks until its reviewer writes again: a new comment is a new
+    finding, and an edited one no longer matches the answer."""
+    found = []
+    for f in findings:
+        answer = (answered or {}).get(f["id"]) or {}
+        answer = answer if answer.get("updated_at") == f["updated_at"] else None
+        found.append({
+            "id": f["id"], "severity": f["severity"], "author": f["author"], "path": f["path"],
+            "line": f["line"] or f["original_line"], "url": f["url"],
+            "body": f["body"] if len(f["body"]) <= BODY_CHARS else f["body"][:BODY_CHARS] + " … [cut here]",
+            "thread_id": f["thread_id"], "reply_to_id": f["reply_to_id"], "updated_at": f["updated_at"],
+            "blocking": not answer and blocking(f["severity"], policy["block_on"]),
+            "answer": {"action": answer.get("action"), "note": answer.get("note") or ""} if answer else None})
+    return sorted(found, key=lambda f: (not f["blocking"], SEVERITIES.index(f["severity"])))
+
+
+def headline(body: str, limit: int = 120) -> str:
+    """A finding's first words for a one-line listing, without the badge markup Codex opens with."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)|</?sub>", "", body or "").replace("**", "")
+    return " ".join(text.split())[:limit]
+
+
+def reply_text(action: str, note: str, head: str) -> str:
+    """What the Factory writes on a finding's thread once the builder's answer to it is published."""
+    note = " ".join(str(note or "").split())[:1000]
+    return f"Fixed in {head[:10]}: {note}" if action == "fixed" else f"Not changed: {note}"
+
+
+def requested_round(evidence: dict | None, head: str) -> dict:
+    """A person's "request changes" is a review round too: it counts, and the builder answers whatever the review
+    of that head left open. A task that never reached the review stage is left as it is."""
+    review = (evidence or {}).get("review")
+    if not review:
+        return evidence or {}
+    result = review.get("result") or {}
+    rounds = int(review.get("rounds", 0)) + 1
+    ids = [f["id"] for f in result.get("open") or []] if result.get("head") == head else []
+    return {**evidence, "review": {**review, "rounds": rounds, "round": {
+        "n": rounds, "head": head, "findings": ids, "replies": {}, "tries": 0} if ids else None}}
 
 
 def _database_id(record: dict) -> int | None:
@@ -132,16 +272,10 @@ def normalize_feedback(*, reviews: list[dict], threads: list[dict], comments: li
     policy = {**deepcopy(DEFAULT_REVIEW), **validate_review(policy)}
     if policy["address"] == "off":
         return []
-    ignored = {s.casefold() for s in policy["ignore"]}
-    ignored.update(a.get("login", "").casefold() for a in (identity, pull_author))
+    ignored = _ignored(policy, identity, pull_author)
 
     def counted(record: dict, *, human_only: bool = False) -> bool:
-        login, kind = _author(record)
-        if not login or login.casefold() in ignored or FACTORY_REPLY_MARKER in (record.get("body") or ""):
-            return False
-        bot = _bot(login, kind)
-        return (not human_only or not bot) and (policy["reviewers"] == "all"
-                or (policy["reviewers"] == "bots") == bot)
+        return _counted(record, policy, ignored, human_only=human_only)
 
     submitted = [r for r in reviews if r.get("state", "").upper() != "PENDING"]
     submitted.sort(key=lambda r: (r.get("submitted_at") or "", int(r["id"])))
@@ -169,7 +303,8 @@ def normalize_feedback(*, reviews: list[dict], threads: list[dict], comments: li
                 "path": record.get("path") or (thread or {}).get("path"),
                 "line": record.get("line", (thread or {}).get("line")),
                 "original_line": record.get("originalLine", record.get("original_line", (thread or {}).get("originalLine"))),
-                "diff_hunk": record.get("diffHunk") or record.get("diff_hunk")}
+                "diff_hunk": record.get("diffHunk") or record.get("diff_hunk"),
+                "severity": severity(record.get("body") or "")}
 
     found: dict[str, Finding] = {}
     for thread in threads:
@@ -200,6 +335,8 @@ def normalize_feedback(*, reviews: list[dict], threads: list[dict], comments: li
             found[item["id"]] = item
     if policy["address"] == "unresolved":
         for comment in comments:
+            if (comment.get("body") or "").strip().casefold() == policy["request"].casefold():
+                continue  # someone asking for a review, as the Factory does, is not a finding
             if counted(comment, human_only=True) and (comment.get("body") or "").strip():
                 item = finding(comment, "issue_comment")
                 found[item["id"]] = item

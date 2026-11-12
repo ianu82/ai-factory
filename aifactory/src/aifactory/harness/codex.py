@@ -134,7 +134,7 @@ class CodexHarness:
             # The CLI reports a failure only as text, so this is the one place its wording is read for a cause.
             message = f"Codex did not return a report (exit {result.exit_code}): {detail}"
             raise HarnessFailed(message, cause=text_cause(message))
-        report, error = validate_report(session.role, report, session.expected_criteria)
+        report, error = validate_report(session.role, report, session.expected_criteria, session.expected_findings)
         if report is None:
             raise HarnessFailed(f"Codex report was invalid: {error}")
         return HarnessResult(report=report, turns=turns, log=result.output[-4000:])

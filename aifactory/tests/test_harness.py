@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
+from aifactory.harness import tools
 from aifactory.harness.base import HarnessSession
 from aifactory.harness.native import NativeHarness
 from aifactory.harness.schemas import BUILDER_REPORT
 from aifactory.inference import ProviderConfig, UsageLedger
-from aifactory.sandbox import LocalSandbox
+from aifactory.sandbox import COMMAND_TIMEOUT, ExecResult, LocalSandbox
 
 from .fakes import call, step
 
@@ -112,6 +114,38 @@ def test_native_forces_a_final_report_when_out_of_turns(tmp_path, monkeypatch):
     session, client, _ = make_session(tmp_path, wrapped, max_turns=3)
     result = asyncio.run(NativeHarness().run(session))
     assert result.report["status"] == "blocked"
+
+
+def test_run_tool_allows_a_command_as_long_as_a_check_and_says_so(tmp_path, monkeypatch):
+    limits, progress = [], []
+
+    async def exec_(self, command, *, timeout=600, **_):
+        limits.append(timeout)
+        slow = command == "sleep 9999"
+        return ExecResult(command, 124 if slow else 0, "so far", 1.0, timed_out=slow)
+
+    monkeypatch.setattr(LocalSandbox, "exec", exec_)
+    session, _, _ = make_session(tmp_path, None,
+                                 on_progress=lambda kind, message, data: progress.append((kind, message)))
+    assert session.command_timeout == COMMAND_TIMEOUT  # what one of the repository's checks is allowed
+    box = tools.ToolBox(session)
+
+    async def go():
+        await box.call("run", {"command": "pytest -q", "timeout_seconds": 99_999})
+        await box.call("run", {"command": "pytest -q"})
+        out = await box.call("run", {"command": "sleep 9999"})
+        session.deadline = time.monotonic() + 200  # a session about to end allows less
+        await box.call("run", {"command": "pytest -q", "timeout_seconds": 99_999})
+        return out
+
+    out = asyncio.run(go())
+    assert limits[:3] == [COMMAND_TIMEOUT, 300, 300] and 30 <= limits[3] <= 140
+    assert "[timed out, " in out
+    results = [message for kind, message in progress if kind == "command_result"]
+    assert results[1].startswith("exit 0 in ")
+    assert results[2].startswith("timed out after ") and results[2].endswith("(limit 300s)")  # not "exit 124"
+    run = next(t["function"] for t in tools.tool_specs(False) if t["function"]["name"] == "run")
+    assert f"Default 300, max {COMMAND_TIMEOUT} " in run["parameters"]["properties"]["timeout_seconds"]["description"]
 
 
 def test_model_client_speaks_responses_api_and_round_trips_reasoning(monkeypatch):
