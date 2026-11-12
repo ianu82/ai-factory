@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "smoke",
+  "cases": [{
+    "id": "add", "task": "Implement add(a, b) in calculator.py without dependencies.",
+    "acceptance": ["Adds positive and negative integers; does not special-case test inputs."],
+    "fixtures": {"calculator.py": "fixtures/calculator.py", "test_calculator.py": "fixtures/test_calculator.py"},
+    "setup_commands": [], "check_commands": ["python -m unittest -q test_calculator"],
+    "scorer_ids": ["checks-v1"], "runtime_qa": null
+  }]
+}
