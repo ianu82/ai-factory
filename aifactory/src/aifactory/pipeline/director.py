@@ -34,8 +34,8 @@ from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedge
                          workspace_models)
 from ..models import Alert, Decision, Event, Message, Outcome, Run, Signal, Task, User, Workspace, new_id
 from .holds import held_workspaces
-from .lead import (FINISHED, STOPPED, UNPRICED_MIN, _bounded, _Budget, _fn, _task, converse, notes_for,
-                   outcome_record)
+from .lead import (FINISHED, RESULT_CHARS, STOPPED, UNPRICED_MIN, _bounded, _Budget, _fn, _task, converse,
+                   notes_for, outcome_record)
 from .runtime import DEFAULT_SETTINGS, budget_extension, merged_settings, outcome_committed, workspace_settings
 
 log = logging.getLogger(__name__)
@@ -525,8 +525,15 @@ class Tools:
         return page
 
     def _inbox_item(self, kind: str, id: str) -> str:
+        """The item whole: redacted, with no per-text shortening (the inbox's brief is what this stands behind), and
+        cut only if the whole result passes RESULT_CHARS, saying so."""
+        from ..mind.tools import clean
+
         found = inbox_item(self.ws, self.cfg, kind, id)
-        return _bounded(found) if found is not None else f"No {kind} with that id in this workspace."
+        if found is None:
+            return f"No {kind} with that id in this workspace."
+        text = json.dumps(clean(found, None, RESULT_CHARS, 500, 500), ensure_ascii=False, default=str)
+        return text if len(text) <= RESULT_CHARS else text[:RESULT_CHARS] + f"… (cut at {RESULT_CHARS} characters)"
 
     def _outcome_record(self, outcome: str) -> str:
         from ..mind.tools import clean

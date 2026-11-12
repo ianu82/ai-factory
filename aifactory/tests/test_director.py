@@ -421,7 +421,7 @@ def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request
     with db.session_scope() as s:  # a long backlog, each question longer than the inbox shows
         for n in range(70):
             s.add(Decision(workspace_id=world["ws"], outcome_id=world["outcome"], kind="question",
-                           title=f"Question {n}", body=f"Context {n}: " + "x" * 2000,
+                           title=f"Question {n}", body=f"Context {n}: " + "x" * 5000,
                            options=[{"value": "answer", "label": "Answer"}],
                            created_at=db.utcnow() - timedelta(minutes=30 + n)))
     item = woken()[world["ws"]]
@@ -446,7 +446,7 @@ def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request
     with db.session_scope() as s:
         question = s.query(Decision).filter_by(title="Question 0").one().id
     full = json.loads(tools._inbox_item("decision", question))
-    assert full["body"].startswith("Context 0: ") and len(full["body"]) > director.BRIEF
+    assert full["body"] == "Context 0: " + "x" * 5000  # whole: no per-text shortening
     assert tools._inbox_item("alert", "nope") == "No alert with that id in this workspace."
 
 
