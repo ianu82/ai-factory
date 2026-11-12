@@ -1,6 +1,4 @@
 /* ---------- My Mind in the sidebar ---------- */
-/* Conversations make the sidebar taller: on a short screen it scrolls, so Settings and Sign out stay reachable. */
-.sidebar { overflow-y: auto; }
 .mind-nav { margin: 0 0 2px; }
 .mind-nav-row { display: flex; align-items: center; gap: 2px; }
 .mind-nav-row .nav-item { flex: 1; min-width: 0; }
