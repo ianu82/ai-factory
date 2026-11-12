@@ -28,6 +28,7 @@ SCAN = 1000  # events read at most per page, so a narrow filter over a long hist
 GROUPS: dict[str, set[str]] = {
     "minds": {"mind"},
     "lead": {"lead"},
+    "director": {"director"},
     "people": {"person", "people", "operator"},
     "planning": {"planner", "plan_reviewer", "outcome_agents"},
     "builders": {"builder", "checks", "task_agents", "outcome_agents"},
@@ -50,6 +51,7 @@ PLANNER = party("planner", "Planner")
 PLAN_REVIEWER = party("plan_reviewer", "Plan reviewer")
 OPERATOR = party("operator", "Operator")
 LEAD = party("lead", "Lead")  # the agent that owns one outcome end to end (pipeline/lead.py)
+DIRECTOR = party("director", "Director")  # the stand-in for people while they're away (pipeline/director.py)
 
 
 def message_data(sender: dict[str, Any], receiver: dict[str, Any], intent: str) -> dict[str, Any]:
@@ -72,6 +74,8 @@ def _who(event: Event, ctx: Context) -> dict[str, Any]:
     data = event.data or {}
     if data.get("source") == "lead":  # the Lead acts as its own system user, with this attribution
         return LEAD
+    if data.get("source") == "director":  # so does the Director
+        return DIRECTOR
     if event.actor == "operator" or (event.actor or "") in ctx.operators:
         return OPERATOR
     name = ctx.names.get(event.actor or "")
@@ -157,6 +161,12 @@ def _guidance(event: Event, ctx: Context) -> Ends:
     return _who(event, ctx), receiver, "inform"
 
 
+def _director_note(event: Event, ctx: Context) -> Ends:
+    # A note on an item the Director leaves to people is its recommendation; otherwise it keeps them informed.
+    data = event.data or {}
+    return DIRECTOR, PEOPLE, "propose" if any(data.get(k) for k in ("decision_id", "alert_id", "signal_id")) else "inform"
+
+
 def _lead_note(event: Event, ctx: Context) -> Ends:
     # A note on a decision is the Lead's recommendation to the people who decide it; otherwise it keeps them informed.
     return LEAD, PEOPLE, "propose" if (event.data or {}).get("decision_id") else "inform"
@@ -182,6 +192,8 @@ RULES: dict[str, Rule] = {
     "task_handed_over": _handed_over,
     "lead_note": _lead_note,
     "lead_update": fixed(_const(LEAD), _const(PEOPLE), "inform"),  # the Lead's post in the outcome's conversation
+    "director_note": _director_note,
+    "director_triage": fixed(_const(DIRECTOR), _const(FACTORY), "answer"),  # a signal accepted as work or ignored
 }
 KINDS = (*RULES, MESSAGE_KIND)
 

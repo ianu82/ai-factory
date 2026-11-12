@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
-import { api, type Credential, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
+import { api, type Credential, type DirectorSettings, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { validMindBudget } from "../mind";
@@ -91,6 +91,7 @@ function Policies() {
   const qc = useQueryClient();
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const selected = policy.data?.after ?? s.autonomy;
+  const director: DirectorSettings = { mode: "off", run_usd: 4, daily_usd: 40, max_outcome_usd: 120, after_minutes: 5, ...s.director };
   const autonomy = async (key: keyof Settings["autonomy"], v: "auto" | "approval") => {
     if (!policy.isSuccess) return;
     const patch = policyPatch(policy.data, key, v);
@@ -112,6 +113,14 @@ function Policies() {
           <Seg value={selected.merge} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("merge", v)} disabled={!admin || !policy.isSuccess} /></div>
         <div className="s-line"><div className="l"><b>Releases</b><span>For repositories that deploy when main changes, require approval before merging.</span></div>
           <Seg value={selected.release} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("release", v)} disabled={!admin || !policy.isSuccess} /></div>
+      </section>
+      <section className="s-block">
+        <h2>Director</h2>
+        <p>While you're away, the Director decides what would otherwise wait for a person: plan, merge and release approvals, budgets, blocked and failed work, agents' questions, Supervisor findings, alerts and signals. It decides through the same choices you have, so every Factory check still applies. It never takes work over, lifts a provider hold or changes settings, and it leaves anything it isn't sure about to you with a note. Each decision is recorded with its reasoning and shows as the Director's.</p>
+        <div className="s-line"><div className="l"><b>Director</b><span>{director.mode === "on"
+          ? `On. Up to $${director.run_usd} a run and $${director.daily_usd} a day. It lets an outcome continue past its budget only until the outcome has committed $${director.max_outcome_usd}.`
+          : "Off: decisions wait for a person."}</span></div>
+          <Seg value={director.mode} options={[["off", "Off"], ["on", "On"]]} onChange={(v) => save({ director: { ...director, mode: v } })} disabled={!admin} /></div>
       </section>
       <section className="s-block">
         <h2>Mind daily budget</h2>

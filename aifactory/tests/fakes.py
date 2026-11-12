@@ -31,7 +31,7 @@ class ScriptedModel:
 
     async def chat(self, *, model, messages, tools=None, ledger=None, **_kwargs):
         system = messages[0]["content"]
-        role = "lead" if "You are the Lead" in system else "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "plan_reviewer" if "You are the plan reviewer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
+        role = "director" if "You are the Director" in system else "lead" if "You are the Lead" in system else "judge" if "You are a decision judge" in system else "scorer" if "You are a scorer" in system else "plan_reviewer" if "You are the plan reviewer" in system else "planner" if "planning engineer" in system else "verifier" if "verification engineer" in system else "builder"
         if role == "judge":
             ScriptedModel.judge_calls.append({"model": model, "messages": messages, "tools": tools, **_kwargs})
         else:
@@ -43,6 +43,8 @@ class ScriptedModel:
             return approving_plan_review(messages)
         if role == "lead" and role not in self.scripts:
             return quiet_lead(messages)
+        if role == "director" and role not in self.scripts:
+            return {"content": "", "tool_calls": [call("finish", {"summary": "Nothing to decide."})]}
         return self.scripts[role](messages)
 
     async def session_cost(self, _session_id):

@@ -187,14 +187,54 @@ def test_a_task_waiting_with_no_decision_gets_one_after_a_grace(factory, monkeyp
     assert tasks_of(oid)["T1"][0] == "queued"
 
 
+def merged(task_id, stage, **evidence):
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.merge_sha, task.stage, task.evidence = "a" * 40, stage, evidence
+
+
 def test_a_merged_task_left_with_failed_checks_is_asked_what_a_failed_smoke_asks(factory, monkeypatch):
     monkeypatch.setattr(scheduler, "UNASKED_AFTER", 0)
     oid, ids = outcome_with(factory, ("T1", "smoke_failed", []), status="attention")
+    merged(ids["T1"], "smoke")
     Orchestrator()._promote()
     [decision] = asked(oid)
     assert decision["task_id"] == ids["T1"] and decision["options"] == ["revert", "fix", "acknowledge"]
     assert decision["title"] == ("T1 was merged, and its checks after the merge failed, "
                                  "and nothing was asking what to do")
+
+
+@pytest.mark.parametrize("stage, evidence", [("revert", {}), ("revert_merge", {"revert_candidate": {"pr": 7}}),
+                                             ("smoke", {"revert_candidate": {"pr": 7}})])
+def test_a_revert_that_did_not_go_through_is_asked_about_with_answers_that_can_end_it(factory, monkeypatch, stage,
+                                                                                    evidence):
+    # Accepting cannot complete a task whose revert is under way, so the sweep does not offer it: an acknowledgement
+    # would leave the task where it is, to be asked about again.
+    monkeypatch.setattr(scheduler, "UNASKED_AFTER", 0)
+    oid, ids = outcome_with(factory, ("T1", "smoke_failed", []), status="attention")
+    merged(ids["T1"], stage, **evidence)
+    Orchestrator()._promote()
+    [decision] = asked(oid)
+    assert decision["task_id"] == ids["T1"] and decision["options"] == ["revert", "abandon"]
+    assert decision["title"] == "T1 was merged, and reverting it did not go through, and nothing was asking what to do"
+    with pytest.raises(DecisionError):
+        answer(factory, decision["id"], "acknowledge")
+    answer(factory, decision["id"], "revert")
+    with session_scope() as s:
+        task = s.get(Task, ids["T1"])
+        assert (task.status, task.stage) == ("queued", "revert")
+
+
+def test_a_supervisor_finding_about_a_task_is_not_its_decision(factory, monkeypatch):
+    # Acknowledging or dismissing the finding moves nothing: the task still needs something to answer.
+    monkeypatch.setattr(scheduler, "UNASKED_AFTER", 0)
+    oid, ids = outcome_with(factory, ("T1", "blocked", []), status="attention")
+    finding = decide(factory, oid, kind="supervisor", task_id=ids["T1"], options=("acknowledge", "dismiss"))
+    Orchestrator()._promote()
+    opened = [d for d in asked(oid) if d["id"] != finding]
+    assert [(d["kind"], d["task_id"], d["options"]) for d in opened] == [("unblock", ids["T1"], RETRY_OR_ABANDON)]
+    Orchestrator()._promote()  # and only once
+    assert len(asked(oid)) == 2 and count(oid, "decision_missing") == 1
 
 
 @pytest.mark.parametrize("kind, swept", [("budget", False), ("supervisor", True)])

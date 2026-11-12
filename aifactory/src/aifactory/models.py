@@ -983,3 +983,89 @@ class TraceState(Base):
     reserved_usd: Mapped[float] = mapped_column(Float, default=0)
     spent_usd: Mapped[float] = mapped_column(Float, default=0)
     __table_args__ = (CheckConstraint("reserved_usd >= 0 AND spent_usd >= 0", name="ck_trace_spend"),)
+
+
+class Release(Base):
+    """Immutable candidate evidence and durable lifecycle, one record per local train slot.
+
+    scheduled_slot is a canonical local date/time + IANA zone string. Using the local
+    slot rather than a UTC instant prevents a DST fold from scheduling two releases.
+    """
+    __tablename__ = "releases"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    scheduled_slot: Mapped[str] = mapped_column(String(200))
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime)
+    baseline_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    included_items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    state: Mapped[str] = mapped_column(String(40), default="scheduled", index=True)
+    decision_id: Mapped[str | None] = mapped_column(ForeignKey("decisions.id"), nullable=True)
+    control_history: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delayed_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (UniqueConstraint("repo_id", "scheduled_slot", name="uq_release_repo_slot"),)
+
+
+class ReleaseStep(Base):
+    """Intent is persisted before dispatch; an ambiguous external effect is reconciled,
+    not retried. Each explicit retry gets a new attempt and stable operation key.
+    """
+    __tablename__ = "release_steps"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    release_id: Mapped[str] = mapped_column(ForeignKey("releases.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    step: Mapped[str] = mapped_column(String(40))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    operation_key: Mapped[str] = mapped_column(String(200), unique=True)
+    state: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    external_handle: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    logs: Mapped[str] = mapped_column(Text, default="")
+    decision_id: Mapped[str | None] = mapped_column(ForeignKey("decisions.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (UniqueConstraint("release_id", "step", "attempt", name="uq_release_step_attempt"),
+                      CheckConstraint("attempt >= 1", name="ck_release_step_attempt"))
+
+
+class ReleaseTrainCursor(Base):
+    """Per-repository scheduler checkpoint; never infer a baseline from a failed train."""
+    __tablename__ = "release_train_cursors"
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    last_scheduled_slot: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    baseline_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_release_id: Mapped[str | None] = mapped_column(ForeignKey("releases.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+@event.listens_for(Release, "before_insert")
+@event.listens_for(Release, "before_update")
+@event.listens_for(ReleaseStep, "before_insert")
+@event.listens_for(ReleaseStep, "before_update")
+def _scrub_release_evidence(_mapper, connection, target) -> None:
+    from sqlalchemy import select
+    from .release_config import release_redacted
+    from .security import decrypt
+
+    secrets = tuple(decrypt(value) for value in connection.execute(
+        select(Secret.ciphertext).where(Secret.workspace_id == target.workspace_id)).scalars())
+    fields = ("config_snapshot", "included_items", "notes", "control_history") if isinstance(target, Release) else (
+        "external_handle", "logs")
+    for field in fields:
+        value = getattr(target, field)
+        if value is not None:
+            setattr(target, field, release_redacted(value, secrets))
