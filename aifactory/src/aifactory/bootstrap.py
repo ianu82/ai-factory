@@ -9,6 +9,13 @@
 It is applied idempotently at startup. Admin emails are invitations: the membership is
 created when that person signs in with MindsHub (their email is verified by MindsHub), and
 the bootstrap organization is then linked to their real MindsHub organization.
+
+``priority`` accepts a list of {"outcome": N, "priority": 0..3, "nonce": "unique-action"}.
+These operator actions target existing outcome numbers from any source in the managed
+workspace only; optional top-level ``delegated_by`` names the delegator in the audit.
+Each nonempty string nonce applies once per outcome, including when priority is already
+current. Reusing it preserves later app edits; use a new nonce to change priority again.
+Invalid entries and missing outcomes are logged and do not consume their nonces.
 """
 
 from __future__ import annotations
@@ -152,6 +159,7 @@ def apply_bootstrap() -> str | None:
     declared = cfg.get("outcomes") or []
     _cancel_declared(workspace_id, cfg.get("cancel") or [])
     _retry_declared(workspace_id, cfg.get("retry") or [])
+    _priority_declared(workspace_id, cfg.get("priority", []), cfg.get("delegated_by", ""))
     _resolve_delegated(workspace_id, cfg.get("resolve") or [], cfg.get("delegated_by", ""))
     _guidance_delegated(workspace_id, cfg.get("guidance") or [], cfg.get("delegated_by", ""))
     if declared:
@@ -283,6 +291,83 @@ def _retry_declared(workspace_id: str, items: list[dict]) -> list[str]:
             retried.append(outcome.id)
     for outcome_id in retried:  # after the commit, so open dashboards show the outcome running again
         notify(workspace_id, "outcome", outcome_id)
+    return results
+
+
+def _priority_declared(workspace_id: str, items: list[dict], delegated_by: str = "") -> list[str]:
+    """Apply {outcome: N, priority: 0..3, nonce: nonempty string} only in the managed workspace.
+
+    Like retry, nonces are outcome-scoped, not workspace-global. Even an equal-priority action
+    is acknowledged once, so restarts cannot overwrite later app edits. The mutation and audit
+    commit together. Store a SHA-256 nonce identity as well as the redacted audit value: a
+    credential-shaped nonce must remain idempotent after event redaction. Older events with
+    only a raw nonce are still recognized. Invalid entries never consume a nonce.
+    """
+    import hashlib
+
+    from sqlalchemy import update
+
+    from .events import bus, notify, record
+    from .models import Event, Outcome
+
+    results: list[str] = []
+    if not isinstance(items, list):
+        log.error("Bootstrap priority must be a list; ignoring it")
+        return results
+    for item in items:
+        if not isinstance(item, dict):
+            log.error("Bootstrap priority skipped: entry must be an object")
+            results.append("priority: invalid entry")
+            continue
+        number, priority, nonce = item.get("outcome"), item.get("priority"), item.get("nonce")
+        if (type(number) is not int or not 1 <= number <= 2**31 - 1
+                or type(priority) is not int or not 0 <= priority <= 3
+                or not isinstance(nonce, str) or not nonce.strip()):
+            log.error("Bootstrap priority skipped: invalid outcome number, priority or nonce")
+            results.append("priority: invalid outcome number, priority or nonce")
+            continue
+        # Never route priority interventions through cross-workspace delegation.
+        if item.get("workspace", workspace_id) != workspace_id:
+            log.error("Bootstrap priority #%s skipped: outside the managed workspace", number)
+            results.append(f"priority #{number}: outside the managed workspace")
+            continue
+        digest = hashlib.sha256(nonce.encode()).hexdigest()
+        with session_scope() as s:
+            # A no-op UPDATE serializes nonce checks on PostgreSQL and SQLite (which ignores
+            # SELECT FOR UPDATE). Read the current priority only after acquiring the lock.
+            s.execute(update(Outcome).where(Outcome.workspace_id == workspace_id, Outcome.number == number)
+                      .values(priority=Outcome.priority, updated_at=Outcome.updated_at)
+                      .execution_options(synchronize_session=False))
+            outcome = s.query(Outcome).filter(Outcome.workspace_id == workspace_id,
+                                               Outcome.number == number).first()
+            if outcome is None:
+                log.error("Bootstrap priority #%s skipped: no such outcome", number)
+                results.append(f"priority #{number}: no such outcome")
+                continue
+            done = any((e.data or {}).get("nonce_sha256") == digest
+                       or ("nonce_sha256" not in (e.data or {}) and (e.data or {}).get("nonce") == nonce)
+                       for e in s.query(Event).filter(
+                           Event.workspace_id == workspace_id, Event.outcome_id == outcome.id,
+                           Event.kind == "outcome_priority_changed", Event.actor == "operator"))
+            if done:
+                results.append(f"priority #{number}: already applied")
+                continue
+            old = outcome.priority
+            outcome.priority = priority
+            data = {"from": old, "to": priority, "nonce": nonce, "nonce_sha256": digest}
+            attribution = ""
+            if delegated_by:
+                data["delegated_by"] = delegated_by
+                attribution = f" (delegated by {delegated_by})"
+            payload = record(workspace_id, "outcome_priority_changed",
+                             f"Operator changed priority of #{number} from {old} to {priority}{attribution}",
+                             outcome_id=outcome.id, actor="operator", data=data, session=s, publish=False)
+            outcome_id = outcome.id
+        # Publish only after the mutation and nonce commit together: a failed commit must
+        # never leave a phantom audit entry on connected dashboards.
+        bus.publish({"type": "event", **payload})
+        notify(workspace_id, "outcome", outcome_id)
+        results.append(f"priority #{number}: changed from {old} to {priority}")
     return results
 
 
