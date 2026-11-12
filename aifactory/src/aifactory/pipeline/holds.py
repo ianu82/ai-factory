@@ -174,7 +174,7 @@ def factory_user(db) -> User:
 
 async def probe_provider(workspace_id: str, decision_id: str) -> str:
     """Test a held workspace's provider: one minimal request (no tools, no retries) to each distinct model its
-    planner, builder and verifier use. Every model answered: the hold is lifted ("lifted"), or a person resumed it
+    planner, plan reviewer, builder and verifier use. Every model answered: the hold is lifted ("lifted"), or a person resumed it
     meanwhile ("resolved"). A refusal for billing, quota or the credential leaves the hold to a person and says why
     once per reason ("refused"). Any other failure is tried again at the next interval, silently ("failed")."""
     models: list[str] = []
@@ -182,8 +182,10 @@ async def probe_provider(workspace_id: str, decision_id: str) -> str:
         settings = workspace_settings(workspace_id)
         provider = resolve_provider(workspace_id)
         chosen = workspace_models(settings, provider=provider.provider)
-        models = list(dict.fromkeys(provider.model_override or model
-                                    for model in (chosen.planner, chosen.builder, chosen.verifier)))
+        # Every model a session of the workspace may be refused on, the plan reviewer's included: a hold lifted
+        # while one of them still refuses would only open again.
+        models = list(dict.fromkeys(provider.model_override or model for model in (
+            chosen.planner, chosen.plan_reviewer, chosen.builder, chosen.verifier)))
         client = ModelClient(provider, timeout=TEST_TIMEOUT, max_retries=0, log_errors=False)
         for model in models:
             await asyncio.wait_for(client._post("/responses", {

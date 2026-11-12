@@ -387,3 +387,43 @@ def test_the_api_never_returns_the_webhook_url(world, client):
     r = client.patch(url, json={"settings": {"alerts": {"webhook_url": ""}}})  # Clear
     assert r.json()["alert_webhook"] == {"set": False, "host": ""}
     assert r.json()["settings"]["alerts"]["after_minutes"] == 60
+
+
+def test_the_webhook_goes_to_the_address_that_was_checked_not_to_a_second_lookup_of_the_name(monkeypatch):
+    from types import SimpleNamespace
+
+    from aifactory import alert_webhook
+
+    seen, lookups = {}, []
+
+    class Client:
+        def __init__(self, **options):
+            seen["client"] = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, **request):
+            seen.update(url=url, **request)
+            return SimpleNamespace(status_code=204)
+
+    def resolve(host, port, **_):
+        lookups.append(host)
+        return [(2, 1, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(alert_webhook.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(alert_webhook.httpx, "Client", Client)
+    assert alert_webhook._post("https://hooks.example.com/services/T/B?x=1", {"text": "hi"}) == 204
+    # One lookup; the request is addressed to its answer, with the name kept for the certificate and the Host header.
+    assert lookups == ["hooks.example.com"] and seen["url"] == "https://93.184.216.34:443/services/T/B?x=1"
+    assert seen["headers"] == {"Host": "hooks.example.com"}
+    assert seen["extensions"] == {"sni_hostname": "hooks.example.com"}
+    assert seen["json"] == {"text": "hi"} and seen["client"]["follow_redirects"] is False
+
+    mixed = [(2, 1, 6, "", ("93.184.216.34", 443)), (2, 1, 6, "", ("10.0.0.5", 443))]
+    monkeypatch.setattr(alert_webhook.socket, "getaddrinfo", lambda host, port, **_: mixed)
+    with pytest.raises(PermissionError):  # any private answer refuses the send
+        alert_webhook._post("https://hooks.example.com/x", {"text": "hi"})

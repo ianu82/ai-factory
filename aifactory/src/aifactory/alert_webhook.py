@@ -13,7 +13,7 @@ import logging
 import re
 import socket
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy.orm import Session
@@ -103,9 +103,16 @@ def send(url: str, text: str) -> str:
 
 
 def _post(url: str, payload: dict[str, Any]) -> int:
-    """Send it, once its host resolves only to public addresses; redirects are not followed."""
+    """Send it, once its host resolves only to public addresses. The connection goes to one of the addresses that
+    were checked, not to a second lookup of the name (which could answer differently); the name is kept for the
+    certificate and the Host header. Redirects are not followed."""
     parts = urlsplit(url)
-    infos = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
-    if not infos or not all(ipaddress.ip_address(str(info[4][0]).split("%")[0]).is_global for info in infos):
+    host, port = parts.hostname or "", parts.port or 443
+    addresses = [str(info[4][0]).split("%")[0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+    if not addresses or not all(ipaddress.ip_address(address).is_global for address in addresses):
         raise PermissionError("the webhook's host resolves to a private address")
-    return httpx.post(url, json=payload, timeout=TIMEOUT, follow_redirects=False).status_code
+    literal = f"[{addresses[0]}]" if ":" in addresses[0] else addresses[0]
+    target = urlunsplit(("https", f"{literal}:{port}", parts.path or "/", parts.query, ""))
+    with httpx.Client(timeout=TIMEOUT, follow_redirects=False) as client:
+        return client.post(target, json=payload, headers={"Host": host if port == 443 else f"{host}:{port}"},
+                           extensions={"sni_hostname": host}).status_code

@@ -71,7 +71,8 @@ class Provider:
 
 @pytest.fixture
 def held(signed_in, monkeypatch):
-    """A workspace held for credit, whose planner and builder use one model and its verifier another."""
+    """A workspace held for credit, whose planner and builder use one model, its plan reviewer the provider's
+    default for that role, and its verifier a third."""
     ws = signed_in["workspaces"][0]["id"]
     with db.session_scope() as s:
         w = s.get(Workspace, ws)
@@ -153,7 +154,7 @@ def test_the_orchestrator_tests_a_hold_beside_the_scheduler_and_remembers_when(h
 def test_every_model_answering_lifts_the_hold_as_a_resume_by_the_factory(held):
     assert asyncio.run(holds.probe_provider(held["ws"], held["hold"])) == "lifted"
     # One minimal request per distinct model of the planner, builder and verifier: no tools, no retries.
-    assert [body["model"] for _, body in Provider.sent] == ["gpt-terra", "check-model"]
+    assert [body["model"] for _, body in Provider.sent] == ["gpt-terra", "opus-5-5", "check-model"]
     assert all(path == "/responses" and body["max_output_tokens"] == holds.TEST_TOKENS and "tools" not in body
                for path, body in Provider.sent)
     assert Provider.options["max_retries"] == 0
@@ -162,7 +163,8 @@ def test_every_model_answering_lifts_the_hold_as_a_resume_by_the_factory(held):
     with db.session_scope() as s:
         d = s.get(Decision, held["hold"])
         assert (d.status, d.resolution, d.attribution) == ("resolved", "retry", {"source": "factory"})
-        assert d.comment == "The provider answered a test request (gpt-terra, check-model). Resumed by the Factory."
+        assert d.comment == ("The provider answered a test request (gpt-terra, opus-5-5, check-model). Resumed by "
+                             "the Factory.")
         factory = s.get(User, d.resolved_by)
         assert (factory.name, factory.email, factory.is_system) == ("Factory", holds.FACTORY_EMAIL, True)
         assert serializers.decision(d)["resolved_by_name"] == "Factory"
@@ -170,8 +172,9 @@ def test_every_model_answering_lifts_the_hold_as_a_resume_by_the_factory(held):
         [resolved] = s.query(Event).filter_by(workspace_id=held["ws"], kind="decision_resolved").all()
         assert resolved.actor == factory.id and resolved.data["source"] == "factory"
     [(level, message, data)] = events(held, "provider_hold_lifted")
-    assert level == "success" and "(gpt-terra, check-model)" in message
-    assert data == {"decision_id": held["hold"], "models": ["gpt-terra", "check-model"], "source": "factory"}
+    assert level == "success" and "(gpt-terra, opus-5-5, check-model)" in message
+    assert data == {"decision_id": held["hold"], "models": ["gpt-terra", "opus-5-5", "check-model"],
+                    "source": "factory"}
 
 
 def test_a_billing_or_credential_refusal_leaves_the_hold_and_says_why_once_per_reason(held):
