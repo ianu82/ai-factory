@@ -20,7 +20,8 @@ from .. import merge_manager
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..models import Decision, Event, Outcome, Plan, Run, Signal, Task, User, Workspace
+from ..models import Decision, Event, Outcome, Plan, Run, Signal, Task, User, Workspace, Workstream
+from ..outcome_settings import effective_priority
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
@@ -904,27 +905,37 @@ class Orchestrator:
             open_by_ws: dict[str, int] = {}
             fresh: dict[str, tuple[str, str]] = {}  # never planned: id -> (workspace, blocked_reason)
             capped: set[str] = set()  # the fresh outcomes the cap applies to
+            planning_rows = (s.query(Outcome, planned, Signal.source).outerjoin(Signal, Signal.id == Outcome.signal_id)
+                             .filter(Outcome.source != "review", Outcome.status.in_(ACTIVE_OUTCOME)).all())
+            queued_rows = (s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
+                           .filter(Outcome.source != "review", Task.status == "queued").all())
+            # Scheduling only needs priority: batch referenced streams once, not full settings per outcome.
+            stream_ids = {o.workstream_id for o in [*(o for o, _, _ in planning_rows),
+                                                   *(o for _, o in queued_rows)] if o.workstream_id}
+            streams = {(w.workspace_id, w.id): w for w in
+                       s.query(Workstream).filter(Workstream.id.in_(stream_ids))} if stream_ids else {}
+
+            def priority(o):
+                return effective_priority(o, streams.get((o.workspace_id, o.workstream_id)))
+
             planning = []
-            for o, was_planned, signal_source in (
-                    s.query(Outcome, planned, Signal.source).outerjoin(Signal, Signal.id == Outcome.signal_id)
-                    .filter(Outcome.source != "review", Outcome.status.in_(ACTIVE_OUTCOME))):
+            for o, was_planned, signal_source in planning_rows:
                 first = o.status == "planning" and not was_planned and o.id not in self._planning
                 if not first:
                     open_by_ws[o.workspace_id] = open_by_ws.get(o.workspace_id, 0) + 1
                 if o.status != "planning":
                     continue
-                planning.append(Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at))
+                planning.append(Candidate(o.id, o.workspace_id, priority(o), o.created_by, o.created_at))
                 if first:
                     fresh[o.id] = (o.workspace_id, o.blocked_reason or "")
-                    if o.priority >= NORMAL_PRIORITY and not {o.source, signal_source} & REPAIR_SOURCES:
+                    if priority(o) >= NORMAL_PRIORITY and not {o.source, signal_source} & REPAIR_SOURCES:
                         capped.add(o.id)
-            queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
+            queued = [Candidate(t.id, t.workspace_id, priority(o), o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
                                 and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"},
                                 outcome_created_at=o.created_at)
-                      for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
-                      .filter(Outcome.source != "review", Task.status == "queued")
+                      for t, o in queued_rows
                       # A task requeued after an infrastructure failure waits out its backoff.
                       if ((t.evidence or {}).get("infra_retry_at") or "") <= now]
             # The merge manager hands out one merge turn per repository; the rest wait without a slot.

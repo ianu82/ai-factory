@@ -17,9 +17,11 @@ import re
 import shlex
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from ..outcome_settings import current_settings, resolve_settings
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
@@ -353,7 +355,7 @@ class TaskRunner:
             repo = s.get(Repository, task.repo_id)
             self.repo = Repository(**{c.name: getattr(repo, c.name) for c in Repository.__table__.columns})
         self.ws = self.task.workspace_id
-        self.settings = workspace_settings(self.ws)
+        self.settings = current_settings(self.task.outcome_id, repo_id=self.task.repo_id).settings
         self.cfg = self.repo.config or {}
 
     def update(self, **fields: Any) -> None:
@@ -779,6 +781,7 @@ class TaskRunner:
                                     {"value": "take_over", "label": "I'll take it from here"},
                                     {"value": "abandon", "label": "Abandon task"}])
             self.update(attempt=attempt)
+            self._refresh_settings()
             budget = self.settings["budgets"].get("outcome_usd")
             # Spending whose cost is known is a lower bound, so reaching the budget with it alone is conclusive.
             spent, _ = outcome_committed(self.task.outcome_id)  # including what a running Lead has reserved
@@ -837,7 +840,7 @@ class TaskRunner:
                     self._infrastructure(attempt, "prepare", error, infrastructure_problem(
                         error, "transient" if isinstance(exc, NoVM) else None))
             self._describe_tree(attempt)
-            self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
+            self.stage("build", f"Attempt {attempt}: building with {self.settings['harness']['builder']}")
             sections = await self._sections()
             if identity != self._steward_identity():
                 self._steward_question("Steward authorization changed during preparation",
@@ -850,7 +853,7 @@ class TaskRunner:
                 spec = SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                     effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
-                    harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
+                    harness=self.settings["harness"]["builder"], system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
                     expected_findings=[f["id"] for f in findings] or None,
                     prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
                                         precedents(self.ws, self.repo.id),
@@ -1068,7 +1071,7 @@ class TaskRunner:
         # independent verification; nothing the builder left running (databases, dev servers) may compete
         # with the verifier for processes or ports.
         await self.builder.kill_all()
-        self.stage("verify", f"Independent verification by a fresh {self.task.verifier_harness} session")
+        self.stage("verify", f"Independent verification by a fresh {self.settings['harness']['verifier']} session")
         verdict = await self._verify(token, patch, attempt)
         if verdict is None:
             if identity is not None and identity["action"] == "revert":
@@ -1427,6 +1430,7 @@ class TaskRunner:
         error = ""
         previous = self._previous_review(patch)
         for tries in range(2):
+            self._refresh_settings()
             sandbox = None
             app: AppRun | None = None
             result = None
@@ -1446,7 +1450,7 @@ class TaskRunner:
                     sections = await self._sections(verifier=True)
                     run, result, error = await self._session(attempt, "verify", SessionSpec(
                         workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
-                        harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
+                        harness=self.settings["harness"]["verifier"], system=verifier_system(self.task.base_sha), sandbox=sandbox,
                         attempt=attempt, writable=False, effective_settings=self.settings,
                         repositories={self.repo.full_name: self.cfg},
                         expected_criteria=list(self.task.acceptance or []),
@@ -1572,6 +1576,10 @@ class TaskRunner:
     async def _session(self, attempt: int, phase: str, spec: SessionSpec):
         """One builder or verifier session (run_agent). A provider that refuses before the session starts (no valid
         credential: there is no run yet) holds the workspace as a refusal inside the session does."""
+        # Preparation may take minutes. Resolve at the session boundary, not only before setup;
+        # an already-running session keeps its immutable snapshot and is never restarted.
+        self._refresh_settings()
+        spec = replace(spec, harness=self.settings["harness"][spec.role], effective_settings=self.settings)
         try:
             return await run_agent(spec, self.cancelled)
         except Exception as exc:
@@ -2787,18 +2795,17 @@ class TaskRunner:
         return "\n\n" + "\n".join(lines)
 
     # merge ---------------------------------------------------------------------
+    def _refresh_settings(self) -> None:
+        # Snapshot only for the next session; never rewrite stored or terminal tasks.
+        self.settings = current_settings(self.task.outcome_id, repo_id=self.task.repo_id).settings
+
     def _merge_needs_approval(self, settings: dict[str, Any] | None = None) -> bool:
         from ..onboarding_policy import active
 
-        settings = workspace_settings(self.ws) if settings is None else settings
-        if active(settings) or _review_asks(getattr(self, "task", None), settings, self.cfg):
-            return True
-        merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
-        release_cfg = self.cfg.get("release") or {}
-        releases_on_merge = release_cfg.get("mode") == "on_merge"
-        if releases_on_merge and settings["autonomy"].get("release") == "approval":
-            return True
-        return merge_policy != "auto"
+        settings = (current_settings(self.task.outcome_id, repo_id=self.task.repo_id).settings
+                    if settings is None else settings)
+        return (active(settings) or _review_asks(self.task, settings, self.cfg)
+                or settings["autonomy"]["merge"] != "auto")
 
     def _require_merge_approval(self) -> None:
         if self._merge_needs_approval() and not self._approved("approve_merge"):
@@ -2833,15 +2840,16 @@ class TaskRunner:
 
     def _merge_under_workspace_lock(self, gh: GitHub, method: str) -> dict[str, Any] | None:
         from ..onboarding_policy import lock_workspace
-        from .runtime import merged_settings
 
         with session_scope() as s:
-            ws = lock_workspace(s, self.ws)
+            lock_workspace(s, self.ws)
             task = s.get(Task, self.task_id)
             # The last check before the merge, which cannot be taken back: the task must still be this runner's.
             if self.cancelled.is_set() or not self._holds(s, task):
                 raise Stop()
-            if self._merge_needs_approval(merged_settings(ws.settings)) and not self._approved("approve_merge"):
+            outcome = s.get(Outcome, task.outcome_id)
+            policy = resolve_settings(s, outcome, repo_id=task.repo_id)
+            if self._merge_needs_approval(policy.settings) and not self._approved("approve_merge"):
                 return None
 
             self._guard_steward_candidate()

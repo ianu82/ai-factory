@@ -155,6 +155,10 @@ def create(db: Session, workspace_id: str, member: Membership, user: User, body:
 
 
 def update(db: Session, stream: Workstream, member: Membership, user: User, body: WorkstreamUpdate) -> dict:
+    from .onboarding_policy import lock_workspace
+
+    lock_workspace(db, stream.workspace_id)
+    db.refresh(stream)
     _authorize(member, stream.owner_id)
     values = body.model_dump(exclude_unset=True)
     # Members cannot hand their streams to someone else to bypass ownership controls.

@@ -666,6 +666,8 @@ class RepoReleaseSelection(BaseModel):
 
 class RepoCommands(BaseModel):
     preview_qa: Any = None
+    plan: dict[str, Any] | None = None
+    merge: dict[str, Any] | None = None
     review: dict[str, Any] | None = None
     setup: list[str] | None = None
     checks: list[str] | None = None
@@ -747,6 +749,15 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
     for key in ("context", "signal_label"):
         if key in patch:
             cfg[key] = str(patch[key] or "")[:8000]
+    for policy in ("plan", "merge"):
+        if policy not in patch:
+            continue
+        if not isinstance(patch[policy], dict):
+            raise HTTPException(422, f"{policy} must be an object")
+        mode = patch[policy].get("mode")
+        if mode is not None and mode not in ("auto", "approval"):
+            raise HTTPException(422, f"{policy}.mode must be auto, approval or null")
+        cfg[policy] = {**(current.get(policy) or {}), **patch[policy]}
     if "merge" in patch:
         if not isinstance(patch["merge"], dict):
             raise HTTPException(422, "merge must be an object")
@@ -867,6 +878,7 @@ class RepoUpdate(BaseModel):
 def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = Depends(current_user),
                 db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
+    # This is the same Workspace row locked by automatic plan approval and the final merge gate.
     definitions.lock_workspace(db, workspace_id)
     definitions.lock_repositories(db, workspace_id)
     repo = db.get(Repository, repo_id)
@@ -1120,7 +1132,10 @@ def outcome_detail(workspace_id: str, outcome_id: str, user: User = Depends(curr
     messages = db.query(Message).filter(Message.outcome_id == o.id).order_by(Message.created_at).all()
     events = (db.query(Event).filter(Event.outcome_id == o.id).order_by(Event.id.desc()).limit(400).all())[::-1]
     open_count = sum(S.actionable(d) for d in decisions)
+    from .outcome_settings import resolve_settings
+
     return {
+        "effective_settings": resolve_settings(db, o).as_dict(),
         "guidance": outcome_guidance(db, workspace_id, o.id),
         "outcome": S.outcome(o, tasks, runs, open_count, S.outcome_sources(db, [o]).get(o.signal_id))
                    | {"created_by_name": _creator(db, users.get(o.created_by or "", ""), o)},

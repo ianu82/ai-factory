@@ -2658,7 +2658,6 @@ def test_plan_approval_uses_policy_after_planner_returns(factory):
     {"merge": {"mode": "auto"}, "release": {"mode": "on_merge"}},
 ])
 def test_applied_preset_does_not_bypass_stricter_repository_controls(factory, repo_config):
-    from types import SimpleNamespace
     from aifactory.onboarding_policy import begin
 
     with session_scope() as s:
@@ -2667,8 +2666,10 @@ def test_applied_preset_does_not_bypass_stricter_repository_controls(factory, re
         settings["learning"] = {**settings["learning"], "status": "applied"}
         settings["autonomy"] = settings["learning"]["preset"]
         ws.settings = settings
-    runner = SimpleNamespace(ws=factory["ws"], cfg=repo_config)
-    assert delivery.TaskRunner._merge_needs_approval(runner) is True
+    runner = merge_gate_runner(factory)
+    with session_scope() as s:
+        s.get(Repository, factory["repo"]).config = repo_config
+    assert runner._merge_needs_approval() is True
 
 
 def test_learning_activation_at_plan_approval_boundary_requires_a_person(factory, monkeypatch):
@@ -5587,3 +5588,266 @@ def test_checks_and_smoke_run_holding_a_host_check_slot(factory, monkeypatch):
     assert outcome_status(outcome_id) == "completed"
     assert ("check", 1) in held and ("smoke", 1) in held, held
     assert all(running == 1 for kind, running in held if kind in ("check", "smoke")), held
+
+
+def attach_stream(factory, outcome_id, **overrides):
+    from aifactory.models import Workstream
+
+    with session_scope() as s:
+        stream = Workstream(workspace_id=factory["ws"], slug="platform", name="Platform", goal="Ship",
+                            owner_id=factory["user"], **overrides)
+        s.add(stream)
+        s.flush()
+        s.get(Outcome, outcome_id).workstream_id = stream.id
+        return stream.id
+
+
+def test_workstream_workers_materialize_and_refresh_without_rewriting_tasks(factory, monkeypatch):
+    from aifactory.harness import get_harness
+    from aifactory.models import Workstream
+
+    seen = []
+    native = get_harness("native")
+
+    def harness(name):
+        seen.append(name)
+        return native
+
+    monkeypatch.setattr(runtime, "get_harness", harness)
+    outcome_id = new_outcome(factory)
+    sid = attach_stream(factory, outcome_id, worker_override="codex")
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    assert seen and set(seen) == {"codex"}
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.harness == task.verifier_harness == "codex"
+        task_id = task.id
+        s.get(Workstream, sid).worker_override = "anton"
+    seen.clear()
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    asyncio.run(runner.run())
+    assert seen == ["anton", "anton"]  # separate builder and fresh independent verifier
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "waiting_ci"
+        assert task.harness == task.verifier_harness == "codex"
+        runs = s.query(Run).filter(Run.task_id == task_id).all()
+        assert {r.role for r in runs} == {"builder", "verifier"}
+        assert len({r.id for r in runs}) == 2
+
+
+@pytest.mark.parametrize("phase", ["planning", "delivery"])
+def test_workstream_budget_blocks_new_sessions(factory, phase):
+    outcome_id = new_outcome(factory)
+    if phase == "delivery":
+        asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    attach_stream(factory, outcome_id, outcome_budget_override=1)
+    with session_scope() as s:
+        s.add(Run(workspace_id=factory["ws"], outcome_id=outcome_id, role="planner", harness="native",
+                  cost_usd=2, cost_known=True, status="completed"))
+        s.query(Run).filter_by(outcome_id=outcome_id).update({"cost_known": True})
+        previous = s.query(Run).filter_by(outcome_id=outcome_id).count()
+        task_id = s.query(Task.id).filter_by(outcome_id=outcome_id).scalar()
+    if phase == "planning":
+        asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    else:
+        asyncio.run(delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock()).run())
+    with session_scope() as s:
+        assert s.query(Run).filter_by(outcome_id=outcome_id).count() == previous
+        decision = s.query(Decision).filter_by(outcome_id=outcome_id, kind="budget", status="open").one()
+        assert "$1" in decision.title + decision.body
+
+
+@pytest.mark.parametrize("source", ["workstream", "repository", "reassignment"])
+def test_current_plan_policy_after_review_requires_approval(factory, source):
+    from aifactory.models import Workstream
+
+    outcome_id = new_outcome(factory)
+    sid = attach_stream(factory, outcome_id)
+    def reviewer(messages):
+        with session_scope() as s:
+            if source == "workstream":
+                s.get(Workstream, sid).plan_approval_override = "approval"
+            elif source == "repository":
+                repo = s.get(Repository, factory["repo"])
+                repo.config = {**repo.config, "plan": {"mode": "approval"}}
+            else:
+                other = Workstream(workspace_id=factory["ws"], slug="restricted", name="Restricted", goal="Safe",
+                                   owner_id=factory["user"], plan_approval_override="approval")
+                s.add(other)
+                s.flush()
+                s.get(Outcome, outcome_id).workstream_id = other.id
+        return {"content": "", "tool_calls": [call("finish", {"verdict": "approve", "summary": "Ready", "findings": []})]}
+    ScriptedModel.scripts["plan_reviewer"] = reviewer
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    with session_scope() as s:
+        assert s.get(Outcome, outcome_id).status == "awaiting_approval"
+        assert s.query(Task).filter_by(outcome_id=outcome_id).count() == 0
+        assert s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_plan", status="open").count() == 1
+
+
+@pytest.mark.parametrize("source", ["workstream", "repository", "reassignment"])
+def test_current_merge_policy_under_final_lock_requires_approval(factory, monkeypatch, source):
+    from aifactory import onboarding_policy
+    from aifactory.models import Workstream
+
+    from aifactory import api, workstreams
+
+    runner = merge_gate_runner(factory)
+    sid = attach_stream(factory, runner.task.outcome_id)
+    original_lock = onboarding_policy.lock_workspace
+    changed = False
+    def change_before_lock(s, wid):
+        nonlocal changed
+        if changed:
+            return original_lock(s, wid)
+        changed = True
+        with session_scope() as current:
+            user = current.get(User, factory["user"])
+            if source == "workstream":
+                api.update_workstream(wid, sid, workstreams.WorkstreamUpdate(merge_approval_override="approval"),
+                                      user=user, db=current)
+            elif source == "repository":
+                api.update_repo(wid, factory["repo"], api.RepoUpdate(config={"merge": {"mode": "approval"}}),
+                                user=user, db=current)
+            else:
+                other = Workstream(workspace_id=wid, slug="restricted", name="Restricted", goal="Safe",
+                                   owner_id=factory["user"], merge_approval_override="approval")
+                current.add(other)
+                current.flush()
+                current.get(Outcome, runner.task.outcome_id).workstream_id = other.id
+        return original_lock(s, wid)
+    monkeypatch.setattr(onboarding_policy, "lock_workspace", change_before_lock)
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner._serialized_merge(FakeGitHub("token"), "squash"))
+    assert FakeGitHub.merged == []
+    with session_scope() as s:
+        assert s.get(Task, runner.task_id).status == "awaiting_approval"
+        assert s.query(Decision).filter_by(task_id=runner.task_id, kind="approve_merge", status="open").count() == 1
+
+
+def test_workstream_plan_approval_waits_without_reviewer(factory):
+    outcome_id = new_outcome(factory)
+    attach_stream(factory, outcome_id, plan_approval_override="approval")
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    with session_scope() as s:
+        assert s.get(Outcome, outcome_id).status == "awaiting_approval"
+        assert s.query(Run).filter_by(outcome_id=outcome_id, role="plan_reviewer").count() == 0
+
+
+@pytest.mark.parametrize("source", ["workstream", "repository"])
+def test_policy_write_committed_before_final_plan_lock_requires_approval(factory, monkeypatch, source):
+    from aifactory import api, workstreams
+
+    outcome_id = new_outcome(factory)
+    sid = attach_stream(factory, outcome_id)
+    original_lock = planning.lock_workspace
+
+    def change_before_lock(s, wid):
+        with session_scope() as current:
+            user = current.get(User, factory["user"])
+            if source == "workstream":
+                api.update_workstream(wid, sid, workstreams.WorkstreamUpdate(plan_approval_override="approval"),
+                                      user=user, db=current)
+            else:
+                api.update_repo(wid, factory["repo"], api.RepoUpdate(config={"plan": {"mode": "approval"}}),
+                                user=user, db=current)
+        return original_lock(s, wid)
+
+    monkeypatch.setattr(planning, "lock_workspace", change_before_lock)
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    with session_scope() as s:
+        assert s.get(Outcome, outcome_id).status == "awaiting_approval"
+        assert s.query(Task).filter_by(outcome_id=outcome_id).count() == 0
+
+
+@pytest.mark.parametrize("source", ["workstream", "repository"])
+def test_policy_writers_share_final_merge_workspace_lock(factory, source):
+    """Exercise the real policy writers, including PostgreSQL's row-lock behavior."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event as ThreadEvent
+
+    from sqlalchemy import event
+    from aifactory import api, workstreams
+
+    runner = merge_gate_runner(factory)
+    sid = attach_stream(factory, runner.task.outcome_id)
+    merging, release, attempting, committed = (ThreadEvent() for _ in range(4))
+
+    class GitHub:
+        async def merge(self, *args, **kwargs):
+            merging.set()
+            await asyncio.to_thread(release.wait)
+            assert not committed.is_set()
+            return {"sha": "merged"}
+
+    def write_policy():
+        with session_scope() as s:
+            user = s.get(User, factory["user"])
+            if source == "workstream":
+                api.update_workstream(factory["ws"], sid,
+                                      workstreams.WorkstreamUpdate(merge_approval_override="approval"), user=user, db=s)
+            else:
+                api.update_repo(factory["ws"], factory["repo"],
+                                api.RepoUpdate(config={"merge": {"mode": "approval"}}), user=user, db=s)
+        committed.set()
+
+    def observe_lock(conn, cursor, statement, parameters, context, executemany):
+        sql = statement.lower()
+        if merging.is_set() and (sql.startswith("update workspaces") or
+                                 ("from workspaces" in sql and "for update" in sql)):
+            attempting.set()
+
+    with session_scope() as s:
+        engine = s.get_bind()
+    event.listen(engine, "before_cursor_execute", observe_lock)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            async def go():
+                merge = asyncio.create_task(runner._serialized_merge(GitHub(), "squash"))
+                writer = None
+                try:
+                    assert await asyncio.to_thread(merging.wait, 5)
+                    writer = pool.submit(write_policy)
+                    assert await asyncio.to_thread(attempting.wait, 5)
+                    assert not committed.is_set()
+                finally:
+                    release.set()
+                    assert await merge == {"sha": "merged"}
+                if writer:
+                    await asyncio.wrap_future(writer)
+            asyncio.run(go())
+    finally:
+        release.set()
+        event.remove(engine, "before_cursor_execute", observe_lock)
+    assert committed.is_set()
+
+
+def test_workstream_edit_during_builder_only_changes_the_next_session(factory, monkeypatch):
+    from aifactory.harness import get_harness
+    from aifactory.models import Workstream
+
+    native, seen = get_harness("native"), []
+    def harness(name):
+        seen.append(name)
+        return native
+    monkeypatch.setattr(runtime, "get_harness", harness)
+    outcome_id = new_outcome(factory)
+    sid = attach_stream(factory, outcome_id, worker_override="codex")
+    asyncio.run(planning.plan_outcome(outcome_id, asyncio.Event()))
+    seen.clear()
+    def builder(messages):
+        if step(messages) == 0:
+            with session_scope() as s:
+                s.get(Workstream, sid).worker_override = "anton"
+        return good_builder(messages)
+    ScriptedModel.scripts["builder"] = builder
+    with session_scope() as s:
+        task_id = s.query(Task.id).filter_by(outcome_id=outcome_id).scalar()
+    asyncio.run(delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock()).run())
+    assert seen == ["codex", "anton"]
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.harness == task.verifier_harness == "codex"
+        assert {(r.role, r.harness) for r in s.query(Run).filter_by(task_id=task_id)} == {
+            ("builder", "codex"), ("verifier", "anton")}

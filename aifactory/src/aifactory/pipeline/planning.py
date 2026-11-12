@@ -21,12 +21,13 @@ from ..github import resolve_credential as resolve_token
 from ..gitops import checkout
 from ..models import Decision, Event, Outcome, Plan, Repository, Run, Task
 from ..onboarding_policy import lock_workspace
+from ..outcome_settings import current_settings, resolve_settings
 from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
 from . import delivery
 from .holds import open_provider_hold
 from .runtime import (SessionSpec, carried_cause, guidance_history, open_decision, outcome_committed, precedents,
-                      run_agent, set_outcome, merged_settings, workspace_settings)
+                      run_agent, set_outcome)
 
 log = logging.getLogger(__name__)
 
@@ -157,13 +158,13 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                       options=[{"value": "retry", "label": "Retry planning"},
                                {"value": "cancel", "label": "Cancel outcome"}])
         return
-    settings = workspace_settings(workspace_id)
+    settings = current_settings(outcome_id).settings
     # Replans (a person's revision or answer, a judge's answer, a retry) keep the outcome's earlier spending, so the
     # budget is checked before the first session too. A person who continues anyway allows one more planning run.
     continued = _continued_past_budget(outcome_id)
 
     def over_budget() -> str:
-        return "" if continued else _over_budget(outcome_id, settings)
+        return "" if continued else _over_budget(outcome_id, current_settings(outcome_id).settings)
 
     if over := over_budget():
         set_outcome(outcome_id, status="blocked", blocked_reason=f"{over}; planning stopped.")
@@ -173,7 +174,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
                       outcome_id=outcome_id, options=[{"value": "retry", "label": "Continue anyway"},
                                                       {"value": "cancel", "label": "Cancel outcome"}])
         return
-    harness_name = snapshot.harness or settings["harness"].get("planner") or "native"
+    harness_name = settings["harness"]["planner"]
     # Automatic approval means the plan reviewer approves; with "approve first" a person reviews instead.
     reviewed = settings["autonomy"].get("plan") == "auto"
     record(workspace_id, "planning_started", f"Planning outcome #{snapshot.number}", outcome_id=outcome_id)
@@ -196,6 +197,8 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         for revisions in range(PLAN_REVIEW_ROUNDS + 1):
             if revisions and (stopped := over_budget()):
                 break  # every round starts two sessions: a revision must not overrun the outcome's budget
+            settings = current_settings(outcome_id).settings
+            harness_name = settings["harness"]["planner"]
             prompt = plan_prompt(snapshot, repos, decisions, guidance_history(outcome_id), work, revision)
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=workspace_id, outcome_id=outcome_id, task_id=None, role="planner", harness=harness_name,
@@ -324,6 +327,8 @@ async def _review(outcome: Outcome, repos: list[Repository], decisions: list[Any
     """Review one plan in the planner's checkout. A review that cannot finish never approves. Also returns the error
     and its cause ("provider" or "transient") when the provider or the sandbox failed the review session, as
     delivery.infrastructure_problem reads it; None when the review finished or failed on its own."""
+    settings = current_settings(outcome.id).settings
+    harness_name = settings["harness"]["planner"]
     prompt = plan_review_prompt(outcome, repos, decisions, guidance_history(outcome.id), work, report)
     try:
         run, result, error = await run_agent(SessionSpec(
@@ -388,19 +393,20 @@ def _approve(s: Session, plan_id: str, approved_by: str | None) -> tuple[bool, s
     if outcome.source == "review":
         raise ValueError("Review outcomes cannot be planned")
     workspace_id = outcome.workspace_id
-    ws = lock_workspace(s, workspace_id)
+    lock_workspace(s, workspace_id)
+    s.refresh(outcome)
     s.refresh(plan)
     if plan.status == "approved":
         return True, None, None
-    settings = merged_settings(ws.settings)
+    settings = resolve_settings(s, outcome).settings
     if approved_by is None and settings["autonomy"].get("plan") != "auto":
         return False, None, None
     repos = {r.full_name.lower(): r for r in s.query(Repository).filter(Repository.workspace_id == workspace_id)}
     plan.status = "approved"
     plan.approved_by = approved_by
     plan.approved_at = utcnow()
-    builder = outcome.harness or settings["harness"].get("builder") or "native"
-    verifier = outcome.harness or settings["harness"].get("verifier") or builder
+    builder = settings["harness"]["builder"]
+    verifier = settings["harness"]["verifier"]
     for item in plan.content.get("tasks", []):
         repo = repos.get(item["repo"].lower())
         s.add(Task(workspace_id=workspace_id, outcome_id=outcome.id, plan_id=plan.id, key=item["key"][:20],

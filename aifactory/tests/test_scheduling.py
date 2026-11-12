@@ -715,3 +715,67 @@ def test_a_resumption_still_precedes_new_work_from_an_older_outcome(queue, monke
             await jobs.stop()
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("count", [1, 20])
+@pytest.mark.parametrize("phase", ["planning", "delivery"])
+def test_workstream_priority_uses_one_batch_per_tick(queue, monkeypatch, count, phase):
+    from sqlalchemy import event
+    from aifactory.models import Workstream
+
+    set_limit(monkeypatch, phase, 1)
+    low = queue(phase, priority=1)
+    candidates = [queue(phase, priority=3) for _ in range(count)]
+    with session_scope() as s:
+        stream = Workstream(workspace_id="w1", slug="urgent", name="Urgent", goal="Ship", owner_id="a", priority_override=0)
+        s.add(stream)
+        s.flush()
+        for item_id in candidates:
+            oid = item_id if phase == "planning" else s.get(Task, item_id).outcome_id
+            s.get(Outcome, oid).workstream_id = stream.id
+        engine = s.get_bind()
+    statements = []
+    def observe(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement.lower())
+    async def go():
+        jobs = Jobs(monkeypatch)
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            await jobs.tick()
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        try:
+            assert jobs.started == [candidates[0]]
+            assert low not in jobs.started
+            assert sum("from workstreams" in sql for sql in statements) == 1
+            assert sum("workspaces.settings" in sql for sql in statements) == 1
+        finally:
+            await jobs.stop()
+    asyncio.run(go())
+
+
+def test_workstream_urgent_priority_bypasses_open_cap_without_changing_stored_priority(queue, monkeypatch):
+    from aifactory.models import Workstream
+
+    set_limit(monkeypatch, "planning", 1)
+    cap("w1", 1)
+    opened(1)
+    urgent, normal = queue(priority=3), queue(priority=2)
+    with session_scope() as s:
+        stream = Workstream(workspace_id="w1", slug="urgent", name="Urgent", goal="Repair", owner_id="a",
+                            priority_override=0)
+        s.add(stream)
+        s.flush()
+        s.get(Outcome, urgent).workstream_id = stream.id
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [urgent]
+            assert waits(normal)[0]
+            with session_scope() as s:
+                assert s.get(Outcome, urgent).priority == 3
+        finally:
+            await jobs.stop()
+    asyncio.run(go())

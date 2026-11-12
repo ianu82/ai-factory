@@ -48,11 +48,6 @@ def test_guided_final_steps(client, signed_in, plan, merge):
     for key, value in before.items():
         if key not in ("autonomy", "budgets", "learning"):
             assert settings[key] == value
-    # Exercise the actual delivery policy, not a copy of its logic.
-    runtime = SimpleNamespace(cfg={"release": {"mode": "on_merge"}}, ws=wid)
-    assert TaskRunner._merge_needs_approval(runtime) is True
-    runtime.cfg = {"release": {"mode": "none"}}
-    assert TaskRunner._merge_needs_approval(runtime) is True  # learning overrides the desired preset
     for step in ("autonomy", "team"):
         assert client.patch(base + "/onboarding", json={"action": "complete", "step": step, "acknowledged": True}).status_code == 200
     members = client.get(base + "/members").json()
@@ -66,6 +61,13 @@ def test_guided_final_steps(client, signed_in, plan, merge):
     first = client.post(base + "/outcomes", json=draft)
     assert first.status_code == 200
     oid = first.json()["id"]
+    # Exercise the actual delivery policy with persisted outcome/repository inputs.
+    runtime = SimpleNamespace(task=SimpleNamespace(outcome_id=oid, repo_id=rid), cfg={}, ws=wid)
+    assert TaskRunner._merge_needs_approval(runtime) is True
+    with db.session_scope() as s:
+        repo = s.get(Repository, rid)
+        repo.config = {**repo.config, "release": {"mode": "none"}}
+    assert TaskRunner._merge_needs_approval(runtime) is True  # learning overrides the desired preset
     # Simulate losing the create response: retry the same draft before saving progress.
     retry = client.post(base + "/outcomes", json=draft)
     assert retry.status_code == 200
