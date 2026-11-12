@@ -194,6 +194,21 @@ def test_the_same_failure_across_outcomes_is_one_alert(world, client):
     assert shown["title"] == "The same failure on 2 outcomes in the last day"
 
 
+def test_one_outage_in_different_phases_is_one_repeated_failure(world, client):
+    with db.session_scope() as s:
+        other = Outcome(workspace_id=world["ws"], number=8, title="Other", status="running")
+        s.add(other)
+        s.flush()
+        for outcome_id, phase in ((world["outcome"], "Implementation"), (other.id, "Independent verification")):
+            s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", status="resolved",
+                           title="T1: infrastructure problem", options=[],
+                           body=f"{phase} failed 3 times in a row for reasons outside the change. Last error:\n\n"
+                                "Sandbox 4f3a2b1c9d did not start"))
+    assert watch.run()["shown"] == 1
+    [shown] = alerts(client, world)
+    assert shown["body"] == "infrastructure problem: Sandbox … did not start"
+
+
 def test_a_dismissed_alert_stays_dismissed_while_its_condition_lasts(world, client):
     late = decision(world, age=timedelta(hours=3))
     watch.run()

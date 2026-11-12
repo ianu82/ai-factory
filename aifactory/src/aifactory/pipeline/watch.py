@@ -202,9 +202,16 @@ def _failures(s, workspace_id: str, now: datetime) -> dict[str, dict[str, Any]]:
         if OWN_FAILURE.search(d.title or ""):
             continue
         title = reason_of(d.title)
-        add(f"{title}: {reason_of(d.body)}" if NO_CAUSE.match(title) else title, d.task_id, d.outcome_id,
-            d.created_at)
+        add(f"{title}: {_cause(d.body)}" if NO_CAUSE.match(title) else title, d.task_id, d.outcome_id, d.created_at)
     return seen
+
+
+def _cause(body: str | None) -> str:
+    """The cause a decision with a cause-less title gives in its body: what follows "Last error:" (an infrastructure
+    problem's body opens with the phase that failed, which differs for one outage), else its first line."""
+    text = body or ""
+    at = text.rfind("Last error:")
+    return reason_of(text[at + len("Last error:"):] if at >= 0 else text)
 
 
 def reason_of(text: str | None) -> str:
