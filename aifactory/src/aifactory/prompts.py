@@ -72,8 +72,9 @@ When done, call finish with your review."""
 
 BUILDER = """You are a senior software engineer in an autonomous software factory.
 
-You are implementing one task in a fresh checkout of the repository. Deliver a complete,
-production-quality change that satisfies every acceptance criterion.
+You are implementing one task in a checkout of the repository; "State of your working tree" in the task says
+what that checkout already holds. Deliver a complete, production-quality change that satisfies every
+acceptance criterion.
 
 How to work:
 - Read the relevant code first; follow the repository's conventions, style and architecture.
@@ -238,6 +239,37 @@ def review_findings(findings: list[dict[str, Any]], more: int = 0) -> list[str]:
     return lines
 
 
+def working_tree(tree: dict[str, Any]) -> str:
+    """What the builder's checkout holds as its session starts, in a sentence or two. ``tree`` is what the runner
+    recorded while preparing it: ``from`` ("default": a checkout of the default branch; "branch": the pull request's
+    branch), ``sha`` (the default branch's commit under it), ``pushed`` (how the pull request's earlier change sits
+    in a branch checkout), and ``changes`` of ``attempt``: "left" by it in this same checkout, "restored" from its
+    saved diff, or "lost" with the sandbox it ran in."""
+    sha, default, changes = str(tree.get("sha") or "")[:12], tree.get("default"), tree.get("changes")
+    branch = tree.get("from") == "branch"
+    if branch:
+        text = f"The pull request's branch `{tree.get('branch')}`, on top of the default branch `{default}` at `{sha}`"
+        text += {
+            "commits": f": everything already pushed to the pull request is in it as commits (see `git diff {sha}`).",
+            "uncommitted": ": the pull request's earlier change is in it as uncommitted changes, not as commits.",
+            "": ": nothing of the pull request's earlier change is in it.",
+        }.get(tree.get("pushed"), ".")
+    else:
+        text = f"{'A' if changes == 'left' else 'A fresh'} checkout of the default branch `{default}` at `{sha}`."
+        if not changes:
+            text += " Nothing from an earlier attempt is in it."
+    of = f"attempt {tree['attempt']}" if tree.get("attempt") else "your previous attempt"
+    see = "run `git status` and `git diff HEAD` to see it"
+    if changes == "left":
+        text += f" What {of} changed is still in it, uncommitted (staged or not): {see}."
+    elif changes == "restored":
+        text += f" The whole change of {of} was restored into it from a saved copy, staged but not committed: {see}."
+    elif changes == "lost":
+        text += (f" What {of} changed {'was never pushed' if branch else 'could not be restored'} and is not in it; "
+                 "the feedback below is what remains of it.")
+    return text
+
+
 def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisions: list[Any],
                  guidance: list[str] | None = None, sections: list[str] | None = None,
                  review: list[str] | None = None) -> str:
@@ -257,6 +289,9 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
         "",
         f"Repository: {repo.full_name}. The checkout is your working directory.",
     ]
+    tree = (getattr(task, "evidence", None) or {}).get("tree")
+    if tree:  # recorded by the runner as it starts this session (TaskRunner._describe_tree)
+        lines += ["", "## State of your working tree", working_tree(tree)]
     if outcome.brief:
         lines += ["", "## Original request (context)", outcome.brief[:4000]]
     lines += sections or []

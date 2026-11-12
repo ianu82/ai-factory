@@ -1252,6 +1252,13 @@ def test_the_builder_gets_the_whole_review_and_its_open_points_outlive_a_failed_
     for prompt in prompts[2:]:
         assert "`sh test.sh` failed (exit 1)" in prompt and "expected greeting, got: Hello, Factry!" in prompt
         assert standing in prompt
+    # Each session is told what its checkout holds. The first three ran in one sandbox; the sandbox made after the
+    # restart starts from what the attempt that failed its check had changed, so the feedback is about code in it.
+    assert "Nothing from an earlier attempt is in it." in prompts[0]
+    assert "What attempt 1 changed is still in it, uncommitted" in prompts[1]
+    assert "What attempt 2 changed is still in it, uncommitted" in prompts[2]
+    assert "The whole change of attempt 2 was restored into it from a saved copy" in prompts[3]
+    assert _event_kinds(outcome_id).count("changes_restored") == 1
 
 
 def test_the_attempt_limit_decision_shows_the_whole_of_the_latest_feedback(factory):
@@ -1678,6 +1685,50 @@ def test_a_start_leaves_open_the_sessions_of_a_task_another_instance_is_running(
     assert [state(run_id) for run_id in started] == [("running", True)]  # only what the dead owner left is closed
     with session_scope() as s:
         assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}] * 2
+
+
+def test_a_start_closes_a_requeued_tasks_sessions_before_another_server_can_claim_it(factory, monkeypatch):
+    """A start requeues a dead owner's task and closes the sessions it left open in one transaction. Closing them
+    after the requeue was committed left a gap: another server claims the task, and from then on the dead owner's
+    session looked like one that server is running, so it stayed open with its cost counted as known."""
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    other, until = "other-host-1-abc123", clock[0] + timedelta(seconds=60)
+    dead = leased_task(factory, lease_owner="gone-host-1-abc123", lease_expires_at=clock[0] - timedelta(seconds=1))
+
+    def session(s, task_id, started_at):
+        task = s.get(Task, task_id)
+        run = Run(workspace_id=task.workspace_id, outcome_id=task.outcome_id, task_id=task_id, harness="native",
+                  role="builder", started_at=started_at)
+        s.add(run)
+        s.flush()
+        return run.id
+
+    with session_scope() as s:
+        lost = session(s, dead, clock[0] - timedelta(minutes=5))
+    orch = Orchestrator()
+    reclaim, started = orch._reclaim, []
+
+    def reclaim_then_another_server_claims(**kwargs):
+        requeued = reclaim(**kwargs)
+        with session_scope() as s:
+            for task_id in requeued:
+                task = s.get(Task, task_id)
+                task.status, task.lease_owner, task.lease_expires_at = "running", other, until
+                started.append(session(s, task_id, clock[0]))
+        return requeued
+
+    monkeypatch.setattr(orch, "_reclaim", reclaim_then_another_server_claims)
+    orch._recover()
+    assert lease(dead) == ("running", other, until)
+    with session_scope() as s:
+        assert (s.get(Run, lost).status, s.get(Run, lost).cost_known) == ("interrupted", False)
+        assert [s.get(Run, run_id).status for run_id in started] == ["running"]  # the other server's own session
+        assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}]
 
 
 def test_the_heartbeat_extends_only_the_leases_of_tasks_this_instance_is_running(factory, monkeypatch):
@@ -3289,6 +3340,9 @@ def test_an_environment_failure_redoes_the_same_attempt(factory, monkeypatch, ph
         records = task.evidence["attempts"]
         assert [(a["n"], a["result"]) for a in records] == [(1, "infra"), (1, "verified")]
         assert records[0]["phase"] == phase and records[0]["cause"] == "transient"
+        builds = s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count()
+    # The builder ran once. When the verifier was what failed, the retry went on from the candidate it had built.
+    assert builds == 1 and ("candidate_resumed" in _event_kinds(outcome_id)) is (phase == "verify")
 
 
 def test_failing_tests_are_compared_with_the_base_commit():
@@ -3851,9 +3905,16 @@ def test_a_revision_interrupted_by_a_restart_continues_on_the_pull_request_branc
     assert _task_state(outcome_id)[:2] == ("queued", "build")
 
     seen = []
-    ScriptedModel.scripts["builder"] = _greeting_reader(seen)
+    builder, prompts = _in_turn(_greeting_reader(seen))
+    ScriptedModel.scripts["builder"] = builder
     assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
     assert seen and "Hello, Factory!" in seen[0], seen  # the pull request's branch, not a fresh copy of main
+    with session_scope() as s:
+        branch = s.query(Task).filter(Task.outcome_id == outcome_id).one().branch
+    # The builder is told that is what it has.
+    assert (f"## State of your working tree\nThe pull request's branch `{branch}`, on top of the default branch "
+            "`main` at `") in prompts[0]
+    assert "everything already pushed to the pull request is in it as commits" in prompts[0]
     _approve_and_finish(factory, outcome_id)
 
 
@@ -3974,6 +4035,188 @@ def test_a_restart_before_publication_still_says_the_builder_never_reported(fact
         run = s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").one()  # the builder ran once
         assert run.status == "failed" and not run.result
     assert f"The builder session reached its limit before it reported ({error})" in FakeGitHub.pulls[1]["body"]
+
+
+def _stop_once(monkeypatch, name, when=lambda *args: True, first=None):
+    """The server stops, once, as ``TaskRunner.<name>`` is called: the task is requeued where it stood."""
+    original, stopped = getattr(delivery.TaskRunner, name), []
+
+    async def method(self, *args, **kwargs):
+        if not stopped and when(*args):
+            stopped.append(True)
+            if first:
+                first(self)
+            raise asyncio.CancelledError()
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(delivery.TaskRunner, name, method)
+    return stopped
+
+
+def _stop_at_the_checks(monkeypatch, first=None):
+    return _stop_once(monkeypatch, "_run_commands", lambda sandbox, commands, kind: kind == "check", first)
+
+
+def _events(outcome_id, kind):
+    with session_scope() as s:
+        return [(e.level, e.message) for e in s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == kind)
+                .order_by(Event.id)]
+
+
+def test_a_restart_during_the_checks_resumes_the_built_candidate(factory, monkeypatch):
+    stopped = _stop_at_the_checks(monkeypatch)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    assert stopped
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        # The builder ran once. Its candidate went on from the checks as the same attempt, with one record.
+        assert s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count() == 1
+        assert task.attempt == 1
+        assert [(a["n"], a["result"]) for a in task.evidence["attempts"]] == [(1, "verified")]
+        assert "candidate" not in task.evidence  # nothing is left to resume once the attempt has its record
+    assert _events(outcome_id, "candidate_resumed") == [
+        ("info", "Attempt 1: resuming the built candidate at checks after an interruption")]
+    kinds = _event_kinds(outcome_id)
+    assert kinds.count("check_result") == 1 and "attempt_resumed" not in kinds
+    assert FakeGitHub.merged == [1]
+    assert "Hello, Factory!" in git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+
+
+def test_a_restart_during_verification_verifies_the_candidate_with_the_check_results_it_had(factory, monkeypatch):
+    stopped = _stop_once(monkeypatch, "_verifier_sandbox")
+    verifier, reviews = _in_turn(passing_verifier)
+    ScriptedModel.scripts["verifier"] = verifier
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    assert stopped
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count() == 1
+        assert task.attempt == 1
+        assert [(a["n"], a["result"]) for a in task.evidence["attempts"]] == [(1, "verified")]
+    assert _events(outcome_id, "candidate_resumed") == [
+        ("info", "Attempt 1: resuming the built candidate at verification after an interruption")]
+    # Neither the builder nor the checks ran again: the one review was shown the results recorded before the stop.
+    kinds = _event_kinds(outcome_id)
+    assert kinds.count("check_result") == 1 and "attempt_resumed" not in kinds and "publish_resumed" not in kinds
+    assert len(reviews) == 1
+    assert "## Configured checks already run by the factory on this candidate\n- `sh test.sh` → passed" in reviews[0]
+    assert FakeGitHub.merged == [1]
+
+
+@pytest.mark.parametrize("problem, why", [("stored in part", "(its diff was not stored whole: "),
+                                          ("does not apply", "(its diff no longer applies to its base commit)")])
+def test_a_saved_candidate_that_cannot_be_restored_is_built_again(factory, monkeypatch, problem, why):
+    from aifactory.models import Artifact
+
+    def keep_part_of_the_diff(runner):  # as for a diff over the stored size: the copy is not the whole candidate
+        with session_scope() as s:
+            diff = s.query(Artifact).filter(Artifact.task_id == runner.task_id, Artifact.kind == "diff").one()
+            diff.content = diff.content[:40]
+
+    stopped = _stop_at_the_checks(monkeypatch, keep_part_of_the_diff if problem == "stored in part" else None)
+    if problem == "does not apply":
+        original, applied = delivery.apply_in_sandbox, []
+
+        async def apply(*args, **kwargs):
+            applied.append(True)
+            if len(applied) == 1:  # the saved candidate, into the sandbox prepared for it after the restart
+                raise delivery.SandboxError("Candidate patch does not apply: error: patch failed: greet.sh:1")
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(delivery, "apply_in_sandbox", apply)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    assert stopped
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        # Built again as the same attempt, as an interrupted attempt always was: not charged, and one record.
+        assert s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count() == 2
+        assert task.attempt == 1
+        assert [(a["n"], a["result"]) for a in task.evidence["attempts"]] == [(1, "verified")]
+    warnings = _events(outcome_id, "candidate_not_resumed")
+    assert len(warnings) == 1 and warnings[0][0] == "warn" and why in warnings[0][1], warnings
+    assert "candidate_resumed" not in _event_kinds(outcome_id)
+    assert "Hello, Factory!" in git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+
+
+def test_a_saved_candidate_is_used_only_by_the_attempt_budget_base_and_round_that_built_it(factory):
+    _, task_id, _ = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        base = s.get(Task, task_id).base_sha
+
+    def resumes(attempt=2, base_sha=base, **evidence):
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            task.attempt, task.base_sha = attempt, base_sha
+            task.evidence = {"budget_epoch": 1, "fix_round": "", **evidence,
+                             "candidate": {"n": 2, "epoch": 1, "base_sha": base, "fix_round": "", "checks": None}}
+        return _runner(task_id)._saved_candidate() is not None
+
+    # The attempt that built it: interrupted, or its number handed back by an infrastructure failure.
+    assert resumes() and resumes(attempt=1)
+    assert not resumes(attempt=3)  # a later attempt never takes an older attempt's candidate
+    assert not resumes(attempt=0)
+    assert not resumes(budget_epoch=2)  # fresh attempts after a person's decision: their numbers start again
+    assert not resumes(base_sha="0" * 40)  # the task's base commit has moved since
+    assert not resumes(fix_round="revise")  # built before the pull request's revision began
+
+
+@pytest.mark.parametrize("change, why_not", [
+    (None, None),
+    ("main moved elsewhere", None),  # the saved diff still applies to the new base
+    ("main changed the same line", "they no longer apply to main at "),
+    ("stored in part", "no whole copy of them was saved"),
+])
+def test_after_a_restart_the_builder_starts_from_what_its_failed_attempt_changed(factory, change, why_not):
+    from aifactory.models import Artifact
+
+    seen = []
+    builder, prompts = _in_turn(good_builder, _slow_builder, _greeting_reader(seen))
+    verifier, _ = _in_turn(_always_failing_verifier, passing_verifier)
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: len(prompts) == 2, timeout=90)  # the server restarts during the second attempt
+    assert _task_state(outcome_id)[:2] == ("queued", "build")
+    failed = _attempt_records(outcome_id)
+    assert [(a["n"], a["result"]) for a in failed] == [(1, "verification_failed")]
+    if change == "stored in part":
+        with session_scope() as s:
+            diff = s.get(Artifact, failed[0]["diff_artifact_id"])
+            diff.content = diff.content[:40]
+    elif change == "main moved elsewhere":
+        _land_on_main(factory, "NOTES.md", "landed meanwhile\n")
+    elif change:
+        _land_on_main(factory, "greet.sh", "echo 'Hi'\n")
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    assert _task_state(outcome_id)[0] == "completed" and len(prompts) == 3
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [
+        (1, "verification_failed"), (2, "verified")]
+    # Each session is told what its checkout holds: nothing yet, then the attempt before it in the same sandbox.
+    assert all("\n## State of your working tree\n" in prompt for prompt in prompts)
+    assert "A fresh checkout of the default branch `main` at `" in prompts[0]
+    assert "Nothing from an earlier attempt is in it." in prompts[0]
+    assert "A checkout of the default branch `main` at `" in prompts[1]
+    assert "What attempt 1 changed is still in it, uncommitted (staged or not)" in prompts[1]
+    # After the restart the feedback is still about attempt 1, and the new checkout holds its change when the saved
+    # copy can be put back. When it cannot, the builder is told that the change is gone.
+    assert "- Independent review FAILED. Greeting still wrong." in prompts[2]
+    kinds = _event_kinds(outcome_id)
+    if why_not is None:
+        assert "Hello, Factory!" in seen[0], seen
+        assert "The whole change of attempt 1 was restored into it from a saved copy" in prompts[2]
+        assert kinds.count("changes_restored") == 1 and "changes_not_restored" not in kinds
+    else:
+        assert "Hello, Factory!" not in seen[0], seen
+        assert "What attempt 1 changed could not be restored and is not in it" in prompts[2]
+        warnings = _events(outcome_id, "changes_not_restored")
+        assert len(warnings) == 1 and warnings[0][0] == "warn" and why_not in warnings[0][1], warnings
+        assert "changes_restored" not in kinds
+    assert "Hello, Factory!" in git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
 
 
 @pytest.mark.parametrize("result, failing, ends", [

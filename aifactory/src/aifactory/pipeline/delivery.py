@@ -131,6 +131,8 @@ class TaskRunner:
         self.verifier_report: dict[str, Any] = {}
         self.checks: list[dict[str, Any]] = []
         self.app_summary: dict[str, Any] | None = None
+        # What the builder's sandbox holds, for the builder's prompt (see prompts.working_tree).
+        self._tree: dict[str, Any] = {}
         self._ci_repairing = False
         # The repository's agent instructions, by base commit and whether they are for the verifier.
         self._instructions: dict[tuple[str, bool], list[str]] = {}
@@ -280,6 +282,8 @@ class TaskRunner:
             for key, value in values.items():
                 if key == "attempts":  # tagged with the budget it belongs to (attempt numbers restart per budget)
                     ev.setdefault("attempts", []).append({**value, "epoch": int(ev.get("budget_epoch", 0))})
+                    if value.get("result") not in NOT_ATTEMPTS:
+                        ev.pop("candidate", None)  # the attempt ended: its saved candidate is never resumed
                     if recovered_from_infra(str(value.get("result")), ev.get("infra_phase")):
                         ev.pop("infra_retries", None)  # the phase that failed has since completed
                         ev.pop("infra_phase", None)
@@ -391,7 +395,13 @@ class TaskRunner:
         finished = {a.get("n") for a in self._budget_attempts()}
         # Verified, but interrupted before publication and the candidate could not be reloaded (see run()).
         unpublished = bool(self._unpublished_candidate())
-        if self.task.attempt and (self.task.attempt not in finished or unpublished):
+        # Built before the task stopped (a restart, or an infrastructure failure at its checks or verification):
+        # the attempt goes on from there below, and the builder does not run again.
+        saved = self._saved_candidate()
+        if saved:
+            if saved["n"] == self.task.attempt:
+                self.update(attempt=self.task.attempt - 1)
+        elif self.task.attempt and (self.task.attempt not in finished or unpublished):
             # Every attempt that ends records its result; one without a record was interrupted (a restart or
             # redeploy), so it is redone rather than counted against the limit.
             self.event("attempt_resumed", f"Attempt {self.task.attempt} was interrupted; running it again")
@@ -435,12 +445,21 @@ class TaskRunner:
                            status="needs_input",
                            options=[{"value": "retry", "label": f"Continue with ${more} more"},
                                     {"value": "abandon", "label": "Stop"}])
+            if saved:
+                candidate, saved = saved, None
+                patch = await self._resume_candidate(token, attempt, candidate)
+                if patch is not None:
+                    if await self._check_and_verify(token, attempt, patch, candidate["diff_artifact_id"],
+                                                    candidate.get("checks")):
+                        break
+                    continue
             if self.builder is None:
                 try:
                     await self._prepare_builder(token, from_branch=continue_from_branch and bool(self.task.branch))
                 except (SandboxError, GitError, OSError) as exc:  # the environment, not the attempt
                     error = f"Sandbox setup failed: {exc}"
                     self._infrastructure(attempt, "prepare", error, infrastructure_problem(error))
+            self._describe_tree(attempt)
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             sections = await self._sections()
             findings, unlisted = self._round_findings()
@@ -502,12 +521,31 @@ class TaskRunner:
             problem = await self._policy_problem(patch)
             if problem:
                 self.feedback.append(problem)
-                self.evidence("attempts", {"n": attempt, "result": "policy", "detail": problem})
+                self.evidence("attempts", {"n": attempt, "result": "policy", "detail": problem,
+                                           "files": len(patch.files)})
                 self.event("candidate_rejected", problem, level="warn")
                 continue
             self.patch = patch
             diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"), run_id=run.id,
                           files=patch.files, additions=patch.additions, deletions=patch.deletions)
+            # Saved as soon as it exists: a stop from here on resumes this candidate instead of building it again.
+            self.evidence("candidate", {
+                "n": attempt, "epoch": int((self.task.evidence or {}).get("budget_epoch", 0)),
+                "diff_artifact_id": diff_id, "patch_sha256": hashlib.sha256(patch.diff).hexdigest(),
+                "base_sha": self.task.base_sha, "run_id": run.id, "files": patch.files,
+                "additions": patch.additions, "deletions": patch.deletions, "fix_round": fix_round, "checks": None})
+            if await self._check_and_verify(token, attempt, patch, diff_id):
+                break
+
+        await self._publish(token)
+        await self.ci_then_merge()
+
+    async def _check_and_verify(self, token: str, attempt: int, patch: Patch, diff_id: str,
+                                checks: list[dict[str, Any]] | None = None) -> bool:
+        """The candidate gate from the configured checks on; True once the candidate is verified. ``checks`` are the
+        results a resumed candidate's checks had before the task stopped: they are not run again."""
+        seen = {"diff_artifact_id": diff_id, "patch_sha256": hashlib.sha256(patch.diff).hexdigest()}
+        if checks is None:
             commands = self.cfg.get("checks") or []
             async with self._check_slot(self.builder, bool(commands)):
                 self.checks = await self._run_commands(self.builder, commands, "check")
@@ -529,37 +567,47 @@ class TaskRunner:
             if failed:
                 self.feedback += [f"- Check `{c['command']}` {_how_failed(c)}{c.get('vs_base', '')}"
                                   f"{_whose_output(c)}:\n```\n{c['tail']}\n```" for c in failed]
-                self.evidence("attempts", {"n": attempt, "result": "checks_failed", "checks": _brief(self.checks)})
-                continue
+                # With its diff: a new sandbox for the next attempt starts from these changes (_earlier_changes).
+                self.evidence("attempts", {"n": attempt, "result": "checks_failed", "checks": _brief(self.checks),
+                                           **seen, "base_sha": self.task.base_sha})
+                return False
+            # A stop during verification resumes there, with these results.
+            self.evidence("candidate", {**self.task.evidence["candidate"], "checks": _shown(self.checks)})
+        else:
+            self.checks = checks
 
-            # independent verification; nothing the builder left running (databases, dev servers) may compete
-            # with the verifier for processes or ports.
-            await self.builder.kill_all()
-            self.stage("verify", f"Independent verification by a fresh {self.task.verifier_harness} session")
-            verdict = await self._verify(token, patch, attempt)
-            if verdict is None:
-                continue
-            self.evidence("attempts", {"n": attempt, "result": "verified", "checks": _brief(self.checks),
-                                       "verdict": verdict, "app_run": self.app_summary,
-                                       "configured_checks": list(self.cfg.get("checks") or []),
-                                       "diff_artifact_id": diff_id,
-                                       # A restart before publication reloads exactly this candidate from the diff.
-                                       "patch_sha256": hashlib.sha256(patch.diff).hexdigest()})
-            break
-
-        await self._publish(token)
-        await self.ci_then_merge()
+        # independent verification; nothing the builder left running (databases, dev servers) may compete
+        # with the verifier for processes or ports.
+        await self.builder.kill_all()
+        self.stage("verify", f"Independent verification by a fresh {self.task.verifier_harness} session")
+        verdict = await self._verify(token, patch, attempt)
+        if verdict is None:
+            return False
+        # A restart before publication reloads exactly this candidate from the diff.
+        self.evidence("attempts", {"n": attempt, "result": "verified", "checks": _brief(self.checks),
+                                   "verdict": verdict, "app_run": self.app_summary,
+                                   "configured_checks": list(self.cfg.get("checks") or []), **seen})
+        return True
 
     async def _prepare_builder(self, token: str, from_branch: bool) -> None:
         self.builder = LocalSandbox(f"task-{self.task_id[:12]}-b{self.task.attempt}").create()
         branch = self.task.branch or f"factory/{self.outcome.number}-{self.task.key.lower()}-{self.task_id[:6]}"
-        self.stage("prepare", f"Preparing a fresh checkout of {self.repo.full_name}")
         if from_branch:
+            self.stage("prepare", f"Preparing the pull request's branch {branch} of {self.repo.full_name}")
             await checkout(self.builder, self.repo.full_name, token, f"refs/heads/{branch}", branch)
             await self._bring_branch_up_to_date(branch)
+            last = self._left_behind()  # never pushed, so not on the branch: only a default-branch checkout restores it
+            self._tree = {"from": "branch", "pushed": await self._branch_holds(),
+                          **({"changes": "lost", "attempt": last.get("n")} if last else {})}
         else:
+            self.stage("prepare", f"Preparing a fresh checkout of {self.repo.full_name}")
             base_sha = await checkout(self.builder, self.repo.full_name, token, self.repo.default_branch, branch)
             self.update(base_sha=base_sha, branch=branch)
+            self._tree = {"from": "default", **await self._earlier_changes()}
+        await self._set_up_builder()
+
+    async def _set_up_builder(self) -> None:
+        """Isolate the prepared checkout and run the repository's setup in it."""
         self.builder = await self._isolate_builder(self.builder)
         if getattr(self.builder, "prepared", None):
             self.event("setup_skipped", "Dependencies unchanged since the prepared environment was saved; setup skipped",
@@ -574,6 +622,58 @@ class TaskRunner:
         if broken:
             self.feedback.append("- Note: repository setup failed before you started:\n" + "\n".join(
                 f"`{c['command']}` {_how_failed(c)}\n```\n{c['tail'][-1500:]}\n```" for c in broken))
+
+    async def _branch_holds(self) -> str | None:
+        """How the pull request's earlier change sits in a sandbox prepared from its branch: as "commits" on the
+        base, as "uncommitted" changes (carried over a conflict, see ``_bring_branch_up_to_date``), or "" when none
+        of it is there. None when git cannot say."""
+        base = shlex.quote(self.task.base_sha or "")
+        ahead = await self.builder.exec(f"git rev-list --count {base}..HEAD", timeout=60)
+        dirty = await self.builder.exec("git status --porcelain --untracked-files=no", timeout=60)
+        if not ahead.ok or not dirty.ok or not ahead.output.strip().isdigit():
+            return None
+        return "commits" if int(ahead.output.strip()) else "uncommitted" if dirty.output.strip() else ""
+
+    def _left_behind(self) -> dict[str, Any] | None:
+        """The record of this budget's latest attempt, when what it changed was only in its sandbox, which a new
+        sandbox does not have. None when nothing was left behind: no attempt ended, it changed nothing, or its
+        candidate was verified (a later record with its number judges that candidate again after a rebase, and it
+        is on the pull request's branch)."""
+        attempts = [a for a in self._budget_attempts() if a.get("result") != "builder_blocked"]
+        last = attempts[-1] if attempts else None
+        if (last is None or (last.get("result") == "policy" and last.get("files") == 0)
+                or any(a.get("result") == "verified" and a.get("n") == last.get("n") for a in attempts)):
+            return None
+        return last
+
+    async def _earlier_changes(self) -> dict[str, Any]:
+        """A new checkout starts from what the latest failed attempt of this budget changed, when that diff reloads
+        whole and still applies: the feedback the builder gets is about that code, as it is when the next attempt
+        runs in the same sandbox. Returns what to tell the builder about it (see prompts.working_tree)."""
+        last = self._left_behind()
+        if last is None:
+            return {}
+        found, why = self._stored_candidate(last), "no whole copy of them was saved"
+        if found:
+            try:
+                await apply_in_sandbox(self.builder, found[0])
+            except SandboxError:  # git applies all of a diff or none of it: the checkout is still clean
+                why = f"they no longer apply to {self.repo.default_branch} at {self.task.base_sha[:8]}"
+            else:
+                self.patch = found[0]  # what this runner last judged, as in the sandbox that was lost
+                self.event("changes_restored", f"Restored the changes of attempt {last.get('n')} into the new "
+                           "checkout, so the builder continues from them", files=len(found[0].files))
+                return {"changes": "restored", "attempt": last.get("n")}
+        self.event("changes_not_restored", f"The changes of attempt {last.get('n')} could not be restored into the "
+                   f"new checkout ({why}); the builder starts from a clean checkout", level="warn")
+        return {"changes": "lost", "attempt": last.get("n")}
+
+    def _describe_tree(self, attempt: int) -> None:
+        """Record what the builder's working tree holds as its session starts, for its prompt. A later session in
+        the same sandbox finds this attempt's changes in it too."""
+        self.evidence("tree", {**self._tree, "sha": self.task.base_sha, "branch": self.task.branch,
+                               "default": self.repo.default_branch})
+        self._tree = {**self._tree, "changes": "left", "attempt": attempt}
 
     async def _bring_branch_up_to_date(self, branch: str) -> None:
         """Revise on top of today's base branch. GitHub runs no pull-request checks while a branch conflicts, so a
@@ -1067,27 +1167,93 @@ class TaskRunner:
         verified, so it is published rather than rebuilt in a new, charged attempt. False when it cannot be reloaded
         byte for byte (a diff stored only in part); the attempt is then redone, uncharged (see deliver())."""
         last = self._unpublished_candidate()
-        if not last.get("patch_sha256") or not last.get("diff_artifact_id"):
+        found = self._stored_candidate(last)
+        if found is None:
             return False
-        with session_scope() as s:
-            diff = s.get(Artifact, last["diff_artifact_id"])
-            if diff is None:
-                return False
-            builder = s.get(Run, diff.run_id) if diff.run_id else None
-            raw, data = (diff.content or "").encode(), dict(diff.data or {})
-            # A builder stopped by its cap has no result on its run: the stand-in for its report is kept with the
-            # task, like every builder report, and no builder has run since this candidate was verified.
-            report = dict((builder.result if builder else None) or (self.task.evidence or {}).get("builder_report")
-                          or {})
-        if hashlib.sha256(raw).hexdigest() != last["patch_sha256"]:
-            return False
-        self.patch = Patch(diff=raw, files=list(data.get("files") or []), additions=int(data.get("additions") or 0),
-                           deletions=int(data.get("deletions") or 0))
-        self.builder_report, self.verifier_report = report, last.get("verdict") or {}
+        self.patch, self.builder_report = found
+        self.verifier_report = last.get("verdict") or {}
         self.checks, self.app_summary = list(last.get("checks") or []), last.get("app_run")
         self.event("publish_resumed", f"Attempt {self.task.attempt} was verified before the restart; publishing that "
                    "candidate")
         return True
+
+    def _stored_candidate(self, record: dict[str, Any]) -> tuple[Patch, dict[str, Any]] | None:
+        """The candidate a record names (``diff_artifact_id``, ``patch_sha256``), reloaded from its stored diff, with
+        its builder's report. None unless the diff reloads byte for byte: it is stored as text, the first 400,000
+        characters of it, so a larger one, or one with bytes that are not UTF-8, does not."""
+        if not record.get("patch_sha256") or not record.get("diff_artifact_id"):
+            return None
+        with session_scope() as s:
+            diff = s.get(Artifact, record["diff_artifact_id"])
+            if diff is None:
+                return None
+            builder = s.get(Run, diff.run_id) if diff.run_id else None
+            raw, data = (diff.content or "").encode(), dict(diff.data or {})
+            # A builder stopped by its cap has no result on its run: the stand-in for its report is kept with the
+            # task, like every builder report, and no builder has run since a candidate that is being resumed.
+            report = dict((builder.result if builder else None) or (self.task.evidence or {}).get("builder_report")
+                          or {})
+        if hashlib.sha256(raw).hexdigest() != record["patch_sha256"]:
+            return None
+        return Patch(diff=raw, files=list(data.get("files") or []), additions=int(data.get("additions") or 0),
+                     deletions=int(data.get("deletions") or 0)), report
+
+    def _saved_candidate(self) -> dict[str, Any] | None:
+        """The candidate built for the attempt this run continues (``evidence["candidate"]``), when the task stopped
+        before that attempt ended: at its checks or its verification. An infrastructure failure hands the attempt's
+        number back, so it is the current number or the next. A record of another attempt, budget, base commit or
+        fix round is never used."""
+        ev = self.task.evidence or {}
+        saved = ev.get("candidate")
+        if (isinstance(saved, dict) and saved.get("n") in (self.task.attempt, self.task.attempt + 1)
+                and saved.get("epoch") == int(ev.get("budget_epoch", 0)) and saved.get("base_sha") == self.task.base_sha
+                and (saved.get("fix_round") or "") == (ev.get("fix_round") or "")):
+            return saved
+        return None
+
+    async def _resume_candidate(self, token: str, attempt: int, saved: dict[str, Any]) -> Patch | None:
+        """Put a candidate built before the task stopped back into a builder's sandbox: its base commit with its diff
+        applied, set up as for a builder. The attempt goes on from its checks, or from its verification when the
+        checks had passed. None when the candidate cannot be restored exactly: the attempt is then built again."""
+        found = self._stored_candidate(saved)
+        if found is None:
+            return self._drop_candidate(attempt, "its diff was not stored whole: it is too large, or not all text")
+        patch, report = found
+        self.stage("prepare", f"Attempt {attempt}: restoring the candidate built before the interruption")
+        try:
+            self.builder = LocalSandbox(f"task-{self.task_id[:12]}-b{attempt}").create()
+            await checkout(self.builder, self.repo.full_name, token, saved["base_sha"], self.task.branch)
+            await apply_in_sandbox(self.builder, patch)
+            await self._set_up_builder()
+        except (SandboxError, GitError, OSError) as exc:
+            if self.builder is not None:
+                await self.builder.close()
+                self.builder = None
+            if str(exc).startswith("Candidate patch does not apply"):
+                return self._drop_candidate(attempt, "its diff no longer applies to its base commit")
+            error = f"Sandbox setup failed: {exc}"
+            cause = infrastructure_problem(error)
+            if cause == "provider" or int((self.task.evidence or {}).get("infra_retries", 0)) < INFRA_RETRIES:
+                self._infrastructure(attempt, "prepare", error, cause)  # the candidate is kept for the retry
+            # A candidate whose base commit can no longer be checked out must not hold the task for good.
+            return self._drop_candidate(attempt, f"its sandbox could not be prepared: {str(exc)[:200]}")
+        # Everything checks, verification and publication read from the runner (the verifier's report and the app
+        # run are set by the verification that follows).
+        self.patch, self.builder_report, self.app_summary = patch, report, None
+        del self.feedback[self._results]  # the builder had these before it built this candidate
+        self._results = slice(len(self.feedback), None)
+        self._tree = {"from": "default", "changes": "restored", "attempt": attempt}
+        at = "checks" if saved.get("checks") is None else "verification"
+        if at == "checks":
+            self.stage("checks")
+        self.event("candidate_resumed", f"Attempt {attempt}: resuming the built candidate at {at} after an "
+                   "interruption", files=len(patch.files))
+        return patch
+
+    def _drop_candidate(self, attempt: int, why: str) -> None:
+        self.event("candidate_not_resumed", f"Attempt {attempt}: the candidate built before the interruption could "
+                   f"not be restored ({why}); building it again", level="warn")
+        self.evidence("candidate", None)
 
     def _auto_retry(self) -> bool:
         """Attempts ran out. When the last one failed on concrete, actionable feedback, start a fresh budget with that
@@ -2495,6 +2661,17 @@ def _brief(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             | ({"first_failure": str(c["first_failure"])[-1500:]} if c.get("first_failure") else {})
             | ({"first": {k: c["first"].get(k) for k in ("exit_code", "same")}} if c.get("first") else {})
             | ({"preexisting": True} if c.get("preexisting") else {}) for c in checks]
+
+
+def _shown(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Check results kept with a saved candidate: the evidence record's, with the failing tests the verifier is
+    shown for failures that predate the change (those of both runs, for a check that failed twice)."""
+    rows = _brief(checks)
+    for row, c in zip(rows, checks):
+        ids = sorted({*(c.get("failures") or []), *((c.get("first") or {}).get("failures") or [])})
+        if c.get("preexisting") and ids:
+            row["failures"] = ids[:200]
+    return rows
 
 
 def _how_failed(check: dict[str, Any]) -> str:
