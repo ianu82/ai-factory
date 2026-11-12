@@ -595,7 +595,9 @@ class TaskRunner:
             self.stage("prepare", f"Preparing the pull request's branch {branch} of {self.repo.full_name}")
             await checkout(self.builder, self.repo.full_name, token, f"refs/heads/{branch}", branch)
             await self._bring_branch_up_to_date(branch)
-            self._tree = {"from": "branch", "pushed": await self._branch_holds()}
+            last = self._left_behind()  # never pushed, so not on the branch: only a default-branch checkout restores it
+            self._tree = {"from": "branch", "pushed": await self._branch_holds(),
+                          **({"changes": "lost", "attempt": last.get("n")} if last else {})}
         else:
             self.stage("prepare", f"Preparing a fresh checkout of {self.repo.full_name}")
             base_sha = await checkout(self.builder, self.repo.full_name, token, self.repo.default_branch, branch)
@@ -631,14 +633,25 @@ class TaskRunner:
             return None
         return "commits" if int(ahead.output.strip()) else "uncommitted" if dirty.output.strip() else ""
 
+    def _left_behind(self) -> dict[str, Any] | None:
+        """The record of this budget's latest attempt, when what it changed was only in its sandbox, which a new
+        sandbox does not have. None when nothing was left behind: no attempt ended, it changed nothing, or its
+        candidate was verified (a later record with its number judges that candidate again after a rebase, and it
+        is on the pull request's branch)."""
+        attempts = [a for a in self._budget_attempts() if a.get("result") != "builder_blocked"]
+        last = attempts[-1] if attempts else None
+        if (last is None or (last.get("result") == "policy" and last.get("files") == 0)
+                or any(a.get("result") == "verified" and a.get("n") == last.get("n") for a in attempts)):
+            return None
+        return last
+
     async def _earlier_changes(self) -> dict[str, Any]:
         """A new checkout starts from what the latest failed attempt of this budget changed, when that diff reloads
         whole and still applies: the feedback the builder gets is about that code, as it is when the next attempt
         runs in the same sandbox. Returns what to tell the builder about it (see prompts.working_tree)."""
-        last = next((a for a in reversed(self._budget_attempts()) if a.get("result") != "builder_blocked"), None)
-        if last is None or last.get("result") == "verified" or (last.get("result") == "policy"
-                                                                 and last.get("files") == 0):
-            return {}  # nothing was left behind
+        last = self._left_behind()
+        if last is None:
+            return {}
         found, why = self._stored_candidate(last), "no whole copy of them was saved"
         if found:
             try:
