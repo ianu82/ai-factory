@@ -331,9 +331,15 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
 def continued_past_budget(db, outcome_id: str) -> bool:
     """A person chose to let this outcome continue past its budget: a budget decision answered "Continue anyway".
     The Lead never answers budget decisions, so only people (or an operator they delegated to) grant this. From then
-    on the outcome's budget doesn't stop its Lead; each Lead run is still held to its own cap."""
-    return db.query(Decision.id).filter(Decision.outcome_id == outcome_id, Decision.kind == "budget",
-                                        Decision.status == "resolved", Decision.resolution == "retry").first() is not None
+    on the outcome's budget doesn't stop its Lead; each Lead run is still held to its own cap. The Director can grant
+    it too (pipeline/director.py), but its grant holds only while the outcome is under the Director's ceiling."""
+    granted = db.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.kind == "budget",
+                                        Decision.status == "resolved", Decision.resolution == "retry").all()
+    if any((d.attribution or {}).get("source") != "director" for d in granted):
+        return True
+    from .director import within_ceiling
+
+    return bool(granted) and within_ceiling(db, granted[0])
 
 
 def _progress(db, outcome_id: str, after: Any, now: datetime) -> list[int]:

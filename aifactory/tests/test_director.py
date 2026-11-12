@@ -129,7 +129,11 @@ def test_it_waits_its_turn_and_stays_within_its_daily_spend(world):
     with db.session_scope() as s:
         s.query(Event).filter(Event.kind.like("director_run%")).delete()
     past_run(world, ago=timedelta(minutes=20), status=None)
-    assert world["ws"] in woken()  # a run a restart cut off doesn't block it
+    assert world["ws"] not in woken()  # a run started without finishing may still be going on another instance
+    with db.session_scope() as s:
+        s.query(Event).filter(Event.kind.like("director_run%")).delete()
+    past_run(world, ago=timedelta(minutes=35), status=None)
+    assert world["ws"] in woken()  # one a restart cut off doesn't block it for long
     assert woken()[world["ws"]]["usd"] == 4.0
     past_run(world, ago=timedelta(hours=2), cost=34.0)
     assert woken()[world["ws"]]["usd"] == pytest.approx(40.0 - 34.0 - 4.0)  # the cut-off run counts what it reserved
@@ -155,11 +159,22 @@ def test_a_provider_hold_and_taking_work_over_stay_with_people(world):
         assert allowed == [] and "billing" in why
 
 
+def spend(world, usd):
+    """Recorded and committed, so budget checks (in their own sessions) count it."""
+    with db.session_scope() as s:
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
+                  status="succeeded", cost_usd=usd, cost_known=True))
+
+
+def test_two_scheduler_instances_never_both_start_a_run(world):
+    item = woken()[world["ws"]]
+    first = director.claim(item)
+    assert first is not None and first[1] == 4.0
+    assert director.claim(item) is None  # the first run is going: the other instance stands down
+    assert world["ws"] not in woken()
+
+
 def test_it_lets_an_outcome_continue_past_its_budget_only_up_to_the_ceiling(world):
-    def spend(usd):  # committed, so the budget check (its own session) counts it
-        with db.session_scope() as s:
-            s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="builder", harness="native",
-                      status="succeeded", cost_usd=usd, cost_known=True))
 
     with db.session_scope() as s:
         budget = Decision(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["t2"], kind="budget",
@@ -169,15 +184,36 @@ def test_it_lets_an_outcome_continue_past_its_budget_only_up_to_the_ceiling(worl
         s.flush()
         budget_id = budget.id
     cfg = director.settings_for({"director": ON})
-    spend(60.0)
-    with db.session_scope() as s:
+    spend(world, 100.0)
+    with db.session_scope() as s:  # $100 committed plus the $10 extension fits under $120
         assert director.choices(s, s.get(Decision, budget_id), cfg) == (["retry", "abandon"], "")
-    spend(70.0)
+    spend(world, 15.0)
     with db.session_scope() as s:
         budget = s.get(Decision, budget_id)
         allowed, why = director.choices(s, budget, cfg)
-        assert allowed == ["abandon"] and "ceiling of $120.00" in why
+        assert allowed == ["abandon"] and "to $125.00" in why and "ceiling of $120.00" in why
         assert director.choices(s, budget, {**cfg, "max_outcome_usd": 200.0})[0] == ["retry", "abandon"]
+
+
+def test_a_continuation_the_director_granted_holds_only_under_its_ceiling(world):
+    from aifactory.pipeline import lead
+
+    def granted(attribution):
+        return Decision(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["t2"], kind="budget",
+                        title="Outcome #7 reached $40", status="resolved", resolution="retry",
+                        options=[{"value": "retry", "label": "Continue"}], attribution=attribution)
+
+    with db.session_scope() as s:
+        assert not lead.continued_past_budget(s, world["outcome"])
+        s.add(granted({"source": "director", "run_id": "r"}))
+    with db.session_scope() as s:
+        assert lead.continued_past_budget(s, world["outcome"])  # later Lead runs may continue, under the ceiling
+    spend(world, 130.0)
+    with db.session_scope() as s:
+        assert not lead.continued_past_budget(s, world["outcome"])  # past it, the outcome's budget stops them again
+        s.add(granted(None))  # a person's grant has no ceiling
+        s.flush()
+        assert lead.continued_past_budget(s, world["outcome"])
 
 
 @pytest.fixture

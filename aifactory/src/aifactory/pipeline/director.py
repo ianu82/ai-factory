@@ -35,7 +35,7 @@ from ..models import Alert, Decision, Event, Message, Outcome, Run, Signal, Task
 from .holds import held_workspaces
 from .lead import (FINISHED, STOPPED, UNPRICED_MIN, _bounded, _Budget, _fn, _task, converse, notes_for,
                    outcome_record)
-from .runtime import DEFAULT_SETTINGS, merged_settings, outcome_committed, workspace_settings
+from .runtime import DEFAULT_SETTINGS, budget_extension, merged_settings, outcome_committed, workspace_settings
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ DAILY_RUNS = 360  # every 4 minutes on average; daily_usd is the limit that bind
 MAX_MINUTES = 15
 TURNS = 40
 LEAD_BUSY = timedelta(minutes=30)  # a Lead run marked running for longer was cut off by a restart
+CLAIMED = timedelta(minutes=30)  # a Director run started this recently without finishing is still going somewhere
 SKIPS = 3  # runs that may pass over a new item without deciding or noting it before it counts as seen
 PER_RUN = {"resolve_decision": 15, "triage_signal": 8, "dismiss_alert": 20, "post_guidance": 6, "note_for_people": 20}
 NEVER = frozenset({"take_over", "takeover", "handover"})  # taking work over is a person's job
@@ -102,12 +103,22 @@ def choices(db, decision: Decision, cfg: dict[str, Any]) -> tuple[list[str], str
     allowed = [value for value in offered if value not in NEVER]
     why = "Taking work over is left to people" if len(allowed) < len(offered) else ""
     if decision.kind == "budget" and "retry" in allowed and decision.outcome_id:
+        # Continuing grants the outcome one more extension (budgets.continue_usd): it must fit under the ceiling.
         committed, _ = outcome_committed(decision.outcome_id)
-        if committed >= cfg["max_outcome_usd"]:
+        after = committed + budget_extension(workspace_settings(decision.workspace_id))
+        if after > cfg["max_outcome_usd"]:
             allowed.remove("retry")
-            why = (f"The outcome has committed ${committed:.2f}, at or past the Director's ceiling of "
-                   f"${cfg['max_outcome_usd']:.2f}: only a person lets it spend more")
+            why = (f"Continuing would take the outcome to ${after:.2f} (${committed:.2f} committed), past the "
+                   f"Director's ceiling of ${cfg['max_outcome_usd']:.2f}: only a person lets it spend more")
     return allowed, why
+
+
+def within_ceiling(db, decision: Decision) -> bool:
+    """Whether a continuation the Director granted (a budget decision it resolved with "retry") still holds: only
+    while the outcome has committed less than the workspace's Director ceiling. Later Lead runs read it through
+    lead.continued_past_budget, so the Director's grant never lets spend run past ``max_outcome_usd``."""
+    cfg = settings_for(workspace_settings(decision.workspace_id))
+    return outcome_committed(decision.outcome_id)[0] < cfg["max_outcome_usd"]
 
 
 # waking ------------------------------------------------------------------------------------------------------------
@@ -207,6 +218,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             history = _history(s, ws.id, now)
             if history:
                 last = history[0]
+                if last["finished"] is None and now - last["started_at"] < CLAIMED:
+                    continue  # running on another scheduler instance (claim() is the guarantee)
                 ok = (last["finished"] or {}).get("status") == "succeeded"
                 if now - last["started_at"] < (COOLDOWN if ok else RETRY_AFTER):
                     continue
@@ -218,8 +231,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 continue
             seen = last_seen(s, ws.id)
             known = seen.get("marks") or {}
-            marks, held = _waiting(s, ws.id, now, cfg)
-            new = sorted(key for key, mark in marks.items() if known.get(key) != mark and key not in held)
+            marks, leads_turn = _waiting(s, ws.id, now, cfg)
+            new = sorted(key for key, mark in marks.items() if known.get(key) != mark and key not in leads_turn)
             if not new:
                 continue
             counts = {kind: sum(1 for key in new if key.startswith(prefix))
@@ -228,6 +241,31 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             woken.append({"workspace_id": ws.id, "reasons": reasons, "new": new, "marks": marks, "seen": seen,
                           "usd": usd})
     return woken
+
+
+def claim(item: dict[str, Any]) -> tuple[str, float] | None:
+    """Start a run on the workspace: its id and spending cap, or None when another run is going (on any scheduler
+    instance) or the day's spend no longer allows one. Under the workspace's row lock (a write lock on SQLite) the
+    checks and the run's started event commit together, so two instances never both start one or both spend the
+    workspace's remaining allowance."""
+    from ..onboarding_policy import lock_workspace
+
+    workspace_id = item["workspace_id"]
+    now = utcnow()
+    with session_scope() as s:
+        lock_workspace(s, workspace_id)
+        history = _history(s, workspace_id, now)
+        if history and (now - history[0]["started_at"] < COOLDOWN
+                        or any(run["finished"] is None and now - run["started_at"] < CLAIMED for run in history)):
+            return None
+        cfg = settings_for(merged_settings(s.get(Workspace, workspace_id).settings))
+        usd = min(float(item.get("usd") or 0.0), cfg["daily_usd"] - _spent(history))
+        if usd < UNPRICED_MIN:
+            return None
+        run_id = new_id()
+        record(workspace_id, "director_run_started", f"Director woke: {'; '.join(item['reasons'])}", session=s,
+               data={"run_id": run_id, "role": "director", "reasons": item["reasons"], "reserved_usd": usd})
+    return run_id, usd
 
 
 # the inbox ---------------------------------------------------------------------------------------------------------
@@ -629,12 +667,12 @@ Rules:
 async def run_director(item: dict[str, Any]) -> dict[str, Any]:
     """One Director run on a workspace. Never raises: every failure ends the run as failed, with the reason recorded."""
     workspace_id = item["workspace_id"]
+    claimed = await asyncio.to_thread(claim, item)
+    if claimed is None:
+        return {"workspace_id": workspace_id, "status": "skipped", "reason": "Another run is going, or none is due"}
+    run_id, usd = claimed
     settings = workspace_settings(workspace_id)
     cfg = settings_for(settings)
-    run_id = new_id()
-    usd = float(item.get("usd") or 0.0)
-    record(workspace_id, "director_run_started", f"Director woke: {'; '.join(item['reasons'])}",
-           data={"run_id": run_id, "role": "director", "reasons": item["reasons"], "reserved_usd": usd})
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings)
     tools = Tools(workspace_id, run_id, cfg, set(item["new"]))
     client = provider = None
