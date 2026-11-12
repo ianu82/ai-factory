@@ -398,6 +398,8 @@ def test_when_two_resolvers_act_at_once_only_the_first_applies(world):
 def test_an_item_it_passes_over_comes_back_until_it_has_been_skipped_three_times(world):
     item = woken()[world["ws"]]
     tools = director.Tools(world["ws"], "r", ON, set(item["new"]))
+    assert director.seen_after(item, tools) == {"marks": {}, "skips": {}}  # shown nothing: nothing counts as skipped
+    tools.shown = set(item["new"])
     tools.handled = {f"d:{world['merge']}"}
     seen = director.seen_after(item, tools)
     assert set(seen["marks"]) == {f"d:{world['merge']}"}
@@ -406,10 +408,46 @@ def test_an_item_it_passes_over_comes_back_until_it_has_been_skipped_three_times
         past_run(world, seen=seen, ago=timedelta(minutes=10))
         item = woken()[world["ws"]]
         tools = director.Tools(world["ws"], "r", ON, set(item["new"]))
+        tools.shown = set(item["new"])
         seen = director.seen_after(item, tools)
     assert set(seen["marks"]) == set(item["marks"]) and seen["skips"] == {}
     past_run(world, seen=seen, ago=timedelta(minutes=10))
     assert world["ws"] not in woken()
+
+
+def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request(world):
+    import json
+
+    with db.session_scope() as s:  # a long backlog, each question longer than the inbox shows
+        for n in range(70):
+            s.add(Decision(workspace_id=world["ws"], outcome_id=world["outcome"], kind="question",
+                           title=f"Question {n}", body=f"Context {n}: " + "x" * 2000,
+                           options=[{"value": "answer", "label": "Answer"}],
+                           created_at=db.utcnow() - timedelta(minutes=30 + n)))
+    item = woken()[world["ws"]]
+    tools = director.Tools(world["ws"], "r", ON, set(item["new"]))
+    first = json.loads(tools._inbox())
+    assert first["waiting"] == {"decisions": 72, "alerts": 1, "signals": 1}
+    assert 0 < len(first["items"]) <= director.PAGE_ITEMS and first["more"] == 74 - len(first["items"])
+    assert all(len(row.get("body") or "") <= director.BRIEF + 1 for row in first["items"])
+    tools.handled |= set(tools.shown)  # decided or noted: what it saw goes last
+    second = json.loads(tools._inbox())
+
+    def ids(rows):
+        return [r.get("decision_id") or r.get("alert_id") or r.get("signal_id") for r in rows]
+
+    unseen = 74 - len(first["items"])  # the rest come first; what it already handled follows them
+    assert set(ids(second["items"][:unseen])).isdisjoint(ids(first["items"]))
+    while len(tools.shown) < 74:  # every item reaches a page
+        before = len(tools.shown)
+        tools.handled |= set(tools.shown)
+        tools._inbox()
+        assert len(tools.shown) > before
+    with db.session_scope() as s:
+        question = s.query(Decision).filter_by(title="Question 0").one().id
+    full = json.loads(tools._inbox_item("decision", question))
+    assert full["body"].startswith("Context 0: ") and len(full["body"]) > director.BRIEF
+    assert tools._inbox_item("alert", "nope") == "No alert with that id in this workspace."
 
 
 def test_the_inbox_and_message_log_show_the_directors_note(world, client):

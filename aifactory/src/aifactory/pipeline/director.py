@@ -20,6 +20,7 @@ finished event carries what the run saw, so the next run wakes only for what is 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -54,8 +55,9 @@ NEVER = frozenset({"take_over", "takeover", "handover"})  # taking work over is 
 PEOPLE_ONLY = {"provider_hold": "A provider hold lifts once a person has fixed billing or the provider key"}
 TRIAGE_SOURCES = ("github_issue", "smoke_failure", "feedback")  # red main is the merge manager's and steward's
 NEEDS_TEXT = frozenset({"answer", "replan", "reject"})
-LISTED = {"decisions": 60, "alerts": 40, "signals": 30}
-BODY = 1500  # characters of a decision's or signal's body in the inbox
+BRIEF = 400  # characters of an item's text in the inbox; inbox_item has it whole
+PAGE_CHARS = 30_000  # an inbox page is built to fit whole within a tool result
+PAGE_ITEMS = 40
 
 
 class DirectorFailed(Exception):
@@ -301,13 +303,15 @@ def claim(item: dict[str, Any]) -> tuple[str, float] | None:
 
 # the inbox ---------------------------------------------------------------------------------------------------------
 
-def _short(text: Any, limit: int = BODY) -> str:
+def _short(text: Any, limit: int = BRIEF) -> str:
     text = text if isinstance(text, str) else ""
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def inbox(workspace_id: str, cfg: dict[str, Any], new: set[str]) -> dict[str, Any]:
-    """Everything open that waits on a person: new items first, then the most urgent outcomes, then the oldest."""
+def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str]) -> list[tuple[str, dict[str, Any]]]:
+    """Every open item waiting on a person, as (key, compact row), in the order a run should see them: new items it
+    hasn't handled yet, then the rest it hasn't handled, then what it already noted this run; within each, the most
+    urgent outcome first, then the oldest."""
     from ..serializers import actionable
 
     now = utcnow()
@@ -317,52 +321,101 @@ def inbox(workspace_id: str, cfg: dict[str, Any], new: set[str]) -> dict[str, An
                      if actionable(d) and _ripe(d, now, cfg)]
         busy = _busy(s, workspace_id, now)
         outcomes = {o.id: o for o in s.query(Outcome).filter(Outcome.workspace_id == workspace_id)}
-        task_ids = {d.task_id for d in decisions if d.task_id}
         alerts = s.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.status == "open").all()
-        task_ids |= {a.task_id for a in alerts if a.task_id}
+        task_ids = {d.task_id for d in decisions if d.task_id} | {a.task_id for a in alerts if a.task_id}
         tasks = {t.id: t for t in s.query(Task).filter(Task.id.in_(task_ids))} if task_ids else {}
         notes = notes_for(s, decisions)
         signals = s.query(Signal).filter(Signal.workspace_id == workspace_id, Signal.status.in_(("new", "proposed")),
                                          Signal.source.in_(TRIAGE_SOURCES)).all()
 
-        def about(outcome_id: str | None) -> dict[str, Any] | None:
+        def about(outcome_id: str | None) -> str | None:
             o = outcomes.get(outcome_id or "")
-            return {"number": o.number, "title": o.title, "status": o.status, "priority": o.priority} if o else None
+            return f"#{o.number} {o.title[:120]} ({o.status}, priority {o.priority})" if o else None
 
-        def order(key: str, outcome_id: str | None, at: datetime | None) -> tuple:
+        def task(task_id: str | None) -> str | None:
+            t = tasks.get(task_id or "")
+            return (f"{t.key} {t.status}/{t.stage}, attempt {t.attempt}" + (f", PR #{t.pr_number}" if t.pr_number
+                                                                              else "")) if t else None
+
+        rows: list[tuple[tuple, str, dict[str, Any]]] = []
+
+        def add(key: str, outcome_id: str | None, at: datetime | None, row: dict[str, Any]) -> None:
             o = outcomes.get(outcome_id or "")
-            return (key not in new, o.priority if o else 2, at or now)
+            group = 2 if key in handled else 0 if key in new else 1
+            rows.append(((group, o.priority if o else 2, at or now), key, {"new": key in new, **row}))
 
-        rows = []
-        for d in sorted(decisions, key=lambda d: order(f"d:{d.id}", d.outcome_id, d.created_at))[:LISTED["decisions"]]:
+        for d in decisions:
             allowed, why = choices(s, d, cfg)
-            t = tasks.get(d.task_id or "")
-            rows.append({"id": d.id, "new": f"d:{d.id}" in new, "kind": d.kind, "title": d.title,
-                         "body": _short(d.body), "waiting_minutes": int((now - d.created_at).total_seconds() // 60)
-                         if d.created_at else None, "outcome": about(d.outcome_id),
-                         "task": {"key": t.key, "status": t.status, "stage": t.stage, "pr_number": t.pr_number,
-                                  "attempt": t.attempt} if t else None,
-                         "finding": (d.metadata_json or {}).get("finding_kind") if d.kind == "supervisor" else None,
-                         "options": [{"value": o.get("value"), "label": o.get("label")}
-                                     for o in d.options or [] if isinstance(o, dict)],
-                         "you_may_choose": allowed, "left_to_people": why or None,
-                         "lead_is_working_on_it": d.outcome_id in busy,
-                         "lead_note": (notes.get(d.id) or {}).get("text")})
-        alert_rows = [{"id": a.id, "new": f"a:{a.id}" in new, "kind": a.kind, "title": a.title, "body": _short(a.body),
-                       "since": a.since.isoformat() if a.since else None, "outcome": about(a.outcome_id),
-                       "task_key": tasks[a.task_id].key if a.task_id in tasks else None, "decision_id": a.decision_id}
-                      for a in sorted(alerts, key=lambda a: order(f"a:{a.id}", a.outcome_id, a.opened_at))
-                      ][:LISTED["alerts"]]
-        signal_rows = [{"id": sig.id, "new": f"s:{sig.id}" in new, "source": sig.source, "status": sig.status,
-                        "title": sig.title, "body": _short(sig.body), "url": sig.url, "times_seen": sig.count,
-                        "first_seen": sig.first_seen_at.isoformat() if sig.first_seen_at else None,
-                        "accepted_as": about(sig.outcome_id)}
-                       for sig in sorted(signals, key=lambda sig: (f"s:{sig.id}" not in new, sig.first_seen_at or now))
-                       ][:LISTED["signals"]]
-    return {"decisions": rows, "alerts": alert_rows, "signals": signal_rows,
-            "shown": {"decisions": f"{len(rows)} of {len(decisions)}", "alerts": f"{len(alert_rows)} of {len(alerts)}",
-                      "signals": f"{len(signal_rows)} of {len(signals)}"},
+            add(f"d:{d.id}", d.outcome_id, d.created_at, {
+                "decision_id": d.id, "kind": d.kind, "title": _short(d.title, 200), "body": _short(d.body),
+                "waiting_minutes": int((now - d.created_at).total_seconds() // 60) if d.created_at else None,
+                "outcome": about(d.outcome_id), "task": task(d.task_id),
+                **({"finding": (d.metadata_json or {}).get("finding_kind")} if d.kind == "supervisor" else {}),
+                "options": ", ".join(f"{o.get('value')} ({o.get('label')})" for o in d.options or []
+                                     if isinstance(o, dict)),
+                "you_may_choose": allowed, **({"left_to_people": why} if why else {}),
+                **({"lead_is_working_on_it": True} if d.outcome_id in busy else {}),
+                **({"lead_note": _short((notes.get(d.id) or {}).get("text"), 300)} if notes.get(d.id) else {})})
+        for a in alerts:
+            add(f"a:{a.id}", a.outcome_id, a.opened_at, {
+                "alert_id": a.id, "kind": a.kind, "title": _short(a.title, 200), "body": _short(a.body, 300),
+                "since": a.since.isoformat() if a.since else None, "outcome": about(a.outcome_id),
+                "task": task(a.task_id), **({"decision_id": a.decision_id} if a.decision_id else {})})
+        for sig in signals:
+            add(f"s:{sig.id}", sig.outcome_id, sig.first_seen_at, {
+                "signal_id": sig.id, "source": sig.source, "status": sig.status, "title": _short(sig.title, 200),
+                "body": _short(sig.body), "times_seen": sig.count, "accepted_as": about(sig.outcome_id)})
+    rows.sort(key=lambda r: r[0])
+    return [(key, row) for _, key, row in rows]
+
+
+def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str]) -> tuple[str, list[str]]:
+    """One page of the inbox, built to fit whole (no shortening drops items from it), and the keys it shows. Items
+    a run has decided leave the inbox, and ones it noted go last, so calling it again shows what is left."""
+    from ..mind.tools import clean
+
+    rows = _rows(workspace_id, cfg, new, handled)
+    shown: list[str] = []
+    page: list[dict[str, Any]] = []
+    size = 0
+    for key, row in rows:
+        row = clean(row)  # redacted; a compact row is within clean's bounds, so nothing more is cut
+        length = len(json.dumps(row, ensure_ascii=False, default=str)) + 2
+        if page and (size + length > PAGE_CHARS or len(page) >= PAGE_ITEMS):
+            break
+        page.append(row)
+        shown.append(key)
+        size += length
+    counts = {kind: sum(1 for key, _ in rows if key.startswith(prefix))
+              for kind, prefix in (("decisions", "d:"), ("alerts", "a:"), ("signals", "s:"))}
+    more = len(rows) - len(page)
+    body = {"waiting": counts, "new_not_yet_handled": sum(1 for key, _ in rows if key in new and key not in handled),
+            "items": page, "more": more,
+            **({"next": "Decide or note these, then call inbox again to see the rest."} if more else {}),
             "limits": {"max_outcome_usd": cfg["max_outcome_usd"], "per_run": PER_RUN}}
+    return json.dumps(body, ensure_ascii=False, default=str), shown
+
+
+def inbox_item(workspace_id: str, cfg: dict[str, Any], kind: str, item_id: str) -> dict[str, Any] | None:
+    """One inbox item in full: a decision's whole question and the Lead's note, an alert's or a signal's whole text."""
+    with session_scope() as s:
+        if kind == "decision":
+            d = s.query(Decision).filter(Decision.id == item_id, Decision.workspace_id == workspace_id).first()
+            if d is None:
+                return None
+            allowed, why = choices(s, d, cfg)
+            return {"decision_id": d.id, "status": d.status, "kind": d.kind, "title": d.title, "body": d.body,
+                    "options": d.options, "metadata": d.metadata_json, "you_may_choose": allowed,
+                    "left_to_people": why or None, "lead_note": (notes_for(s, [d]).get(d.id) or {}).get("text")}
+        if kind == "alert":
+            a = s.query(Alert).filter(Alert.id == item_id, Alert.workspace_id == workspace_id).first()
+            return {"alert_id": a.id, "status": a.status, "kind": a.kind, "title": a.title, "body": a.body,
+                    "data": a.data, "decision_id": a.decision_id} if a else None
+        if kind == "signal":
+            sig = s.query(Signal).filter(Signal.id == item_id, Signal.workspace_id == workspace_id).first()
+            return {"signal_id": sig.id, "status": sig.status, "source": sig.source, "title": sig.title,
+                    "body": sig.body, "url": sig.url, "times_seen": sig.count} if sig else None
+    return None
 
 
 # tools -------------------------------------------------------------------------------------------------------------
@@ -370,8 +423,12 @@ def inbox(workspace_id: str, cfg: dict[str, Any], new: set[str]) -> dict[str, An
 TEXT = {"type": "string", "maxLength": 4000}
 OUTCOME = {"type": "string", "description": "The outcome's number (#12 or 12) or id."}
 TOOLS = [
-    _fn("inbox", "Everything that waits on a person in this workspace: open decisions (with the options you may "
-        "choose and the Lead's note), open alerts and signals awaiting triage. New items are marked."),
+    _fn("inbox", "What waits on a person in this workspace, a page at a time: open decisions (with the options you "
+        "may choose and the Lead's note), open alerts and signals awaiting triage. New items come first and are "
+        "marked; items you decide leave it, so call it again to see more."),
+    _fn("inbox_item", "One inbox item in full: a decision's whole question, options and the Lead's note, or an "
+        "alert's or a signal's whole text.", {"kind": {"type": "string", "enum": ["decision", "alert", "signal"]},
+                                              "id": {"type": "string"}}, ("kind", "id")),
     _fn("outcome_record", "One outcome's record: plan, tasks, open decisions, team rules, recent posts and events.",
         {"outcome": OUTCOME}, ("outcome",)),
     _fn("task_detail", "One task's full record: spec, acceptance criteria, evidence (attempts, checks, CI, review, "
@@ -411,6 +468,7 @@ class Tools:
         self.used: dict[str, int] = {}
         self.actions: list[dict[str, Any]] = []
         self.handled: set[str] = set()  # items decided or noted this run
+        self.shown: set[str] = set()  # items an inbox page showed this run
         self.followups: list[Any] = []  # coroutines to run on the event loop after a tool call
 
     @property
@@ -462,7 +520,13 @@ class Tools:
         return outcome
 
     def _inbox(self) -> str:
-        return _bounded(inbox(self.ws, self.cfg, self.new))
+        page, keys = inbox_page(self.ws, self.cfg, self.new, self.handled)
+        self.shown.update(keys)
+        return page
+
+    def _inbox_item(self, kind: str, id: str) -> str:
+        found = inbox_item(self.ws, self.cfg, kind, id)
+        return _bounded(found) if found is not None else f"No {kind} with that id in this workspace."
 
     def _outcome_record(self, outcome: str) -> str:
         from ..mind.tools import clean
@@ -649,8 +713,9 @@ class Tools:
 
 def seen_after(item: dict[str, Any], tools: Tools) -> dict[str, Any]:
     """What the next run counts as seen: what was seen before and is still waiting, unchanged, plus what this run
-    decided or noted. A new item it passed over comes back next run, and counts as seen after SKIPS such runs, so an
-    item the model keeps ignoring can't wake it forever."""
+    decided or noted. A new item an inbox page showed but the run passed over comes back next run, and counts as seen
+    after SKIPS such runs, so an item the model keeps ignoring can't wake it forever. One the run never got to see
+    (on a later page) stays new, with no skip counted."""
     before = item.get("seen") or {}
     known, skips = dict(before.get("marks") or {}), dict(before.get("skips") or {})
     marks: dict[str, str] = item["marks"]
@@ -659,6 +724,9 @@ def seen_after(item: dict[str, Any], tools: Tools) -> dict[str, Any]:
     for key in item["new"]:
         if key in tools.handled:
             out[key] = marks[key]
+        elif key not in tools.shown:
+            if key in skips:
+                left[key] = int(skips[key])
         else:
             count = int(skips.get(key, 0)) + 1
             if count >= SKIPS:
@@ -673,9 +741,10 @@ away, so delivery keeps going unattended. The Factory's planner, builders, verif
 Lead do the work; the decisions they bring to a person reach you. Decide each as a careful, experienced engineering
 lead would, from the evidence in the record.
 
-You were woken because new items wait on a person. Call inbox first, read what you need (outcome_record,
-task_detail, run_log), then decide, most urgent first: items blocking other work, then outcome priority (0 is
-urgent), then the oldest.
+You were woken because new items wait on a person. Call inbox first, read what you need (inbox_item for an
+item's full text, outcome_record, task_detail, run_log), then decide, most urgent first: items blocking other work,
+then outcome priority (0 is urgent), then the oldest. The inbox shows a page at a time: when it says there is more,
+call it again once you have decided or noted what it showed.
 - Plan approvals: approve when the plan delivers the brief and its acceptance criteria within the named repositories
   and its tasks are concrete. Replan with specific direction when it misses something. Cancel only an outcome that
   is obsolete or duplicates another, and name it.
