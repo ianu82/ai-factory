@@ -745,6 +745,7 @@ def test_a_merge_approval_counts_every_blocking_finding_also_past_the_number_it_
     for n in range(22):  # a review result keeps 20 findings and says how many more there are
         finding(head, 600 + n)
     assert poll(tid)[:2] == ("queued", "merge")
+    approval(tid)  # the merge stage opens the approval that carries the facts
     review = merge_facts(tid)["review"]
     assert (review["open"], review["blocking"]) == (22, 22)
 
