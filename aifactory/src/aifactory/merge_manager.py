@@ -115,6 +115,10 @@ def _is_repair(runner) -> bool:
     ev = runner.task.evidence or {}
     if ev.get("revert_candidate"):
         return True
+    steward = ev.get("steward") or {}
+    if (isinstance(steward, dict) and steward.get("authorized") is True and steward.get("episode_id")
+            and steward.get("action") in ("fix", "revert")):
+        return True
     with session_scope() as s:
         outcome = s.get(Outcome, runner.task.outcome_id)
         if outcome is None:
