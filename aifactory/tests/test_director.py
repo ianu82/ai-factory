@@ -428,21 +428,26 @@ def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request
     tools = director.Tools(world["ws"], "r", ON, set(item["new"]))
     first = json.loads(tools._inbox())
     assert first["waiting"] == {"decisions": 72, "alerts": 1, "signals": 1}
-    assert 0 < len(first["items"]) <= director.PAGE_ITEMS and first["more"] == 74 - len(first["items"])
+    assert 0 < len(first["items"]) <= director.PAGE_ITEMS and first["not_shown_yet"] == 74 - len(first["items"])
     assert all(len(row.get("body") or "") <= director.BRIEF + 1 for row in first["items"])
-    tools.handled |= set(tools.shown)  # decided or noted: what it saw goes last
-    second = json.loads(tools._inbox())
 
     def ids(rows):
         return [r.get("decision_id") or r.get("alert_id") or r.get("signal_id") for r in rows]
 
-    unseen = 74 - len(first["items"])  # the rest come first; what it already handled follows them
+    # Even when the run can neither decide nor note what it saw, each call moves on to items not yet shown.
+    second = json.loads(tools._inbox())
+    unseen = 74 - len(first["items"])
     assert set(ids(second["items"][:unseen])).isdisjoint(ids(first["items"]))
+    calls = 2
     while len(tools.shown) < 74:  # every item reaches a page
         before = len(tools.shown)
-        tools.handled |= set(tools.shown)
         tools._inbox()
+        calls += 1
         assert len(tools.shown) > before
+    assert calls <= 3 and json.loads(tools._inbox())["not_shown_yet"] == 0
+    noted = set(ids(first["items"]))  # what it noted goes after what it was shown but left
+    tools.handled |= {key for key in tools.shown if key.split(":", 1)[1] in noted}
+    assert not set(ids(json.loads(tools._inbox())["items"][:1])) & noted
     with db.session_scope() as s:
         question = s.query(Decision).filter_by(title="Question 0").one().id
     full = json.loads(tools._inbox_item("decision", question))

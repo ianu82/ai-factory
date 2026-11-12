@@ -308,10 +308,12 @@ def _short(text: Any, limit: int = BRIEF) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str]) -> list[tuple[str, dict[str, Any]]]:
+def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str],
+          shown: set[str]) -> list[tuple[str, dict[str, Any]]]:
     """Every open item waiting on a person, as (key, compact row), in the order a run should see them: new items it
-    hasn't handled yet, then the rest it hasn't handled, then what it already noted this run; within each, the most
-    urgent outcome first, then the oldest."""
+    hasn't been shown yet, then the rest it hasn't been shown, then what it was shown but left, then what it noted;
+    within each, the most urgent outcome first, then the oldest. Each inbox call so reaches items not yet shown, even
+    when the run can neither decide nor note what it saw."""
     from ..serializers import actionable
 
     now = utcnow()
@@ -341,7 +343,7 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
 
         def add(key: str, outcome_id: str | None, at: datetime | None, row: dict[str, Any]) -> None:
             o = outcomes.get(outcome_id or "")
-            group = 2 if key in handled else 0 if key in new else 1
+            group = 3 if key in handled else 2 if key in shown else 0 if key in new else 1
             rows.append(((group, o.priority if o else 2, at or now), key, {"new": key in new, **row}))
 
         for d in decisions:
@@ -369,13 +371,14 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
     return [(key, row) for _, key, row in rows]
 
 
-def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str]) -> tuple[str, list[str]]:
+def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str],
+               shown: set[str]) -> tuple[str, list[str]]:
     """One page of the inbox, built to fit whole (no shortening drops items from it), and the keys it shows. Items
-    a run has decided leave the inbox, and ones it noted go last, so calling it again shows what is left."""
+    not yet shown this run come first, so calling it again reaches the rest; ``more`` counts what no page has shown."""
     from ..mind.tools import clean
 
-    rows = _rows(workspace_id, cfg, new, handled)
-    shown: list[str] = []
+    rows = _rows(workspace_id, cfg, new, handled, shown)
+    keys: list[str] = []
     page: list[dict[str, Any]] = []
     size = 0
     for key, row in rows:
@@ -384,16 +387,17 @@ def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: s
         if page and (size + length > PAGE_CHARS or len(page) >= PAGE_ITEMS):
             break
         page.append(row)
-        shown.append(key)
+        keys.append(key)
         size += length
     counts = {kind: sum(1 for key, _ in rows if key.startswith(prefix))
               for kind, prefix in (("decisions", "d:"), ("alerts", "a:"), ("signals", "s:"))}
-    more = len(rows) - len(page)
+    seen = shown | set(keys)
+    more = sum(1 for key, _ in rows if key not in seen)
     body = {"waiting": counts, "new_not_yet_handled": sum(1 for key, _ in rows if key in new and key not in handled),
-            "items": page, "more": more,
-            **({"next": "Decide or note these, then call inbox again to see the rest."} if more else {}),
+            "items": page, "not_shown_yet": more,
+            **({"next": "Call inbox again to see the items not shown yet."} if more else {}),
             "limits": {"max_outcome_usd": cfg["max_outcome_usd"], "per_run": PER_RUN}}
-    return json.dumps(body, ensure_ascii=False, default=str), shown
+    return json.dumps(body, ensure_ascii=False, default=str), keys
 
 
 def inbox_item(workspace_id: str, cfg: dict[str, Any], kind: str, item_id: str) -> dict[str, Any] | None:
@@ -520,7 +524,7 @@ class Tools:
         return outcome
 
     def _inbox(self) -> str:
-        page, keys = inbox_page(self.ws, self.cfg, self.new, self.handled)
+        page, keys = inbox_page(self.ws, self.cfg, self.new, self.handled, self.shown)
         self.shown.update(keys)
         return page
 
