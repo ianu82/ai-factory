@@ -370,13 +370,12 @@ def test_a_hold_lifted_before_the_watch_first_looked_is_told_once_as_what_happen
     client.post(f"/api/workspaces/{world['ws']}/decisions/{old}/resolve", json={"resolution": "retry"})
     watch.run(resolved + timedelta(hours=2))  # lifted long before this pass: old news, not sent
     assert len(posted) == 1
-    # A hold lifted and another opened before the watch looked: only the open one is told, since nothing has resumed.
-    with db.session_scope() as s:
-        s.get(Decision, old).resolved_at = resolved + timedelta(hours=2)
+    # That hold was lifted a moment ago, and another opens before the watch looks: only the open one is told,
+    # since nothing has resumed.
     again = open_provider_hold(world["ws"], "MindsHub: no credit remaining (balance 0)", "planning outcome #7")
     with db.session_scope() as s:
         reopened = s.get(Decision, again).created_at
-    watch.run(resolved + timedelta(hours=2, minutes=1))
+    watch.run(reopened + timedelta(minutes=1))
     assert [text for _, text in posted[1:]] == [
         f"Work is on hold in {name} since {watch._when(reopened)}: {CAUSES['credit'][0]}. Nothing new starts until "
         f"the hold is lifted. {CAUSES['credit'][1]}"]
