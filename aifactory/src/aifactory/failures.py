@@ -39,7 +39,7 @@ _EXHAUSTED = ("insufficient_quota", "quota exceeded", "exceeded your current quo
               "no credit", "wallet", "billing")
 # Wording of an answer whose trouble passes by itself. A provider that adds "do not send this again" to such an
 # answer (it already retried on its side) has given up for the moment, not set a limit.
-_MOMENTARY = ("overloaded", "momentarily", "temporarily", "try again")
+_MOMENTARY = ("overloaded", "momentarily", "temporarily")
 CAUSES = ("provider", "transient", "")
 
 
@@ -101,7 +101,9 @@ def failure_cause(exc: BaseException) -> str:
     provider SDK's exceptions are read by shape (``status_code``, class name), so no SDK is imported here."""
     cause = getattr(exc, "cause", None)
     if isinstance(cause, str) and cause in CAUSES:
-        return cause
+        # A refusal whose own words say it passes by itself is not one a person has to lift: on 12 November a session
+        # ended with "The model provider is momentarily overloaded", carried as a refusal, and held the workspace.
+        return "transient" if cause == "provider" and momentary(str(exc)) else cause
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and not isinstance(status, bool):
         if status in (401, 402, 403):

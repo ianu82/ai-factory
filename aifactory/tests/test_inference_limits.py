@@ -331,9 +331,21 @@ def test_do_not_send_this_again_is_a_refusal_only_on_a_limit():
                                    "recover after 3 attempts.", never)) == "transient"
     assert failure_cause(sdk_error("UnprocessableEntityError", 422, "The model is temporarily unavailable, try "
                                    "again shortly.", never)) == "transient"
-    # A spent quota stays a refusal, even where its wording says to try again.
+    # A spent quota and a monthly limit stay refusals, even where their wording says to try again.
     assert failure_cause(sdk_error("RateLimitError", 429, "Quota exceeded, try again next month",
                                    never)) == "provider"
+    assert failure_cause(sdk_error("RateLimitError", 429, "Monthly limit reached; try again next month",
+                                   never)) == "provider"
+
+
+def test_a_session_that_ended_on_an_overload_is_not_a_refusal_whatever_cause_it_carried():
+    from aifactory.failures import failure_cause
+    from aifactory.harness.base import HarnessFailed
+
+    # What production recorded on 12 November: the session's failure carried "provider", and held the workspace.
+    overload = "The model provider is momentarily overloaded. It did not recover after 3 attempts."
+    assert failure_cause(HarnessFailed(overload, cause="provider")) == "transient"
+    assert failure_cause(HarnessFailed("MindsHub: no credit remaining", cause="provider")) == "provider"
 
 
 async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):
