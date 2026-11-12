@@ -501,6 +501,7 @@ def test_an_untriaged_smoke_failure_offers_to_create_the_fix_or_ignore_it(world,
         fixed = signal(db, world, "smoke_failure", status="new", body="Health check returned 500",
                        url="https://github.com/acme/test/pull/1").id
         ignored = signal(db, world, "smoke_failure", status="new", url="https://github.com/acme/test/pull/2").id
+        db.get(Workspace, world[0]).outcome_seq = 1  # the fixture's outcome is #1: the fix's outcome is the next one
     sweep(world[0], NOW)
     with session_scope() as db:
         items = {d.metadata_json["subject"]: d for d in db.query(Decision).filter_by(kind="supervisor")}
