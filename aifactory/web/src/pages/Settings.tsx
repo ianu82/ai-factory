@@ -79,8 +79,10 @@ function Policies() {
   const save = useSaveSettings();
   const s = ws.settings;
   const admin = ws.role === "owner" || ws.role === "admin";
-  const [nums, setNums] = useState({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd });
-  useEffect(() => setNums({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd }), [s]);
+  const [nums, setNums] = useState({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd,
+    open_outcomes: s.limits.open_outcomes ?? 0 });
+  useEffect(() => setNums({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd,
+    open_outcomes: s.limits.open_outcomes ?? 0 }), [s]);
   const [mindBudget, setMindBudget] = useState(String(s.mind?.daily_budget_usd ?? 10));
   const [mindSaving, setMindSaving] = useState(false);
   useEffect(() => setMindBudget(String(s.mind?.daily_budget_usd ?? 10)), [ws.id, s.mind?.daily_budget_usd]);
@@ -167,12 +169,17 @@ function Policies() {
         <div className="s-grid">
           <label className="field"><span>Tasks in parallel</span><input className="input num" type="number" min={1} max={50} value={nums.concurrency} disabled={!admin} onChange={(e) => setNums({ ...nums, concurrency: Number(e.target.value) })} /><span className="hint">1–50</span></label>
           <label className="field"><span>Plans in parallel</span><input className="input num" type="number" min={1} max={50} step={1} value={nums.planning_concurrency} disabled={!admin} onChange={(e) => setNums({ ...nums, planning_concurrency: Number(e.target.value) })} /><span className="hint">1–50 · default 2 per workspace; also bounded by the Factory-wide limit</span></label>
+          <label className="field"><span>Open outcomes</span>
+            <input className="input num" type="number" min={0} max={1000} step={1} value={nums.open_outcomes}
+              disabled={!admin} onChange={(e) => setNums({ ...nums, open_outcomes: Number(e.target.value) })} />
+            <span className="hint">New outcomes wait unplanned while this many are open. 0: no limit.</span></label>
           <label className="field"><span>Attempts per task</span><input className="input num" type="number" min={1} max={8} value={nums.max_attempts} disabled={!admin} onChange={(e) => setNums({ ...nums, max_attempts: Number(e.target.value) })} /><span className="hint">Failed checks or verification feed the next attempt</span></label>
           <label className="field"><span>Automatic retry rounds</span><input className="input num" type="number" min={0} max={3} value={nums.auto_retry_rounds} disabled={!admin} onChange={(e) => setNums({ ...nums, auto_retry_rounds: Number(e.target.value) })} /><span className="hint">When attempts run out on concrete findings, start a fresh set before asking you (0–3)</span></label>
           <label className="field"><span>Budget per agent session (USD)</span><input className="input num" type="number" min={0.5} step={0.5} value={nums.run_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, run_usd: Number(e.target.value) })} /></label>
           <label className="field"><span>Budget per outcome (USD)</span><input className="input num" type="number" min={1} step={1} value={nums.outcome_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, outcome_usd: Number(e.target.value) })} /><span className="hint">Work pauses for a decision when reached</span></label>
         </div>
-        {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, planning_concurrency: nums.planning_concurrency, max_attempts: nums.max_attempts, auto_retry_rounds: nums.auto_retry_rounds, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
+        {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, planning_concurrency: nums.planning_concurrency, max_attempts: nums.max_attempts, auto_retry_rounds: nums.auto_retry_rounds,
+          limits: { ...s.limits, open_outcomes: nums.open_outcomes }, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
       </section>
     </>
   );
