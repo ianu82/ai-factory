@@ -171,6 +171,35 @@ def test_a_decision_marked_for_people_is_left_to_them(world):
     assert f"d:{world['merge']}" not in due["marks"] and f"d:{world['stuck']}" in due["marks"]
 
 
+def test_a_plan_sent_back_twice_is_left_to_people(world):
+    options = [{"value": "approve", "label": "Approve"}, {"value": "replan", "label": "Revise"},
+               {"value": "cancel", "label": "Cancel"}]
+
+    def sent_back(outcome_id):
+        return Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="approve_plan", title="Approve plan",
+                        options=options, status="resolved", resolution="replan", comment="Plan the whole request.")
+
+    with db.session_scope() as s:
+        other = Outcome(workspace_id=world["ws"], number=8, title="Billing", brief="Add billing", status="planning")
+        s.add(other)
+        s.flush()
+        latest = Decision(workspace_id=world["ws"], outcome_id=world["outcome"], kind="approve_plan",
+                          title="Approve plan v3", options=options)
+        s.add_all([latest, sent_back(world["outcome"]), sent_back(other.id), sent_back(other.id)])
+        s.flush()
+        latest_id = latest.id
+    with db.session_scope() as s:
+        cfg = director.settings_for(s.get(Workspace, world["ws"]).settings)
+        # Sent back once (another outcome's revisions don't count): the Director may still revise, approve or cancel.
+        assert director.choices(s, s.get(Decision, latest_id), cfg) == (["approve", "replan", "cancel"], "")
+        s.add(sent_back(world["outcome"]))
+    with db.session_scope() as s:
+        allowed, why = director.choices(s, s.get(Decision, latest_id), cfg)
+        assert allowed == [] and "sent back 2 times" in why and "split the outcome" in why
+        # The merge decision on the same outcome is not a plan: it stays the Director's to take.
+        assert director.choices(s, s.get(Decision, world["merge"]), cfg)[0] == ["approve", "reject"]
+
+
 def spend(world, usd):
     """Recorded and committed, so budget checks (in their own sessions) count it."""
     with db.session_scope() as s:
