@@ -84,7 +84,9 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                            attribution=decision.attribution))
 
     kind = decision.kind
-    if kind == "approve_plan" and outcome:
+    if kind == "supervisor" and resolution == "acknowledge":
+        pass  # Surface-only: acknowledging never changes the linked work.
+    elif kind == "approve_plan" and outcome:
         plan = (db.query(Plan).filter(Plan.outcome_id == outcome.id, Plan.status == "proposed")
                 .order_by(Plan.version.desc()).first())
         if resolution == "approve" and plan:

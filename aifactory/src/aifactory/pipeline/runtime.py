@@ -27,6 +27,7 @@ from .attachments import prepare_attachments
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "review": DEFAULT_REVIEW,
+    "supervisor": {"mode": "observe", "interval_minutes": 30, "stuck_minutes": 120, "unaccepted_issue_hours": 24},
     "provider": "mindshub",
     "decision_judges": "decide",
     # One agent per outcome, responsible for delivering it (pipeline/lead.py).
@@ -390,11 +391,25 @@ def outcome_allowance(outcome_id: str, budget: float | None = None) -> float:
 
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,
                   task_id: str | None = None, options: list[dict[str, Any]] | None = None,
-                  metadata: dict[str, Any] | None = None) -> str:
+                  metadata: dict[str, Any] | None = None, dedup_key: str | None = None) -> str:
     with session_scope() as s:
-        existing = (s.query(Decision)
-                    .filter(Decision.workspace_id == workspace_id, Decision.kind == kind, Decision.status == "open",
-                            Decision.outcome_id == outcome_id, Decision.task_id == task_id).first())
+        if dedup_key is not None:
+            # Serialize the read/check/insert boundary, including on SQLite
+            # where FOR UPDATE is ignored. No external work runs under the lock.
+            if s.bind.dialect.name == "sqlite":
+                s.query(Workspace).filter(Workspace.id == workspace_id).update(
+                    {Workspace.outcome_seq: Workspace.outcome_seq}, synchronize_session=False)
+            s.query(Workspace).filter(Workspace.id == workspace_id).with_for_update().one()
+            candidates = s.query(Decision).filter(Decision.workspace_id == workspace_id,
+                Decision.kind == kind, Decision.status.in_(["open", "dismissed"]))
+            existing = next((d for d in candidates
+                             if (d.metadata_json or {}).get("fingerprint") == dedup_key), None)
+            if existing:
+                return existing.id
+        else:
+            existing = (s.query(Decision)
+                        .filter(Decision.workspace_id == workspace_id, Decision.kind == kind, Decision.status == "open",
+                                Decision.outcome_id == outcome_id, Decision.task_id == task_id).first())
         if existing:
             existing.body = body
             existing.title = title
@@ -416,7 +431,8 @@ def publish_decision(workspace_id: str, decision_id: str, kind: str, title: str,
                      outcome_id: str | None = None, task_id: str | None = None) -> None:
     """Announce a decision only after its transaction has committed."""
     record(workspace_id, "decision_requested", title, outcome_id=outcome_id, task_id=task_id, level="warn",
-           data={"decision_id": decision_id, "kind": kind})
+           data={"decision_id": decision_id, "kind": kind},
+           actor="supervisor" if kind == "supervisor" else "factory")
     notify(workspace_id, "decision", decision_id)
 
 

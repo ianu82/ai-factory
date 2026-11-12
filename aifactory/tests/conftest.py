@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -38,11 +41,74 @@ def pytest_collection_modifyitems(config, items):
         items[:] = keep
 
 
+def worker_database_name(run_uid: str, worker_id: str) -> str:
+    """ASCII, below Postgres's 63-byte limit, and unique to this run/worker pair."""
+    if not run_uid or not worker_id:
+        raise ValueError("Postgres worker isolation requires a run and worker identifier")
+    identity = json.dumps([run_uid, worker_id], ensure_ascii=True).encode()
+    return "factory_xdist_" + hashlib.sha256(identity).hexdigest()[:40]
+
+
+@contextmanager
+def postgres_worker_database(shared: str, run_uid: str, worker_id: str):
+    """Own exactly one newly created database; never adopt or delete an existing one.
+
+    Connect to the supplied database only for autocommit CREATE/DROP DATABASE. URL.set preserves
+    credentials, driver and query options. Never print the resulting (unredacted) connection URL.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.pool import NullPool
+
+    from aifactory import db
+
+    source = make_url(db.normalize_url(shared))
+    name = worker_database_name(run_uid, worker_id)
+    if source.get_backend_name() != "postgresql" or name in {source.database, "postgres", "template0", "template1"}:
+        raise ValueError("Refusing unsafe Postgres worker database provisioning")
+    admin = create_engine(source, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    quoted = admin.dialect.identifier_preparer.quote_identifier(name)
+    try:
+        with admin.connect() as conn:
+            conn.exec_driver_sql(f"CREATE DATABASE {quoted}")
+        # Only a successful CREATE grants ownership. In particular, a collision must not DROP anything.
+        try:
+            yield source.set(database=name).render_as_string(hide_password=False)
+        finally:
+            with admin.connect() as conn:
+                # Pools are disposed by the caller first. FORCE also closes any leaked test connections.
+                conn.exec_driver_sql(f"DROP DATABASE {quoted} WITH (FORCE)")
+    finally:
+        admin.dispose()
+
+
+@pytest.fixture(scope="session")
+def test_database_url(request):
+    shared = os.environ.get("AIFACTORY_TEST_DATABASE_URL")
+    worker = getattr(request.config, "workerinput", None)
+    if not shared or worker is None:
+        yield shared  # serial Postgres and the default per-test SQLite path are unchanged
+        return
+    from sqlalchemy.engine import make_url
+
+    from aifactory import db
+
+    if make_url(db.normalize_url(shared)).get_backend_name() != "postgresql":
+        yield shared
+        return
+    with postgres_worker_database(shared, worker["testrunuid"], worker["workerid"]) as url:
+        try:
+            yield url
+        finally:
+            if db._engine is not None:
+                db._engine.dispose()
+
+
 @pytest.fixture(autouse=True)
-def isolated_env(tmp_path, monkeypatch):
+def isolated_env(tmp_path, monkeypatch, test_database_url):
     data = tmp_path / "data"
     monkeypatch.setenv("AIFACTORY_DATA_DIR", str(data))
-    shared = os.environ.get("AIFACTORY_TEST_DATABASE_URL")  # e.g. a throwaway Postgres; reset per test
+    shared = test_database_url  # a throwaway Postgres (per worker under xdist); reset per test
     monkeypatch.setenv("DATABASE_URL", shared or f"sqlite:///{data / 'factory.db'}")
     monkeypatch.setenv("AIFACTORY_SECRET_KEY", "test-secret-key-for-unit-tests-only")
     monkeypatch.setenv("AIFACTORY_ALLOW_DEV_SIGN_IN", "1")

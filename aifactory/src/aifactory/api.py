@@ -213,12 +213,18 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         review = review_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+    from .supervisor_policy import supervisor_policy
+    try:
+        supervisor = supervisor_policy(raw)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     mind = _mind_settings(raw.get("mind"))
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
     alerts = _alert_settings(raw.get("alerts"))
     merged = merged_settings({**raw, "lead": lead, "alerts": alerts})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
+    merged["supervisor"] = supervisor
     merged["review"] = review
     merged["mind"] = mind
     merged["lead"] = lead
@@ -1598,6 +1604,8 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
     if sig.outcome_id:
         db.commit()
         return S.signal(sig)  # accepting again must not create duplicate work
+    from .connectors.core import signal_priority
+
     worker = (sig.data or {}).get("worker") if sig.source == "github_issue" else None
     if worker not in ("native", "codex", "anton"):
         worker = None
@@ -1605,7 +1613,8 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         Repository.workspace_id == workspace_id).limit(1)]
     outcome = outcome_from_text(db, workspace_id, user, body.title or sig.title,
                                 (body.brief or sig.body or "") + (f"\n\nSource: {sig.url}" if sig.url else ""),
-                                repo_ids, source="signal", signal_id=sig.id, harness=worker)
+                                repo_ids, source="signal", signal_id=sig.id, harness=worker,
+                                priority=signal_priority(sig))
     sig.status, sig.outcome_id = "accepted", outcome.id
     db.commit()
     orchestrator.wake()
