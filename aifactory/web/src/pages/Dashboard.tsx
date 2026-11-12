@@ -128,7 +128,7 @@ function Board({ data }: { data: Series }) {
         </Panel>
         <Panel title="Cost per delivered task" note={`${def.cost_per_delivered_task} ≥ marks a lower bound: some usage has no known cost.`}>
           <Columns period={period} buckets={buckets} money series={[
-            { label: "Cost per delivered task", color: AGENTS, values: buckets.map((b) => b.cost_per_delivered_task.usd ?? 0) },
+            { label: "Cost per delivered task", color: AGENTS, values: buckets.map((b) => b.cost_per_delivered_task.usd) },
           ]} lowerBound={buckets.map((b) => !b.cost_per_delivered_task.known && b.cost_per_delivered_task.usd !== null)}
             extra={(b) => [`${money(b.cost.usd, b.cost.known)} spent · ${b.tasks_delivered} delivered`,
               `Median outcome: ${usd(b.outcome_cost.median_usd, b.outcome_cost.known)} (${b.outcome_cost.sample_count} completed)`]} />
@@ -238,7 +238,8 @@ function useWidth() {
   return { ref, px };
 }
 
-type ColumnSeries = { label: string; color: string; values: number[] };
+// A null value is undefined for that period (a cost per task with no task delivered): it draws nothing and reads "—".
+type ColumnSeries = { label: string; color: string; values: (number | null)[] };
 
 function Columns({ period, buckets, series, extra, unit, money: isMoney, lowerBound }: {
   period: Period; buckets: Bucket[]; series: ColumnSeries[]; extra?: (b: Bucket) => string[]; unit?: string;
@@ -255,6 +256,10 @@ function Columns({ period, buckets, series, extra, unit, money: isMoney, lowerBo
   const barW = Math.max(3, Math.min(24, band * 0.62));
   const y = (v: number) => top + plotH - (v / max) * plotH;
   const fmt = (v: number) => (isMoney ? money(v) : Number.isInteger(v) ? String(v) : v.toFixed(1));
+  const show = (s: ColumnSeries, i: number) => {
+    const v = s.values[i] ?? null;
+    return v === null ? "—" : `${lowerBound?.[i] ? "≥" : ""}${fmt(v)}`;
+  };
   const ticks = tickIndexes(buckets.length, Math.max(2, Math.floor(plotW / 64)));
   const tip = hover === null ? null : buckets[hover];
   return (
@@ -293,7 +298,7 @@ function Columns({ period, buckets, series, extra, unit, money: isMoney, lowerBo
               {lowerBound?.[i] && totals[i] > 0 && <text x={cx} y={y(totals[i]) - 3} textAnchor="middle" className="dash-tick">≥</text>}
               {ticks.includes(i) && <text x={cx} y={H - 5} textAnchor="middle" className="dash-tick">{bucketLabel(b.start, period)}</text>}
               <rect x={left + band * i} y={top} width={band} height={plotH} fill="transparent" tabIndex={0}
-                aria-label={`${bucketLabel(b.start, period, true)}: ${series.map((s) => `${s.label} ${fmt(s.values[i] || 0)}`).join(", ")}`}
+                aria-label={`${bucketLabel(b.start, period, true)}: ${series.map((s) => `${s.label} ${show(s, i)}`).join(", ")}`}
                 onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)} onFocus={() => setHover(i)} onBlur={() => setHover(null)} />
             </g>
           );
@@ -305,7 +310,7 @@ function Columns({ period, buckets, series, extra, unit, money: isMoney, lowerBo
           <div className="dash-tip-head">{bucketLabel(tip.start, period, true)}{tip.partial ? " · so far" : ""}</div>
           {series.map((s) => (
             <div key={s.label} className="dash-tip-row">
-              <i style={{ background: s.color }} /><b>{lowerBound?.[hover] ? "≥" : ""}{fmt(s.values[hover] || 0)}</b><span>{s.label}{unit ? ` ${unit}` : ""}</span>
+              <i style={{ background: s.color }} /><b>{show(s, hover)}</b><span>{s.label}{unit ? ` ${unit}` : ""}</span>
             </div>
           ))}
           {extra?.(tip).map((line) => <div key={line} className="dash-tip-extra">{line}</div>)}
