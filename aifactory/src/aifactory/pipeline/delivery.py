@@ -2247,9 +2247,9 @@ class TaskRunner:
 
     async def _ci_required(self, gh: GitHub, wait: dict[str, Any] | None = None) -> tuple[bool, str]:
         """Whether a head must show CI checks before it merges, and why: "setting" (`require_ci` true or false),
-        "workflows" (no setting or "auto": required when the repository has an active workflow), "unknown" (the
-        workflows could not be read: required, the safe side) or "skipped" (this head's own checks were left to its
-        CI after a rebase). `wait` remembers the workflows answer for its head."""
+        "workflows" (no setting or "auto": required when the repository runs workflows on pull requests), "unknown"
+        (that could not be read: required, the safe side) or "skipped" (this head's own checks were left to its CI
+        after a rebase). `wait` remembers the workflows answer for its head."""
         reval = (self.task.evidence or {}).get("revalidation") or {}
         if wait is not None and reval.get("local_checks") == "skipped" and reval.get("head") == wait["head"]:
             return True, "skipped"
@@ -2259,7 +2259,7 @@ class TaskRunner:
         known = (wait or {}).get("workflows")
         if known is None:
             try:
-                known = await gh.has_workflows(self.repo.full_name)
+                known = await gh.has_pull_request_workflows(self.repo.full_name)
             except Exception:
                 return True, "unknown"
             if wait is not None:
@@ -2364,7 +2364,7 @@ class TaskRunner:
                 elif elapsed > max(grace, CI_NO_CHECKS_SECONDS):
                     # No checks is unknown, not a pass: a person decides, and is told which case this is.
                     case = {"setting": "this repository requires CI before merging",
-                            "workflows": "this repository has workflows, but none ran for this pull request "
+                            "workflows": "this repository runs workflows on pull requests, but none ran for this one "
                                          "(a path filter?)",
                             "unknown": "this repository's workflows could not be read, so CI is taken as required",
                             "skipped": "its checks were left to CI after the rebase, so this commit needs CI"}[why]
@@ -2959,7 +2959,8 @@ class TaskRunner:
                 if required and why != "unknown":
                     decision.update(local_checks="skipped", local_checks_reason=(
                         "No file is shared with the commits that landed, and "
-                        + ("this repository requires CI" if why == "setting" else "this repository has workflows")
+                        + ("this repository requires CI" if why == "setting"
+                           else "this repository runs workflows on pull requests")
                         + ": the pull request's CI on the rebased commit is the gate."))
             self.artifact("report", "Revalidation changed paths", json.dumps({"candidate": candidate, "main": main}))
             state = {**decision, "phase": "rebasing"}

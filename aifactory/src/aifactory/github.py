@@ -613,9 +613,15 @@ class GitHub:
         """Needs Actions write; a token without it gets 403, which the caller treats as "cannot rerun"."""
         await self.request("POST", f"/repos/{full_name}/actions/runs/{run_id}/rerun-failed-jobs", retries=0)
 
-    async def has_workflows(self, full_name: str) -> bool:
-        found = await self.request("GET", f"/repos/{full_name}/actions/workflows", params={"per_page": 100})
-        return any(w.get("state") == "active" for w in found.get("workflows", []))
+    async def has_pull_request_workflows(self, full_name: str) -> bool:
+        """Whether Actions has run a workflow for a pull request here. Workflows that only run on a push, a tag or
+        a schedule put no check on a pull request, so a pull request without checks is not missing anything."""
+        for event in ("pull_request", "pull_request_target"):
+            found = await self.request("GET", f"/repos/{full_name}/actions/runs",
+                                       params={"event": event, "per_page": 1})
+            if found.get("total_count") or found.get("workflow_runs"):
+                return True
+        return False
 
     async def set_status(self, full_name: str, sha: str, state: str, description: str, target_url: str = "") -> None:
         if self.installation_bound:

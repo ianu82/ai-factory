@@ -721,7 +721,7 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
         value = patch["require_ci"]
         if type(value) is not bool and value != "auto":
             raise HTTPException(422, "require_ci must be true, false or auto")
-        cfg.pop("require_ci", None)  # no setting is "auto": required when the repository has workflows
+        cfg.pop("require_ci", None)  # no setting is "auto": required when its pull requests run workflows
         if value != "auto":
             cfg["require_ci"] = value
     if "max_changed_lines" in patch:

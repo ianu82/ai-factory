@@ -211,7 +211,7 @@ class FakeGitHub:
     # CI: one check, ``ci``, in ``check_state``. ``check_conclusion`` is its conclusion when that is not the state
     # ("cancelled"), ``check_run_id`` the Actions run it belongs to (its failed jobs can then be rerun; ``reruns``
     # lists the runs asked for), ``base_failing`` the checks failing on a commit asked about by name alone, and
-    # ``workflows`` whether the repository has an active workflow.
+    # ``workflows`` whether its pull requests run workflows.
     check_conclusion: str | None = None
     check_run_id: int | None = None
     reruns: list[int] = []
@@ -233,8 +233,8 @@ class FakeGitHub:
         self._fail("rerun_failed_jobs")
         FakeGitHub.reruns.append(run_id)
 
-    async def has_workflows(self, full_name):
-        self._fail("has_workflows")
+    async def has_pull_request_workflows(self, full_name):
+        self._fail("has_pull_request_workflows")
         return FakeGitHub.workflows
 
     async def job_log_tail(self, full_name, check, limit=6000):

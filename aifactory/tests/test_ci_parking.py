@@ -168,7 +168,7 @@ def test_no_checks_where_ci_is_required_waits_ten_minutes_then_asks_a_person_and
         require_ci(factory, setting)
     FakeGitHub.workflows = bool(workflows)
     if workflows is None:
-        FakeGitHub.failures = {"has_workflows": 5}
+        FakeGitHub.failures = {"has_pull_request_workflows": 5}
     tid = candidate(factory)
     FakeGitHub.check_state = "none"
     asyncio.run(park(tid))
@@ -1788,3 +1788,21 @@ def test_revert_record_commits_evidence_and_terminal_state_together(factory, mon
         assert not s.query(Event).filter_by(task_id=tid, kind="reverted").count()
     assert reconcile._handle_reverted(tid, FakeGitHub.pulls[2])
     assert snapshot(tid)[:2] == ("reverted", "done")
+
+
+@pytest.mark.parametrize("value,stored", [(True, True), (False, False), ("auto", None)])
+def test_the_ci_setting_is_stored_as_true_or_false_and_auto_is_no_setting(value, stored):
+    from aifactory.api import _clean_repo_config
+
+    assert _clean_repo_config({"require_ci": True}, {"require_ci": value}).get("require_ci") is stored
+
+
+@pytest.mark.parametrize("value", ["yes", "true", 1, None])
+def test_the_ci_setting_refuses_anything_but_true_false_and_auto(value):
+    from fastapi import HTTPException
+
+    from aifactory.api import _clean_repo_config
+
+    with pytest.raises(HTTPException) as refused:
+        _clean_repo_config({}, {"require_ci": value})
+    assert refused.value.status_code == 422

@@ -590,7 +590,7 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
           <label className="field"><span>GitHub CI checks before merging</span>
             <select className="select" value={form.require_ci} disabled={!admin}
               onChange={(e) => setForm({ ...form, require_ci: e.target.value })}>
-              <option value="auto">Required when the repository has workflows (default)</option>
+              <option value="auto">Required when pull requests here run workflows (default)</option>
               <option value="true">Always required</option><option value="false">Not required</option>
             </select><span className="hint">A pull request that shows no checks is not merged while CI is required:
               after ten minutes the Factory asks. Not required: it merges once checks have had 150 seconds to
