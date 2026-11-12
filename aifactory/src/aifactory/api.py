@@ -190,12 +190,14 @@ def _lead_settings(value: Any) -> dict[str, Any]:
 
 def _director_settings(value: Any) -> dict[str, Any]:
     """The Director: off or on, its spend per run and per day, the most an outcome may have committed for it to let
-    the outcome continue past its budget, and how long a decision waits before it takes it (pipeline/director.py)."""
+    the outcome continue past its budget, how long a decision waits before it takes it, and how long what it left to
+    people waits for them before it decides that itself (0: always people's; pipeline/director.py)."""
     default = DEFAULT_SETTINGS["director"]
     if value is None:
         return dict(default)
     if not isinstance(value, dict) or set(value) - set(default):
-        raise HTTPException(422, "director accepts only mode, run_usd, daily_usd, max_outcome_usd and after_minutes")
+        raise HTTPException(422, "director accepts only mode, run_usd, daily_usd, max_outcome_usd, after_minutes and "
+                                 "decide_after_hours")
     out = {**default, **value}
     if out["mode"] not in ("off", "on"):
         raise HTTPException(422, "director.mode must be off or on")
@@ -206,6 +208,8 @@ def _director_settings(value: Any) -> dict[str, Any]:
         out[key] = float(number)
     if type(out["after_minutes"]) is not int or not 0 <= out["after_minutes"] <= 1440:
         raise HTTPException(422, "director.after_minutes must be a whole number from 0 to 1440")
+    if type(out["decide_after_hours"]) is not int or not 0 <= out["decide_after_hours"] <= 168:
+        raise HTTPException(422, "director.decide_after_hours must be a whole number from 0 to 168")
     return out
 
 

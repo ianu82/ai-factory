@@ -18,7 +18,7 @@ from typing import Any, Callable
 import httpx
 
 from .config import get_settings
-from .failures import quota_exhausted
+from .failures import quota_exhausted, rate_limited
 from .inference_limits import admission
 from .db import session_scope
 from .models import Run, Secret, Workspace
@@ -461,7 +461,10 @@ class ModelClient:
                 detail = _error_detail(response)
                 if response.status_code == 402:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
-                if response.headers.get("x-should-retry", "").lower() == "false":
+                if (response.status_code == 429 and response.headers.get("x-should-retry", "").lower() == "false"
+                        and not rate_limited(detail)):
+                    # A limit a person lifts, such as a monthly spend limit. An overload or a rate limit marked
+                    # this way is still retried: a gateway marks it once its own retries are spent.
                     raise InferenceError(f"{self.provider.label} limit reached ({response.status_code}): {detail}",
                                          status=response.status_code, cause="provider")
                 if response.status_code in (401, 403):

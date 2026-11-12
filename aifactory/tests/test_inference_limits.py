@@ -250,6 +250,26 @@ async def test_an_outage_longer_than_the_retry_budget_fails_the_request(provider
     assert notes == ["Model provider unavailable (503); gave up after 243 s"]
 
 
+async def test_an_overload_or_rate_limit_marked_not_worth_retrying_is_still_retried(provider, clocked, monkeypatch):
+    # A gateway marks an overload "x-should-retry: false" once its own retries are spent (12 Nov 2026: that held a
+    # whole workspace for hours). Only a 429 that isn't a rate limit is a limit a person lifts.
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    answers = [(529, {"x-should-retry": "false"}, {"error": {"type": "overloaded_error", "message": "Overloaded"}}),
+               (429, {"x-should-retry": "false"}, {"error": {"message": "Rate limit reached for requests"}}),
+               (200, {}, {"output": []})]
+    sends = []
+
+    def upstream(req):
+        sends.append(guard.active)
+        status, headers, body = answers[len(sends) - 1]
+        return httpx.Response(status, headers=headers, json=body)
+
+    fake_http(monkeypatch, upstream)
+    assert await ModelClient(provider)._post("/responses", {}) == {"output": []}
+    assert sends == [1, 1, 1] and waits == [1, 2] and guard.active == 0
+
+
 @pytest.mark.parametrize("limit, sent, waited", [(0, 1, []), (2, 3, [1, 2])])
 async def test_a_client_with_a_retry_limit_fails_fast(provider, clocked, monkeypatch, limit, sent, waited):
     now, guard = clocked

@@ -30,7 +30,8 @@ def _free_port() -> int:
 
 
 def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100, cached_tokens=0, errors=None):
-    """``errors``: HTTP statuses the provider answers with first, one per request, before it serves any."""
+    """``errors``: what the provider answers with first, one per request, before it serves any: an HTTP status, or
+    (status, headers, body)."""
     import uvicorn
 
     app = FastAPI()
@@ -47,7 +48,10 @@ def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100,
         body = await request.json()
         if errors:
             from fastapi.responses import JSONResponse
-            return JSONResponse({"error": {"message": "the fake provider refused"}}, status_code=errors.pop(0))
+            answer = errors.pop(0)
+            status, headers, content = answer if isinstance(answer, tuple) else (
+                answer, {}, {"error": {"message": "the fake provider refused"}})
+            return JSONResponse(content, status_code=status, headers=headers)
         requests.append(body)
         outputs = [i for i in body.get("input", []) if isinstance(i, dict) and i.get("type") == "function_call_output"]
         n = len(requests)
@@ -188,6 +192,31 @@ def test_a_provider_refusal_ends_an_anton_session_with_its_cause(tmp_path, monke
     assert requests == []  # no request was served
     assert not [event for event in progress if event[0] == "warn"]  # the retry loop never waited on a refusal
     assert provider_guard(provider).active == 0
+
+
+def test_an_overload_marked_not_worth_retrying_ends_an_anton_session_as_transient(tmp_path, monkeypatch):
+    # 12 Nov 2026: a gateway's overload marked "x-should-retry: false" was taken for a billing refusal, and the
+    # planner's failure held the whole workspace until a person resumed it. An overload is retried, and when it
+    # outlasts the retries the session fails as transient: the work is redone later, nothing is held.
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    monkeypatch.setattr(inference, "RETRY_WAIT_CAP_SECONDS", 0.01)
+    monkeypatch.setattr(inference, "RETRY_BUDGET_SECONDS", 0.2)
+    port = _free_port()
+    requests: list = []
+    overloaded = (529, {"x-should-retry": "false"}, {"error": {"type": "overloaded_error", "message": "Overloaded"}})
+    server = _fake_server(port, requests, errors=[overloaded] * 1000)
+    try:
+        provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
+        session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
+                                 sandbox=_sandbox(tmp_path), model="fake-model", client=ModelClient(provider),
+                                 ledger=UsageLedger(run_id="r", workspace_settings={}), report_schema=BUILDER_REPORT,
+                                 writable=True, max_turns=2, deadline=time.monotonic() + 60)
+        with pytest.raises(HarnessFailed) as failed:
+            asyncio.run(AntonHarness().run(session))
+    finally:
+        server.should_exit = True
+    assert failed.value.cause == "transient", str(failed.value)
+    assert requests == [] and provider_guard(provider).active == 0
 
 
 @pytest.mark.parametrize("seconds_left", [300, 60])

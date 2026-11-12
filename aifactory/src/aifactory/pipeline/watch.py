@@ -1,7 +1,9 @@
 """The watch: stuck work and repeated failures, found every few minutes and shown to people in the app.
 
 Every WATCH_EVERY the orchestrator calls run(), which looks in each workspace that isn't paused for:
-- overdue: a decision that has waited on a person longer than the workspace's alert time (alerts.after_minutes);
+- overdue: a decision that has waited on a person longer than the workspace's alert time (alerts.after_minutes),
+  unless the Director is on and has left a note on it: the note on the decision says why it waits, and the Director
+  decides it itself once people haven't answered in its decide_after_hours;
 - unasked: a task waiting on a person with no open decision, so there is nothing anyone can answer;
 - stalled: an outcome where nothing is moving and nothing asks a person (its open tasks wait on dropped ones);
 - quiet: an outcome with work marked active but no activity for QUIET, while the workspace runs nothing at all
@@ -92,6 +94,9 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
                                                          Outcome.status.in_(ACTIVE_OUTCOME))}
     decisions = s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.status == "open").all()
     tasks = s.query(Task).filter(Task.outcome_id.in_(list(outcomes))).all() if outcomes else []
+    from .director import director_notes, settings_for as director_settings
+
+    noted = set(director_notes(s, decisions)) if director_settings(settings)["mode"] == "on" else set()
     keys = {t.id: t.key for t in tasks}
     found: dict[str, dict[str, Any]] = {}
 
@@ -103,7 +108,7 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
     for d in decisions:
         if d.outcome_id and d.outcome_id not in outcomes:
             continue  # its outcome ended: nothing to chase
-        if actionable(d) and now - d.created_at >= after:
+        if actionable(d) and now - d.created_at >= after and d.id not in noted:
             add(f"overdue:{d.id}", "overdue", f"{DECISIONS.get(d.kind, 'Decision')} has waited over {_span(after)}",
                 d.title, d.created_at, outcome_id=d.outcome_id, task_id=d.task_id, decision_id=d.id)
 

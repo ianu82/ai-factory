@@ -91,7 +91,7 @@ function Policies() {
   const qc = useQueryClient();
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const selected = policy.data?.after ?? s.autonomy;
-  const director: DirectorSettings = { mode: "off", run_usd: 4, daily_usd: 40, max_outcome_usd: 120, after_minutes: 5, ...s.director };
+  const director: DirectorSettings = { mode: "off", run_usd: 4, daily_usd: 40, max_outcome_usd: 120, after_minutes: 5, decide_after_hours: 4, ...s.director };
   const autonomy = async (key: keyof Settings["autonomy"], v: "auto" | "approval") => {
     if (!policy.isSuccess) return;
     const patch = policyPatch(policy.data, key, v);
@@ -121,6 +121,11 @@ function Policies() {
           ? `On. Up to $${director.run_usd} a run and $${director.daily_usd} a day. It lets an outcome continue past its budget only until the outcome has committed $${director.max_outcome_usd}.`
           : "Off: decisions wait for a person."}</span></div>
           <Seg value={director.mode} options={[["off", "Off"], ["on", "On"]]} onChange={(v) => save({ director: { ...director, mode: v } })} disabled={!admin} /></div>
+        <div className="s-line"><div className="l"><b>When nobody answers</b><span>{director.decide_after_hours
+          ? `What it left to you with a note waits ${director.decide_after_hours} h for an answer. Then it decides it itself, unless the choice it would make is one it may not make.`
+          : "What it leaves to you waits for you, however long that takes."}</span></div>
+          <Seg value={String(director.decide_after_hours)} options={[["0", "Never"], ["2", "2 h"], ["4", "4 h"], ["8", "8 h"], ["24", "24 h"]]}
+            onChange={(v) => save({ director: { ...director, decide_after_hours: Number(v) } })} disabled={!admin} /></div>
       </section>
       <section className="s-block">
         <h2>Mind daily budget</h2>
