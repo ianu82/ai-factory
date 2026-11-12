@@ -116,7 +116,7 @@ export interface Settings {
   auto_retry_rounds?: number;
   autonomy: { plan: "auto" | "approval"; merge: "auto" | "approval"; release: "auto" | "approval" };
   budgets: { run_usd: number; outcome_usd: number; run_tokens: number };
-  limits: Record<string, number>;
+  limits: { open_outcomes?: number | null; [key: string]: number | null | undefined };
   reasoning_effort?: string;
   linear?: LinearConfig;
   mind?: { daily_budget_usd: number };

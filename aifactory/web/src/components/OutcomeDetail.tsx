@@ -132,7 +132,8 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
         <h3 id="guided-tasks">Tasks {tasks.length > 0 && <span className="r faint num">{outcome.progress.done} of {tasks.length} delivered</span>}</h3>
         {tasks.length === 0 ? (
           <div className="muted" style={{ fontSize: 13 }}>
-            {outcome.status === "planning" ? "The planner is reading the repositories and drafting tasks…" : "No tasks yet."}
+            {outcome.status !== "planning" ? "No tasks yet."
+              : outcome.blocked_reason || "The planner is reading the repositories and drafting tasks…"}
           </div>
         ) : (
           tasks.map((t) => <TaskCard key={t.id} task={t} runs={runs.filter((r) => r.task_id === t.id)} defaultOpen={tasks.length === 1} />)
