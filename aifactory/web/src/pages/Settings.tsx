@@ -2,7 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
-import { api, type Credential, type DirectorSettings, type ModelCheckResult, type Repo, type Settings, type Workspace } from "../api";
+import {
+  api, type Credential, type DirectorSettings, type ModelCheckResult, type Repo, type ReviewPolicy, type Settings,
+  type Workspace,
+} from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
 import { validMindBudget } from "../mind";
@@ -12,6 +15,7 @@ import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
 import { LinearSettings } from "../components/LinearSettings";
+import { REVIEW_DEFAULTS, ruleText, rulesInForce } from "../rules";
 
 const SECTIONS = [
   ["policies", "Autonomy & limits"],
@@ -53,7 +57,9 @@ function useSaveSettings() {
   const { ws } = useWs();
   const qc = useQueryClient();
   const toast = useToast();
-  return async (patch: Omit<Partial<Settings>, "autonomy"> & { autonomy?: Partial<Settings["autonomy"]> } | { name?: string; paused?: boolean; description?: string }, isSettings = true) => {
+  return async (patch: Omit<Partial<Settings>, "autonomy" | "review">
+    & { autonomy?: Partial<Settings["autonomy"]>; review?: Partial<ReviewPolicy> }
+    | { name?: string; paused?: boolean; description?: string }, isSettings = true) => {
     try {
       await api<Workspace>(`/api/workspaces/${ws.id}`, { method: "PATCH", json: isSettings ? { settings: patch } : patch });
       await qc.invalidateQueries({ queryKey: ["me"] });
@@ -74,15 +80,163 @@ function Seg<T extends string>({ value, options, onChange, disabled }: { value: 
   );
 }
 
+function RulesInForce() {
+  const { ws } = useWs();
+  const rules = rulesInForce(ws.settings, ws.alert_webhook?.set === true);
+  const go = (target: string) =>
+    document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  return (
+    <section className="s-block" aria-labelledby="rules-in-force">
+      <h2 id="rules-in-force">Rules in force</h2>
+      <p>What the Factory does in this workspace, as the settings below stand.</p>
+      <ul className="rules">
+        {rules.map((rule) => (
+          <li key={rule.id}>
+            <span>{rule.parts.map((part, i) => typeof part === "string" ? part : <b key={i}>{part.b}</b>)}</span>
+            {rule.target && (
+              <a href={`#${rule.target}`} aria-label={`Change: ${ruleText(rule)}`}
+                onClick={(e) => { e.preventDefault(); go(rule.target!); }}>Change</a>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+type ReviewForm = Omit<ReviewPolicy, "wait_seconds" | "max_rounds" | "ignore"> & {
+  wait_seconds: string; max_rounds: string; ignore: string;
+};
+
+const reviewForm = (r: Partial<ReviewPolicy> | undefined): ReviewForm => {
+  const p = { ...REVIEW_DEFAULTS, request: "", ignore: [] as string[], ...r };
+  return { address: p.address, reviewers: p.reviewers, trust: p.trust, block_on: p.block_on, on_timeout: p.on_timeout,
+    wait_seconds: String(p.wait_seconds), max_rounds: String(p.max_rounds), request: p.request,
+    ignore: (p.ignore || []).join(", ") };
+};
+
+function ReviewPolicySection() {
+  const { ws } = useWs();
+  const save = useSaveSettings();
+  const admin = ws.role === "owner" || ws.role === "admin";
+  const saved = useMemo(() => reviewForm(ws.settings.review), [ws.settings.review]);
+  const [form, setForm] = useState(saved);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => setForm(saved), [saved]);
+  const whole = (v: string) => /^\d+$/.test(v);
+  const valid = whole(form.wait_seconds) && whole(form.max_rounds) && form.request.length <= 500;
+  const logins = (v: string) => v.split(",").map((x) => x.trim()).filter(Boolean);
+  // Only the keys that changed: the API merges the review policy key by key.
+  const patch = (): Partial<ReviewPolicy> => {
+    const out: Partial<ReviewPolicy> = {};
+    if (form.address !== saved.address) out.address = form.address;
+    if (form.reviewers !== saved.reviewers) out.reviewers = form.reviewers;
+    if (form.trust !== saved.trust) out.trust = form.trust;
+    if (form.block_on !== saved.block_on) out.block_on = form.block_on;
+    if (form.on_timeout !== saved.on_timeout) out.on_timeout = form.on_timeout;
+    if (form.wait_seconds !== saved.wait_seconds) out.wait_seconds = Number(form.wait_seconds);
+    if (form.max_rounds !== saved.max_rounds) out.max_rounds = Number(form.max_rounds);
+    if (form.request !== saved.request) out.request = form.request;
+    if (JSON.stringify(logins(form.ignore)) !== JSON.stringify(logins(saved.ignore))) out.ignore = logins(form.ignore);
+    return out;
+  };
+  const off = !admin || saving;
+  return (
+    <section className="s-block" id="rules-review">
+      <h2>Review</h2>
+      <p>Before a green pull request merges, the Factory waits for its review, sends blocking findings back to the
+        builder, and answers each finding on its thread. A repository's own review settings, where it has them, take
+        precedence key by key.</p>
+      <form onSubmit={async (e) => {
+        e.preventDefault();
+        const changes = patch();
+        if (!admin || saving || !valid || !Object.keys(changes).length) return;
+        setSaving(true);
+        try { await save({ review: changes }); }
+        finally { setSaving(false); }
+      }}>
+        <div className="s-grid">
+          <label className="field"><span>What to address</span>
+            <select className="select" value={form.address} disabled={off}
+              onChange={(e) => setForm({ ...form, address: e.target.value as ReviewPolicy["address"] })}>
+              <option value="unresolved">Unresolved threads, change requests and comments (default)</option>
+              <option value="changes_requested">Only reviews that request changes</option>
+              <option value="off">Nothing: do not wait for a review</option>
+            </select>
+            <span className="hint">Off: a green pull request goes on to merge without waiting for a review.</span>
+          </label>
+          <label className="field"><span>Wait for a review (seconds)</span>
+            <input className="input num" type="number" min={0} step={1} value={form.wait_seconds} readOnly={!admin}
+              disabled={saving} onChange={(e) => setForm({ ...form, wait_seconds: e.target.value })} />
+            <span className="hint">How long a requested review is waited for. A whole number, 0 or more · default 600
+              (10 minutes)</span></label>
+          <label className="field"><span>When no review arrives</span>
+            <select className="select" value={form.on_timeout} disabled={off}
+              onChange={(e) => setForm({ ...form, on_timeout: e.target.value as ReviewPolicy["on_timeout"] })}>
+              <option value="proceed">Merge without one (default)</option>
+              <option value="ask">Ask a person</option>
+            </select></label>
+          <label className="field"><span>Rounds of fixes at most</span>
+            <input className="input num" type="number" min={0} step={1} value={form.max_rounds} readOnly={!admin}
+              disabled={saving} onChange={(e) => setForm({ ...form, max_rounds: e.target.value })} />
+            <span className="hint">Blocking findings go back to the builder this many times; then a person decides.
+              A whole number, 0 or more · default 3</span></label>
+          <label className="field"><span>Findings that block a merge</span>
+            <select className="select" value={form.block_on} disabled={off}
+              onChange={(e) => setForm({ ...form, block_on: e.target.value as ReviewPolicy["block_on"] })}>
+              <option value="p1">P0, P1 and unrated (default)</option>
+              <option value="all">Every finding</option>
+              <option value="none">None</option>
+            </select>
+            <span className="hint">Severity comes from the reviewer's badge; a finding without one counts as a
+              P1.</span>
+          </label>
+          <label className="field"><span>Whose reviews count</span>
+            <select className="select" value={form.reviewers} disabled={off}
+              onChange={(e) => setForm({ ...form, reviewers: e.target.value as ReviewPolicy["reviewers"] })}>
+              <option value="all">People and bots (default)</option>
+              <option value="people">People only</option>
+              <option value="bots">Bots only</option>
+            </select></label>
+          <label className="field"><span>Trusted reviewers</span>
+            <select className="select" value={form.trust} disabled={off}
+              onChange={(e) => setForm({ ...form, trust: e.target.value as ReviewPolicy["trust"] })}>
+              <option value="collaborators">Collaborators and installed bots (default)</option>
+              <option value="anyone">Anyone</option>
+            </select>
+            <span className="hint">Anyone: in a public repository, anyone's comment can hold a merge.</span></label>
+          <label className="field"><span>Reviewers to ignore</span>
+            <input className="input" value={form.ignore} readOnly={!admin} disabled={saving} placeholder="login, login"
+              onChange={(e) => setForm({ ...form, ignore: e.target.value })} />
+            <span className="hint">GitHub logins, separated by commas. The Factory's own account and the pull
+              request's author never count.</span></label>
+        </div>
+        <label className="field"><span>Comment that asks for a review</span>
+          <input className="input mono" maxLength={500} value={form.request} readOnly={!admin} disabled={saving}
+            onChange={(e) => setForm({ ...form, request: e.target.value })} />
+          <span className="hint">Posted on each new head after the pull request's first. Empty: never ask.</span>
+        </label>
+        {admin && (
+          <button className="btn primary" disabled={saving || !valid || !Object.keys(patch()).length}>
+            {saving ? "Saving…" : "Save review"}
+          </button>
+        )}
+      </form>
+    </section>
+  );
+}
+
 function Policies() {
   const { ws } = useWs();
   const save = useSaveSettings();
   const s = ws.settings;
   const admin = ws.role === "owner" || ws.role === "admin";
   const [nums, setNums] = useState({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd,
-    open_outcomes: s.limits.open_outcomes ?? 0 });
+    open_outcomes: s.limits.open_outcomes ?? 0, task_attempts_total: s.limits.task_attempts_total ?? 0,
+    task_usd: s.budgets.task_usd ?? 0 });
   useEffect(() => setNums({ concurrency: s.concurrency, planning_concurrency: s.planning_concurrency ?? 2, max_attempts: s.max_attempts, auto_retry_rounds: s.auto_retry_rounds ?? 1, run_usd: s.budgets.run_usd, outcome_usd: s.budgets.outcome_usd,
-    open_outcomes: s.limits.open_outcomes ?? 0 }), [s]);
+    open_outcomes: s.limits.open_outcomes ?? 0, task_attempts_total: s.limits.task_attempts_total ?? 0,
+    task_usd: s.budgets.task_usd ?? 0 }), [s]);
   const [mindBudget, setMindBudget] = useState(String(s.mind?.daily_budget_usd ?? 10));
   const [mindSaving, setMindSaving] = useState(false);
   useEffect(() => setMindBudget(String(s.mind?.daily_budget_usd ?? 10)), [ws.id, s.mind?.daily_budget_usd]);
@@ -93,6 +247,9 @@ function Policies() {
   const [stoppedAfter, setStoppedAfter] = useState(String(s.alerts?.stopped_minutes ?? 20));
   useEffect(() => setStoppedAfter(String(s.alerts?.stopped_minutes ?? 20)), [ws.id, s.alerts?.stopped_minutes]);
   const validStopped = /^\d+$/.test(stoppedAfter) && Number(stoppedAfter) >= 5 && Number(stoppedAfter) <= 240;
+  const [holdTest, setHoldTest] = useState(String(s.holds?.test_minutes ?? 5));
+  useEffect(() => setHoldTest(String(s.holds?.test_minutes ?? 5)), [ws.id, s.holds?.test_minutes]);
+  const validHoldTest = /^\d+$/.test(holdTest) && Number(holdTest) <= 60;
   const [webhookUrl, setWebhookUrl] = useState("");
   const [webhookSaving, setWebhookSaving] = useState(false);
   const webhook = ws.alert_webhook;
@@ -119,7 +276,8 @@ function Policies() {
   };
   return (
     <>
-      <section className="s-block">
+      <RulesInForce />
+      <section className="s-block" id="rules-autonomy">
         <h2>When does a person step in?</h2>
         <p>Everything else runs unattended. Every approval is recorded with who gave it.</p>
         {policy.isPending && <p role="status">Loading saved policy…</p>}
@@ -132,7 +290,8 @@ function Policies() {
         <div className="s-line"><div className="l"><b>Releases</b><span>For repositories that deploy when main changes, require approval before merging.</span></div>
           <Seg value={selected.release} options={[["auto", "Automatic"], ["approval", "Approve first"]]} onChange={(v) => autonomy("release", v)} disabled={!admin || !policy.isSuccess} /></div>
       </section>
-      <section className="s-block">
+      <ReviewPolicySection key={ws.id} />
+      <section className="s-block" id="rules-director">
         <h2>Director</h2>
         <p>While you're away, the Director decides what would otherwise wait for a person: plan, merge and release approvals, budgets, blocked and failed work, agents' questions, Supervisor findings, alerts and signals. It decides through the same choices you have, so every Factory check still applies. It never takes work over, lifts a provider hold or changes settings, and it leaves anything it isn't sure about to you with a note. Each decision is recorded with its reasoning and shows as the Director's.</p>
         <div className="s-line"><div className="l"><b>Director</b><span>{director.mode === "on"
@@ -159,16 +318,17 @@ function Policies() {
           {admin && <button className="btn primary" disabled={mindSaving || !validMindBudget(mindBudget)}>{mindSaving ? "Saving…" : "Save Mind budget"}</button>}
         </form>
       </section>
-      <section className="s-block">
+      <section className="s-block" id="rules-alerts">
         <h2>Alerts</h2>
         <p>Every few minutes the Factory looks for stuck work: a decision waiting too long, a task waiting on a person with nothing to answer, an outcome where nothing moves, and the same failure across tasks. The outcome's Lead looks first; what stays stuck shows at the top of the Inbox.</p>
         <form onSubmit={async (e) => {
           e.preventDefault();
-          if (!admin || alertSaving || !validAlertAfter || !validStopped) return;
+          if (!admin || alertSaving || !validAlertAfter || !validStopped || !validHoldTest) return;
           setAlertSaving(true);
           try {
             await save({ alerts: { after_minutes: Number(alertAfter), stopped_minutes: Number(stoppedAfter),
-                                   slack: false, email: false } });
+                                   slack: false, email: false },
+                         holds: { test_minutes: Number(holdTest) } });
           }
           finally { setAlertSaving(false); }
         }}>
@@ -180,8 +340,17 @@ function Policies() {
               onChange={(e) => setStoppedAfter(e.target.value)} />
             <span className="hint" id="alert-stopped-help">5–240 · default 20</span>
           </label>
+          <label className="field">
+            <span>Test the provider during a hold (minutes)</span>
+            <input className="input num" type="number" min={0} max={60} step={1} value={holdTest}
+              readOnly={!admin} disabled={alertSaving} aria-describedby="hold-test-help"
+              onChange={(e) => setHoldTest(e.target.value)} />
+            <span className="hint" id="hold-test-help">While a provider hold is open the Factory tests the provider
+              this often and lifts the hold when it answers. 0: never. 0–60 · default 5</span>
+          </label>
           {admin && (
-            <button className="btn primary" disabled={alertSaving || !validAlertAfter || !validStopped}>
+            <button className="btn primary"
+              disabled={alertSaving || !validAlertAfter || !validStopped || !validHoldTest}>
               {alertSaving ? "Saving…" : "Save alert times"}
             </button>
           )}
@@ -220,7 +389,7 @@ function Policies() {
         <div className="s-line"><div className="l"><b>Email</b><span>Not available yet.</span></div>
           <Seg value="off" options={[["off", "Off"], ["on", "On"]]} onChange={() => undefined} disabled /></div>
       </section>
-      <section className="s-block">
+      <section className="s-block" id="rules-limits">
         <h2>Throughput and limits</h2>
         <p>Independent tasks run side by side up to the concurrency limit. Merges into the same repository are serialized and revalidated against the latest main.</p>
         <div className="s-grid">
@@ -232,11 +401,27 @@ function Policies() {
             <span className="hint">New outcomes wait unplanned while this many are open. 0: no limit.</span></label>
           <label className="field"><span>Attempts per task</span><input className="input num" type="number" min={1} max={8} value={nums.max_attempts} disabled={!admin} onChange={(e) => setNums({ ...nums, max_attempts: Number(e.target.value) })} /><span className="hint">Failed checks or verification feed the next attempt</span></label>
           <label className="field"><span>Automatic retry rounds</span><input className="input num" type="number" min={0} max={3} value={nums.auto_retry_rounds} disabled={!admin} onChange={(e) => setNums({ ...nums, auto_retry_rounds: Number(e.target.value) })} /><span className="hint">When attempts run out on concrete findings, start a fresh set before asking you (0–3)</span></label>
+          <label className="field"><span>Attempts per task, over its whole life</span>
+            <input className="input num" type="number" min={0} max={100} step={1} value={nums.task_attempts_total}
+              disabled={!admin} onChange={(e) => setNums({ ...nums, task_attempts_total: Number(e.target.value) })} />
+            <span className="hint">A task that has used this many attempts, or this many dollars, stops and asks a
+              person. 0: no limit.</span></label>
           <label className="field"><span>Budget per agent session (USD)</span><input className="input num" type="number" min={0.5} step={0.5} value={nums.run_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, run_usd: Number(e.target.value) })} /></label>
           <label className="field"><span>Budget per outcome (USD)</span><input className="input num" type="number" min={1} step={1} value={nums.outcome_usd} disabled={!admin} onChange={(e) => setNums({ ...nums, outcome_usd: Number(e.target.value) })} /><span className="hint">Work pauses for a decision when reached</span></label>
+          <label className="field"><span>Budget per task, over its whole life (USD)</span>
+            <input className="input num" type="number" min={0} max={1000} step={1} value={nums.task_usd}
+              disabled={!admin} onChange={(e) => setNums({ ...nums, task_usd: Number(e.target.value) })} />
+            <span className="hint">A task that has used this many attempts, or this many dollars, stops and asks a
+              person. 0: no limit.</span></label>
         </div>
         {admin && <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => save({ concurrency: nums.concurrency, planning_concurrency: nums.planning_concurrency, max_attempts: nums.max_attempts, auto_retry_rounds: nums.auto_retry_rounds,
-          limits: { ...s.limits, open_outcomes: nums.open_outcomes }, budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd } })}>Save limits</button></div>}
+          // A lifetime limit left unset and at 0 is not sent: a stored 0 would mean "no limit" over the default.
+          limits: { ...s.limits, open_outcomes: nums.open_outcomes,
+            ...(s.limits.task_attempts_total == null && nums.task_attempts_total === 0
+              ? {} : { task_attempts_total: nums.task_attempts_total }) },
+          budgets: { ...s.budgets, run_usd: nums.run_usd, outcome_usd: nums.outcome_usd,
+            ...(s.budgets.task_usd == null && nums.task_usd === 0 ? {} : { task_usd: nums.task_usd }) } })}>
+          Save limits</button></div>}
       </section>
     </>
   );
