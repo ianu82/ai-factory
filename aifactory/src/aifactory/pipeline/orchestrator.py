@@ -610,10 +610,12 @@ class Orchestrator:
 
         free = concurrency() - len(self._leads)
         now = time.monotonic()
-        if self._stopping or free <= 0 or now - self._lead_check < 10:
+        if self._stopping or now - self._lead_check < 10:
             return
         self._lead_check = now
-        for item in (await asyncio.to_thread(due, frozenset(self._leads)))[:free]:
+        # due() also posts the progress digests, which need no Lead: it runs even when none may start (every Lead
+        # slot taken, or a server with Lead concurrency 0).
+        for item in (await asyncio.to_thread(due, frozenset(self._leads)))[:max(free, 0)]:
             outcome_id = item["outcome_id"]
             job = asyncio.create_task(run_lead(item["workspace_id"], outcome_id, item["reasons"], item["seen"],
                                                item["decisions"]), name=f"lead-{outcome_id[:8]}")

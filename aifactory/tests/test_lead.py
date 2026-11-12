@@ -628,6 +628,48 @@ def test_progress_is_still_told_when_the_lead_has_used_its_runs_for_the_day(worl
     assert digests(world) == [("Progress since the last update:\n- T1: Opened PR #12", published)]
 
 
+def test_progress_is_told_when_the_outcome_is_over_its_budget_and_its_lead_cannot_run(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
+    with db.session_scope() as s:  # $45 spent of the outcome's $40, and a person asks how it is going
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], role="builder",
+                  harness="native", status="succeeded", cost_usd=45.0, cost_known=True,
+                  started_at=db.utcnow() - timedelta(minutes=4), finished_at=db.utcnow() - timedelta(minutes=3)))
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
+                      author_kind="user", body="How is it going?"))
+    published = milestone(world, "published", message="Opened PR #12")
+    assert world["outcome"] not in woken()  # the Lead waits for the budget decision
+    assert digests(world) == [("Progress since the last update:\n- T1: Opened PR #12", published)]
+
+
+def test_digests_are_posted_when_no_lead_may_start(world, monkeypatch):
+    from aifactory.pipeline.orchestrator import Orchestrator
+
+    monkeypatch.setenv("AIFACTORY_LEAD_CONCURRENCY", "0")
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
+    published = milestone(world, "published", message="Opened PR #12")
+    orchestrator = Orchestrator()
+    asyncio.run(orchestrator._maybe_run_leads())
+    assert digests(world) == [("Progress since the last update:\n- T1: Opened PR #12", published)]
+    assert orchestrator._leads == {}
+
+
+def test_a_progress_digest_ends_the_group_of_steps_it_reports(world, client):
+    base = db.utcnow() - timedelta(minutes=30)
+    with db.session_scope() as s:
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="published",
+                    message="Opened PR #12", created_at=base + timedelta(minutes=1)))
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_kind="factory",
+                      body="Progress since the last update:\n- T1: Opened PR #12",
+                      attribution={"source": "factory", "kind": "digest"}, created_at=base + timedelta(minutes=2)))
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], task_id=world["task"], kind="merged",
+                    message="Merged PR #12", created_at=base + timedelta(minutes=3)))
+    items = client.get(f"/api/workspaces/{world['ws']}/outcomes/{world['outcome']}/conversation").json()["items"]
+    digest = next(i for i in items if i["kind"] == "factory")
+    assert digest["digest"] is True and [s_["text"] for s_ in digest["steps"]] == ["Opened PR #12"]
+    # What came after the digest is still being worked on; what it told is not listed again.
+    assert items[-1]["kind"] == "working" and [s_["text"] for s_ in items[-1]["steps"]] == ["Merged PR #12"]
+
+
 def test_a_lead_that_something_else_woke_reports_the_progress_too(world):
     lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
     published = milestone(world, "published", message="Opened PR #12")

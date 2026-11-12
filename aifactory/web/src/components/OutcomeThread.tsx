@@ -186,7 +186,12 @@ function Item({ item }: { item: ConversationItem }) {
         </div>
       );
     case "factory":
-      return <div className="onote"><div className="by">Factory · {clock(item.at)}</div><Prose text={item.text} /></div>;
+      return (
+        <div className="onote">
+          <div className="by">Factory · {clock(item.at)}</div><Prose text={item.text} />
+          {item.steps && item.steps.length > 0 && <Steps steps={item.steps} omitted={item.steps_omitted || 0} />}
+        </div>
+      );
     case "decision":
       return <DecisionItem item={item} />;
     case "working":

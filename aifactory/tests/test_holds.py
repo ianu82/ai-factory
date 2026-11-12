@@ -117,6 +117,18 @@ def test_a_hold_is_tested_two_minutes_after_it_opens_then_every_five_minutes_and
     assert holds.due_probes({}, now=opened + timedelta(hours=1)) == []  # 0: never tested
 
 
+def test_a_hold_that_opens_soon_after_the_factory_lifted_one_is_first_tested_later(held):
+    ws, opened, due = held["ws"], held["opened"], [{"workspace_id": held["ws"], "decision_id": held["hold"]}]
+    with db.session_scope() as s:  # the Factory's test passed ten minutes before this hold: the work was refused again
+        s.add(Event(workspace_id=ws, kind="provider_hold_lifted", message="lifted",
+                    created_at=opened - timedelta(minutes=10)))
+    assert holds.due_probes({}, now=opened + timedelta(minutes=29)) == []
+    assert holds.due_probes({}, now=opened + timedelta(minutes=30)) == due
+    with db.session_scope() as s:
+        s.query(Event).filter(Event.kind == "provider_hold_lifted").one().created_at = opened - timedelta(minutes=31)
+    assert holds.due_probes({}, now=opened + timedelta(minutes=2)) == due  # an older lift says nothing about this one
+
+
 def test_the_orchestrator_tests_a_hold_beside_the_scheduler_and_remembers_when(held, monkeypatch):
     from aifactory.pipeline import orchestrator as orchestration
 
