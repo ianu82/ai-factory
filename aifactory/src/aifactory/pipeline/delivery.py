@@ -927,7 +927,8 @@ class TaskRunner:
     @asynccontextmanager
     async def _checkpoints(self, fix_round: str):
         """While the builder's session runs, save its work in progress every ``CHECKPOINT_SECONDS``, and once more
-        when the service stops the session, so a restart continues from the save (see ``_earlier_changes``). Not in
+        when the session returns or the service stops it, so a restart continues from the save (see
+        ``_earlier_changes``). Not in
         a fix round: its checkout of the pull request's branch restores nothing. No save starts or is stored once
         this returns; a snapshot cut off at that moment only ever wrote files of its own (see ``snapshot_patch``)."""
         async def periodically() -> None:
@@ -950,6 +951,12 @@ class TaskRunner:
             if not fix_round and not self.cancelled.is_set():
                 await self._save_progress(timeout=5)
             raise
+        else:
+            await stopped(saving)
+            # The session returned. Reading its candidate can take minutes, and until that is recorded a restart
+            # goes back to the last save: so what the session left is saved first. Not after a person's cancel.
+            if not fix_round and not self.cancelled.is_set():
+                await self._save_progress(timeout=30)
         finally:
             await stopped(saving)
 

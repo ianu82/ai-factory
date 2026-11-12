@@ -4824,6 +4824,26 @@ def test_the_work_in_progress_is_saved_once_more_when_the_service_stops_the_sess
     assert stored == ([(saved["artifact_id"], change.diff.decode())] if saves else []) and bool(saved) is saves
 
 
+@pytest.mark.parametrize("fix_round, by_a_person, saves", [("", False, True), ("", True, False),
+                                                           ("revise", False, False)])
+def test_the_work_in_progress_is_saved_once_more_when_the_session_returns(factory, monkeypatch, fix_round,
+                                                                          by_a_person, saves):
+    outcome_id, runner = _building(factory)
+    change = _change("Hello, Factory!")
+    taken = _snapshots(monkeypatch, change)
+
+    async def session():
+        async with runner._checkpoints(fix_round):
+            if by_a_person:  # a person's cancel ends the task: there is nothing to continue
+                runner.cancelled.set()
+
+    asyncio.run(session())
+    # Reading the candidate can take minutes: a restart before it is recorded continues from what the session left.
+    saved, stored = _saved_work(outcome_id)
+    assert len(taken) == (1 if saves else 0)
+    assert stored == ([(saved["artifact_id"], change.diff.decode())] if saves else []) and bool(saved) is saves
+
+
 @pytest.mark.parametrize("write, cleared", [
     ({"attempts": {"n": 1, "result": "builder_failed", "error": "ended without a report"}}, True),
     ({"attempts": {"n": 1, "result": "policy", "detail": "- over the line limit", "files": 1}}, True),
