@@ -1564,6 +1564,20 @@ def stats(workspace_id: str, user: User = Depends(current_user), db: Session = D
     }
 
 
+@router.get("/workspaces/{workspace_id}/dashboard")
+def dashboard(workspace_id: str, period: str = Query("week", pattern="^(day|week|month)$"),
+              buckets: int | None = Query(None, ge=1), user: User = Depends(current_user),
+              db: Session = Depends(get_db)):
+    """Delivery performance over time (dashboard.py): the Runs strip's definitions, per day, week or month."""
+    from . import dashboard as board
+
+    _ws(db, user, workspace_id)
+    try:
+        return board.series(db, workspace_id, period, buckets)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+
 @router.get("/workspaces/{workspace_id}/events")
 def events(workspace_id: str, after: int = 0, limit: int = 200, user: User = Depends(current_user),
            db: Session = Depends(get_db)):
