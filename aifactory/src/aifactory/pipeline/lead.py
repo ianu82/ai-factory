@@ -1,10 +1,11 @@
 """The Lead: one agent responsible for one outcome, from acceptance to delivery.
 
-Whatever needs judgement on its outcome wakes it: a decision waiting on someone, a person posting on the
-outcome, work the watch found stuck, or the outcome ending. Progress alone does not: it is told as a digest that
-needs no model (``_post_digest``). It reads the outcome's record (plan, tasks, attempts and evidence, runs, events, guidance) and acts
-within the set delegated operators have: answer an agent's question, retry or acknowledge a blocked task, request
-changes on a pull request, and post guidance to the outcome's agents. Everything else stays with people:
+Whatever needs judgement on its outcome wakes it: a decision waiting on someone, a person posting on the outcome,
+work the watch found stuck, or the outcome ending. Progress alone does not: it is told as a digest that needs no
+model (``_post_digest``). It reads the outcome's record (plan, tasks, attempts and evidence, runs, events,
+guidance) and acts within the set delegated operators have: answer an agent's question, retry or acknowledge a
+blocked task, request changes on a pull request, and post guidance to the outcome's agents. Everything else stays
+with people:
 approving a plan, a merge or a release, budgets, cancelling, abandoning and taking over. For those, the Lead
 leaves a note saying what it found and what it recommends.
 
