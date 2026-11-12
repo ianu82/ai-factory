@@ -132,6 +132,8 @@ def test_codex_reaches_models_only_through_the_gateway(tmp_path, monkeypatch):
     assert ledger.input_tokens >= 321 and ledger.output_tokens >= 45
     env_dump = (sb.home / ".codex" / "config.toml").read_text()
     assert "mdb_real.secret" not in env_dump
+    # The CLI's own retries of a request or stream the gateway could not serve (its backoff timing is the CLI's).
+    assert "request_max_retries = 5" in env_dump and "stream_max_retries = 5" in env_dump
 
 
 def test_codex_runs_inside_a_vm_sandbox_through_the_gateway(tmp_path, monkeypatch):
