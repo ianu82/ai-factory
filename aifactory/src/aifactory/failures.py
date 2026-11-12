@@ -34,25 +34,38 @@ TRANSIENT_PROBLEMS = ("Model request failed", "unreachable", "timed out", "timeo
 _SERVER_ERROR = re.compile(r"\b(?:returned|error(?: code)?|status(?: code)?|http)\W{0,3}(?:5\d\d|429)\b",
                            re.IGNORECASE)
 # A 429 that is a spent quota, not a rate limit: waiting does not help. Narrower than PROVIDER_PROBLEMS, whose
-# "limit reached" also matches an ordinary rate limit ("Rate limit reached for …").
+# "limit reached" also matches an ordinary rate limit ("Rate limit reached for …"). MindsHub's gateway sends its
+# allowance and daily spend fuse codes on a 429 too.
 _EXHAUSTED = ("insufficient_quota", "quota exceeded", "exceeded your current quota", "credits are used up",
-              "no credit", "wallet", "billing")
+              "no credit", "wallet", "billing", "allowance_exhausted", "spend_fuse")
+# A rate limit: the provider asks for requests to slow down, and waiting lifts it.
+_RATE_LIMITS = ("rate limit", "rate_limit", "ratelimit", "too many requests")
 # Wording of an answer whose trouble passes by itself. A provider that adds "do not send this again" to such an
 # answer (it already retried on its side) has given up for the moment, not set a limit.
 _MOMENTARY = ("overloaded", "momentarily", "temporarily")
+# The Anton SDK's own failures, by class name: its retries ended on an overload or outage, or it stopped on billing
+# or on the credential.
+_ANTON_TRANSIENT = ("ProviderOverloadedError", "TransientProviderError")
+_ANTON_PROVIDER = ("MindsHubBillingStop", "ProviderAuthError")
 CAUSES = ("provider", "transient", "")
+
+
+def rate_limited(text: str) -> bool:
+    """Whether a refusal is a rate limit, which lifts on its own, rather than a spent quota or credit."""
+    text = (text or "").lower()
+    return any(p in text for p in _RATE_LIMITS) and not quota_exhausted(text)
 
 
 def text_cause(error: str) -> str:
     """A failure's cause read from its wording: "provider" (billing, quota or access; a person acts), "transient"
-    (the provider or the sandbox was unavailable; the work is redone later), or "" (the session's own failure,
-    including its turn, time, token and cost caps)."""
+    (the provider or the sandbox was unavailable, or limited its rate; the work is redone later), or "" (the
+    session's own failure, including its turn, time, token and cost caps)."""
     text = (error or "").lower()
-    if any(p.lower() in text for p in PROVIDER_PROBLEMS) or _PAYMENT_REQUIRED.search(text):
+    if (any(p.lower() in text for p in PROVIDER_PROBLEMS) and not rate_limited(text)) or _PAYMENT_REQUIRED.search(text):
         return "provider"
     if any(c.lower() in text for c in RUN_CAPS):
         return ""
-    if any(p.lower() in text for p in TRANSIENT_PROBLEMS) or _SERVER_ERROR.search(text):
+    if any(p.lower() in text for p in TRANSIENT_PROBLEMS) or _SERVER_ERROR.search(text) or rate_limited(text):
         return "transient"
     return ""
 
@@ -84,7 +97,9 @@ def failure_status(exc: BaseException) -> int | None:
 
 
 def _never_retry(exc: BaseException) -> bool:
-    """The provider marked its answer as not to be sent again (``x-should-retry: false``)."""
+    """The provider marked its answer as not to be sent again (``x-should-retry: false``). On a limit that isn't a
+    rate limit, that is a limit a person lifts (a monthly spend limit). On an overload, a rate limit or a server error
+    it isn't: a gateway sends it once its own retries are spent, and the provider recovers on its own."""
     headers: Any = getattr(getattr(exc, "response", None), "headers", None)
     try:
         return str(headers.get("x-should-retry", "")).lower() == "false"
@@ -104,6 +119,11 @@ def failure_cause(exc: BaseException) -> str:
         # A refusal whose own words say it passes by itself is not one a person has to lift: on 12 November a session
         # ended with "The model provider is momentarily overloaded", carried as a refusal, and held the workspace.
         return "transient" if cause == "provider" and momentary(str(exc)) else cause
+    names = {c.__name__ for c in type(exc).__mro__}
+    if names & set(_ANTON_PROVIDER):
+        return "provider"
+    if names & set(_ANTON_TRANSIENT):
+        return "transient"
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and not isinstance(status, bool):
         if status in (401, 402, 403):
@@ -116,9 +136,9 @@ def failure_cause(exc: BaseException) -> str:
             return "transient"
         if status not in (408, 409, 429) and status < 500:
             return ""
-        if _never_retry(exc) and status < 500:
+        if _never_retry(exc) and status < 500 and not rate_limited(str(exc)):
             return "provider"
-        return "transient"
+        return "transient"  # an overload, a server error or a rate limit: the provider recovers on its own
     if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
         return "transient"
     if any(c.__name__ in ("APIConnectionError", "APITimeoutError") for c in type(exc).__mro__):

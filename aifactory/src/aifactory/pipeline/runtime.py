@@ -35,7 +35,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # The Director stands in for the people who run the workspace (pipeline/director.py). Off unless a workspace turns
     # it on: run_usd caps a run, daily_usd its runs in a day, max_outcome_usd how far it lets an outcome spend past
     # its budget, and after_minutes how long a decision waits for its judge and Lead first.
-    "director": {"mode": "off", "run_usd": 4.0, "daily_usd": 40.0, "max_outcome_usd": 120.0, "after_minutes": 5},
+    "director": {"mode": "off", "run_usd": 4.0, "daily_usd": 40.0, "max_outcome_usd": 120.0, "after_minutes": 5,
+                 "decide_after_hours": 4},
     # Alerts show in the app's Inbox. Slack and email are delivery options that aren't available yet: both stay off.
     "alerts": {"after_minutes": 120, "slack": False, "email": False},
     "models": {"default": "gpt-terra"},

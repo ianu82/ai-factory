@@ -13,7 +13,8 @@ from aifactory.pipeline import director
 from aifactory.pipeline.holds import open_provider_hold
 from tests.fakes import ScriptedModel, call, step
 
-ON = {"mode": "on", "run_usd": 4.0, "daily_usd": 40.0, "max_outcome_usd": 120.0, "after_minutes": 5}
+ON = {"mode": "on", "run_usd": 4.0, "daily_usd": 40.0, "max_outcome_usd": 120.0, "after_minutes": 5,
+      "decide_after_hours": 4}
 
 
 @pytest.fixture
@@ -88,7 +89,7 @@ def test_off_by_default_and_its_settings_are_validated(client, signed_in):
     assert r.status_code == 200, r.text
     assert r.json()["settings"]["director"] == {**ON, "daily_usd": 25.0}
     for bad in ({"mode": "maybe"}, {"run_usd": 50}, {"daily_usd": -1}, {"max_outcome_usd": "lots"},
-                {"after_minutes": 1.5}, {"model": "x"}, "on"):
+                {"after_minutes": 1.5}, {"decide_after_hours": 2.5}, {"decide_after_hours": 200}, {"model": "x"}, "on"):
         assert client.patch(f"/api/workspaces/{ws}", json={"settings": {"director": bad}}).status_code == 422
     with db.session_scope() as s:  # the refused changes left the saved settings alone
         assert s.get(Workspace, ws).settings["director"] == {**ON, "daily_usd": 25.0}
@@ -409,7 +410,8 @@ def test_when_two_resolvers_act_at_once_only_the_first_applies(world):
 def test_an_item_it_passes_over_comes_back_until_it_has_been_skipped_three_times(world):
     item = woken()[world["ws"]]
     tools = director.Tools(world["ws"], "r", ON, set(item["new"]))
-    assert director.seen_after(item, tools) == {"marks": {}, "skips": {}}  # shown nothing: nothing counts as skipped
+    # Shown nothing: nothing counts as skipped.
+    assert director.seen_after(item, tools) == {"marks": {}, "skips": {}, "final": {}}
     tools.shown = set(item["new"])
     tools.handled = {f"d:{world['merge']}"}
     seen = director.seen_after(item, tools)
@@ -424,6 +426,97 @@ def test_an_item_it_passes_over_comes_back_until_it_has_been_skipped_three_times
     assert set(seen["marks"]) == set(item["marks"]) and seen["skips"] == {}
     past_run(world, seen=seen, ago=timedelta(minutes=10))
     assert world["ws"] not in woken()
+
+
+def test_what_it_left_to_people_it_decides_itself_once_no_one_has_answered_in_time(world):
+    import json
+
+    with db.session_scope() as s:
+        s.get(Decision, world["fresh"]).status = "resolved"
+        s.get(Decision, world["stuck"]).created_at = db.utcnow() - timedelta(hours=5)
+    item = woken()[world["ws"]]
+    tools = director.Tools(world["ws"], "r", ON, set(item["new"]))
+    tools.shown = tools.handled = set(item["new"])  # it noted each one for people
+    seen = director.seen_after(item, tools)
+    with db.session_scope() as s:
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="director_note",
+                    created_at=db.utcnow() - timedelta(hours=3), message="Director: T2 needs a person",
+                    data={"source": "director", "run_id": "r", "decision_id": world["stuck"],
+                          "text": "Retry T2 with a smaller index; it fails the same check each time."}))
+    past_run(world, seen=seen, ago=timedelta(minutes=10))
+    assert world["ws"] not in woken()  # its note is 3 h old: still the people's
+
+    later = db.utcnow() + timedelta(hours=1, minutes=1)
+    due = woken(later)[world["ws"]]  # 4 h with no answer: the people are away
+    stuck = f"d:{world['stuck']}"
+    assert (due["new"], due["overdue"]) == ([], [stuck])
+    assert due["reasons"] == ["1 item left to people has had no answer in 4 h"]
+    with db.session_scope() as s:  # 0: what it leaves to people waits for them, however long
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "director": {**ON, "decide_after_hours": 0}}
+    assert world["ws"] not in woken(later)
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "director": dict(ON)}
+
+    tools = director.Tools(world["ws"], "r", ON, set(due["new"]), set(due["overdue"]))
+    page = json.loads(tools._inbox())
+    assert page["items"][0]["decision_id"] == world["stuck"] and page["items"][0]["decide_now"] is True
+    # What it recommended when it left the item to people, so it can follow it now.
+    assert page["items"][0]["your_note"].startswith("Retry T2 with a smaller index")
+    assert json.loads(tools._inbox_item("decision", world["stuck"]))["your_note"].startswith("Retry T2")
+    assert page["decide_now_not_yet_handled"] == 1 and page["limits"]["decide_after_hours"] == 4
+    assert not any(row.get("decide_now") for row in page["items"][1:])
+
+    seen = director.seen_after(due, tools)  # shown, but the run ended before it decided or noted it: it comes back
+    assert (seen["final"], seen["skips"]) == ({}, {stuck: 1})
+    past_run(world, seen=seen, ago=timedelta(minutes=6))
+    assert woken(later + timedelta(minutes=5))[world["ws"]]["overdue"] == [stuck]
+    tools.handled.add(stuck)  # it had its turn: noted again, it now waits for a person
+    seen = director.seen_after(due, tools)
+    assert (seen["final"], seen["skips"]) == ({stuck: due["marks"][stuck]}, {})
+    past_run(world, seen=seen, ago=timedelta(minutes=5))
+    assert world["ws"] not in woken(later + timedelta(minutes=5))
+    with db.session_scope() as s:  # unless the question changes: then it is new again
+        s.get(Decision, world["stuck"]).body = "T2 failed its checks a fourth time."
+    assert woken(later + timedelta(minutes=5))[world["ws"]]["new"] == [stuck]
+
+
+def test_a_decision_it_noted_raises_no_waiting_alert_until_its_turn_to_decide_has_passed(world):
+    from aifactory.pipeline import watch
+    from aifactory.pipeline.runtime import merged_settings
+
+    def overdue():
+        with db.session_scope() as s:
+            return [a.status for a in s.query(Alert).filter_by(key=f"overdue:{world['merge']}").order_by(Alert.id)]
+
+    def raised():
+        with db.session_scope() as s:
+            settings = merged_settings(s.get(Workspace, world["ws"]).settings)
+            return f"overdue:{world['merge']}" in watch.find(s, world["ws"], settings, db.utcnow())
+
+    with db.session_scope() as s:
+        s.get(Decision, world["merge"]).created_at = db.utcnow() - timedelta(hours=6)
+    watch.run()
+    assert overdue() == ["open"]
+    with db.session_scope() as s:  # the note on the decision says why it waits: the alert would repeat it
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="director_note",
+                    message="Director: the merge needs a person",
+                    data={"source": "director", "run_id": "r", "decision_id": world["merge"],
+                          "text": "Only a rebase since a person approved; approve once CI is green."}))
+    watch.run()
+    assert overdue() == ["cleared"]
+    # It had its turn to decide it and noted it again: only a person can answer it now.
+    past_run(world, seen={"marks": {}, "skips": {}, "final": {f"d:{world['merge']}": "its mark"}})
+    assert raised()
+    with db.session_scope() as s:
+        s.query(Event).filter(Event.kind.like("director_run%")).delete(synchronize_session=False)
+    assert not raised()
+    with db.session_scope() as s:  # its turn never came (the workspace was held, say), and the time has passed
+        aged = db.utcnow() - timedelta(hours=5, minutes=1)  # past decide_after_hours and its run
+        s.query(Event).filter_by(kind="director_note").update({"created_at": aged})
+    watch.run()
+    assert sorted(overdue()) == ["cleared", "open"]
 
 
 def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request(world):

@@ -46,7 +46,14 @@ have had their turn, the Director decides what would otherwise wait on a person:
 release approvals, budgets (up to a ceiling), blocked work, Supervisor findings, alerts and signal
 triage. It decides through the same choices a person has, so every gate still applies. It never
 takes work over, lifts a provider hold or changes settings, and it stays within its own spend per
-run and per day (`pipeline/director.py`).
+run and per day (`pipeline/director.py`). What it leaves to people with a note waits for them for
+`decide_after_hours` (4 by default; 0 to always wait); with no answer by then, the Director decides
+it itself, unless the choice it would make is one it may not make.
+
+A **provider hold** stops all new work in a workspace when the model provider refuses it for
+billing, quota or its credential (`pipeline/holds.py`). An overload or a rate limit never opens one:
+it is retried. While a hold is open, every page shows a banner with its cause, what lifts it and
+**Resume work**.
 
 ## Product surfaces
 

@@ -10,9 +10,12 @@ applies: it answers the question, it never skips a gate.
 It never takes work over, lifts a provider hold (a person fixes billing or the key first), changes settings or
 credentials, or lets an outcome continue past its budget once the outcome has committed ``max_outcome_usd``. Those,
 and anything it isn't confident about, it leaves to people with a note saying what it found and what it recommends.
+When no person has answered what it left them in ``decide_after_hours`` (0: never), the people are away: it takes
+each such item once more and decides it itself, unless the choice it would make is one it may not make.
 Its resolutions are attributed to the Director, a system identity, with ``{"source": "director"}``.
 
-Runs: at most one per workspace at a time, woken when something new waits on a person, with a cooldown between runs,
+Runs: at most one per workspace at a time, woken when something new waits on a person or what it left to people has
+waited ``decide_after_hours`` for them, with a cooldown between runs,
 a longer wait after a failed one, and caps per run (``run_usd``) and per day (``daily_usd``). A run isn't a Run row
 (every Run belongs to an outcome): it is recorded as ``director_run_started`` / ``director_run_finished`` events. The
 finished event carries what the run saw, so the next run wakes only for what is new.
@@ -83,6 +86,8 @@ def settings_for(settings: dict[str, Any]) -> dict[str, Any]:
         cfg[key] = float(value) if ok else float(DEFAULTS[key])
     after = cfg.get("after_minutes")
     cfg["after_minutes"] = after if type(after) is int and 0 <= after <= 1440 else DEFAULTS["after_minutes"]
+    hours = cfg.get("decide_after_hours")
+    cfg["decide_after_hours"] = hours if type(hours) is int and 0 <= hours <= 168 else DEFAULTS["decide_after_hours"]
     return cfg
 
 
@@ -197,6 +202,63 @@ def _waiting(db, workspace_id: str, now: datetime, cfg: dict[str, Any]) -> tuple
     return marks, held
 
 
+def _began(db, keys: set[str]) -> dict[str, datetime]:
+    """When each item began waiting on a person."""
+    ids = {prefix: [key.split(":", 1)[1] for key in keys if key.startswith(prefix + ":")] for prefix in "das"}
+    began: dict[str, datetime] = {}
+    if ids["d"]:
+        began.update({f"d:{id_}": at for id_, at in db.query(Decision.id, Decision.created_at)
+                      .filter(Decision.id.in_(ids["d"])) if at})
+    if ids["a"]:
+        began.update({f"a:{id_}": opened or created for id_, opened, created in
+                      db.query(Alert.id, Alert.opened_at, Alert.created_at).filter(Alert.id.in_(ids["a"]))
+                      if opened or created})
+    if ids["s"]:
+        began.update({f"s:{id_}": at for id_, at in db.query(Signal.id, Signal.first_seen_at)
+                      .filter(Signal.id.in_(ids["s"])) if at})
+    return began
+
+
+def _overdue(db, workspace_id: str, now: datetime, cfg: dict[str, Any], marks: dict[str, str],
+             known: dict[str, str], final: dict[str, str], held: set[str]) -> list[str]:
+    """What the Director left to people (with a note, or passed over) that no person has answered in
+    ``decide_after_hours``: unchanged since, waiting at least that long, and with no note on it in that time. The
+    people are away, so it decides these itself. Each gets that turn once: ``final`` keeps the items that have had it,
+    and an item comes back only if it changes."""
+    hours = cfg["decide_after_hours"]
+    if not hours:
+        return []
+    left = {key for key, mark in marks.items() if known.get(key) == mark and final.get(key) != mark and key not in held}
+    cutoff = now - timedelta(hours=hours)
+    waiting = {key for key, at in _began(db, left).items() if at <= cutoff} if left else set()
+    if not waiting:
+        return []
+    for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == "director_note",
+                                    Event.created_at > cutoff):
+        data = e.data or {}
+        waiting -= {f"{prefix}:{data.get(field)}" for field, prefix in
+                    (("decision_id", "d"), ("alert_id", "a"), ("signal_id", "s"))}
+    return sorted(waiting)
+
+
+def _my_notes(db, workspace_id: str, keys: set[str]) -> dict[str, str]:
+    """The Director's latest note on each item (key d:/a:/s: + id): what it found and recommended when it left the
+    item to people, for its turn to decide the item itself."""
+    notes: dict[str, str] = {}
+    if not keys:
+        return notes
+    for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == "director_note") \
+            .order_by(Event.id.desc()).limit(2000):
+        data = e.data or {}
+        for field, prefix in (("decision_id", "d"), ("alert_id", "a"), ("signal_id", "s")):
+            key = f"{prefix}:{data.get(field)}"
+            if key in keys and key not in notes:
+                notes[key] = str(data.get("text") or e.message or "")
+        if len(notes) == len(keys):
+            break
+    return notes
+
+
 def _history(db, workspace_id: str, now: datetime) -> list[dict[str, Any]]:
     """The Director's runs in the last day, newest first: when each started, what it reserved, and how it ended
     (None while running, or when a restart cut it off)."""
@@ -270,15 +332,21 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 continue
             seen = last_seen(s, ws.id)
             known = seen.get("marks") or {}
+            final = seen.get("final") if isinstance(seen.get("final"), dict) else {}
             marks, leads_turn = _waiting(s, ws.id, now, cfg)
             new = sorted(key for key, mark in marks.items() if known.get(key) != mark and key not in leads_turn)
-            if not new:
+            overdue = _overdue(s, ws.id, now, cfg, marks, known, final, leads_turn)
+            if not new and not overdue:
                 continue
             counts = {kind: sum(1 for key in new if key.startswith(prefix))
                       for kind, prefix in (("decision", "d:"), ("alert", "a:"), ("signal", "s:"))}
             reasons = [f"{n} new {kind}{'s' if n != 1 else ''} waiting on a person" for kind, n in counts.items() if n]
-            woken.append({"workspace_id": ws.id, "reasons": reasons, "new": new, "marks": marks, "seen": seen,
-                          "usd": usd})
+            if overdue:
+                n = len(overdue)
+                reasons.append(f"{n} item{'s' if n != 1 else ''} left to people {'has' if n == 1 else 'have'} had no "
+                               f"answer in {cfg['decide_after_hours']} h")
+            woken.append({"workspace_id": ws.id, "reasons": reasons, "new": new, "overdue": overdue, "marks": marks,
+                          "seen": seen, "usd": usd})
     return woken
 
 
@@ -318,12 +386,12 @@ def _short(text: Any, limit: int = BRIEF) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str],
-          shown: set[str]) -> list[tuple[str, dict[str, Any]]]:
-    """Every open item waiting on a person, as (key, compact row), in the order a run should see them: new items it
-    hasn't been shown yet, then the rest it hasn't been shown, then what it was shown but left, then what it noted;
-    within each, the most urgent outcome first, then the oldest. Each inbox call so reaches items not yet shown, even
-    when the run can neither decide nor note what it saw."""
+def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str], shown: set[str],
+          overdue: set[str] = frozenset()) -> list[tuple[str, dict[str, Any]]]:
+    """Every open item waiting on a person, as (key, compact row), in the order a run should see them: new items and
+    items to decide now that it hasn't been shown yet, then the rest it hasn't been shown, then what it was shown but
+    left, then what it noted; within each, the most urgent outcome first, then the oldest. Each inbox call so reaches
+    items not yet shown, even when the run can neither decide nor note what it saw."""
     from ..serializers import actionable
 
     now = utcnow()
@@ -337,6 +405,7 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
         task_ids = {d.task_id for d in decisions if d.task_id} | {a.task_id for a in alerts if a.task_id}
         tasks = {t.id: t for t in s.query(Task).filter(Task.id.in_(task_ids))} if task_ids else {}
         notes = notes_for(s, decisions)
+        mine = _my_notes(s, workspace_id, set(overdue))  # what it recommended, for what it decides now
         signals = s.query(Signal).filter(Signal.workspace_id == workspace_id, Signal.status.in_(("new", "proposed")),
                                          Signal.source.in_(TRIAGE_SOURCES)).all()
 
@@ -353,8 +422,10 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
 
         def add(key: str, outcome_id: str | None, at: datetime | None, row: dict[str, Any]) -> None:
             o = outcomes.get(outcome_id or "")
-            group = 3 if key in handled else 2 if key in shown else 0 if key in new else 1
-            rows.append(((group, o.priority if o else 2, at or now), key, {"new": key in new, **row}))
+            group = 3 if key in handled else 2 if key in shown else 0 if key in new or key in overdue else 1
+            rows.append(((group, o.priority if o else 2, at or now), key,
+                         {"new": key in new, **({"decide_now": True} if key in overdue else {}),
+                          **({"your_note": _short(mine[key], 600)} if key in mine else {}), **row}))
 
         for d in decisions:
             allowed, why = choices(s, d, cfg)
@@ -382,12 +453,12 @@ def _rows(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[st
 
 
 def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: set[str],
-               shown: set[str]) -> tuple[str, list[str]]:
+               shown: set[str], overdue: set[str] = frozenset()) -> tuple[str, list[str]]:
     """One page of the inbox, built to fit whole (no shortening drops items from it), and the keys it shows. Items
     not yet shown this run come first, so calling it again reaches the rest; ``more`` counts what no page has shown."""
     from ..mind.tools import clean
 
-    rows = _rows(workspace_id, cfg, new, handled, shown)
+    rows = _rows(workspace_id, cfg, new, handled, shown, overdue)
     keys: list[str] = []
     page: list[dict[str, Any]] = []
     size = 0
@@ -404,15 +475,20 @@ def inbox_page(workspace_id: str, cfg: dict[str, Any], new: set[str], handled: s
     seen = shown | set(keys)
     more = sum(1 for key, _ in rows if key not in seen)
     body = {"waiting": counts, "new_not_yet_handled": sum(1 for key, _ in rows if key in new and key not in handled),
+            **({"decide_now_not_yet_handled": sum(1 for key, _ in rows if key in overdue and key not in handled)}
+               if overdue else {}),
             "items": page, "not_shown_yet": more,
             **({"next": "Call inbox again to see the items not shown yet."} if more else {}),
-            "limits": {"max_outcome_usd": cfg["max_outcome_usd"], "per_run": PER_RUN}}
+            "limits": {"max_outcome_usd": cfg["max_outcome_usd"], "decide_after_hours": cfg["decide_after_hours"],
+                       "per_run": PER_RUN}}
     return json.dumps(body, ensure_ascii=False, default=str), keys
 
 
 def inbox_item(workspace_id: str, cfg: dict[str, Any], kind: str, item_id: str) -> dict[str, Any] | None:
-    """One inbox item in full: a decision's whole question and the Lead's note, an alert's or a signal's whole text."""
+    """One inbox item in full: a decision's whole question and the Lead's note, an alert's or a signal's whole text,
+    and the Director's own latest note on it."""
     with session_scope() as s:
+        mine = _my_notes(s, workspace_id, {f"{kind[0]}:{item_id}"}).get(f"{kind[0]}:{item_id}")
         if kind == "decision":
             d = s.query(Decision).filter(Decision.id == item_id, Decision.workspace_id == workspace_id).first()
             if d is None:
@@ -420,15 +496,16 @@ def inbox_item(workspace_id: str, cfg: dict[str, Any], kind: str, item_id: str) 
             allowed, why = choices(s, d, cfg)
             return {"decision_id": d.id, "status": d.status, "kind": d.kind, "title": d.title, "body": d.body,
                     "options": d.options, "metadata": d.metadata_json, "you_may_choose": allowed,
-                    "left_to_people": why or None, "lead_note": (notes_for(s, [d]).get(d.id) or {}).get("text")}
+                    "left_to_people": why or None, "lead_note": (notes_for(s, [d]).get(d.id) or {}).get("text"),
+                    "your_note": mine}
         if kind == "alert":
             a = s.query(Alert).filter(Alert.id == item_id, Alert.workspace_id == workspace_id).first()
             return {"alert_id": a.id, "status": a.status, "kind": a.kind, "title": a.title, "body": a.body,
-                    "data": a.data, "decision_id": a.decision_id} if a else None
+                    "data": a.data, "decision_id": a.decision_id, "your_note": mine} if a else None
         if kind == "signal":
             sig = s.query(Signal).filter(Signal.id == item_id, Signal.workspace_id == workspace_id).first()
             return {"signal_id": sig.id, "status": sig.status, "source": sig.source, "title": sig.title,
-                    "body": sig.body, "url": sig.url, "times_seen": sig.count} if sig else None
+                    "body": sig.body, "url": sig.url, "times_seen": sig.count, "your_note": mine} if sig else None
     return None
 
 
@@ -438,8 +515,8 @@ TEXT = {"type": "string", "maxLength": 4000}
 OUTCOME = {"type": "string", "description": "The outcome's number (#12 or 12) or id."}
 TOOLS = [
     _fn("inbox", "What waits on a person in this workspace, a page at a time: open decisions (with the options you "
-        "may choose and the Lead's note), open alerts and signals awaiting triage. New items come first and are "
-        "marked; items you decide leave it, so call it again to see more."),
+        "may choose and the Lead's note), open alerts and signals awaiting triage. New items and items to decide "
+        "now come first and are marked; items you decide leave it, so call it again to see more."),
     _fn("inbox_item", "One inbox item in full: a decision's whole question, options and the Lead's note, or an "
         "alert's or a signal's whole text.", {"kind": {"type": "string", "enum": ["decision", "alert", "signal"]},
                                               "id": {"type": "string"}}, ("kind", "id")),
@@ -477,8 +554,10 @@ TOOLS = [
 class Tools:
     """The Director's tools. The workspace is fixed by the orchestrator: no argument can reach another one."""
 
-    def __init__(self, workspace_id: str, run_id: str, cfg: dict[str, Any], new: set[str]):
+    def __init__(self, workspace_id: str, run_id: str, cfg: dict[str, Any], new: set[str],
+                 overdue: set[str] | None = None):
         self.ws, self.run_id, self.cfg, self.new = workspace_id, run_id, cfg, new
+        self.overdue = set(overdue or ())  # left to people, who haven't answered: decide these now
         self.used: dict[str, int] = {}
         self.actions: list[dict[str, Any]] = []
         self.handled: set[str] = set()  # items decided or noted this run
@@ -534,7 +613,7 @@ class Tools:
         return outcome
 
     def _inbox(self) -> str:
-        page, keys = inbox_page(self.ws, self.cfg, self.new, self.handled, self.shown)
+        page, keys = inbox_page(self.ws, self.cfg, self.new, self.handled, self.shown, self.overdue)
         self.shown.update(keys)
         return page
 
@@ -736,7 +815,9 @@ def seen_after(item: dict[str, Any], tools: Tools) -> dict[str, Any]:
     """What the next run counts as seen: what was seen before and is still waiting, unchanged, plus what this run
     decided or noted. A new item an inbox page showed but the run passed over comes back next run, and counts as seen
     after SKIPS such runs, so an item the model keeps ignoring can't wake it forever. One the run never got to see
-    (on a later page) stays new, with no skip counted."""
+    (on a later page) stays new, with no skip counted. An item to decide now (_overdue) is counted the same way:
+    once the run has decided or noted it, or passed over it SKIPS times, it has had its turn, and ``final`` keeps it
+    with its mark then, so it doesn't get another while it waits unchanged."""
     before = item.get("seen") or {}
     known, skips = dict(before.get("marks") or {}), dict(before.get("skips") or {})
     marks: dict[str, str] = item["marks"]
@@ -754,7 +835,23 @@ def seen_after(item: dict[str, Any], tools: Tools) -> dict[str, Any]:
                 out[key] = marks[key]
             else:
                 left[key] = count
-    return {"marks": out, "skips": left}
+    final = {key: mark for key, mark in (before.get("final") or {}).items() if marks.get(key) == mark} \
+        if isinstance(before.get("final"), dict) else {}
+    for key in item.get("overdue") or []:
+        if key not in marks:
+            continue
+        if key in tools.handled:
+            final[key] = marks[key]
+        elif key not in tools.shown:
+            if key in skips:
+                left[key] = int(skips[key])
+        else:  # shown, but the run ended before it decided or noted it (its turns or caps ran out): it comes back
+            count = int(skips.get(key, 0)) + 1
+            if count >= SKIPS:
+                final[key] = marks[key]
+            else:
+                left[key] = count
+    return {"marks": out, "skips": left, "final": final}
 
 
 SYSTEM = """You are the Director of an AI Factory workspace: you stand in for the people who run it while they are
@@ -790,6 +887,13 @@ call it again once you have decided or noted what it showed.
 - Anything you may not choose (see you_may_choose and left_to_people), or aren't confident about, gets a
   note_for_people naming the item, with what you found and what you recommend. Every new item you don't decide
   needs such a note, or it comes back on your next run.
+- Items marked decide_now were left for a person, by your note or passed over, and no one has answered in
+  limits.decide_after_hours: the people are away, and delivery must keep going. Decide each one now. Choose what
+  your note recommended (your_note); without one, the choice a careful lead would make to keep delivery moving safely (answer a
+  question with the conservative option that fits the brief; retry blocked work with a new approach, or drop work
+  that a person cancelled or that is no longer needed). For an alert, act on its cause where you can, then dismiss it
+  saying what you found. Never pick an option only because the one you would choose is outside you_may_choose: note
+  it again instead, and it then waits for a person.
 Finish with a short summary of what you decided and what still waits on a person, then call finish.
 
 Rules:
@@ -810,7 +914,7 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
     settings = workspace_settings(workspace_id)
     cfg = settings_for(settings)
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings)
-    tools = Tools(workspace_id, run_id, cfg, set(item["new"]))
+    tools = Tools(workspace_id, run_id, cfg, set(item["new"]), set(item.get("overdue") or []))
     client = provider = None
     started = False
     status, error, summary, model = "failed", "", "", ""
@@ -832,7 +936,9 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": f"You were woken because: {'; '.join(item['reasons'])}. Call inbox to see "
-                                        "everything waiting on a person; new items are marked."},
+                                        "everything waiting on a person; new items are marked"
+                                        + (", and so are items to decide now: no one answered them in "
+                                           f"{cfg['decide_after_hours']} h." if item.get("overdue") else ".")},
         ]
         async with asyncio.timeout(MAX_MINUTES * 60):
             summary = await converse(client, model, ledger, budget, settings, messages, TOOLS, tools.call, TURNS,
@@ -880,10 +986,8 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def director_notes(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
-    """The Director's latest note on each decision: what it found and recommends, shown where people decide."""
-    from ..serializers import ts
-
+def latest_notes(db, decisions: list[Decision]) -> dict[str, Event]:
+    """The Director's latest note on each decision, as its event."""
     wanted = {d.id for d in decisions}
     if not wanted:
         return {}
@@ -891,10 +995,18 @@ def director_notes(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
     query = db.query(Event).filter(Event.workspace_id == decisions[0].workspace_id, Event.kind == "director_note")
     if oldest is not None:
         query = query.filter(Event.created_at >= oldest)
-    notes: dict[str, dict[str, Any]] = {}
+    notes: dict[str, Event] = {}
     for e in query.order_by(Event.id.desc()).limit(500):
         decision_id = (e.data or {}).get("decision_id")
         if decision_id in wanted and decision_id not in notes:
-            notes[decision_id] = {"text": (e.data or {}).get("text") or e.message, "created_at": ts(e.created_at)}
+            notes[decision_id] = e
     return notes
+
+
+def director_notes(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
+    """The Director's latest note on each decision: what it found and recommends, shown where people decide."""
+    from ..serializers import ts
+
+    return {decision_id: {"text": (e.data or {}).get("text") or e.message, "created_at": ts(e.created_at)}
+            for decision_id, e in latest_notes(db, decisions).items()}
 
