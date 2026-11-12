@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from .models import Artifact, Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User
 
-AUTOMATED_ACTORS = {None, "", "factory", "policy", "system", "scheduler"}
+AUTOMATED_ACTORS = {None, "", "factory", "policy", "system", "scheduler", "supervisor"}
 
 
 def human_message(m) -> bool:
@@ -198,7 +198,11 @@ def workspace_metrics(db: Session, workspace_id: str) -> dict:
 
     outcome_events = index_history(events)
     outcome_messages = index_history(messages)
-    outcome_decisions = index_history(decisions)
+    # Reading or dismissing a Supervisor notification is not intervention in
+    # delivery. Exempt both the decision row and its human-authored resolution
+    # event, including task-only links and decisions outside the time window.
+    supervisor_decisions = {d.id for d in decisions if d.kind == "supervisor"}
+    outcome_decisions = index_history([d for d in decisions if d.kind != "supervisor"])
     outcome_tasks = defaultdict(list)
     for t in tasks.values():
         outcome_tasks[t.outcome_id].append(t)
@@ -244,7 +248,7 @@ def workspace_metrics(db: Session, workspace_id: str) -> dict:
                 continue
             exempt = False
             if e.kind == "decision_resolved":
-                exempt = e.data.get("decision_id") in approvals
+                exempt = e.data.get("decision_id") in approvals | supervisor_decisions
             elif e.kind == "plan_approved":
                 # Production emits only plan_id here, before decision_resolved.
                 plan = plans.get(e.data.get("plan_id"))
