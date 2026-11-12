@@ -30,6 +30,8 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import or_
+
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
 from ..events import notify, record
@@ -245,12 +247,16 @@ def _my_notes(db, workspace_id: str, keys: set[str]) -> dict[str, str]:
     """The Director's latest note on each item (key d:/a:/s: + id): what it found and recommended when it left the
     item to people, for its turn to decide the item itself."""
     notes: dict[str, str] = {}
-    if not keys:
+    fields = (("decision_id", "d"), ("alert_id", "a"), ("signal_id", "s"))
+    ids = {field: [key[2:] for key in keys if key.startswith(prefix + ":")] for field, prefix in fields}
+    match = [Event.data[field].as_string().in_(wanted) for field, wanted in ids.items() if wanted]
+    if not match:
         return notes
-    for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == "director_note") \
-            .order_by(Event.id.desc()).limit(2000):
+    # Only notes on these items: however many it wrote on others, none hides one asked about.
+    for e in db.query(Event).filter(Event.workspace_id == workspace_id, Event.kind == "director_note", or_(*match)) \
+            .order_by(Event.id.desc()):
         data = e.data or {}
-        for field, prefix in (("decision_id", "d"), ("alert_id", "a"), ("signal_id", "s")):
+        for field, prefix in fields:
             key = f"{prefix}:{data.get(field)}"
             if key in keys and key not in notes:
                 notes[key] = str(data.get("text") or e.message or "")
@@ -987,19 +993,19 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def latest_notes(db, decisions: list[Decision]) -> dict[str, Event]:
-    """The Director's latest note on each decision, as its event."""
+    """The Director's latest note on each decision, as its event. Only notes on these decisions are read, so however
+    many it writes on others, none hides one asked about."""
     wanted = {d.id for d in decisions}
     if not wanted:
         return {}
     oldest = min(d.created_at for d in decisions if d.created_at) if any(d.created_at for d in decisions) else None
-    query = db.query(Event).filter(Event.workspace_id == decisions[0].workspace_id, Event.kind == "director_note")
+    query = db.query(Event).filter(Event.workspace_id == decisions[0].workspace_id, Event.kind == "director_note",
+                                   Event.data["decision_id"].as_string().in_(wanted))
     if oldest is not None:
         query = query.filter(Event.created_at >= oldest)
     notes: dict[str, Event] = {}
-    for e in query.order_by(Event.id.desc()).limit(500):
-        decision_id = (e.data or {}).get("decision_id")
-        if decision_id in wanted and decision_id not in notes:
-            notes[decision_id] = e
+    for e in query.order_by(Event.id.desc()):
+        notes.setdefault((e.data or {}).get("decision_id"), e)
     return notes
 
 

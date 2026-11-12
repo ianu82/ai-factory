@@ -592,18 +592,53 @@ def milestone(world, kind, ago=timedelta(0), message="", task=True):
         return event.id
 
 
-def test_progress_wakes_the_lead_to_report_in_batches(world):
-    seen = woken()[world["outcome"]]["seen"]
-    lead_run(world, seen, ago=timedelta(minutes=5))
+def digests(world):
+    with db.session_scope() as s:
+        return [(m.body, m.attribution["event_id"]) for m in s.query(Message).filter(
+            Message.outcome_id == world["outcome"], Message.author_kind == "factory").order_by(Message.created_at)]
+
+
+def test_progress_alone_is_told_as_a_digest_and_does_not_wake_the_lead(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
     published = milestone(world, "published", message="Opened PR #12")
     milestone(world, "stage", message="Stage: ci")  # not a milestone
-    assert world["outcome"] not in woken()  # within ten minutes of its last run: batched into the next update
+    assert world["outcome"] not in woken()  # nothing to judge: no Lead run, whatever the time since its last one
+    assert digests(world) == [("Progress since the last update:\n- T1: Opened PR #12", published)]
     with db.session_scope() as s:
-        s.query(Run).one().started_at = db.utcnow() - timedelta(minutes=11)
+        assert s.query(Run).filter(Run.role == "lead").count() == 1  # the one before the progress
+    merged = milestone(world, "merged", message="T1 merged as PR #12")
+    assert world["outcome"] not in woken() and len(digests(world)) == 1  # at most one digest every half hour
+    with db.session_scope() as s:
+        s.query(Event).filter(Event.kind == "progress_digest").one().created_at = db.utcnow() - timedelta(minutes=31)
+    assert world["outcome"] not in woken()
+    # Only what the last digest had not told, and a task's key is not repeated in front of a message that has it.
+    assert digests(world)[1] == ("Progress since the last update:\n- T1 merged as PR #12", merged)
+    assert world["outcome"] not in woken() and len(digests(world)) == 2  # told once
+
+
+def test_progress_is_still_told_when_the_lead_has_used_its_runs_for_the_day(world):
+    seen = woken()[world["outcome"]]["seen"]
+    for n in range(lead.DAILY_RUNS):
+        lead_run(world, seen, ago=timedelta(minutes=5 + n))
+    published = milestone(world, "published", message="Opened PR #12")
+    with db.session_scope() as s:  # a person's post would wake the Lead, had it a run left today
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
+                      author_kind="user", body="How is it going?"))
+    assert world["outcome"] not in woken()
+    assert digests(world) == [("Progress since the last update:\n- T1: Opened PR #12", published)]
+
+
+def test_a_lead_that_something_else_woke_reports_the_progress_too(world):
+    lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
+    published = milestone(world, "published", message="Opened PR #12")
+    with db.session_scope() as s:
+        s.add(Message(workspace_id=world["ws"], outcome_id=world["outcome"], author_id=world["uid"],
+                      author_kind="user", body="How is it going?"))
     due = woken()[world["outcome"]]
-    assert due["reasons"] == ["1 step of progress to report"] and due["seen"]["event_id"] == published
-    lead_run(world, due["seen"], ago=timedelta(minutes=10, seconds=30))
-    assert world["outcome"] not in woken()  # reported
+    assert due["reasons"] == ["1 new post from people", "1 step of progress to report"]
+    assert due["seen"]["update_due"] is True and due["seen"]["event_id"] == published and digests(world) == []
+    lead_run(world, due["seen"], ago=timedelta(minutes=2))
+    assert world["outcome"] not in woken() and digests(world) == []  # its update covered the step: no digest of it
 
 
 def test_a_finished_outcome_reports_how_it_ended_within_the_hour(world):

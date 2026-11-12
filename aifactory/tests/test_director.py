@@ -519,6 +519,29 @@ def test_a_decision_it_noted_raises_no_waiting_alert_until_its_turn_to_decide_ha
     assert sorted(overdue()) == ["cleared", "open"]
 
 
+def test_its_note_on_a_decision_is_found_however_many_it_wrote_since_on_others(world):
+    from aifactory.pipeline import watch
+    from aifactory.pipeline.runtime import merged_settings
+
+    with db.session_scope() as s:
+        s.get(Decision, world["merge"]).created_at = db.utcnow() - timedelta(hours=6)
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="director_note",
+                    message="Director: the merge needs a person",
+                    data={"source": "director", "run_id": "r", "decision_id": world["merge"],
+                          "text": "Approve once CI is green."}))
+    with db.session_scope() as s:  # a busy few hours since: a run may write 20 notes
+        s.add_all([Event(workspace_id=world["ws"], kind="director_note", message="Director: elsewhere",
+                         data={"source": "director", "run_id": "r", "decision_id": f"other{n}", "text": "Elsewhere."})
+                   for n in range(600)])
+    with db.session_scope() as s:
+        merge = s.get(Decision, world["merge"])
+        assert director.latest_notes(s, [merge])[merge.id].data["text"] == "Approve once CI is green."
+        assert director._my_notes(s, world["ws"], {f"d:{merge.id}"}) == {f"d:{merge.id}": "Approve once CI is green."}
+        # The note still says why the decision waits, so the watch raises no alert that would repeat it.
+        settings = merged_settings(s.get(Workspace, world["ws"]).settings)
+        assert f"overdue:{merge.id}" not in watch.find(s, world["ws"], settings, db.utcnow())
+
+
 def test_the_inbox_shows_every_item_a_page_at_a_time_and_each_in_full_on_request(world):
     import json
 
