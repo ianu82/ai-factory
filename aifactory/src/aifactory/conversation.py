@@ -63,7 +63,7 @@ def conversation(db: Session, outcome: Outcome, viewer_id: str | None = None) ->
         if item["kind"] == "step":
             item.pop("kind")
             steps.append(item)
-        elif item["kind"] == "lead":
+        elif item["kind"] == "lead" or item.get("digest"):  # an update, or a digest of progress: the steps it tells
             thread.append({**item, **_steps(steps)})
             steps = []
         else:
@@ -121,7 +121,7 @@ def _message(m: Message, users: dict[str, User], keys: dict[str, str]) -> dict[s
     if attribution.get("source") == "lead":
         return {"kind": "lead_guidance", **base, "delivered": m.delivered}
     if m.author_kind != "user":
-        return {"kind": "factory", **base}
+        return {"kind": "factory", **base, **({"digest": True} if attribution.get("kind") == "digest" else {})}
     author = users.get(m.author_id)
     return {"kind": "person", **base, "author": _name(author) + (" via Mind" if attribution.get("source") == "mind" else ""),
             "operator": bool(author and author.is_system), "delivered": m.delivered}

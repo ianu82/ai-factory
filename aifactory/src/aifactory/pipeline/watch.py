@@ -357,6 +357,13 @@ def _deliver(workspace_id: str, now: datetime) -> None:
                 sent["raised"] = now.isoformat()
             elif d.status != "open" and "raised" in sent and "cleared" not in sent:
                 text, sent["cleared"] = f"Work has resumed in {name}: the provider hold is lifted.", now.isoformat()
+            elif (d.status != "open" and not sent and d.resolved_at is not None
+                  and d.resolved_at > now - timedelta(minutes=30)):
+                # Opened and lifted between two passes of the watch (the Factory's own test lifts a hold within
+                # minutes): told once, as what happened.
+                text = (f"Work was on hold in {name} from {_when(d.created_at)} to {_when(d.resolved_at)}: "
+                        f"{hold_details(d)['label']}. The hold is lifted and work has resumed.")
+                sent["raised"] = sent["cleared"] = now.isoformat()
             else:
                 continue
             d.metadata_json = {**meta, "webhook": sent}

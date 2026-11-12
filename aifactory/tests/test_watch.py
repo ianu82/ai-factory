@@ -352,6 +352,26 @@ def test_the_webhook_carries_a_hold_and_nothing_running_out_once_when_raised_and
         assert s.query(Event).filter_by(kind="alert_delivery_failed").count() == 0
 
 
+def test_a_hold_lifted_before_the_watch_first_looked_is_told_once_as_what_happened(world, client, posted):
+    client.patch(f"/api/workspaces/{world['ws']}", json={"settings": {"alerts": {"webhook_url": WEBHOOK}}})
+    with db.session_scope() as s:
+        name = s.get(Workspace, world["ws"]).name
+    hold = open_provider_hold(world["ws"], "MindsHub: no credit remaining (balance 0)", "planning outcome #7")
+    r = client.post(f"/api/workspaces/{world['ws']}/decisions/{hold}/resolve", json={"resolution": "retry"})
+    assert r.status_code == 200, r.text
+    with db.session_scope() as s:
+        opened, resolved = s.get(Decision, hold).created_at, s.get(Decision, hold).resolved_at
+    watch.run(resolved + timedelta(minutes=1))
+    assert posted == [(WEBHOOK, f"Work was on hold in {name} from {watch._when(opened)} to {watch._when(resolved)}: "
+                                f"{CAUSES['credit'][0]}. The hold is lifted and work has resumed.")]
+    watch.run(resolved + timedelta(minutes=6))
+    assert len(posted) == 1
+    old = open_provider_hold(world["ws"], "MindsHub: no credit remaining (balance 0)", "planning outcome #7")
+    client.post(f"/api/workspaces/{world['ws']}/decisions/{old}/resolve", json={"resolution": "retry"})
+    watch.run(resolved + timedelta(hours=2))  # lifted long before this pass: old news, not sent
+    assert len(posted) == 1
+
+
 def test_a_failing_webhook_neither_raises_nor_repeats(world, client, monkeypatch):
     calls = []
 
