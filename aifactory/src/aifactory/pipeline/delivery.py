@@ -2708,7 +2708,7 @@ class TaskRunner:
                 who = (current.get("merged_by") or {}).get("login") or "someone"
                 self.update(merge_sha=current.get("merge_commit_sha") or "", status="running", blocked_reason="")
                 self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "by": who,
-                                        "outside": True, "at": utcnow().isoformat()})
+                                        "outside": True, "at": current.get("merged_at")})
                 self.event("merged", f"PR #{self.task.pr_number} was merged on GitHub by {who} "
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()

@@ -122,6 +122,50 @@ def test_priority_and_requester_turns_persist_one_slot_per_tick(queue, monkeypat
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("phase", ["planning", "delivery"])
+def test_committed_priority_promotion_dispatches_next_without_preempting(queue, monkeypatch, phase):
+    set_limit(monkeypatch, phase, 1)
+    active = queue(phase, priority=2)
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [active]
+            running = jobs.orch._planning if phase == "planning" else jobs.orch._tasks
+            job, cancel = running[active]
+            older = queue(phase, priority=2, age=-100)
+            promoted = queue(phase, priority=3)
+            with session_scope() as s:
+                oid = promoted if phase == "planning" else s.get(Task, promoted).outcome_id
+                s.get(Outcome, oid).priority = 0
+            # A committed edit is visible next tick, but the occupied slot is not reclaimed.
+            await jobs.tick()
+            assert jobs.started == [active]
+            assert running == {active: (job, cancel)}
+            assert not job.done() and not job.cancelled() and not job.cancelling()
+            assert not cancel.is_set() and not jobs.release[active].is_set()
+            with session_scope() as s:
+                if phase == "delivery":
+                    assert s.get(Task, active).status == "running"
+                    assert s.get(Task, promoted).status == s.get(Task, older).status == "queued"
+                else:
+                    assert s.get(Outcome, active).status == "planning"
+                assert s.get(Outcome, oid).priority == 0
+            await jobs.complete(active)
+            await jobs.tick()
+            assert jobs.started == [active, promoted]
+            assert set(running) == {promoted}
+            assert not job.cancelled() and not cancel.is_set()
+            await jobs.complete(promoted)
+            await jobs.tick()
+            assert jobs.started == [active, promoted, older]
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
 def test_planners_default_workspace_and_global_caps_and_waiting_state(queue, monkeypatch):
     monkeypatch.delenv("AIFACTORY_GLOBAL_PLANNING_CONCURRENCY", raising=False)
     reset_settings_cache()
