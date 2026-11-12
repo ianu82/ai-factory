@@ -536,6 +536,9 @@ class Tools:
         if not isinstance(args, dict):
             return "Arguments must be a JSON object."
         if name in PER_RUN:
+            if not settings_for(workspace_settings(self.ws))["enabled"]:
+                # Switched off in Settings while this run was under way: it decides and posts nothing more.
+                return "The Lead has been switched off for this workspace. Do nothing more: call finish."
             if self.used.get(name, 0) >= PER_RUN[name]:
                 return f"You have used {name} {PER_RUN[name]} times this run, the limit. Finish, and say what is left."
             self.used[name] = self.used.get(name, 0) + 1

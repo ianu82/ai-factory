@@ -1894,7 +1894,9 @@ class TaskRunner:
                                        if allow["usd"] else ""]))
         self.block("unblock", f"{self.task.key}: reached its lifetime limit", "\n\n".join(lines), status="failed",
                    options=[{"value": "retry",
-                             "label": f"Allow {max_attempts} more attempt" + ("" if max_attempts == 1 else "s"),
+                             # Without an attempt limit the allowance is in dollars alone: the label says that.
+                             "label": (f"Allow {max_attempts} more attempt" + ("" if max_attempts == 1 else "s")
+                                       if attempts_limit else f"Allow ${cap_usd:.2f} more"),
                              "effect": f"Lets the task go on with a fresh set of attempts: {more}."},
                             TAKE_OVER, ABANDON],
                    metadata={"people_only": "A task at its lifetime limit goes on only when a person says so",
@@ -1906,6 +1908,12 @@ class TaskRunner:
             return float(s.query(func.coalesce(func.sum(Run.cost_usd), 0)).filter(
                 Run.task_id == self.task_id, Run.role.in_(("builder", "verifier")),
                 Run.cost_known.is_(True)).scalar() or 0)
+
+    def _unpriced(self) -> int:
+        """How many of the task's finished builder and verifier runs have no recorded cost."""
+        with session_scope() as s:
+            return s.query(Run).filter(Run.task_id == self.task_id, Run.role.in_(("builder", "verifier")),
+                                       Run.cost_known.isnot(True), Run.status != "running").count()
 
     def _fresh_budget_after_base_moved(self, why: str) -> None:
         """A verified change that other work overtook is not the builder's failure: rebuilding it gets a fresh
@@ -2771,6 +2779,8 @@ class TaskRunner:
                   "state": "reviewed" if reviewers else "unavailable", "reviewers": reviewers,
                   "open": found[:MAX_FINDINGS], "more": max(0, len(found) - MAX_FINDINGS),
                   "counts": {level: n for level, n in counts.items() if n}, "at": utcnow().isoformat()}
+        if result["more"]:  # the findings kept are not all of them: how many of all of them block
+            result["blocking"] = sum(bool(f.get("blocking")) for f in found)
         if of:
             result["of"] = of
         if not reviewers:
@@ -2903,8 +2913,11 @@ class TaskRunner:
             facts["review"] = {"state": result.get("state"), "reviewers": list(result.get("reviewers") or []),
                                "round": int(review.get("rounds") or 0),
                                "open": len(found) + int(result.get("more") or 0),
-                               "blocking": sum(bool(f.get("blocking")) for f in found)}
-        facts["cost"] = {"usd": round(self._spent(), 2), "attempts": len(_charged(ev))}
+                               "blocking": int(result["blocking"]) if "blocking" in result
+                               else sum(bool(f.get("blocking")) for f in found)}
+        unpriced = self._unpriced()  # sessions with no recorded cost: the sum is then a floor, and says so
+        facts["cost"] = {"usd": round(self._spent(), 2), "attempts": len(_charged(ev)),
+                         **({"unpriced": unpriced} if unpriced else {})}
         because, text = _merge_asks(self.task, settings, self.cfg)
         facts["asked"] = {"because": because, "text": text}
         return facts
@@ -3613,8 +3626,11 @@ def _merge_lines(facts: dict[str, Any]) -> list[str]:
                      + f"; {review['round']} review round{'' if review['round'] == 1 else 's'} so far")
     cost = facts.get("cost")
     if cost:
-        lines.append(f"Cost so far: ${cost['usd']:.2f} on builder and verifier sessions, {cost['attempts']} "
-                     f"charged attempt{'' if cost['attempts'] == 1 else 's'}")
+        unpriced = int(cost.get("unpriced") or 0)
+        lines.append(f"Cost so far: {'at least ' if unpriced else ''}${cost['usd']:.2f} on builder and verifier "
+                     "sessions" + (f" ({unpriced} session{'' if unpriced == 1 else 's'} with no recorded cost)"
+                                   if unpriced else "")
+                     + f", {cost['attempts']} charged attempt{'' if cost['attempts'] == 1 else 's'}")
     if (facts.get("asked") or {}).get("text"):
         lines.append(facts["asked"]["text"])
     return lines

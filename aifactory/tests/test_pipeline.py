@@ -363,19 +363,23 @@ def test_a_merge_approval_carries_the_change_its_checks_its_cost_and_why_a_perso
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         spent = round(sum(r.cost_usd or 0 for r in s.query(Run).filter(
             Run.task_id == task.id, Run.role.in_(("builder", "verifier")), Run.cost_known.is_(True))), 2)
+        unpriced = s.query(Run).filter(Run.task_id == task.id, Run.role.in_(("builder", "verifier")),
+                                       Run.cost_known.isnot(True), Run.status != "running").count()
+        cost = {"usd": spent, "attempts": 1, **({"unpriced": unpriced} if unpriced else {})}
+        cost_line = delivery._merge_lines({"cost": cost})[0]
         text = "\n".join([
             "Change: 1 file, +1 -1: greet.sh",
             "Verifier: pass — Greeting verified.",
             "Repository checks: 1 of 1 passed",
             "CI: success (1 check)",
-            f"Cost so far: ${spent:.2f} on builder and verifier sessions, 1 charged attempt",
+            cost_line,
             "Asked because merges in this workspace wait for a person (Settings → Autonomy)."])
         facts = decision.metadata_json["merge"]
         assert facts == {"pr": 1, "head": task.head_sha,
                          "change": {"files": 1, "additions": 1, "deletions": 1, "paths": ["greet.sh"]},
                          "verifier": {"verdict": "pass", "summary": "Greeting verified."},
                          "checks": {"passed": 1, "total": 1, "preexisting": 0},
-                         "ci": {"state": "success", "checks": 1}, "cost": {"usd": spent, "attempts": 1},
+                         "ci": {"state": "success", "checks": 1}, "cost": cost,
                          "asked": {"because": "workspace", "text": delivery.MERGE_ASKS["workspace"]}, "text": text}
         assert "review" not in facts  # reviews are off in this workspace
         # Today's sentence first, then the facts as short lines: the Lead, the Director and Mind read the text.
@@ -1261,6 +1265,31 @@ def test_a_task_that_has_spent_its_lifetime_dollars_asks_a_person_before_another
             "allow": {"attempts": 15, "usd": 30.5}}
         assert s.query(Run).filter(Run.task_id == task_id).count() == 3  # only the runs it started with
     assert "builder" not in ScriptedModel.calls
+
+
+def test_with_only_the_dollar_limit_on_the_option_to_go_on_speaks_of_dollars(factory):
+    outcome_id, _ = _task_with_history(factory, ["verification_failed"] * 2,
+                                       runs=[("builder", 9.0, True), ("verifier", 6.5, True)])
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "limits": {**(ws.settings.get("limits") or {}), "task_attempts_total": 0},
+                       "budgets": {**ws.settings["budgets"], "outcome_usd": 1000}}
+    assert drive(lambda: _open_decision(outcome_id, "unblock") is not None)
+    with session_scope() as s:
+        decision = s.get(Decision, _open_decision(outcome_id, "unblock"))
+        assert decision.title == "T1: reached its lifetime limit"
+        go_on = decision.options[0]
+        assert (go_on["value"], go_on["label"]) == ("retry", "Allow $15.00 more")  # there are no attempts to allow
+        assert go_on["effect"] == ("Lets the task go on with a fresh set of attempts: $15.00 more on its builder "
+                                   "and verifier sessions.")
+
+
+def test_a_merge_cost_with_a_session_of_no_recorded_cost_reads_as_a_floor():
+    assert delivery._merge_lines({"cost": {"usd": 1.5, "attempts": 2, "unpriced": 1}}) == [
+        "Cost so far: at least $1.50 on builder and verifier sessions (1 session with no recorded cost), "
+        "2 charged attempts"]
+    assert delivery._merge_lines({"cost": {"usd": 1.5, "attempts": 1}}) == [
+        "Cost so far: $1.50 on builder and verifier sessions, 1 charged attempt"]
 
 
 def test_allowing_more_lets_exactly_one_more_set_of_attempts_run_before_asking_again(factory):

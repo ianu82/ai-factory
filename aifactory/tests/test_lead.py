@@ -598,6 +598,19 @@ def digests(world):
             Message.outcome_id == world["outcome"], Message.author_kind == "factory").order_by(Message.created_at)]
 
 
+def test_a_lead_switched_off_during_its_run_decides_and_posts_nothing_more(world):
+    tools = lead.Tools(world["ws"], world["outcome"], "run-1")
+    assert "Posted" in tools.call("post_update", {"text": "T1 is building."})
+    with db.session_scope() as s:
+        w = s.get(Workspace, world["ws"])
+        w.settings = {**w.settings, "lead": {"enabled": False}}
+    for name in ("post_update", "resolve_decision", "post_guidance", "note_for_people"):
+        assert "switched off" in tools.call(name, {"text": "T1 is still building."})
+    with db.session_scope() as s:
+        assert s.query(Message).filter(Message.author_kind == "lead").count() == 1
+        assert s.get(Decision, world["question"]).status == "open"
+
+
 def test_progress_alone_is_told_as_a_digest_and_does_not_wake_the_lead(world):
     lead_run(world, woken()[world["outcome"]]["seen"], ago=timedelta(minutes=5))
     published = milestone(world, "published", message="Opened PR #12")
