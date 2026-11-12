@@ -39,8 +39,8 @@ MAX_OUTPUT = 64000
 
 
 def secrets_for(db, user_id, scoped=()):
-    # Reads can target newly joined workspaces outside the creation snapshot.
-    # Include those credentials as well as the original scope on every egress.
+    # Include current memberships and the stored scope so legacy transcripts and
+    # credentials saved after thread creation remain protected on every egress.
     ids = set(store.memberships(db, user_id)) | set(scoped)
     return tuple(value for s in db.query(Secret).filter(Secret.workspace_id.in_(ids))
                  for value in redaction_values(s) if value)
@@ -251,11 +251,12 @@ def handoff(db, thread) -> dict | None:
     from ..models import Outcome
 
     actions = db.query(MindAction).filter(MindAction.thread_id == thread.id, MindAction.owner_id == thread.owner_id,
+                                          MindAction.workspace_id == thread.billing_workspace_id,
                                           MindAction.kind.in_(OUTCOME_KINDS), MindAction.status == "succeeded") \
         .order_by(MindAction.created_at).all()
     for action in actions:
         outcome = db.get(Outcome, (action.result or {}).get("outcome_id") or "")
-        if outcome is not None and outcome.workspace_id in (thread.workspace_ids or []):
+        if outcome is not None and outcome.workspace_id == thread.billing_workspace_id:
             return {"id": outcome.id, "number": outcome.number, "title": outcome.title, "status": outcome.status,
                     "workspace_id": outcome.workspace_id, "action_id": action.id}
     return None
@@ -296,16 +297,21 @@ def transcript(db, thread, history=False):
 def create_thread(body: CreateThread, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_member(db, user, body.billing_workspace_id)
     row = MindThread(owner_id=user.id, billing_workspace_id=body.billing_workspace_id,
-                     workspace_ids=store.memberships(db, user.id))
+                     workspace_ids=[body.billing_workspace_id])
     db.add(row)
     db.commit()
     return scrub(jsonable_encoder(thread_view(db, row)), secrets_for(db, user.id, row.workspace_ids))
 
 
 @router.get("/threads")
-def list_threads(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_threads(workspace_id: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if workspace_id is not None:
+        require_member(db, user, workspace_id)
     scope = set(store.memberships(db, user.id))
-    rows = db.query(MindThread).filter_by(owner_id=user.id).order_by(MindThread.updated_at.desc()).all()
+    query = db.query(MindThread).filter_by(owner_id=user.id)
+    if workspace_id is not None:
+        query = query.filter_by(billing_workspace_id=workspace_id)
+    rows = query.order_by(MindThread.updated_at.desc()).all()
     result = []
     for row in rows:
         if set(row.workspace_ids).issubset(scope):
@@ -380,7 +386,14 @@ class PrivateTools:
         with SessionLocal() as db:
             thread = store.owned(db, self.context.user_id, self.context.thread_id)
             try:
+                reason = ("Mind can only read and act in this conversation's workspace; "
+                          f"use workspace_id {thread.billing_workspace_id}.")
+                if not isinstance(arguments, dict) or arguments.get("workspace_id") != thread.billing_workspace_id:
+                    raise HTTPException(403, reason)
                 result = await Tools(Context(db, self.context.user_id, thread.id)).call(name, arguments)
+                if any(not isinstance(c, dict) or c.get("workspace_id") != thread.billing_workspace_id
+                       for c in result.get("citations") or []):
+                    raise HTTPException(403, reason)
             except HTTPException as exc:
                 if not (400 <= exc.status_code < 500 and isinstance(exc.detail, str)):
                     raise
@@ -393,13 +406,6 @@ class PrivateTools:
                 await self.emit({"type": "tool_finished", "data": {"call_id": str(self.calls), "name": name,
                                  "summary": "Factory refused the call", "citations": []}})
                 return refusal
-            # A read or proposal in a workspace joined after the thread began widens the thread's scope before
-            # anything derived from it is kept, so revoking that membership later hides the thread (owned()).
-            touched = {arguments.get("workspace_id") if isinstance(arguments, dict) else None}
-            touched |= {c.get("workspace_id") for c in result.get("citations") or [] if isinstance(c, dict)}
-            touched = {w for w in touched if isinstance(w, str) and w}
-            if not touched <= set(thread.workspace_ids):
-                thread.workspace_ids = sorted(set(thread.workspace_ids) | touched)
             result = scrub(result, secrets_for(db, self.context.user_id, thread.workspace_ids))
             # Proposal rows are also private persistence: scrub the complete record.
             from ..models import MindAction
@@ -421,12 +427,11 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
            runtime=Depends(get_runtime)):
     thread = store.owned(db, user.id, thread_id)
     store.recover(db, thread)
-    if body.context:
-        require_member(db, user, body.context.workspace_id)
-        # Context from a workspace joined after the thread began widens its scope in the same transaction that
-        # keeps the message, so revoking that membership later hides the thread (owned()).
-        if body.context.workspace_id not in thread.workspace_ids:
-            thread.workspace_ids = sorted(set(thread.workspace_ids) | {body.context.workspace_id})
+    context = body.context
+    if context and context.workspace_id != thread.billing_workspace_id:
+        context = None
+    if context:
+        require_member(db, user, context.workspace_id)
     existing = db.query(MindMessage).filter_by(thread_id=thread_id, client_message_id=body.client_message_id).first()
     if existing:
         raise HTTPException(409, "Message already submitted; reload the thread")
@@ -444,7 +449,7 @@ def submit(thread_id: str, body: SubmitMessage, user: User = Depends(current_use
     if position >= 200:
         db.rollback()
         raise HTTPException(409, "Thread turn limit reached; create a new conversation")
-    original = {"text": body.text, "context": body.context.model_dump() if body.context else None}
+    original = {"text": body.text, "context": context.model_dump() if context else None}
     clean = scrub(original, secrets_for(db, user.id, thread.workspace_ids))
     prompt = MindMessage(thread_id=thread_id, role="user", **clean, turn_id=turn_id,
                          position=position + 1, client_message_id=body.client_message_id)

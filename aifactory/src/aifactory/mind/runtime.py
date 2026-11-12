@@ -14,14 +14,13 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException
 
 from ..db import SessionLocal
-from ..models import MindCharge, MindThread, Workspace
-from .actions import execution_results
+from ..models import MindAction, MindActionResult, MindCharge, Workspace
 from .api import scrub, secrets_for
 from .contracts import TurnContext
 from .engine import MindEngine
 from .provider import MindUnavailable, Readiness, _ProviderStop
-from .store import AccountingError, memberships
-from .tools import Context
+from .store import AccountingError, memberships, owned
+from .tools import clean
 
 # MindsHub can report a just-finished send's cost a moment late; wait this long before calling usage unknown.
 RECONCILE_TRIES = 4
@@ -65,13 +64,16 @@ def _pending(user_id: str) -> bool:
 
 
 def _prompt(message: dict[str, Any], results: list[dict], workspaces: list[dict] | None = None) -> str:
-    """The person's message, with the workspaces Mind may read for them, what they are looking at and the
+    """The person's message, with the workspace Mind may read for them, what they are looking at and the
     confirmed results of earlier actions. All are Factory records, quoted as data: the persona already treats
     object text as untrusted."""
     parts = []
     if workspaces:
-        parts.append("Workspaces this person can ask about (pass the id as workspace_id): "
-                     + json.dumps(workspaces, ensure_ascii=False))
+        workspace = workspaces[0]
+        parts.append("This conversation belongs to the Factory workspace "
+                     + json.dumps(workspace["name"], ensure_ascii=False) + " (id " + workspace["id"] + "). "
+                     "It is the only workspace you can read or act in: pass this id as workspace_id on every tool call. "
+                     "Do not look for or mention other workspaces.")
     context = {k: v for k, v in (message.get("context") or {}).items()
                if k in ("workspace_id", "kind", "id", "outcome_id", "label") and v}
     if context:
@@ -102,21 +104,33 @@ class EngineRuntime:
         messages = [m for m in history if m.get("role") in ("user", "assistant")]
         if not messages or messages[-1].get("role") != "user":
             raise ValueError("A Mind turn needs the person's message last")
-        prior = [{"role": m["role"], "content": m["text"]} for m in messages[:-1] if (m.get("text") or "").strip()]
         with SessionLocal() as db:
-            current = memberships(db, context.user_id)
-            # Everything listed to the model enters the thread's scope first, so revoking any of these workspaces
-            # later hides the thread and the replies that may mention it (store.owned()).
-            thread = db.get(MindThread, context.thread_id)
-            if thread is not None and not set(current) <= set(thread.workspace_ids):
-                thread.workspace_ids = sorted(set(thread.workspace_ids) | set(current))
-                db.commit()
-            secrets = secrets_for(db, context.user_id, current)
+            thread = owned(db, context.user_id, context.thread_id)
+            if (thread.billing_workspace_id != context.billing_workspace_id
+                    or context.billing_workspace_id not in memberships(db, context.user_id)):
+                raise HTTPException(404, "Thread not found")
+            workspace = db.get(Workspace, thread.billing_workspace_id)
+            if workspace is None:
+                raise HTTPException(404, "Thread not found")
+            # Legacy messages have no reliable workspace provenance: even messages without context or citations
+            # may contain another workspace's data. Keep the stored transcript, but omit prior text on every turn
+            # of a legacy multi-workspace thread; its unchanged scope remains the marker of that risk.
+            prior = []
+            if set(thread.workspace_ids) == {thread.billing_workspace_id}:
+                prior = [{"role": m["role"], "content": m["text"]} for m in messages[:-1]
+                         if (m.get("text") or "").strip()]
+            secrets = secrets_for(db, context.user_id, thread.workspace_ids)
             # The provider sees confirmed results and workspace names only through the same workspace-secret scrub
             # as every other egress.
-            results = scrub(execution_results(Context(db, context.user_id, context.thread_id)), secrets)
-            workspaces = scrub([{"id": w.id, "name": w.name} for w in db.query(Workspace).filter(
-                Workspace.id.in_(current)).order_by(Workspace.name)], secrets)
+            # Legacy threads can contain confirmed actions in other workspaces. Filter by the action's
+            # immutable target before limiting results, so those records never reach the provider.
+            rows = db.query(MindActionResult).join(MindAction, MindActionResult.action_id == MindAction.id).filter(
+                MindActionResult.thread_id == thread.id, MindActionResult.owner_id == context.user_id,
+                MindAction.thread_id == thread.id, MindAction.owner_id == context.user_id,
+                MindAction.workspace_id == thread.billing_workspace_id,
+            ).order_by(MindActionResult.created_at.desc(), MindActionResult.id.desc()).limit(20).all()
+            results = scrub([clean(row.content) for row in reversed(rows)], secrets)
+            workspaces = scrub([{"id": workspace.id, "name": workspace.name}], secrets)
         bridge = LedgerBridge(ledger)
         ready = await self.provider.readiness(context.billing_workspace_id, bridge, session_id=ledger.session_id)
         if not ready.available:

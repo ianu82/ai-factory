@@ -291,6 +291,34 @@ def test_resolution_options_and_judged_decisions(world):
     assert exc.value.status_code == 409
 
 
+def test_a_cancel_card_names_the_tasks_that_wait_and_drops_them_only_when_asked(world, monkeypatch):
+    from aifactory.pipeline import orchestrator as orchestration
+    monkeypatch.setattr(orchestration.orchestrator, "cancel_task", lambda task_id: None)
+    db, users, work = world
+    ws, o, t, _, _, _, plan = work[0]
+    waiting = Task(workspace_id=ws.id, outcome_id=o.id, plan_id=plan.id, repo_id=t.repo_id, key="T2", title="Page",
+                   status="pending", depends_on=["T1"])
+    db.add(waiting); db.commit()
+    ctx = Context(db, users[0].id, "thread")
+    base = {"workspace_id": ws.id, "outcome_id": o.id, "task_id": t.id}
+    kept = propose("propose_cancel_task", base, ctx)
+    assert kept["effect"].endswith(" The tasks that wait for it are kept, and will ask what to do: T2 Page.")
+    dropped = propose("propose_cancel_task", {**base, "dependents": "drop"}, ctx)
+    assert dropped["effect"].endswith(" The tasks that wait for it are dropped too: T2 Page.")
+    with pytest.raises(HTTPException) as exc:
+        propose("propose_cancel_task", {**base, "dependents": "all"}, ctx)
+    assert exc.value.status_code == 422
+    confirm(ctx, dropped["id"], 1)
+    db.expire_all()
+    assert db.get(Task, t.id).status == "cancelled" and db.get(Task, waiting.id).status == "cancelled"
+    [event] = db.query(Event).filter_by(kind="task_cancelled", task_id=waiting.id).all()
+    assert event.message == "Alice via Mind dropped T2: it waits for T1, which was cancelled"
+    assert event.data["source"] == "mind" and event.data["with"] == "T1"
+    with pytest.raises(HTTPException) as exc:  # the kept card's target changed: T1 is no longer open
+        confirm(ctx, kept["id"], 1)
+    assert exc.value.status_code == 409
+
+
 def test_take_over_and_cancel_finish_after_the_commit(world, monkeypatch):
     from aifactory.pipeline import orchestrator as orchestration
     stopped = []

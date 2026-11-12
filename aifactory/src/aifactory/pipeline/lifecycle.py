@@ -17,11 +17,17 @@ ENDED_AS = {"abandoned": "was abandoned", "cancelled": "was cancelled", "reverte
             "handed_over": "was handed over to a person"}
 
 
-def stranded(tasks: list[Task]) -> tuple[list[Task], list[Task]]:
+def stranded(tasks: list[Task], gone: set[str] | None = None) -> tuple[list[Task], list[Task]]:
     """The pending tasks that can never start, because something they depend on (directly, or through another such
     task) ended without being delivered; and the ended tasks they wait behind. A task behind one that waits on a
-    person is not stranded: that person's answer moves it."""
+    person is not stranded: that person's answer moves it.
+
+    ``gone``: the keys to count as ended instead of the tasks that have ended, to ask what ending them would strand."""
     by_key = {t.key: t for t in tasks}
+
+    def over(t: Task) -> bool:
+        return t.key in gone if gone is not None else t.status in ENDED
+
     waiting: dict[str, Task] = {}
     changed = True
     while changed:
@@ -30,16 +36,23 @@ def stranded(tasks: list[Task]) -> tuple[list[Task], list[Task]]:
             if t.status != "pending" or t.key in waiting:
                 continue
             behind = [by_key[k] for k in t.depends_on or [] if k in by_key]
-            if any(b.status in ENDED or b.key in waiting for b in behind):
+            if any(over(b) or b.key in waiting for b in behind):
                 waiting[t.key] = t
                 changed = True
     ended = {k: by_key[k] for t in waiting.values() for k in t.depends_on or []
-             if k in by_key and by_key[k].status in ENDED}
+             if k in by_key and over(by_key[k])}
 
     def order(t: Task) -> tuple[int, str]:
         return len(t.key), t.key  # T2 before T10
 
     return sorted(waiting.values(), key=order), sorted(ended.values(), key=order)
+
+
+def dependents(tasks: list[Task], key: str) -> list[Task]:
+    """The unfinished tasks that wait for ``key``, directly or through other tasks: what ending it would strand."""
+    if not any(t.key == key and t.status not in STOPPED for t in tasks):
+        return []
+    return stranded(tasks, {key})[0]
 
 
 def transition(session, task: Task, *, owner: str | None = None, exclusive: bool = False, **fields) -> bool:

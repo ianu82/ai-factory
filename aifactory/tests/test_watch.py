@@ -37,6 +37,13 @@ def alerts(client, world):
     return client.get(f"/api/workspaces/{world['ws']}/inbox").json()["alerts"]
 
 
+def raised(world):
+    """The open alerts as the watch left them (the Inbox folds an overdue one into its decision)."""
+    with db.session_scope() as s:
+        return [{"id": a.id, "kind": a.kind, "title": a.title, "body": a.body, "decision_id": a.decision_id}
+                for a in s.query(Alert).filter(Alert.workspace_id == world["ws"], Alert.status == "open")]
+
+
 def live(world):
     with db.session_scope() as s:
         return {a.kind: a.status for a in s.query(Alert).filter(Alert.workspace_id == world["ws"],
@@ -74,13 +81,37 @@ def test_a_decision_waiting_past_the_alert_time_alerts_until_it_is_answered(worl
     decision(world, age=timedelta(hours=1))
     late = decision(world, age=timedelta(hours=3))
     assert watch.run()["shown"] == 1  # the default alert time is two hours
-    [shown] = alerts(client, world)
+    [shown] = raised(world)
     assert shown["kind"] == "overdue" and shown["title"] == "Question has waited over 2 hours"
-    assert shown["body"] == "Which queue?" and shown["decision_id"] == late and shown["outcome_number"] == 7
+    assert shown["body"] == "Which queue?" and shown["decision_id"] == late
     assert watch.run() == {"raised": 0, "shown": 0, "cleared": 0, "woken": 0}  # one alert while it lasts
     with db.session_scope() as s:
         s.get(Decision, late).status = "resolved"
-    assert watch.run()["cleared"] == 1 and alerts(client, world) == []
+    assert watch.run()["cleared"] == 1 and raised(world) == []
+
+
+def test_an_overdue_decision_is_one_item_in_the_inbox_marked_on_the_decision(world, client):
+    working(world)
+    recent = decision(world, age=timedelta(minutes=5))
+    late = decision(world, age=timedelta(hours=4))
+    with db.session_scope() as s:  # and a repeated failure: an alert about no listed decision
+        other = Outcome(workspace_id=world["ws"], number=8, title="Other", brief="", status="running")
+        s.add(other)
+        s.flush()
+        for outcome_id in (world["outcome"], other.id):
+            s.add(Run(workspace_id=world["ws"], outcome_id=outcome_id, role="builder", harness="native",
+                      status="failed", error="Sandbox refused", started_at=now(), finished_at=now()))
+    watch.run()
+    [overdue] = [a for a in raised(world) if a["kind"] == "overdue"]
+    inbox = client.get(f"/api/workspaces/{world['ws']}/inbox").json()
+    assert [a["kind"] for a in inbox["alerts"]] == ["repeated"]  # the overdue alert is not a second item
+    assert [d["id"] for d in inbox["decisions"]] == [late, recent]  # overdue first
+    first, second = inbox["decisions"]
+    assert first["overdue"] == {"alert_id": overdue["id"], "title": "Question has waited over 2 hours"}
+    assert 239 <= first["waited_minutes"] <= 241 and second["overdue"] is None and 4 <= second["waited_minutes"] <= 6
+    assert len(inbox["alerts"]) + len(inbox["decisions"]) == 3  # what the navigation counts is what the list shows
+    detail = client.get(f"/api/workspaces/{world['ws']}/outcomes/{world['outcome']}").json()
+    assert {d["id"]: d["overdue"] for d in detail["decisions"]}[late] == first["overdue"]  # the card shows it too
 
 
 def test_a_task_waiting_with_nothing_to_answer_wakes_the_lead_then_alerts(world, client):
@@ -184,7 +215,7 @@ def test_a_dismissed_alert_stays_dismissed_while_its_condition_lasts(world, clie
     working(world)
     late = decision(world, age=timedelta(hours=3))
     watch.run()
-    [shown] = alerts(client, world)
+    [shown] = raised(world)
     r = client.post(f"/api/workspaces/{world['ws']}/alerts/{shown['id']}/dismiss")
     assert r.status_code == 200 and r.json() == {"status": "dismissed"}
     watch.run()
@@ -196,7 +227,7 @@ def test_a_dismissed_alert_stays_dismissed_while_its_condition_lasts(world, clie
     with db.session_scope() as s:
         s.get(Decision, late).status = "open"  # the same condition again is a new alert
     watch.run()
-    assert [a["id"] != shown["id"] for a in alerts(client, world)] == [True]
+    assert [a["id"] != shown["id"] for a in raised(world)] == [True]
 
 
 def test_alerts_show_in_the_app_and_slack_and_email_stay_off(world, client):
@@ -211,7 +242,7 @@ def test_alerts_show_in_the_app_and_slack_and_email_stay_off(world, client):
     working(world)
     decision(world, age=timedelta(minutes=61))
     watch.run()
-    assert [a["title"] for a in alerts(client, world)] == ["Question has waited over 1 hour"]
+    assert [a["title"] for a in raised(world)] == ["Question has waited over 1 hour"]
 
 
 def test_a_failure_reason_drops_what_differs_between_occurrences():

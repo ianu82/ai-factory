@@ -11,7 +11,9 @@ from aifactory.db import session_scope
 from aifactory.decisions import DecisionError, resolve
 from aifactory.models import Decision, Event, Message, Outcome, Plan, Repository, Task, User
 from aifactory.pipeline import planning
+from aifactory.pipeline.lifecycle import dependents
 from aifactory.pipeline.orchestrator import Orchestrator
+from aifactory.work_services import cancel_task
 
 from .fakes import ScriptedModel, call, make_remote
 from .test_pipeline import CRITERION, FILES, factory, new_outcome, outcome_status  # noqa: F401 - the workspace fixture
@@ -166,6 +168,128 @@ def test_dropping_the_waiting_tasks_ends_the_outcome_with_what_was_delivered(fac
     assert outcome_status(oid) == "partially_completed" and asked(oid) == []
     with session_scope() as s:
         assert s.get(Outcome, oid).summary == "1 of 4 task(s) delivered."
+
+
+# A cancel says what it strands ------------------------------------------------------------------------------------
+
+@pytest.fixture
+def person(signed_in):
+    """The signed-in person's workspace with a repository, in the shape outcome_with takes."""
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="acme/demo", default_branch="main")
+        s.add(repo)
+        s.flush()
+        return {"ws": ws, "repo": repo.id, "user": signed_in["user"]["id"]}
+
+
+def test_the_tasks_waiting_for_one_are_found_through_others_and_finished_ones_left_out():
+    def t(key, status, deps):
+        return Task(key=key, title=f"Part {key}", status=status, depends_on=deps)
+
+    tasks = [t("T1", "running", []), t("T2", "pending", ["T1"]), t("T3", "pending", ["T2"]),
+             t("T4", "completed", ["T1"]), t("T5", "pending", []), t("T6", "pending", ["T5", "T3"]),
+             t("T7", "cancelled", ["T1"]), t("T10", "pending", ["T1"])]
+    assert [w.key for w in dependents(tasks, "T1")] == ["T2", "T3", "T6", "T10"]  # directly, or through T2 and T3
+    assert [w.key for w in dependents(tasks, "T5")] == ["T6"]
+    assert dependents(tasks, "T6") == []
+    assert dependents(tasks, "T4") == dependents(tasks, "T7") == []  # finished: cancelling it strands nothing new
+
+
+def test_a_cancel_shows_what_waits_and_can_drop_it_in_the_same_step(person, client):
+    oid, ids = outcome_with(person, ("T1", "running", []), ("T2", "pending", ["T1"]), ("T3", "pending", ["T2"]),
+                            ("T4", "completed", []), ("T5", "pending", []))
+    detail = client.get(f"/api/workspaces/{person['ws']}/outcomes/{oid}").json()
+    assert {t["key"]: [w["key"] for w in t["dependents"]] for t in detail["tasks"]} == {
+        "T1": ["T2", "T3"], "T2": ["T3"], "T3": [], "T4": [], "T5": []}
+    assert detail["tasks"][0]["dependents"][0] == {"id": ids["T2"], "key": "T2", "title": "Part T2"}
+    r = client.post(f"/api/workspaces/{person['ws']}/tasks/{ids['T1']}/cancel", json={"dependents": "drop"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "dropped": [ids["T2"], ids["T3"]]}
+    assert {k: v[0] for k, v in tasks_of(oid).items()} == {
+        "T1": "cancelled", "T2": "cancelled", "T3": "cancelled", "T4": "completed", "T5": "pending"}
+    with session_scope() as s:  # one event each, saying why
+        said = {e.task_id: (e.message, (e.data or {}).get("with")) for e in s.query(Event).filter(
+            Event.outcome_id == oid, Event.kind == "task_cancelled")}
+    assert said == {ids["T1"]: ("Ian stopped T1", None),
+                     ids["T2"]: ("Ian dropped T2: it waits for T1, which was cancelled", "T1"),
+                     ids["T3"]: ("Ian dropped T3: it waits for T1, which was cancelled", "T1")}
+    bad = client.post(f"/api/workspaces/{person['ws']}/tasks/{ids['T5']}/cancel", json={"dependents": "all"})
+    assert bad.status_code == 422 and tasks_of(oid)["T5"][0] == "pending"
+
+
+def test_a_cancel_that_keeps_what_waits_behaves_as_before(person, client):
+    oid, ids = outcome_with(person, ("T1", "running", []), ("T2", "pending", ["T1"]))
+    r = client.post(f"/api/workspaces/{person['ws']}/tasks/{ids['T1']}/cancel")  # no choice: keep
+    assert r.status_code == 200 and r.json() == {"ok": True, "dropped": []}
+    assert tasks_of(oid) == {"T1": ("cancelled", []), "T2": ("pending", ["T1"])}
+    assert count(oid, "task_cancelled") == 1
+
+
+def test_kept_tasks_ask_what_to_do_once_their_task_is_cancelled(factory):
+    oid, ids = outcome_with(factory, ("T1", "running", []), ("T2", "pending", ["T1"]))
+    with session_scope() as s:
+        payloads, later = cancel_task(s, s.get(User, factory["user"]), factory["ws"], ids["T1"])
+        assert len(payloads) == 1 and later == [("stop_task", ids["T1"], factory["ws"], oid)]
+    Orchestrator()._promote()
+    [decision] = asked(oid)
+    assert decision["metadata"] == {"stranded": {"waiting": ["T2"], "ended": ["T1"]}}
+
+
+# Decisions with one cause are answered in one go ------------------------------------------------------------------
+
+def stranded_question(ids, oid, title, *, status="open", options=None, metadata=None, kind="unblock"):
+    with session_scope() as s:
+        d = Decision(workspace_id=ids["ws"], outcome_id=oid, kind=kind, title=title, status=status,
+                     options=options if options is not None else scheduler.STRANDED_OPTIONS,
+                     metadata_json=metadata if metadata is not None else {"stranded": {}})
+        s.add(d)
+        s.flush()
+        return d.id
+
+
+def test_the_inbox_keys_the_same_question_about_different_work_alike(person, client):
+    first, _ = outcome_with(person, ("T1", "cancelled", []), ("T2", "pending", ["T1"]), ("T3", "pending", ["T1"]),
+                            status="attention")
+    second, _ = outcome_with(person, ("T1", "cancelled", []), ("T2", "pending", ["T1"]), status="attention")
+    a = stranded_question(person, first, "T2, T3 cannot start: T1 ended without being delivered")
+    b = stranded_question(person, second, "T2 cannot start: T1 ended without being delivered")
+    other = stranded_question(person, second, "T2 cannot start: T1 ended without being delivered",
+                              options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+    words = stranded_question(person, first, "Which queue?", kind="question",
+                              options=[{"value": "answer", "label": "Answer"}])
+    words_too = stranded_question(person, second, "Which queue?", kind="question",
+                                  options=[{"value": "answer", "label": "Answer"}])
+    keys = {d["id"]: d["question"] for d in client.get(f"/api/workspaces/{person['ws']}/inbox").json()["decisions"]}
+    shape = "T# cannot start: T# ended without being delivered"  # the task keys left out
+    assert keys[a] == keys[b] == f'["unblock", ["continue", "drop"], "{shape}"]'
+    assert keys[other] not in (None, keys[a])  # another set of answers is another question
+    assert keys[words] is None and keys[words_too] is None  # answered in words: never grouped
+
+
+def test_a_group_is_answered_one_decision_at_a_time_and_each_reports_how_it_went(person, client):
+    outcomes = [outcome_with(person, ("T1", "cancelled", []), ("T2", "pending", ["T1"]), status="attention")
+                for _ in range(3)]
+    title = "T2 cannot start: T1 ended without being delivered"
+    first = stranded_question(person, outcomes[0][0], title)
+    done = stranded_question(person, outcomes[1][0], title, status="resolved")
+    refused = stranded_question(person, outcomes[1][0], title, options=[{"value": "retry", "label": "Retry"}])
+    for_people = stranded_question(person, outcomes[2][0], title, metadata={"stranded": {}, "people_only": "x"})
+    r = client.post(f"/api/workspaces/{person['ws']}/decisions/resolve", json={
+        "decision_ids": [first, done, refused, "missing", for_people], "resolution": "drop"})
+    assert r.status_code == 200, r.text
+    assert [(x["id"], x["status"], x.get("reason")) for x in r.json()["results"]] == [
+        (first, "resolved", None), (done, "already_resolved", None), (refused, "refused", "Choose one of: retry"),
+        ("missing", "refused", "Decision not found"), (for_people, "resolved", None)]
+    with session_scope() as s:
+        for decision_id in (first, for_people):  # each its own record and event, attributed to the person
+            d = s.get(Decision, decision_id)
+            assert (d.status, d.resolution, d.resolved_by) == ("resolved", "drop", person["user"])
+            assert s.query(Event).filter(Event.kind == "decision_resolved",
+                                         Event.outcome_id == d.outcome_id).one().data["decision_id"] == decision_id
+        assert s.get(Decision, refused).status == "open"
+    assert tasks_of(outcomes[0][0])["T2"][0] == tasks_of(outcomes[2][0])["T2"][0] == "abandoned"
+    assert tasks_of(outcomes[1][0])["T2"][0] == "pending"
 
 
 # A task left waiting on a person with nothing asking -------------------------------------------------------------

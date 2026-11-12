@@ -492,3 +492,66 @@ def test_combined_break_baseline_matches_failing_workflow(world, green_workflow,
                      data={"repo_id": world[1], "branch": "trunk", "state": "success",
                            "workflow": green_workflow}))
     assert bool(findings(world, "combined_break")) is expected
+
+
+def test_an_untriaged_smoke_failure_offers_to_create_the_fix_or_ignore_it(world, signed_in):
+    from aifactory.decisions import resolve
+    from aifactory.models import User
+    with session_scope() as db:
+        fixed = signal(db, world, "smoke_failure", status="new", body="Health check returned 500",
+                       url="https://github.com/acme/test/pull/1").id
+        ignored = signal(db, world, "smoke_failure", status="new", url="https://github.com/acme/test/pull/2").id
+        db.get(Workspace, world[0]).outcome_seq = 1  # the fixture's outcome is #1: the fix's outcome is the next one
+    sweep(world[0], NOW)
+    with session_scope() as db:
+        items = {d.metadata_json["subject"]: d for d in db.query(Decision).filter_by(kind="supervisor")}
+        assert set(items) == {fixed, ignored}
+        options = items[fixed].options
+        assert [(o["value"], o["label"]) for o in options] == [("fix", "Create the fix"), ("dismiss", "Ignore")]
+        assert all(o["effect"] for o in options)
+        person = db.get(User, signed_in["user"]["id"])
+        resolve(db, items[fixed], person, "fix")
+        resolve(db, items[ignored], person, "dismiss")
+    with session_scope() as db:
+        sig = db.get(Signal, fixed)
+        outcome = db.get(Outcome, sig.outcome_id)  # what accepting the signal on the Signals page creates
+        assert sig.status == "accepted" and outcome.signal_id == fixed and outcome.source == "signal"
+        assert outcome.title == "Failure"
+        assert outcome.brief == "Health check returned 500\n\nSource: https://github.com/acme/test/pull/1"
+        assert db.get(Signal, ignored).status == "new" and db.get(Signal, ignored).outcome_id is None
+        assert sorted(d.status for d in db.query(Decision).filter_by(kind="supervisor")) == ["dismissed", "resolved"]
+    sweep(world[0], NOW + timedelta(minutes=30))
+    with session_scope() as db:  # neither is raised again
+        assert db.query(Decision).filter_by(kind="supervisor").count() == 2
+
+
+def test_a_stuck_task_with_an_open_decision_is_noted_on_it_instead_of_raised_again(world):
+    from aifactory.serializers import decision as view
+    with session_scope() as db:
+        t = task(db, world, status="needs_input")
+        asked = Decision(workspace_id=world[0], outcome_id=world[2], task_id=t.id, kind="question", title="Which?",
+                         options=[{"value": "answer", "label": "Answer"}])
+        db.add(asked)
+        db.flush()
+        asked_id, task_id = asked.id, t.id
+    [finding] = findings(world, "stuck_task")
+    assert finding.about == asked_id
+    with session_scope() as db:  # an item the Supervisor raised for it before
+        db.add(Decision(workspace_id=world[0], task_id=task_id, kind="supervisor", title="T0: task is stuck",
+                        options=[{"value": "acknowledge"}, {"value": "dismiss"}],
+                        metadata_json={"fingerprint": finding.fingerprint}))
+    sweep(world[0], NOW)
+    with session_scope() as db:
+        assert [d.status for d in db.query(Decision).filter_by(kind="supervisor")] == ["superseded"]
+        d = db.get(Decision, asked_id)
+        assert d.status == "open" and d.metadata_json["stuck"] == {
+            "since": "2026-11-10T06:00:00+00:00", "status": "needs_input", "flagged_at": "2026-11-11T12:00:00+00:00"}
+        assert view(d)["stuck"]["since"] == "2026-11-10T06:00:00+00:00"
+    sweep(world[0], NOW + timedelta(minutes=30))
+    with session_scope() as db:  # one finding, one note: nothing new is raised while the decision waits
+        assert db.query(Decision).filter_by(kind="supervisor").count() == 1
+        assert db.get(Decision, asked_id).metadata_json["stuck"]["flagged_at"] == "2026-11-11T12:00:00+00:00"
+        db.get(Decision, asked_id).status = "resolved"
+    sweep(world[0], NOW + timedelta(minutes=60))
+    with session_scope() as db:  # with no decision to answer, it is raised as before
+        assert db.query(Decision).filter_by(kind="supervisor", status="open").count() == 1

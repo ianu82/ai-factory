@@ -35,7 +35,8 @@ from ..pipeline.handover import NOT_TAKEABLE, HandoverError, mark_handed_over
 from ..pipeline.planning import adopt_plan
 from ..security import redact
 from ..serializers import actionable
-from ..work_services import cancel_outcome, cancel_task, create_outcome, finish, publish_changes, send_guidance, target
+from ..work_services import (cancel_outcome, cancel_task, create_outcome, finish, publish_changes, send_guidance,
+                             target, task_dependents)
 from .routing import PrivateRoute
 from .tools import (OUTCOME_REF, TASK_REF, Context, ReadTool, citation, clean, current, resolve_refs,
                     validate_arguments)
@@ -422,14 +423,39 @@ def check_open_task(context, ask):
     return Target(outcome, task, labels=refs(outcome, task), state=identity(outcome, task))
 
 
+def check_task_cancel(context, ask):
+    """A task to stop, and the tasks waiting for it (work_services.task_dependents): the card names them and says
+    whether they are dropped too or kept to ask what to do. A change in who waits is a changed target."""
+    checked = check_open_task(context, ask)
+    waiting = [f"{w.key} {w.title}" for w in task_dependents(context.db, checked.task)]
+    choice = ask.params.get("dependents") or "keep"
+    if choice not in ("keep", "drop"):
+        raise HTTPException(422, "dependents is keep or drop")
+    checked.params = {"dependents": choice}
+    checked.labels = {**checked.labels, "dependents": waiting}
+    if waiting:  # with none, the state is what a card proposed before dependents were shown
+        checked.state = {**checked.state, "dependents": waiting}
+    return checked
+
+
 def task_cancel_effect(labels, action):
     closing = f", and closes {labels['pr']}" if labels.get("pr") else ""
-    return f"Stop task {labels.get('task', '')} “{labels.get('task_title', '')}”: the Factory cancels it and stops its job{closing}."
+    effect = (f"Stop task {labels.get('task', '')} “{labels.get('task_title', '')}”: the Factory cancels it and stops "
+              f"its job{closing}.")
+    waiting = labels.get("dependents") or []
+    if waiting:
+        which = "; ".join(waiting)
+        if ((action.snapshot or {}).get("params") or {}).get("dependents") == "drop":
+            effect += f" The tasks that wait for it are dropped too: {which}."
+        else:
+            effect += f" The tasks that wait for it are kept, and will ask what to do: {which}."
+    return effect
 
 
 def run_task_cancel(context, action, t, user, payloads, later):
-    payload, steps = cancel_task(context.db, user, action.workspace_id, action.task_id, action_id=action.id)
-    payloads.append(payload)
+    events, steps = cancel_task(context.db, user, action.workspace_id, action.task_id,
+                                dependents=t.params.get("dependents", "keep"), action_id=action.id)
+    payloads.extend(events)
     later.extend(steps)
     return {"ok": True}
 
@@ -519,9 +545,13 @@ KINDS: dict[str, Kind] = {
         {"outcome_id": OUTCOME_REF}, ("outcome_id",), "none", no_params, check_outcome_cancel, lambda args, t: {},
         outcome_cancel_effect, work_object, run_outcome_cancel),
     "cancel_task": Kind(
-        "Propose stopping one task: it is cancelled, its job stops and its pull request is closed." + NO_EXECUTION,
-        {"outcome_id": OUTCOME_REF, "task_id": TASK_REF}, ("outcome_id", "task_id"), "none", no_params, check_open_task,
-        lambda args, t: {}, task_cancel_effect, work_object, run_task_cancel),
+        "Propose stopping one task: it is cancelled, its job stops and its pull request is closed. The card lists the "
+        "tasks that wait for it; dependents says what happens to them: keep (the default: they stay, and the "
+        "Factory asks the person what to do with them) or drop (they are cancelled too). Ask the person which they "
+        "want when tasks wait for it." + NO_EXECUTION,
+        {"outcome_id": OUTCOME_REF, "task_id": TASK_REF, "dependents": {"type": "string", "enum": ["keep", "drop"]}},
+        ("outcome_id", "task_id"), "none", lambda args: {"dependents": args.get("dependents") or "keep"},
+        check_task_cancel, lambda args, t: {}, task_cancel_effect, work_object, run_task_cancel),
     "take_over_task": Kind(
         "Propose handing a task over to the person: the Factory stops working on it; its latest candidate is "
         "pushed and opened as a draft pull request when it has none." + NO_EXECUTION,

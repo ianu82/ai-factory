@@ -5,6 +5,7 @@ import { api, type Decision } from "../api";
 import { useWs } from "../App";
 import { mergeFactRows, withoutFacts } from "../decisionFacts";
 import { ago, DECISION_KIND } from "../format";
+import { stuckLine, waiting } from "../inboxGroups";
 import { Prose, useToast } from "../ui";
 
 const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
@@ -55,6 +56,12 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
     <article ref={card} id={`decision-${d.id}`} tabIndex={-1} className={`decide ${focused ? "focused" : ""}`} aria-label={d.title}>
       <span className="kind-tag">{DECISION_KIND[d.kind] || d.kind} · {ago(d.created_at)}</span>
       <h4>{d.title}</h4>
+      {d.status === "open" && d.overdue && (
+        <p style={{ margin: "0 0 8px", color: "var(--bad)" }} title={d.overdue.title}>
+          {waiting(d.waited_minutes ?? 0)}
+        </p>
+      )}
+      {d.status === "open" && d.stuck && <p className="muted" style={{ margin: "0 0 8px" }}>{stuckLine(d.stuck)}</p>}
       {d.hold && <p className="muted" style={{ margin: "0 0 8px" }}><b>Cause:</b> {d.hold.label}{d.hold.source ? ` (${d.hold.source})` : ""}. {d.hold.advice}</p>}
       {showContext && d.outcome_number != null && (
         <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
