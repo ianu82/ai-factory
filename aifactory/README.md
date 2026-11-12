@@ -55,6 +55,32 @@ billing, quota or its credential (`pipeline/holds.py`). An overload or a rate li
 it is retried. While a hold is open, every page shows a banner with its cause, what lifts it and
 **Resume work**.
 
+## Supervisor
+
+The workspace `supervisor` setting defaults to `mode: observe`: deterministic,
+workspace-scoped checks surface findings in the Inbox without changing delivery
+rows. `off` disables checks. `fix` additionally permits only these local actions:
+
+- Requeue a stale running task with an expired lease and no live orchestrator job,
+  once per task budget epoch. A still-queued or repeatedly expired task is surfaced
+  rather than retried indefinitely.
+- Link an orphan post-merge smoke failure to an unambiguous merged task in the same
+  repository and open an unblock decision. This never opens or merges a revert.
+- Resolve stale default-branch CI signals for removed repositories or a proven
+  newer recovery in the same workflow.
+- Relay failed review findings into task-scoped Factory guidance once per review
+  attempt. Eligible failed/blocked tasks resume at `revise` within the existing
+  `auto_retry_rounds` and monetary budget; otherwise a person is notified.
+
+Fixes recheck live state and policy under database locks, commit their audit events
+with `actor: supervisor`, and wake scheduling only after commit. They do not accept
+issues, bypass approvals, grant money, or perform merges, reverts or releases.
+Push protection must persist across two sweeps before notifying a person, and is
+never retried automatically. Acknowledged/dismissed incidents remain quiet until
+material evidence changes; ordinary heartbeat timestamps are not new incidents.
+Supervisor fixes count as assisted delivery in autonomy metrics; observation and
+acknowledgement alone do not.
+
 ## Product surfaces
 
 - **Inbox** — decisions that need a person (plan approval, questions, merge/release approval,

@@ -164,6 +164,7 @@ def test_outcome_is_planned_built_verified_merged_and_smoke_tested(factory):
         assert task.status == "completed" and task.merge_sha and task.pr_number == 1
         assert task.evidence["smoke"]["state"] == "passed"
         assert task.evidence["ci"]["state"] == "success"
+        assert task.evidence["merge"]["ci"]["state"] == "success"
         # The outcome's Lead may also run (tests/test_lead.py covers it); the pipeline's own roles are these.
         assert {r.role for r in runs if r.role != "lead"} == {"planner", "plan_reviewer", "builder", "verifier"}
         assert all(r.input_tokens > 0 for r in runs if r.role != "lead")  # the Lead is covered in test_lead.py

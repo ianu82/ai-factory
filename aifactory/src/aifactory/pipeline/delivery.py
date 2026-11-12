@@ -3138,7 +3138,8 @@ class TaskRunner:
         if refresh_onto:
             await self._refresh_onto_main(token, gh, refresh_onto)
             return
-        self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "at": utcnow().isoformat()})
+        self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "at": utcnow().isoformat(),
+                                "ci": dict((self.task.evidence or {}).get("ci") or {})})
         self.event("merged", f"Merged PR #{self.task.pr_number} ({self.task.merge_sha[:8]})", level="success")
         await self.smoke()
 
