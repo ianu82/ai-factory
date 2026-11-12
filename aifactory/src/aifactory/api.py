@@ -265,6 +265,9 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     if task_usd is not None and (type(task_usd) not in (int, float) or not math.isfinite(task_usd)
                                  or not 0 <= task_usd <= 1000):
         raise HTTPException(422, "budgets.task_usd must be a number from 0 to 1000 (0: no limit)")
+    cap = merged["limits"].get("open_outcomes")
+    if cap is not None and (type(cap) is not int or not 0 <= cap <= 1000):
+        raise HTTPException(422, "limits.open_outcomes must be a whole number from 0 to 1000 (0: no limit)")
     for role in ("builder", "verifier", "planner"):
         if merged["harness"].get(role) not in ("native", "codex", "anton"):
             merged["harness"][role] = "native"

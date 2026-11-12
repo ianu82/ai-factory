@@ -134,6 +134,21 @@ def test_an_active_outcome_with_no_activity_is_quiet_only_when_nothing_runs(worl
     assert live(world) == {}  # the hold is what to answer, not each outcome it stopped
 
 
+def test_an_outcome_waiting_for_capacity_is_neither_stalled_nor_quiet(world):
+    reason = "10 outcomes are open in this workspace (limit 10). This one is planned when one finishes."
+    with db.session_scope() as s:
+        waiting = Outcome(workspace_id=world["ws"], number=8, title="Export", status="planning", blocked_reason=reason)
+        s.add(waiting)
+        s.flush()
+        s.add(Event(workspace_id=world["ws"], outcome_id=waiting.id, kind="waiting_for_capacity", message=reason,
+                    created_at=now() - timedelta(days=2)))
+        waiting_id = waiting.id
+    for later in (timedelta(0), watch.GRACE + timedelta(hours=3)):
+        watch.run(now() + later)
+        assert live(world) == {}
+    with db.session_scope() as s:
+        assert s.query(Event).filter(Event.outcome_id == waiting_id, Event.kind == "lead_watch").count() == 0
+
 def test_the_same_failure_across_outcomes_is_one_alert(world, client):
     with db.session_scope() as s:
         other = Outcome(workspace_id=world["ws"], number=8, title="Other", status="running")

@@ -1,6 +1,7 @@
 """The orchestrator: schedules planning and task delivery with bounded concurrency.
 
-- Outcomes in ``planning`` get one planner.
+- Outcomes in ``planning`` get one planner. A new outcome is first planned only while fewer than the workspace's
+  ``limits.open_outcomes`` are open, unless it repairs the line or is urgent.
 - Tasks become ``queued`` once their dependencies are complete; queued tasks start while the
   workspace (and the server) has free slots. Independent tasks run in parallel.
 - Merges into the same repository are serialized; everything else overlaps.
@@ -19,13 +20,13 @@ from .. import merge_manager
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..models import Decision, Outcome, Task, User, Workspace
+from ..models import Decision, Event, Outcome, Plan, Run, Signal, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
 from .holds import held_workspaces
 from .lifecycle import ACCEPTING, ENDED, ENDED_AS, accepted_after_merge, complete_accepted, stranded, transition
-from .planning import plan_outcome
+from .planning import ACTIVE_OUTCOME, plan_outcome
 from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
 from .scheduling import Candidate, RequesterTurns
 
@@ -53,6 +54,33 @@ STRANDED_OPTIONS = [{"value": "continue", "label": "Start the waiting tasks"},
 # a lease that ran out belongs to nobody and any instance may requeue the task.
 LEASE_SECONDS = 90
 HEARTBEAT_SECONDS = LEASE_SECONDS / 3
+# Work that repairs the line is never held by the cap on open outcomes (limits.open_outcomes): outcomes from a red
+# main branch, the steward or a failed smoke run. Nor is work more urgent than Normal (priority 2).
+REPAIR_SOURCES = merge_manager.REPAIR_SOURCES | {"smoke_failure"}
+NORMAL_PRIORITY = 2
+WAIT_TAIL = "This one is planned when one finishes."
+ADMITTED = "outcome_admitted"  # the event that holds a new outcome's place under the cap (Orchestrator._admit)
+
+
+def _planned():
+    """SQL: the outcome has been planned (a plan), is being planned (a planning session) or holds a place under
+    the cap. Any of these makes an outcome in ``planning`` count as open."""
+    from sqlalchemy import exists, or_
+
+    return or_(exists().where(Plan.outcome_id == Outcome.id),
+               exists().where(Run.outcome_id == Outcome.id, Run.task_id.is_(None),
+                              Run.role.in_(("planner", "plan_reviewer"))),
+               exists().where(Event.outcome_id == Outcome.id, Event.kind == ADMITTED))
+
+
+def open_cap(settings: dict[str, Any]) -> int | None:
+    cap = (settings.get("limits") or {}).get("open_outcomes")
+    return cap if type(cap) is int and cap > 0 else None
+
+
+def waiting_reason(count: int, cap: int) -> str:
+    are = "outcome is" if count == 1 else "outcomes are"
+    return f"{count} {are} open in this workspace (limit {cap}). {WAIT_TAIL}"
 
 
 class Orchestrator:
@@ -837,12 +865,32 @@ class Orchestrator:
             # The model provider refused these workspaces: nothing starts there until a person resumes the hold.
             on_hold = held_workspaces(s)
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
-            planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
-                        for o in s.query(Outcome).filter(Outcome.source != "review", Outcome.status == "planning")]
+            caps = {wid: open_cap(ws_settings) for wid, ws_settings in limits.items()}
+            # An outcome is open from its first planning until it ends. One query for every active outcome: whether
+            # it was ever planned (a plan, or a planning session) and the signal it came from.
+            planned = _planned().label("planned")
+            open_by_ws: dict[str, int] = {}
+            fresh: dict[str, tuple[str, str]] = {}  # never planned: id -> (workspace, blocked_reason)
+            capped: set[str] = set()  # the fresh outcomes the cap applies to
+            planning = []
+            for o, was_planned, signal_source in (
+                    s.query(Outcome, planned, Signal.source).outerjoin(Signal, Signal.id == Outcome.signal_id)
+                    .filter(Outcome.source != "review", Outcome.status.in_(ACTIVE_OUTCOME))):
+                first = o.status == "planning" and not was_planned and o.id not in self._planning
+                if not first:
+                    open_by_ws[o.workspace_id] = open_by_ws.get(o.workspace_id, 0) + 1
+                if o.status != "planning":
+                    continue
+                planning.append(Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at))
+                if first:
+                    fresh[o.id] = (o.workspace_id, o.blocked_reason or "")
+                    if o.priority >= NORMAL_PRIORITY and not {o.source, signal_source} & REPAIR_SOURCES:
+                        capped.add(o.id)
             queued = [Candidate(t.id, t.workspace_id, o.priority, o.created_by, t.created_at,
                                 0 if t.started_at is not None or t.stage or t.attempt > 0 else 1,
                                 ci_continuation=bool((t.evidence or {}).get("ci_wait"))
-                                and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"})
+                                and t.stage in {"merge", "ci_repair", "ci_refresh", "revert_merge"},
+                                outcome_created_at=o.created_at)
                       for t, o in s.query(Task, Outcome).join(Outcome, Task.outcome_id == Outcome.id)
                       .filter(Outcome.source != "review", Task.status == "queued")
                       # A task requeued after an infrastructure failure waits out its backoff.
@@ -857,12 +905,28 @@ class Orchestrator:
             for task in s.query(Task).filter(Task.id.in_(list(self._tasks))):
                 running_by_ws[task.workspace_id] = running_by_ws.get(task.workspace_id, 0) + 1
 
-        def dispatch(candidates, active, counts, global_limit, limit_key, turns, spawn):
+        def at_cap(workspace_id: str) -> bool:
+            cap = caps.get(workspace_id)
+            return cap is not None and open_by_ws.get(workspace_id, 0) >= cap
+
+        def spawn_plan(outcome_id: str) -> None:
+            workspace_id = fresh[outcome_id][0] if outcome_id in fresh else None
+            cap = caps.get(workspace_id) if outcome_id in capped else None
+            if cap is not None and not self._admit(outcome_id, workspace_id, cap):
+                # Another instance gave the last place away since this tick counted: this outcome waits too.
+                open_by_ws[workspace_id] = max(open_by_ws.get(workspace_id, 0), cap)
+                return
+            self._spawn_plan(outcome_id)
+            if workspace_id is not None:  # open from now on
+                open_by_ws[workspace_id] = open_by_ws.get(workspace_id, 0) + 1
+
+        def dispatch(candidates, active, counts, global_limit, limit_key, turns, spawn, hold=lambda c: False):
             while len(active) < global_limit:
                 eligible = [c for c in candidates if c.id not in active
                             and c.workspace_id in workspaces and not workspaces[c.workspace_id].paused
                             and c.workspace_id not in on_hold
-                            and counts.get(c.workspace_id, 0) < limits[c.workspace_id][limit_key]]
+                            and counts.get(c.workspace_id, 0) < limits[c.workspace_id][limit_key]
+                            and not hold(c)]
                 if not eligible:
                     break
                 candidate = turns.choose(eligible)
@@ -872,9 +936,58 @@ class Orchestrator:
                 candidates.remove(candidate)
 
         dispatch(planning, self._planning, planning_by_ws, settings.global_planning_concurrency,
-                 "planning_concurrency", self._planning_turns, self._spawn_plan)
+                 "planning_concurrency", self._planning_turns, spawn_plan,
+                 hold=lambda c: c.id in capped and at_cap(c.workspace_id))
+        waiting = {oid: waiting_reason(open_by_ws[ws], caps[ws]) for oid, (ws, _) in fresh.items()
+                   if oid in capped and oid not in self._planning and at_cap(ws)}
+        changed = {oid: reason for oid, reason in waiting.items() if reason != fresh[oid][1]}
+        cleared = [oid for oid, (_, reason) in fresh.items() if oid not in waiting and reason.endswith(WAIT_TAIL)]
+        if changed or cleared:
+            self._show_waiting(changed, cleared)
         dispatch(queued, self._tasks, running_by_ws, settings.global_concurrency,
                  "concurrency", self._delivery_turns, self._spawn_task)
+
+    @staticmethod
+    def _admit(outcome_id: str, workspace_id: str, cap: int) -> bool:
+        """Take one of the workspace's places under the cap for a new outcome. The open outcomes are counted and the
+        place is recorded in one transaction under the workspace's lock, so two instances at work at once (a
+        deploy) cannot both give the last place away. The place is the outcome's ADMITTED event: from then on the
+        outcome counts as open for every instance, before its planning session exists."""
+        from sqlalchemy import func, or_
+
+        from ..onboarding_policy import lock_workspace
+
+        with session_scope() as s:
+            lock_workspace(s, workspace_id)
+            taken = s.query(func.count(Outcome.id)).filter(
+                Outcome.workspace_id == workspace_id, Outcome.source != "review", Outcome.id != outcome_id,
+                Outcome.status.in_(ACTIVE_OUTCOME), or_(Outcome.status != "planning", _planned())).scalar() or 0
+            if taken >= cap:
+                return False
+            record(workspace_id, ADMITTED, f"Planning may start: {taken + 1} of {cap} open outcomes",
+                   outcome_id=outcome_id, session=s)
+        return True
+
+    @staticmethod
+    def _show_waiting(waiting: dict[str, str], cleared: list[str]) -> None:
+        """Say on each outcome the cap holds why it waits (one event per wait), and clear that once it may start."""
+        touched: list[tuple[str, str]] = []
+        with session_scope() as s:
+            for oid, reason in waiting.items():
+                outcome = s.get(Outcome, oid)
+                if outcome is None or outcome.status != "planning":
+                    continue
+                if not (outcome.blocked_reason or "").endswith(WAIT_TAIL):
+                    record(outcome.workspace_id, "waiting_for_capacity", reason, outcome_id=oid, session=s)
+                outcome.blocked_reason = reason
+                touched.append((outcome.workspace_id, oid))
+            for oid in cleared:
+                outcome = s.get(Outcome, oid)
+                if outcome is not None and (outcome.blocked_reason or "").endswith(WAIT_TAIL):
+                    outcome.blocked_reason = ""
+                    touched.append((outcome.workspace_id, oid))
+        for workspace_id, oid in touched:
+            notify(workspace_id, "outcome", oid)
 
     def _schedule_ci(self) -> None:
         # A done callback (not only coroutine finally) handles cancellation before

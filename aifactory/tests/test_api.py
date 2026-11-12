@@ -132,6 +132,17 @@ def test_planning_settings_default_and_normalization(client, signed_in, value, e
     assert saved["concurrency"] == 3
 
 
+@pytest.mark.parametrize("value,status", [(25, 200), (0, 200), (None, 200), (-1, 422), (1001, 422), ("10", 422),
+                                          (2.5, 422), (True, 422)])
+def test_open_outcomes_limit_default_and_validation(client, signed_in, value, status):
+    ws = signed_in["workspaces"][0]
+    assert ws["settings"]["limits"]["open_outcomes"] == 10
+    response = client.patch(f"/api/workspaces/{ws['id']}", json={"settings": {"limits": {"open_outcomes": value}}})
+    assert response.status_code == status, response.text
+    saved = client.get("/api/me").json()["workspaces"][0]["settings"]["limits"]
+    assert saved["open_outcomes"] == (value if status == 200 else 10)
+    assert saved["builder_turns"] == 120  # the other limits keep their defaults
+
 def test_gateway_pins_model_enforces_budget_and_records_usage(client, signed_in, monkeypatch):
     ws_id = signed_in["workspaces"][0]["id"]
     with session_scope() as s:

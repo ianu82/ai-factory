@@ -10,7 +10,8 @@ import pytest
 
 from aifactory.config import get_settings, reset_settings_cache
 from aifactory.db import session_scope
-from aifactory.models import Decision, Organization, Outcome, Plan, Repository, Task, User, Workspace
+from aifactory.models import (Decision, Event, Organization, Outcome, Plan, Repository, Run, Signal, Task, User,
+                               Workspace)
 from aifactory.pipeline import orchestrator as module
 from aifactory.pipeline.orchestrator import Orchestrator
 from aifactory.pipeline.runtime import merged_settings
@@ -460,5 +461,257 @@ def test_a_job_whose_task_another_instance_took_leaves_it_alone(queue, monkeypat
         finally:
             await jobs.stop()
         assert lease(task_id) == ("running", "other", expires)
+
+    asyncio.run(go())
+
+
+def opened(count, *, ws="w1", **fields):
+    """Outcomes already planned and running: they count toward the workspace's cap on open outcomes."""
+    ids = []
+    with session_scope() as s:
+        for _ in range(count):
+            n = s.query(Outcome).filter(Outcome.id.like("open%")).count()
+            oid = f"open{n:03}"
+            s.add(Outcome(id=oid, workspace_id=ws, number=900 + n, title=oid, status="running", **fields))
+            s.flush()
+            ids.append(oid)
+    return ids
+
+
+def cap(ws, value, **settings):
+    with session_scope() as s:
+        s.get(Workspace, ws).settings = {"limits": {"open_outcomes": value}, **settings}
+
+
+def waits(oid):
+    with session_scope() as s:
+        return s.get(Outcome, oid).blocked_reason, [e.message for e in s.query(Event).filter(
+            Event.outcome_id == oid, Event.kind == "waiting_for_capacity").order_by(Event.id)]
+
+
+def test_at_the_cap_a_new_outcome_waits_unplanned_says_so_once_and_is_planned_when_one_ends(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 2)
+    running = opened(2)
+    new = queue()
+    elsewhere = queue(ws="w2")  # another workspace has its own count
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            await jobs.tick()
+            assert jobs.started == [elsewhere]
+            reason = "2 outcomes are open in this workspace (limit 2). This one is planned when one finishes."
+            assert waits(new) == (reason, [reason])
+            opened(1)
+            await jobs.tick()  # the sentence follows the count; the wait is still one event
+            assert waits(new) == (reason.replace("2 outcomes", "3 outcomes"), [reason])
+            with session_scope() as s:
+                for oid in running:
+                    s.get(Outcome, oid).status = "completed"
+            await jobs.tick()
+            assert jobs.started == [elsewhere, new]
+            assert waits(new) == ("", [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_a_place_under_the_cap_is_taken_in_the_database_so_two_instances_cannot_give_the_last_one_twice(
+        queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 2)
+    opened(1)
+    first, second = queue(), queue()
+    # Another instance, which counted one open outcome as this one would, admits both in turn: the count and the
+    # place are one transaction, so the second finds the last place gone.
+    assert Orchestrator._admit(first, "w1", 2) is True
+    assert Orchestrator._admit(second, "w1", 2) is False
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            await jobs.tick()
+            assert jobs.started == [first]  # it holds its place, whichever instance plans it
+            reason = "2 outcomes are open in this workspace (limit 2). This one is planned when one finishes."
+            assert waits(second) == (reason, [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_an_outcome_that_loses_the_last_place_to_another_instance_waits_like_the_others(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 2)
+    opened(1)
+    new = queue()
+    # This tick counts one open outcome; by the time it asks for the place, another instance has taken it.
+    monkeypatch.setattr(Orchestrator, "_admit", staticmethod(lambda outcome_id, workspace_id, cap: False))
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            await jobs.tick()
+            assert jobs.started == []
+            reason = "2 outcomes are open in this workspace (limit 2). This one is planned when one finishes."
+            assert waits(new) == (reason, [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_outcomes_started_in_one_tick_count_toward_the_cap(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 2, planning_concurrency=4)
+    opened(1)
+    first, second, third = queue(), queue(), queue()
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [first]
+            reason = "2 outcomes are open in this workspace (limit 2). This one is planned when one finishes."
+            assert waits(second) == waits(third) == (reason, [reason])
+            await jobs.complete(first)  # planned: still open, so nothing more starts
+            await jobs.tick()
+            assert jobs.started == [first]
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_a_replan_or_a_first_plan_already_under_way_is_never_held(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 1, planning_concurrency=4)
+    opened(1)
+    replan, resumed, new = queue(), queue(), queue()
+    with session_scope() as s:
+        s.add(Plan(id=replan, outcome_id=replan, status="rejected"))
+        # A restart cut its first planning short: it has a planning session, so it is open already.
+        s.add(Run(workspace_id="w1", outcome_id=resumed, role="planner", harness="native", status="interrupted"))
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [replan, resumed]
+            assert waits(replan) == waits(resumed) == ("", [])
+            reason = "3 outcomes are open in this workspace (limit 1). This one is planned when one finishes."
+            assert waits(new) == (reason, [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_repairs_and_urgent_outcomes_are_never_held(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 10)
+    cap("w1", 1, planning_concurrency=10)
+    opened(1)
+    urgent, high, normal, low = queue(priority=0), queue(priority=1), queue(priority=2), queue(priority=3)
+    repairs = {kind: queue() for kind in ("ci_failure", "smoke_failure", "steward")}  # a red main, smoke, steward
+    steward = queue()
+    with session_scope() as s:
+        for kind, oid in repairs.items():
+            s.add(Signal(id=f"sig-{kind}", workspace_id="w1", source=kind, fingerprint=kind, title=kind))
+            outcome = s.get(Outcome, oid)
+            outcome.source, outcome.signal_id = "signal", f"sig-{kind}"
+        s.get(Outcome, steward).source = "steward"
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert set(jobs.started) == {urgent, high, steward, *repairs.values()}
+            reason = "7 outcomes are open in this workspace (limit 1). This one is planned when one finishes."
+            assert waits(normal) == waits(low) == (reason, [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("value", [0, None])
+def test_a_cap_of_zero_or_none_is_no_cap(queue, monkeypatch, value):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", value)
+    opened(20)
+    new = queue()
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [new] and waits(new) == ("", [])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_review_outcomes_do_not_count_toward_the_cap(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 1)
+    opened(3, source="review")
+    new = queue()
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            assert jobs.started == [new]
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def outcome_age(task_id, seconds):
+    with session_scope() as s:
+        s.get(Outcome, s.get(Task, task_id).outcome_id).created_at = datetime(2025, 1, 1) + timedelta(seconds=seconds)
+
+
+def test_the_oldest_outcomes_task_goes_first_even_when_the_task_is_newer(queue, monkeypatch):
+    set_limit(monkeypatch, "delivery", 1)
+    young = queue("delivery", age=0)
+    old = queue("delivery", age=50)
+    outcome_age(old, -1000)
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            for task_id in [old, young]:
+                await jobs.tick()
+                assert jobs.started[-1] == task_id
+                await jobs.complete(task_id)
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_a_resumption_still_precedes_new_work_from_an_older_outcome(queue, monkeypatch):
+    set_limit(monkeypatch, "delivery", 1)
+    fresh = queue("delivery", age=0)
+    outcome_age(fresh, -1000)
+    resumed = queue("delivery", age=50, started=True)
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            for task_id in [resumed, fresh]:
+                await jobs.tick()
+                assert jobs.started[-1] == task_id
+                await jobs.complete(task_id)
+        finally:
+            await jobs.stop()
 
     asyncio.run(go())

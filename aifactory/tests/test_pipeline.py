@@ -1684,6 +1684,31 @@ def test_a_rail_added_in_the_repositorys_settings_while_a_candidate_waits_is_rea
     assert delivery._rails_touched(runner.task)["paths"] == ["greet.sh"]
 
 
+def test_an_approval_the_director_gave_does_not_carry_a_change_onto_the_rails(factory):
+    from aifactory.db import utcnow
+    from aifactory.pipeline import director
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {**ws.settings["autonomy"], "merge": "approval"}}
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    with session_scope() as s:  # the Director approves the ordinary merge; then the file it changes becomes a rail
+        decision = s.get(Decision, _open_decision(outcome_id, "approve_merge"))
+        decision.status, decision.resolution = "resolved", "approve"
+        decision.resolved_by, decision.resolved_at = director.director_user(s).id, utcnow()
+        decision_id, task_id = decision.id, s.query(Task).filter(Task.outcome_id == outcome_id).one().id
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "rails": ["greet.sh"]}
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    assert runner._approved("approve_merge") is True  # nothing says yet that this candidate touches a rail
+    asyncio.run(runner._check_rails("token"))
+    assert runner._approved("approve_merge") is False  # on the rails only a person's approval counts
+    with session_scope() as s:
+        s.get(Decision, decision_id).resolved_by = factory["user"]
+    assert runner._approved("approve_merge") is True
+
+
 def test_the_rails_are_read_at_the_base_commit_so_a_candidate_cannot_remove_its_own(factory):
     from aifactory.models import Plan
 

@@ -2961,6 +2961,14 @@ class TaskRunner:
                                             Decision.status == "resolved").order_by(Decision.resolved_at.desc()).first())
             if not (row and row.resolution == "approve" and row.resolved_at):
                 return False
+            if kind == "approve_merge" and _rails_touched(self.task):
+                # On the rails only a person's approval counts: one the Director gave, or one from before the
+                # change was known to touch a rail, does not carry it in.
+                from ..models import User
+
+                by = s.get(User, row.resolved_by) if row.resolved_by else None
+                if by is None or by.is_system:
+                    return False
             given = row.resolved_at
         evidence = self.task.evidence or {}
         published, approved = evidence.get("published") or {}, evidence.get("approved") or {}

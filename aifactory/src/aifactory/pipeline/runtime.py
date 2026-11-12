@@ -56,7 +56,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
                "task_attempts_total": 12,  # charged attempts over a task's whole life; 0 or None: no limit
                "run_minutes": 60,
-               "ci_minutes": 45, "max_changed_lines": 1500},
+               "ci_minutes": 45, "max_changed_lines": 1500,
+               # Outcomes planned and not yet ended; a new one waits unplanned at this many (0 or None: no cap).
+               "open_outcomes": 10},
     "reasoning_effort": "medium",
     # Per person per UTC day across all their workspaces, the lowest of their workspaces' limits (mind/store.py).
     "mind": {"daily_budget_usd": 10.0},
