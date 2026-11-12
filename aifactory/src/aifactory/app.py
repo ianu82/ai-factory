@@ -20,6 +20,8 @@ from .config import get_settings
 from .db import init_engine
 from .gateway import router as gateway_router
 from .merge_manager import router as merge_queue_router
+from .coordination import router as coordination_router
+from .rulings import router as rulings_router
 from .mind.api import router as mind_router
 from .mind.runtime import EngineRuntime
 from .onboarding import router as onboarding_router
@@ -60,6 +62,8 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
             return JSONResponse({"detail": "Invalid credential request"}, status_code=422)
         if request.url.path.startswith("/api/workspaces/") and request.url.path.endswith("/linear"):
             return JSONResponse({"detail": "Invalid Linear configuration request"}, status_code=422)
+        if request.url.path.startswith("/api/workspaces/") and "/repositories" in request.url.path:
+            return JSONResponse({"detail": "Invalid repository request"}, status_code=422)
         return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
@@ -77,6 +81,8 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
     app.include_router(onboarding_router)
     app.include_router(pulls_router)
     app.include_router(merge_queue_router)
+    app.include_router(coordination_router)
+    app.include_router(rulings_router)
     # Mind: private threads and streams (T1) over the restricted engine (T2); confirmations (T3) come with api_router.
     app.include_router(mind_router, prefix="/api")
     app.state.mind_runtime = EngineRuntime()

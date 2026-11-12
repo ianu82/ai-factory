@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 
 import pytest
@@ -46,12 +47,29 @@ def good_builder(messages):
                                                           "tests": ["sh test.sh: passed"]})]}
 
 
+def prompt_criteria(messages):
+    """The acceptance criteria a verifier's prompt lists, in order."""
+    lines = iter(messages[1]["content"].splitlines())
+    for line in lines:
+        if line.startswith("## Acceptance criteria"):
+            break
+    listed = []
+    for line in lines:
+        numbered = re.match(r"\d+\. (.*)", line)
+        if not numbered:
+            break
+        listed.append(numbered.group(1))
+    return listed
+
+
 def passing_verifier(messages):
+    """Looks, then passes every criterion the prompt lists (a report needs a result for each of the task's)."""
     if step(messages) == 0:
         return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh && git diff --stat HEAD"})]}
     return {"content": "", "tool_calls": [call("finish", {
-        "verdict": "pass", "summary": "Greeting verified.",
-        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}], "findings": []})]}
+        "verdict": "pass", "summary": "Greeting verified.", "findings": [],
+        "criteria": [{"criterion": criterion, "status": "pass", "evidence": "sh test.sh exit 0"}
+                     for criterion in prompt_criteria(messages) or [CRITERION]]})]}
 
 
 @pytest.fixture
@@ -65,6 +83,9 @@ def factory(tmp_path, monkeypatch):
     FakeGitHub.pulls = {}
     FakeGitHub.merged = []
     FakeGitHub.check_state = "success"
+    FakeGitHub.comments, FakeGitHub.failures, FakeGitHub.reviewer = [], {}, None
+    FakeGitHub.reviews, FakeGitHub.threads, FakeGitHub.issue_comments = [], [], []
+    FakeGitHub.replies, FakeGitHub.resolved = [], []
     monkeypatch.setattr(delivery, "GitHub", FakeGitHub)
     monkeypatch.setattr(delivery, "resolve_token", lambda ws: "token")
     monkeypatch.setattr(planning, "resolve_token", lambda ws: "token")
@@ -78,6 +99,8 @@ def factory(tmp_path, monkeypatch):
         # These scenarios exercise an established operational workspace, not first-run learning.
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
         settings["limits"]["ci_minutes"] = 1
+        # No scenario waits for pull request reviews unless it turns them on (see review_on in test_ci_parking.py).
+        settings["review"]["address"] = "off"
         ws = Workspace(org_id=org.id, name="Acme", slug="acme", settings=settings)
         user = User(email="dev@acme.test", name="Dev")
         s.add_all([ws, user])
@@ -183,6 +206,105 @@ def test_failed_verification_feeds_back_and_second_attempt_passes(factory):
         results = [a["result"] for a in task.evidence["attempts"]]
         assert results == ["verification_failed", "verified"]
     assert seen_feedback, "builder never saw the verifier's feedback"
+
+
+def _reviewing(report):
+    """A verifier that looks at the change, then reports ``report``."""
+    def verifier(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh"})]}
+        return {"content": "", "tool_calls": [call("finish", report)]}
+    return verifier
+
+
+def test_a_later_review_is_given_the_previous_verdict_and_what_changed_since(factory):
+    def adds_notes(messages):  # leaves greet.sh as the first attempt wrote it
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("write_file", {"path": "notes.txt", "content": "quoting\n"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Added notes.",
+                                                              "tests": []})]}
+
+    passed = [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}]
+    # A blocker fails a change whose criteria all pass. The second review then fails the criterion it had passed.
+    first = {"verdict": "fail", "summary": "Unsafe quoting.", "criteria": passed, "findings": [
+        {"severity": "blocker", "description": "greet.sh breaks when HOME has spaces", "location": "greet.sh:1"}]}
+    second = {"verdict": "fail", "summary": "The greeting is wrong after all.", "findings": [],
+              "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "prints Hello"}]}
+    builder, _ = _in_turn(good_builder, adds_notes, good_builder)
+    verifier, reviews = _in_turn(_reviewing(first), _reviewing(second), passing_verifier)
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=120)
+    assert _task_state(outcome_id)[0] == "completed"
+    records = _attempt_records(outcome_id)
+    assert [(a["n"], a["result"]) for a in records] == [
+        (1, "verification_failed"), (2, "verification_failed"), (3, "verified")]
+    # The first review has nothing before it. The second is given the first verdict and which files changed since.
+    assert "## Your previous review" not in reviews[0]
+    for said in ("## Your previous review (attempt 1)", "Verdict: fail. Unsafe quoting.",
+                 f"- [pass] {CRITERION} — sh test.sh exit 0",
+                 "- blocker: greet.sh breaks when HOME has spaces greet.sh:1",
+                 "Files whose diff changed: notes.txt", "Files whose diff is the same as then: greet.sh"):
+        assert said in reviews[1], said
+    assert "was not recorded" not in reviews[1] and "The base commit moved" not in reviews[1]
+    # The third attempt changed nothing, and its review is told so.
+    assert "## Your previous review (attempt 2)" in reviews[2]
+    assert "No file's diff changed: the change is exactly as that review saw it." in reviews[2]
+    # A criterion that passed and then failed is recorded on the attempt and on the event.
+    assert "flipped" not in records[0] and records[1]["flipped"] == [CRITERION]
+    with session_scope() as s:
+        failed = s.query(Event).filter(Event.outcome_id == outcome_id,
+                                       Event.kind == "verification_failed").order_by(Event.id).all()
+        assert [e.data.get("flipped") for e in failed] == [None, [CRITERION]]
+
+
+def test_major_findings_on_a_passing_review_are_shown_on_the_pull_request(factory):
+    findings = [{"severity": "major", "description": "Add a regression test for an empty HOME", "location": "test.sh"},
+                {"severity": "minor", "description": "Quote the greeting consistently", "location": "greet.sh:1"}]
+    ScriptedModel.scripts["verifier"] = _reviewing({
+        "verdict": "pass", "summary": "Greeting verified.", "findings": findings,
+        "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "sh test.sh exit 0"}]})
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"  # advice does not stop the merge
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [(1, "verified")]
+    body = FakeGitHub.pulls[1]["body"]
+    assert ("### Reviewer notes\nThe independent review passed, with these points to follow up:\n"
+            "- Add a regression test for an empty HOME (`test.sh`)") in body
+    assert "Quote the greeting consistently" not in body
+
+
+def test_a_verifier_report_missing_a_criterion_is_corrected_in_the_same_session(factory):
+    second = "test.sh passes"
+
+    def planner(messages):
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [call("list_files", {})]}
+        report = json.loads(planner_script(messages)["tool_calls"][0]["function"]["arguments"])
+        report["tasks"][0]["acceptance"] = [CRITERION, second]
+        return {"content": "", "tool_calls": [call("finish", report)]}
+
+    replies = []
+
+    def verifier(messages):
+        if step(messages) == 0:
+            return passing_verifier(messages)  # looks first
+        replies[:] = [m["content"] for m in messages if m["role"] == "tool" and "Report not accepted" in m["content"]]
+        # First two results, both for the same criterion: the right number, but the second criterion has none.
+        reported = (CRITERION, second) if replies else (CRITERION, CRITERION)
+        return {"content": "", "tool_calls": [call("finish", {
+            "verdict": "pass", "summary": "Greeting verified.", "findings": [],
+            "criteria": [{"criterion": c, "status": "pass", "evidence": "sh test.sh exit 0"} for c in reported]})]}
+
+    ScriptedModel.scripts.update(planner=planner, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"))
+    assert outcome_status(outcome_id) == "completed"
+    assert len(replies) == 1 and replies[0].startswith(
+        "Report not accepted: The report has results for 1 of the task's 2 acceptance criteria (1 missing). "
+        "Not covered: 2. test.sh passes. Report on every criterion once")
+    with session_scope() as s:  # one verifier session: it corrected its report instead of failing
+        assert s.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "verifier").count() == 1
 
 
 def test_plan_approval_policy_waits_for_a_person(factory, client):
@@ -352,6 +474,34 @@ def _approve_and_finish(factory, outcome_id):
         assert finished, (task.status, task.blocked_reason, " ".join(_event_kinds(outcome_id)))
 
 
+def _approve_merge_after_main_moves(factory, move, approval="patch"):
+    """Merge needs approval; while the request waits, ``move()`` moves main; then a person approves the merge.
+    Returns (outcome, the head that was approved)."""
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {"plan": "auto", "merge": "approval", "release": "auto"},
+                       "merge": {"approval": approval}}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None)
+    move()
+    db = SessionLocal()
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]), "approve")
+    db.close()
+    with session_scope() as s:
+        return outcome_id, s.query(Task).filter(Task.outcome_id == outcome_id).one().head_sha
+
+
+def _merge_candidate(outcome_id):
+    """(status, head, evidence, how many merge approvals were asked for) of the outcome's only task."""
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        asked = s.query(Decision).filter(Decision.task_id == task.id, Decision.kind == "approve_merge").count()
+        return task.status, task.head_sha, dict(task.evidence or {}), asked
+
+
 def test_a_requested_revision_is_rebased_onto_newer_main_first(factory):
     outcome_id, main = _request_changes_after_main_moves(
         factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"))
@@ -480,6 +630,102 @@ def test_a_conflicting_revision_keeps_the_earlier_change_and_resolves_only_the_o
     bare = factory["remotes"] / "acme/demo.git"
     assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
     assert "land greet.sh" in git("log", "--format=%s", "main", cwd=bare)
+
+
+def test_a_merge_approval_covers_the_same_patch_rebased_onto_newer_main(factory):
+    from aifactory.db import utcnow
+
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"))
+    approved = _merge_candidate(outcome_id)[2]["approved"]
+    assert approved["head"] == approved_head and re.fullmatch(r"[0-9a-f]{40,64}", approved["patch_id"])
+    FakeGitHub.check_state = "pending"  # CI on the rebased head has not finished
+
+    def waiting_for_ci_on_the_rebased_head():
+        status, head, evidence, _ = _merge_candidate(outcome_id)
+        ci = evidence.get("ci") or {}
+        return (status == "waiting_ci" and head != approved_head
+                and (ci.get("head"), ci.get("state")) == (head, "pending"))
+
+    assert drive(waiting_for_ci_on_the_rebased_head, timeout=120), " ".join(_event_kinds(outcome_id))
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    # The approval went with the patch to the rebased head, said once; nothing merges before CI passes there.
+    assert FakeGitHub.merged == [] and asked == 1
+    assert evidence["approved"] == {**approved, "head": head}
+    assert (evidence["published"]["head"], evidence["published"]["patch_id"]) == (head, approved["patch_id"])
+    with session_scope() as s:
+        carried = s.query(Event).filter(Event.outcome_id == outcome_id, Event.kind == "approval_carried").one()
+        assert (carried.data["approved_head"], carried.data["head"]) == (approved_head, head)
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        task.evidence = {**task.evidence, "ci_wait": {**task.evidence["ci_wait"], "next_poll_at": utcnow().isoformat()}}
+    FakeGitHub.check_state = "success"
+    assert drive(lambda: outcome_status(outcome_id) == "completed", timeout=120), " ".join(_event_kinds(outcome_id))
+    _, merged_head, evidence, asked = _merge_candidate(outcome_id)
+    assert FakeGitHub.merged == [1] and asked == 1 and merged_head == head
+    assert (evidence["ci"]["head"], evidence["ci"]["state"]) == (head, "success")
+    with session_scope() as s:
+        events = s.query(Event).filter(Event.outcome_id == outcome_id,
+                                       Event.kind.in_(["approval_carried", "ci_status", "merged"])).order_by(Event.id)
+        story = [(e.kind, (e.data or {}).get("state")) for e in events]
+    assert story == [("ci_status", "success"), ("approval_carried", None), ("ci_status", "pending"),
+                     ("ci_status", "success"), ("merged", None)]
+    bare = factory["remotes"] / "acme/demo.git"
+    assert git("show", "main:greet.sh", cwd=bare) == "echo 'Hello, Factory!'"
+    assert git("show", "main:other.txt", cwd=bare) == "landed meanwhile"
+
+
+def test_with_merge_approval_by_head_a_rebased_candidate_is_approved_again(factory):
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"), approval="head")
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    assert FakeGitHub.merged == [] and asked == 2 and head != approved_head
+    assert "approval_carried" not in _event_kinds(outcome_id)
+    # The patch is the one that was approved: only the setting asks again.
+    assert evidence["approved"]["head"] == approved_head
+    assert evidence["approved"]["patch_id"] and evidence["approved"]["patch_id"] == evidence["published"]["patch_id"]
+    _approve_and_finish(factory, outcome_id)
+    assert FakeGitHub.merged == [1]
+
+
+def test_a_merge_approval_does_not_cover_a_patch_changed_to_resolve_a_conflict(factory):
+    outcome_id, approved_head = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "greet.sh", "echo 'Hi'\n"))
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    _, head, evidence, asked = _merge_candidate(outcome_id)
+    kinds = _event_kinds(outcome_id)
+    assert FakeGitHub.merged == [] and asked == 2 and head != approved_head
+    assert "rebuild_after_base_moved" in kinds and "approval_carried" not in kinds, " ".join(kinds)
+    # The builder settled the conflict, so what would merge is no longer the patch that was approved.
+    approved, published = evidence["approved"]["patch_id"], evidence["published"]["patch_id"]
+    assert approved and published and approved != published
+    _approve_and_finish(factory, outcome_id)
+    assert git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git") == "echo 'Hello, Factory!'"
+
+
+def test_changes_requested_after_a_merge_approval_end_it_even_for_the_same_patch(factory):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    # Approval by head asks again after the rebase, which gives the person a second request to answer.
+    outcome_id, _ = _approve_merge_after_main_moves(
+        factory, lambda: _land_on_main(factory, "other.txt", "landed meanwhile\n"), approval="head")
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    with session_scope() as s:  # from here the same patch would stay approved: only the later answer can end it
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "merge": {"approval": "patch"}}
+    db = SessionLocal()
+    resolve(db, db.get(Decision, _open_decision(outcome_id, "approve_merge")), db.get(User, factory["user"]), "reject",
+            comment="Please also keep the script POSIX-only.")
+    db.close()
+    assert drive(lambda: _open_decision(outcome_id, "approve_merge") is not None, timeout=120)
+    _, _, evidence, asked = _merge_candidate(outcome_id)
+    kinds = _event_kinds(outcome_id)
+    assert FakeGitHub.merged == [] and asked == 3 and "approval_carried" not in kinds, " ".join(kinds)
+    # The revision published the patch that was approved at first; the request for changes is what counts.
+    assert evidence["approved"]["patch_id"] and evidence["approved"]["patch_id"] == evidence["published"]["patch_id"]
+    _approve_and_finish(factory, outcome_id)
+    assert FakeGitHub.merged == [1]
 
 
 def test_a_binary_conflict_is_never_settled_silently_in_mains_favour(factory):
@@ -794,16 +1040,19 @@ def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(fact
     assert title == "T1 did not pass after 1 attempts and an automatic retry"
     with session_scope() as s:
         verdict = s.get(Task, task_id).evidence["attempts"][-1]["verdict"]
+        # The verifier passed the change; the runtime failure alone fails it, as a blocker.
+        assert verdict["verdict"] == "fail" and all(c["status"] == "pass" for c in verdict["criteria"])
+        assert [f["severity"] for f in verdict["findings"] if f.get("location") == "runtime QA"] == ["blocker"]
         assert any("Required runtime QA failed: the app did not start" in f["description"] for f in verdict["findings"])
 
 
 def test_a_runtime_qa_failure_is_recorded_even_when_the_verifier_already_failed(factory):
-    def bare_failing_verifier(messages):  # fails with all criteria passing and no findings
+    def bare_failing_verifier(messages):  # fails on its own grounds, with no findings
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("run", {"command": "true"})]}
         return {"content": "", "tool_calls": [call("finish", {
             "verdict": "fail", "summary": "Not convinced.",
-            "criteria": [{"criterion": CRITERION, "status": "pass", "evidence": "ok"}], "findings": []})]}
+            "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "not shown"}], "findings": []})]}
 
     ScriptedModel.scripts["verifier"] = bare_failing_verifier
     with session_scope() as s:
@@ -960,6 +1209,65 @@ def test_reviewer_findings_survive_a_retry(factory):
     assert "Race on credential save" in joined and "stale token" in joined and "events published before commit" in joined
 
 
+def _review_with_open_points(messages):
+    """A review that fails the criterion and raises eight findings: ten lines of feedback."""
+    if step(messages) == 0:
+        return {"content": "", "tool_calls": [call("run", {"command": "sh test.sh"})]}
+    return {"content": "", "tool_calls": [call("finish", {
+        "verdict": "fail", "summary": "Greeting is not robust.",
+        "criteria": [{"criterion": CRITERION, "status": "fail", "evidence": "breaks under set -u"}],
+        "findings": [{"severity": "blocker" if i == 0 else "major", "description": f"Open point {i}",
+                      "location": f"greet.sh:{i}"} for i in range(8)]})]}
+
+
+def test_the_builder_gets_the_whole_review_and_its_open_points_outlive_a_failed_check_and_a_restart(factory):
+    def typo_builder(messages):  # a change that fails the repository's check
+        if step(messages) == 0:
+            return {"content": "", "tool_calls": [
+                call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factry!'\n"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    builder, prompts = _in_turn(good_builder, typo_builder, _slow_builder, good_builder)
+    verifier, _ = _in_turn(_review_with_open_points, passing_verifier)
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: len(prompts) == 3, timeout=120)  # the server restarts during the third attempt
+    assert _task_state(outcome_id)[:2] == ("queued", "build")
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=120)
+    assert _task_state(outcome_id)[0] == "completed" and len(prompts) == 4
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [
+        (1, "verification_failed"), (2, "checks_failed"), (3, "verified")]
+    unmet = f"Criterion not met: {CRITERION} — breaks under set -u"
+    # After the failed review: all of it, though it is more than eight lines.
+    assert "## Feedback from the previous attempt — address every point" in prompts[1]
+    assert "- Independent review FAILED. Greeting is not robust." in prompts[1] and f"  - {unmet}" in prompts[1]
+    assert all(f"Open point {i} greet.sh:{i}" in prompts[1] for i in range(8))
+    assert "## Still open from the review" not in prompts[1]
+    # After the failed check: its failure in full, then what the review left open, under a standing heading. The
+    # third prompt was built by the runner that ran the check; the fourth after the restart, from the evidence.
+    standing = "\n".join(["## Still open from the review of attempt 1", f"- {unmet}",
+                          "- blocker: Open point 0 greet.sh:0",
+                          *[f"- major: Open point {i} greet.sh:{i}" for i in range(1, 8)]])
+    for prompt in prompts[2:]:
+        assert "`sh test.sh` failed (exit 1)" in prompt and "expected greeting, got: Hello, Factry!" in prompt
+        assert standing in prompt
+
+
+def test_the_attempt_limit_decision_shows_the_whole_of_the_latest_feedback(factory):
+    ScriptedModel.scripts["verifier"] = _review_with_open_points
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "max_attempts": 1, "auto_retry_rounds": 0}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("attention", "completed", "needs_input"))
+    with session_scope() as s:
+        body = s.get(Decision, _open_decision(outcome_id, "unblock")).body
+    assert "- Independent review FAILED. Greeting is not robust." in body
+    assert f"  - Criterion not met: {CRITERION} — breaks under set -u" in body
+    assert all(f"Open point {i} greet.sh:{i}" in body for i in range(8))
+
+
 def test_runtime_qa_boots_the_app_and_attaches_screenshots(factory):
     pytest.importorskip("playwright")
     from aifactory.models import Artifact
@@ -1029,6 +1337,112 @@ def test_merge_approval_does_not_cover_a_later_candidate(factory):
     with session_scope() as s:
         s.get(Task, task_id).evidence = {"published": {"head": "old", "at": (approved_at - timedelta(minutes=5)).isoformat()}}
     assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge") is True
+
+
+def _task_published_again_after_its_approval(factory, approved, published_patch, kind="approve_merge"):
+    """A task whose ``kind`` decision was approved and whose candidate was published again five minutes later.
+    ``approved`` goes into the record that approval left (None: it left none); ``published_patch`` is the new
+    head's patch id (None: none recorded). Returns (task id, when the approval was given)."""
+    from datetime import timedelta
+
+    from aifactory.db import utcnow
+    from aifactory.models import Plan
+
+    outcome_id, given = new_outcome(factory), utcnow()
+    evidence = {"published": {"head": "new", "at": (given + timedelta(minutes=5)).isoformat()}}
+    if published_patch is not None:
+        evidence["published"]["patch_id"] = published_patch
+    if approved is not None:
+        evidence["approved"] = {"head": "old", "at": given.isoformat(), **approved}
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key="T1", title="t",
+                    repo_id=factory["repo"], status="queued", stage="merge", evidence=evidence)
+        s.add(task)
+        s.flush()
+        s.add(Decision(workspace_id=factory["ws"], outcome_id=outcome_id, task_id=task.id, kind=kind,
+                       title="Approve", status="resolved", resolution="approve", resolved_at=given))
+        return task.id, given
+
+
+@pytest.mark.parametrize("kind,approved,published_patch,holds", [
+    ("approve_merge", {"patch_id": "a" * 40}, "a" * 40, True),  # the same patch at a later head
+    ("approve_merge", {"patch_id": "a" * 40}, "b" * 40, False),  # the patch changed
+    ("approve_merge", {"patch_id": "a" * 40}, "", False),  # the new head's patch could not be read
+    ("approve_merge", {"patch_id": ""}, "", False),  # neither could be read: nothing says they are the same
+    ("approve_merge", {"patch_id": "a" * 40, "at": "not a time"}, "a" * 40, False),
+    ("approve_merge", {"patch_id": "a" * 40, "at": "2000-01-01T00:00:00"}, "a" * 40, False),  # an older approval's
+    ("approve_merge", None, "a" * 40, False),  # approved before approvals left a record
+    ("approve_merge", None, None, False),  # approved and published before patches were recorded: as before
+    ("approve_release", {"patch_id": "a" * 40}, "a" * 40, False),  # only a merge approval carries over
+])
+def test_a_merge_approval_covers_a_later_head_only_with_the_same_patch(factory, kind, approved, published_patch,
+                                                                       holds):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    task_id, _ = _task_published_again_after_its_approval(factory, approved, published_patch, kind)
+    assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved(kind) is holds
+
+
+@pytest.mark.parametrize("workspace,repository,holds", [
+    ("patch", None, True), (None, None, True), ("head", None, False), ("anything else", None, False),
+    ("head", "patch", True), ("patch", "head", False),  # the repository's own setting wins
+])
+def test_merge_approval_setting_decides_whether_the_same_patch_stays_approved(factory, workspace, repository, holds):
+    from aifactory.pipeline.delivery import TaskRunner
+
+    with session_scope() as s:
+        ws, repo = s.get(Workspace, factory["ws"]), s.get(Repository, factory["repo"])
+        settings = {k: v for k, v in ws.settings.items() if k != "merge"}  # None: saved before the setting existed
+        ws.settings = {**settings, "merge": {"approval": workspace}} if workspace else settings
+        if repository:
+            repo.config = {**repo.config, "merge": {"approval": repository}}
+    task_id, _ = _task_published_again_after_its_approval(factory, {"patch_id": "a" * 40}, "a" * 40)
+    assert TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())._approved("approve_merge") is holds
+
+
+def test_a_later_request_for_changes_ends_a_carried_merge_approval(factory):
+    from datetime import timedelta
+
+    from aifactory.pipeline.delivery import TaskRunner
+
+    task_id, given = _task_published_again_after_its_approval(factory, {"patch_id": "a" * 40}, "a" * 40)
+    runner = TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock())
+    assert runner._approved("approve_merge") is True
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        s.add(Decision(workspace_id=task.workspace_id, outcome_id=task.outcome_id, task_id=task_id,
+                       kind="approve_merge", title="Approve", status="resolved", resolution="reject",
+                       resolved_at=given + timedelta(minutes=6)))
+    assert runner._approved("approve_merge") is False  # the latest decision is the one that counts
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_approving_a_merge_records_the_head_and_patch_that_were_approved(factory, recorded):
+    from aifactory.db import SessionLocal, utcnow
+    from aifactory.decisions import resolve
+
+    _, task_id, number = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        head = task.head_sha
+        published = {"head": head, "base": task.base_sha, "at": utcnow().isoformat(), "pr": number,
+                     "patch_id": "a" * 40}
+        if recorded:
+            task.evidence = {"published": published}
+        decision_id = s.query(Decision).filter(Decision.task_id == task_id).one().id
+    db = SessionLocal()
+    resolve(db, db.get(Decision, decision_id), db.get(User, factory["user"]), "approve")
+    db.close()
+    with session_scope() as s:
+        task, decision = s.get(Task, task_id), s.get(Decision, decision_id)
+        assert (task.status, task.stage) == ("queued", "merge")
+        # A candidate published before patches were recorded is approved all the same, with nothing to carry it by.
+        assert task.evidence["approved"] == {"head": head, "patch_id": "a" * 40 if recorded else "",
+                                             "at": decision.resolved_at.isoformat()}
+        assert task.evidence.get("published") == (published if recorded else None)
 
 
 def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
@@ -1138,6 +1552,288 @@ def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch
         priced, other = s.get(Run, ids["mindshub"]), s.get(Run, ids["builder"])
         assert (priced.cost_usd, priced.cost_known) == (1.75, True)
         assert (other.cost_usd, other.cost_known) == (0.5, False)  # only MindsHub can say what a session cost
+
+
+def leased_task(ids, **fields) -> str:
+    """A task some server was running; `fields` say who holds its lease."""
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(ids)
+    with session_scope() as s:
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        task = Task(**{"workspace_id": ids["ws"], "outcome_id": outcome_id, "plan_id": plan.id, "key": "T1",
+                       "title": "Greeting", "repo_id": ids["repo"], "status": "running", "stage": "build",
+                       "attempt": 1, **fields})
+        s.add(task)
+        s.flush()
+        return task.id
+
+
+def lease(task_id):
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        return task.status, task.lease_owner, task.lease_expires_at
+
+
+def resumed(task_id) -> int:
+    with session_scope() as s:
+        return s.query(Event).filter(Event.task_id == task_id, Event.kind == "resumed").count()
+
+
+def test_each_server_start_has_its_own_instance_id():
+    """The process id alone, the old id, is the same number on every start in a container."""
+    first, second = Orchestrator(), Orchestrator()
+    assert first.instance != second.instance
+    assert all(0 < len(orch.instance) <= 64 for orch in (first, second))  # the lease owner column's size
+    assert first.status()["instance"] == first.instance
+
+
+def test_recovery_requeues_only_the_running_tasks_nobody_holds(factory, monkeypatch, caplog):
+    """Two servers on one database: a start must not requeue what the other one is running. A lease is live while
+    its owner keeps extending it. A task with no owner, no expiry (every row from before leases had one) or an expiry
+    in the past is nobody's, and resumes."""
+    import logging
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    caplog.set_level(logging.INFO, logger=scheduler.__name__)
+    other, until = "other-host-1-abc123", clock[0] + timedelta(seconds=60)
+    unowned = leased_task(factory)
+    legacy = leased_task(factory, lease_owner="1")  # before leases: the process id as the owner, never an expiry
+    expired = leased_task(factory, lease_owner=other, lease_expires_at=clock[0] - timedelta(seconds=1))
+    held = leased_task(factory, lease_owner=other, lease_expires_at=until)
+
+    Orchestrator()._recover()
+    assert [lease(task_id) for task_id in (unowned, legacy, expired)] == [("queued", "", None)] * 3
+    assert [resumed(task_id) for task_id in (unowned, legacy, expired, held)] == [1, 1, 1, 0]
+    assert lease(held) == ("running", other, until)
+
+    # Its owner died without releasing it: no restart is needed, the scheduler looks again every heartbeat interval.
+    orch = Orchestrator()
+    orch._maybe_reclaim()
+    assert lease(held) == ("running", other, until)  # still live
+    clock[0] = until + timedelta(seconds=30)
+    orch._maybe_reclaim()  # it looked a moment ago
+    assert lease(held) == ("running", other, until)
+    monkeypatch.setattr(scheduler, "HEARTBEAT_SECONDS", 0)  # an interval later
+    orch._maybe_reclaim()
+    assert (lease(held), resumed(held)) == (("queued", "", None), 1)
+    assert f"reclaimed T1 from instance {other}: its lease ran out 30s ago" in [r.getMessage() for r in caplog.records]
+
+
+def test_a_start_leaves_open_the_sessions_of_a_task_another_instance_is_running(factory, monkeypatch):
+    """Two servers on one database, or a deploy whose old and new process overlap: the session of a task the other
+    one holds is running now. Closing it as interrupted would end its record early and mark its cost unknown. It is
+    closed when the task is reclaimed, if its owner dies without closing it."""
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(scheduler, "HEARTBEAT_SECONDS", 0)  # every look below is an interval after the last
+    other, until = "other-host-1-abc123", clock[0] + timedelta(seconds=60)
+    held = leased_task(factory, lease_owner=other, lease_expires_at=until)
+    dead = leased_task(factory, lease_owner=other, lease_expires_at=clock[0] - timedelta(seconds=1))
+
+    def session(task_id):
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            run = Run(workspace_id=task.workspace_id, outcome_id=task.outcome_id, task_id=task_id, harness="native",
+                      role="builder", started_at=clock[0] - timedelta(minutes=5))
+            s.add(run)
+            s.flush()
+            return run.id
+
+    def state(run_id):
+        with session_scope() as s:
+            run = s.get(Run, run_id)
+            return run.status, run.cost_known
+
+    live, lost = session(held), session(dead)
+    orch = Orchestrator()
+    orch._recover()
+    assert (state(live), state(lost)) == (("running", True), ("interrupted", False))
+    assert lease(held) == ("running", other, until)
+
+    orch._maybe_reclaim()  # the lease is still live
+    assert state(live) == ("running", True)
+    clock[0] = until + timedelta(seconds=1)  # its owner died without closing anything
+    # Another server claims the task the moment its requeue is committed, and starts a session before this pass ends.
+    reclaim, started = orch._reclaim, []
+
+    def reclaim_then_another_server_starts(**kwargs):
+        requeued = reclaim(**kwargs)
+        started.extend(session(task_id) for task_id in requeued)
+        return requeued
+
+    monkeypatch.setattr(orch, "_reclaim", reclaim_then_another_server_starts)
+    orch._maybe_reclaim()
+    assert (lease(held), state(live)) == (("queued", "", None), ("interrupted", False))
+    assert [state(run_id) for run_id in started] == [("running", True)]  # only what the dead owner left is closed
+    with session_scope() as s:
+        assert [e.data for e in s.query(Event).filter(Event.kind == "runs_interrupted")] == [{"runs": 1}] * 2
+
+
+def test_the_heartbeat_extends_only_the_leases_of_tasks_this_instance_is_running(factory, monkeypatch):
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    clock = [datetime(2026, 1, 1, 12)]
+    monkeypatch.setattr(scheduler, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(scheduler, "HEARTBEAT_SECONDS", 0)  # every look below is an interval after the last
+    orch, other = Orchestrator(), Orchestrator()
+    soon = clock[0] + timedelta(seconds=10)
+    mine = leased_task(factory, lease_owner=orch.instance, lease_expires_at=soon)
+    theirs = leased_task(factory, lease_owner=other.instance, lease_expires_at=soon)
+    ended = leased_task(factory, status="completed", stage="done", lease_owner=orch.instance, lease_expires_at=soon)
+    stray = leased_task(factory, lease_owner=orch.instance, lease_expires_at=soon)  # no job of this instance runs it
+    orch._tasks = {task_id: (None, None) for task_id in (mine, ended)}  # the jobs it has
+    with session_scope() as s:
+        changed = s.get(Task, mine).updated_at
+
+    orch._heartbeat()
+    extended = clock[0] + timedelta(seconds=scheduler.LEASE_SECONDS)
+    assert [lease(task_id)[2] for task_id in (mine, theirs, ended, stray)] == [extended, soon, soon, soon]
+    with session_scope() as s:
+        assert s.get(Task, mine).updated_at == changed  # a heartbeat is not a change to the task
+
+    # A task is never reclaimed by the instance whose job runs it, however late its heartbeat. Any other instance
+    # may take it once the lease has run out, and a row left without a job is picked up the same way.
+    clock[0] = extended + timedelta(seconds=1)
+    orch._maybe_reclaim()
+    assert lease(mine) == ("running", orch.instance, extended)
+    assert [lease(task_id) for task_id in (theirs, stray)] == [("queued", "", None)] * 2
+    assert lease(ended) == ("completed", orch.instance, soon)
+    other._maybe_reclaim()
+    assert (lease(mine), resumed(mine)) == (("queued", "", None), 1)
+
+
+def test_shutdown_gives_up_the_leases_it_still_holds(factory, monkeypatch):
+    """A job that could not put its task back in time leaves it running under this instance. Stopping releases the
+    lease, so the next start resumes the task at once instead of waiting for the lease to run out."""
+    from datetime import datetime, timedelta
+
+    from aifactory.pipeline import orchestrator as scheduler
+
+    now = datetime(2026, 1, 1, 12)
+    monkeypatch.setattr(scheduler, "utcnow", lambda: now)
+    until = now + timedelta(seconds=60)
+
+    async def go():
+        orch, other = Orchestrator(), Orchestrator()
+        mine = leased_task(factory, lease_owner=orch.instance, lease_expires_at=until)
+        theirs = leased_task(factory, lease_owner=other.instance, lease_expires_at=until)
+        Orchestrator()._recover()  # a start while both are held touches neither
+        assert (lease(mine), lease(theirs)) == (("running", orch.instance, until), ("running", other.instance, until))
+        await orch.stop()
+        assert (lease(mine), lease(theirs)) == (("running", "", None), ("running", other.instance, until))
+        Orchestrator()._recover()
+        assert (lease(mine), resumed(mine)) == (("queued", "", None), 1)
+        assert (lease(theirs), resumed(theirs)) == (("running", other.instance, until), 0)
+
+    asyncio.run(go())
+
+
+def test_a_runner_whose_task_another_instance_took_stops_writing(factory):
+    """Its lease ran out while it was stalled; another instance requeued the task and started it: same status and
+    stage, a different owner. Nothing the first runner writes may land. A row leased to nobody still takes its
+    writes (a shutdown releases the leases before the last runners have ended); what cannot be taken back is held
+    to more, see the next test."""
+    first, second = Orchestrator(), Orchestrator()
+    task_id = leased_task(factory, lease_owner=first.instance)
+    runner = delivery.TaskRunner(task_id, asyncio.Event(), lambda _: asyncio.Lock(), first.instance)
+
+    def row():
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            return (task.status, task.summary, task.blocked_reason, task.evidence, task.lease_owner,
+                    s.query(Decision).filter(Decision.task_id == task_id).count())
+
+    runner.update(summary="mine")
+    runner.evidence("note", "mine")
+    assert row() == ("running", "mine", "", {"note": "mine"}, first.instance, 0)
+
+    with session_scope() as s:
+        s.get(Task, task_id).lease_owner = second.instance
+    for write in (lambda: runner.update(summary="stale"), lambda: runner.evidence("note", "stale"),
+                  lambda: runner.block("unblock", "Stale", "stale")):
+        with pytest.raises(delivery.Stop):
+            write()
+        assert row() == ("running", "mine", "", {"note": "mine"}, second.instance, 0)
+
+    with session_scope() as s:
+        s.get(Task, task_id).lease_owner = ""
+    runner.update(summary="released")
+    runner.evidence("note", "released")
+    with pytest.raises(delivery.Stop):  # block() always ends the runner; this time what it wrote is there
+        runner.block("unblock", "Blocked", "needs a look")
+    assert row() == ("blocked", "released", "needs a look", {"note": "released"}, "", 1)
+
+
+def test_a_runner_whose_task_another_instance_took_does_not_merge(factory):
+    """The guard before every push and comment, and the last check before the merge itself, ask who holds the task.
+    A runner that stalled past its lease and woke after another instance started the task must not merge the pull
+    request: its new owner may be revising it. Nor after the new owner let go of the lease again (its server
+    stopped, or it parked the task for CI): a scheduled runner acts only on a running task leased to its own
+    instance."""
+    first, second = Orchestrator(), Orchestrator()
+    runner = merge_gate_runner(factory)
+    runner.owner = first.instance
+    merged = []
+
+    class GitHub:
+        async def merge(self, repo, number, **kwargs):
+            merged.append((number, kwargs["sha"]))
+            return {"sha": "merged"}
+
+    def hold(owner, status="running"):
+        with session_scope() as s:
+            task = s.get(Task, runner.task_id)
+            task.status, task.lease_owner = status, owner
+
+    # Held by the other instance; released by it while running (its server stopped); parked by it for CI.
+    for owner, status in ((second.instance, "running"), ("", "running"), ("", "waiting_ci")):
+        hold(owner, status)
+        for stale in (runner._guard, lambda: runner._guard("running"),
+                      lambda: runner._merge_under_workspace_lock(GitHub(), "squash")):
+            with pytest.raises(delivery.Stop):
+                stale()
+        assert lease(runner.task_id)[:2] == (status, owner)  # a refused guard changes nothing
+    assert merged == []
+
+    hold(first.instance)
+    runner._guard()
+    assert runner._merge_under_workspace_lock(GitHub(), "squash") == {"sha": "merged"}
+    assert (merged, lease(runner.task_id)[:2]) == ([(1, "head")], ("running", first.instance))
+
+    runner.owner = None  # a CI poll works on a parked task that nobody leases, and is not asked
+    hold("", "waiting_ci")
+    runner._guard("waiting_ci")
+
+
+def test_a_transition_without_an_owner_does_not_ask_who_holds_the_lease(factory):
+    from datetime import datetime
+
+    from aifactory.pipeline.lifecycle import transition
+
+    task_id = leased_task(factory, lease_owner="someone", lease_expires_at=datetime(2026, 1, 1))
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert transition(s, task, summary="any caller")  # as before: status, stage, pause and cancellation only
+        assert not transition(s, task, owner="another", summary="not the holder")
+        assert transition(s, task, owner="someone", stage="verify")
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert (task.summary, task.stage, task.lease_owner) == ("any caller", "verify", "someone")
+        assert transition(s, task, status="blocked", lease_owner="")
+    assert lease(task_id) == ("blocked", "", None)  # an expiry never outlives its owner
 
 
 def test_smoke_failure_is_reverted_under_recovery_policy(factory):
@@ -2028,6 +2724,21 @@ def _attempt_records(outcome_id):
         return list((task.evidence or {}).get("attempts", [])) if task else []
 
 
+def _holds(ws, status="open"):
+    with session_scope() as s:
+        return [d.id for d in s.query(Decision).filter(Decision.workspace_id == ws, Decision.kind == "provider_hold",
+                                                       Decision.status == status).order_by(Decision.created_at)]
+
+
+def _resume(factory, hold_id):
+    from aifactory.db import SessionLocal
+    from aifactory.decisions import resolve
+
+    db = SessionLocal()
+    resolve(db, db.get(Decision, hold_id), db.get(User, factory["user"]), "retry")
+    db.close()
+
+
 @pytest.mark.parametrize("error,expected", [
     # Billing and quota, as each harness reports it: the native client, Codex through the gateway, Anton through
     # the OpenAI SDK.
@@ -2064,21 +2775,161 @@ def test_provider_and_infrastructure_failures_are_recognised_for_every_harness(e
     assert delivery.infrastructure_problem(error) == expected
 
 
-def test_a_provider_billing_problem_blocks_without_using_an_attempt(factory):
+def test_a_provider_billing_problem_holds_the_workspace_without_using_an_attempt(factory):
     from aifactory.inference import InferenceError
 
     def out_of_credit(messages):
         raise InferenceError("Server returned 402: your MindsHub credits are used up", status=402)
 
+    def parked(count):
+        return len(_attempt_records(outcome_id)) == count and _task_state(outcome_id)[0] == "queued"
+
     ScriptedModel.scripts["builder"] = out_of_credit
     outcome_id = new_outcome(factory)
-    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    assert drive(lambda: parked(1))
+    [hold_id] = _holds(factory["ws"])
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
-        decision = s.query(Decision).filter(Decision.task_id == task.id, Decision.status == "open").one()
-        assert task.status == "blocked" and task.attempt == 0
-        assert decision.title == "T1: model provider problem" and "credits are used up" in decision.body
-        assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+        hold = s.get(Decision, hold_id)
+        # The task waits in the queue with no decision of its own, and the attempt was not charged.
+        assert (task.status, task.attempt, task.blocked_reason) == ("queued", 0, "")
+        assert s.query(Decision).filter(Decision.task_id == task.id).count() == 0
+        assert [(a["n"], a["result"], a["cause"], a["phase"]) for a in task.evidence["attempts"]] == [
+            (1, "infra", "provider", "build")]
+        assert (hold.outcome_id, hold.task_id, hold.title) == (None, None, "Model provider refused: work is on hold")
+        assert "credits are used up" in hold.body and "T1 of outcome #1, the builder session" in hold.body
+        assert hold.options == [{"value": "retry", "label": "Resume work"}]
+    assert outcome_status(outcome_id) == "running"
+    # Nothing starts while the hold is open.
+    assert not drive(lambda: len(_attempt_records(outcome_id)) > 1, timeout=2)
+
+    # Resumed while the provider still refuses: the task runs again and the first failure opens a new hold.
+    _resume(factory, hold_id)
+    assert drive(lambda: parked(2))
+    [second] = _holds(factory["ws"])
+    assert second != hold_id and _holds(factory["ws"], "resolved") == [hold_id]
+
+    ScriptedModel.scripts["builder"] = good_builder
+    _resume(factory, second)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [
+        (1, "infra"), (1, "infra"), (1, "verified")]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
+    assert _holds(factory["ws"]) == []
+
+
+def test_a_verifier_the_provider_refuses_holds_the_workspace_too(factory):
+    from aifactory.inference import InferenceError
+
+    refusing = [1]
+
+    def verifier(messages):
+        if refusing:
+            raise InferenceError("MindsHub: no credit remaining (insufficient balance)", status=402)
+        return passing_verifier(messages)
+
+    ScriptedModel.scripts["verifier"] = verifier
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: len(_attempt_records(outcome_id)) == 1 and _task_state(outcome_id)[0] == "queued")
+    [hold_id] = _holds(factory["ws"])
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert (task.status, task.stage, task.attempt) == ("queued", "verify", 0)
+        assert s.query(Decision).filter(Decision.task_id == task.id).count() == 0
+        assert "T1 of outcome #1, independent verification" in s.get(Decision, hold_id).body
+        assert [(a["n"], a["result"], a["cause"], a["phase"]) for a in task.evidence["attempts"]] == [
+            (1, "infra", "provider", "verify")]
+
+    refusing.clear()
+    _resume(factory, hold_id)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [(1, "infra"), (1, "verified")]
+    with session_scope() as s:
+        assert s.query(Task).filter(Task.outcome_id == outcome_id).one().attempt == 1
+    assert _holds(factory["ws"]) == []
+
+
+def _running_tasks(factory, *stages):
+    """Tasks T1, T2, … of one running outcome, each mid-attempt in the given stage, with no runner behind them."""
+    from aifactory.models import Plan
+
+    outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        s.get(Outcome, outcome_id).status = "running"
+        plan = Plan(outcome_id=outcome_id, version=1, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        tasks = [Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, key=f"T{n}", title=f"T{n}",
+                      repo_id=factory["repo"], status="running", stage=stage, attempt=1)
+                 for n, stage in enumerate(stages, 1)]
+        s.add_all(tasks)
+        s.flush()
+        return outcome_id, [t.id for t in tasks]
+
+
+def test_tasks_the_provider_refuses_share_one_hold(factory):
+    outcome_id, task_ids = _running_tasks(factory, "build", "verify")
+    error = "Model request failed: Server returned 402: your MindsHub credits are used up"
+    for task_id, phase in zip(task_ids, ("build", "verify")):
+        with pytest.raises(delivery.Stop):
+            _runner(task_id)._infrastructure(1, phase, error, "provider")
+    with session_scope() as s:
+        [hold] = s.query(Decision).filter(Decision.workspace_id == factory["ws"]).all()
+        assert (hold.kind, hold.status, hold.outcome_id, hold.task_id) == ("provider_hold", "open", None, None)
+        assert "T1 of outcome #1, the builder session" in hold.body and "T2" not in hold.body
+        for task in s.query(Task).filter(Task.outcome_id == outcome_id):
+            assert (task.status, task.attempt, task.blocked_reason) == ("queued", 0, "")
+            assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+            assert (task.evidence["infra_retries"], task.evidence["infra_retry_at"]) == (0, None)
+        waits = s.query(Event).filter(Event.workspace_id == factory["ws"], Event.kind == "provider_hold").all()
+        assert sorted(e.task_id for e in waits) == sorted(task_ids) and {e.level for e in waits} == {"warn"}
+        assert s.query(Event).filter(Event.workspace_id == factory["ws"],
+                                     Event.kind == "decision_requested").count() == 1
+
+
+@pytest.mark.parametrize("phase", ["prepare", "checks", "verify"])
+def test_an_access_problem_setting_up_a_sandbox_still_blocks_only_its_task(factory, phase):
+    _, [task_id] = _running_tasks(factory, "build")
+    error = "Sandbox setup failed: No GitHub access is configured for this workspace."
+    assert delivery.infrastructure_problem(error) == "provider"
+    with pytest.raises(delivery.Stop):
+        _runner(task_id)._infrastructure(1, phase, error, "provider")
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        [decision] = s.query(Decision).filter(Decision.workspace_id == factory["ws"]).all()
+        assert (task.status, task.attempt) == ("blocked", 0)
+        assert (decision.kind, decision.task_id, decision.title) == ("unblock", task_id, "T1: access problem")
+        assert [o["value"] for o in decision.options] == ["retry", "abandon"] and "No GitHub access" in decision.body
+
+
+def test_a_provider_hold_is_listed_without_an_outcome_and_can_only_be_resumed(factory, client):
+    from aifactory.pipeline.holds import open_provider_hold
+
+    ws = factory["ws"]
+    hold_id = open_provider_hold(ws, "Error code: 402 - Payment Required", "planning outcome #3")
+    # A second refusal finds the hold that is already open.
+    assert open_provider_hold(ws, "another refusal", "T2 of outcome #4, the builder session") == hold_id
+    assert _holds(ws) == [hold_id]
+    assert client.post("/auth/dev", json={"email": "dev@acme.test", "name": "Dev"}).status_code == 200
+    r = client.get(f"/api/workspaces/{ws}/inbox")
+    assert r.status_code == 200, r.text
+    [item] = r.json()["decisions"]
+    assert (item["id"], item["kind"], item["actionable"]) == (hold_id, "provider_hold", True)
+    assert (item["outcome_id"], item["task_id"], item["outcome_number"], item["task_key"]) == (None, None, None, None)
+    assert item["options"] == [{"value": "retry", "label": "Resume work"}]
+    assert "planning outcome #3" in item["body"] and "another refusal" not in item["body"]
+    for refused in ("dismiss", "abandon"):
+        r = client.post(f"/api/workspaces/{ws}/decisions/{hold_id}/resolve", json={"resolution": refused})
+        assert r.status_code == 400, r.text
+        assert _holds(ws) == [hold_id]
+    r = client.post(f"/api/workspaces/{ws}/decisions/{hold_id}/resolve",
+                    json={"resolution": "retry", "comment": "Topped up", "reusable": True})
+    assert r.status_code == 200, r.text
+    with session_scope() as s:
+        hold = s.get(Decision, hold_id)
+        assert (hold.status, hold.resolution, hold.reusable) == ("resolved", "retry", False)
+    assert _holds(ws) == []
 
 
 def test_infrastructure_failures_are_retried_after_a_backoff_without_using_attempts(factory):
@@ -2394,11 +3245,13 @@ def test_a_provider_problem_after_the_builder_wrote_code_is_still_infrastructure
 
     ScriptedModel.scripts["builder"] = builder
     outcome_id = new_outcome(factory)
-    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    assert drive(lambda: len(_attempt_records(outcome_id)) == 1 and _task_state(outcome_id)[0] == "queued")
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
-        assert task.status == "blocked" and task.attempt == 0
+        # The provider refused the session, so the task waits in the queue under the workspace's hold.
+        assert task.status == "queued" and task.attempt == 0
         assert [(a["n"], a["result"], a["cause"]) for a in task.evidence["attempts"]] == [(1, "infra", "provider")]
+    assert len(_holds(factory["ws"])) == 1
     # Not judged as a candidate: nothing was checked or reviewed.
     assert "builder_unreported" not in _event_kinds(outcome_id) and "verifier" not in ScriptedModel.calls
 
@@ -3495,7 +4348,8 @@ def test_rebased_rejection_cannot_merge_until_subsequent_scripted_verification_p
             return {'content': '', 'tool_calls': [call('run', {'command': 'sh test.sh'})]}
         if verified[-1] == 'reject':
             return {'content': '', 'tool_calls': [call('finish', {
-                'verdict': 'fail', 'summary': 'Please cover the interaction', 'criteria': [],
+                'verdict': 'fail', 'summary': 'Please cover the interaction',
+                'criteria': [{'criterion': CRITERION, 'status': 'fail', 'evidence': 'interaction not covered'}],
                 'findings': [{'severity': 'major', 'description': 'Add interaction coverage'}]})]}
         return passing_verifier(messages)
 
@@ -3592,6 +4446,45 @@ def test_patch_paths_use_nul_delimiters(factory):
             patch = await gitops.extract_patch(sandbox, base)
             assert patch.files == ['tab\tand\nnewline.txt']
             assert patch.additions == 1
+        finally:
+            await sandbox.close()
+    asyncio.run(go())
+
+
+def test_a_patch_id_names_the_change_whatever_base_it_sits_on(factory):
+    from aifactory.sandbox import LocalSandbox
+    seed, bare = factory['remotes'] / 'seed' / 'acme' / 'demo', factory['remotes'] / 'acme/demo.git'
+
+    def branch(name, greeting):
+        git('checkout', '-q', '-B', name, 'main', cwd=seed)
+        (seed / 'greet.sh').write_text(greeting)
+        git('commit', '-qam', name, cwd=seed)
+        git('push', '-q', str(bare), name, cwd=seed)
+        head = git('rev-parse', 'HEAD', cwd=seed)
+        git('checkout', '-q', 'main', cwd=seed)
+        return head
+
+    old_main = git('rev-parse', 'main', cwd=seed)
+    first = branch('first', "echo 'Hello, Factory!'\n")
+    new_main = _land_on_main(factory, 'other.txt', 'landed meanwhile\n')
+    rebased = branch('rebased', "echo 'Hello, Factory!'\n")
+    edited = branch('edited', "echo 'Hello, world!'\n")
+    indented = branch('indented', "  echo 'Hello, Factory!'\n")
+
+    async def go():
+        sandbox = LocalSandbox('patch-ids').create()
+        try:
+            await gitops.checkout(sandbox, 'acme/demo', 'token', 'main', 'ids')
+            change = await gitops.patch_id(sandbox, old_main, first)
+            assert re.fullmatch(r'[0-9a-f]{40,64}', change)
+            # The same change on the newer base, and the first branch measured from a main that moved under it.
+            assert await gitops.patch_id(sandbox, new_main, rebased) == change
+            assert await gitops.patch_id(sandbox, new_main, first) == change
+            assert await gitops.patch_id(sandbox, new_main, edited) not in ('', change)
+            assert await gitops.patch_id(sandbox, new_main, indented) not in ('', change)  # whitespace is a change
+            assert await gitops.patch_id(sandbox, new_main, new_main) == ''  # nothing changed
+            assert await gitops.patch_id(sandbox, old_main, 'f' * 40) == ''  # no such commit
+            assert await gitops.patch_id(sandbox, '', first) == ''
         finally:
             await sandbox.close()
     asyncio.run(go())

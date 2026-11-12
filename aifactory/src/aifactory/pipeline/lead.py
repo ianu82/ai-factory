@@ -49,7 +49,7 @@ DAILY_RUNS = 24
 # Progress the Lead tells people about in the outcome's conversation, at most every NARRATE_EVERY when nothing
 # else needs it: a finished run's update covers everything since its last one.
 MILESTONES = ("plan_approved", "published", "verification_failed", "ci_failed", "merged", "task_completed",
-              "smoke_failed", "revert_opened", "released", "outcome_completed")
+              "smoke_failed", "revert_opened", "released", "outcome_completed", "work_overlap")
 NARRATE_EVERY = timedelta(minutes=10)
 JUST_FINISHED = timedelta(hours=1)  # a finished outcome's Lead still reports how it ended
 FIRST_LOOK = timedelta(days=1)  # posts older than this predate the Lead: its first run reads them, not wakes for them
@@ -126,10 +126,23 @@ You were woken because something on your outcome needs judgement. Read the outco
 - Request changes on a pull request (resolve_decision with "reject" on a merge approval) when review findings,
   failed checks or the verifier's report show it isn't ready. Say exactly what must change.
 - Post guidance (post_guidance) when the agents need direction that isn't tied to a decision.
+- Follow the team's rules (team_rules in the record). They are decisions people made for every outcome; cite the
+  rule when it settles a question, and never tell an agent to break one. If a rule seems wrong for this case, say
+  so in a note for people instead.
+- Coordinate with other outcomes (overlapping_work in the record lists other outcomes' in-flight work that changes
+  the same files as yours). Post guidance to your task so its builder works with the other change: keep edits to
+  the shared files small and local, don't rename, move or reformat shared code, and build on the other change
+  rather than against it. The work further along (published, verified or merging) goes first; the merge manager
+  merges one at a time and the later one rebases. If the two outcomes want contradictory behaviour, don't pick a
+  winner: leave a note for people naming both outcomes and the conflict.
 - For anything you may not do (approving a plan, a merge or a release, budgets, cancelling, abandoning, taking
   over), or when you are not confident, leave a note for people (note_for_people) with what you found and the
   option you recommend. People read it in the outcome and the Inbox.
 - When a person has posted on the outcome, reply with note_for_people. Answer their question directly.
+- When the watch woke you because work is stuck (a task waiting with no decision to answer, an outcome where nothing
+  moves, or no activity for a long time), find out why from the record. If a decision lets you unstick it, do;
+  otherwise leave a note for people: what is stuck, the likely cause and what a person should do. If it stays
+  stuck, people also get an alert in the app.
 - Keep the outcome's conversation current. When you first join an outcome, when progress woke you, and when the
   outcome has ended, post one short
   update with post_update: what happened since your last update and what it means, then what happens next. People
@@ -223,6 +236,9 @@ def _people_posts(db, outcome_id: str, since: datetime | None) -> list[Message]:
 
 def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> list[dict[str, Any]]:
     """The outcomes whose Lead should run now, each with why and what it was woken for."""
+    from .. import coordination
+
+    coordination.maybe_sync()  # new overlaps between outcomes become milestones that wake both Leads
     now = now or utcnow()
     woken: list[dict[str, Any]] = []
     with session_scope() as s:
@@ -273,6 +289,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 (m.attribution or {}).get("closing") for m in s.query(Message).filter(
                     Message.outcome_id == o.id, Message.author_kind == "lead", Message.created_at >= ended_at))
             ending = finished and not reported
+            # The watch found work stuck on this outcome since the Lead last looked (pipeline/watch.py).
+            stuck = [] if finished else [e.message for e in s.query(Event).filter(
+                Event.outcome_id == o.id, Event.kind == "lead_watch",
+                Event.created_at > (done.started_at if done is not None else now - FIRST_LOOK))]
             if progress and not (changed or posts or joined) and last is not None and now - last.started_at < NARRATE_EVERY:
                 progress = []  # batch progress into one update
             reasons = []
@@ -286,6 +306,8 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append("you've just joined this outcome")
             if ending:
                 reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
+            if stuck:
+                reasons.append("the watch found work stuck: " + "; ".join(m.removeprefix("Watch: ") for m in stuck[:3]))
             if not reasons:
                 continue
             limit = budgets[o.workspace_id]  # checked only for outcomes with a reason to wake: it costs queries
@@ -355,7 +377,22 @@ def outcome_record(outcome_id: str) -> dict[str, Any]:
         events = s.query(Event).filter(Event.outcome_id == o.id, Event.kind.notin_(("agent_thought", "agent_tool"))) \
             .order_by(Event.id.desc()).limit(40).all()
         keys = {t.id: t.key for t in tasks}
+        from .. import coordination
+        from ..rulings import active as rules_in_force
+
+        overlapping = coordination.for_outcome(s, o.id)
+        rules = [d for d in rules_in_force(s, o.workspace_id)
+                 if d.scope == "workspace" or d.outcome_id == o.id
+                 or (d.task_id and s.get(Task, d.task_id) and s.get(Task, d.task_id).repo_id in (o.repo_ids or []))
+                 or (not d.task_id and d.outcome_id and s.get(Outcome, d.outcome_id)
+                     and set(s.get(Outcome, d.outcome_id).repo_ids or []) & set(o.repo_ids or []))]
+        # Every team ruling, always; other reusable precedents are examples, so the newest few suffice.
+        rules = [d for d in rules if d.kind == "ruling"] + [d for d in rules if d.kind != "ruling"][:12]
         return {
+            "team_rules": [{"rule": d.title, "detail": d.comment if d.kind == "ruling" else
+                            f"{d.resolution}{' — ' + d.comment if d.comment else ''}", "scope": d.scope}
+                           for d in rules],
+            "overlapping_work": overlapping,
             "outcome": {"number": o.number, "title": o.title, "status": o.status, "priority": o.priority,
                         "brief": o.brief, "acceptance": o.acceptance, "blocked_reason": o.blocked_reason,
                         "repositories": [repos.get(r, r) for r in o.repo_ids or []]},
@@ -452,7 +489,14 @@ class Tools:
             return f"Invalid arguments for {name}."
 
     def _outcome_record(self) -> str:
-        return _bounded(outcome_record(self.outcome_id))
+        from ..mind.tools import clean
+
+        record_ = outcome_record(self.outcome_id)
+        rules = record_.pop("team_rules", [])
+        # Rules are never shortened away with the rest of the record: every one applies.
+        lines = [f"- [{r['scope']}] {clean(r['rule'], None, 4000)}: {clean(r['detail'], None, 8000)}" for r in rules]
+        return _bounded(record_) + ("\n\nteam_rules (all of them; follow every one):\n" + "\n".join(lines)
+                                    if lines else "\n\nteam_rules: none")
 
     def _task_detail(self, task: str) -> str:
         from .. import serializers as S

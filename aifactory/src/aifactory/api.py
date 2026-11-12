@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from . import definitions
 from . import attachments as A
-from . import insights, linear_config, onboarding_policy, workstreams
+from . import insights, linear_config, onboarding_policy, preview_config, workstreams
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
@@ -34,7 +34,7 @@ from .inference import PROVIDERS, InferenceError, ModelClient, resolve_provider
 from .linear import Linear, LinearError
 from .memory import MemoryScopeError, MemoryService
 from .model_checks import check_workspace_models
-from .models import (Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
+from .models import (Alert, Artifact, Decision, DecisionReview, Event, Membership, Message, Organization, Outcome, Plan, Repository, Run,
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings
@@ -188,6 +188,26 @@ def _lead_settings(value: Any) -> dict[str, Any]:
     return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
 
 
+def _alert_settings(value: Any) -> dict[str, Any]:
+    """Alerts: how long a decision may wait before it alerts, and the outside channels. Slack and email aren't
+    available yet, so they can only be off: alerts show in the app's Inbox."""
+    default = DEFAULT_SETTINGS["alerts"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "alerts accepts only after_minutes, slack and email")
+    after = value.get("after_minutes", default["after_minutes"])
+    if type(after) is not int or not 15 <= after <= 1440:
+        raise HTTPException(422, "alerts.after_minutes must be a whole number from 15 to 1440")
+    for channel, name in (("slack", "Slack"), ("email", "Email")):
+        on = value.get(channel, False)
+        if type(on) is not bool:
+            raise HTTPException(422, f"alerts.{channel} must be true or false")
+        if on:
+            raise HTTPException(422, f"{name} alerts aren't available yet: alerts show in the Inbox")
+    return {"after_minutes": after, "slack": False, "email": False}
+
+
 def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         review = review_policy(raw)
@@ -195,12 +215,14 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from None
     mind = _mind_settings(raw.get("mind"))
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
-    merged = merged_settings({**raw, "lead": lead})
+    alerts = _alert_settings(raw.get("alerts"))
+    merged = merged_settings({**raw, "lead": lead, "alerts": alerts})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["review"] = review
     merged["mind"] = mind
     merged["lead"] = lead
+    merged["alerts"] = alerts
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -453,6 +475,8 @@ async def test_credential(workspace_id: str, kind: str,
                                                         pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"),
                           user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
+    if kind.startswith("preview_"):
+        raise HTTPException(404, "Unknown credential")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec is None:
         raise HTTPException(404, "Not configured")
@@ -480,6 +504,8 @@ async def test_credential(workspace_id: str, kind: str,
 @router.delete("/workspaces/{workspace_id}/credentials/{kind}")
 def delete_credential(workspace_id: str, kind: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
+    if kind.startswith("preview_"):
+        raise HTTPException(404, "Unknown credential")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec:
         db.delete(sec)
@@ -567,6 +593,7 @@ class RepoReleaseSelection(BaseModel):
 
 
 class RepoCommands(BaseModel):
+    preview_qa: Any = None
     review: dict[str, Any] | None = None
     setup: list[str] | None = None
     checks: list[str] | None = None
@@ -617,6 +644,11 @@ async def preview_repo(workspace_id: str, body: RepoConnect, user: User = Depend
 
 def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(current)
+    if "preview_qa" in patch:
+        try:
+            cfg["preview_qa"] = preview_config.validate_config(patch["preview_qa"], current.get("preview_qa"))
+        except ValueError:
+            raise HTTPException(422, "Invalid Preview QA configuration") from None
     if "require_trusted_issue_author" in patch:
         if type(patch["require_trusted_issue_author"]) is not bool:
             raise HTTPException(422, "require_trusted_issue_author must be a boolean")
@@ -725,12 +757,67 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     return S.repository(repo)
 
 
+def _preview_repository(db: Session, user: User, workspace_id: str, repo_id: str,
+                        minimum: str = "viewer") -> Repository:
+    _ws(db, user, workspace_id, minimum)
+    # Always query again after the workspace lock: db.get may reuse a cached
+    # repository that a concurrent disconnect has already removed.
+    repo = db.query(Repository).filter_by(id=repo_id, workspace_id=workspace_id).populate_existing().one_or_none()
+    if repo is None:
+        raise HTTPException(404, "Repository not found")
+    return repo
+
+
+@router.get("/workspaces/{workspace_id}/repositories/{repo_id}/preview-qa/account")
+def preview_account_metadata(workspace_id: str, repo_id: str, user: User = Depends(current_user),
+                             db: Session = Depends(get_db)):
+    _preview_repository(db, user, workspace_id, repo_id)
+    return preview_config.account_metadata(preview_config.account(db, workspace_id, repo_id))
+
+
+@router.put("/workspaces/{workspace_id}/repositories/{repo_id}/preview-qa/account")
+async def put_preview_account(workspace_id: str, repo_id: str, request: Request,
+                              user: User = Depends(current_user), db: Session = Depends(get_db)):
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    # Bound bytes before decoding. Never let framework validation echo input values.
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > preview_config.MAX_ACCOUNT_BYTES:
+            raise HTTPException(422, "Invalid preview account request")
+        raw.extend(chunk)
+    try:
+        fields = preview_config.validate_account(json.loads(raw))
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise HTTPException(422, "Invalid preview account request") from None
+    definitions.lock_workspace(db, workspace_id)
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    sec = preview_config.save_account(db, workspace_id, repo_id, fields, user.id)
+    db.commit()
+    record(workspace_id, "preview_account_saved", "Updated Preview QA account", actor=user.id)
+    return preview_config.account_metadata(sec)
+
+
+@router.delete("/workspaces/{workspace_id}/repositories/{repo_id}/preview-qa/account")
+def delete_preview_account(workspace_id: str, repo_id: str, user: User = Depends(current_user),
+                           db: Session = Depends(get_db)):
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    definitions.lock_workspace(db, workspace_id)
+    _preview_repository(db, user, workspace_id, repo_id, "admin")
+    sec = preview_config.account(db, workspace_id, repo_id)
+    if sec is not None:
+        db.delete(sec)
+    db.commit()
+    record(workspace_id, "preview_account_deleted", "Deleted Preview QA account", actor=user.id)
+    return preview_config.account_metadata(None)
+
+
 @router.delete("/workspaces/{workspace_id}/repositories/{repo_id}")
 def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    repo = db.get(Repository, repo_id)
-    if repo is None or repo.workspace_id != workspace_id:
-        raise HTTPException(404, "Repository not found")
+    # Use the same serialization point as account PUT/DELETE before reading
+    # repository state, so a late account write cannot leave an orphan secret.
+    definitions.lock_workspace(db, workspace_id)
+    repo = _preview_repository(db, user, workspace_id, repo_id, "admin")
     if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running", "waiting_ci"])).first():
         raise HTTPException(409, "Work is running on this repository")
     try:
@@ -747,6 +834,9 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
             config["enabled"] = False
         linear_config.save_config(db, workspace, linear_config.LinearConfig.model_validate(config), user.id,
                                   commit=False)
+    preview_account = preview_config.account(db, workspace_id, repo_id)
+    if preview_account is not None:
+        db.delete(preview_account)
     workstream_events = workstreams.remove_repository_defaults(db, workspace_id, repo_id, user)
     db.delete(repo)
     db.commit()
@@ -1022,7 +1112,16 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
     from .pipeline.lead import notes_for
 
     lead_notes = notes_for(db, decisions)
+    alerts = db.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.status == "open") \
+        .order_by(Alert.opened_at.desc()).limit(50).all()
+    about = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({a.outcome_id for a in alerts if a.outcome_id}))}
+    alert_tasks = {t.id: t.key for t in db.query(Task).filter(Task.id.in_({a.task_id for a in alerts if a.task_id}))}
     return {
+        "alerts": [{"id": a.id, "kind": a.kind, "title": a.title, "body": a.body, "since": S.ts(a.since),
+                    "opened_at": S.ts(a.opened_at), "outcome_id": a.outcome_id, "decision_id": a.decision_id,
+                    "outcome_number": about[a.outcome_id].number if a.outcome_id in about else None,
+                    "outcome_title": about[a.outcome_id].title if a.outcome_id in about else "",
+                    "task_key": alert_tasks.get(a.task_id)} for a in alerts],
         "decisions": [S.decision(d, {
             "outcome_number": outcomes[d.outcome_id].number if d.outcome_id in outcomes else None,
             "outcome_title": outcomes[d.outcome_id].title if d.outcome_id in outcomes else "",
@@ -1037,6 +1136,23 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
                                        "outcome_title": change_outcomes[e.outcome_id].title}
                                       if e.outcome_id in change_outcomes else {}) for e in recent],
     }
+
+
+@router.post("/workspaces/{workspace_id}/alerts/{alert_id}/dismiss")
+def dismiss_alert(workspace_id: str, alert_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Hide an alert while its condition lasts. If the condition clears and comes back, that is a new alert."""
+    _ws(db, user, workspace_id, "member")
+    alert = db.get(Alert, alert_id)
+    if alert is None or alert.workspace_id != workspace_id:
+        raise HTTPException(404, "Alert not found")
+    if alert.status == "open":
+        alert.status, alert.dismissed_by, alert.dismissed_at = "dismissed", user.id, utcnow()
+        record(workspace_id, "alert_dismissed", f"{user.name or user.email} dismissed an alert: {alert.title}",
+               outcome_id=alert.outcome_id, task_id=alert.task_id, actor=user.id,
+               data={"alert_id": alert.id, "kind": alert.kind}, session=db)
+        db.commit()
+        notify(workspace_id, "alert", workspace_id)
+    return {"status": alert.status}
 
 
 class Resolution(BaseModel):

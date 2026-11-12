@@ -22,6 +22,8 @@ from ..models import Decision, Outcome, Plan, Repository, Run, Task
 from ..onboarding_policy import lock_workspace
 from ..prompts import PLAN_REVIEWER, PLANNER, describe_review, plan_prompt, plan_review_prompt
 from ..sandbox import LocalSandbox
+from . import delivery
+from .holds import open_provider_hold
 from .runtime import (SessionSpec, guidance_history, open_decision, outcome_committed, precedents, run_agent, set_outcome,
                       merged_settings, workspace_settings)
 
@@ -111,7 +113,7 @@ def _save_plan(workspace_id: str, outcome_id: str, version: int, report: dict[st
     return plan_id
 
 
-async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
+async def plan_outcome(outcome_id: str, cancelled: asyncio.Event, *, infra_retries: int = 0) -> None:
     with session_scope() as s:
         outcome = s.get(Outcome, outcome_id)
         if outcome.source == "review":
@@ -145,7 +147,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
     record(workspace_id, "planning_started", f"Planning outcome #{snapshot.number}", outcome_id=outcome_id)
     sandbox = LocalSandbox(f"plan-{outcome_id[:12]}-{version}").create()
     result = review = last = None
-    error, problems, stopped = "", [], ""
+    error, problems, stopped, setup_failed = "", [], "", False
     try:
         token = resolve_token(workspace_id)
         sandbox.work.mkdir(parents=True, exist_ok=True)
@@ -153,7 +155,7 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
             await checkout(sandbox, repo.full_name, token, repo.default_branch, f"factory/plan-{outcome_id[:8]}",
                            subdir=repo.full_name.replace("/", "__"), adopt=False)
         sandbox.adopt_work()
-        decisions = precedents(workspace_id)
+        decisions = precedents(workspace_id, repo_ids=[r.id for r in repos])
         work = other_work(workspace_id, outcome_id)
         repositories = {r.full_name: r.config or {} for r in repos}
         revision = None
@@ -188,16 +190,41 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         raise
     except Exception as exc:
         log.exception("planning setup failed")
-        result, error = None, str(exc)
+        result, error, setup_failed = None, str(exc), True
     finally:
         await sandbox.close()
     if cancelled.is_set():
         return
 
     if last is None:
+        # As for a task (delivery.infrastructure_problem): the provider or the sandbox failed, not the plan.
+        cause = delivery.infrastructure_problem(error)
+        if cause == "provider" and not setup_failed:
+            # The provider refused the planner as it would every model session of the workspace: the outcome stays in
+            # planning under the workspace's one hold, and is planned again when a person resumes it. An access
+            # problem while setting up (a repository, the GitHub credential) is this outcome's own and blocks it.
+            open_provider_hold(workspace_id, error, f"planning outcome #{snapshot.number}")
+            record(workspace_id, "provider_hold", f"The model provider refused the planner ({error[:200]}). Planning "
+                   "waits until the provider hold in the inbox is resumed", outcome_id=outcome_id, level="warn")
+            return
+        if cause == "transient" and infra_retries < delivery.INFRA_RETRIES:
+            delay = delivery.INFRA_BACKOFF_SECONDS[min(infra_retries, len(delivery.INFRA_BACKOFF_SECONDS) - 1)]
+            record(workspace_id, "infra_retry", f"Planning hit an infrastructure problem ({error[:200]}); retrying in "
+                   f"{delay // 60} min ({infra_retries + 1} of {delivery.INFRA_RETRIES})", outcome_id=outcome_id,
+                   level="warn", data={"delay": delay})
+            try:  # the outcome stays in planning and keeps its slot; cancelling it ends the wait at once
+                await asyncio.wait_for(cancelled.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+            if cancelled.is_set():
+                return
+            return await plan_outcome(outcome_id, cancelled, infra_retries=infra_retries + 1)
+        failed = "The planner could not produce a plan."
+        if cause == "transient":
+            failed = (f"Planning failed {infra_retries + 1} times in a row for reasons outside the plan (the model "
+                      "provider or the sandbox was unavailable). Last error:")
         set_outcome(outcome_id, status="blocked", blocked_reason=f"Planning failed: {error}")
-        open_decision(workspace_id, "unblock", f"Planning failed for #{snapshot.number}",
-                      f"The planner could not produce a plan.\n\n{error}",
+        open_decision(workspace_id, "unblock", f"Planning failed for #{snapshot.number}", f"{failed}\n\n{error}",
                       outcome_id=outcome_id, options=[{"value": "retry", "label": "Retry planning"},
                                                       {"value": "cancel", "label": "Cancel outcome"}])
         return

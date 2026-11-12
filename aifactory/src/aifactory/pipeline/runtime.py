@@ -30,6 +30,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "decision_judges": "decide",
     # One agent per outcome, responsible for delivering it (pipeline/lead.py).
     "lead": {"enabled": True, "run_usd": 2.0, "turns": 30},
+    # Alerts show in the app's Inbox. Slack and email are delivery options that aren't available yet: both stay off.
+    "alerts": {"after_minutes": 120, "slack": False, "email": False},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,
@@ -39,6 +41,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # fresh budget before asking a person: relaying findings into a retry is not a decision.
     "auto_retry_rounds": 1,
     "autonomy": {"plan": "auto", "merge": "auto", "release": "approval"},
+    # "patch": a merge approval covers the same change when it is published again on a newer base. "head": every new
+    # head is approved again. A repository's merge.approval overrides it (TaskRunner._approved).
+    "merge": {"approval": "patch"},
     "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
                "run_minutes": 60,
@@ -111,7 +116,8 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
     return take
 
 
-def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -> list[Decision]:
+def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12,
+                repo_ids: list[str] | None = None) -> list[Decision]:
     """Reusable, attributed human decisions that apply to this workspace (and repository)."""
     with session_scope() as s:
         query = (s.query(Decision)
@@ -123,6 +129,13 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
                      DecisionReview.workspace_id == workspace_id,
                      DecisionReview.correction_decision_id.is_not(None))).desc(),
                            Decision.resolved_at.desc(), Decision.id))
+
+        def applicable_to(d: Decision, repo: str) -> bool:
+            if d.task_id:
+                t = s.get(Task, d.task_id)
+                return bool(t and t.repo_id == repo)
+            o = s.get(Outcome, d.outcome_id) if d.outcome_id else None
+            return bool(o and repo in (o.repo_ids or []))
 
         def applicable(rows: list[Decision]) -> list[Decision]:
             """A repository-scoped decision applies to the repository it was made about (its task's, else its
@@ -145,12 +158,17 @@ def precedents(workspace_id: str, repo_id: str | None = None, limit: int = 12) -
         found: list[Decision] = []
         offset, page = 0, max(limit * 4, 20)
         while len(found) < limit:
-            rows = query.offset(offset).limit(page).all()
+            rows = query.filter(Decision.kind != "ruling").offset(offset).limit(page).all()
             found += applicable(rows)
             if len(rows) < page:
                 break
             offset += page
-        return found[:limit]
+        # Team rulings are rules, not examples: every applicable one is always given, beyond the limit.
+        rules = applicable(query.filter(Decision.kind == "ruling").all())
+        if repo_id is None and repo_ids is not None:
+            # Planning across an outcome's repositories: a repository rule for another repository doesn't apply.
+            rules = [d for d in rules if d.scope == "workspace" or any(applicable_to(d, r) for r in repo_ids)]
+        return rules + found[:limit]
 
 
 @dataclass(frozen=True)
@@ -168,6 +186,8 @@ class SessionSpec:
     effective_settings: Mapping[str, Any] | None = None
     model_override: str | None = None
     repositories: Mapping[str, Any] | None = None
+    expected_criteria: list[str] | None = None  # the task's acceptance criteria, for a verifier's report
+    expected_findings: list[str] | None = None  # ids of the review findings a builder's report must answer
 
     def __post_init__(self) -> None:
         # Own a recursively immutable snapshot, not a reference to mutable workspace/repo JSON.
@@ -240,6 +260,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         session = HarnessSession(
             run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
             client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
+            expected_criteria=spec.expected_criteria, expected_findings=spec.expected_findings,
             deadline=time.monotonic() + limits.get("run_minutes", 60) * 60, cancelled=cancelled,
             on_progress=on_progress, take_guidance=take_guidance(spec.outcome_id, spec.task_id),
             # A VM reaches the Factory only over its public URL; local sandboxes use the internal one.

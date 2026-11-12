@@ -17,7 +17,7 @@ type Card = { status: string; open_decisions: number; priority: number; updated_
 
 /** The QA stages of a task: the candidate's configured checks, independent verification (and publishing the
  * verified change), and waiting for CI. Building, rework, CI repair, merging and smoke checks are delivery. */
-const QA_STAGES = ["checks", "verify", "publish", "ci"];
+const QA_STAGES = ["checks", "verify", "publish", "ci", "review"];
 const FINISHED = ["completed", "abandoned", "cancelled", "handed_over", "reverted"];
 
 /** Tasks moving through delivery right now: started (they have a stage) and not finished or waiting to start. */

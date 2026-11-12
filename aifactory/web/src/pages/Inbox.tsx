@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { LifeBuoy, X } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
-import { api, type Decision, type FactoryEvent } from "../api";
+import { api, type Alert, type Decision, type FactoryEvent } from "../api";
 import { useWs } from "../App";
 import { ago, DECISION_KIND } from "../format";
 import { Dot, Empty, Skeleton, useToast } from "../ui";
@@ -13,10 +13,14 @@ import { RecoveryGuide } from "../components/RecoveryGuide";
 
 import { type LearningPolicy, policyLabel } from "../learningPolicy";
 
-type InboxData = { decisions: Decision[]; since: string | null; changes: (FactoryEvent & { outcome_number?: number; outcome_title?: string })[] };
+type InboxData = { decisions: Decision[]; alerts?: Alert[]; since: string | null; changes: (FactoryEvent & { outcome_number?: number; outcome_title?: string })[] };
 
 const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
+const ALERT_KIND: Record<Alert["kind"], string> = {
+  overdue: "Waiting", unasked: "Stuck", stalled: "Stalled", quiet: "Quiet", repeated: "Repeated failure",
+};
 const GROUPS: { key: string; label: string; kinds: string[] }[] = [
+  { key: "hold", label: "Work on hold", kinds: ["provider_hold"] },
   { key: "merge", label: "Merge approvals", kinds: ["approve_merge", "approve_release"] },
   { key: "plan", label: "Plans to approve", kinds: ["approve_plan"] },
   { key: "question", label: "Questions", kinds: ["question"] },
@@ -78,6 +82,23 @@ export function InboxPage() {
   const close = () => navigate(`/w/${ws.id}/inbox`);
   const openOutcome = (e: FactoryEvent) => e.outcome_id && navigate(`/w/${ws.id}/outcomes/${e.outcome_id}`);
   const canAct = ws.role !== "viewer";
+  const alerts = q.data?.alerts || [];
+  const openAlert = (a: Alert) => {
+    if (a.decision_id && decisions.some((d) => d.id === a.decision_id)) navigate(`/w/${ws.id}/inbox/${a.decision_id}`);
+    else if (a.outcome_id) navigate(`/w/${ws.id}/outcomes/${a.outcome_id}`);
+    else navigate(`/w/${ws.id}/runs`);
+  };
+  const dismiss = async (a: Alert) => {
+    setBusy(`alert:${a.id}`);
+    try {
+      await api(`/api/workspaces/${ws.id}/alerts/${a.id}/dismiss`, { method: "POST" });
+      qc.invalidateQueries({ queryKey: ["inbox", ws.id] });
+    } catch (err) {
+      toast((err as Error).message, true);
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const quick = async (d: Decision, value: string) => {
     setBusy(`${d.id}:${value}`);
@@ -115,7 +136,7 @@ export function InboxPage() {
     <>
       <div className="page-head">
         <h1>Inbox</h1>
-        <span className="muted" style={{ fontSize: 12.5, whiteSpace: "nowrap" }}>{decisions.length ? `${decisions.length} need${decisions.length === 1 ? "s" : ""} you` : ""}</span>
+        <span className="muted" style={{ fontSize: 12.5, whiteSpace: "nowrap" }}>{decisions.length + alerts.length ? `${decisions.length + alerts.length} need${decisions.length + alerts.length === 1 ? "s" : ""} you` : ""}</span>
         <span className="spacer" />
         <button className="btn sm ghost" onClick={() => setGuide(true)}><LifeBuoy /> How recovery works</button>
       </div>
@@ -137,6 +158,35 @@ export function InboxPage() {
           {q.isLoading || setup.loading ? <Skeleton rows={4} /> : (
             <>
               {!setup.ready && <SetupNotice />}
+              {alerts.length > 0 && (
+                <section aria-label="Alerts">
+                  <div className="list-section">Alerts · {alerts.length}</div>
+                  <ul className="rows">
+                    {alerts.map((a) => (
+                      <li key={a.id} className="row ib-row" tabIndex={0} onClick={() => openAlert(a)}
+                        onKeyDown={(e) => { if (e.key === "Enter") openAlert(a); }}>
+                        <Dot tone="bad" />
+                        <div style={{ minWidth: 0 }}>
+                          <div className="title"><span className="ib-kind">{ALERT_KIND[a.kind] || a.kind}</span>{a.title}</div>
+                          <div className="sub">
+                            {a.outcome_number != null && <span className="ref">#{a.outcome_number}{a.task_key ? ` ${a.task_key}` : ""}</span>}
+                            <span className="ib-why">{a.body || a.outcome_title}</span>
+                          </div>
+                        </div>
+                        <div className="meta">
+                          {canAct && (
+                            <button className="btn sm ib-act" disabled={busy !== null}
+                              onClick={(e) => { e.stopPropagation(); dismiss(a); }}>
+                              {busy === `alert:${a.id}` ? "…" : "Dismiss"}
+                            </button>
+                          )}
+                          <span className="num" style={{ minWidth: 52 }}>{ago(a.since)}</span>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
               {groups.map((g) => (
                 <section key={g.key} aria-label={g.label}>
                   <div className="list-section">{g.label} · {g.rows.length}</div>
@@ -147,7 +197,7 @@ export function InboxPage() {
                       return (
                         <li key={d.id} className={`row ib-row ${d.id === decisionId ? "selected" : ""}`} tabIndex={0} aria-selected={d.id === decisionId}
                           onClick={() => select(d)} onKeyDown={(e) => onRowKey(e, d)}>
-                          <Dot tone={d.kind === "unblock" || d.kind === "budget" ? "bad" : "human"} />
+                          <Dot tone={["unblock", "budget", "provider_hold"].includes(d.kind) ? "bad" : "human"} />
                           <div style={{ minWidth: 0 }}>
                             <div className="title">
                               <span className="ib-kind">{DECISION_KIND[d.kind] || d.kind}</span>{d.title.replace(/^Approve merge: /, "").replace(/^Approve plan for #\d+: /, "")}
@@ -178,7 +228,7 @@ export function InboxPage() {
                   </ul>
                 </section>
               ))}
-              {decisions.length === 0 && setup.ready && (
+              {decisions.length === 0 && alerts.length === 0 && setup.ready && (
                 <Empty title="Nothing needs you">
                   Running work stays in Outcomes. Plan approvals, questions, merges that need a person and anything that got stuck land here.
                 </Empty>

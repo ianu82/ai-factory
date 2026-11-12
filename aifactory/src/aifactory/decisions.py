@@ -13,6 +13,7 @@ from .models import Decision, Message, Outcome, Plan, Task, User
 from .pipeline.orchestrator import ACTIVE_TASK, HUMAN_TASK, orchestrator
 from .pipeline.lifecycle import ACCEPTING, accepted_after_merge, complete_accepted
 from .pipeline.planning import approve_plan
+from .review import requested_round
 
 
 class DecisionError(ValueError):
@@ -119,11 +120,17 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     elif kind == "approve_merge" and task:
         if resolution == "approve":
             task.status, task.stage = "queued", "merge"
+            published = (task.evidence or {}).get("published") or {}
+            # What was approved: the same patch at a later head keeps this approval (TaskRunner._approved).
+            task.evidence = {**(task.evidence or {}), "approved": {
+                "head": published.get("head") or task.head_sha or "", "patch_id": published.get("patch_id") or "",
+                "at": decision.resolved_at.isoformat()}}
         elif resolution == "reject":
             guidance(comment or "A reviewer requested changes before merging.")
             task.status, task.stage, task.attempt = "queued", "revise", 0
             # A requested revision is a fresh budget: earlier rounds' offsets and automatic retries do not carry over.
-            task.evidence = fresh_budget(task.evidence)
+            # It is a review round too: it counts, and the builder answers what the head's review left open.
+            task.evidence = requested_round(fresh_budget(task.evidence), task.head_sha)
     elif kind == "budget" and task:
         if resolution == "retry":
             from .pipeline.runtime import budget_extension, outcome_committed, workspace_settings
@@ -196,6 +203,12 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             elif resolution == "cancel":
                 outcome.status = "cancelled"
                 stop(outcome.id)
+    elif kind == "provider_hold":
+        # Closing the decision is what lifts the hold: the workspace's parked tasks are queued and its outcomes still
+        # planning, so the scheduler starts them again. A hold is only ever resumed, and is never a precedent.
+        if resolution != "retry":
+            raise DecisionError("Choose one of: retry")
+        decision.reusable = False
     payload = record(decision.workspace_id, "decision_resolved", f"{author}: {resolution} — {decision.title}",
                      outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
                      data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],

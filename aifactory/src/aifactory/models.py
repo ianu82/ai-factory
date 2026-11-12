@@ -115,6 +115,10 @@ class Repository(Base):
     # Delete review identities/evidence on disconnect, retaining outcomes and runs
     # as the cumulative cost history, just like other outcome attribution.
     reviews: Mapped[list["PullReview"]] = relationship(cascade="all, delete-orphan")
+    # Tracing identities and their dependent evidence/accounting belong to the
+    # connected repository. ORM cascades also work on existing databases: unlike
+    # ON DELETE, they require no alteration of the already-created foreign keys.
+    errors: Mapped[list["ErrorRecord"]] = relationship(cascade="all, delete-orphan")
 
     __table_args__ = (UniqueConstraint("workspace_id", "full_name"),)
 
@@ -443,6 +447,32 @@ class Decision(Base):
     review: Mapped["DecisionReview | None"] = relationship(
         foreign_keys="DecisionReview.decision_id", uselist=False, lazy="selectin")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Alert(Base):
+    """Stuck work or a repeated failure that people should know about (pipeline/watch.py). One row per condition
+    while it lasts: watching (its Lead was woken; not shown yet), open (shown in the Inbox), dismissed by a person,
+    or cleared once the condition went away. A condition that returns later is a new row."""
+
+    __tablename__ = "alerts"
+    __table_args__ = (Index("ix_alerts_workspace_status", "workspace_id", "status"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(String(32))
+    outcome_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20))  # overdue|unasked|stalled|quiet|repeated
+    key: Mapped[str] = mapped_column(String(120))  # the condition: one live row per key
+    title: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="open")  # watching|open|dismissed|cleared
+    since: Mapped[datetime] = mapped_column(DateTime, default=utcnow)  # when the condition began, as far as known
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    dismissed_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class DecisionReview(Base):
@@ -777,3 +807,134 @@ class MindCharge(Base):
     usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     settled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class ErrorRecord(Base):
+    """One episode of a source error. Reopens never overwrite historical attribution."""
+
+    __tablename__ = "error_records"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    source: Mapped[str] = mapped_column(String(40))
+    external_id: Mapped[str] = mapped_column(String(200))
+    episode: Mapped[int] = mapped_column(Integer, default=1)
+    title: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text, default="")
+    stack_frames: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime)
+    release: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lifecycle: Mapped[str] = mapped_column(String(20), default="open")
+    ingestion_revision: Mapped[int] = mapped_column(Integer, default=1)
+    processed_revision: Mapped[int] = mapped_column(Integer, default=0)
+    evidence_fingerprint: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    observations: Mapped[list["ErrorObservation"]] = relationship(cascade="all, delete-orphan")
+    causes: Mapped[list["SuspectedCause"]] = relationship(cascade="all, delete-orphan")
+    trace_runs: Mapped[list["TraceRun"]] = relationship(cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "repo_id", "source", "external_id", "episode", name="uq_error_episode"),
+        CheckConstraint("episode > 0 AND ingestion_revision > 0 AND processed_revision >= 0 "
+                        "AND processed_revision <= ingestion_revision", name="ck_error_revisions"),
+        CheckConstraint("last_seen_at >= first_seen_at", name="ck_error_dates"),
+        CheckConstraint("lifecycle IN ('open', 'resolved')", name="ck_error_lifecycle"),
+    )
+
+
+class ErrorObservation(Base):
+    """Replay receipts survive episode changes, including explicit regression events."""
+
+    __tablename__ = "error_observations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
+    source: Mapped[str] = mapped_column(String(40))
+    external_id: Mapped[str] = mapped_column(String(200))
+    observation_key: Mapped[str] = mapped_column(String(64))
+    error_id: Mapped[str] = mapped_column(ForeignKey("error_records.id"), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "repo_id", "source", "external_id", "observation_key",
+                         name="uq_error_observation"),
+    )
+
+
+class SuspectedCause(Base):
+    __tablename__ = "suspected_causes"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    error_id: Mapped[str] = mapped_column(ForeignKey("error_records.id"), index=True)
+    error_revision: Mapped[int] = mapped_column(Integer)
+    repo_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), index=True)
+    pr_number: Mapped[int] = mapped_column(Integer)
+    merge_sha: Mapped[str] = mapped_column(String(64))
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    disposition: Mapped[str] = mapped_column(String(20), default="pending")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    decision_id: Mapped[str | None] = mapped_column(ForeignKey("decisions.id"), nullable=True)
+    side_effect_progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("error_id", "repo_id", "pr_number", "merge_sha", name="uq_error_cause"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_cause_confidence"),
+        CheckConstraint("pr_number > 0 AND error_revision > 0", name="ck_cause_numbers"),
+        CheckConstraint("disposition IN ('pending', 'confirmed', 'rejected', 'uncertain')", name="ck_cause_disposition"),
+    )
+
+
+class TraceRun(Base):
+    """Standalone tracer accounting; deliberately does not relax Run.outcome_id."""
+
+    __tablename__ = "trace_runs"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    error_id: Mapped[str] = mapped_column(ForeignKey("error_records.id"), index=True)
+    error_revision: Mapped[int] = mapped_column(Integer)
+    cycle_id: Mapped[str] = mapped_column(String(64), index=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    outcome_id: Mapped[str | None] = mapped_column(ForeignKey("outcomes.id"), nullable=True)
+    provider: Mapped[str] = mapped_column(String(20), default="")
+    model: Mapped[str] = mapped_column(String(100), default="")
+    harness: Mapped[str] = mapped_column(String(20), default="native")
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    turns: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (
+        CheckConstraint("error_revision > 0 AND attempt > 0 AND turns >= 0 AND input_tokens >= 0 "
+                        "AND output_tokens >= 0 AND cost_usd >= 0", name="ck_trace_usage"),
+        CheckConstraint("finished_at IS NULL OR finished_at >= started_at", name="ck_trace_dates"),
+    )
+
+
+class TraceState(Base):
+    """Workspace nightly cursor and fenced lease. Reservation survives lease expiry."""
+
+    __tablename__ = "trace_states"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    completed_cutoff: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cycle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cycle_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cycle_cutoff: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reserved_usd: Mapped[float] = mapped_column(Float, default=0)
+    spent_usd: Mapped[float] = mapped_column(Float, default=0)
+    __table_args__ = (CheckConstraint("reserved_usd >= 0 AND spent_usd >= 0", name="ck_trace_spend"),)

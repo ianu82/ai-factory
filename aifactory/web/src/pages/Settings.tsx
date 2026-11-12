@@ -84,6 +84,10 @@ function Policies() {
   const [mindBudget, setMindBudget] = useState(String(s.mind?.daily_budget_usd ?? 10));
   const [mindSaving, setMindSaving] = useState(false);
   useEffect(() => setMindBudget(String(s.mind?.daily_budget_usd ?? 10)), [ws.id, s.mind?.daily_budget_usd]);
+  const [alertAfter, setAlertAfter] = useState(String(s.alerts?.after_minutes ?? 120));
+  const [alertSaving, setAlertSaving] = useState(false);
+  useEffect(() => setAlertAfter(String(s.alerts?.after_minutes ?? 120)), [ws.id, s.alerts?.after_minutes]);
+  const validAlertAfter = /^\d+$/.test(alertAfter) && Number(alertAfter) >= 15 && Number(alertAfter) <= 1440;
   const qc = useQueryClient();
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const selected = policy.data?.after ?? s.autonomy;
@@ -122,6 +126,26 @@ function Policies() {
           <label className="field"><span>Mind daily budget (USD)</span><input className="input num" type="number" min={0} step="any" value={mindBudget} readOnly={!admin} disabled={mindSaving} aria-describedby="mind-budget-help" onChange={(e) => setMindBudget(e.target.value)} /><span className="hint" id="mind-budget-help">Default $10. Enter a finite, nonnegative amount. Only workspace admins and owners can change this limit.</span></label>
           {admin && <button className="btn primary" disabled={mindSaving || !validMindBudget(mindBudget)}>{mindSaving ? "Saving…" : "Save Mind budget"}</button>}
         </form>
+      </section>
+      <section className="s-block">
+        <h2>Alerts</h2>
+        <p>Every few minutes the Factory looks for stuck work: a decision waiting too long, a task waiting on a person with nothing to answer, an outcome where nothing moves, and the same failure across tasks. The outcome's Lead looks first; what stays stuck shows at the top of the Inbox.</p>
+        <form onSubmit={async (e) => {
+          e.preventDefault();
+          if (!admin || alertSaving || !validAlertAfter) return;
+          setAlertSaving(true);
+          try { await save({ alerts: { after_minutes: Number(alertAfter), slack: false, email: false } }); }
+          finally { setAlertSaving(false); }
+        }}>
+          <label className="field"><span>Alert when a decision has waited (minutes)</span><input className="input num" type="number" min={15} max={1440} step={1} value={alertAfter} readOnly={!admin} disabled={alertSaving} aria-describedby="alert-after-help" onChange={(e) => setAlertAfter(e.target.value)} /><span className="hint" id="alert-after-help">15–1440 · default 120</span></label>
+          {admin && <button className="btn primary" disabled={alertSaving || !validAlertAfter}>{alertSaving ? "Saving…" : "Save alert time"}</button>}
+        </form>
+        <div className="s-line"><div className="l"><b>In the app</b><span>Alerts show at the top of the Inbox.</span></div>
+          <Seg value="on" options={[["on", "On"]]} onChange={() => undefined} disabled /></div>
+        <div className="s-line"><div className="l"><b>Slack</b><span>Not available yet.</span></div>
+          <Seg value="off" options={[["off", "Off"], ["on", "On"]]} onChange={() => undefined} disabled /></div>
+        <div className="s-line"><div className="l"><b>Email</b><span>Not available yet.</span></div>
+          <Seg value="off" options={[["off", "Off"], ["on", "On"]]} onChange={() => undefined} disabled /></div>
       </section>
       <section className="s-block">
         <h2>Throughput and limits</h2>

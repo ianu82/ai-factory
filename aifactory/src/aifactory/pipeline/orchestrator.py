@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from .. import merge_manager
@@ -22,6 +23,7 @@ from ..models import Decision, Outcome, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
+from .holds import held_workspaces
 from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
 from .planning import plan_outcome
 from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
@@ -33,14 +35,23 @@ ACTIVE_TASK = {"queued", "running", "waiting_ci"}
 DONE_TASK = {"completed"}
 TERMINAL_TASK = {"completed", "abandoned", "cancelled", "reverted", "handed_over"}
 HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_failed"}
+# A running task is leased to the instance that runs it. The instance extends the lease every HEARTBEAT_SECONDS;
+# a lease that ran out belongs to nobody and any instance may requeue the task.
+LEASE_SECONDS = 90
+HEARTBEAT_SECONDS = LEASE_SECONDS / 3
 
 
 class Orchestrator:
     def __init__(self) -> None:
         self._purge_task: asyncio.Task | None = None
-        self.instance = f"{os.getpid()}"
+        import secrets
+        import socket
+
+        # Unique per process start: in a container the process id alone is the same number on every start.
+        self.instance = f"{socket.gethostname()[:40]}-{os.getpid()}-{secrets.token_hex(3)}"
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         self._planning: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._ci_polls: dict[str, asyncio.Task] = {}
         self._tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
@@ -57,17 +68,23 @@ class Orchestrator:
         self._vm_sweep_task: asyncio.Task | None = None
         self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
         self._lead_check = float("-inf")
+        self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
         if self._loop_task is None:
+            log.info("instance %s", self.instance)
             log.info("capacity %s check_slots=%d", host_capacity(), check_slot_count())
             trash = quarantine_orphaned_jobs()
             if trash is not None:
                 log.info("moved job directories left by the previous run aside: %s", trash.name)
             self._purge_task = asyncio.create_task(asyncio.to_thread(purge_quarantine), name="purge-jobs")
             self._recover()
+            import time
+
+            self._last_reclaim = time.monotonic()  # _recover just looked: the periodic pass starts an interval later
             self._loop_task = asyncio.create_task(self._run(), name="orchestrator")
+            self._heartbeat_task = asyncio.create_task(self._beat(), name="lease-heartbeat")
             from ..linear_sync import LinearSync
 
             self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
@@ -76,10 +93,14 @@ class Orchestrator:
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
         self._stopping = True
-        for job, _cancel in list(self._planning.values()) + list(self._tasks.values()):
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        jobs = [job for job, _cancel in list(self._planning.values()) + list(self._tasks.values())]
+        for job in jobs:
             job.cancel()
         for job in list(self._ci_polls.values()):
             job.cancel()
+        released = asyncio.create_task(self._release(jobs), name="release-leases")  # beside the rest of the shutdown
         for job in list(self._leads.values()):
             job.cancel()
         await asyncio.gather(*list(self._leads.values()), return_exceptions=True)
@@ -95,7 +116,21 @@ class Orchestrator:
         if self._vm_sweep_task:
             self._vm_sweep_task.cancel()
             await asyncio.gather(self._vm_sweep_task, return_exceptions=True)
+        await released
         await asyncio.sleep(0)
+
+    async def _release(self, jobs: list[asyncio.Task]) -> None:
+        """The cancelled jobs put their work back in their handlers. Wait for that, bounded (a job stuck in a sandbox
+        call must not hold the shutdown), then give up every lease this instance still holds: the next start requeues
+        those tasks at once instead of waiting for the lease to run out."""
+        if jobs:
+            await asyncio.wait(jobs, timeout=10)
+        try:
+            with session_scope() as s:
+                s.query(Task).filter(Task.lease_owner == self.instance, Task.status == "running").update(
+                    {Task.lease_owner: "", Task.lease_expires_at: None}, synchronize_session=False)
+        except Exception:
+            log.exception("could not release this instance's task leases")
 
     def wake(self) -> None:
         try:
@@ -113,32 +148,111 @@ class Orchestrator:
                                                         Task.status == "running")]
         return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
                 "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage(),
-                "leads": list(self._leads)}
+                "leads": list(self._leads), "instance": self.instance}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
         with session_scope() as s:
-            s.query(Task).filter(Task.status == "waiting_ci").update({Task.lease_owner: ""})
-            for task in s.query(Task).filter(Task.status == "running"):
-                task.status = "queued"
-                task.lease_owner = ""
-                record(task.workspace_id, "resumed", f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
-                       outcome_id=task.outcome_id, task_id=task.id, session=s)
+            s.query(Task).filter(Task.status == "waiting_ci").update(
+                {Task.lease_owner: "", Task.lease_expires_at: None})
+        self._reclaim()
         self._close_interrupted_runs()
         from .lead import recover as recover_leads
 
         recover_leads()
         self._complete_accepted()
 
-    def _close_interrupted_runs(self) -> None:
+    def _reclaim(self, close_runs: bool = False) -> list[str]:
+        """Requeue the running tasks nobody holds: no owner, no expiry (rows from before leases had one) or a lease
+        that ran out. A live lease is another instance's work. A task this instance runs is its own to finish, even
+        when its heartbeat fell behind. Returns the ids of the tasks it requeued.
+
+        `close_runs`: their owner died mid-session, so close the sessions it left open, in the transaction that
+        requeues the tasks: once that is committed another server may claim one and start a session of its own. A
+        start closes every session nobody is running right after this, so it does not ask."""
+        from sqlalchemy import or_
+
+        now = utcnow()
+        reclaimed: list[str] = []
+        free = or_(Task.lease_owner == "", Task.lease_expires_at.is_(None), Task.lease_expires_at < now)
+        with session_scope() as s:
+            for task in s.query(Task).filter(Task.status == "running", free).all():
+                if task.id in self._tasks:
+                    continue
+                owner, expired = task.lease_owner, task.lease_expires_at
+                # Conditional: its owner may have renewed the lease, or moved the task on, since the read.
+                if not s.query(Task).filter(Task.id == task.id, Task.status == "running", free).update(
+                        {Task.status: "queued", Task.lease_owner: "", Task.lease_expires_at: None},
+                        synchronize_session=False):
+                    continue
+                reclaimed.append(task.id)
+                if owner and owner != self.instance and expired:
+                    log.info("reclaimed %s from instance %s: its lease ran out %.0fs ago", task.key, owner,
+                             (now - expired).total_seconds())
+                record(task.workspace_id, "resumed",
+                       f"{task.key} resumed after a restart (stage: {task.stage or 'start'})",
+                       outcome_id=task.outcome_id, task_id=task.id, session=s)
+            if close_runs and reclaimed:
+                self._close_interrupted_runs(reclaimed, session=s)
+        return reclaimed
+
+    def _maybe_reclaim(self) -> None:
+        """A task whose owner died without releasing it is picked up once its lease has run out."""
+        import time
+
+        if time.monotonic() - getattr(self, "_last_reclaim", float("-inf")) < HEARTBEAT_SECONDS:
+            return
+        self._last_reclaim = time.monotonic()
+        self._reclaim(close_runs=True)  # the start-up pass left a live owner's sessions open for it
+
+    def _lease_end(self):
+        from datetime import timedelta
+
+        return utcnow() + timedelta(seconds=LEASE_SECONDS)
+
+    def _heartbeat(self) -> None:
+        """Extend the lease of every task this instance is running. A row it holds without a job is left to run out,
+        so the periodic pass picks it up."""
+        if not self._tasks:
+            return
+        with session_scope() as s:
+            # updated_at is the task's last change; a heartbeat is not one.
+            s.query(Task).filter(Task.id.in_(list(self._tasks)), Task.lease_owner == self.instance,
+                                 Task.status == "running").update(
+                {Task.lease_expires_at: self._lease_end(), Task.updated_at: Task.updated_at}, synchronize_session=False)
+
+    async def _beat(self) -> None:
+        """Its own task, not a pass of _run: one scheduler tick can outlast a lease (cost reconciliation and signal
+        sync await providers call by call)."""
+        while not self._stopping:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            try:
+                self._heartbeat()
+            except Exception:  # a failed beat is retried at the next one; two may be missed before the lease runs out
+                log.exception("lease heartbeat failed")
+
+    def _close_interrupted_runs(self, tasks: list[str] | None = None, session=None) -> None:
         """A killed process never reaches run_agent's finally, so its sessions would stay "running" for good.
-        Close them as interrupted, which is not a verdict on the work. Lead sessions are closed by lead.recover()."""
-        from sqlalchemy import func, select
+        Close them as interrupted, which is not a verdict on the work. Lead sessions are closed by lead.recover().
+
+        At a start (`tasks` is None) that is every open session except those of a task another instance holds with a
+        live lease: that session is running now, on the other server. They are closed when their task is reclaimed,
+        if its owner dies without closing them (`tasks`: the ids being requeued; `session`: the transaction that
+        requeues them, so a session another server starts after claiming one is never among them)."""
+        from contextlib import nullcontext
+
+        from sqlalchemy import func, or_, select
 
         from ..models import Event, Run
 
         open_runs = (Run.status == "running", Run.role != "lead")
-        with session_scope() as s:
+        if tasks is not None:
+            open_runs += (Run.task_id.in_(tasks),)
+        else:
+            held = select(Task.id).where(Task.status == "running", Task.lease_owner.notin_(("", self.instance)),
+                                         Task.lease_expires_at > utcnow())
+            open_runs += (or_(Run.task_id.is_(None), Run.task_id.notin_(held)),)
+        with (session_scope() if session is None else nullcontext(session)) as s:
             # Events are indexed by outcome, not by run; a session's events carry both.
             last_event = dict(s.query(Event.run_id, func.max(Event.created_at)).filter(
                 Event.outcome_id.in_(select(Run.outcome_id).where(*open_runs)),
@@ -181,6 +295,7 @@ class Orchestrator:
     async def _run(self) -> None:
         while not self._stopping:
             try:
+                self._maybe_reclaim()
                 await asyncio.to_thread(self._promote)
                 self._schedule()
                 await self._maybe_sync_signals()
@@ -189,6 +304,7 @@ class Orchestrator:
                 await self._maybe_reconcile_pulls()
                 await self._maybe_inventory()
                 await self._maybe_sweep_vms()
+                await self._maybe_watch()
                 await self._maybe_run_leads()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
@@ -326,6 +442,21 @@ class Orchestrator:
             priced += 1
         if priced:
             log.info("priced %d run(s) from provider usage", priced)
+
+    async def _maybe_watch(self) -> None:
+        """Every few minutes, look for stuck work and repeated failures: wake Leads, raise alerts (watch.py)."""
+        from .watch import WATCH_EVERY, run as watch
+
+        if time.monotonic() - self._last_watch < WATCH_EVERY.total_seconds():
+            return
+        self._last_watch = time.monotonic()
+        try:
+            counts = await asyncio.to_thread(watch)
+        except Exception:  # the watch must never stop scheduling
+            log.exception("watch failed")
+            return
+        if any(counts.values()):
+            log.info("watch %s", counts)
 
     def _maybe_analyze(self) -> None:
         """Refresh improvement proposals from delivery history (every 30 minutes by default)."""
@@ -523,6 +654,8 @@ class Orchestrator:
         now = utcnow().isoformat()
         with session_scope() as s:
             workspaces = {w.id: w for w in s.query(Workspace)}
+            # The model provider refused these workspaces: nothing starts there until a person resumes the hold.
+            on_hold = held_workspaces(s)
             limits = {wid: merged_settings(w.settings) for wid, w in workspaces.items()}
             planning = [Candidate(o.id, o.workspace_id, o.priority, o.created_by, o.created_at)
                         for o in s.query(Outcome).filter(Outcome.source != "review", Outcome.status == "planning")]
@@ -548,6 +681,7 @@ class Orchestrator:
             while len(active) < global_limit:
                 eligible = [c for c in candidates if c.id not in active
                             and c.workspace_id in workspaces and not workspaces[c.workspace_id].paused
+                            and c.workspace_id not in on_hold
                             and counts.get(c.workspace_id, 0) < limits[c.workspace_id][limit_key]]
                 if not eligible:
                     break
@@ -573,7 +707,9 @@ class Orchestrator:
             due = [t.id for t in s.query(Task).join(Workspace, Task.workspace_id == Workspace.id)
                    .filter(Task.status == "waiting_ci", Workspace.paused.is_(False))
                    .order_by(Task.updated_at, Task.id)
-                   if ((t.evidence or {}).get("ci_wait") or {}).get("next_poll_at", "") <= now
+                   # A head waiting for its review (stage "review") is polled on the review wait's own clock.
+                   if ((t.evidence or {}).get("review" if t.stage == "review" else "ci_wait") or {}).get(
+                       "next_poll_at", "") <= now
                    and t.id not in self._ci_polls and t.id not in self._tasks][:4 - len(self._ci_polls)]
         for task_id in due:
             async def poll(tid=task_id):
@@ -623,29 +759,33 @@ class Orchestrator:
         self._planning[outcome_id] = (asyncio.create_task(job(), name=f"plan-{outcome_id}"), cancel)
 
     def _spawn_task(self, task_id: str) -> None:
+        if self._stopping:  # a tick still in flight during shutdown must not take a lease nobody will release
+            return
         cancel = asyncio.Event()
         with session_scope() as s:
             task = s.get(Task, task_id)
-            if task.status != "queued" or not transition(s, task, status="running", lease_owner=self.instance):
+            if task.status != "queued" or not transition(s, task, status="running", lease_owner=self.instance,
+                                                         lease_expires_at=self._lease_end()):
                 return
             ws, outcome_id = task.workspace_id, task.outcome_id
         notify(ws, "task", task_id, outcome_id=outcome_id)
 
         async def job() -> None:
             try:
-                await TaskRunner(task_id, cancel, self.repo_lock).run()
+                await TaskRunner(task_id, cancel, self.repo_lock, self.instance).run()
             except asyncio.CancelledError:
                 with session_scope() as s:
                     task = s.get(Task, task_id)
                     if task and task.status == "running":
-                        transition(s, task, status="cancelled" if cancel.is_set() else "queued", lease_owner="")
+                        transition(s, task, owner=self.instance, status="cancelled" if cancel.is_set() else "queued",
+                                   lease_owner="")
             except Exception as exc:
                 log.exception("task crashed")
                 try:
                     with session_scope() as s:
                         task = s.get(Task, task_id)
                         if task.status not in ("queued", "running") or not transition(
-                                s, task, status="blocked", lease_owner="",
+                                s, task, owner=self.instance, status="blocked", lease_owner="",
                                 blocked_reason=f"{type(exc).__name__}: {exc}"[:2000]):
                             return
                         from ..models import Decision
@@ -666,19 +806,20 @@ class Orchestrator:
                     task = s.get(Task, task_id)
                     if task and task.status == "running" and not self._stopping:
                         # Never silently loop: a runner that stops without a recorded state needs a look.
-                        transition(s, task, status="blocked", lease_owner="",
+                        transition(s, task, owner=self.instance, status="blocked", lease_owner="",
                                    blocked_reason="The task stopped without recording an outcome.")
                     if task and task.status == "running":
                         # A workspace pause stops continuation at the next gate;
                         # retain the stage for resumption when it is unpaused.
                         s.query(Task).filter(Task.id == task_id, Task.status == "running",
+                                             Task.lease_owner.in_(("", self.instance)),
                                              Task.stage == task.stage, Task.workspace_id.in_(
                                                  s.query(Workspace.id).filter(Workspace.paused.is_(True)))).update(
                             {Task.status: "queued"}, synchronize_session=False)
                     if task:
                         # Leases are execution-only, including pause/stop/error exits.
                         s.query(Task).filter(Task.id == task_id, Task.lease_owner == self.instance).update(
-                            {Task.lease_owner: ""}, synchronize_session=False)
+                            {Task.lease_owner: "", Task.lease_expires_at: None}, synchronize_session=False)
                 notify(ws, "task", task_id, outcome_id=outcome_id)
                 self.wake()
 

@@ -130,7 +130,7 @@ class CodexHarness:
             failure = next((e for e in reversed(events) if e.get("type") in ("turn.failed", "error")), None)
             detail = json.dumps(failure)[:600] if failure else result.output[-800:]
             raise HarnessFailed(f"Codex did not return a report (exit {result.exit_code}): {detail}")
-        report, error = validate_report(session.role, report)
+        report, error = validate_report(session.role, report, session.expected_criteria, session.expected_findings)
         if report is None:
             raise HarnessFailed(f"Codex report was invalid: {error}")
         return HarnessResult(report=report, turns=turns, log=result.output[-4000:])
