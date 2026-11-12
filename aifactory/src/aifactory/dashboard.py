@@ -268,11 +268,17 @@ def series(db: Session, workspace_id: str, period: str = "week", buckets: int | 
                 else bump("cf_settled") if sample["settled"] else bump("cf_pending"))
 
     # Autonomy, per completed outcome. The Director standing in for people is not a person, and not hidden either.
-    def outcome_of(row) -> str | None:
-        return row.outcome_id or (tasks[row.task_id].outcome_id if row.task_id in tasks else None)
-
-    directed = {outcome_of(d) for d in decisions if (d.attribution or {}).get("source") == "director"}
-    directed |= {outcome_of(m) for m in messages if (m.attribution or {}).get("source") == "director"}
+    # Like metrics.autonomy, only what the Director did while the outcome was being delivered counts: a later note
+    # on a completed outcome doesn't rewrite how it was delivered.
+    directed: set[str] = set()
+    for row, at in [(d, d.resolved_at) for d in decisions] + [(m, m.created_at) for m in messages]:
+        if (row.attribution or {}).get("source") != "director":
+            continue
+        for outcome_id in {row.outcome_id, tasks[row.task_id].outcome_id if row.task_id in tasks else None}:
+            o = outcomes.get(outcome_id)
+            begun, done, when = (timestamp(o.created_at), timestamp(o.completed_at), timestamp(at)) if o else (None,) * 3
+            if begun and done and when and begun <= when <= done:
+                directed.add(outcome_id)
     classes = autonomy(outcomes, tasks, events, messages, decisions, set(system), plans)
     for outcome_id, kind in classes.items():
         o = outcomes[outcome_id]

@@ -263,3 +263,21 @@ def test_dashboard_endpoint_validates_and_keeps_workspaces_apart(client, signed_
     assert other.get(f"/api/workspaces/{ws}/dashboard").status_code == 401
     other.post("/auth/dev", json={"email": "other@test.com", "organization": "Other"})
     assert other.get(f"/api/workspaces/{ws}/dashboard").status_code in (403, 404)
+
+
+def test_director_activity_after_delivery_does_not_reclassify_it(client, signed_in):
+    ws = signed_in["workspaces"][0]["id"]
+    done = T0 + timedelta(hours=11)
+    with session_scope() as s:
+        director = User(email="director@factory.local", name="Director", is_system=True)
+        s.add(director)
+        s.flush()
+        o = outcome(s, ws, completed=done)
+        t = task(s, ws, o, status="completed", finished_at=done)
+        # A note and a decision on the finished outcome: they say nothing about how it was delivered.
+        s.add(Message(workspace_id=ws, outcome_id=o.id, author_id=director.id, author_kind="user", body="Later",
+                      attribution={"source": "director"}, created_at=done + timedelta(hours=1)))
+        s.add(Decision(workspace_id=ws, task_id=t.id, kind="supervisor", title="Finding", status="resolved",
+                       resolution="acknowledge", resolved_by=director.id, resolved_at=done + timedelta(hours=2),
+                       attribution={"source": "director"}, created_at=done))
+    assert board(ws)["buckets"][2]["autonomy"] == {"unattended": 1, "director": 0, "assisted": 0, "unverified": 0}
