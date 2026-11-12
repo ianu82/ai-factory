@@ -182,3 +182,113 @@ def test_model_client_speaks_responses_api_and_round_trips_reasoning(monkeypatch
     replay = seen[1]["input"]
     assert {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc", "summary": []} in replay
     assert replay[-1] == {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}
+
+
+def definition_context():
+    return {"skills": {"w/skill/test": {"id": "w/skill/test", "name": "test", "description": "when testing",
+                                      "body": "x" * 65536, "source": {"kind": "managed"},
+                                      "files": {"docs/guide.txt": "a" * 100000}}},
+            "knowledge": {"w/knowledge/notes": {"id": "w/knowledge/notes", "name": "notes", "description": "notes",
+                                               "source": {"kind": "managed"}, "body": "notes" * 20000}}}
+
+
+def test_native_shared_definition_tools_are_on_demand_and_unclipped(tmp_path):
+    events = []
+    def fn(messages):
+        if step(messages) == 0:
+            assert "x" * 100 not in str(messages)
+            return {"tool_calls": [call("read_skill", {"skill_id": "w/skill/test"}),
+                                   call("search_knowledge", {"query": "notes"}, 1)]}
+        outputs = [m["content"] for m in messages if m["role"] == "tool"]
+        assert outputs[0] == "x" * 65536
+        assert json.loads(outputs[1])["pages"][0]["id"] == "w/knowledge/notes"
+        return {"tool_calls": [call("finish", {"status": "done", "summary": "ok"})]}
+    session, _, _ = make_session(tmp_path, fn, definition_context=json.dumps(definition_context()),
+                                 definition_revision=4, on_progress=lambda *args: events.append(args))
+    asyncio.run(NativeHarness().run(session))
+    assert [e[0] for e in events].count("skill_loaded") == 1
+    assert session.loaded_skills[0]["revision"] == 4
+
+
+def test_definition_tools_confine_and_paginate_supporting_files_and_pages(tmp_path):
+    from aifactory.harness.tools import ToolBox, tool_specs
+    events = []
+    session, _, _ = make_session(tmp_path, lambda _: None, definition_context=json.dumps(definition_context()),
+                                 on_progress=lambda *args: events.append(args))
+    box = ToolBox(session)
+    async def go():
+        for args in ({"skill_id": "other/skill/test"}, {"skill_id": "test"},
+                     {"skill_id": "w/skill/test", "workspace_id": "other"},
+                     {"skill_id": "w/skill/test", "path": "../guide.txt"},
+                     {"skill_id": "w/skill/test", "path": "/guide.txt"},
+                     {"skill_id": "w/skill/test", "path": "docs/missing.txt"}):
+            assert (await box.call("read_skill", args)).startswith("Error:")
+        page = json.loads(await box.call("read_skill", {"skill_id": "w/skill/test", "path": "docs/guide.txt", "limit": 999999}))
+        assert len(page["body"]) == 16000 and page["next_offset"] == 16000 and page["total"] == 100000
+        tail = json.loads(await box.call("read_skill", {"skill_id": "w/skill/test", "path": "docs/guide.txt", "offset": 96000}))
+        assert len(tail["body"]) == 4000 and tail["next_offset"] is None
+        page = json.loads(await box.call("search_knowledge", {"page_id": "w/knowledge/notes"}))
+        assert len(page["body"]) == 16000 and page["next_offset"] == 16000
+        assert (await box.call("search_knowledge", {"page_id": "other/knowledge/notes"})).startswith("Error:")
+        assert not events and not session.loaded_skills
+        for _ in range(2):
+            assert len(await box.call("read_skill", {"skill_id": "w/skill/test"})) == 65536
+    asyncio.run(go())
+    assert len(events) == 2 and len(session.loaded_skills) == 1
+    assert {t["function"]["name"] for t in tool_specs(False)} >= {"read_skill", "search_knowledge"}
+
+
+def test_native_bounds_batched_skill_bodies_without_counting_deferred_loads(tmp_path):
+    context = definition_context()
+    template = context['skills']['w/skill/test']
+    context['skills'] = {f'w/skill/{i}': {**template, 'id': f'w/skill/{i}', 'name': f'skill-{i}'}
+                         for i in range(8)}
+    events = []
+
+    def fn(messages):
+        turn = step(messages)
+        if turn == 0:
+            return {'tool_calls': [call('read_skill', {'skill_id': f'w/skill/{i}'}, i) for i in range(8)]}
+        batch = [m['content'] for m in messages if m['role'] == 'tool'][-(8 if turn == 1 else 6):]
+        assert batch[:2] == ['x' * 65536] * 2  # full bodies, never clipped
+        assert all('not loaded: output budget for this turn reached, call read_skill again' in result
+                   for result in batch[2:])
+        assert sum(len(result.encode()) for result in batch) < tools.SKILL_BODY_TURN_BUDGET + 1000
+        assert len(events) == len(session.loaded_skills) == turn * 2
+        assert [item['id'] for item in session.loaded_skills] == [f'w/skill/{i}' for i in range(turn * 2)]
+        if turn == 1:
+            # The next response resets the shared budget, and deferred IDs remain readable.
+            return {'tool_calls': [call('read_skill', {'skill_id': f'w/skill/{i}'}, i) for i in range(2, 8)]}
+        return {'tool_calls': [call('finish', {'status': 'done', 'summary': 'ok'})]}
+
+    session, _, _ = make_session(tmp_path, fn, definition_context=json.dumps(context),
+                                 on_progress=lambda *args: events.append(args))
+    asyncio.run(NativeHarness().run(session))
+    assert len(events) == 4
+    assert all(event[0] == 'skill_loaded' for event in events)
+
+
+def test_knowledge_source_metadata_is_bounded_and_search_advances(tmp_path):
+    context = definition_context()
+    source = {'kind': 'managed', 'repository_id': None,
+              'path': 'a' * 450000, 'commit': 'b' * 450000}
+    context['knowledge']['w/knowledge/notes']['source'] = source
+    session, _, _ = make_session(tmp_path, None, definition_context=json.dumps(context))
+    box = tools.ToolBox(session)
+
+    async def go():
+        output = await box.call('search_knowledge', {'page_id': 'w/knowledge/notes'})
+        page = json.loads(output)
+        assert len(output) < 18000
+        assert len(page['body']) == 16000 and page['next_offset'] == 16000
+        assert page['source']['path'].endswith('… [truncated]')
+        assert page['source']['commit'].endswith('… [truncated]')
+        result = await box.call('search_knowledge', {'query': 'notes', 'limit': 1})
+        hits = json.loads(result)
+        assert len(result) < 2000
+        assert len(hits['pages']) == 1 and hits['next_offset'] is None
+        assert hits['pages'][0]['source'] == page['source']
+        assert box.definitions['knowledge']['w/knowledge/notes']['source'] == source
+        assert not session.loaded_skills
+
+    asyncio.run(go())

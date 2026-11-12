@@ -2305,6 +2305,16 @@ def test_shared_agent_hook_rehydrates_every_role_attempt_and_resume(factory, tmp
     from .test_attachments import seed_references
 
     outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        from aifactory.models import Plan
+        plan = Plan(outcome_id=outcome_id, version=1)
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, repo_id=factory["repo"],
+                    key="T1", title="attachment test")
+        s.add(task)
+        s.flush()
+        task_id = task.id
     rows = seed_references(factory["ws"], outcome_id)
     sb = LocalSandbox("retry-refs", root=tmp_path / "retry-refs").create()
     sb.work.mkdir()
@@ -2328,7 +2338,7 @@ def test_shared_agent_hook_rehydrates_every_role_attempt_and_resume(factory, tmp
     async def go():
         for role, attempt in [("planner", 1), ("builder", 1), ("builder", 1), ("builder", 2),
                               ("verifier", 1), ("verifier", 2)]:
-            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, role, harness_name,
+            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, task_id if role != "planner" else None, role, harness_name,
                                                             "task", "system", sb, attempt=attempt), asyncio.Event())
             assert run.status == "succeeded" and result and not error
         # The same references for every role, attempt and resume; only a builder's prompt goes on to state its budget.
@@ -2347,6 +2357,16 @@ def test_attachment_setup_failure_finishes_run_and_revokes_gateway(factory, tmp_
     from .test_attachments import attachment
 
     outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        from aifactory.models import Plan
+        plan = Plan(outcome_id=outcome_id, version=1)
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, repo_id=factory["repo"],
+                    key="T1", title="attachment test")
+        s.add(task)
+        s.flush()
+        task_id = task.id
     sb = LocalSandbox("failure", root=tmp_path / "failure").create()
     sb.work.mkdir()
     with session_scope() as s:
@@ -2387,7 +2407,7 @@ def test_attachment_setup_failure_finishes_run_and_revokes_gateway(factory, tmp_
             pytest.fail("invalid attachment reached the harness")
 
     monkeypatch.setattr(runtime, "get_harness", lambda _: NeverHarness())
-    run, result, error = asyncio.run(run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "codex",
+    run, result, error = asyncio.run(run_agent(SessionSpec(factory["ws"], outcome_id, task_id, "builder", "codex",
                                                           "task", "system", sb), asyncio.Event()))
     assert error and result is None and run.status == "failed" and run.finished_at
     assert granted == revoked == [run.id]
@@ -2407,6 +2427,16 @@ def test_no_attachments_leave_shared_session_unchanged(factory, tmp_path, monkey
     from aifactory.sandbox import LocalSandbox
 
     outcome_id = new_outcome(factory)
+    with session_scope() as s:
+        from aifactory.models import Plan
+        plan = Plan(outcome_id=outcome_id, version=1)
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=factory["ws"], outcome_id=outcome_id, plan_id=plan.id, repo_id=factory["repo"],
+                    key="T1", title="attachment test")
+        s.add(task)
+        s.flush()
+        task_id = task.id
     sb = LocalSandbox("no-refs", root=tmp_path / "no-refs").create()
     sb.work.mkdir()
 
@@ -2424,7 +2454,7 @@ def test_no_attachments_leave_shared_session_unchanged(factory, tmp_path, monkey
 
     async def go():
         for _ in range(2):
-            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, None, "builder", "anton",
+            run, result, error = await run_agent(SessionSpec(factory["ws"], outcome_id, task_id, "builder", "anton",
                                                             "original prompt", "system", sb), asyncio.Event())
             assert run.status == "succeeded" and result and not error
 

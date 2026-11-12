@@ -220,6 +220,7 @@ def test_selected_endpoint_digest(provider, env, monkeypatch, client, signed_in)
 
 @pytest.mark.parametrize("role", ["planner", "builder", "verifier"])
 async def test_run_persistence_override_and_immutable_snapshot(role, client, signed_in, monkeypatch):
+    from aifactory.models import Task, Plan
     from aifactory.harness import HarnessResult
     from types import SimpleNamespace
     ws = signed_in["workspaces"][0]["id"]
@@ -228,6 +229,16 @@ async def test_run_persistence_override_and_immutable_snapshot(role, client, sig
         s.add(o)
         s.flush()
         oid = o.id
+        repo = Repository(workspace_id=ws, full_name="a/b")
+        s.add(repo)
+        s.flush()
+        plan = Plan(outcome_id=oid, version=1)
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=ws, outcome_id=oid, plan_id=plan.id, repo_id=repo.id, key="T1", title="test")
+        s.add(task)
+        s.flush()
+        tid = task.id if role != "planner" else None
     provider = ProviderConfig("openai", "http://model.test", "key", "Test", model_override="provider-model")
     monkeypatch.setattr(runtime, "resolve_provider", lambda *a, **kw: provider)
     async def prepare(*args):
@@ -242,7 +253,7 @@ async def test_run_persistence_override_and_immutable_snapshot(role, client, sig
     monkeypatch.setattr(runtime, "get_harness", lambda _: Harness())
     settings = {"models": {role: "workspace-model"}, "limits": {f"{role}_turns": 7}}
     repo_cfg = {"context": "loaded notes"}
-    spec = runtime.SessionSpec(ws, oid, None, role, "native", "task one", "system", SimpleNamespace(kind="local"),
+    spec = runtime.SessionSpec(ws, oid, tid, role, "native", "task one", "system", SimpleNamespace(kind="local"),
                                effective_settings=settings, repositories={"a/b": repo_cfg})
     settings["limits"][f"{role}_turns"] = 99
     repo_cfg["context"] = "edited notes"
@@ -259,11 +270,11 @@ async def test_run_persistence_override_and_immutable_snapshot(role, client, sig
     with db.session_scope() as s:
         assert s.get(Run, run.id).config_version == run.config_version
         assert s.get(Workspace, ws).settings.get("models", {}).get(role) != "workspace-model"
-    spec2 = runtime.SessionSpec(ws, oid, None, role, "native", "different task", "system", spec.sandbox,
+    spec2 = runtime.SessionSpec(ws, oid, tid, role, "native", "different task", "system", spec.sandbox,
                                 effective_settings=spec.effective_settings, repositories=spec.repositories)
     second, _, _ = await runtime.run_agent(spec2, asyncio.Event())
     assert second.config_version == run.config_version
-    explicit = runtime.SessionSpec(ws, oid, None, role, "native", "task", "system", spec.sandbox,
+    explicit = runtime.SessionSpec(ws, oid, tid, role, "native", "task", "system", spec.sandbox,
                                    effective_settings=spec.effective_settings, model_override="benchmark-model")
     third, _, _ = await runtime.run_agent(explicit, asyncio.Event())
     assert third.model == seen[-1].model == "benchmark-model" and third.config_version != run.config_version
@@ -297,7 +308,7 @@ def test_new_database_columns():
 
 
 async def test_runner_uses_loaded_repository_snapshot(tmp_path, monkeypatch):
-    from aifactory.models import Task
+    from aifactory.models import Task, Plan
     from aifactory.pipeline import planning
     from aifactory.pipeline.delivery import TaskRunner
     from .test_pipeline import factory, new_outcome
@@ -324,8 +335,11 @@ async def test_runner_uses_loaded_repository_snapshot(tmp_path, monkeypatch):
             assert run.config_version and serializers.run(run)["config_version"] == run.config_version
             assert run.config_snapshot["repositories"]["acme/demo"]["checks"] == loaded["checks"]
             if run.role in ("builder", "verifier"):
-                expected, _ = versions.configuration_version(
+                import hashlib
+                from aifactory.config_versions import canonical_json
+                _, base = versions.configuration_version(
                     role=run.role, system=prompts.BUILDER if run.role == "builder" else prompts.VERIFIER,
                     harness=run.harness, provider=ProviderConfig("openai", "http://model.test", "k", "Test"),
                     model=run.model, settings=runner.settings, repositories={"acme/demo": loaded})
-                assert run.config_version == expected
+                base["definitions"] = run.config_snapshot["definitions"]
+                assert run.config_version == hashlib.sha256(canonical_json(base).encode()).hexdigest()[:16]

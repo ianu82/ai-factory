@@ -402,10 +402,25 @@ class BenchmarkTrial(Base):
     cost_known: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class RunDefinition(Base):
+    """Pinned effective definitions; never fetched by aggregate Run queries."""
+
+    __tablename__ = "run_definitions"
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, deferred=True)
+    applicable_skills: Mapped[list] = mapped_column(JSON, default=list)
+    loaded_skills: Mapped[list] = mapped_column(JSON, default=list)
+    instructions: Mapped[list] = mapped_column(JSON, default=list, deferred=True)
+    instruction_metadata: Mapped[list | None] = mapped_column(JSON, nullable=True, default=list)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class Run(Base):
     """One agent session (planner, builder, verifier) and what it cost."""
 
     __tablename__ = "runs"
+    definition: Mapped[RunDefinition | None] = relationship(lazy="select", uselist=False)
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     outcome_id: Mapped[str] = mapped_column(ForeignKey("outcomes.id"), index=True)

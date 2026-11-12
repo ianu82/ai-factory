@@ -61,6 +61,13 @@ class HarnessSession:
     # Ids of the review findings a builder was given: its report answers each (see validate_report).
     expected_findings: list[str] | None = None
 
+    # JSON owns a detached immutable copy: tools cannot consult a later workspace head.
+    definition_context: str = "{}"
+    definition_revision: int | None = None
+    applicable_skills: list[dict[str, Any]] = field(default_factory=list)
+    loaded_skills: list[dict[str, Any]] = field(default_factory=list)
+    applied_instructions: list[dict[str, Any]] = field(default_factory=list)
+
     def remaining(self) -> float:
         return self.deadline - time.monotonic()
 
