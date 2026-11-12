@@ -16,7 +16,6 @@ import posixpath
 import re
 import shlex
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -33,13 +32,12 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
 from ..gitops import patch_id
 from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
 from ..harness.schemas import _criterion_key
-from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
+from ..prompts import BUILDER, build_prompt, review_findings
 from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, findings_unseen, headline,
                       new_review_evidence, normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
 from ..sandbox import COMMAND_TIMEOUT, LocalSandbox, SandboxError
-from .check_slots import check_slot
+from .verification import VerificationGates, verify_candidate, _failing_tests, _output_signature
 from .context import plan_context, repo_instructions
-from .qa import AppRun, change_checks, verifier_brief
 from .runtime import (SessionSpec, budget_extension, carried_cause, guidance_history, open_decision,
                       outcome_committed, outcome_cost, precedents, publish_decision, run_agent, workspace_settings)
 
@@ -205,10 +203,11 @@ class Stop(Exception):
     """The task paused or ended for a recorded reason; the orchestrator should release its slot."""
 
 
-class TaskRunner:
+class TaskRunner(VerificationGates):
     def __init__(self, task_id: str, cancelled: asyncio.Event, repo_lock: Callable[[str], asyncio.Lock],
-                 owner: str | None = None):
+                 owner: str | None = None, *, optional_gates: dict[str, Callable[..., Any]] | None = None):
         self.task_id = task_id
+        self.optional_gates = optional_gates or {}
         self.cancelled = cancelled
         self.repo_lock = repo_lock
         # The instance whose lease this runner works under: once another instance holds the task, its writes stop
@@ -253,7 +252,9 @@ class TaskRunner:
                 continue  # not the end of an attempt: what came before it still stands
             verdict, failed = attempt.get("verdict"), [c for c in _objects(attempt.get("checks")) if not c.get("ok")]
             if result == "verification_failed" and isinstance(verdict, dict) and verdict:
-                return _review_feedback(verdict, str(attempt.get("app_log") or ""))
+                return [f"- Verifier setup `{c.get('command')}` failed: {c.get('tail', '')}"
+                        for c in _objects(attempt.get("setup")) if not c.get("ok")] + _review_feedback(
+                            verdict, str(attempt.get("app_log") or ""))
             if result == "checks_failed" and failed:
                 return [f"- Check `{c.get('command')}` failed (exit {c.get('exit_code')})"
                         + (" (it fails the same way on the base commit)" if c.get("preexisting") else "")
@@ -1171,93 +1172,6 @@ class TaskRunner:
             return "- The diff is larger than 5 MB. Remove generated or binary files from the change."
         return ""
 
-    @asynccontextmanager
-    async def _check_slot(self, sandbox, needed: bool = True):
-        """Hold a host check slot while the repository's checks run in a local sandbox (see check_slots), saying so
-        when every slot is taken. Waiting spends none of a command's timeout. Checks in a VM run off this host and
-        take no slot."""
-        if not needed or getattr(sandbox, "kind", "local") != "local":
-            yield
-            return
-        started = time.monotonic()
-        waited = False
-
-        def waiting(running: int, queued: int) -> None:
-            nonlocal waited
-            waited = True
-            self.event("check_slot_wait", f"Waiting for a check slot: {running} running on this server, {queued} waiting",
-                       running=running, waiting=queued)
-
-        async with check_slot(on_wait=waiting):
-            if waited:
-                seconds = round(time.monotonic() - started, 1)
-                self.event("check_slot", f"Got a check slot after waiting {seconds:.0f}s", waited=seconds)
-            yield
-
-    async def _run_commands(self, sandbox: LocalSandbox, commands: list[str], kind: str,
-                            timeout: float = COMMAND_TIMEOUT) -> list[dict[str, Any]]:
-        """Run each command and record how it ended. A failed row says why in ``cause``: "timeout", or "real" until
-        the comparison with the base commit finds it "preexisting". A candidate's check (``kind == "check"``) that
-        fails without timing out runs once more in the same sandbox, inside the caller's check slot. If it passes
-        then, it counts as passed, labelled "flaky", and keeps the first run's output in ``first_failure``. If it
-        fails again, the row describes the second run and keeps the first under ``first``: the comparison with the
-        base commit must hold for both, and the cause is "real" even when the second ran out of time. When the two
-        did not fail the same way, ``tail`` is the first run's output, the failure that started it. A timeout is
-        not run again: a second wait of the same length teaches nothing. Nor is a check whose failed run changed
-        the checkout's files (``not_rerun`` is "changed", with ``changed_files``): a second run would test what the
-        first run left behind, not the candidate, and could pass where a fresh checkout fails. Only files git can
-        see are compared; what a run leaves in ignored files or outside the checkout is not noticed."""
-        results = []
-        for command in commands:
-            before = await tree_id(sandbox) if kind == "check" else None
-            row, output = await self._run_command(sandbox, command, timeout)
-            rerun = kind == "check" and not row["ok"] and not row["timed_out"]
-            if rerun:
-                after = await tree_id(sandbox)
-                if not before or not after:
-                    rerun, row["not_rerun"] = False, "unknown"
-                elif after != before:
-                    rerun = False
-                    row |= {"not_rerun": "changed", "changed_files": await tree_changes(sandbox, before, after)}
-            if rerun:
-                first, first_output = row, output
-                row, output = await self._run_command(sandbox, command, timeout)
-                if row["ok"]:
-                    row |= {"cause": "flaky", "first_failure": first["tail"]}
-                    self.event("check_flaky", f"`{command}` failed (exit {first['exit_code']}), then passed when run "
-                               "again in the same sandbox: counted as passed", level="warn", command=command,
-                               exit_code=first["exit_code"], duration=first["duration"])
-                else:
-                    same = _same_run(first, row)
-                    row |= {"cause": "real", "first": {k: first.get(k) for k in _FIRST_RUN} | {"same": same}}
-                    if not same:
-                        row["tail"] = first["tail"]
-                if row["ok"] or not row["first"]["same"]:  # the output kept below is the second run's
-                    self.artifact(kind, f"first run (failed): {command}"[:300], first_output, ok=False,
-                                  exit_code=first["exit_code"])
-            results.append(row)
-            note = (f" — {_how_failed(row)}" if row["timed_out"] or row.get("not_rerun") else
-                    " — on a second run" if row.get("cause") == "flaky" else "")
-            self.event(f"{kind}_result", f"{'✓' if row['ok'] else '✗'} {command}{note}",
-                       level="success" if row["ok"] else "warn", command=command, exit_code=row["exit_code"],
-                       duration=row["duration"], **({"cause": row["cause"]} if row.get("cause") else {}))
-            self.artifact(kind, command, output, ok=row["ok"], exit_code=row["exit_code"])
-        return results
-
-    async def _run_command(self, sandbox: LocalSandbox, command: str, timeout: float) -> tuple[dict[str, Any], str]:
-        started = time.monotonic()
-        result = await sandbox.exec(command, timeout=timeout)
-        row = {"command": command, "ok": result.ok, "exit_code": result.exit_code,
-               "duration": round(time.monotonic() - started, 1), "timed_out": result.timed_out,
-               "tail": result.output[-4000:]}
-        if not result.ok:
-            row["failures"] = _failing_tests(result.output)
-            row["signature"] = _output_signature(result.output, sandbox)
-            printed = result.total_bytes if result.truncated else 0  # the output kept was cut; the count was not
-            row |= ({"cause": "timeout", "limit": timeout, "progress": _progress(result.output, printed)}
-                    if result.timed_out else {"cause": "real"})
-        return row, result.output
-
     async def _verify(self, token: str, patch: Patch, attempt: int) -> dict[str, Any] | None:
         self._guard_steward_candidate()
         if self._steward_identity() is not None:
@@ -1269,61 +1183,38 @@ class TaskRunner:
         previous = self._previous_review(patch)
         for tries in range(2):
             sandbox = None
-            app: AppRun | None = None
             result = None
             carried = None  # what the session's failure said it was; a sandbox that failed says nothing
             try:
                 try:
                     sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
-                    await self._prepare(sandbox)
+                    result = await verify_candidate(
+                        sandbox, self.task, self.repo, self.task.base_sha, self.cancelled,
+                        workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id,
+                        config=self.cfg, settings=self.settings, gates=self, attempt=attempt,
+                        optional_gates=self.optional_gates,
+                        harness=self.task.verifier_harness, review=False, checks=self.checks,
+                        decisions=precedents(self.ws, self.repo.id),
+                        guidance=guidance_history(self.task.outcome_id, self.task_id),
+                        outcome=self.outcome, sections=await self._sections(verifier=True), previous=previous,
+                        session=lambda spec, _: self._session(attempt, "verify", spec),
+                        extra_prompt=("\nExplicit verification criterion: " + STEWARD_TEST_CRITERION
+                                      if self._steward_identity() else ""))
                 except (SandboxError, GitError, OSError) as exc:  # the environment, not the candidate
                     error = f"Sandbox setup failed: {exc}"
-                else:
-                    brief = ""
-                    if qa_cfg.get("start"):
-                        app = await self._start_app(sandbox, qa_cfg)
-                        brief = verifier_brief(app)
-                    sections = await self._sections(verifier=True)
-                    run, result, error = await self._session(attempt, "verify", SessionSpec(
-                        workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
-                        harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
-                        attempt=attempt, writable=False, effective_settings=self.settings,
-                        repositories={self.repo.full_name: self.cfg},
-                        expected_criteria=list(self.task.acceptance or []),
-                        prompt=verify_prompt(self.task, self.repo, self.task.base_sha, self.builder_report, self.checks,
-                                             precedents(self.ws, self.repo.id),
-                                             guidance_history(self.task.outcome_id, self.task_id),
-                                             outcome=self.outcome, sections=sections, previous=previous)
-                        + ("\nExplicit verification criterion: " + STEWARD_TEST_CRITERION if self._steward_identity() else "")
-                        + brief))
-                    carried = carried_cause(run)
-                    if app is not None:
-                        await self._store_app_evidence(app, attempt, run.id)
             finally:
-                if app is not None:
-                    app.stop()
                 if sandbox is not None:
                     await sandbox.close()
-            if result is None:
+            if result is None or result.error:
+                if result is not None:
+                    error, carried = result.error, result.failure_cause
                 if infrastructure_problem(error, carried) == "provider":
                     self._infrastructure(attempt, "verify", error, "provider")
                 self.event("verification_unavailable", f"Verifier session failed: {error[:300]}", level="warn")
                 continue
             report = result.report
-            runtime_problem = self._runtime_problem(app, qa_cfg)
-            if runtime_problem:
-                # Recorded as a finding whatever the verifier said, so later attempts (and the automatic retry) see
-                # the concrete failure; a passing verdict is overridden. A blocker: the change must not merge as it is.
-                report = {**report, "findings": [*(report.get("findings") or []), {
-                    "severity": "blocker", "description": f"Required runtime QA failed: {runtime_problem}",
-                    "location": "runtime QA"}]}
-                if report["verdict"] == "pass":
-                    report = {**report, "verdict": "fail",
-                              "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
             self.verifier_report = report
-            self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
-                          verdict=report.get("verdict"))
-            if report["verdict"] == "pass":
+            if result.verdict == "pass":
                 if (self.task.evidence or {}).get("infra_retries"):
                     # Verification completed, which ends a run of infrastructure retries. The build loop's "verified"
                     # record would do it too, but a revalidation that passes writes no attempt record.
@@ -1333,19 +1224,22 @@ class TaskRunner:
                 self.feedback.clear()  # a passing review settles everything raised before it
                 self._results = slice(0, 0)
                 return report
-            app_log = str(app.evidence.get("log_tail") or "")[-1500:] if runtime_problem and app is not None else ""
             if self._results.stop is not None:  # no attempt is running (a revalidation): this replaces the last results
                 del self.feedback[self._results]
                 self._results = slice(len(self.feedback), None)
-            self.feedback += _review_feedback(report, app_log)
+            self.feedback += result.feedback
             self._results = slice(self._results.start, len(self.feedback))
             # With what this review saw, so the next one can be told what changed since, and the criteria it failed
             # that the previous review had passed.
             seen = {"diff_artifact_id": self._reviewed_diff(patch, attempt), "base_sha": self.task.base_sha,
-                    "patch_sha256": hashlib.sha256(patch.diff).hexdigest()} | ({"app_log": app_log} if app_log else {})
+                    "patch_sha256": hashlib.sha256(patch.diff).hexdigest()}
+            if result.app_log:
+                seen["app_log"] = result.app_log
             flipped = {"flipped": _flipped(previous["verdict"], report)} if previous else {}
             self.evidence("attempts", {"n": attempt, "result": "verification_failed", "verdict": report,
-                                       "checks": _brief(self.checks), "app_run": self.app_summary, **seen, **flipped})
+                                       "setup": _brief(result.setup),
+                                       "checks": _brief(result.checks), "app_run": result.qa,
+                                       "optional_gates": result.optional, **seen, **flipped})
             self.event("verification_failed", str(report.get("summary") or "")[:400], level="warn", **flipped)
             return None
         if infrastructure_problem(error, carried) == "transient":
@@ -1711,95 +1605,7 @@ class TaskRunner:
         return vm
 
     async def _save_environment(self, sandbox, key: str) -> None:
-        started = time.monotonic()
-        try:
-            await sandbox.checkpoint(key)
-            self.event("environment_prepared", f"Saved a prepared environment for these dependencies "
-                       f"({time.monotonic() - started:.0f}s)", environment=key)
-            from ..vm import prune_environments
-
-            pruned = await prune_environments(key)
-            if pruned:
-                self.event("environments_pruned", f"Removed {len(pruned)} older prepared environment(s)",
-                           environments=pruned)
-        except Exception as exc:  # an optimisation only
-            self.event("environment_prepare_failed", f"Could not save a prepared environment: {str(exc)[:200]}",
-                       level="warn")
-
-    async def _prepare(self, sandbox, kind: str = "verify_setup") -> list[dict[str, Any]]:
-        """Install dependencies, unless the VM booted from a prepared environment for these exact lockfiles.
-        After a clean install in a VM, save it so the next verification starts ready. Returns the setup results."""
-        setup = self.cfg.get("setup") or []
-        if getattr(sandbox, "prepared", None):
-            self.event(f"{kind}_skipped", "Dependencies unchanged since the prepared environment was saved; "
-                       "setup skipped", level="success", environment=sandbox.prepared)
-            return []
-        results = await self._run_commands(sandbox, setup, kind, timeout=1200)
-        key = getattr(sandbox, "environment_key", None)
-        if key and results and all(r["ok"] for r in results):
-            await self._save_environment(sandbox, key)
-        return results
-
-    async def _start_app(self, sandbox, qa_cfg: dict[str, Any]) -> AppRun:
-        """Boot the candidate in the verifier's sandbox, then let the Factory capture its own evidence first."""
-        app = AppRun(sandbox, qa_cfg)
-        self.event("qa_app_starting", f"Starting the app for runtime QA: {qa_cfg['start'][:200]}")
-        ready = await app.start()
-        if ready:
-            checks, extra_pages = change_checks(self.builder_report)
-            pages = list(dict.fromkeys(list(qa_cfg.get("pages") or []) + extra_pages))
-            app.evidence["pages"] = await app.screenshots(pages) if pages else []
-            app.evidence["probes"] = await app.probes()
-            app.evidence["change_checks"] = await app.probes(checks) if checks else []
-            ok_pages = sum(1 for p in app.evidence["pages"] if p.get("status") and p["status"] < 400)
-            ok_probes = sum(1 for p in app.evidence["probes"] if p.get("ok"))
-            ok_change = sum(1 for p in app.evidence["change_checks"] if p.get("ok"))
-            all_ok = (ok_pages == len(app.evidence["pages"]) and ok_probes == len(app.evidence["probes"])
-                      and ok_change == len(app.evidence["change_checks"]))
-            self.event("qa_app_ready", f"App ready in {app.evidence['ready_seconds']}s · pages {ok_pages}/"
-                       f"{len(app.evidence['pages'])} · probes {ok_probes}/{len(app.evidence['probes'])}"
-                       + (f" · change checks {ok_change}/{len(checks)}" if checks else ""),
-                       level="success" if all_ok else "warn")
-        else:
-            tail = " ".join((app.evidence.get("log_tail") or "").strip().splitlines()[-4:])[-400:]
-            self.event("qa_app_failed", f"The app did not become ready for runtime QA: {tail or 'no output'}",
-                       level="warn")
-        return app
-
-    async def _store_app_evidence(self, app: AppRun, attempt: int, run_id: str) -> None:
-        rows = {p.get("name"): p for p in app.evidence.get("pages", []) if isinstance(p, dict)}
-        images = await app.collect_images()
-        for name, image in images:
-            meta = rows.get(name, {"name": name, "by": "verifier"})
-            self.artifact("screenshot", f"{'Factory' if meta.get('by') == 'factory' else 'Verifier'}: {meta.get('path', name)}",
-                          image, run_id=run_id, attempt=attempt, **{k: meta.get(k) for k in
-                                                                    ("path", "status", "title", "console_errors", "by")})
-        self.artifact("log", f"App log (attempt {attempt})", await app.log_tail(20000), run_id=run_id)
-        self.app_summary = {
-            "started": app.evidence.get("started"), "ready_seconds": app.evidence.get("ready_seconds"),
-            "isolation": app.evidence.get("isolation"),
-            "pages": [{k: p.get(k) for k in ("path", "status", "title", "error")} for p in app.evidence.get("pages", [])],
-            "probes": [{k: p.get(k) for k in ("method", "path", "status", "ok")} for p in app.evidence.get("probes", [])],
-            "change_checks": [{k: p.get(k) for k in ("method", "path", "status", "ok", "expect_status", "why", "error")}
-                              for p in app.evidence.get("change_checks", [])],
-            "screenshots": len(images), "verifier_screenshots": sum(1 for n, _ in images if n not in rows)}
-
-    def _runtime_problem(self, app: AppRun | None, qa_cfg: dict[str, Any]) -> str:
-        # Runtime QA is evidence for the verifier; it only fails a candidate on its own when marked required
-        # (a broken QA environment must not sink a good change).
-        if app is None or not qa_cfg.get("required"):
-            return ""
-        if not app.evidence.get("started"):
-            return "the app did not start"
-        bad_pages = [f"{p.get('path')} ({p.get('error') or p.get('status')})"[:300] for p in app.evidence.get("pages", [])
-                     if p.get("error") or (p.get("status") or 500) >= 500]
-        bad_probes = [p.get("path") for p in [*app.evidence.get("probes", []),
-                                               *app.evidence.get("change_checks", [])] if not p.get("ok")]
-        if bad_pages:
-            return f"pages failed to render: {bad_pages}"
-        if bad_probes:
-            return f"probes failed: {bad_probes}"
-        return ""
+        await super()._save_environment(sandbox, key)
 
     # publication ---------------------------------------------------------------
     async def _publish(self, token: str) -> None:
@@ -3101,8 +2907,11 @@ def _actionable(attempt: dict[str, Any]) -> bool:
         return bool(attempt.get("detail"))
     if result == "verification_failed":
         verdict = attempt.get("verdict") or {}  # optional report fields may be null
-        # Exactly what the feedback relays to the next attempt: unmet criteria and blocker/major findings.
-        return (any(c.get("status") != "pass" for c in _objects(verdict.get("criteria")))
+        # Failed optional gates also count for records written before their findings were included.
+        return (any(not c.get("ok") for c in attempt.get("setup") or [])
+                or any(g.get("verdict") == "fail" for g in (attempt.get("optional_gates") or {}).values()
+                       if isinstance(g, dict))
+                or any(c.get("status") != "pass" for c in _objects(verdict.get("criteria")))
                 or any(f.get("severity") in ("blocker", "major") for f in _objects(verdict.get("findings"))))
     return False
 
@@ -3184,44 +2993,6 @@ def _check_note(check: dict[str, Any]) -> str:
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
-_PYTEST_FAILURE = re.compile(r"^(FAILED|ERROR) (.+?)(?: - .*)?$", re.MULTILINE)
-_PYTEST_TOTALS = re.compile(r"\b(\d+) (?:failed|errors?)\b")
-
-
-def _failing_tests(output: str) -> list[str] | None:
-    """The FAILED/ERROR node ids of pytest's short test summary, or None when there are none, or when the summary
-    lists fewer than its totals line counts (the output was clipped)."""
-    text = _ANSI.sub("", output or "")
-    ids = []
-    for kind, node in _PYTEST_FAILURE.findall(text):
-        node = node.strip()
-        if "::" in node or node.endswith(".py"):
-            ids.append(f"{kind} {node}")
-    if not ids:
-        return None
-    totals = [line for line in text.splitlines() if re.search(r"\bin [\d.]+s\b", line) and _PYTEST_TOTALS.search(line)]
-    if totals and len(ids) < sum(int(n) for n in _PYTEST_TOTALS.findall(totals[-1])):
-        return None
-    return sorted(set(ids))
-
-
-_VOLATILE = re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?"  # timestamps
-                       r"|\b\d\d:\d\d:\d\d(?:[.,]\d+)?\b"  # times of day
-                       r"|\b\d+(?:\.\d+)?\s?(?:ms|s)\b"  # durations
-                       r"|\b0x[0-9a-fA-F]+\b")  # addresses
-
-
-def _output_signature(output: str, sandbox: Any = None) -> str:
-    """A digest of a failing command's whole output with what differs between two runs of the same failure taken
-    out: colours, the sandbox's own paths, timestamps, durations and memory addresses. "" when there is no output,
-    which proves nothing. Two runs with the same signature printed the same thing."""
-    text = _ANSI.sub("", output or "")
-    # A local sandbox's work directory is inside its root; a VM has only a work directory.
-    for attr, name in (("root", "<sandbox>"), ("work", "<sandbox>/work")):
-        if getattr(sandbox, attr, None):
-            text = text.replace(str(getattr(sandbox, attr)), name)
-    text = "\n".join(line.rstrip() for line in _VOLATILE.sub("<n>", text).strip().splitlines())
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:32] if text else ""
 
 
 def _progress(output: str, total_bytes: int = 0) -> int:
