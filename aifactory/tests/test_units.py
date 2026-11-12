@@ -185,6 +185,9 @@ def test_a_criterion_that_passed_before_and_does_not_now_is_a_flip():
     assert _flipped(before, after) == ["the page loads", "exports"]  # matched trimmed and case-folded
     assert _flipped(before, verdict(exports="pass")) == [] and _flipped({}, after) == []
     assert _flipped(verdict(exports="pass"), verdict(**{"exports as CSV": "fail"})) == []  # reworded: no match
+    # A list number on one side is not a rewording: criteria are matched the way a report's are to the task's.
+    numbered = verdict(**{"1. The page loads": "pass"})
+    assert _flipped(numbered, verdict(**{"The page loads": "fail"})) == ["The page loads"]
 
 
 def test_sandbox_exec_timeout_and_clipping(tmp_path):
