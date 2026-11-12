@@ -52,6 +52,8 @@ class HarnessSession:
     tool_policy: dict[str, Any] = field(default_factory=dict)
     # The task's acceptance criteria: a verifier's report needs a result of its own for each (see validate_report).
     expected_criteria: list[str] | None = None
+    # Ids of the review findings a builder was given: its report answers each (see validate_report).
+    expected_findings: list[str] | None = None
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()

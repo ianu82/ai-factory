@@ -27,8 +27,10 @@ from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as re
 from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _mirror_path, git, apply_in_sandbox, checkout,
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit)
 from ..gitops import patch_id
-from ..models import Artifact, Decision, Outcome, Repository, Run, Signal, Task, new_id
-from ..prompts import BUILDER, build_prompt, verifier_system, verify_prompt
+from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
+from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
+from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, findings_unseen, headline,
+                      new_review_evidence, normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
 from ..sandbox import LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
@@ -41,6 +43,8 @@ from .lifecycle import transition
 log = logging.getLogger(__name__)
 
 CI_POLL_TIMEOUT_SECONDS = 90
+REVIEW_POLL_SECONDS = 60
+REVIEW_REPLY_TRIES = 3  # polls that may fail to post a round's answers on their threads before the Factory gives up
 
 # Billing, quota and access problems: a person has to act (top up credits, fix a key), so the task blocks and no
 # attempt is charged. Each harness words them differently: the native client ("MindsHub: no credit remaining"), Codex
@@ -359,7 +363,7 @@ class TaskRunner:
                                               self.task.evidence["ci_wait"]["stale_main"])
             elif stage == "revert_merge":
                 await self._merge_revert()
-            elif stage == "ci":
+            elif stage in ("ci", "review"):  # a review wait that was requeued passes through the CI wait again
                 await self.ci_then_merge()
             elif stage == "smoke":
                 await self.smoke()
@@ -457,13 +461,16 @@ class TaskRunner:
             self._describe_tree(attempt)
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             sections = await self._sections()
+            findings, unlisted = self._round_findings()
             run, result, error = await run_agent(SessionSpec(
                 workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                 effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                 harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
+                expected_findings=[f["id"] for f in findings] or None,
                 prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
                                     precedents(self.ws, self.repo.id),
-                                    guidance_history(self.task.outcome_id, self.task_id), sections)), self.cancelled)
+                                    guidance_history(self.task.outcome_id, self.task_id), sections,
+                                    review_findings(findings, unlisted))), self.cancelled)
             if result is None:
                 cause = infrastructure_problem(error)
                 if cause:
@@ -1575,6 +1582,8 @@ class TaskRunner:
 
     async def poll_ci(self, gh: GitHub | None = None) -> None:
         """One bounded observation. No sleeps, sandbox, merge lock, or delivery slot."""
+        if self.task.stage == "review":
+            return await self.poll_review(gh)
         try:
             await asyncio.wait_for(self._poll_ci(gh), timeout=CI_POLL_TIMEOUT_SECONDS)
         except (asyncio.TimeoutError, GitHubError) as exc:
@@ -1638,8 +1647,10 @@ class TaskRunner:
         ev = {**self.task.evidence, "ci_wait": wait, "ci": ci}
         if summary.state == "failure":
             ev["failure_facts"] = [*ev.get("failure_facts", []), {"kind": "ci", **ci}]
-        self.update(status="queued" if stage else "waiting_ci", stage=stage or "ci", evidence=ev,
-                    lease_owner="", blocked_reason="")
+        # A green head waits for its reviewers before the merge (never a revert, which goes straight in).
+        review = stage == "merge" and self._enter_review(ev, wait["head"], now)
+        self.update(status="queued" if stage and not review else "waiting_ci",
+                    stage="review" if review else stage or "ci", evidence=ev, lease_owner="", blocked_reason="")
         if changed:
             self.event("ci_status", f"CI {summary.state}", state=summary.state, checks=summary.checks)
 
@@ -1656,12 +1667,326 @@ class TaskRunner:
         self._ci_repairing = True  # a restart inside this round fetches the CI logs again (see run())
         await self.deliver(continue_from_branch=True)
 
+    # review ----------------------------------------------------------------------
+    def _review_policy(self) -> dict[str, Any]:
+        try:
+            return review_policy(self.settings, self.cfg)
+        except ValueError:  # a stored policy that no longer validates: the defaults apply
+            return review_policy()
+
+    def _review_patch(self, head: str) -> str | None:
+        published = (self.task.evidence or {}).get("published") or {}
+        return published.get("patch_id") if published.get("head") == head else None
+
+    def _round_findings(self) -> tuple[list[dict[str, Any]], int]:
+        """The findings the review round in progress gives the builder, and how many more were left out."""
+        review = (self.task.evidence or {}).get("review") or {}
+        ids = (review.get("round") or {}).get("findings") or []
+        if not ids or self._review_policy()["address"] == "off":
+            return [], 0
+        result = review.get("result") or {}
+        return [f for f in _objects(result.get("open")) if f.get("id") in ids], int(result.get("more") or 0)
+
+    def _enter_review(self, ev: dict[str, Any], head: str, now: datetime) -> bool:
+        """Whether this green head waits for its review before the merge; ``ev`` then carries the wait."""
+        policy = self._review_policy()
+        if policy["address"] == "off" or not self.task.pr_number:
+            return False
+        review = {**new_review_evidence(), **(ev.get("review") or {})}
+        result = review.get("result") or {}
+        published = ev.get("published") or {}
+        patch = published.get("patch_id") if published.get("head") == head else None
+        if (patch and result.get("patch_id") == patch and result.get("head") != head
+                and result.get("state") == "reviewed" and not result.get("unseen")):
+            # The same change on a newer base: what its review found stands. Nothing is asked for or awaited.
+            # A head that went on without a review carries nothing: the new head waits for its own.
+            result = review["result"] = {**result, "head": head, "of": result.get("of") or result.get("head")}
+        ev["review"] = review
+        if result.get("head") == head and not review.get("round"):
+            return False
+        if review.get("head") != head:
+            review.update(head=head, started_at=now.isoformat(),
+                          deadline=(now + timedelta(seconds=policy["wait_seconds"])).isoformat())
+        review["next_poll_at"] = now.isoformat()
+        return True
+
+    async def poll_review(self, gh: GitHub | None = None) -> None:
+        """One bounded look at the pull request's reviews, like a CI poll. A failure to read or write them is tried
+        again at the next poll: it never uses an attempt and never blocks the task, and once the deadline has
+        passed the head goes on as not reviewed."""
+        try:
+            await asyncio.wait_for(self._poll_review(gh), timeout=CI_POLL_TIMEOUT_SECONDS)
+        except Stop:
+            raise
+        except Exception as exc:  # a fault here must not leave the task polled forever: it counts as unread too
+            self._guard("waiting_ci")
+            log.warning("review poll failed for %s: %r", self.task_id, exc,
+                        exc_info=not isinstance(exc, (asyncio.TimeoutError, GitHubError)))
+            self._review_unread()
+
+    async def _poll_review(self, gh: GitHub | None) -> None:
+        self._guard("waiting_ci")
+        gh = gh or GitHub(resolve_token(self.ws))
+        self._guard("waiting_ci")
+        policy = self._review_policy()
+        review = json.loads(json.dumps((self.task.evidence or {}).get("review") or {}))
+        head = self.task.head_sha
+        if policy["address"] == "off" or review.get("head") != head or not self.task.pr_number:
+            # Switched off while waiting, or not this head's wait: the CI wait decides again what comes next.
+            self.update(status="queued", stage="ci", lease_owner="", blocked_reason="")
+            return
+        snapshot = await gh.review_snapshot(self.repo.full_name, self.task.pr_number)
+        self._guard("waiting_ci")
+        if review.get("round") and not await self._answer_round(gh, review, snapshot["threads"]):
+            return self._review_later(review)
+        seen = {"reviews": snapshot["reviews"], "comments": snapshot["comments"], "policy": policy,
+                "identity": snapshot["identity"], "pull_author": snapshot["pull_author"]}
+        reviewers = reviewed_by(head, **seen)
+        # Codex says it found something, and its review is not in what was read: wait for a reading that has it.
+        unseen = findings_unseen(head, **seen)
+        standing = review.get("result") or {}
+        carried = not reviewers and standing.get("head") == head and standing.get("state") == "reviewed"
+        if carried:  # the same change as a head they reviewed (see _enter_review)
+            reviewers = standing.get("reviewers") or []
+        if (not reviewers or unseen) and utcnow() < datetime.fromisoformat(review["deadline"]):
+            if not reviewers and not unseen:
+                await self._request_review(gh, review, snapshot, policy)
+            return self._review_later(review)
+        self._review_result(review, snapshot, policy, reviewers, standing.get("of") if carried else None, unseen)
+
+    def _save_review(self, review: dict[str, Any]) -> None:
+        # A copy: the caller goes on changing ``review``, which must not reach the stored evidence unsaved.
+        self.update(evidence={**self.task.evidence, "review": json.loads(json.dumps(review))})
+
+    def _review_later(self, review: dict[str, Any]) -> None:
+        review["next_poll_at"] = (utcnow() + timedelta(seconds=REVIEW_POLL_SECONDS)).isoformat()
+        self._save_review(review)
+
+    def _review_unread(self) -> None:
+        """A poll failed. Before the deadline the next poll tries again; after it this head was not reviewed."""
+        review = json.loads(json.dumps((self.task.evidence or {}).get("review") or {}))
+        if not review.get("deadline"):  # no wait on record to resume: the CI wait starts one
+            return self.update(status="queued", stage="ci", lease_owner="", blocked_reason="")
+        if utcnow() < datetime.fromisoformat(review["deadline"]):
+            return self._review_later(review)
+        if review.get("round"):  # its answers could not be posted either: the merge approval says so
+            self._close_round(review, self._unposted(review))
+        head = review["head"]
+        self._leave_review(review, self._review_policy(), {
+            "head": head, "patch_id": self._review_patch(head), "state": "unavailable", "reason": "unreadable",
+            "reviewers": [], "open": [], "more": 0, "counts": {}, "at": utcnow().isoformat()})
+
+    def _round_answers(self, review: dict[str, Any]) -> dict[str, tuple[dict[str, Any], str, str]]:
+        """The builder's answers to the round's findings, from its latest report: id -> (finding, action, note)."""
+        ids = (review.get("round") or {}).get("findings") or []
+        findings = {f.get("id"): f for f in _objects((review.get("result") or {}).get("open")) if f.get("id") in ids}
+        answers = {}
+        for answer in _objects(self.builder_report.get("review_responses")):
+            fid, action = answer.get("id"), answer.get("action")
+            if isinstance(fid, str) and fid in findings and action in ACTIONS:
+                answers[fid] = (findings[fid], action, str(answer.get("note") or ""))
+        return answers
+
+    def _unposted(self, review: dict[str, Any]) -> list[str]:
+        """Links to the round's answered findings whose reply or resolution is not on GitHub yet."""
+        replies = (review.get("round") or {}).get("replies") or {}
+        missing = []
+        for fid, (finding, action, _note) in self._round_answers(review).items():
+            done = replies.get(fid) or {}
+            if (finding.get("reply_to_id") and not done.get("replied")) or (
+                    action == "fixed" and finding.get("thread_id") and not done.get("resolved")):
+                missing.append(finding.get("url") or fid)
+        return missing
+
+    async def _answer_round(self, gh: GitHub, review: dict[str, Any], threads: list[dict[str, Any]]) -> bool:
+        """Put the published revision's answers on their threads, each once: a reply, and the thread resolved when
+        the builder fixed it. Every step is recorded as it happens, and a reply already on the thread is not posted
+        again. A failure is tried again at the next poll (False); after REVIEW_REPLY_TRIES polls the round closes
+        without the missing answers, which the merge approval then lists."""
+        current = review["round"]
+        by_id = {t.get("id"): t for t in threads}
+        for fid, (finding, action, note) in self._round_answers(review).items():
+            done = current.setdefault("replies", {}).setdefault(fid, {})
+            thread = by_id.get(finding.get("thread_id")) or {}
+            text = reply_text(action, note, self.task.head_sha)
+            try:
+                if finding.get("reply_to_id") and not done.get("replied"):
+                    if not _replied(thread, text):
+                        self._guard("waiting_ci")
+                        await gh.reply_review_comment(self.repo.full_name, self.task.pr_number,
+                                                      finding["reply_to_id"], text)
+                    done["replied"] = True
+                    self._save_review(review)
+                if action == "fixed" and finding.get("thread_id") and not done.get("resolved"):
+                    if not thread.get("isResolved"):
+                        self._guard("waiting_ci")
+                        await gh.resolve_review_thread(finding["thread_id"])
+                    thread["isResolved"] = True  # this poll reads the open findings from the same snapshot
+                    done["resolved"] = True
+                    self._save_review(review)
+            except GitHubError as exc:
+                log.warning("review answer for %s on %s failed: %s", self.task_id, fid, exc)
+        failed = self._unposted(review)
+        if failed:
+            current["tries"] = int(current.get("tries") or 0) + 1
+            if current["tries"] < REVIEW_REPLY_TRIES:
+                self._save_review(review)
+                return False
+        self._close_round(review, failed)
+        return True
+
+    def _close_round(self, review: dict[str, Any], failed: list[str]) -> None:
+        """The round is over. What the builder answered stops counting until its reviewer writes again."""
+        answered = review.setdefault("answered", {})
+        for fid, (finding, action, note) in self._round_answers(review).items():
+            answered[fid] = {"action": action, "note": _one_line(note), "updated_at": finding.get("updated_at")}
+        review["unanswered"] = list(dict.fromkeys([*(review.get("unanswered") or []), *failed]))
+        review["round"] = None
+
+    async def _request_review(self, gh: GitHub, review: dict[str, Any], snapshot: dict[str, Any],
+                              policy: dict[str, Any]) -> None:
+        """Ask for a review of a head that is not the pull request's first, exactly once. The intent is recorded
+        before the comment is posted; a poll that finds the intent looks for the comment before posting it."""
+        head, text = review["head"], policy["request"]
+        requested = review.get("requested") or {}
+        if not text or (requested.get("head") == head and requested.get("state") != "intent"):
+            return
+        if requested.get("head") != head:
+            first = self._first_publication(head)
+            requested = review["requested"] = {"head": head, "at": utcnow().isoformat(),
+                                               "state": "first" if first else "intent"}
+            self._save_review(review)
+            if first:
+                return
+        published = (self.task.evidence or {}).get("published") or {}
+        since = _github_time(published.get("at") if published.get("head") == head else requested.get("at"))
+        own = {str(a.get("login") or "").casefold() for a in (snapshot["identity"], snapshot["pull_author"])} - {""}
+        posted = since is not None and any(
+            (c.get("body") or "").strip() == text and str((c.get("user") or {}).get("login") or "").casefold() in own
+            and (_github_time(c.get("created_at")) or datetime.min) >= since for c in snapshot["comments"])
+        if not posted:
+            self._guard("waiting_ci")
+            await gh.comment(self.repo.full_name, self.task.pr_number, text, retries=0)
+        requested["state"] = "posted"
+        self._save_review(review)
+        self.event("review_requested", f"Asked for a review of {head[:10]} on PR #{self.task.pr_number}", head=head)
+
+    def _first_publication(self, head: str) -> bool:
+        """Whether this head is the only one the Factory has published on the pull request, by its own record: the
+        reviewers of a new pull request start on their own. Any other head, a rebased one included, is asked for."""
+        with session_scope() as s:
+            events = s.query(Event).filter(Event.task_id == self.task_id, Event.kind == "published").all()
+            heads = {(e.data or {}).get("head") for e in events if (e.data or {}).get("url") == self.task.pr_url}
+        return heads == {head}
+
+    def _review_result(self, review: dict[str, Any], snapshot: dict[str, Any], policy: dict[str, Any],
+                       reviewers: list[str], of: str | None = None, unseen: bool = False) -> None:
+        """Record what the review of this head left open, or that none arrived in time, and leave the wait."""
+        head = review["head"]
+        found = open_findings(normalize_feedback(policy=policy, **snapshot), policy, review.get("answered") or {})
+        counts = {level: sum(f["severity"] == level for f in found) for level in SEVERITIES}
+        result = {"head": head, "patch_id": self._review_patch(head),
+                  "state": "reviewed" if reviewers else "unavailable", "reviewers": reviewers,
+                  "open": found[:MAX_FINDINGS], "more": max(0, len(found) - MAX_FINDINGS),
+                  "counts": {level: n for level, n in counts.items() if n}, "at": utcnow().isoformat()}
+        if of:
+            result["of"] = of
+        if not reviewers:
+            result.update(reason="timeout", waited_seconds=policy["wait_seconds"])
+        if unseen:  # a reviewer reported findings that never became readable: a person decides the merge
+            result["unseen"] = True
+        self._leave_review(review, policy, result)
+
+    def _leave_review(self, review: dict[str, Any], policy: dict[str, Any], result: dict[str, Any]) -> None:
+        """Leave the wait with this head's result. A review that left a blocking finding starts a round while
+        rounds remain: a revision with a fresh attempt budget. Otherwise the merge is next, and the result says
+        when a person has to decide it whatever the merge autonomy (see _review_asks)."""
+        from ..decisions import fresh_budget
+
+        head, reviewed = result["head"], result["state"] == "reviewed"
+        blockers = [f["id"] for f in result["open"] if f.get("blocking")]
+        rounds = int(review.get("rounds") or 0)
+        again = bool(blockers) and reviewed and rounds < policy["max_rounds"]
+        review["result"] = result
+        if again:
+            # Everything still open goes to the builder, except what it already answered.
+            ids = [f["id"] for f in result["open"] if not f.get("answer")]
+            review.update(rounds=rounds + 1,
+                          round={"n": rounds + 1, "head": head, "findings": ids, "replies": {}, "tries": 0})
+            self.update(status="queued", stage="revise", attempt=0, lease_owner="", blocked_reason="",
+                        evidence=fresh_budget({**self.task.evidence, "review": review}))
+        else:
+            if blockers:  # a known blocking finding never merges on its own
+                result["ask"] = "limit" if reviewed else "open"
+            elif result.get("unseen") or (not reviewed and policy["on_timeout"] == "ask"):
+                result["ask"] = "unreviewed"
+            self.update(status="queued", stage="merge", lease_owner="", blocked_reason="",
+                        evidence={**self.task.evidence, "review": review})
+        total = len(result["open"]) + result["more"]
+        if reviewed:
+            self.event("review_received", f"{', '.join(result['reviewers'])} reviewed {head[:10]}: "
+                       + (f"{total} finding(s) open" if total else "nothing open"),
+                       head=head, reviewers=result["reviewers"], counts=result["counts"])
+        else:
+            self.event("review_unavailable", f"No review of {head[:10]} to go on: "
+                       + ("the reviews could not be read" if result.get("reason") == "unreadable" else
+                          "a reviewer's findings could not be read" if result.get("unseen") else
+                          f"none arrived within {policy['wait_seconds']} seconds"),
+                       level="warn", head=head, reason=result.get("reason"))
+        if again:
+            self.event("review_round", f"Review round {rounds + 1}: {len(ids)} finding(s) go back to the builder",
+                       head=head, round=rounds + 1, findings=ids)
+        elif result.get("ask") == "limit":
+            self.event("review_limit", f"{len(blockers)} blocking finding(s) are still open after {rounds} review "
+                       "round(s); a person decides the merge", level="warn", head=head, rounds=rounds,
+                       findings=blockers)
+
+    def _review_summary(self) -> str:
+        """What the merge approval says about the review of this head: who reviewed it and what is still open."""
+        review = (self.task.evidence or {}).get("review") or {}
+        result = review.get("result") or {}
+        head = self.task.head_sha or ""
+        if result.get("head") != head or self._review_policy()["address"] == "off":
+            return ""
+        found = _objects(result.get("open"))
+        more = int(result.get("more") or 0)
+        total = len(found) + more
+        if result.get("state") == "reviewed":
+            same = f" (the same change as {str(result['of'])[:10]}, which they reviewed)" if result.get("of") else ""
+            lines = [f"Reviewed at {head[:10]} by {', '.join(result.get('reviewers') or [])}{same}: "
+                     + (f"{total} finding(s) open." if total else "nothing open.")]
+        elif result.get("reason") == "unreadable":
+            lines = [f"Not reviewed: the reviews of {head[:10]} could not be read from GitHub."]
+        else:
+            minutes = round(int(result.get("waited_seconds") or 0) / 60)
+            lines = [f"No review of {head[:10]} arrived within {minutes} minute{'' if minutes == 1 else 's'}."
+                     + (f" {total} finding(s) from earlier reviews are still open." if total else "")]
+        for f in found:
+            where = f"{f.get('path')}:{f.get('line')}" if f.get("path") and f.get("line") else f.get("path") or ""
+            answer = f.get("answer") or {}
+            said = {"disputed": "the builder disagreed", "deferred": "the builder left it for later",
+                    "fixed": "the builder reports it fixed"}.get(answer.get("action"))
+            lines.append(" ".join(filter(None, [f"- {f.get('severity')}", f"{where}:" if where else "",
+                                                 headline(str(f.get("body") or "")), str(f.get("url") or ""),
+                                                 f"({said}: {answer.get('note') or ''})" if said else ""])))
+        if more:
+            lines.append(f"- and {more} more")
+        if review.get("unanswered"):
+            lines.append("The Factory could not post its answer on: " + ", ".join(review["unanswered"][:MAX_FINDINGS]))
+        if result.get("unseen"):
+            lines.append(f"A reviewer reported findings on {head[:10]} that could not be read from GitHub. "
+                         "Read its review on the pull request before you approve.")
+        if result.get("ask") == "limit":
+            lines.append(f"The review rounds are used up ({int(review.get('rounds') or 0)}). "
+                         "\"Request changes\" runs one more.")
+        return "\n\n" + "\n".join(lines)
+
     # merge ---------------------------------------------------------------------
     def _merge_needs_approval(self, settings: dict[str, Any] | None = None) -> bool:
         from ..onboarding_policy import active
 
         settings = workspace_settings(self.ws) if settings is None else settings
-        if active(settings):
+        if active(settings) or _review_asks(getattr(self, "task", None), settings, self.cfg):
             return True
         merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
         release_cfg = self.cfg.get("release") or {}
@@ -1678,7 +2003,7 @@ class TaskRunner:
         self.update(stage="merge")
         self.block("approve_merge", f"Approve merge: {self.task.title}",
                    f"PR #{self.task.pr_number} passed independent verification and CI at "
-                   f"{self.task.head_sha[:10]}. {self.task.pr_url}",
+                   f"{self.task.head_sha[:10]}. {self.task.pr_url}{self._review_summary()}",
                    status="awaiting_approval",
                    options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
 
@@ -2154,6 +2479,35 @@ FEEDBACK_CHARS = 40_000  # the most feedback one builder prompt carries; each it
 
 def _one_line(text: Any, limit: int = 300) -> str:
     return " ".join(str(text or "").split())[:limit]
+
+
+def _review_asks(task: Any, settings: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Whether the review of the task's head left its merge to a person, whatever the merge autonomy: a blocking
+    finding is open and no round is left, or no review arrived under ``on_timeout: ask``. No database access: the
+    merge calls this while it holds the workspace lock."""
+    result = ((getattr(task, "evidence", None) or {}).get("review") or {}).get("result") or {}
+    if not result.get("ask") or result.get("head") != getattr(task, "head_sha", None):
+        return False
+    try:
+        return review_policy(settings, cfg)["address"] != "off"
+    except ValueError:
+        return True
+
+
+def _github_time(value: Any) -> datetime | None:
+    """A GitHub timestamp (or one of the Factory's own) as naive UTC, like utcnow()."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (parsed - parsed.utcoffset()).replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _replied(thread: dict[str, Any], text: str) -> bool:
+    """Whether the Factory's reply with this text is already on the review thread."""
+    want = " ".join(f"{FACTORY_REPLY_MARKER} {text}".split())
+    nodes = (thread.get("comments") or {}).get("nodes") or []
+    return any(" ".join(str(node.get("body") or "").split()) == want for node in _objects(nodes))
 
 
 def _review_feedback(verdict: dict[str, Any], app_log: str = "") -> list[str]:
