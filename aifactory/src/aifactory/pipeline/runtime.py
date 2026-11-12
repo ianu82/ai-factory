@@ -50,8 +50,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # "patch": a merge approval covers the same change when it is published again on a newer base. "head": every new
     # head is approved again. A repository's merge.approval overrides it (TaskRunner._approved).
     "merge": {"approval": "patch"},
-    "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000},
+    "budgets": {"run_usd": 8.0, "outcome_usd": 40.0, "run_tokens": 6_000_000,
+                "task_usd": 15.0},  # a task's builder and verifier runs over its whole life; 0 or None: no limit
     "limits": {"builder_turns": 120, "verifier_turns": 60, "planner_turns": 60, "plan_reviewer_turns": 40,
+               "task_attempts_total": 12,  # charged attempts over a task's whole life; 0 or None: no limit
                "run_minutes": 60,
                "ci_minutes": 45, "max_changed_lines": 1500},
     "reasoning_effort": "medium",

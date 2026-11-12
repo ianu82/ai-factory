@@ -176,6 +176,9 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
                             "deadline": (now + timedelta(minutes=workspace_settings(task.workspace_id)[
                                 "limits"].get("ci_minutes", 45))).isoformat(), "next_poll_at": now.isoformat()}
                     task.evidence = {**task.evidence, "ci_wait": wait}
+                allow = ((decision.metadata_json or {}).get("lifetime_limit") or {}).get("allow")
+                if isinstance(allow, dict):  # "Allow more" at a task's lifetime limit (TaskRunner._check_lifetime)
+                    task.evidence = {**(task.evidence or {}), "lifetime_allowance": allow}
                 if task.status == "failed":
                     task.attempt = 0
                     task.evidence = fresh_budget(task.evidence)

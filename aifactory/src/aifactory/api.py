@@ -254,6 +254,13 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     merged["director"] = director
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
+    total = merged["limits"].get("task_attempts_total")
+    if total is not None and (type(total) is not int or not 0 <= total <= 100):
+        raise HTTPException(422, "limits.task_attempts_total must be a whole number from 0 to 100 (0: no limit)")
+    task_usd = merged["budgets"].get("task_usd")
+    if task_usd is not None and (type(task_usd) not in (int, float) or not math.isfinite(task_usd)
+                                 or not 0 <= task_usd <= 1000):
+        raise HTTPException(422, "budgets.task_usd must be a number from 0 to 1000 (0: no limit)")
     for role in ("builder", "verifier", "planner"):
         if merged["harness"].get(role) not in ("native", "codex", "anton"):
             merged["harness"][role] = "native"
@@ -699,7 +706,7 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
                              **(current.get("review") or {}), **validate_review(patch["review"], repository=True)}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
-    for key in ("setup", "checks", "smoke", "protected_paths"):
+    for key in ("setup", "checks", "smoke", "protected_paths", "rails"):
         if key in patch:
             cfg[key] = [str(x).strip() for x in patch[key] or [] if str(x).strip()]
     for key in ("context", "signal_label"):

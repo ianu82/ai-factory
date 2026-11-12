@@ -159,6 +159,17 @@ def test_a_provider_hold_and_taking_work_over_stay_with_people(world):
         assert allowed == [] and "billing" in why
 
 
+def test_a_decision_marked_for_people_is_left_to_them(world):
+    why = "A change to the Factory's rails merges only when a person approves it"
+    with db.session_scope() as s:
+        s.get(Decision, world["merge"]).metadata_json = {"people_only": why}
+    with db.session_scope() as s:
+        cfg = director.settings_for(s.get(Workspace, world["ws"]).settings)
+        assert director.choices(s, s.get(Decision, world["merge"]), cfg) == ([], why)
+    due = woken()[world["ws"]]
+    assert f"d:{world['merge']}" not in due["marks"] and f"d:{world['stuck']}" in due["marks"]
+
+
 def spend(world, usd):
     """Recorded and committed, so budget checks (in their own sessions) count it."""
     with db.session_scope() as s:

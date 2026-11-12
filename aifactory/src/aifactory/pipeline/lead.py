@@ -549,7 +549,7 @@ class Tools:
                 if decision.task_id else None
             if outcome.status in FINISHED or (locked is not None and locked.status in STOPPED):
                 return "That work has been stopped or finished, so this decision no longer applies. Leave it."
-            if (decision.kind, option) not in ACTIONS:
+            if (decision.kind, option) not in ACTIONS or (decision.metadata_json or {}).get("people_only"):
                 return ("You may not choose that. Leave a note for people (note_for_people) with what you found and "
                         "the option you recommend.")
             if not actionable(decision):
