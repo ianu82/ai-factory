@@ -8,6 +8,7 @@ import logging
 import threading
 from typing import Any
 
+from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session
 
 from .db import session_scope
@@ -63,6 +64,45 @@ bus = EventBus()
 log = logging.getLogger("aifactory.events")
 
 
+def _publish(payload: dict[str, Any], session: Session | None = None) -> None:
+    if session is None:
+        bus.publish(payload)
+    else:
+        transaction = session.get_nested_transaction() or session.get_transaction()
+        session.info.setdefault("event_publications", []).append((transaction, payload))
+
+
+@sa_event.listens_for(Session, "after_commit")
+def _committed(session: Session) -> None:
+    # Releasing a SAVEPOINT is not committing the enclosing transaction.
+    if session.in_nested_transaction():
+        return
+    for _, payload in session.info.pop("event_publications", []):
+        bus.publish(payload)
+
+
+@sa_event.listens_for(Session, "after_rollback")
+def _rolled_back(session: Session) -> None:
+    transaction = session.get_nested_transaction() or session.get_transaction()
+
+    def within(candidate):
+        while candidate is not None:
+            if candidate is transaction:
+                return True
+            candidate = candidate.parent
+        return False
+
+    session.info["event_publications"] = [
+        (tx, payload) for tx, payload in session.info.get("event_publications", []) if not within(tx)]
+
+
+@sa_event.listens_for(Session, "after_transaction_end")
+def _transaction_ended(session: Session, transaction) -> None:
+    if transaction.parent is None:
+        # Session.close() also discards any unpublished work before the session can be reused.
+        session.info.pop("event_publications", None)
+
+
 def event_dict(event: Event) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -115,13 +155,13 @@ def record(
             s.flush()
             payload = event_dict(event)
     if publish:
-        bus.publish({"type": "event", **payload})
+        _publish({"type": "event", **payload}, session)
     if kind not in ("agent_thought", "agent_tool"):
         log.info("[%s %s%s] %s: %s", workspace_id[:6], (outcome_id or "-")[:6], f"/{task_id[:6]}" if task_id else "",
                  kind, payload["message"][:300])
     return payload
 
 
-def notify(workspace_id: str, entity: str, entity_id: str, **extra: Any) -> None:
+def notify(workspace_id: str, entity: str, entity_id: str, *, session: Session | None = None, **extra: Any) -> None:
     """Tell live clients an entity changed so they can refetch it."""
-    bus.publish({"type": "changed", "workspace_id": workspace_id, "entity": entity, "id": entity_id, **extra})
+    _publish({"type": "changed", "workspace_id": workspace_id, "entity": entity, "id": entity_id, **extra}, session)

@@ -376,3 +376,16 @@ def test_list_detail_source_serialization_is_batched(configured, client):
             number = row["number"]
             expected = issue(number)
             assert row["linear_issue"] == {"id": expected["id"], "identifier": expected["identifier"], "url": expected["url"]}
+
+
+def test_linear_event_publications_wait_for_commit_in_order(configured, monkeypatch):
+    from aifactory import events
+    workspace_id, _ = configured
+    published = []
+    monkeypatch.setattr(events.bus, 'publish', published.append)
+    with session_scope() as db:
+        config = linear_intake.linear_config.saved_config(db.get(Workspace, workspace_id))
+        assert linear_intake._admit(db, workspace_id, issue(), config) == (True, True)
+        assert published == []
+    assert [(p['type'], p.get('kind', p.get('entity'))) for p in published] == [
+        ('event', 'outcome_created'), ('changed', 'outcome'), ('event', 'signal_accepted')]

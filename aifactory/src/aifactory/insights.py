@@ -411,7 +411,7 @@ def analyze(db: Session, workspace_id: str) -> dict[str, int]:
             retired += 1
     if created or updated or retired:
         db.flush()
-        notify(workspace_id, "signal", "")
+        notify(workspace_id, "signal", "", session=db)
     return {"created": created, "updated": updated, "retired": retired}
 
 

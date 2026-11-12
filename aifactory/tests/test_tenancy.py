@@ -315,3 +315,34 @@ def test_definition_routes_and_foreign_object_ids_are_isolated(client, signed_in
         assert other.put(foreign, json={"expected_revision": 1, "bundle": forged}).status_code == 422
     assert client.get(root).json() == own
     assert other.get(foreign).json()["revision"] == 1
+
+
+def test_workstream_assignments_cannot_cross_workspaces(client, signed_in):
+    from aifactory.models import Workstream
+    ws = signed_in['workspaces'][0]['id']
+    ids = _seed(ws)
+    with session_scope() as s:
+        stream = Workstream(workspace_id=ws, owner_id=signed_in['user']['id'], name='Private',
+                            goal='Private', slug='private')
+        s.add(stream)
+        s.flush()
+        sid = stream.id
+    other = TestClient(client.app)
+    other.post('/auth/dev', json={'email': 'stream@elsewhere.test', 'organization': 'Other'})
+    other_ws = other.get('/api/me').json()['workspaces'][0]['id']
+    theirs = _seed(other_ws)
+    root = f'/api/workspaces/{other_ws}'
+    assert other.patch(root + '/outcomes/' + ids['outcome'], json={'workstream_id': None}).status_code == 404
+    assert other.patch(root + '/outcomes/' + theirs['outcome'], json={'workstream_id': sid}).status_code == 404
+    assert other.post(root + '/outcomes', json={'title': 'Foreign stream', 'repo_ids': [theirs['repo']],
+                                               'workstream_id': sid}).status_code == 404
+    with session_scope() as s:
+        signal = Signal(workspace_id=other_ws, repo_id=theirs['repo'], source='feedback', title='Foreign proposal',
+                        fingerprint='foreign', data={'proposed_workstream_id': sid})
+        s.add(signal)
+        s.flush()
+        signal_id = signal.id
+    assert other.post(root + '/signals/' + signal_id, json={'action': 'accept'}).status_code == 404
+    with session_scope() as s:
+        assert s.query(Outcome).filter_by(workspace_id=other_ws).count() == 1
+        assert s.get(Signal, signal_id).status == 'new'

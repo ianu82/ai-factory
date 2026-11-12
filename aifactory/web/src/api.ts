@@ -577,6 +577,9 @@ export interface Signal {
   data: {
     rule?: string;
     acceptance_reason?: string;
+    workstream_assignment_reason?: string;
+    proposed_workstream_id?: string | null;
+    workstream_labels?: string[];
     action?: { type: "settings" | "repo_config" | "team_note" | "review"; label?: string; note?: string; repo_id?: string; set?: Record<string, unknown> };
     evidence?: { label: string; detail?: string; outcome_id?: string; task_id?: string; url?: string }[];
   };

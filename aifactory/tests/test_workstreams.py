@@ -363,3 +363,146 @@ def test_disconnect_failure_rolls_back_defaults_repository_and_audit(client, sig
         assert s.get(Repository, repo_id) is not None
     assert [client.get(root + "/" + stream["id"]).json() for stream in streams] == streams
     assert _audits() == before and published == []
+
+
+def test_outcome_assignment_defaults_reassignment_and_audit(client, signed_in, root, monkeypatch):
+    ws = signed_in['workspaces'][0]['id']
+    base = f'/api/workspaces/{ws}/outcomes'
+    with db.session_scope() as s:
+        repos = [Repository(workspace_id=ws, full_name=f'acme/{n}') for n in ('app', 'other')]
+        s.add_all(repos)
+        s.flush()
+        first, second = [r.id for r in repos]
+    stream = _create(client, root, default_repo_ids=[first])
+    other = _create(client, root, name='Other', default_repo_ids=[second])
+    assert client.post(base, json={'title': 'No repositories'}).status_code == 400
+    created = client.post(base, json={'title': 'Prefill repositories', 'workstream_id': stream['id']}).json()
+    assert created['repo_ids'] == [first] and created['workstream_id'] == stream['id']
+    explicit = client.post(base, json={'title': 'Explicit repositories', 'workstream_id': stream['id'],
+                                       'repo_ids': [second]}).json()
+    assert explicit['repo_ids'] == [second]
+    path = base + '/' + created['id']
+    with db.session_scope() as s:
+        s.get(Outcome, created['id']).status = 'running'
+    for sid in (other['id'], None):
+        response = client.patch(path, json={'workstream_id': sid})
+        assert response.status_code == 200, response.text
+        assert response.json()['workstream_id'] == sid
+        assert response.json()['repo_ids'] == [first] and response.json()['status'] == 'running'
+    for body in ({'status': 'completed'}, {'workstream_id': stream['id'], 'status': 'completed'}, {}):
+        assert client.patch(path, json=body).status_code == 422
+    client.patch(root + '/' + stream['id'], json={'state': 'archived'})
+    assert client.patch(path, json={'workstream_id': stream['id']}).status_code == 422
+    assert client.post(base, json={'title': 'Archived assignment', 'workstream_id': stream['id'],
+                                  'repo_ids': [first]}).status_code == 422
+    with db.session_scope() as s:
+        audits = s.query(Event).filter_by(kind='outcome_workstream_changed').order_by(Event.id).all()
+        assert len(audits) == 2
+        assert all(e.actor == signed_in['user']['id'] for e in audits)
+        assert audits[0].data == {'old_workstream_id': stream['id'], 'new_workstream_id': other['id']}
+        assert audits[1].data == {'old_workstream_id': other['id'], 'new_workstream_id': None}
+        s.query(Membership).filter_by(workspace_id=ws, user_id=signed_in['user']['id']).one().role = 'viewer'
+    assert client.patch(path, json={'workstream_id': None}).status_code == 403
+    assert client.post(base, json={'title': 'Viewer creation', 'repo_ids': [first]}).status_code == 403
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_outcome_creation_deduplicates_explicit_repositories(client, signed_in, root, assigned):
+    ws = signed_in["workspaces"][0]["id"]
+    with db.session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="acme/app")
+        s.add(repo)
+        s.flush()
+        repo_id = repo.id
+    body = {"title": "Repeated repository", "repo_ids": [repo_id, repo_id]}
+    if assigned:
+        # Explicit repositories still win over empty stream defaults.
+        body["workstream_id"] = _create(client, root)["id"]
+    response = client.post(f"/api/workspaces/{ws}/outcomes", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["repo_ids"] == [repo_id]
+    assert response.json()["workstream_id"] == body.get("workstream_id")
+
+
+def test_session_publications_commit_order_and_savepoint_rollback(signed_in, monkeypatch):
+    ws = signed_in['workspaces'][0]['id']
+    published = []
+    monkeypatch.setattr(events.bus, 'publish', published.append)
+    with db.session_scope() as s:
+        events.record(ws, 'outer', session=s)
+        events.notify(ws, 'signal', 'outer', session=s)
+        with pytest.raises(ValueError):
+            with s.begin_nested():
+                events.record(ws, 'rolled_back', session=s)
+                events.notify(ws, 'signal', 'rolled_back', session=s)
+                raise ValueError('rollback savepoint')
+        with s.begin_nested():
+            events.record(ws, 'nested', session=s)
+        assert published == []
+        events.record(ws, 'last', session=s)
+    assert [(p['type'], p.get('kind', p.get('id'))) for p in published] == [
+        ('event', 'outer'), ('changed', 'outer'), ('event', 'nested'), ('event', 'last')]
+    published.clear()
+    with pytest.raises(ValueError):
+        with db.session_scope() as s:
+            events.record(ws, 'discard', session=s)
+            events.notify(ws, 'signal', 'discard', session=s)
+            raise ValueError('rollback outer')
+    assert published == []
+
+
+def test_assignment_audit_failure_rolls_back(client, signed_in, root, monkeypatch):
+    ws = signed_in['workspaces'][0]['id']
+    stream = _create(client, root)
+    with db.session_scope() as s:
+        o = Outcome(workspace_id=ws, number=1, title='Untouched', status='running')
+        s.add(o)
+        s.flush()
+        oid = o.id
+    original = events.record
+    def fail(*args, **kwargs):
+        if args[1] == 'outcome_workstream_changed':
+            raise RuntimeError('audit failed')
+        return original(*args, **kwargs)
+    monkeypatch.setattr('aifactory.api.record', fail)
+    published = []
+    monkeypatch.setattr(events.bus, 'publish', published.append)
+    with pytest.raises(RuntimeError, match='audit failed'):
+        client.patch(f'/api/workspaces/{ws}/outcomes/{oid}', json={'workstream_id': stream['id']})
+    with db.session_scope() as s:
+        assert s.get(Outcome, oid).workstream_id is None
+    assert not published
+
+
+def test_rollup_notification_follows_committed_event(signed_in, monkeypatch):
+    from types import SimpleNamespace
+    from aifactory.pipeline.orchestrator import orchestrator
+    ws = signed_in['workspaces'][0]['id']
+    published = []
+    monkeypatch.setattr(events.bus, 'publish', published.append)
+    with db.session_scope() as s:
+        outcome = Outcome(workspace_id=ws, number=1, title='Complete', status='running')
+        s.add(outcome)
+        s.flush()
+        task = SimpleNamespace(status='completed')
+        orchestrator._rollup(outcome, [task], s)
+        assert published == []
+    assert [(p['type'], p.get('kind')) for p in published] == [('event', 'outcome_completed'), ('changed', None)]
+
+
+def test_assignment_route_preserves_existing_priority_edits(client, signed_in, root):
+    ws = signed_in["workspaces"][0]["id"]
+    stream = _create(client, root)
+    with db.session_scope() as s:
+        outcome = Outcome(workspace_id=ws, number=1, title="Shared endpoint", status="running", priority=2)
+        s.add(outcome)
+        s.flush()
+        oid = outcome.id
+    path = f"/api/workspaces/{ws}/outcomes/{oid}"
+    assert client.patch(path, json={"priority": 0}).status_code == 200
+    assigned = client.patch(path, json={"workstream_id": stream["id"]})
+    assert assigned.status_code == 200
+    assert assigned.json()["priority"] == 0 and assigned.json()["status"] == "running"
+    assert assigned.json()["workstream_id"] == stream["id"]
+    assert client.patch(path, json={"priority": 1, "workstream_id": None}).status_code == 422
+    assert client.patch(path, json={"priority": 1, "status": "completed"}).status_code == 422

@@ -60,11 +60,11 @@ def send_guidance(db: Session, user: User, workspace_id: str, outcome_id: str,
     return message, payload
 
 
-def create_outcome(db: Session, user: User, workspace_id: str, *, title: str, brief: str, repo_ids: list[str],
+def create_outcome(db: Session, user: User, workspace_id: str, *, title: str, brief: str, repo_ids: list[str] | None,
                    acceptance: list[str] | None = None, harness: str | None = None, priority: int = 2,
                    attachment_ids: list[str] | None = None, template: str | None = None,
                    signal_id: str | None = None, action_id: str | None = None,
-                   pending_events: list[dict] | None = None) -> Outcome:
+                   pending_events: list[dict] | None = None, workstream_id: str | None = None) -> Outcome:
     """POST /outcomes and a confirmed Mind card: connected repositories, a known harness, staged attachments
     claimed before anything is created. Callers commit and wake the orchestrator. A Mind card's outcome has source
     "mind" (the app names its creator "<person> via Mind") and its creation event waits in pending_events."""
@@ -74,7 +74,19 @@ def create_outcome(db: Session, user: User, workspace_id: str, *, title: str, br
     from .signals import outcome_from_text
 
     require_member(db, user, workspace_id, "member")
+    from . import workstreams
+
     attachment_ids = list(attachment_ids or [])
+    if template and (attachment_ids or (repo_ids is not None and len(repo_ids) != 1)):
+        raise HTTPException(400, "The README example requires exactly one repository and no attachments")
+    try:
+        uploads = A.validate_staged(db, workspace_id, user.id, attachment_ids)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    workstreams.lock_workspace(db, workspace_id)
+    repo_ids = workstreams.creation_repositories(db, workspace_id, repo_ids, workstream_id)
     repos = db.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.id.in_(repo_ids)).all()
     if not repo_ids or len(repos) != len(set(repo_ids)):
         raise HTTPException(400, "Unknown repository")
@@ -82,12 +94,6 @@ def create_outcome(db: Session, user: User, workspace_id: str, *, title: str, br
         raise HTTPException(400, "The README example requires exactly one repository and no attachments")
     if harness and harness not in ("native", "codex", "anton"):
         raise HTTPException(400, "Unknown harness")
-    try:
-        uploads = A.validate_staged(db, workspace_id, user.id, attachment_ids)
-    except LookupError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
     # Claim before creating any outcome/events. The conditional UPDATE serializes
     # competing submissions on both SQLite and Postgres; a loser rolls back all claims.
     claim_id = new_id()
@@ -102,7 +108,7 @@ def create_outcome(db: Session, user: User, workspace_id: str, *, title: str, br
                                 harness=harness, priority=max(0, min(priority, 3)), signal_id=signal_id,
                                 guidance={"template": README_TEMPLATE, "repo_id": repos[0].id} if template else None,
                                 source="mind" if action_id else "user", action_id=action_id,
-                                pending_events=pending_events)
+                                pending_events=pending_events, workstream_id=workstream_id)
     if uploads:
         db.query(Artifact).filter(Artifact.workspace_id == workspace_id, Artifact.outcome_id == claim_id).update(
             {Artifact.outcome_id: outcome.id}, synchronize_session=False)
