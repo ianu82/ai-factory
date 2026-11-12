@@ -264,7 +264,17 @@ def test_a_continuation_the_director_granted_holds_only_under_its_ceiling(world)
         s.add(granted({"source": "director", "run_id": "r"}))
     with db.session_scope() as s:
         assert lead.continued_past_budget(s, world["outcome"])  # later Lead runs may continue, under the ceiling
-    spend(world, 130.0)
+    spend(world, 119.0)
+    with db.session_scope() as s:  # a Lead run reserves no more than what is left under the ceiling
+        run = Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="running")
+        s.add(run)
+        s.flush()
+        run_id = run.id
+    assert lead._reserve(world["outcome"], run_id, 2.0, 40.0, 5.0, timedelta(minutes=60)) == pytest.approx(1.0)
+    with db.session_scope() as s:
+        s.query(Run).filter_by(id=run_id).delete()
+    spend(world, 11.0)
     with db.session_scope() as s:
         assert not lead.continued_past_budget(s, world["outcome"])  # past it, the outcome's budget stops them again
         s.add(granted(None))  # a person's grant has no ceiling
@@ -343,6 +353,42 @@ def test_a_run_decides_what_waits_and_leaves_the_rest_to_people_with_a_note(worl
     later = db.utcnow() + timedelta(minutes=3)
     assert world["ws"] not in woken(later)  # the noted decision stays seen; nothing else is new
     assert woken(db.utcnow() + timedelta(minutes=6))[world["ws"]]["new"] == [f"d:{world['fresh']}"]  # now it's ripe
+
+
+def test_switching_it_off_stops_a_run_before_its_next_change(world, model):
+    def script(messages):
+        if step(messages) == 0:
+            with db.session_scope() as s:  # a person switches it off while the model is thinking
+                w = s.get(Workspace, world["ws"])
+                w.settings = {**w.settings, "director": {**ON, "mode": "off"}}
+            return {"content": "", "tool_calls": [
+                call("resolve_decision", {"decision_id": world["merge"], "option": "approve", "comment": "Green."})]}
+        return {"content": "", "tool_calls": [call("finish", {"summary": "Done."})]}
+
+    model.scripts = {"director": script}
+    result = asyncio.run(director.run_director(woken()[world["ws"]]))
+    assert result["status"] == "stopped" and "switched off" in result["reason"]
+    with db.session_scope() as s:
+        assert s.get(Decision, world["merge"]).status == "open"  # decisions wait for a person again
+
+
+def test_when_two_resolvers_act_at_once_only_the_first_applies(world):
+    from aifactory.decisions import DecisionError, resolve
+
+    person, other = db.SessionLocal(), db.SessionLocal()
+    try:
+        mine, theirs = person.get(Decision, world["merge"]), other.get(Decision, world["merge"])
+        assert mine.status == theirs.status == "open"  # both loaded it while it was open
+        resolve(person, mine, person.get(User, world["uid"]), "approve")
+        with pytest.raises(DecisionError, match="already resolved"):
+            resolve(other, theirs, director.director_user(other), "reject", "Not yet.")
+    finally:
+        person.close()
+        other.close()
+    with db.session_scope() as s:
+        merge = s.get(Decision, world["merge"])
+        assert merge.resolution == "approve" and merge.resolved_by == world["uid"]
+        assert s.get(Task, world["t1"]).stage == "merge"
 
 
 def test_an_item_it_passes_over_comes_back_until_it_has_been_skipped_three_times(world):

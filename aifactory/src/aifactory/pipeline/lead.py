@@ -651,7 +651,16 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
             s.query(Outcome).filter(Outcome.id == outcome_id).with_for_update().one()
         # A finished outcome's closing update runs within the Lead's own run cap, even when the outcome is spent.
         finished = s.query(Outcome.status).filter(Outcome.id == outcome_id).scalar() in FINISHED
-        if outcome_limit is not None and not finished and not continued_past_budget(s, outcome_id):
+        if outcome_limit is not None and not finished and continued_past_budget(s, outcome_id):
+            # Continued past its budget: by a person, with no limit but the run's own cap; or only by the Director,
+            # up to its ceiling, so the run reserves no more than what is left under it.
+            granted = s.query(Decision).filter(Decision.outcome_id == outcome_id, Decision.kind == "budget",
+                                               Decision.status == "resolved", Decision.resolution == "retry").all()
+            if all((d.attribution or {}).get("source") == "director" for d in granted):
+                from .director import room
+
+                cap = min(cap, max(0.0, room(granted[0].workspace_id, outcome_id)))
+        elif outcome_limit is not None and not finished:
             spent, _ = outcome_cost(outcome_id)
             held = 0.0
             for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,

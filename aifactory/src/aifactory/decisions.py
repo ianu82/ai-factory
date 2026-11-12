@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from .db import utcnow
@@ -49,6 +50,14 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     valid = {o.get("value") for o in decision.options or []} or {"dismiss"}
     if resolution not in valid:
         raise DecisionError(f"Choose one of: {', '.join(sorted(v for v in valid if v))}")
+    # Claim the decision in the database: of two resolvers acting at once (a person, their Mind, the Lead, the
+    # Director, an operator relay), only the first applies; the other finds it resolved and changes nothing.
+    db.flush()
+    claimed = db.execute(update(Decision).where(Decision.id == decision.id, Decision.status == "open")
+                         .values(status="resolved" if resolution != "dismiss" else "dismissed")
+                         .execution_options(synchronize_session=False)).rowcount
+    if claimed != 1:
+        raise DecisionError("This decision is already resolved")
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
     decision.resolution = resolution
     decision.comment = comment.strip()[:8000]

@@ -62,6 +62,13 @@ class DirectorFailed(Exception):
     """The run ended without doing its job; it is recorded as failed so a later run revisits what woke it."""
 
 
+class SwitchedOff(DirectorFailed):
+    """The workspace turned the Director off (or paused) during the run: it stops before its next change."""
+
+
+CHANGES = frozenset({"resolve_decision", "triage_signal", "dismiss_alert", "post_guidance", "note_for_people"})
+
+
 def settings_for(settings: dict[str, Any]) -> dict[str, Any]:
     raw = settings.get("director") if isinstance(settings.get("director"), dict) else {}
     cfg = {**DEFAULTS, **raw}
@@ -131,9 +138,14 @@ def continuation_usd(decision: Decision, settings: dict[str, Any]) -> float:
 def within_ceiling(db, decision: Decision) -> bool:
     """Whether a continuation the Director granted (a budget decision it resolved with "retry") still holds: only
     while the outcome has committed less than the workspace's Director ceiling. Later Lead runs read it through
-    lead.continued_past_budget, so the Director's grant never lets spend run past ``max_outcome_usd``."""
-    cfg = settings_for(workspace_settings(decision.workspace_id))
-    return outcome_committed(decision.outcome_id)[0] < cfg["max_outcome_usd"]
+    lead.continued_past_budget, and reserve at most what is left (room), so the Director's grant never lets spend
+    run past ``max_outcome_usd``."""
+    return room(decision.workspace_id, decision.outcome_id) > 0
+
+
+def room(workspace_id: str, outcome_id: str) -> float:
+    """What the outcome may still commit under the workspace's Director ceiling."""
+    return settings_for(workspace_settings(workspace_id))["max_outcome_usd"] - outcome_committed(outcome_id)[0]
 
 
 # waking ------------------------------------------------------------------------------------------------------------
@@ -407,6 +419,8 @@ class Tools:
     def call(self, name: str, args: Any) -> str:
         if not isinstance(args, dict):
             return "Arguments must be a JSON object."
+        if name in CHANGES and not self._still_on():
+            raise SwitchedOff("The Director was switched off during the run")
         if name in PER_RUN:
             if self.used.get(name, 0) >= PER_RUN[name]:
                 return f"You have used {name} {PER_RUN[name]} times this run, the limit. Finish, and say what is left."
@@ -418,6 +432,12 @@ class Tools:
             return handler(**args)
         except TypeError:
             return f"Invalid arguments for {name}."
+
+    def _still_on(self) -> bool:
+        """Read fresh before every change: a person may have turned the Director off or paused the workspace."""
+        with session_scope() as s:
+            ws = s.get(Workspace, self.ws)
+            return ws is not None and not ws.paused and settings_for(merged_settings(ws.settings))["mode"] == "on"
 
     async def after_call(self) -> None:
         """Follow-ups a resolution leaves for after its commit, as the app's own resolve runs them."""
@@ -728,6 +748,8 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
         status = "succeeded"
     except asyncio.CancelledError:
         status, error = "cancelled", "Stopped"
+    except SwitchedOff as exc:
+        status, error = "stopped", str(exc)
     except (BudgetExceeded, DirectorFailed) as exc:
         error = str(exc)
     except TimeoutError:
