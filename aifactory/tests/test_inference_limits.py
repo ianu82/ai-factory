@@ -242,10 +242,12 @@ async def test_an_outage_longer_than_the_retry_budget_fails_the_request(provider
     fake_http(monkeypatch, upstream)
     with pytest.raises(inference.InferenceError) as failed:
         await ModelClient(provider)._post("/responses", {}, notice=notes.append)
-    assert waits == [1, 2, 4, 8, 16, 32, 60, 60, 60, 57]  # doubling, capped at a minute, then what is left
-    assert len(sends) == 11 and sends[-1] - sends[0] == inference.RETRY_BUDGET_SECONDS
+    # Doubling, capped at a minute. With 57 s left the next wait would end at the budget, so it is not taken and
+    # nothing is sent there: such a request could run for its whole timeout past the budget.
+    assert waits == [1, 2, 4, 8, 16, 32, 60, 60, 60]
+    assert len(sends) == 10 and sends[-1] - sends[0] == 243 < inference.RETRY_BUDGET_SECONDS
     assert (failed.value.status, failed.value.cause) == (503, "transient")
-    assert notes == ["Model provider unavailable (503); gave up after 300 s"]
+    assert notes == ["Model provider unavailable (503); gave up after 243 s"]
 
 
 @pytest.mark.parametrize("limit, sent, waited", [(0, 1, []), (2, 3, [1, 2])])
@@ -300,12 +302,13 @@ async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(pro
     client = ModelClient(provider)
     with pytest.raises(inference.InferenceError):
         await client._post("/responses", {}, deadline=now[0] + 10)
-    assert waits == [1, 2, 4, 3] and sends == [0, 1, 3, 7, 10]  # the last wait is cut to the session's time
+    # With 3 s of the session left the next wait (8 s) does not fit: the request fails, nothing is sent at the deadline.
+    assert waits == [1, 2, 4] and sends == [0, 1, 3, 7]
     stopped = asyncio.Event()
     stopped.set()
     with pytest.raises(inference.InferenceError):
         await client._post("/responses", {}, cancelled=stopped)
-    assert len(sends) == 6 and len(waits) == 4  # a cancelled session sends once and never waits
+    assert len(sends) == 5 and len(waits) == 3  # a cancelled session sends once and never waits
 
 
 async def test_cancelling_the_session_ends_a_retry_wait(provider, clocked, monkeypatch):

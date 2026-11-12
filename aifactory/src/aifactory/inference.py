@@ -286,7 +286,8 @@ def from_responses_output(data: dict[str, Any]) -> dict[str, Any]:
 class Retries:
     """One request's in-place retries while the provider is briefly unavailable: capped exponential backoff (a
     ``retry-after`` is honoured) until RETRY_BUDGET_SECONDS have passed since the request's first failure, never past
-    the session's ``deadline`` (time.monotonic), ended at once by its ``cancelled`` event. ``limit`` replaces the
+    the session's ``deadline`` (time.monotonic), ended at once by its ``cancelled`` event. A wait that would last
+    until either end is not taken, so nothing is sent at the deadline itself. ``limit`` replaces the
     time budget with a fixed number of resends (0: fail on the first error). A request that was retried is reported
     once, when it ends: to ``notice`` when given, else in the log."""
 
@@ -307,20 +308,23 @@ class Retries:
 
     async def wait(self, what: str, retry_after: float | None = None) -> bool:
         """Sleep before the next try. False, without sleeping, when the retry budget, the session's time or the
-        allowed resends are spent, or the session was cancelled; False after the sleep if it was cancelled meanwhile."""
+        allowed resends are spent, when this wait would use up the time that is left (a request sent at the deadline
+        could run for its whole timeout past it), or the session was cancelled; False after the sleep if it was
+        cancelled meanwhile."""
         now = _clock()
         if self.first is None:
             self.first = now
         self.what = what
         ends = [end for end in (self.deadline, None if self.limit is not None else self.first + RETRY_BUDGET_SECONDS)
                 if end is not None]
-        left = min(ends) - now if ends else RETRY_WAIT_CAP_SECONDS
+        left = min(ends) - now if ends else float("inf")
         if left <= 0 or (self.limit is not None and self.waits + self.resends >= self.limit):
             return False
         if self.cancelled is not None and self.cancelled.is_set():
             return False
-        delay = min(RETRY_WAIT_CAP_SECONDS, left,
-                    retry_after or 2 ** min(self.waits + self.resends, 6) + random.random())
+        delay = min(RETRY_WAIT_CAP_SECONDS, retry_after or 2 ** min(self.waits + self.resends, 6) + random.random())
+        if delay >= left:
+            return False
         self.waits += 1
         if self.cancelled is None:
             await asyncio.sleep(delay)
