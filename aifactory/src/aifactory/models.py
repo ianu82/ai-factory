@@ -3,6 +3,26 @@
 Hierarchy: Organization -> Workspace -> (Repository, Secret, Outcome -> Plan, Task -> Run).
 Events are the append-only journal; Decisions are attributed human choices (and the
 attention queue); Signals are incoming product feedback.
+
+Eval storage is intentionally a parallel workspace-owned hierarchy, with no
+Outcome/Task/Run dependencies: EvalConfiguration (content-addressed snapshot),
+EvalSchedule (UTC cadence/matrix/thresholds), EvalRun (one suite x requested
+worker/model/config cell), EvalCaseResult (one immutable case revision per run),
+and EvalDailyBudget (workspace x UTC date). See benchmarks' module docstring for
+JSON shapes and T2-T7 lifecycle/reservation/lease contracts. Composite foreign
+keys enforce tenant scope for configuration, schedule, previous run and case
+links. Schedule-period-cell and run-case unique constraints provide restart
+idempotency. Nullable schedule/period means an on-demand invocation.
+
+All leases have an optimistic generation fence: ORM writes use version_id_col;
+bulk writes must match and advance claim_generation explicitly. Reclaims must
+advance it even if the owner is unchanged. Schedule-dependent launches also
+require a generation check under lock, implemented by the scheduler (T4).
+Snapshots and requested identity cannot be replaced after insertion. JSON
+columns are plain SQLAlchemy JSON: edits must assign fresh values to persist;
+in-place snapshot mutations are never updates. Execution/evidence writers must
+scrub and bound their JSON before assignment. Unknown costs default to unknown,
+not free. Budget admission/reconciliation is T2, not a side effect of model flush.
 """
 
 from __future__ import annotations
@@ -19,6 +39,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     Text,
@@ -26,7 +47,7 @@ from sqlalchemy import (
     Index,
 )
 from sqlalchemy import event, inspect
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .db import Base, utcnow
 
@@ -983,3 +1004,171 @@ class TraceState(Base):
     reserved_usd: Mapped[float] = mapped_column(Float, default=0)
     spent_usd: Mapped[float] = mapped_column(Float, default=0)
     __table_args__ = (CheckConstraint("reserved_usd >= 0 AND spent_usd >= 0", name="ck_trace_spend"),)
+
+
+class EvalConfiguration(Base):
+    """Secret-free, content-addressed eval input, independent of delivery versions."""
+
+    __tablename__ = "eval_configurations"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class EvalSchedule(Base):
+    """UTC schedule intent. Optimistic generation fences stale lease holders."""
+
+    __tablename__ = "eval_schedules"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    name: Mapped[str] = mapped_column(String(80), default="nightly")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    cadence: Mapped[str] = mapped_column(String(20), default="nightly")
+    suites: Mapped[list] = mapped_column(JSON, default=list)
+    matrix: Mapped[list] = mapped_column(JSON, default=list)
+    thresholds: Mapped[dict] = mapped_column(JSON, default=dict)
+    run_budget_usd: Mapped[float] = mapped_column(Float, default=8.0)
+    daily_budget_usd: Mapped[float] = mapped_column(Float, default=40.0)
+    last_period: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claim_generation: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __mapper_args__ = {"version_id_col": claim_generation}
+    __table_args__ = (UniqueConstraint("workspace_id", "id"), UniqueConstraint("workspace_id", "name"))
+
+
+class EvalRun(Base):
+    """One suite x requested worker/model/config cell; never a delivery Run."""
+
+    __tablename__ = "eval_runs"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    invocation_id: Mapped[str] = mapped_column(String(32), index=True)
+    schedule_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    period: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    suite_id: Mapped[str] = mapped_column(String(80))
+    suite_revision: Mapped[str] = mapped_column(String(64))
+    suite_snapshot: Mapped[dict] = mapped_column(JSON)
+    worker: Mapped[str] = mapped_column(String(80))
+    model: Mapped[str] = mapped_column(String(100))
+    configuration_id: Mapped[str] = mapped_column(String(64))
+    requested_identity: Mapped[dict] = mapped_column(JSON, default=dict)
+    effective_identity: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    previous_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    aggregate: Mapped[dict] = mapped_column(JSON, default=dict)
+    run_budget_usd: Mapped[float] = mapped_column(Float, default=8.0)
+    budget_day: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    reserved_usd: Mapped[float] = mapped_column(Float, default=0)
+    spent_usd: Mapped[float] = mapped_column(Float, default=0)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    reservation_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True)
+    reservation_released_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claim_generation: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __mapper_args__ = {"version_id_col": claim_generation}
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("schedule_id", "period", "suite_id", "worker", "model", "configuration_id",
+                         name="uq_eval_scheduled_cell"),
+        ForeignKeyConstraint(["workspace_id", "schedule_id"], ["eval_schedules.workspace_id", "eval_schedules.id"]),
+        ForeignKeyConstraint(["workspace_id", "configuration_id"],
+                             ["eval_configurations.workspace_id", "eval_configurations.id"]),
+        ForeignKeyConstraint(["workspace_id", "previous_run_id"], ["eval_runs.workspace_id", "eval_runs.id"]),
+        CheckConstraint("(schedule_id IS NULL AND period IS NULL) OR (schedule_id IS NOT NULL AND period IS NOT NULL)",
+                        name="ck_eval_schedule_period"),
+        CheckConstraint("status IN ('queued','running','passed','failed','error','cancelled','budget_exceeded')",
+                        name="ck_eval_run_status"),
+        CheckConstraint("reserved_usd >= 0 AND spent_usd >= 0 AND run_budget_usd >= 0", name="ck_eval_run_cost"),
+    )
+
+
+class EvalCaseResult(Base):
+    """Usage totals include all attempts. Unknown cost must not be treated as zero."""
+
+    __tablename__ = "eval_case_results"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    run_id: Mapped[str] = mapped_column(String(32), index=True)
+    case_id: Mapped[str] = mapped_column(String(100))
+    case_revision: Mapped[str] = mapped_column(String(64))
+    case_snapshot: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    verdict: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    scores: Mapped[list] = mapped_column(JSON, default=list)
+    usage: Mapped[dict] = mapped_column(JSON, default=dict)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    transcript_summary: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    diff: Mapped[dict] = mapped_column(JSON, default=dict)
+    claim_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claim_generation: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __mapper_args__ = {"version_id_col": claim_generation}
+    __table_args__ = (
+        UniqueConstraint("run_id", "case_id", name="uq_eval_run_case"),
+        ForeignKeyConstraint(["workspace_id", "run_id"], ["eval_runs.workspace_id", "eval_runs.id"]),
+        CheckConstraint("status IN ('queued','running','passed','failed','error','cancelled','budget_exceeded')",
+                        name="ck_eval_case_status"),
+        CheckConstraint("verdict IS NULL OR verdict IN ('pass','fail','error')", name="ck_eval_verdict"),
+        CheckConstraint("cost_usd >= 0 AND duration_seconds >= 0 AND attempts >= 0", name="ck_eval_case_usage"),
+    )
+
+    @validates("status")
+    def _validate_status(self, _key, value):
+        if value not in {"queued", "running", "passed", "failed", "error", "cancelled", "budget_exceeded"}:
+            raise ValueError("Invalid eval case status")
+        return value
+
+
+class EvalDailyBudget(Base):
+    """One UTC YYYY-MM-DD ledger per workspace, locked before reservation (T2)."""
+
+    __tablename__ = "eval_daily_budgets"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    limit_usd: Mapped[float] = mapped_column(Float)
+    reserved_usd: Mapped[float] = mapped_column(Float, default=0)
+    spent_usd: Mapped[float] = mapped_column(Float, default=0)
+    cost_known: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    __table_args__ = (CheckConstraint("limit_usd >= 0 AND reserved_usd >= 0 AND spent_usd >= 0",
+                                    name="ck_eval_daily_cost"),)
+
+
+def _eval_immutable(_mapper, _connection, obj):
+    fields = {
+        EvalConfiguration: ("workspace_id", "id", "snapshot"),
+        EvalRun: ("workspace_id", "invocation_id", "schedule_id", "period", "suite_id", "suite_revision",
+                  "suite_snapshot", "worker", "model", "configuration_id", "requested_identity"),
+        EvalCaseResult: ("workspace_id", "run_id", "case_id", "case_revision", "case_snapshot"),
+    }[type(obj)]
+    if any(inspect(obj).attrs[key].history.has_changes() for key in fields):
+        raise ValueError("Eval snapshots and requested identities are immutable")
+
+
+for _eval_type in (EvalConfiguration, EvalRun, EvalCaseResult):
+    event.listen(_eval_type, "before_update", _eval_immutable)
+
+
+@event.listens_for(EvalSchedule, "before_insert")
+def _eval_schedule_defaults(_mapper, _connection, schedule):
+    if schedule.thresholds is None:
+        from .benchmarks import DEFAULT_THRESHOLDS
+
+        schedule.thresholds = dict(DEFAULT_THRESHOLDS)
