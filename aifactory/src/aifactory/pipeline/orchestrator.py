@@ -672,11 +672,25 @@ class Orchestrator:
         for workspace_id, decision_id, title, outcome_id, task_id in opened:  # announced once they are committed
             publish_decision(workspace_id, decision_id, "unblock", title, outcome_id=outcome_id, task_id=task_id)
 
-    def _ask(self, s, outcome: Outcome, tasks: list[Task], decisions: list[Decision],
-             unasked: set[str]) -> list[tuple[str, str, str, str, str | None]]:
+    @staticmethod
+    def _open_decisions(s, outcome: Outcome) -> list[Decision]:
+        """The outcome's open decisions, read again under the workspace's lock (the one open_decision takes, held
+        until this pass commits): another instance's pass may have opened one since this pass first read them."""
+        if s.bind.dialect.name == "sqlite":  # FOR UPDATE is ignored there; a write takes the lock
+            s.query(Workspace).filter(Workspace.id == outcome.workspace_id).update(
+                {Workspace.outcome_seq: Workspace.outcome_seq}, synchronize_session=False)
+        s.query(Workspace).filter(Workspace.id == outcome.workspace_id).with_for_update().one()
+        return (s.query(Decision).filter(Decision.status == "open", Decision.outcome_id == outcome.id)
+                .populate_existing().all())
+
+    def _ask(self, s, outcome: Outcome, tasks: list[Task], decisions: list[Decision], unasked: set[str],
+             locked: bool = False) -> list[tuple[str, str, str, str, str | None]]:
         """Nothing waits on a person without a decision to answer. Two cases no other code asks about: tasks that
         can never start because what they depend on ended undelivered (one decision for the outcome), and a task
-        left waiting on a person with no open decision. Returns the decisions opened, for announcing."""
+        left waiting on a person with no open decision. Returns the decisions opened, for announcing.
+
+        A decision is only opened from what is read under the workspace's lock, so that two instances cannot both
+        open it: the first time this pass is about to open one, it starts over with the decisions read there."""
         ws, opened = outcome.workspace_id, []
         whole = [d for d in decisions if not d.task_id]
         current = next((d for d in whole if d.kind == "unblock" and "stranded" in (d.metadata_json or {})), None)
@@ -694,6 +708,8 @@ class Orchestrator:
                 "the builders. Drop them otherwise: the outcome then ends with what was delivered.",
             ])
             if current is None:
+                if not locked:
+                    return self._ask(s, outcome, tasks, self._open_decisions(s, outcome), unasked, locked=True)
                 decision = Decision(workspace_id=ws, kind="unblock", title=title, body=body, outcome_id=outcome.id,
                                     options=STRANDED_OPTIONS, metadata_json={"stranded": keys})
                 s.add(decision)
@@ -721,6 +737,8 @@ class Orchestrator:
             unasked.add(task.id)
             if now - self._unasked.setdefault(task.id, now) < UNASKED_AFTER:
                 continue
+            if not locked:
+                return self._ask(s, outcome, tasks, self._open_decisions(s, outcome), unasked, locked=True)
             title = f"{task.key} {WAITS_AS[task.status]}, and nothing was asking what to do"[:300]
             body = (f"{task.key} ({task.title}) {WAITS_AS[task.status]}, with no open decision: nobody was being "
                     f"asked what to do next.\n\nRecorded reason: {task.blocked_reason or 'none'}")
@@ -914,8 +932,6 @@ class Orchestrator:
                                 s, task, owner=self.instance, status="blocked", lease_owner="",
                                 blocked_reason=f"{type(exc).__name__}: {exc}"[:2000]):
                             return
-                        from ..models import Decision
-
                         decision = Decision(workspace_id=ws, kind="unblock", title="A task stopped unexpectedly",
                                             body=f"{type(exc).__name__}: {exc}"[:2000], outcome_id=outcome_id,
                                             task_id=task_id, options=[{"value": "retry", "label": "Retry"},
@@ -929,33 +945,37 @@ class Orchestrator:
             finally:
                 self._tasks.pop(task_id, None)
                 asked: tuple[str, str] | None = None
-                with session_scope() as s:
-                    task = s.get(Task, task_id)
-                    if task and task.status == "running" and not self._stopping:
-                        # Never silently loop: a runner that stops without a recorded state needs a look, and the
-                        # decision that asks for it is written with the status.
-                        if transition(s, task, owner=self.instance, status="blocked", lease_owner="",
-                                      blocked_reason="The task stopped without recording an outcome."):
-                            decision = Decision(
-                                workspace_id=ws, kind="unblock", outcome_id=outcome_id, task_id=task_id,
-                                title=f"{task.key} stopped without recording an outcome", options=RETRY_OR_ABANDON,
-                                body=f"The run of {task.key} ended at stage '{task.stage or 'start'}' without saying "
-                                     "how it ended. Retry continues from that stage.")
-                            s.add(decision)
-                            s.flush()
-                            asked = decision.id, decision.title
-                    if task and task.status == "running":
-                        # A workspace pause stops continuation at the next gate;
-                        # retain the stage for resumption when it is unpaused.
-                        s.query(Task).filter(Task.id == task_id, Task.status == "running",
-                                             Task.lease_owner.in_(("", self.instance)),
-                                             Task.stage == task.stage, Task.workspace_id.in_(
-                                                 s.query(Workspace.id).filter(Workspace.paused.is_(True)))).update(
-                            {Task.status: "queued"}, synchronize_session=False)
-                    if task:
-                        # Leases are execution-only, including pause/stop/error exits.
-                        s.query(Task).filter(Task.id == task_id, Task.lease_owner == self.instance).update(
-                            {Task.lease_owner: "", Task.lease_expires_at: None}, synchronize_session=False)
+                try:
+                    with session_scope() as s:
+                        task = s.get(Task, task_id)
+                        if task and task.status == "running" and not self._stopping:
+                            # Never silently loop: a runner that stops without a recorded state needs a look, and the
+                            # decision that asks for it is written with the status.
+                            if transition(s, task, owner=self.instance, status="blocked", lease_owner="",
+                                          blocked_reason="The task stopped without recording an outcome."):
+                                decision = Decision(
+                                    workspace_id=ws, kind="unblock", outcome_id=outcome_id, task_id=task_id,
+                                    title=f"{task.key} stopped without recording an outcome", options=RETRY_OR_ABANDON,
+                                    body=f"The run of {task.key} ended at stage '{task.stage or 'start'}' without "
+                                         "saying how it ended. Retry continues from that stage.")
+                                s.add(decision)
+                                s.flush()
+                                asked = decision.id, decision.title
+                        if task and task.status == "running":
+                            # A workspace pause stops continuation at the next gate;
+                            # retain the stage for resumption when it is unpaused.
+                            s.query(Task).filter(Task.id == task_id, Task.status == "running",
+                                                 Task.lease_owner.in_(("", self.instance)),
+                                                 Task.stage == task.stage, Task.workspace_id.in_(
+                                                     s.query(Workspace.id).filter(Workspace.paused.is_(True)))).update(
+                                {Task.status: "queued"}, synchronize_session=False)
+                        if task:
+                            # Leases are execution-only, including pause/stop/error exits.
+                            s.query(Task).filter(Task.id == task_id, Task.lease_owner == self.instance).update(
+                                {Task.lease_owner: "", Task.lease_expires_at: None}, synchronize_session=False)
+                except Exception:  # the lease runs out and the task is picked up again; nothing was asked
+                    log.exception("could not record how the task ended")
+                    asked = None
                 if asked:
                     publish_decision(ws, asked[0], "unblock", asked[1], outcome_id=outcome_id, task_id=task_id)
                 notify(ws, "task", task_id, outcome_id=outcome_id)

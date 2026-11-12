@@ -217,6 +217,22 @@ def test_a_task_that_is_already_asked_about_is_left_alone(factory, monkeypatch):
     assert count(oid, "decision_missing") == 0
 
 
+def test_a_decision_another_instance_just_opened_is_not_opened_twice(factory, monkeypatch):
+    # Two instances' passes can both read the open decisions before either writes one. Whichever writes second reads
+    # them again under the workspace's lock, and finds what the first opened.
+    monkeypatch.setattr(scheduler, "UNASKED_AFTER", 0)
+    oid, ids = outcome_with(factory, ("T1", "abandoned", []), ("T2", "pending", ["T1"]), ("T3", "blocked", []),
+                            status="attention")
+    Orchestrator()._promote()  # the first instance: one decision for T2 behind T1, one for T3
+    first = asked(oid)
+    assert sorted(d["task_id"] or "" for d in first) == ["", ids["T3"]]
+    with session_scope() as s:  # the second instance, with the (empty) list it read before the first wrote
+        tasks = s.query(Task).filter(Task.outcome_id == oid).all()
+        assert Orchestrator()._ask(s, s.get(Outcome, oid), tasks, [], set()) == []
+    assert asked(oid) == first
+    assert count(oid, "tasks_stranded") == 1 and count(oid, "decision_missing") == 1
+
+
 def test_a_run_that_ends_without_saying_how_asks_what_to_do(factory, monkeypatch):
     class Silent:
         def __init__(self, *_args):
