@@ -618,7 +618,8 @@ class RepoQACommands(BaseModel):
 
 
 class RepoReleaseSelection(BaseModel):
-    mode: Literal["on_merge"] | None = None
+    model_config = {"extra": "allow"}
+    mode: Literal["on_merge", "continuous", "train"] | None = None
 
 
 class RepoCommands(BaseModel):
@@ -711,6 +712,8 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
         if "reverify" in merge and merge["reverify"] not in ("overlap", "always", "never"):
             raise HTTPException(422, "merge.reverify must be overlap, always or never")
         cfg["merge"] = merge
+    if "release" in patch and patch["release"] is None:
+        cfg["release"] = None
     for key in ("release", "qa", "recovery", "build"):
         if key in patch and isinstance(patch[key], dict):
             cfg[key] = patch[key]
@@ -746,7 +749,10 @@ async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depend
         if isinstance(patch.get("release"), dict):
             patch["release"] = {**(config.get("release") or {}), **patch["release"]}
         config = _clean_repo_config(config, patch)
-    repo = Repository(workspace_id=workspace_id, full_name=info["full_name"], default_branch=info.get("default_branch") or "main",
+    repo_id = new_id()
+    if "release" in config:
+        config["release"] = _validated_release(config["release"], db, workspace_id, repo_id)
+    repo = Repository(id=repo_id, workspace_id=workspace_id, full_name=info["full_name"], default_branch=info.get("default_branch") or "main",
                       description=info.get("description") or "", config=config)
     try:
         definitions.lock_workspace(db, workspace_id)
@@ -760,6 +766,49 @@ async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depend
     record(workspace_id, "repository_connected", f"Connected {repo.full_name}", actor=user.id,
            data={"detected": config.get("detected", [])})
     return S.repository(repo)
+
+
+def _validated_release(value, db: Session, workspace_id: str, repo_id: str):
+    from .release_config import validate_release_patch
+
+    try:
+        return validate_release_patch(value, db=db, workspace_id=workspace_id, repo_id=repo_id)
+    except ValueError:
+        raise HTTPException(422, "Invalid release configuration or webhook secret reference") from None
+
+
+class ReleaseWebhookSecretBody(BaseModel):
+    # Explicitly omit Pydantic's value-bearing validation errors for this credential.
+    value: Any = None
+
+
+@router.put("/workspaces/{workspace_id}/repositories/{repo_id}/release/webhook-secret")
+def set_release_webhook_secret(workspace_id: str, repo_id: str, body: ReleaseWebhookSecretBody,
+                               user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .release_config import webhook_secret_kind
+
+    _ws(db, user, workspace_id, "admin")
+    definitions.lock_workspace(db, workspace_id)
+    repo = db.get(Repository, repo_id)
+    if repo is None or repo.workspace_id != workspace_id:
+        raise HTTPException(404, "Repository not found")
+    if not isinstance(body.value, str) or len(body.value.strip()) < 8 or len(body.value.encode()) > 8192:
+        raise HTTPException(422, "Invalid webhook secret request")
+    value = body.value.strip()
+    kind = webhook_secret_kind(repo_id)
+    secret = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
+    if secret is None:
+        secret = Secret(workspace_id=workspace_id, kind=kind, ciphertext="")
+        db.add(secret)
+    secret.ciphertext = encrypt(value)
+    secret.hint = ""  # not even a partial credential is public
+    secret.updated_by = user.id
+    payload = record(workspace_id, "release_webhook_secret_configured", "Configured release webhook secret",
+           actor=user.id, data={"repo_id": repo_id}, session=db, publish=False)
+    db.commit()
+    from .events import bus
+    bus.publish({"type": "event", **payload})
+    return {"configured": True}
 
 
 class RepoUpdate(BaseModel):
@@ -776,7 +825,10 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
     if repo is None or repo.workspace_id != workspace_id:
         raise HTTPException(404, "Repository not found")
     try:
-        repo.config = _clean_repo_config(repo.config or {}, body.config)
+        patch = dict(body.config)
+        if "release" in patch:
+            patch["release"] = _validated_release(patch["release"], db, workspace_id, repo_id)
+        repo.config = _clean_repo_config(repo.config or {}, patch)
         definitions.validate_repository_change(db, workspace_id, author=user.id)
         db.commit()
     except definitions.DefinitionError as exc:
@@ -867,6 +919,16 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
     if preview_account is not None:
         db.delete(preview_account)
     workstream_events = workstreams.remove_repository_defaults(db, workspace_id, repo_id, user)
+    # Disconnect deletes repository-owned release history, just like review history.
+    # Explicit child-first cleanup also works on existing databases without changing
+    # their foreign keys. Keep credential removal in this same transaction.
+    from .models import Release, ReleaseStep, ReleaseTrainCursor
+    from .release_config import webhook_secret_kind
+
+    db.query(ReleaseTrainCursor).filter_by(workspace_id=workspace_id, repo_id=repo_id).delete()
+    db.query(ReleaseStep).filter_by(workspace_id=workspace_id, repo_id=repo_id).delete()
+    db.query(Release).filter_by(workspace_id=workspace_id, repo_id=repo_id).delete()
+    db.query(Secret).filter_by(workspace_id=workspace_id, kind=webhook_secret_kind(repo_id)).delete()
     db.delete(repo)
     definitions.validate_repository_change(db, workspace_id, author=user.id)
     db.commit()

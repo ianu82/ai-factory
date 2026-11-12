@@ -39,8 +39,11 @@ def workstream(w: Workstream) -> dict[str, Any]:
 
 def repository(r: Repository) -> dict[str, Any]:
     from .steward_policy import steward_policy
+    from .release_config import release_public
 
     config = r.config if isinstance(r.config, dict) else {}
+    if "release" in config:
+        config = {**config, "release": release_public(config["release"])}
     policy_invalid = not isinstance(r.config, (dict, type(None)))
     try:
         policy = steward_policy(config)
