@@ -89,6 +89,8 @@ def test_a_task_waiting_with_nothing_to_answer_wakes_the_lead_then_alerts(world,
     task(world, status="blocked", blocked_reason="Could not push the branch")
     with db.session_scope() as s:
         s.get(Outcome, world["outcome"]).status = "attention"
+    assert watch.run()["raised"] == 0  # the scheduler asks about it within minutes: nothing to wake the Lead for yet
+    task(world, updated_at=now() - watch.UNASKED_AFTER)
     assert watch.run() == {"raised": 1, "shown": 0, "cleared": 0, "woken": 1}
     assert live(world) == {"unasked": "watching"} and alerts(client, world) == []  # the Lead looks first
     [due] = [d for d in lead.due() if d["outcome_id"] == world["outcome"]]
@@ -103,7 +105,7 @@ def test_a_task_waiting_with_nothing_to_answer_wakes_the_lead_then_alerts(world,
 
 def test_without_a_lead_stuck_work_still_waits_before_it_alerts(world, client):
     client.patch(f"/api/workspaces/{world['ws']}", json={"settings": {"lead": {"enabled": False}}})
-    task(world, status="needs_input")
+    task(world, status="needs_input", updated_at=now() - watch.UNASKED_AFTER)
     assert watch.run() == {"raised": 1, "shown": 0, "cleared": 0, "woken": 0}
     with db.session_scope() as s:
         assert s.query(Event).filter_by(kind="lead_watch").count() == 0
@@ -188,6 +190,9 @@ def test_the_same_failure_across_outcomes_is_one_alert(world, client):
         for outcome_id, crash in ((world["outcome"], "KeyError: 'repo'"), (other.id, "TimeoutError: VM 12 boot")):
             s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", status="resolved",
                            title="A task stopped unexpectedly", body=crash, options=[]))  # different crashes
+            # The scheduler asking about work nothing asked about isn't a failure, however many outcomes have it.
+            s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", options=[],
+                           title="T2 is blocked, and nothing was asking what to do", metadata_json={"unasked": "blocked"}))
     assert watch.run()["shown"] == 1
     [shown] = alerts(client, world)
     assert shown["kind"] == "repeated" and shown["body"] == "VM refused: slot # busy (id …)"

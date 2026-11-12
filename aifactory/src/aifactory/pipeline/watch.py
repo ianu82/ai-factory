@@ -41,6 +41,9 @@ from .runtime import DEFAULT_SETTINGS, merged_settings
 WATCH_EVERY = timedelta(minutes=5)
 GRACE = timedelta(minutes=30)  # how long stuck work lasts, with its Lead woken, before people are alerted
 QUIET = timedelta(hours=1)
+# The scheduler opens a decision for a task left waiting on a person within minutes (scheduler's UNASKED_AFTER): the
+# watch looks only at tasks that have waited longer, so it doesn't wake the Lead for what is about to be asked.
+UNASKED_AFTER = timedelta(minutes=10)
 REPEAT_WINDOW = timedelta(days=1)
 REPEAT_TASKS, REPEAT_OUTCOMES = 3, 2
 STUCK = ("unasked", "stalled", "quiet")
@@ -118,7 +121,8 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
     asked_whole = {d.outcome_id for d in decisions if d.outcome_id and not d.task_id}  # e.g. an outcome's budget
     unasked: set[str] = set()
     for t in tasks:
-        if t.status in HUMAN_TASK and t.id not in asked_tasks and t.outcome_id not in asked_whole:
+        if t.status in HUMAN_TASK and t.id not in asked_tasks and t.outcome_id not in asked_whole \
+                and now - (t.updated_at or now) >= UNASKED_AFTER:
             unasked.add(t.outcome_id)
             add(f"unasked:{t.id}", "unasked", f"{t.key} is {WAITING.get(t.status, t.status)} with no decision to answer",
                 t.blocked_reason or t.title, outcome_id=t.outcome_id, task_id=t.id)
@@ -199,8 +203,8 @@ def _failures(s, workspace_id: str, now: datetime) -> dict[str, dict[str, Any]]:
             add(run.error, run.task_id, run.outcome_id, run.finished_at or run.started_at)
     for d in s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == "unblock",
                                       Decision.created_at > since):
-        if OWN_FAILURE.search(d.title or ""):
-            continue
+        if OWN_FAILURE.search(d.title or "") or {"stranded", "unasked"} & set(d.metadata_json or {}):
+            continue  # a task's own failure, or the scheduler asking about work nothing asked about: not a failure
         title = reason_of(d.title)
         add(f"{title}: {_cause(d.body)}" if NO_CAUSE.match(title) else title, d.task_id, d.outcome_id, d.created_at)
     return seen
