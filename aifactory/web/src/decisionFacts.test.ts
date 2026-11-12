@@ -34,6 +34,9 @@ test("facts that were not recorded are left out, and counts read in the singular
     { label: "Cost", text: "$0.00 so far · 2 charged attempts" },
   ]);
   assert.deepEqual(mergeFactRows({ pr: 1, head: "b" }), []);
+  // A session with no recorded cost makes the sum a floor, and the row says so.
+  assert.deepEqual(mergeFactRows({ pr: 1, head: "b", cost: { usd: 2, attempts: 3, unpriced: 2 } }), [
+    { label: "Cost", text: "at least $2.00 so far · 3 charged attempts · 2 sessions with no recorded cost" }]);
 });
 
 test("the text drops the lines its rows repeat, and a decision without facts is shown as it is", () => {

@@ -739,6 +739,16 @@ def test_a_merge_approval_says_which_review_rule_asked_for_a_person(factory, cas
     assert f"\n{delivery.MERGE_ASKS[because]}\n\n" in body
 
 
+def test_a_merge_approval_counts_every_blocking_finding_also_past_the_number_it_keeps(factory):
+    tid, head = awaiting_review(factory, autonomy="auto", on_timeout="ask", max_rounds=2)
+    set_review(tid, rounds=2)
+    for n in range(22):  # a review result keeps 20 findings and says how many more there are
+        finding(head, 600 + n)
+    assert poll(tid)[:2] == ("queued", "merge")
+    review = merge_facts(tid)["review"]
+    assert (review["open"], review["blocking"]) == (22, 22)
+
+
 @pytest.mark.parametrize("case", ["workspace", "repository", "release", "learning"])
 def test_a_merge_approval_says_which_setting_asked_for_a_person(factory, case):
     from aifactory.onboarding_policy import begin

@@ -447,7 +447,7 @@ export interface MergeFacts {
   checks?: { passed: number; total: number; preexisting: number };
   ci?: { state: string; checks: number };
   review?: { state: string; reviewers: string[]; round: number; open: number; blocking: number };
-  cost?: { usd: number; attempts: number };
+  cost?: { usd: number; attempts: number; unpriced?: number };
   asked?: { because: string; text: string };
   /** The same facts as lines of the decision's text. */
   text?: string;

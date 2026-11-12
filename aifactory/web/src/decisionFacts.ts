@@ -34,7 +34,9 @@ export function mergeFactRows(m: MergeFacts): FactRow[] {
   }
   if (m.cost) {
     const attempts = count(m.cost.attempts, "charged attempt");
-    rows.push({ label: "Cost", text: `$${m.cost.usd.toFixed(2)} so far · ${attempts}` });
+    const unpriced = m.cost.unpriced || 0;  // sessions with no recorded cost: the sum is a floor
+    rows.push({ label: "Cost", text: `${unpriced ? "at least " : ""}$${m.cost.usd.toFixed(2)} so far · ${attempts}`
+      + (unpriced ? ` · ${count(unpriced, "session")} with no recorded cost` : "") });
   }
   return rows;
 }

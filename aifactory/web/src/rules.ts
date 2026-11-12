@@ -71,10 +71,17 @@ export function rulesInForce(s: RuleSettings, webhookSet: boolean): Rule[] {
           : [b("P0, P1 and unrated findings"), " block a merge", ...fixes(rounds, "go")] },
       { id: "review-counts", target: "rules-review", parts: [
         "Findings are ",
-        b(review.address === "changes_requested" ? "threads in reviews that request changes"
-          : "unresolved threads, change requests and comments"),
-        " from ",
-        b(review.reviewers === "people" ? "people" : review.reviewers === "bots" ? "bots" : "people and bots"),
+        // A comment on the pull request itself counts only from a person; threads and change requests count from
+        // the reviewers chosen (review.py normalize_feedback).
+        ...(review.address === "changes_requested"
+          ? [b("threads in reviews that request changes"), " from ",
+            b(review.reviewers === "people" ? "people" : review.reviewers === "bots" ? "bots" : "people and bots")]
+          : review.reviewers === "people"
+            ? [b("unresolved threads, change requests and comments"), " from ", b("people")]
+            : review.reviewers === "bots"
+              ? [b("unresolved threads and change requests"), " from ", b("bots")]
+              : [b("unresolved threads and change requests"), " from ", b("people and bots"), ", and ",
+                b("comments"), " from ", b("people")]),
         "; trusted: ", b(review.trust === "anyone" ? "anyone" : "collaborators and installed bots"),
         ...(ignored.length ? ["; ignored: ", b(ignored.join(", "))] : []), "."] },
     );
@@ -117,7 +124,7 @@ export function rulesInForce(s: RuleSettings, webhookSet: boolean): Rule[] {
     { id: "director", target: "rules-director", parts: s.director?.mode === "on"
       ? ["The Director is ", b("on"), ": it decides what would otherwise wait for a person."]
       : ["The Director is ", b("off"), ": decisions wait for a person."] },
-    { id: "lead", target: null, parts: s.lead?.enabled === false
+    { id: "lead", target: "rules-director", parts: s.lead?.enabled === false
       ? ["The Lead is ", b("off"), ": no agent looks after each outcome as a whole."]
       : ["The Lead is ", b("on"), ": one agent is responsible for each outcome, from acceptance to delivery."] },
   );

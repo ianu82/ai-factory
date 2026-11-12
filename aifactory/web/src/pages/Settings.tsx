@@ -266,6 +266,7 @@ function Policies() {
   const qc = useQueryClient();
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const selected = policy.data?.after ?? s.autonomy;
+  const lead = { enabled: true, run_usd: 2, turns: 30, ...s.lead };
   const director: DirectorSettings = { mode: "off", run_usd: 4, daily_usd: 40, max_outcome_usd: 120, after_minutes: 5, decide_after_hours: 4, ...s.director };
   const autonomy = async (key: keyof Settings["autonomy"], v: "auto" | "approval") => {
     if (!policy.isSuccess) return;
@@ -298,6 +299,11 @@ function Policies() {
           ? `On. Up to $${director.run_usd} a run and $${director.daily_usd} a day. It lets an outcome continue past its budget only until the outcome has committed $${director.max_outcome_usd}.`
           : "Off: decisions wait for a person."}</span></div>
           <Seg value={director.mode} options={[["off", "Off"], ["on", "On"]]} onChange={(v) => save({ director: { ...director, mode: v } })} disabled={!admin} /></div>
+        <div className="s-line"><div className="l"><b>Lead</b><span>{lead.enabled
+          ? "On: one agent is responsible for each outcome. It runs when a decision, a post or stuck work needs it."
+          : "Off: no agent looks after each outcome as a whole."}</span></div>
+          <Seg value={lead.enabled ? "on" : "off"} options={[["off", "Off"], ["on", "On"]]}
+            onChange={(v) => save({ lead: { ...lead, enabled: v === "on" } })} disabled={!admin} /></div>
         <div className="s-line"><div className="l"><b>When nobody answers</b><span>{director.decide_after_hours
           ? `What it left to you with a note waits ${director.decide_after_hours} h for an answer. Then it decides it itself, unless the choice it would make is one it may not make.`
           : "What it leaves to you waits for you, however long that takes."}</span></div>

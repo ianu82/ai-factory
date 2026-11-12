@@ -77,7 +77,12 @@ test("the review policy's values read as what the Factory does", () => {
   assert.equal(read({ review: { max_rounds: 0 } })["review-block"],
     "P0, P1 and unrated findings block a merge; with no rounds of fixes, a person decides.");
   assert.equal(read({ review: { reviewers: "all", trust: "collaborators" } })["review-counts"],
-    "Findings are unresolved threads, change requests and comments from people and bots; "
+    "Findings are unresolved threads and change requests from people and bots, and comments from people; "
+    + "trusted: collaborators and installed bots.");
+  assert.equal(read({ review: { reviewers: "bots" } })["review-counts"],
+    "Findings are unresolved threads and change requests from bots; trusted: collaborators and installed bots.");
+  assert.equal(read({ review: { reviewers: "people" } })["review-counts"],
+    "Findings are unresolved threads, change requests and comments from people; "
     + "trusted: collaborators and installed bots.");
   const off = read({ review: { address: "off", wait_seconds: 600 } });
   assert.equal(off.review,
