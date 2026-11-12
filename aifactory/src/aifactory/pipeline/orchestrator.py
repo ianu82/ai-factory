@@ -20,7 +20,7 @@ from .. import merge_manager
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..models import Decision, Outcome, Plan, Run, Signal, Task, User, Workspace
+from ..models import Decision, Event, Outcome, Plan, Run, Signal, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
@@ -59,6 +59,18 @@ HEARTBEAT_SECONDS = LEASE_SECONDS / 3
 REPAIR_SOURCES = merge_manager.REPAIR_SOURCES | {"smoke_failure"}
 NORMAL_PRIORITY = 2
 WAIT_TAIL = "This one is planned when one finishes."
+ADMITTED = "outcome_admitted"  # the event that holds a new outcome's place under the cap (Orchestrator._admit)
+
+
+def _planned():
+    """SQL: the outcome has been planned (a plan), is being planned (a planning session) or holds a place under
+    the cap. Any of these makes an outcome in ``planning`` count as open."""
+    from sqlalchemy import exists, or_
+
+    return or_(exists().where(Plan.outcome_id == Outcome.id),
+               exists().where(Run.outcome_id == Outcome.id, Run.task_id.is_(None),
+                              Run.role.in_(("planner", "plan_reviewer"))),
+               exists().where(Event.outcome_id == Outcome.id, Event.kind == ADMITTED))
 
 
 def open_cap(settings: dict[str, Any]) -> int | None:
@@ -845,8 +857,6 @@ class Orchestrator:
             notify(outcome.workspace_id, "outcome", outcome.id)
 
     def _schedule(self) -> None:
-        from sqlalchemy import exists, or_
-
         self._schedule_ci()
         settings = get_settings()
         now = utcnow().isoformat()
@@ -858,9 +868,7 @@ class Orchestrator:
             caps = {wid: open_cap(ws_settings) for wid, ws_settings in limits.items()}
             # An outcome is open from its first planning until it ends. One query for every active outcome: whether
             # it was ever planned (a plan, or a planning session) and the signal it came from.
-            planned = or_(exists().where(Plan.outcome_id == Outcome.id),
-                          exists().where(Run.outcome_id == Outcome.id, Run.task_id.is_(None),
-                                         Run.role.in_(("planner", "plan_reviewer")))).label("planned")
+            planned = _planned().label("planned")
             open_by_ws: dict[str, int] = {}
             fresh: dict[str, tuple[str, str]] = {}  # never planned: id -> (workspace, blocked_reason)
             capped: set[str] = set()  # the fresh outcomes the cap applies to
@@ -902,9 +910,14 @@ class Orchestrator:
             return cap is not None and open_by_ws.get(workspace_id, 0) >= cap
 
         def spawn_plan(outcome_id: str) -> None:
+            workspace_id = fresh[outcome_id][0] if outcome_id in fresh else None
+            cap = caps.get(workspace_id) if outcome_id in capped else None
+            if cap is not None and not self._admit(outcome_id, workspace_id, cap):
+                # Another instance gave the last place away since this tick counted: this outcome waits too.
+                open_by_ws[workspace_id] = max(open_by_ws.get(workspace_id, 0), cap)
+                return
             self._spawn_plan(outcome_id)
-            if outcome_id in fresh:  # open from now on
-                workspace_id = fresh[outcome_id][0]
+            if workspace_id is not None:  # open from now on
                 open_by_ws[workspace_id] = open_by_ws.get(workspace_id, 0) + 1
 
         def dispatch(candidates, active, counts, global_limit, limit_key, turns, spawn, hold=lambda c: False):
@@ -933,6 +946,27 @@ class Orchestrator:
             self._show_waiting(changed, cleared)
         dispatch(queued, self._tasks, running_by_ws, settings.global_concurrency,
                  "concurrency", self._delivery_turns, self._spawn_task)
+
+    @staticmethod
+    def _admit(outcome_id: str, workspace_id: str, cap: int) -> bool:
+        """Take one of the workspace's places under the cap for a new outcome. The open outcomes are counted and the
+        place is recorded in one transaction under the workspace's lock, so two instances at work at once (a
+        deploy) cannot both give the last place away. The place is the outcome's ADMITTED event: from then on the
+        outcome counts as open for every instance, before its planning session exists."""
+        from sqlalchemy import func, or_
+
+        from ..onboarding_policy import lock_workspace
+
+        with session_scope() as s:
+            lock_workspace(s, workspace_id)
+            taken = s.query(func.count(Outcome.id)).filter(
+                Outcome.workspace_id == workspace_id, Outcome.source != "review", Outcome.id != outcome_id,
+                Outcome.status.in_(ACTIVE_OUTCOME), or_(Outcome.status != "planning", _planned())).scalar() or 0
+            if taken >= cap:
+                return False
+            record(workspace_id, ADMITTED, f"Planning may start: {taken + 1} of {cap} open outcomes",
+                   outcome_id=outcome_id, session=s)
+        return True
 
     @staticmethod
     def _show_waiting(waiting: dict[str, str], cleared: list[str]) -> None:

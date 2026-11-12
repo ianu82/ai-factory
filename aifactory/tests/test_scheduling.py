@@ -519,6 +519,53 @@ def test_at_the_cap_a_new_outcome_waits_unplanned_says_so_once_and_is_planned_wh
     asyncio.run(go())
 
 
+def test_a_place_under_the_cap_is_taken_in_the_database_so_two_instances_cannot_give_the_last_one_twice(
+        queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 2)
+    opened(1)
+    first, second = queue(), queue()
+    # Another instance, which counted one open outcome as this one would, admits both in turn: the count and the
+    # place are one transaction, so the second finds the last place gone.
+    assert Orchestrator._admit(first, "w1", 2) is True
+    assert Orchestrator._admit(second, "w1", 2) is False
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            await jobs.tick()
+            assert jobs.started == [first]  # it holds its place, whichever instance plans it
+            reason = "2 outcomes are open in this workspace (limit 2). This one is planned when one finishes."
+            assert waits(second) == (reason, [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
+def test_an_outcome_that_loses_the_last_place_to_another_instance_waits_like_the_others(queue, monkeypatch):
+    set_limit(monkeypatch, "planning", 4)
+    cap("w1", 2)
+    opened(1)
+    new = queue()
+    # This tick counts one open outcome; by the time it asks for the place, another instance has taken it.
+    monkeypatch.setattr(Orchestrator, "_admit", staticmethod(lambda outcome_id, workspace_id, cap: False))
+
+    async def go():
+        jobs = Jobs(monkeypatch)
+        try:
+            await jobs.tick()
+            await jobs.tick()
+            assert jobs.started == []
+            reason = "2 outcomes are open in this workspace (limit 2). This one is planned when one finishes."
+            assert waits(new) == (reason, [reason])
+        finally:
+            await jobs.stop()
+
+    asyncio.run(go())
+
+
 def test_outcomes_started_in_one_tick_count_toward_the_cap(queue, monkeypatch):
     set_limit(monkeypatch, "planning", 4)
     cap("w1", 2, planning_concurrency=4)
