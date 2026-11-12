@@ -2881,23 +2881,21 @@ class TaskRunner:
 
     async def _check_rails(self, token: str) -> None:
         """Record in ``evidence["rails"]`` which files the published candidate changes that match the repository's
-        rails: ``RAILS_FILE`` as it is at the task's base commit (never the candidate's, so a change cannot remove
-        its own rail), the repository's ``rails`` setting, and the rails file itself. Read once per head and base."""
+        rails: ``RAILS_FILE`` as it is at the task's base commit, and the rails file itself. The base commit is the
+        only source, so the answer for a head and its base cannot change while the candidate waits, and a change
+        cannot remove its own rail. Read once per head and base."""
         head, base = self.task.head_sha, self.task.base_sha
-        # The repository's own patterns are part of what the record answers for: a rail added in its settings while
-        # the candidate waits (for its merge turn, for a person) is read before it merges.
-        configured = sorted({str(p).strip() for p in self.cfg.get("rails") or [] if str(p).strip()})
         known = (self.task.evidence or {}).get("rails") or {}
-        if known.get("head") == head and known.get("base") == base and known.get("configured", []) == configured:
+        if known.get("head") == head and known.get("base") == base:
             return
-        record: dict[str, Any] = {"head": head, "base": base, "configured": configured, "paths": []}
+        record: dict[str, Any] = {"head": head, "base": base, "paths": []}
         try:
             files = await changed_paths(self.repo.full_name, token, base, head)
             mirror_path = _mirror_path(self.repo.full_name)
             listed = ""
             if (await git("ls-tree", "--name-only", base, "--", RAILS_FILE, cwd=mirror_path)).strip():
                 listed = await git("show", f"{base}:{RAILS_FILE}", cwd=mirror_path)
-            patterns = [RAILS_FILE, *configured, *(line.strip() for line in listed.splitlines())]
+            patterns = [RAILS_FILE, *(line.strip() for line in listed.splitlines())]
             record["paths"] = protected_violations(files, [p for p in patterns if p and not p.startswith("#")])
         except GitError as exc:  # unknown rails ask a person, as rails do
             record["unreadable"] = str(exc)[:300]
@@ -2962,12 +2960,13 @@ class TaskRunner:
             if not (row and row.resolution == "approve" and row.resolved_at):
                 return False
             if kind == "approve_merge" and _rails_touched(self.task):
-                # On the rails only a person's approval counts: one the Director gave, or one from before the
-                # change was known to touch a rail, does not carry it in.
+                # On the rails only an approval that was asked as one (it says so, and is marked for people) and
+                # that a person gave counts: the Director's, or one given before the change was known to touch a
+                # rail (the same patch on an older base), does not carry it in.
                 from ..models import User
 
                 by = s.get(User, row.resolved_by) if row.resolved_by else None
-                if by is None or by.is_system:
+                if by is None or by.is_system or not (row.metadata_json or {}).get("people_only"):
                     return False
             given = row.resolved_at
         evidence = self.task.evidence or {}

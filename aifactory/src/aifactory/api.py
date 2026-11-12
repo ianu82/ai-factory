@@ -713,7 +713,7 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
                              **(current.get("review") or {}), **validate_review(patch["review"], repository=True)}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
-    for key in ("setup", "checks", "smoke", "protected_paths", "rails"):
+    for key in ("setup", "checks", "smoke", "protected_paths"):
         if key in patch:
             cfg[key] = [str(x).strip() for x in patch[key] or [] if str(x).strip()]
     for key in ("context", "signal_label"):

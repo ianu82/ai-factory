@@ -796,23 +796,6 @@ def test_task_lifetime_limits_are_validated(client, signed_in):
         assert (stored["limits"]["task_attempts_total"], stored["budgets"]["task_usd"]) == (100, 1000)
 
 
-def test_repository_rails_are_cleaned_like_protected_paths(client, signed_in):
-    from aifactory.models import Repository
-
-    wid = signed_in["workspaces"][0]["id"]
-    with session_scope() as db:
-        repo = Repository(workspace_id=wid, full_name="acme/rails", config={"protected_paths": ["deploy/**"]})
-        db.add(repo)
-        db.flush()
-        rid = repo.id
-    response = client.patch(f"/api/workspaces/{wid}/repositories/{rid}",
-                            json={"config": {"rails": [" billing/** ", "", "  ", "src/merge.py"]}})
-    assert response.status_code == 200, response.text
-    with session_scope() as db:
-        assert db.get(Repository, rid).config == {"protected_paths": ["deploy/**"],
-                                                  "rails": ["billing/**", "src/merge.py"]}
-
-
 def test_disconnect_repository_deletes_review_history_and_keeps_costs(client, signed_in):
     # Uses foreign-key-enforcing SQLite by default, or Postgres through
     # AIFACTORY_TEST_DATABASE_URL, exactly like the rest of the API suite.

@@ -11,6 +11,7 @@ aifactory/src/aifactory/failures.py
 aifactory/src/aifactory/release.py
 aifactory/src/aifactory/release_config.py
 aifactory/src/aifactory/decision_judges.py
+aifactory/src/aifactory/decisions.py
 aifactory/src/aifactory/pipeline/delivery.py
 aifactory/src/aifactory/merge_manager.py
 aifactory/src/aifactory/pipeline/holds.py
