@@ -31,8 +31,9 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
                       changed_paths, path_overlap, conflict_marker_files, extract_patch, protected_violations, publish, rebase_branch, revert_commit,
                       tree_changes, tree_id)
 from ..gitops import patch_id, snapshot_patch
-from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
+from ..models import Artifact, Decision, Event, GateVerdict, Outcome, Repository, Run, Signal, Task, new_id
 from ..harness.schemas import _criterion_key
+from ..regrets import normalized_diff_signature, record_gate_verdict, record_regret
 from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
 from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, findings_unseen, headline,
                       new_review_evidence, normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
@@ -189,6 +190,7 @@ def recovered_from_infra(result: str, failing_phase: str | None) -> bool:
 BUILD_STAGES = ("prepare", "build", "checks", "verify", "publish")
 # Check results on clean checkouts of base commits, by (repository, base commit, command), shared by every task.
 _BASE_CHECKS: dict[tuple[str, ...], dict[str, Any]] = {}
+_CANDIDATE_RUN = object()  # omitted gate run: inherit builder provenance; explicit None: no run exists
 
 
 def infrastructure_problem(error: str, cause: str | None = None) -> str:
@@ -367,6 +369,7 @@ class TaskRunner:
     def _set_evidence(self, values: dict[str, Any], wip: Patch | None = None) -> None:
         """Record evidence keys in one transaction ("attempts" appends). ``wip`` is the work in progress that a new
         "wip" record describes: the task's one artifact of that kind holds it from this write on."""
+        signal_id = None
         with session_scope() as s:
             task = s.get(Task, self.task_id)
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
@@ -397,7 +400,127 @@ class TaskRunner:
             elif not s.query(Task).filter(Task.id == self.task_id, Task.lease_owner.in_(("", self.owner))).update(
                     {Task.evidence: ev}, synchronize_session=False):
                 raise Stop()  # another instance holds the task now: its evidence is not this runner's to write
+            if (values.get("smoke") or {}).get("state") == "failed":
+                # The observation and its regret commit together; a restart must
+                # not lose a failure if the next smoke happens to pass.
+                regret, created = record_regret(s, self.ws, self.task_id, kind="smoke_failure",
+                              source_key=f"smoke:{task.merge_sha}", reporter="factory:smoke",
+                              occurred_at=ev["smoke"]["at"], url=task.pr_url,
+                              run_id=(ev.get("merge") or {}).get("builder_run_id"),
+                              evidence={"checks": ev["smoke"].get("checks", []), "sha": task.merge_sha})
+                if created:
+                    signal_id = regret.signal_id
+                    signal = s.get(Signal, signal_id) if signal_id else None
+                    if signal is not None:
+                        diagnostics = "\n\n".join(
+                            f"Check `{c['command']}` failed (exit {c.get('exit_code')}):\n```\n{c.get('tail', '')}\n```"
+                            for c in ev["smoke"].get("checks", []) if not c.get("ok"))
+                        signal.body = f"{signal.body}\n\n{diagnostics}"[:8000]
             self.task.evidence = ev
+        if signal_id:
+            notify(self.ws, "signal", signal_id)
+
+    def _candidate(self, patch: Patch, run_id: str | None, *, head: str = "") -> None:
+        """Persist every extracted diff before policy/checks can reject it."""
+        candidate = {"id": new_id(), "attempt": self.task.attempt,
+                     "epoch": (self.task.evidence or {}).get("budget_epoch", 0),
+                     "run_id": run_id, "head": head, "base": self.task.base_sha,
+                     "diff_signature": normalized_diff_signature(patch.diff)}
+        diff_id = self.artifact("diff", f"Attempt {self.task.attempt} diff",
+                                patch.diff.decode("utf-8", "replace"), run_id=run_id,
+                                candidate_id=candidate["id"], files=patch.files,
+                                additions=patch.additions, deletions=patch.deletions,
+                                diff_signature=candidate["diff_signature"], complete=len(patch.diff) <= 400_000)
+        candidate["diff_artifact_id"] = diff_id
+        # Unlike the resumable "candidate", this provenance survives the attempt's end.
+        self._set_evidence({"gate_candidate": candidate, "gate_ids": {},
+                            "candidates": [*(self.task.evidence or {}).get("candidates", []), candidate]})
+
+    def _gate(self, gate: str, verdict: str, evidence: dict[str, Any], *, run_id: Any = _CANDIDATE_RUN,
+              head: str | None = None, session: str = "") -> str:
+        candidate = (self.task.evidence or {}).get("gate_candidate") or {}
+        with session_scope() as s:
+            row, _ = record_gate_verdict(
+                s, self.ws, self.task_id, gate=gate, attempt=max(1, self.task.attempt), verdict=verdict,
+                candidate_fingerprint=candidate.get("id", ""),
+                head_sha=head if head is not None else candidate.get("head", self.task.head_sha),
+                run_id=candidate.get("run_id") if run_id is _CANDIDATE_RUN else run_id, session_key=session,
+                at=utcnow(), evidence={"candidate": candidate, **evidence})
+            gate_id = row.id
+            task = s.get(Task, self.task_id)
+            ev = task.evidence or {}
+            task.evidence = {**ev, "gate_ids": {**ev.get("gate_ids", {}), gate: gate_id}}
+            self.task.evidence = task.evidence
+        return gate_id
+
+    def _bind_published_candidate(self, head: str) -> None:
+        """Attach pre-publication decisions to the exact commit made from their patch.
+
+        Enrich the original observations without changing verdicts or times.
+        Retain the pre-publication reviewed provenance in their evidence.
+        Only gates for this patch can be attached. A resumed publication may
+        recreate its commit; rebase and external-push paths never call this helper.
+        """
+        with session_scope() as s:
+            task = s.get(Task, self.task_id)
+            ev = task.evidence or {}
+            candidate = ev.get("gate_candidate") or {}
+            if not candidate or candidate.get("head") == head:
+                return
+            published = {**candidate, "head": head}
+            gate_ids = dict(ev.get("gate_ids") or {})
+            for gate, gate_id in gate_ids.items():
+                row = s.get(GateVerdict, gate_id)
+                if (gate not in ("checks", "verifier") and not gate.startswith("check:")):
+                    continue
+                if (row is None or row.head_sha != candidate.get("head", "")
+                        or row.candidate_fingerprint != candidate["id"]):
+                    continue
+                row.head_sha = head
+                row.candidate_key = hashlib.sha256(
+                    json.dumps([row.candidate_fingerprint, head]).encode()).hexdigest()
+                row.evidence = {**row.evidence, "candidate": published,
+                                "reviewed_candidate": row.evidence.get("reviewed_candidate", candidate)}
+            task.evidence = {**ev, "gate_candidate": published, "gate_ids": gate_ids,
+                             "candidates": [published if c["id"] == candidate["id"] else c
+                                            for c in ev.get("candidates", [])]}
+            self.task.evidence = task.evidence
+
+    def _checks_gate(self, results: list[dict[str, Any]]) -> None:
+        self._gate("checks", "fail" if any(not r["ok"] for r in results) else
+                   "pass" if results else "skipped",
+                   {"state": "completed" if results else "not_configured", "checks": _brief(results)})
+
+    def _merge_evidence(self, pr: dict[str, Any], **extra: Any) -> None:
+        """Freeze attribution and time once; a resumed smoke must not move the cohort."""
+        with session_scope() as s:
+            task = s.query(Task).filter_by(id=self.task_id).with_for_update().one()
+            ev = task.evidence or {}
+            previous = ev.get("merge") or {}
+            if previous.get("at"):
+                self.task.evidence = ev
+                return
+            reviewed = ev.get("gate_candidate") or {}
+            head = (pr.get("head") or {}).get("sha", "") if pr.get("merged") else task.head_sha
+            matches = bool(head and reviewed.get("head") == head)
+            candidate = reviewed if matches else {}
+            task.head_sha = self.task.head_sha = head
+            run = s.get(Run, candidate["run_id"]) if candidate.get("run_id") else None
+            merge = {"sha": task.merge_sha, "pr": task.pr_number,
+                     "at": pr.get("merged_at") or utcnow().isoformat(),
+                     "head": head, "candidate": candidate, "reviewed_candidate": reviewed,
+                     "gate_ids": dict(ev.get("gate_ids") or {}) if matches else {},
+                     "builder_run_id": run.id if run else None,
+                     "builder_harness": run.harness if run else None,
+                     "builder_model": run.model if run else None, **extra}
+            if run and run.config_version:
+                merge["config_version"] = run.config_version
+            outcome = s.get(Outcome, task.outcome_id)
+            workstream_id = outcome.workstream_id if outcome else None
+            if workstream_id or ev.get("workstream_id"):
+                merge["workstream_id"] = workstream_id or ev["workstream_id"]
+            task.evidence = {**ev, "merge": {**previous, **merge}}
+            self.task.evidence = task.evidence
 
     def _store_wip(self, s, saved: dict[str, Any] | None, patch: Patch | None) -> None:
         """Keep the task's one work-in-progress artifact in step with its record (``evidence["wip"]``), in the
@@ -894,6 +1017,7 @@ class TaskRunner:
             except SandboxError as exc:
                 self.feedback.append(f"- Could not read your changes: {exc}")
                 continue
+            self._candidate(patch, run.id if run else None)
             problem = await self._policy_problem(patch)
             if problem:
                 if identity is not None and identity["action"] == "revert":
@@ -907,13 +1031,12 @@ class TaskRunner:
                 self._steward_question("Steward authorization changed during building",
                            "Discard the candidate and rebuild for the current authorization.", status="needs_input")
             self._bind_steward_candidate(patch)
-            diff_id = self.artifact("diff", f"Attempt {attempt} diff", patch.diff.decode("utf-8", "replace"),
-                                    run_id=run.id if run else None, files=patch.files,
-                                    additions=patch.additions, deletions=patch.deletions)
+            diff_id = self.task.evidence["gate_candidate"]["diff_artifact_id"]
             await self._steward_test_gate(patch)
             self.patch = patch
             # Saved as soon as it exists: a stop from here on resumes this candidate instead of building it again.
             self.evidence("candidate", {
+                **self.task.evidence["gate_candidate"],
                 "n": attempt, "epoch": int((self.task.evidence or {}).get("budget_epoch", 0)),
                 "diff_artifact_id": diff_id, "patch_sha256": hashlib.sha256(patch.diff).hexdigest(),
                 "base_sha": self.task.base_sha, "run_id": run.id if run else None, "files": patch.files,
@@ -1017,6 +1140,7 @@ class TaskRunner:
             commands = self.cfg.get("checks") or []
             async with self._check_slot(self.builder, bool(commands)):
                 self.checks = await self._run_commands(self.builder, commands, "check")
+            self._checks_gate(self.checks)
             failed = [c for c in self.checks if not c["ok"]]
             if failed:
                 try:
@@ -1350,7 +1474,7 @@ class TaskRunner:
         first run left behind, not the candidate, and could pass where a fresh checkout fails. Only files git can
         see are compared; what a run leaves in ignored files or outside the checkout is not noticed."""
         results = []
-        for command in commands:
+        for index, command in enumerate(commands):
             before = await tree_id(sandbox) if kind == "check" else None
             row, output = await self._run_command(sandbox, command, timeout)
             rerun = kind == "check" and not row["ok"] and not row["timed_out"]
@@ -1378,6 +1502,8 @@ class TaskRunner:
                     self.artifact(kind, f"first run (failed): {command}"[:300], first_output, ok=False,
                                   exit_code=first["exit_code"])
             results.append(row)
+            if kind == "check":
+                self._gate(f"check:{index}", "pass" if row["ok"] else "fail", row)
             note = (f" — {_how_failed(row)}" if row["timed_out"] or row.get("not_rerun") else
                     " — on a second run" if row.get("cause") == "flaky" else "")
             self.event(f"{kind}_result", f"{'✓' if row['ok'] else '✗'} {command}{note}",
@@ -1414,6 +1540,7 @@ class TaskRunner:
             app: AppRun | None = None
             result = None
             carried = None  # what the session's failure said it was; a sandbox that failed says nothing
+            run = None
             try:
                 try:
                     sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
@@ -1447,6 +1574,8 @@ class TaskRunner:
                 if sandbox is not None:
                     await sandbox.close()
             if result is None:
+                self._gate("verifier", "unknown", {"error": error[:1500]},
+                           run_id=run.id if run else None, session=f"setup:{tries}" if run is None else "")
                 if infrastructure_problem(error, carried) == "provider":
                     self._infrastructure(attempt, "verify", error, "provider")
                 self.event("verification_unavailable", f"Verifier session failed: {error[:300]}", level="warn")
@@ -1462,6 +1591,9 @@ class TaskRunner:
                 if report["verdict"] == "pass":
                     report = {**report, "verdict": "fail",
                               "summary": f"Runtime QA failed: {runtime_problem}. " + report.get("summary", "")}
+            self._gate("verifier", "pass" if report.get("verdict") == "pass" else "fail",
+                       {"report": report, "reported_verdict": result.report.get("verdict"),
+                        "runtime_problem": runtime_problem, "app_run": self.app_summary}, run_id=run.id)
             self.verifier_report = report
             self.artifact("report", f"Verification (attempt {attempt})", json.dumps(report, indent=2), run_id=run.id,
                           verdict=report.get("verdict"))
@@ -1966,6 +2098,7 @@ class TaskRunner:
                                  patch=self.patch, message=message, task_id=self.task_id)
         except GitError as exc:
             self.block("unblock", f"{self.task.key}: could not push the branch", str(exc))
+        self._bind_published_candidate(head)
         gh = GitHub(token)
         body = _factory_block(self._pr_body())
         try:
@@ -1991,6 +2124,7 @@ class TaskRunner:
         # Record the publication before advancing the head, as revalidation does: a stop between the two must not
         # leave the task at this head with a record of the publication before it.
         self.evidence("published", {"head": head, "base": self.task.base_sha, "at": utcnow().isoformat(),
+                                    "candidate_id": (self.task.evidence.get("gate_candidate") or {}).get("id"),
                                     "pr": pr["number"], "patch_id": change_id})
         self._carry_approval()
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
@@ -2205,10 +2339,17 @@ class TaskRunner:
             self._check_ci_deadline(self.task.evidence["ci_wait"])
             detail = (f"GitHub CI observation timed out after {CI_POLL_TIMEOUT_SECONDS} seconds."
                       if isinstance(exc, asyncio.TimeoutError) else str(exc))
+            wait = self.task.evidence["ci_wait"]
+            self._gate("ci" if wait["continuation"] == "delivery" else "revert_ci", "unknown",
+                       {"state": "unavailable", "error": detail}, head=wait["head"],
+                       session=wait["first_wait_at"] + ":unavailable")
             self.block("unblock", f"{self.task.key}: could not check CI", detail)
 
     def _check_ci_deadline(self, wait: dict[str, Any]) -> None:
         if utcnow() > datetime.fromisoformat(wait["deadline"]):
+            self._gate("ci" if wait["continuation"] == "delivery" else "revert_ci", "unknown",
+                       {"state": "timed_out", "deadline": wait["deadline"]}, head=wait["head"],
+                       session=wait["first_wait_at"] + ":timed_out")
             wait = {**wait, "timed_out": True}
             self.update(evidence={**self.task.evidence, "ci_wait": wait})
             self.block("unblock", f"{self.task.key}: CI did not finish",
@@ -2228,6 +2369,12 @@ class TaskRunner:
         elapsed = (now - datetime.fromisoformat(wait["first_wait_at"])).total_seconds()
         grace = int(self.cfg.get("ci_grace_seconds", 150))
         stage = None
+        if summary.state in ("success", "failure") or (summary.state == "none" and elapsed > grace):
+            self._gate("ci" if wait["continuation"] == "delivery" else "revert_ci",
+                       {"success": "pass", "failure": "fail", "none": "skipped"}[summary.state],
+                       {"state": summary.state, "checks": summary.checks, "pr": wait["pr"],
+                        "required": bool(self.cfg.get("require_ci"))}, head=wait["head"],
+                       session=wait["first_wait_at"] + ":" + summary.state)
         if summary.state == "success":
             stage = "revert_merge" if wait["continuation"] == "revert" else "merge"
         elif summary.state == "failure":
@@ -2707,8 +2854,7 @@ class TaskRunner:
             if current.get("merged"):  # a person merged it on GitHub: that is the approval
                 who = (current.get("merged_by") or {}).get("login") or "someone"
                 self.update(merge_sha=current.get("merge_commit_sha") or "", status="running", blocked_reason="")
-                self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "by": who,
-                                        "outside": True, "at": current.get("merged_at")})
+                self._merge_evidence(current, by=who, outside=True)
                 self.event("merged", f"PR #{self.task.pr_number} was merged on GitHub by {who} "
                            f"({self.task.merge_sha[:8]})", level="success")
                 await self.smoke()
@@ -2795,7 +2941,7 @@ class TaskRunner:
         if refresh_onto:
             await self._refresh_onto_main(token, gh, refresh_onto)
             return
-        self.evidence("merge", {"sha": self.task.merge_sha, "pr": self.task.pr_number, "at": utcnow().isoformat()})
+        self._merge_evidence(pr)
         self.event("merged", f"Merged PR #{self.task.pr_number} ({self.task.merge_sha[:8]})", level="success")
         await self.smoke()
 
@@ -2819,6 +2965,7 @@ class TaskRunner:
             mode = (self.cfg.get("merge") or {}).get("reverify", "overlap")
             overlap = path_overlap(candidate, main)
             decision = {"mode": mode, "old_base": old_base, "old_head": old_head, "new_base": main_sha,
+                        "reviewed_verifier_id": (self.task.evidence or {}).get("gate_ids", {}).get("verifier"),
                         "candidate_paths": candidate[:20], "main_paths": main[:20],
                         "candidate_paths_count": len(candidate), "main_paths_count": len(main), **overlap,
                         "run": bool(identity) or mode == "always" or (mode != "never" and overlap["overlap"])}
@@ -2878,9 +3025,20 @@ class TaskRunner:
                     finally:
                         self.builder = previous
                 if state["phase"] == "checks":
+                    old_verifier = state.get("reviewed_verifier_id")
+                    previous = (self.task.evidence or {}).get("gate_candidate") or {}
+                    patch = await extract_patch(sandbox, state["new_base"])
+                    self._candidate(patch, previous.get("run_id"), head=state["head"])
+                    if not state["run"] and old_verifier:
+                        self.evidence("gate_ids", {"verifier": old_verifier})
+                        self._gate("verifier_revalidation", "skipped",
+                                   {"reason": "revalidation_policy", "reviewed_verifier_id": old_verifier})
                     async with self._check_slot(sandbox, bool(self.cfg.get("setup") or self.cfg.get("checks"))):
                         setup = await self._run_commands(sandbox, self.cfg.get("setup") or [], "setup", timeout=1200)
                         self.checks = await self._run_commands(sandbox, self.cfg.get("checks") or [], "check")
+                    self._checks_gate(self.checks)
+                    if any(not r["ok"] for r in setup):
+                        self._gate("checks", "fail", {"setup": _brief(setup)}, session="setup-failure")
                     state.update(setup=setup, checks=self.checks)
                     failed = [c for c in setup + self.checks if not c["ok"]]
                     if failed:
@@ -2969,9 +3127,6 @@ class TaskRunner:
         ok = all(r["ok"] for r in results)
         self.evidence("smoke", {"state": "passed" if ok else "failed", "ref": self.task.merge_sha, "checks": _brief(results)})
         if not ok:
-            failed = [r for r in results if not r["ok"]]
-            _signal(self.ws, self.repo.id, "smoke_failure", f"Smoke failed after merging {self.task.title}",
-                    "\n\n".join(f"`{r['command']}`\n{r['tail'][-1500:]}" for r in failed), self.task.pr_url)
             if (self.cfg.get("recovery") or {}).get("smoke_failure") == "revert":
                 self.event("recovery", "Smoke failed; the repository's recovery policy reverts the merge", level="warn")
                 await self.revert()

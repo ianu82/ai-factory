@@ -124,6 +124,19 @@ def _handle_reverted(task_id: str, pr: dict) -> bool:
                 or (task.evidence or {}).get("revert")):
             return False
         now = utcnow()
+        from .regrets import record_regret
+        from .models import MergeRegret
+
+        smoke = s.query(MergeRegret).filter_by(workspace_id=task.workspace_id, task_id=task.id,
+                                             kind="smoke_failure").first()
+        record_regret(s, task.workspace_id, task.id, kind="factory_revert",
+                      source_key=f"revert-pr:{candidate['pr']}", reporter="factory:revert",
+                      source_signal_id=smoke.signal_id if smoke else None,
+                      fix_outcome_id=smoke.fix_outcome_id if smoke else None,
+                      fix_url=smoke.fix_url if smoke else "",
+                      occurred_at=pr.get("merged_at") or now, url=candidate.get("url", ""),
+                      run_id=((task.evidence or {}).get("merge") or {}).get("builder_run_id"),
+                      evidence={"pr": candidate["pr"], "sha": pr.get("merge_commit_sha", "")})
         task.evidence = {**task.evidence, "revert": {
             "pr": candidate["pr"], "sha": pr.get("merge_commit_sha", ""),
             "ci": (task.evidence.get("ci") or {}).get("state", "unknown"), "at": now.isoformat()}}

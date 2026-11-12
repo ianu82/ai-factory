@@ -13,7 +13,8 @@ import pytest
 from aifactory import gitops
 from aifactory.db import session_scope
 from aifactory.inference import ProviderConfig
-from aifactory.models import Decision, Event, Membership, Organization, Outcome, Repository, Run, Task, User, Workspace
+from aifactory.models import (Decision, Event, GateVerdict, Membership, MergeRegret, Organization, Outcome,
+                              Repository, Run, Signal, Task, User, Workspace)
 from aifactory.pipeline import delivery, planning, runtime
 from aifactory.pipeline.orchestrator import Orchestrator
 from aifactory.pipeline.runtime import DEFAULT_SETTINGS
@@ -162,6 +163,22 @@ def test_outcome_is_planned_built_verified_merged_and_smoke_tested(factory):
         assert task.status == "completed" and task.merge_sha and task.pr_number == 1
         assert task.evidence["smoke"]["state"] == "passed"
         assert task.evidence["ci"]["state"] == "success"
+        merge = task.evidence["merge"]
+        builder = next(r for r in runs if r.role == "builder")
+        assert merge["builder_run_id"] == builder.id
+        assert (merge["builder_harness"], merge["builder_model"]) == (builder.harness, builder.model)
+        assert merge["config_version"] == builder.config_version
+        assert merge["candidate"]["diff_signature"].startswith("diff-v1:")
+        assert merge["candidate"]["head"] == task.head_sha
+        for gate in ("check:0", "checks", "verifier", "ci"):
+            row = s.get(GateVerdict, merge["gate_ids"][gate])
+            assert row.verdict == "pass" and row.at and row.evidence
+            assert row.candidate_fingerprint == merge["candidate"]["id"]
+            assert row.head_sha == task.head_sha
+            assert row.evidence["candidate"]["head"] == task.head_sha
+        from aifactory.regrets import merge_gate_passes
+        assert {(task.id, gate) for gate in ("checks", "verifier", "ci")} <= merge_gate_passes(s, factory["ws"])
+        assert s.get(GateVerdict, merge["gate_ids"]["ci"]).head_sha == task.head_sha
         # The outcome's Lead may also run (tests/test_lead.py covers it); the pipeline's own roles are these.
         assert {r.role for r in runs if r.role != "lead"} == {"planner", "plan_reviewer", "builder", "verifier"}
         assert all(r.input_tokens > 0 for r in runs if r.role != "lead")  # the Lead is covered in test_lead.py
@@ -206,6 +223,12 @@ def test_failed_verification_feeds_back_and_second_attempt_passes(factory):
         assert task.attempt == 2
         results = [a["result"] for a in task.evidence["attempts"]]
         assert results == ["verification_failed", "verified"]
+        reviews = s.query(GateVerdict).filter_by(task_id=task.id, gate="verifier").order_by(GateVerdict.at).all()
+        assert [r.verdict for r in reviews] == ["fail", "pass"]
+        assert reviews[0].run_id != reviews[1].run_id
+        assert reviews[0].candidate_fingerprint != reviews[1].candidate_fingerprint
+        assert reviews[0].evidence["candidate"]["diff_signature"] == reviews[1].evidence["candidate"]["diff_signature"]
+        assert task.evidence["merge"]["gate_ids"]["verifier"] == reviews[1].id
     assert seen_feedback, "builder never saw the verifier's feedback"
 
 
@@ -414,6 +437,10 @@ def test_ci_failure_returns_to_builder_with_logs(factory):
         assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
         assert outcome_status(outcome_id) == "completed"
         assert saw_ci
+        with session_scope() as s:
+            rows = s.query(GateVerdict).filter_by(gate="ci").order_by(GateVerdict.at).all()
+            assert [r.verdict for r in rows] == ["fail", "pass"]
+            assert all(r.evidence["checks"] for r in rows)
     finally:
         FakeGitHub.checks = original
 
@@ -1045,6 +1072,9 @@ def test_a_required_runtime_qa_failure_is_recorded_as_a_finding_and_retried(fact
         assert verdict["verdict"] == "fail" and all(c["status"] == "pass" for c in verdict["criteria"])
         assert [f["severity"] for f in verdict["findings"] if f.get("location") == "runtime QA"] == ["blocker"]
         assert any("Required runtime QA failed: the app did not start" in f["description"] for f in verdict["findings"])
+        gates = s.query(GateVerdict).filter_by(task_id=task_id, gate="verifier").all()
+        assert gates and all(g.verdict == "fail" and g.evidence["reported_verdict"] == "pass"
+                             and g.evidence["runtime_problem"] for g in gates)
 
 
 def test_a_runtime_qa_failure_is_recorded_even_when_the_verifier_already_failed(factory):
@@ -1123,7 +1153,8 @@ def test_an_attempt_interrupted_after_a_retry_is_redone_not_counted(factory):
     assert "attempt_resumed" in _event_kinds(outcome_id)
 
 
-def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
+@pytest.mark.parametrize("reverify", ["overlap", "never"])
+def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory, reverify):
     def planner(messages):
         if step(messages) == 0:
             return {"content": "", "tool_calls": [call("list_files", {})]}
@@ -1152,7 +1183,7 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     ScriptedModel.scripts.update(planner=planner, builder=builder, verifier=verifier)
     with session_scope() as s:
         repo = s.get(Repository, factory["repo"])
-        repo.config = {**repo.config, "checks": [], "smoke": ["test -f greet.sh"]}
+        repo.config = {**repo.config, "checks": [], "smoke": ["test -f greet.sh"], "merge": {"reverify": reverify}}
     outcome_id = new_outcome(factory)
     assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=90)
     assert outcome_status(outcome_id) == "completed"
@@ -1160,6 +1191,15 @@ def test_parallel_tasks_on_one_repository_are_revalidated_before_merge(factory):
     assert "a.txt" in tree and "b.txt" in tree
     with session_scope() as s:
         kinds = [e.kind for e in s.query(Event).filter(Event.outcome_id == outcome_id).order_by(Event.id)]
+        tasks = s.query(Task).filter_by(outcome_id=outcome_id).all()
+        for task in tasks:
+            gates = task.evidence["merge"]["gate_ids"]
+            assert s.get(GateVerdict, gates["checks"]).verdict == "skipped"
+            assert s.get(GateVerdict, gates["ci"]).head_sha == task.head_sha
+            if task.evidence.get("revalidation"):
+                assert s.get(GateVerdict, gates["checks"]).head_sha == task.head_sha
+                review = s.get(GateVerdict, gates["verifier"])
+                assert (review.evidence["candidate"]["id"] == task.evidence["gate_candidate"]["id"]) is task.evidence["revalidation"]["run"]
     assert "revalidate" in kinds, "second merge should have rebased onto the first"
 
 
@@ -1899,6 +1939,15 @@ def test_smoke_failure_is_reverted_under_recovery_policy(factory):
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         assert task.status == "reverted", (task.status, task.blocked_reason)
         assert task.evidence["revert"]["pr"] == 2 and task.evidence["smoke"]["state"] == "failed"
+        regrets = s.query(MergeRegret).filter_by(task_id=task.id).all()
+        assert {r.kind for r in regrets} == {"smoke_failure", "factory_revert"}
+        assert len(regrets) == 2 and len({r.signal_id for r in regrets}) == 1
+        assert s.query(Signal).filter_by(repo_id=task.repo_id).count() == 1
+        task_id = task.id
+    from aifactory.reconcile import _handle_reverted
+    assert not _handle_reverted(task_id, FakeGitHub.pulls[2])
+    with session_scope() as s:
+        assert s.query(MergeRegret).filter_by(task_id=task_id).count() == 2
     assert FakeGitHub.merged == [1, 2]
     main_greet = git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
     assert main_greet.strip() == "echo 'Hello'"
@@ -2204,6 +2253,7 @@ def test_a_pr_merged_on_github_finishes_its_task_without_asking_again(factory, m
         task = s.get(Task, task_id)
         assert task.status == "completed", (task.status, task.blocked_reason)
         assert task.merge_sha and task.evidence["merge"]["outside"]
+        assert task.evidence["merge"]["at"] == FakeGitHub.pulls[number]["merged_at"]
         decisions = s.query(Decision).filter(Decision.task_id == task_id).all()
         assert [(d.kind, d.status) for d in decisions] == [("approve_merge", "superseded")]  # no new approval card
 
@@ -3874,6 +3924,9 @@ def test_a_check_that_passes_when_run_again_is_flaky_and_does_not_use_an_attempt
         check = _counted(records[0])
         assert check["ok"] and check["cause"] == "flaky"
         assert check["first_failure"].strip() == "run 1: connection reset by peer"
+        gate = s.get(GateVerdict, task.evidence["merge"]["gate_ids"]["check:1"])
+        assert gate.verdict == "pass" and gate.head_sha == task.head_sha
+        assert gate.evidence["cause"] == "flaky" and gate.evidence["first_failure"] == check["first_failure"]
         events = [(e.kind, e.level) for e in s.query(Event).filter(Event.task_id == task.id).order_by(Event.id)
                   if e.data.get("command") == "sh counted.sh"]
         body = FakeGitHub.pulls[task.pr_number]["body"]
@@ -5163,6 +5216,11 @@ def test_revalidation_push_interruption_resumes_verification_and_status_failure_
     monkeypatch.setattr(FakeGitHub, 'set_status', status)
     asyncio.run(restored.run())
     assert seen == ['ci'] and restored.task.evidence['revalidation']['phase'] == 'complete'
+    with session_scope() as s:
+        gates = s.get(Task, task_id).evidence["gate_ids"]
+        for gate in ("checks", "verifier"):
+            row = s.get(GateVerdict, gates[gate])
+            assert row.head_sha == restored.task.head_sha and row.verdict == "pass"
     assert 'verified' in _event_kinds(restored.task.outcome_id)
     assert 'revalidation_warning' in _event_kinds(restored.task.outcome_id)
 
@@ -5424,3 +5482,332 @@ def test_checks_and_smoke_run_holding_a_host_check_slot(factory, monkeypatch):
     assert outcome_status(outcome_id) == "completed"
     assert ("check", 1) in held and ("smoke", 1) in held, held
     assert all(running == 1 for kind, running in held if kind in ("check", "smoke")), held
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_smoke_regret_survives_failed_or_unrequested_revert(factory, monkeypatch, recovery):
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "smoke": ["false"],
+                       "recovery": {"smoke_failure": "revert" if recovery else "ask"}}
+    original = FakeGitHub.checks
+    async def checks(self, full_name, sha):
+        FakeGitHub.check_state = "failure" if len(FakeGitHub.pulls) > 1 else "success"
+        return await original(self, full_name, sha)
+    monkeypatch.setattr(FakeGitHub, "checks", checks)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.status == "smoke_failed"
+        assert [r.kind for r in s.query(MergeRegret).filter_by(task_id=task.id)] == ["smoke_failure"]
+        task_id = task.id
+        assert bool(task.evidence.get("revert_candidate")) is recovery
+    runner = _runner(task_id)
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner.smoke())
+    with session_scope() as s:
+        assert s.query(MergeRegret).filter_by(task_id=task_id).count() == 1
+        assert s.query(Signal).filter_by(repo_id=factory["repo"]).count() == 1
+    assert FakeGitHub.merged == [1]
+
+
+def test_no_ci_is_skipped_and_merge_attribution_is_immutable_on_resume(factory):
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": [], "ci_grace_seconds": -1}
+    FakeGitHub.check_state = "none"
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"))
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.status == "completed"
+        merge = task.evidence["merge"]
+        assert s.get(GateVerdict, merge["gate_ids"]["checks"]).verdict == "skipped"
+        assert s.get(GateVerdict, merge["gate_ids"]["ci"]).verdict == "skipped"
+        task_id = task.id
+    runner = _runner(task_id)
+    runner._merge_evidence({"merged_at": "2099-01-01T00:00:00Z"})
+    assert runner.task.evidence["merge"] == merge
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.evidence = {k: v for k, v in task.evidence.items() if k != "merge"}
+    runner = _runner(task_id)
+    runner._merge_evidence({"merged_at": "2026-01-01T12:34:56Z"})
+    with session_scope() as s:
+        restored = s.get(Task, task_id).evidence["merge"]
+        assert restored["at"] == "2026-01-01T12:34:56Z"
+        assert restored["gate_ids"] == merge["gate_ids"]
+
+
+def test_normalized_diff_signature_is_shared_conservative_and_deterministic():
+    from aifactory.regrets import normalized_diff_signature as signature
+    a = b"diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old value\n+new value\n"
+    b = a.replace(b"@@ -1 +1 @@", b"@@ -20 +30 @@").replace(b"old value", b"old   value").replace(b"aaa..bbb", b"ccc..ddd")
+    assert signature(a) == signature(b) and signature(a)
+    c = a.replace(b"a/x b/x", b"a/y b/y")
+    assert signature(a + c) == signature(c + a)
+    assert signature(a) != signature(c)
+    assert signature(a) != signature(a.replace(b"new value", b"different"))
+    for missing in (None, b"", a[:-1], a[:a.index(b"+new")], a + b"... truncated ...\n"):
+        assert signature(missing) is None
+    assert signature(a, complete=False) is None
+    assert signature(b"diff --git a/x b/x\nBinary files a/x and b/x differ\n") is None
+    rename = b"diff --git a/x b/y\nsimilarity index 100%\nrename from x\nrename to y\n"
+    assert signature(rename) and signature(rename) != signature(rename.replace(b"rename to y", b"rename to z"))
+    import base64
+    import zlib
+    def binary(value):
+        compressed = zlib.compress(value)
+        encoded = base64.b85encode(compressed, pad=True)
+        size = len(compressed)
+        prefix = bytes([size + 64 if size <= 26 else size + 70])
+        return (b"diff --git a/x b/x\nGIT binary patch\nliteral 1\n" + prefix + encoded
+                + b"\n\n")
+    assert signature(binary(b"a")) and signature(binary(b"a")) != signature(binary(b"b"))
+    assert signature(binary(b"a")[:-7] + b"\n") is None
+
+
+@pytest.mark.parametrize("failure", ["open", "merge"])
+def test_unsuccessful_revert_never_records_completed_revert(factory, monkeypatch, failure):
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "smoke": ["false"], "recovery": {"smoke_failure": "revert"}}
+    if failure == "open":
+        async def cannot_open(*args, **kwargs):
+            raise gitops.GitError("conflict reverting")
+        monkeypatch.setattr(delivery, "revert_commit", cannot_open)
+    else:
+        original = FakeGitHub.merge
+        async def cannot_merge(self, full_name, number, **kwargs):
+            if number == 2:
+                raise delivery.GitHubError("branch protection", status=405)
+            return await original(self, full_name, number, **kwargs)
+        monkeypatch.setattr(FakeGitHub, "merge", cannot_merge)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.status == "smoke_failed"
+        assert [r.kind for r in s.query(MergeRegret).filter_by(task_id=task.id)] == ["smoke_failure"]
+        assert not task.evidence.get("revert")
+    assert FakeGitHub.merged == [1]
+
+
+@pytest.mark.parametrize("changed_head", [False, True])
+def test_external_merge_only_attributes_gates_for_the_observed_head(factory, monkeypatch, changed_head):
+    # Publish a real reviewed candidate, then let a person merge it while paused
+    # for approval, optionally after pushing an unreviewed commit.
+    with session_scope() as s:
+        ws = s.get(Workspace, factory["ws"])
+        ws.settings = {**ws.settings, "autonomy": {**ws.settings["autonomy"], "merge": "approval"}}
+    outcome_id = new_outcome(factory)
+    def waiting():
+        with session_scope() as s:
+            return s.query(Decision).filter_by(outcome_id=outcome_id, kind="approve_merge", status="open").count() == 1
+    assert drive(waiting)
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        task_id, number = task.id, task.pr_number
+        reviewed = task.evidence["gate_candidate"]
+        gate_ids = task.evidence["gate_ids"]
+        # The reconciler would queue this continuation after observing the merge.
+        task.status = "running"
+    pr = FakeGitHub.pulls[number]
+    observed = "a" * 40 if changed_head else reviewed["head"]
+    pr.update(merged=True, merge_commit_sha="b" * 40, merged_at="2026-11-10T12:00:00Z",
+              head={**pr["head"], "sha": observed})
+    async def smoke(self):
+        pass
+    monkeypatch.setattr(delivery.TaskRunner, "smoke", smoke)
+    runner = _runner(task_id)
+    asyncio.run(runner.merge())
+    runner = _runner(task_id)  # prove the attribution survives reconstruction
+    merge = runner.task.evidence["merge"]
+    assert merge["head"] == runner.task.head_sha == observed
+    assert merge["at"] == pr["merged_at"]
+    assert merge["reviewed_candidate"] == reviewed
+    assert merge["gate_ids"] == ({} if changed_head else gate_ids)
+    assert merge["candidate"] == ({} if changed_head else reviewed)
+    from aifactory.regrets import merge_gate_passes
+    with session_scope() as s:
+        accepts = merge_gate_passes(s, factory["ws"])
+        for gate in ("checks", "verifier", "ci"):
+            assert ((task_id, gate) in accepts) is not changed_head
+        for gate_id in gate_ids.values():
+            assert s.get(GateVerdict, gate_id).head_sha == reviewed["head"]
+    runner._merge_evidence({"merged_at": "2099-01-01T00:00:00Z"})
+    assert runner.task.evidence["merge"] == merge
+
+
+def test_smoke_regret_notifies_signal_clients_once_after_commit(factory, monkeypatch):
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "smoke": ["false"]}
+    notifications = []
+    def notified(workspace_id, entity, entity_id, **kwargs):
+        if entity == "signal":
+            # Notifications must follow commit so clients can read the new signal.
+            with session_scope() as s:
+                signal = s.get(Signal, entity_id)
+                assert signal and signal.workspace_id == workspace_id
+            notifications.append((workspace_id, entity_id))
+    monkeypatch.setattr(delivery, "notify", notified)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "attention")
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        task_id = task.id
+        regret = s.query(MergeRegret).filter_by(task_id=task_id).one()
+        assert notifications == [(factory["ws"], regret.signal_id)]
+    with pytest.raises(delivery.Stop):
+        asyncio.run(_runner(task_id).smoke())
+    assert len(notifications) == 1
+
+
+def test_resumed_publication_binds_gates_without_repeating_decisions(factory):
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == "completed")
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        task_id = task.id
+        original = task.evidence["gate_candidate"]
+        gate_ids = task.evidence["gate_ids"]
+        times = {gate: s.get(GateVerdict, gate_id).at for gate, gate_id in gate_ids.items()}
+        count = s.query(GateVerdict).filter_by(task_id=task_id).count()
+    # A restart after push but before PR persistence can recreate the same patch
+    # as a new commit (commit time changes), without rerunning checks or review.
+    runner = _runner(task_id)
+    runner._bind_published_candidate("c" * 40)
+    runner = _runner(task_id)
+    runner._bind_published_candidate("c" * 40)
+    assert runner.task.evidence["gate_candidate"]["id"] == original["id"]
+    assert runner.task.evidence["gate_candidate"]["head"] == "c" * 40
+    with session_scope() as s:
+        assert s.query(GateVerdict).filter_by(task_id=task_id).count() == count
+        assert s.get(Task, task_id).evidence["gate_ids"] == gate_ids
+        for gate in ("check:0", "checks", "verifier"):
+            row = s.get(GateVerdict, gate_ids[gate])
+            assert row.head_sha == "c" * 40 and row.at == times[gate]
+            assert row.evidence["reviewed_candidate"]["head"] == ""
+        # CI did not observe the recreated commit and must not be rebound.
+        assert s.get(GateVerdict, gate_ids["ci"]).head_sha == original["head"]
+
+
+def test_verifier_setup_failure_records_unknown_without_a_verifier_run(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    runner = _runner(task_id)
+    patch = gitops.Patch(b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
+                         ["x"], 1, 1)
+    runner._candidate(patch, None, head=runner.task.head_sha)
+
+    async def unavailable(*args, **kwargs):
+        raise delivery.SandboxError("Sandbox setup failed: checkout unavailable")
+
+    monkeypatch.setattr(runner, "_verifier_sandbox", unavailable)
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner._verify("token", patch, 1))
+    with session_scope() as s:
+        gates = s.query(GateVerdict).filter_by(task_id=task_id, gate="verifier").all()
+        assert len(gates) == 2
+        assert all(g.verdict == "unknown" and g.run_id is None for g in gates)
+        assert all(g.evidence["candidate"]["id"] == runner.task.evidence["gate_candidate"]["id"] for g in gates)
+        assert all("checkout unavailable" in g.evidence["error"] for g in gates)
+        assert not s.query(Run).filter_by(task_id=task_id, role="verifier").count()
+
+
+def test_merge_captures_existing_workstream_without_creating_one(factory):
+    from aifactory.models import Workstream
+
+    _, task_id, number = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        workstream = Workstream(workspace_id=factory["ws"], slug="greeting", name="Greeting", goal="Say hello",
+                                owner_id=factory["user"])
+        s.add(workstream)
+        s.flush()
+        workstream_id = workstream.id
+        task = s.get(Task, task_id)
+        s.get(Outcome, task.outcome_id).workstream_id = workstream_id
+    runner = _runner(task_id)
+    runner._merge_evidence(FakeGitHub.pulls[number])
+    assert runner.task.evidence["merge"]["workstream_id"] == workstream_id
+    with session_scope() as s:
+        assert s.query(Workstream).count() == 1
+
+@pytest.mark.parametrize("interrupted_stage", ["checks", "verification", "publication"])
+def test_candidate_gate_attribution_survives_a_delivery_restart(factory, monkeypatch, interrupted_stage):
+    if interrupted_stage == "checks":
+        stopped = _stop_at_the_checks(monkeypatch)
+    else:
+        method = "_verifier_sandbox" if interrupted_stage == "verification" else "_publish"
+        stopped = _stop_once(monkeypatch, method)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=90)
+    assert stopped
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert "candidate" not in task.evidence  # main's resumable record was cleared
+        merge = task.evidence["merge"]
+        assert merge["candidate"] == task.evidence["gate_candidate"]
+        assert len(task.evidence["candidates"]) == 1
+        assert s.query(Run).filter_by(task_id=task.id, role="builder").count() == 1
+        for gate in ("check:0", "checks", "verifier", "ci"):
+            row = s.get(GateVerdict, merge["gate_ids"][gate])
+            assert row.verdict == "pass"
+            assert row.head_sha == task.head_sha == merge["candidate"]["head"]
+            assert row.candidate_fingerprint == merge["candidate"]["id"]
+
+def test_verifier_setup_failure_does_not_inherit_the_builder_run(factory, monkeypatch):
+    task_id, _ = _revalidation_candidate(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        builder = Run(workspace_id=factory['ws'], outcome_id=task.outcome_id, task_id=task_id,
+                      role='builder', harness='test')
+        s.add(builder)
+        s.flush()
+        builder_id = builder.id
+    runner = _runner(task_id)
+    patch = gitops.Patch(b'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n',
+                         ['x'], 1, 1)
+    runner._candidate(patch, builder_id, head=runner.task.head_sha)
+    runner._checks_gate([])  # an omitted run ID still inherits the candidate's builder
+
+    async def unavailable(*args, **kwargs):
+        raise delivery.SandboxError('checkout unavailable')
+
+    monkeypatch.setattr(runner, '_verifier_sandbox', unavailable)
+    with pytest.raises(delivery.Stop):
+        asyncio.run(runner._verify('token', patch, 1))
+    with session_scope() as s:
+        checks = s.query(GateVerdict).filter_by(task_id=task_id, gate='checks').one()
+        assert checks.run_id == builder_id
+        reviews = s.query(GateVerdict).filter_by(task_id=task_id, gate='verifier').all()
+        assert len(reviews) == 2
+        assert all(row.run_id is None and row.verdict == 'unknown' for row in reviews)
+        assert all(row.evidence['candidate']['run_id'] == builder_id for row in reviews)
+        assert not s.query(Run).filter_by(task_id=task_id, role='verifier').count()
+
+
+def test_smoke_regret_signal_retains_failure_diagnostics_for_a_fix(factory):
+    command = "echo 'smoke endpoint returned 503'; exit 1"
+    with session_scope() as s:
+        repo = s.get(Repository, factory['repo'])
+        repo.config = {**repo.config, 'smoke': [command]}
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) == 'attention')
+    with session_scope() as s:
+        task = s.query(Task).filter_by(outcome_id=outcome_id).one()
+        task_id = task.id
+        regret = s.query(MergeRegret).filter_by(task_id=task_id, kind='smoke_failure').one()
+        signal = s.get(Signal, regret.signal_id)
+        body, signal_id = signal.body, signal.id
+        assert command in body and 'failed (exit 1)' in body
+        assert '\nsmoke endpoint returned 503\n' in body
+        assert regret.id in body and task.pr_url in body
+    # Replaying the observation leaves one actionable proposal with the original diagnostics.
+    with pytest.raises(delivery.Stop):
+        asyncio.run(_runner(task_id).smoke())
+    with session_scope() as s:
+        assert s.query(Signal).filter_by(repo_id=factory['repo']).count() == 1
+        assert s.get(Signal, signal_id).body == body
