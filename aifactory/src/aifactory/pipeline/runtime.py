@@ -15,10 +15,11 @@ from ..config import concurrency_limit, get_settings
 from ..config_versions import canonical_json, configuration_version
 from ..db import session_scope, utcnow
 from ..events import notify, record
+from ..failures import failure_cause, failure_status
 from ..gateway import GatewayGrant, issue, revoke
-from ..harness import HarnessResult, HarnessSession, get_harness
+from ..harness import HarnessFailed, HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
-from ..inference import ModelClient, UsageLedger, resolve_provider, workspace_models
+from ..inference import InferenceError, ModelClient, UsageLedger, resolve_provider, workspace_models
 from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from ..review import DEFAULT_REVIEW
@@ -202,8 +203,17 @@ class SessionSpec:
                 object.__setattr__(self, key, freeze(value))
 
 
+def carried_cause(run: Any) -> str | None:
+    """Why a failed run failed, as run_agent recorded it from the exception: "provider", "transient" or "" (see
+    failures.failure_cause). None when the failure did not say (a sandbox error, a run recorded before causes were
+    kept): the caller then reads the error's wording."""
+    failure = (getattr(run, "config_snapshot", None) or {}).get("failure")
+    return failure.get("cause") if isinstance(failure, dict) else None
+
+
 async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, HarnessResult | None, str]:
-    """Run one harness session as a recorded Run. Returns (run, result_or_None, error)."""
+    """Run one harness session as a recorded Run. Returns (run, result_or_None, error). A failed run keeps what
+    failed it under ``config_snapshot["failure"]`` (cause and HTTP status) when the exception says: carried_cause."""
     settings = (merged_settings(json.loads(canonical_json(spec.effective_settings)))
                 if spec.effective_settings is not None else workspace_settings(spec.workspace_id))
     provider = (resolve_provider(spec.workspace_id, required_provider=settings["provider"])
@@ -235,6 +245,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     result: HarnessResult | None = None
     error = ""
     status = "succeeded"
+    failure: dict[str, Any] | None = None
     try:
         if spec.harness == "codex":
             gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
@@ -254,7 +265,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                 return
             last_progress["t"] = now
             record(spec.workspace_id, f"agent_{kind}", message, outcome_id=spec.outcome_id, task_id=spec.task_id,
-                   run_id=run_id, data={"role": spec.role, **data})
+                   run_id=run_id, level="warn" if kind == "warn" else "info", data={"role": spec.role, **data})
 
         session = HarnessSession(
             run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
@@ -283,6 +294,11 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         raise
     except Exception as exc:  # harness failures are recorded, never hidden
         status, error = "failed", str(exc) or type(exc).__name__
+        cause = failure_cause(exc)
+        # A harness or model-client failure says what it was, even when that is "not the provider". Anything else
+        # (the sandbox, a stray error) carries nothing unless its type is telling, and is read from its wording.
+        if cause or isinstance(exc, (HarnessFailed, InferenceError)):
+            failure = {"cause": cause, "status": failure_status(exc)}
     finally:
         if gateway_token:
             revoke(run_id)
@@ -300,6 +316,8 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
                 row.cost_usd, row.cost_known = round(ledger.cost_usd, 6), ledger.cost_known and ledger.calls > 0
             if result:
                 row.result = result.report
+            if failure is not None:
+                row.config_snapshot = {**(row.config_snapshot or {}), "failure": failure}
             # Reserve in the same transaction as completion: a restart cannot lose sampled work.
             try:
                 from ..scorers import reserve_automatic

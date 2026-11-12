@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..failures import failure_cause
 from ..inference import BudgetExceeded, InferenceError
 from .base import HarnessFailed, HarnessResult, HarnessSession
 from .schemas import validate_report
@@ -68,11 +69,15 @@ class NativeHarness:
                     tool_choice="required" if final_turn else None,
                     ledger=session.ledger,
                     reasoning_effort=session.reasoning_effort,
+                    # A short provider outage is retried inside the request, within this session's time.
+                    deadline=session.deadline,
+                    cancelled=session.cancelled,
+                    notice=lambda text: session.on_progress("warn", text, {}),
                 )
             except BudgetExceeded as exc:
                 raise HarnessFailed(str(exc)) from exc
             except InferenceError as exc:
-                raise HarnessFailed(f"Model request failed: {exc}") from exc
+                raise HarnessFailed(f"Model request failed: {exc}", cause=failure_cause(exc)) from exc
             turns += 1
             calls = message.get("tool_calls") or []
             assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}

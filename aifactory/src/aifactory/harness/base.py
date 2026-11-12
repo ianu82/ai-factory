@@ -21,7 +21,13 @@ class HarnessUnavailable(RuntimeError):
 
 
 class HarnessFailed(RuntimeError):
-    pass
+    """A session ended without a report. ``cause`` is set where the reason is known (failures.failure_cause):
+    "provider" or "transient" when the model provider failed it, "" when the session itself did (its turns, time
+    or budget ran out, its report was rejected)."""
+
+    def __init__(self, message: str, *, cause: str = ""):
+        super().__init__(message)
+        self.cause = cause
 
 
 @dataclass
