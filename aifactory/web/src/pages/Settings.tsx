@@ -93,7 +93,7 @@ function Policies() {
   const validStopped = /^\d+$/.test(stoppedAfter) && Number(stoppedAfter) >= 5 && Number(stoppedAfter) <= 240;
   const [webhookUrl, setWebhookUrl] = useState("");
   const [webhookSaving, setWebhookSaving] = useState(false);
-  const webhook = s.alerts?.webhook;
+  const webhook = ws.alert_webhook;
   const alertValues = {
     after_minutes: s.alerts?.after_minutes ?? 120, stopped_minutes: s.alerts?.stopped_minutes ?? 20,
     slack: false, email: false,

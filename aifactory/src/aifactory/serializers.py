@@ -25,14 +25,15 @@ def workspace(w: Workspace, role: str | None = None, org_name: str = "") -> dict
 
     from .pipeline.runtime import merged_settings
 
-    settings = merged_settings(w.settings)
     db = object_session(w)
-    if db is not None:  # the alert webhook is a secret: only whether it is set, and its host
+    webhook = {"set": False, "host": ""}
+    if db is not None:  # the alert webhook is a secret, kept apart from the settings: whether it is set, its host
         from .alert_webhook import view
 
-        settings["alerts"] = {**settings["alerts"], "webhook": view(db, w.id)}
+        webhook = view(db, w.id)
     return {"id": w.id, "name": w.name, "slug": w.slug, "description": w.description, "org_id": w.org_id,
-            "org_name": org_name, "role": role, "paused": w.paused, "settings": settings,
+            "org_name": org_name, "role": role, "paused": w.paused, "settings": merged_settings(w.settings),
+            "alert_webhook": webhook,
             "mindshub_workspace_id": w.mindshub_workspace_id, "created_at": ts(w.created_at)}
 
 

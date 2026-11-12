@@ -121,13 +121,8 @@ export interface Settings {
   linear?: LinearConfig;
   mind?: { daily_budget_usd: number };
   /** Slack and email aren't available yet and are always off; alerts show in the Inbox. The webhook is write-only:
-   * set it with webhook_url ("" clears it); settings show only whether it is set and its host. */
-  alerts?: {
-    after_minutes: number; slack: boolean; email: boolean;
-    stopped_minutes?: number;
-    webhook?: { set: boolean; host: string };
-    webhook_url?: string;
-  };
+   * set it with webhook_url ("" clears it); the workspace's alert_webhook says whether it is set and its host. */
+  alerts?: { after_minutes: number; slack: boolean; email: boolean; stopped_minutes?: number; webhook_url?: string };
   /** The stand-in for people while they're away (pipeline/director.py). Off by default. */
   director?: DirectorSettings;
 }
@@ -173,6 +168,8 @@ export interface Workspace {
   role: Role;
   paused: boolean;
   settings: Settings;
+  /** The alert webhook is a secret: only whether it is set, and its host. */
+  alert_webhook?: { set: boolean; host: string };
 }
 
 export interface Me {

@@ -216,12 +216,11 @@ def _director_settings(value: Any) -> dict[str, Any]:
 def _alert_settings(value: Any) -> dict[str, Any]:
     """Alerts: how long a decision may wait before it alerts, how long nothing may run while work waits, and the
     outside channels. Slack and email aren't available yet, so they can only be off: alerts show in the app's Inbox.
-    The webhook (alerts.webhook_url) is a secret kept apart (update_workspace); ``webhook`` is its read-only view."""
+    The webhook (alerts.webhook_url) is a secret kept apart (update_workspace), shown as the workspace's
+    ``alert_webhook``."""
     default = DEFAULT_SETTINGS["alerts"]
     if value is None:
         return dict(default)
-    if isinstance(value, dict):
-        value = {k: v for k, v in value.items() if k != "webhook"}
     if not isinstance(value, dict) or set(value) - set(default):
         raise HTTPException(422, "alerts accepts only after_minutes, stopped_minutes, webhook_url, slack and email")
     after = value.get("after_minutes", default["after_minutes"])
@@ -321,7 +320,7 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
         webhook = None
         if isinstance(patch.get("alerts"), dict):
             # Alerts are patched key by key. The webhook URL is a secret: kept encrypted, never in the settings.
-            alerts = {k: v for k, v in patch["alerts"].items() if k not in ("webhook_url", "webhook")}
+            alerts = {k: v for k, v in patch["alerts"].items() if k != "webhook_url"}
             if "webhook_url" in patch["alerts"]:
                 from . import alert_webhook
 

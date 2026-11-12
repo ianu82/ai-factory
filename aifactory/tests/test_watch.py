@@ -191,8 +191,8 @@ def test_alerts_show_in_the_app_and_slack_and_email_stay_off(world, client):
         assert client.patch(url, json={"settings": {"alerts": bad}}).status_code == 422, bad
     r = client.patch(url, json={"settings": {"alerts": {"after_minutes": 60}}})
     assert r.status_code == 200 and r.json()["settings"]["alerts"] == {
-        "after_minutes": 60, "stopped_minutes": 20, "slack": False, "email": False,
-        "webhook": {"set": False, "host": ""}}
+        "after_minutes": 60, "stopped_minutes": 20, "slack": False, "email": False}
+    assert r.json()["alert_webhook"] == {"set": False, "host": ""}
     working(world)
     decision(world, age=timedelta(minutes=61))
     watch.run()
@@ -312,8 +312,7 @@ def posted(monkeypatch):
 def test_the_webhook_carries_a_hold_and_nothing_running_out_once_when_raised_and_once_when_cleared(
         world, client, posted):
     r = client.patch(f"/api/workspaces/{world['ws']}", json={"settings": {"alerts": {"webhook_url": WEBHOOK}}})
-    assert r.status_code == 200 and r.json()["settings"]["alerts"]["webhook"] == {"set": True,
-                                                                                 "host": "hooks.example.com"}
+    assert r.status_code == 200 and r.json()["alert_webhook"] == {"set": True, "host": "hooks.example.com"}
     with db.session_scope() as s:
         name = s.get(Workspace, world["ws"]).name
     hold = open_provider_hold(world["ws"], "MindsHub: no credit remaining (balance 0)", "planning outcome #7")
@@ -377,14 +376,14 @@ def test_the_api_never_returns_the_webhook_url(world, client):
     me = client.get("/api/me")
     assert "SECRET" not in me.text
     [mine] = [w for w in me.json()["workspaces"] if w["id"] == world["ws"]]
-    assert mine["settings"]["alerts"]["webhook"] == {"set": True, "host": "hooks.example.com"}
+    assert mine["alert_webhook"] == {"set": True, "host": "hooks.example.com"}
     with db.session_scope() as s:  # kept encrypted, never in the settings
         secret = s.query(Secret).filter_by(workspace_id=world["ws"], kind=alert_webhook.KIND).one()
         assert "SECRET" not in secret.ciphertext and "SECRET" not in str(s.get(Workspace, world["ws"]).settings)
         assert alert_webhook.url_for(s, world["ws"]) == WEBHOOK
     assert client.post(f"{url}/credentials/{alert_webhook.KIND}/test").status_code == 404
     r = client.patch(url, json={"settings": {"alerts": {"after_minutes": 60}}})  # alerts are patched key by key
-    assert r.json()["settings"]["alerts"]["webhook"]["set"] is True and "SECRET" not in r.text
+    assert r.json()["alert_webhook"]["set"] is True and "SECRET" not in r.text
     r = client.patch(url, json={"settings": {"alerts": {"webhook_url": ""}}})  # Clear
-    assert r.json()["settings"]["alerts"]["webhook"] == {"set": False, "host": ""}
+    assert r.json()["alert_webhook"] == {"set": False, "host": ""}
     assert r.json()["settings"]["alerts"]["after_minutes"] == 60
