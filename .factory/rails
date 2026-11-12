@@ -19,3 +19,13 @@ aifactory/src/aifactory/pipeline/holds.py
 aifactory/src/aifactory/pipeline/lead.py
 aifactory/src/aifactory/pipeline/director.py
 aifactory/src/aifactory/pipeline/runtime.py
+# Who may answer a decision, how people are told apart from the Factory's own identities, and what a rule means.
+aifactory/src/aifactory/onboarding_policy.py
+aifactory/src/aifactory/review.py
+aifactory/src/aifactory/supervisor_policy.py
+aifactory/src/aifactory/rulings.py
+aifactory/src/aifactory/bootstrap.py
+aifactory/src/aifactory/operator_relay.py
+aifactory/src/aifactory/auth.py
+aifactory/src/aifactory/security.py
+aifactory/src/aifactory/mind/actions.py
