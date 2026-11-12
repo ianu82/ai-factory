@@ -18,6 +18,12 @@ class Candidate:
     # CI-only waits have already released their execution slot. Their ready
     # continuations get the next eligible slot, even ahead of urgent fresh work.
     ci_continuation: bool = False
+    # A task's outcome: within one priority, class and requester, the oldest outcome's work goes first, so outcomes
+    # finish before more start. Planning candidates leave it unset (they are the outcome).
+    outcome_created_at: datetime | None = None
+
+    def age(self) -> tuple[datetime, datetime, str]:
+        return self.outcome_created_at or self.created_at, self.created_at, self.id
 
 
 class RequesterTurns:
@@ -41,7 +47,7 @@ class RequesterTurns:
                 continue
             requester = self._requester(candidate)
             previous = heads.get(requester)
-            if previous is None or (candidate.created_at, candidate.id) < (previous.created_at, previous.id):
+            if previous is None or candidate.age() < previous.age():
                 heads[requester] = candidate
         requesters = sorted(heads)
         last = self.last_served.get(rank[0])

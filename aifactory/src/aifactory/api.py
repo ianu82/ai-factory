@@ -279,6 +279,9 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     merged["holds"] = holds
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
+    cap = merged["limits"].get("open_outcomes")
+    if cap is not None and (type(cap) is not int or not 0 <= cap <= 1000):
+        raise HTTPException(422, "limits.open_outcomes must be a whole number from 0 to 1000 (0: no limit)")
     for role in ("builder", "verifier", "planner"):
         if merged["harness"].get(role) not in ("native", "codex", "anton"):
             merged["harness"][role] = "native"
