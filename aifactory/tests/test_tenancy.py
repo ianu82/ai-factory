@@ -315,3 +315,53 @@ def test_definition_routes_and_foreign_object_ids_are_isolated(client, signed_in
         assert other.put(foreign, json={"expected_revision": 1, "bundle": forged}).status_code == 422
     assert client.get(root).json() == own
     assert other.get(foreign).json()["revision"] == 1
+
+
+def test_github_connection_roles_workspace_and_user_state(client, signed_in, monkeypatch):
+    from datetime import timedelta
+    from aifactory import config
+    from aifactory.db import utcnow
+    from aifactory.models import GitHubConnectionState, Membership, Workspace
+    from aifactory.security import new_token, sign, token_hash
+    from aifactory.auth import COOKIE
+
+    ws = signed_in["workspaces"][0]["id"]
+    root = f"/api/workspaces/{ws}/github/connection"
+    for name in ("ID", "PRIVATE_KEY", "CLIENT_ID", "CLIENT_SECRET", "WEBHOOK_SECRET"):
+        monkeypatch.setenv("AIFACTORY_GITHUB_APP_" + name, "configured")
+    config.reset_settings_cache()
+    state = sign(new_token())
+    with session_scope() as db:
+        original = db.get(Workspace, ws)
+        other_ws = Workspace(name="Other", slug="other", org_id=original.org_id)
+        db.add(other_ws)
+        db.flush()
+        other_id = other_ws.id
+        db.add(Membership(workspace_id=other_id, user_id=signed_in["user"]["id"], role="owner"))
+        db.add(GitHubConnectionState(token_hash=token_hash(state), workspace_id=ws,
+                                    user_id=signed_in["user"]["id"], stage="install", destination="setup",
+                                    session_hash=token_hash(client.cookies.get(COOKIE)),
+                                    expires_at=utcnow() + timedelta(minutes=10)))
+    params = {"state": state, "installation_id": "42"}
+    assert client.get(f"/api/workspaces/{other_id}/github/connection/return", params=params).status_code == 400
+    other = TestClient(client.app)
+    other.post("/auth/dev", json={"email": "other@foreign.test", "organization": "Other"})
+    user_id = other.get("/api/me").json()["user"]["id"]
+    assert other.get(root).status_code == 404
+    assert other.post(root + "/start").status_code == 404
+    assert other.delete(root).status_code == 404
+    with session_scope() as db:
+        db.add(Membership(workspace_id=ws, user_id=user_id, role="admin"))
+    assert other.get(root + "/return", params=params).status_code == 400
+    with session_scope() as db:
+        db.query(Membership).filter_by(workspace_id=ws, user_id=user_id).one().role = "viewer"
+    assert other.get(root).status_code == 200
+    assert other.post(root + "/start").status_code == 403
+    assert other.delete(root).status_code == 403
+    assert other.get(root + "/return", params=params).status_code == 403
+    assert other.get(root + "/oauth", params={"state": state, "code": "test"}).status_code == 403
+    assert TestClient(client.app).post(root + "/start").status_code == 401
+    # Only the originating workspace's admin may clear its binding, even with App config off.
+    assert client.delete(root).status_code == 200
+    with session_scope() as db:
+        assert db.get(GitHubConnectionState, token_hash(state)) is None

@@ -554,11 +554,9 @@ class GitHub:
             checks.extend(await self._actions_checks(full_name, sha))
             actions_loaded = True
         if self.installation_bound:
-            statuses = {}
             if not actions_loaded:
                 checks.extend(await self._actions_checks(full_name, sha))
-        else:
-            statuses = await self.request("GET", f"/repos/{full_name}/commits/{sha}/status")
+        statuses = await self.request("GET", f"/repos/{full_name}/commits/{sha}/status")
         for run in runs.get("check_runs", []):
             checks.append({
                 "name": run["name"],

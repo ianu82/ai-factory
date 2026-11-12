@@ -11,6 +11,7 @@ import { ago } from "../format";
 import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
+import { GitHubConnection } from "../components/Setup";
 import { LinearSettings } from "../components/LinearSettings";
 
 const SECTIONS = [
@@ -270,7 +271,7 @@ function Credentials() {
     <section className="s-block">
       <h2>Credentials</h2>
       <p>Stored encrypted on the Factory server. Values are never shown again, never sent to sandboxes, and never appear in logs, PRs or evidence. Agents reach models through a run-scoped gateway token.</p>
-      {q.isLoading ? <Skeleton rows={3} /> : q.error ? <p role="alert">Could not load credentials: {q.error.message} <button className="btn sm" onClick={() => q.refetch()}>Retry</button></p> : q.data?.items.map((c) => <CredentialRow key={`${ws.id}-${c.kind}`} c={c} fallback={q.data!.server_fallbacks[c.kind]} />)}
+      {q.isLoading ? <Skeleton rows={3} /> : q.error ? <p role="alert">Could not load credentials: {q.error.message} <button className="btn sm" onClick={() => q.refetch()}>Retry</button></p> : q.data?.items.map((c) => c.kind === "github_token" ? <GitHubConnection key={`${ws.id}-${c.kind}`} workspaceId={ws.id} admin={ws.role === "owner" || ws.role === "admin"} destination="settings"><CredentialRow c={c} fallback={q.data!.server_fallbacks[c.kind]} /></GitHubConnection> : <CredentialRow key={`${ws.id}-${c.kind}`} c={c} fallback={q.data!.server_fallbacks[c.kind]} />)}
     </section>
   );
 }

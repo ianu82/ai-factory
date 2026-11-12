@@ -50,7 +50,10 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AIFACTORY_SANDBOX_ISOLATION", "0")
     monkeypatch.setenv("AIFACTORY_VM_WORK", "/fake-vm-work")  # the fake VM's checkout; never a real path
     for key in ("AIFACTORY_BOOTSTRAP_OPENAI_API_KEY", "AIFACTORY_BOOTSTRAP_MINDSHUB_API_KEY",
-                "AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+                "AIFACTORY_BOOTSTRAP_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN",
+                "AIFACTORY_GITHUB_APP_ID", "AIFACTORY_GITHUB_APP_PRIVATE_KEY",
+                "AIFACTORY_GITHUB_APP_CLIENT_ID", "AIFACTORY_GITHUB_APP_CLIENT_SECRET",
+                "AIFACTORY_GITHUB_APP_WEBHOOK_SECRET"):
         monkeypatch.delenv(key, raising=False)
     from aifactory import config, db, fallbacks, security
 

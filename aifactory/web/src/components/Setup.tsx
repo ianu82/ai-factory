@@ -45,3 +45,5 @@ export function CopySetupPrompt() {
     <p role="status">{status}</p>
   </div>;
 }
+
+export { GitHubConnection } from "./GitHubConnection";
