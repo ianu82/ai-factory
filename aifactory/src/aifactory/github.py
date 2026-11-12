@@ -437,7 +437,7 @@ class GitHub:
         query = """query($owner:String!, $name:String!, $number:Int!, $after:String) {
             repository(owner:$owner, name:$name) { pullRequest(number:$number) {
                 reviewThreads(first:100, after:$after) { nodes {
-                    id isResolved path line originalLine
+                    id isResolved isOutdated path line originalLine
                     comments(first:100) { nodes { %s } %s }
                 } %s }
             } }

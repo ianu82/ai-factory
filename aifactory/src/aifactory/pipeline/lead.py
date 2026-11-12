@@ -16,14 +16,16 @@ so delivery metrics count them as the Factory's own work, not a person's.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
@@ -56,6 +58,11 @@ FIRST_LOOK = timedelta(days=1)  # posts older than this predate the Lead: its fi
 MAX_MINUTES = 15
 PER_RUN = {"resolve_decision": 5, "post_guidance": 3, "note_for_people": 5, "post_update": 2}
 RESULT_CHARS = 40_000
+# Merge approvals: what review says about the exact commit up for merging, read from GitHub on every run.
+REVIEW_RECHECK = timedelta(minutes=10)  # how often the watcher reads what review says about open merge approvals
+CODEX = "chatgpt-codex-connector[bot]"
+SEVERITY = re.compile(r"\b(P[0-3]) Badge")
+BLOCKING = ("P0", "P1")
 MAX_OUTPUT = 8000  # tokens a Lead request may write
 MIN_OUTPUT = 512  # below this a request can't do anything useful: the run stops instead
 UNPRICED_OUTPUT = 4000  # without a price, a smaller reply bounds what one request can spend
@@ -125,6 +132,12 @@ You were woken because something on your outcome needs judgement. Read the outco
 - Acknowledge (resolve_decision with "acknowledge") only when a failure is understood and accepting it is right.
 - Request changes on a pull request (resolve_decision with "reject" on a merge approval) when review findings,
   failed checks or the verifier's report show it isn't ready. Say exactly what must change.
+- Merge approvals: merge_reviews in the record says what review reports for the exact commit up for merging, read
+  from GitHub now. Never recommend merging while that commit's review isn't in, while it couldn't be read, while
+  the PR has moved on to another commit, while a reviewer requests changes, or while P0 or P1 findings are open:
+  request changes citing the open P0/P1 findings or the change request, or say what is outstanding.
+  List any lower-severity findings still open. Your notes on a merge approval start with that review line
+  automatically.
 - Post guidance (post_guidance) when the agents need direction that isn't tied to a decision.
 - Follow the team's rules (team_rules in the record). They are decisions people made for every outcome; cite the
   rule when it settles a question, and never tell an agent to break one. If a rule seems wrong for this case, say
@@ -203,14 +216,61 @@ def notes_for(db, decisions: list[Decision]) -> dict[str, dict[str, Any]]:
     notes: dict[str, dict[str, Any]] = {}
     if not outcome_ids:
         return notes
+    current = {d.id: question_mark(db, d) for d in decisions}
+    merges = {d.id for d in decisions if d.kind == "approve_merge"}
+    seen = _review_seen(db, [d for d in decisions if d.id in merges])
     rows = db.query(Message).filter(Message.outcome_id.in_(outcome_ids), Message.author_kind == "lead") \
         .order_by(Message.created_at.desc(), Message.id.desc())
     for m in rows:
-        decision_id = (m.attribution or {}).get("decision_id")
-        if decision_id in wanted and decision_id not in notes:
-            notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at),
-                                  "run_id": (m.attribution or {}).get("run_id")}
-    return notes
+        attribution = m.attribution or {}
+        decision_id = attribution.get("decision_id")
+        if decision_id not in wanted or decision_id in notes:
+            continue
+        # A note answers the question as it was when written: once the question or the commit up for merging
+        # changes, it is advice for something else and isn't shown. Notes from before marks were recorded carry
+        # none: they still show on a question, but not on a merge, where the commit may since have changed.
+        mark = attribution.get("question")
+        if mark != current[decision_id] and (mark is not None or decision_id in merges):
+            notes[decision_id] = None
+            continue
+        # Nor once review was seen to differ from what the Lead read when it wrote: a note saying review was clean
+        # must not outlive a new finding, even when the Lead can't run to replace it (a spent budget), and whoever
+        # saw it first (the watcher, or a later run that left the note alone). Seeing the same review again isn't a
+        # change. The Lead's next run writes a new note.
+        read_at = _parse(attribution.get("review_read_at")) or m.created_at
+        last = seen.get(decision_id)
+        if last is not None and last[0] > read_at and (
+                last[1] is None or last[1] != attribution.get("review_fingerprint")):
+            notes[decision_id] = None
+            continue
+        notes[decision_id] = {"text": m.body, "created_at": ts(m.created_at), "run_id": attribution.get("run_id")}
+    return {d: note for d, note in notes.items() if note is not None}
+
+
+def _review_seen(db, merges: list[Decision]) -> dict[str, tuple[datetime, str | None]]:
+    """What was last seen of each merge approval's review, and when: by the watcher (its latest lead_review_changed)
+    or by a Lead run that finished in any way (the snapshot its result keeps, read at read_at), whichever is later."""
+    seen: dict[str, tuple[datetime, str | None]] = {}
+    if not merges:
+        return seen
+    ids = {d.id for d in merges}
+    outcome_ids = {d.outcome_id for d in merges if d.outcome_id}
+    decision_of = Event.data["decision_id"].as_string()
+    latest = db.query(decision_of.label("decision_id"), func.max(Event.created_at).label("at")).filter(
+        Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed", decision_of.in_(ids)) \
+        .group_by(decision_of).subquery()
+    for e in db.query(Event).join(latest, and_(decision_of == latest.c.decision_id, Event.created_at == latest.c.at)) \
+            .filter(Event.outcome_id.in_(outcome_ids), Event.kind == "lead_review_changed"):
+        seen[(e.data or {})["decision_id"]] = (e.created_at, (e.data or {}).get("fingerprint"))
+    for outcome_id in outcome_ids:
+        # Finished in any way: a run that failed after reading review (and perhaps writing a note) still read it.
+        for run in db.query(Run).filter(Run.outcome_id == outcome_id, Run.role == "lead", Run.status != "running") \
+                .order_by(Run.started_at.desc()).limit(5):
+            for decision_id, review in ((run.result or {}).get("reviews") or {}).items():
+                at = _parse(review.get("read_at")) if isinstance(review, dict) else None
+                if decision_id in ids and at is not None and (decision_id not in seen or at > seen[decision_id][0]):
+                    seen[decision_id] = (at, review.get("fingerprint"))
+    return seen
 
 
 # waking ----------------------------------------------------------------------------------------------------------
@@ -222,8 +282,18 @@ def _marks(db, outcome_id: str) -> dict[str, str]:
     people with its recommendation. One path, in that order."""
     from ..serializers import actionable
 
-    return {d.id: question_fingerprint(d)[:16] for d in db.query(Decision).filter(
+    return {d.id: question_mark(db, d) for d in db.query(Decision).filter(
         Decision.outcome_id == outcome_id, Decision.status == "open") if actionable(d)}
+
+
+def question_mark(db, d: Decision) -> str:
+    """What a decision asks, as a short fingerprint: its question, and for a merge approval the commit up for merging.
+    A changed mark is a new question: it wakes the Lead, and the Lead's notes on the old one no longer apply."""
+    mark = question_fingerprint(d)[:16]
+    if d.kind == "approve_merge" and d.task_id:
+        task = db.get(Task, d.task_id)
+        mark += ":" + ((task.head_sha or "")[:12] if task else "")
+    return mark
 
 
 def _people_posts(db, outcome_id: str, since: datetime | None) -> list[Message]:
@@ -306,6 +376,15 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
                 reasons.append("you've just joined this outcome")
             if ending:
                 reasons.append(f"the outcome has ended ({o.status.replace('_', ' ')})")
+            if done is not None and s.query(Event.id).filter(
+                    Event.outcome_id == o.id, Event.kind == "lead_review_changed",
+                    Event.created_at > done.started_at).first() is not None:
+                reasons.append("what review says about a merge approval changed")
+            continued = None if finished else s.query(func.max(Decision.resolved_at)).filter(
+                Decision.outcome_id == o.id, Decision.kind == "budget", Decision.status == "resolved",
+                Decision.resolution == "retry").scalar()
+            if continued is not None and (done is None or done.started_at < continued):
+                reasons.append("a person let this outcome continue past its budget")
             if stuck:
                 reasons.append("the watch found work stuck: " + "; ".join(m.removeprefix("Watch: ") for m in stuck[:3]))
             if not reasons:
@@ -339,6 +418,191 @@ def _progress(db, outcome_id: str, after: Any, now: datetime) -> list[int]:
     query = db.query(Event.id).filter(Event.outcome_id == outcome_id, Event.kind.in_(MILESTONES))
     query = query.filter(Event.id > after) if isinstance(after, int) else query.filter(Event.created_at > now - FIRST_LOOK)
     return [row.id for row in query.order_by(Event.id)]
+
+
+async def watch_reviews() -> int:
+    """Review can change on a commit nobody pushes to: a reviewer's receipt arrives, someone requests changes, a P0
+    or P1 thread opens. Every REVIEW_RECHECK the orchestrator reads, from GitHub, what review says now about each
+    open merge approval a Lead has already looked at, and compares it with what the Lead (or this watcher) last saw.
+    A change is recorded as lead_review_changed, which wakes that outcome's Lead. Unchanged reviews cost GitHub reads
+    only, no model call. Returns how many changed."""
+    watched = []
+    with session_scope() as s:
+        paused = {w.id for w in s.query(Workspace).filter(Workspace.paused.is_(True))}
+        enabled: dict[str, bool] = {}
+        for d in s.query(Decision).filter(Decision.status == "open", Decision.kind == "approve_merge",
+                                          Decision.task_id.isnot(None)):
+            outcome = s.get(Outcome, d.outcome_id) if d.outcome_id else None
+            task = s.get(Task, d.task_id)
+            repo = s.get(Repository, task.repo_id) if task else None
+            if outcome is None or outcome.status in FINISHED or d.workspace_id in paused or task is None \
+                    or repo is None or not task.pr_number or not task.head_sha:
+                continue
+            if d.workspace_id not in enabled:
+                enabled[d.workspace_id] = settings_for(workspace_settings(d.workspace_id))["enabled"]
+            known = _last_review(s, d)
+            if enabled[d.workspace_id] and known is not None:
+                watched.append((d.workspace_id, d.outcome_id, d.task_id, d.id, repo.full_name, task.pr_number,
+                                task.head_sha, known))
+    changed = 0
+    for workspace_id, outcome_id, task_id, decision_id, repo, number, head, known in watched:
+        state = await review_state(workspace_id, repo, number, head)
+        line, mark = review_line(state, number), review_fingerprint(state)
+        if known.get("fingerprint"):
+            moved = mark != known["fingerprint"]  # the findings themselves, not just their summary line
+        else:  # recorded before fingerprints existed
+            moved = line != known.get("line") or head != known.get("head")
+        if moved:
+            record(workspace_id, "lead_review_changed", line, outcome_id=outcome_id, task_id=task_id,
+                   data={"decision_id": decision_id, "head": head, "line": line, "fingerprint": mark})
+            changed += 1
+    return changed
+
+
+def _last_review(db, decision: Decision) -> dict[str, Any] | None:
+    """What was last seen of a merge approval's review: by a Lead run (finished in any way: one that failed after
+    writing a note still read review), by a Lead note (what review said when it was written), or by the watcher."""
+    seen: tuple[datetime, dict[str, Any]] | None = None
+
+    def consider(at: datetime | None, review: dict[str, Any]) -> None:
+        nonlocal seen
+        if at is not None and (seen is None or at > seen[0]):
+            seen = (at, review)
+
+    for run in db.query(Run).filter(Run.outcome_id == decision.outcome_id, Run.role == "lead",
+                                    Run.status != "running").order_by(Run.started_at.desc()).limit(5):
+        review = ((run.result or {}).get("reviews") or {}).get(decision.id)
+        if isinstance(review, dict):
+            consider(_parse(review.get("read_at")) or run.started_at, review)
+            break
+    note = _latest_note(db, decision)
+    if note is not None and (note.attribution or {}).get("review_fingerprint"):
+        consider(_parse(note.attribution.get("review_read_at")) or note.created_at,
+                 {"fingerprint": note.attribution["review_fingerprint"]})
+    event = db.query(Event).filter(Event.outcome_id == decision.outcome_id, Event.kind == "lead_review_changed",
+                                   Event.data["decision_id"].as_string() == decision.id) \
+        .order_by(Event.created_at.desc(), Event.id.desc()).first()
+    if event is not None:
+        consider(event.created_at, event.data or {})
+    return seen[1] if seen else None
+
+
+def _latest_note(db, decision: Decision) -> Message | None:
+    for m in db.query(Message).filter(Message.outcome_id == decision.outcome_id, Message.author_kind == "lead") \
+            .order_by(Message.created_at.desc(), Message.id.desc()).limit(200):
+        if (m.attribution or {}).get("decision_id") == decision.id:
+            return m
+    return None
+
+
+async def review_state(workspace_id: str, repo: str, number: int, head: str) -> dict[str, Any]:
+    """What review says about this exact commit of a pull request, read from GitHub: whether a reviewer has
+    reported on it, who requests changes, and the review threads still open on the code (neither resolved nor
+    outdated), with their severity. Only reviewers the repository's review policy trusts count, read the way the
+    review stage reads them (review.py): not the PR's author or the Factory, not ignored logins, and on the default
+    policy only collaborators and installed bots. Unreadable means unknown, never clean."""
+    from ..github import GitHub, resolve_credential
+    from ..review import findings_unseen, normalize_feedback, reviewed_by
+
+    state: dict[str, Any] = {"head": head, "checked": False, "reviewed": False, "open": [],
+                             "changes_requested_by": []}
+    try:
+        policy = _review_policy(workspace_id, repo)
+        # The client's helpers read every page and refuse partial GraphQL data: a partial read is never clean.
+        gh = GitHub(resolve_credential(workspace_id))
+        # The PR as it is now: a commit pushed straight to it isn't what the Factory put up for merging, and nothing
+        # else here would notice (the task keeps the commit it published).
+        state["live_head"] = _head_of(await gh.pull(repo, number))
+        snapshot = await gh.review_snapshot(repo, number)
+        seen = {"reviews": snapshot["reviews"], "comments": snapshot["comments"], "policy": policy,
+                "identity": snapshot["identity"], "pull_author": snapshot["pull_author"]}
+        # Reviewed: a trusted reviewer submitted a review of this commit, or Codex says it found nothing in it; and
+        # no reviewer reports findings on it that aren't in what was read.
+        state["reviewed"] = bool(reviewed_by(head, **seen)) and not findings_unseen(head, **seen)
+        # The findings that count, whatever the policy says the Factory addresses itself.
+        findings = normalize_feedback(threads=snapshot["threads"],
+                                      **{**seen, "policy": {**policy, "address": "unresolved"}})
+        state["changes_requested_by"] = sorted({f["author"] for f in findings
+                                                if f.get("review_state") == "CHANGES_REQUESTED" and f["author"]})
+        # Outdated is GitHub's own flag: a comment on a whole file has no line and is still current.
+        outdated = {t.get("id") for t in snapshot["threads"] if t.get("isOutdated") is True}
+        shown: set[str] = set()
+        for f in findings:  # one per open thread: its first comment that counts
+            thread = f.get("thread_id")
+            if f["kind"] != "inline" or not thread or thread in outdated or thread in shown:
+                continue
+            shown.add(thread)
+            body = f.get("body") or ""
+            found = SEVERITY.search(body)
+            state["open"].append({"id": thread, "severity": found.group(1) if found else "",
+                                  "path": f.get("path") or "", "line": f.get("line"), "by": f["author"],
+                                  "text": re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)|\*\*", "", body).strip()[:300]})
+        # And again after: a commit pushed while review was being read makes this a snapshot of the old one.
+        state["live_head"] = _head_of(await gh.pull(repo, number))
+        state["checked"] = True
+    except Exception as exc:  # anything at all (a credential that no longer decrypts, a timeout): unknown, never clean
+        log.warning("review state of %s#%s unreadable: %r", repo, number, exc)
+        state["checked"] = False
+    return state
+
+
+def _review_policy(workspace_id: str, repo: str) -> dict[str, Any]:
+    """The review policy the review stage applies to this repository: the workspace's, with the repository's on top."""
+    from ..review import review_policy
+
+    with session_scope() as s:
+        row = s.query(Repository).filter(Repository.workspace_id == workspace_id, Repository.full_name == repo).first()
+        config = dict(row.config or {}) if row is not None else {}
+    try:
+        return review_policy(workspace_settings(workspace_id), config)
+    except ValueError:  # a stored policy that no longer validates: the defaults apply, as in delivery
+        return review_policy()
+
+
+def _head_of(pr: dict[str, Any]) -> str:
+    sha = (pr.get("head") or {}).get("sha")
+    if not isinstance(sha, str) or not sha:
+        raise ValueError("pull request has no head commit")
+    return sha
+
+
+def review_line(state: dict[str, Any], number: int) -> str:
+    """One line people read above every Lead note on a merge approval, whatever the note says."""
+    at = f"PR #{number} at {state['head'][:7]}"
+    if not state.get("checked"):
+        return f"Review of {at}: couldn't be read from GitHub, so it isn't known to be clean."
+    if moved_on(state):
+        return (f"Review of {at}: the PR has moved on to {state['live_head'][:7]}, which isn't the commit up for "
+                "merging, so this review doesn't cover the PR as it is.")
+    if not state.get("reviewed"):
+        return f"Review of {at}: not in yet."
+    blocking = [f for f in state["open"] if f["severity"] in BLOCKING]
+    parts = []
+    if state["open"]:
+        parts.append(f"{len(state['open'])} open review finding{'s' if len(state['open']) != 1 else ''}"
+                     + (f", {len(blocking)} of them P0/P1" if blocking else ""))
+    if state.get("changes_requested_by"):
+        parts.append("changes requested by " + ", ".join(state["changes_requested_by"]))
+    return f"Review of {at}: " + ("; ".join(parts) if parts else "reviewed, no open findings") + "."
+
+
+def review_fingerprint(state: dict[str, Any]) -> str:
+    """The review state itself, not its one-line summary: a P1 replaced by another P1, or a finding rewritten, is a
+    change the Lead must read even though the line still says "1 open review finding, 1 of them P0/P1"."""
+    findings = sorted((f.get("id") or "", f.get("severity") or "", f.get("text") or "") for f in state.get("open", []))
+    body = json.dumps({"head": state.get("head"), "checked": bool(state.get("checked")),
+                       "reviewed": bool(state.get("reviewed")), "changes": sorted(state.get("changes_requested_by", [])),
+                       "open": findings, "moved_to": state["live_head"] if moved_on(state) else None}, sort_keys=True)
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+def settled(state: dict[str, Any]) -> bool:
+    return bool(state.get("checked") and state.get("reviewed")) and not moved_on(state)
+
+
+def moved_on(state: dict[str, Any]) -> bool:
+    """Whether the PR's head on GitHub is no longer the commit up for merging (someone pushed to it directly)."""
+    return bool(state.get("live_head")) and state["live_head"] != state.get("head")
 
 
 def _parse(value: Any) -> datetime | None:
@@ -468,6 +732,60 @@ class Tools:
         self.used: dict[str, int] = {}
         self.actions: list[dict[str, Any]] = []
         self.closing = False  # woken to report how the outcome ended: its update is the closing report
+        self.reviews: dict[str, dict[str, Any]] = {}  # merge approval id -> review state of its commit (lines below)
+        self.lines: dict[str, str] = {}
+        self.read_at: dict[str, datetime] = {}  # when each review was read: a later change makes the note stale
+        self.prs: dict[str, tuple[str, int]] = {}  # merge approval id -> its repository and PR number
+
+    async def read_reviews(self) -> None:
+        """Review states for this outcome's open merge approvals, from GitHub, before the Lead reads its record.
+        A commit pushed while GitHub was being read is read again, once; a later one is caught by _unseen_commit."""
+        for _ in range(2):
+            for decision_id, repo, number, head in self._unread():
+                self.read_at[decision_id] = utcnow()  # before the read: a change recorded during it counts as later
+                state = await review_state(self.ws, repo, number, head)
+                self.reviews[decision_id], self.prs[decision_id] = state, (repo, number)
+                self.lines[decision_id] = review_line(state, number)
+
+    async def recheck(self, name: str, args: Any) -> str | None:
+        """Right before the Lead writes about a merge approval (a note, or requesting changes): read its review again.
+        The model may have thought for minutes, and a commit pushed straight to the PR or a new finding in that time
+        makes what it is about to say about something else. Returns why it can't go ahead, or None."""
+        decision_id = args.get("decision_id") if isinstance(args, dict) else None
+        if name not in ("note_for_people", "resolve_decision") or decision_id not in self.prs:
+            return None
+        before = self.reviews[decision_id]
+        repo, number = self.prs[decision_id]
+        self.read_at[decision_id] = utcnow()
+        state = await review_state(self.ws, repo, number, before["head"])
+        self.reviews[decision_id], self.lines[decision_id] = state, review_line(state, number)
+        if review_fingerprint(state) == review_fingerprint(before):
+            return None
+        return (f"Review of this merge approval changed while you were working. Now: {self.lines[decision_id]} "
+                "Read it again (outcome_record, merge_reviews) before you say or do anything about this merge.")
+
+    def _unread(self) -> list[tuple[str, str, int, str]]:
+        """Open merge approvals whose current commit has no review read this run."""
+        with session_scope() as s:
+            wanted = []
+            for d in s.query(Decision).filter(Decision.outcome_id == self.outcome_id, Decision.status == "open",
+                                              Decision.kind == "approve_merge", Decision.task_id.isnot(None)):
+                task = s.get(Task, d.task_id)
+                repo = s.get(Repository, task.repo_id) if task else None
+                if task is not None and repo is not None and task.pr_number and task.head_sha \
+                        and (self.reviews.get(d.id) or {}).get("head") != task.head_sha:
+                    wanted.append((d.id, repo.full_name, task.pr_number, task.head_sha))
+            return wanted
+
+    def _unseen_commit(self, decision: Decision, task: Task | None) -> str | None:
+        """Why the Lead may not advise or act on a merge approval now: its commit isn't the one whose review this run
+        read (pushed during the run, or after the approval opened). The new commit wakes the Lead again."""
+        if decision.kind != "approve_merge" or task is None or not task.head_sha:
+            return None
+        if (self.reviews.get(decision.id) or {}).get("head") == task.head_sha:
+            return None
+        return ("This PR has a commit you haven't read the review of, so anything you say or do about it now would be "
+                "about the wrong commit. Leave it this run: the new commit wakes you again.")
 
     @property
     def source(self) -> dict[str, str]:
@@ -493,10 +811,23 @@ class Tools:
 
         record_ = outcome_record(self.outcome_id)
         rules = record_.pop("team_rules", [])
+        text = _bounded(record_)
+        if self.reviews:
+            # Never shortened with the rest of the record: every P0/P1 is here, for the Lead to cite. Lower-severity
+            # findings are capped, and the count left out is given.
+            reviews = {}
+            for d, state in self.reviews.items():
+                blocking = [f for f in state["open"] if f.get("severity") in BLOCKING]
+                others = [f for f in state["open"] if f.get("severity") not in BLOCKING]
+                reviews[d] = {"line": self.lines[d], "open_findings": blocking + others[:15],
+                              "lower_severity_not_listed": max(0, len(others) - 15),
+                              "changes_requested_by": state["changes_requested_by"]}
+            text += "\n\nmerge_reviews (every P0/P1 finding is listed):\n" + json.dumps(
+                clean(reviews, None, 400, 10_000, 10_000), ensure_ascii=False, default=str)
         # Rules are never shortened away with the rest of the record: every one applies.
         lines = [f"- [{r['scope']}] {clean(r['rule'], None, 4000)}: {clean(r['detail'], None, 8000)}" for r in rules]
-        return _bounded(record_) + ("\n\nteam_rules (all of them; follow every one):\n" + "\n".join(lines)
-                                    if lines else "\n\nteam_rules: none")
+        return text + ("\n\nteam_rules (all of them; follow every one):\n" + "\n".join(lines)
+                       if lines else "\n\nteam_rules: none")
 
     def _task_detail(self, task: str) -> str:
         from .. import serializers as S
@@ -546,6 +877,9 @@ class Tools:
                 return "This decision is still being reviewed. Leave it for now."
             if option in NEEDS_TEXT and not comment:
                 return f"A comment is required for {option}: say exactly what the agents should do."
+            unseen = self._unseen_commit(decision, locked)
+            if unseen:
+                return unseen
             task = db.get(Task, decision.task_id) if decision.task_id else None
             if option == "retry" and task is not None and task.stage in MERGING_STAGES:
                 return ("Retrying here would resume a merge, release or revert. Leave a note for people with your "
@@ -599,12 +933,23 @@ class Tools:
         text = (text or "").strip()
         if not text:
             return "A note needs text."
+        if decision_id in self.lines:  # people see what review says about the commit, whatever the note says
+            text = f"{self.lines[decision_id]}\n\n{text}"
         with session_scope() as s:
-            if decision_id and s.query(Decision).filter(Decision.id == decision_id,
-                                                        Decision.outcome_id == self.outcome_id).first() is None:
+            decision = s.query(Decision).filter(Decision.id == decision_id,
+                                                Decision.outcome_id == self.outcome_id).first() if decision_id else None
+            if decision_id and decision is None:
                 return "No decision with that id on your outcome."
+            unseen = self._unseen_commit(decision, s.get(Task, decision.task_id) if decision.task_id else None) \
+                if decision is not None else None
+            if unseen:
+                return unseen
             actor = lead_user(s).id
-            data = {**self.source, **({"decision_id": decision_id} if decision_id else {})}
+            data = {**self.source, **({"decision_id": decision_id, "question": question_mark(s, decision)}
+                                      if decision is not None else {})}
+            if decision_id in self.read_at:  # what review said when this was written, and when it was read
+                data["review_read_at"] = self.read_at[decision_id].isoformat()
+                data["review_fingerprint"] = review_fingerprint(self.reviews[decision_id])
             s.add(Message(workspace_id=self.ws, outcome_id=self.outcome_id, author_id=actor, author_kind="lead",
                           body=text[:4000], attribution=data))
         record(self.ws, "lead_note", f"Lead: {text[:300]}", outcome_id=self.outcome_id, run_id=self.run_id,
@@ -646,6 +991,8 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
             held = 0.0
             for other in s.query(Run).filter(Run.outcome_id == outcome_id, Run.status == "running", Run.id != run_id,
                                              Run.started_at > utcnow() - alive):
+                if other.role == "lead" and other.started_at <= utcnow() - STALE:
+                    continue  # a Lead run this old was cut off: outcome_committed() doesn't count it either
                 snapshot = other.config_snapshot or {}
                 limit = _limit(snapshot.get("budget_reserved"))
                 limit = limit if limit is not None else _limit((snapshot.get("limits") or {}).get("run_usd"))
@@ -748,7 +1095,12 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.cost_usd = round(measured if measured is not None else max([ledger.cost_usd, *reading]), 6)
             # A request that failed before its usage was recorded may still be billed: unknown unless measured.
             row.cost_known = measured is not None or (ledger.cost_known and not reading and attempts == ledger.calls)
-            row.result = {"summary": summary, "actions": tools.actions}
+            row.result = {"summary": summary, "actions": tools.actions,
+                          # What review said about each merge approval's commit: an unsettled one is looked at again.
+                          "reviews": {d: {"head": st["head"], "settled": settled(st), "line": tools.lines[d],
+                                          "fingerprint": review_fingerprint(st),
+                                          "read_at": tools.read_at[d].isoformat()}
+                                      for d, st in tools.reviews.items()}}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
         message = f"Lead of #{number}: {summary[:300]}" if status == "succeeded" else f"Lead of #{number} {status}: {error}"
@@ -763,6 +1115,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
 
 async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings: dict[str, Any], turns: int,
                 number: int, reasons: list[str], outcome_id: str, budget: _Budget) -> str:
+    await tools.read_reviews()
     record_now = await asyncio.to_thread(tools._outcome_record)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM},
@@ -804,6 +1157,9 @@ async def _loop(client, model: str, ledger: UsageLedger, tools: Tools, settings:
                 return (summary if isinstance(summary, str) and summary.strip() else "Finished").strip()[:2000]
             # A resolution runs on this loop, as the operator relay's do: resolve() wakes the orchestrator and can
             # touch this loop's work. Everything else is reading or writing rows: a worker thread keeps the loop free.
-            output = tools.call(name, args) if name == "resolve_decision" else await asyncio.to_thread(tools.call, name, args)
+            output = await tools.recheck(name, args)
+            if output is None:
+                output = tools.call(name, args) if name == "resolve_decision" \
+                    else await asyncio.to_thread(tools.call, name, args)
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": output})
     return "Out of turns"

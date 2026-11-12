@@ -68,6 +68,8 @@ class Orchestrator:
         self._vm_sweep_task: asyncio.Task | None = None
         self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
         self._lead_check = float("-inf")
+        self._review_watch = float("-inf")
+        self._review_task: asyncio.Task | None = None
         self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
 
     # lifecycle -----------------------------------------------------------------
@@ -103,6 +105,8 @@ class Orchestrator:
         released = asyncio.create_task(self._release(jobs), name="release-leases")  # beside the rest of the shutdown
         for job in list(self._leads.values()):
             job.cancel()
+        if self._review_task is not None:
+            self._review_task.cancel()
         await asyncio.gather(*list(self._leads.values()), return_exceptions=True)
         if self._loop_task:
             self._loop_task.cancel()
@@ -310,6 +314,7 @@ class Orchestrator:
                 await self._maybe_sweep_vms()
                 await self._maybe_watch()
                 await self._maybe_run_leads()
+                self._maybe_watch_reviews()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -574,6 +579,23 @@ class Orchestrator:
                 self.wake()
 
             job.add_done_callback(done)
+
+    def _maybe_watch_reviews(self) -> None:
+        """Every REVIEW_RECHECK, read what review says about open merge approvals a Lead has advised on, beside the
+        scheduler (pipeline/lead.watch_reviews): a change wakes that outcome's Lead."""
+        import time
+
+        from .lead import REVIEW_RECHECK, watch_reviews
+
+        now = time.monotonic()
+        if self._stopping or now - self._review_watch < REVIEW_RECHECK.total_seconds() or (
+                self._review_task is not None and not self._review_task.done()):
+            return
+        self._review_watch = now
+        self._review_task = asyncio.create_task(watch_reviews(), name="lead-review-watch")
+        self._review_task.add_done_callback(
+            lambda t: None if t.cancelled() or t.exception() is None
+            else log.error("Lead review watch failed: %r", t.exception()))
 
     async def _maybe_sweep_vms(self) -> None:
         """Every 15 minutes, starting 10 minutes after startup (a deployment being replaced may still be closing its
