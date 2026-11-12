@@ -38,7 +38,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "director": {"mode": "off", "run_usd": 4.0, "daily_usd": 40.0, "max_outcome_usd": 120.0, "after_minutes": 5,
                  "decide_after_hours": 4},
     # Alerts show in the app's Inbox. Slack and email are delivery options that aren't available yet: both stay off.
-    "alerts": {"after_minutes": 120, "slack": False, "email": False},
+    # stopped_minutes: how long nothing runs while work waits before "Nothing is running" (pipeline/watch.py).
+    "alerts": {"after_minutes": 120, "slack": False, "email": False,
+               "stopped_minutes": 20},
+    # While a provider hold is open, the provider is tested this often and the hold lifts once it answers (0: never).
+    "holds": {"test_minutes": 5},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
     "concurrency": 3,

@@ -18,6 +18,7 @@ type InboxData = { decisions: Decision[]; alerts?: Alert[]; since: string | null
 const NEEDS_TEXT = new Set(["answer", "replan", "reject"]);
 const ALERT_KIND: Record<Alert["kind"], string> = {
   overdue: "Waiting", unasked: "Stuck", stalled: "Stalled", quiet: "Quiet", repeated: "Repeated failure",
+  stopped: "Nothing is running",
 };
 // A provider hold isn't among them: it stops all work, so it shows first, above the alerts.
 const GROUPS: { key: string; label: string; kinds: string[] }[] = [
