@@ -11,7 +11,7 @@ PLANNER_REPORT: dict[str, Any] = {
         "summary": {"type": "string", "description": "What will be delivered and how, in 2-5 sentences."},
         "tasks": {
             "type": "array",
-            "description": "Independent, reviewable units of work. Prefer the fewest tasks that can run in parallel.",
+            "description": "Independent, reviewable units of work that together cover the whole request.",
             "items": {
                 "type": "object",
                 "properties": {

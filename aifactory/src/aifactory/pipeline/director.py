@@ -8,8 +8,9 @@ services a person's click uses, so every Factory check (CI, verification, the me
 applies: it answers the question, it never skips a gate.
 
 It never takes work over, lifts a provider hold (a person fixes billing or the key first), changes settings or
-credentials, or lets an outcome continue past its budget once the outcome has committed ``max_outcome_usd``. Those,
-and anything it isn't confident about, it leaves to people with a note saying what it found and what it recommends.
+credentials, or lets an outcome continue past its budget once the outcome has committed ``max_outcome_usd``. Nor
+does it decide on a plan once the outcome's plan has been sent back ``REPLANS`` times (replans_spent). Those, and
+anything it isn't confident about, it leaves to people with a note saying what it found and what it recommends.
 When no person has answered what it left them in ``decide_after_hours`` (0: never), the people are away: it takes
 each such item once more and decides it itself, unless the choice it would make is one it may not make.
 Its resolutions are attributed to the Director, a system identity, with ``{"source": "director"}``.
@@ -61,6 +62,7 @@ NEVER = frozenset({"take_over", "takeover", "handover"})  # taking work over is 
 PEOPLE_ONLY = {"provider_hold": "A provider hold lifts once a person has fixed billing or the provider key"}
 TRIAGE_SOURCES = ("github_issue", "smoke_failure", "feedback")  # red main is the merge manager's and steward's
 NEEDS_TEXT = frozenset({"answer", "replan", "reject"})
+REPLANS = 2  # times one outcome's plan may be sent back before only a person decides on the next one
 BRIEF = 400  # characters of an item's text in the inbox; inbox_item has it whole
 PAGE_CHARS = 30_000  # an inbox page is built to fit whole within a tool result
 PAGE_ITEMS = 40
@@ -116,7 +118,7 @@ def director_user(db) -> User:
 def choices(db, decision: Decision, cfg: dict[str, Any]) -> tuple[list[str], str]:
     """The options the Director may choose on a decision, and why any others are left to people."""
     offered = [o.get("value") for o in decision.options or [] if isinstance(o, dict) and o.get("value")] or ["dismiss"]
-    why = people_only(decision)
+    why = people_only(decision) or replans_spent(db, decision)
     if why:
         return [], why
     allowed = [value for value in offered if value not in NEVER]
@@ -137,6 +139,20 @@ def people_only(decision: Decision) -> str:
     (``metadata_json["people_only"]``, e.g. a merge that touches the rails). "" when the Director may answer it."""
     meta = decision.metadata_json if isinstance(decision.metadata_json, dict) else {}
     return PEOPLE_ONLY.get(decision.kind) or str(meta.get("people_only") or "")
+
+
+def replans_spent(db, decision: Decision) -> str:
+    """Why a plan approval is left to people: the outcome's plan has been sent back ``REPLANS`` times already and
+    the new plan still did not satisfy its review. Sending it back again with the same notes loops (outcome #57 went
+    through eight plans): a person cuts the scope, splits the outcome or approves the plan. "" otherwise."""
+    if decision.kind != "approve_plan" or not decision.outcome_id:
+        return ""
+    sent_back = db.query(Decision).filter(Decision.outcome_id == decision.outcome_id, Decision.kind == "approve_plan",
+                                          Decision.status == "resolved", Decision.resolution == "replan").count()
+    if sent_back < REPLANS:
+        return ""
+    return (f"This outcome's plan has been sent back {sent_back} times and still does not satisfy its review: a "
+            "person decides whether to cut the scope, split the outcome into smaller ones, or approve the plan")
 
 
 def continuation_usd(decision: Decision, settings: dict[str, Any]) -> float:

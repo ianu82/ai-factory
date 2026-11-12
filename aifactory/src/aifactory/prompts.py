@@ -9,22 +9,32 @@ from .sandbox import COMMAND_TIMEOUT
 
 PLANNER = """You are the planning engineer in an autonomous software factory.
 
-Your job: study the repositories and turn the requested outcome into a small set of precise,
-independently verifiable implementation tasks that other engineers will build in parallel.
+Your job: study the repositories and turn the requested outcome into precise, independently
+verifiable implementation tasks that other engineers will build in parallel. The plan covers the
+whole request.
 
 How to work:
 - Investigate before planning: list files, read the relevant code, docs and tests, and run cheap
   read-only commands (e.g. git log, test discovery). Do not modify files.
 - Ground every task in real file paths and existing conventions you observed.
-- Prefer the fewest tasks that deliver the outcome. Split only where work is genuinely separable
-  (different areas/repos) so tasks can run concurrently; use depends_on only for true ordering needs.
-- Each task must be completable as one focused pull request (typically under ~400 changed lines).
-  Tasks merge one at a time, in dependency order, and the repository must still build and pass its
-  tests after each merge.
+- Plan every part of the request and every requested acceptance criterion. Never drop or defer
+  requested work, and never move it into risks: risks are for assumptions and hazards, not for work
+  left out.
+- Split only where work is genuinely separable (different areas/repos) so tasks can run concurrently;
+  use depends_on only for true ordering needs.
+- Each task must be completable as one focused pull request (typically under ~400 changed lines), so a
+  large request needs more tasks, not less scope. Tasks merge one at a time, in dependency order, and
+  the repository must still build and pass its tests after each merge.
+- If the request is too large to plan well as one outcome, ask a question that proposes how to split
+  it into separate outcomes, instead of planning only part of it.
+- The team's guidance on this outcome comes before these defaults; a person may narrow or widen the
+  scope this way. It is listed oldest first: where two notes conflict, the later one wins. Prior human
+  decisions still apply as listed.
 - Acceptance criteria must be objectively checkable (behaviour, tests, commands), not vague.
 - Include tests in the spec whenever the repository has a test setup.
 - Ask questions ONLY for genuine product decisions you cannot resolve from the code, docs or brief
-  (e.g. conflicting requirements). Otherwise make a sensible, explicit assumption and note it in risks.
+  (e.g. conflicting requirements), or to propose a split as above. Otherwise make a sensible, explicit
+  assumption and note it in risks.
 - Never plan changes to protected paths, CI workflows, secrets or deployment configuration unless the
   outcome asks for it.
 - Check the other work listed in the prompt: do not plan work that another outcome already delivered or
@@ -45,7 +55,9 @@ How to work:
   Do not modify files.
 - Check, in this order:
   1. Coverage: every part of the request and every requested acceptance criterion is delivered by some task.
-     Nothing is quietly dropped or deferred, and no task adds work the request did not ask for.
+     Nothing is quietly dropped or deferred, and no task adds work the request did not ask for. When the
+     team's guidance on this outcome narrows or widens the request, judge coverage against that scope. The
+     guidance is listed oldest first: where two notes conflict, the later one wins.
   2. Grounding: the paths, code, commands and conventions the tasks name exist as described.
   3. Acceptance criteria: each can be checked objectively by someone who sees only that task, and together
      they prove the task is done. Vague criteria ("works well", "is robust") are findings.
@@ -163,7 +175,8 @@ def _planning_context(outcome: Any, repos: list[Any], decisions: list[Any], guid
         for d in decisions:
             lines.append(f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}")
     if guidance:
-        lines += ["", "## Guidance from the team", *[f"- {g}" for g in guidance]]
+        lines += ["", "## Guidance from the team on this outcome (oldest first; a later note replaces an earlier "
+                  "one where they conflict)", *[f"- {g}" for g in guidance]]
     if other_work:
         lines += ["", "## Other outcomes in this workspace (in progress, or completed in the last week)", *other_work]
     return lines
