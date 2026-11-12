@@ -415,7 +415,7 @@ class Artifact(Base):
     outcome_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     task_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    kind: Mapped[str] = mapped_column(String(30))  # diff|log|report|check|ci|smoke|plan|transcript|attachment
+    kind: Mapped[str] = mapped_column(String(30))  # diff|log|report|check|ci|smoke|plan|transcript|attachment|wip
     name: Mapped[str] = mapped_column(String(300))
     content: Mapped[str] = mapped_column(Text, default="")
     data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
