@@ -137,10 +137,16 @@ def budget_extension(settings: dict[str, Any]) -> float:
     return max(0.01, round(positive(budgets.get("continue_usd")) or positive(budgets.get("outcome_usd")) / 4, 2))
 
 
+def guidance_filter():
+    from sqlalchemy import and_, or_
+    return or_(Message.author_kind == "user", and_(Message.author_kind == "factory",
+               Message.attribution["source"].as_string() == "decision_judge"))
+
+
 def guidance_history(outcome_id: str, task_id: str | None = None) -> list[str]:
     """All team guidance so far for an outcome (and this task), for inclusion in new prompts."""
     with session_scope() as s:
-        rows = (s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user")
+        rows = (s.query(Message).filter(Message.outcome_id == outcome_id, guidance_filter())
                 .order_by(Message.created_at).all())
         return [m.body for m in rows if m.task_id in (None, task_id)]
 
@@ -152,7 +158,7 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
 
     def take() -> list[str]:
         with session_scope() as s:
-            rows = [m for m in s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user",
+            rows = [m for m in s.query(Message).filter(Message.outcome_id == outcome_id, guidance_filter(),
                                                         Message.created_at >= started).order_by(Message.created_at)
                     if m.task_id in (None, task_id) and m.id not in seen]
             for m in rows:
@@ -434,26 +440,31 @@ def outcome_allowance(outcome_id: str, budget: float | None = None) -> float:
                                          if isinstance(amount, (int, float)) and not isinstance(amount, bool)])
 
 
+def question_metadata(role: str, *, paths: list[str] | None = None) -> dict[str, Any]:
+    return {"origin": {"role": role}, "safety": {
+        "approval": False, "budget": False, "takeover": False, "protected_paths": False,
+        "paths": paths or []}}
+
+
 def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcome_id: str | None = None,
                   task_id: str | None = None, options: list[dict[str, Any]] | None = None,
                   metadata: dict[str, Any] | None = None, dedup_key: str | None = None) -> str:
+    from .decision_reviews import lock, prepare
+
     with session_scope() as s:
+        # Serialize both fingerprint and item deduplication, including pending reviews.
+        lock(s, workspace_id)
         if dedup_key is not None:
-            # Serialize the read/check/insert boundary, including on SQLite
-            # where FOR UPDATE is ignored. No external work runs under the lock.
-            if s.bind.dialect.name == "sqlite":
-                s.query(Workspace).filter(Workspace.id == workspace_id).update(
-                    {Workspace.outcome_seq: Workspace.outcome_seq}, synchronize_session=False)
-            s.query(Workspace).filter(Workspace.id == workspace_id).with_for_update().one()
             candidates = s.query(Decision).filter(Decision.workspace_id == workspace_id,
-                Decision.kind == kind, Decision.status.in_(["open", "dismissed"]))
+                Decision.kind == kind, Decision.status.in_(("open", "judging", "dismissed")))
             existing = next((d for d in candidates
                              if (d.metadata_json or {}).get("fingerprint") == dedup_key), None)
             if existing:
                 return existing.id
         else:
             existing = (s.query(Decision)
-                        .filter(Decision.workspace_id == workspace_id, Decision.kind == kind, Decision.status == "open",
+                        .filter(Decision.workspace_id == workspace_id, Decision.kind == kind,
+                                Decision.status.in_(("open", "judging")),
                                 Decision.outcome_id == outcome_id, Decision.task_id == task_id).first())
         if existing:
             existing.body = body
@@ -468,6 +479,7 @@ def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcom
             s.add(decision)
             s.flush()
             decision_id = decision.id
+        prepare(s, existing or decision)
     publish_decision(workspace_id, decision_id, kind, title, outcome_id=outcome_id, task_id=task_id)
     return decision_id
 
@@ -475,6 +487,10 @@ def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcom
 def publish_decision(workspace_id: str, decision_id: str, kind: str, title: str, *,
                      outcome_id: str | None = None, task_id: str | None = None) -> None:
     """Announce a decision only after its transaction has committed."""
+    with session_scope() as s:
+        decision = s.get(Decision, decision_id)
+        if not decision or decision.status != "open":
+            return
     record(workspace_id, "decision_requested", title, outcome_id=outcome_id, task_id=task_id, level="warn",
            data={"decision_id": decision_id, "kind": kind},
            actor="supervisor" if kind == "supervisor" else "factory")

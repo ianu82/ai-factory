@@ -73,13 +73,14 @@ def eligible(decision: Decision, repositories: list[Repository] | None = None) -
     safe_options = {"answer", "replan", "retry", "cancel", "abandon", "dismiss", "acknowledge", "fix", "revert"}
     if mixed_planner:
         safe_options.add("approve")
-    return values <= safe_options
+    action = "answer" if decision.kind == "question" else "retry"
+    return action in values and values <= safe_options
 
 
 def allowed_resolutions(decision: Decision) -> set[str]:
     return {o["value"] for o in decision.options or []
             if isinstance(o, dict) and isinstance(o.get("value"), str)
-            and o["value"].strip().lower() not in FORBIDDEN_OPTIONS}
+            and o["value"] in ({"answer"} if decision.kind == "question" else {"retry"})}
 
 
 def build_context(db: Session, decision: Decision) -> dict[str, Any]:
@@ -152,7 +153,7 @@ def validate_report(db: Session, decision: Decision, report: Any,
     current = db.query(Decision).filter(
         Decision.id == decision.id, Decision.workspace_id == decision.workspace_id,
     ).populate_existing().with_for_update().one_or_none()
-    if current is None or current.status != "open":
+    if current is None or current.status not in ("open", "judging"):
         raise ValueError("Decision is no longer open")
     decision = current
     if not isinstance(report, dict) or report.get("verdict") not in ("decide", "send_back", "hold"):
@@ -198,6 +199,7 @@ def validate_report(db: Session, decision: Decision, report: Any,
         source = db.query(Decision).filter(Decision.id == ident, Decision.workspace_id == decision.workspace_id).first()
         snapshot = supplied[ident]
         if (source is None or source.id == decision.id or source.status != "resolved"
+                or source.resolution == "send_back" or (source.attribution or {}).get("verdict") == "send_back"
                 or source.created_at >= decision.created_at or source.resolved_at is None
                 or source.resolved_at >= decision.created_at):
             raise ValueError("Citation must be an earlier resolved workspace record")
@@ -206,6 +208,18 @@ def validate_report(db: Session, decision: Decision, report: Any,
                     DecisionReview.decision_id == ident,
                     DecisionReview.correction_decision_id.is_not(None)).first()):
             raise ValueError("Citation has been corrected")
+        if source.scope == "item":
+            if (source.task_id != decision.task_id or source.outcome_id != decision.outcome_id
+                    or not source.outcome_id):
+                raise ValueError("Citation is outside this item's scope")
+        elif source.scope == "repository":
+            source_task = db.query(Task).filter_by(id=source.task_id, workspace_id=decision.workspace_id).first()
+            source_outcome = db.query(Outcome).filter_by(id=source.outcome_id, workspace_id=decision.workspace_id).first()
+            source_repos = {source_task.repo_id} if source_task else set(source_outcome.repo_ids or []) if source_outcome else set()
+            if not repo_ids or not set(repo_ids) <= source_repos:
+                raise ValueError("Citation is outside this repository's scope")
+        elif source.scope != "workspace":
+            raise ValueError("Unknown citation scope")
         if not any(passage in (getattr(source, field) or "") and passage in (snapshot.get(field) or "")
                    for field in ("resolution", "comment")):
             raise ValueError("Citation passage does not match the supplied answer")

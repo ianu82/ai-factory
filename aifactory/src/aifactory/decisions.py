@@ -42,6 +42,16 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     candidate, closing a dropped pull request) goes to ``after`` for work_services.finish()."""
     if action_id and (pending_events is None or after is None):
         raise DecisionError("A Mind resolution leaves its events and follow-up work to its confirmation")
+    # Serialize with judge application and other human resolutions. The no-op
+    # conditional write supplies SQLite's missing FOR UPDATE before refreshing.
+    from sqlalchemy import update
+
+    changed = db.execute(update(Decision).where(Decision.id == decision.id,
+        Decision.workspace_id == decision.workspace_id, Decision.status == "open")
+        .values(status="open").execution_options(synchronize_session=False))
+    if changed.rowcount != 1:
+        raise DecisionError("This decision is already resolved")
+    db.refresh(decision)
     if decision.status != "open":
         raise DecisionError("This decision is already resolved")
     # A decision that offers choices is answered with one of them: dismissing it would leave the work it is about
@@ -49,6 +59,16 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     valid = {o.get("value") for o in decision.options or []} or {"dismiss"}
     if resolution not in valid:
         raise DecisionError(f"Choose one of: {', '.join(sorted(v for v in valid if v))}")
+    source = (attribution or {}).get("source")
+    # Suggest proposals require an explicit member confirmation, not another
+    # automated agent taking the proposal on the member's behalf.
+    if (source == "lead" and decision.review and decision.review.mode == "suggest"
+            and decision.review.state not in ("bypassed", "superseded")):
+        raise DecisionError("This judge suggestion requires human confirmation")
+    judged = source == "decision_judge"
+    if judged and (decision.kind not in ("question", "unblock")
+                   or resolution != ("answer" if decision.kind == "question" else "retry")):
+        raise DecisionError("Decision judges may only answer questions or retry work")
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
     decision.resolution = resolution
     decision.comment = comment.strip()[:8000]
@@ -82,7 +102,7 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
     def guidance(text: str) -> None:
         if text.strip() and outcome:
             db.add(Message(workspace_id=decision.workspace_id, outcome_id=outcome.id, task_id=task.id if task else None,
-                           author_id=user.id, author_kind="user", body=text.strip(),
+                           author_id=user.id, author_kind="factory" if judged else "user", body=text.strip(),
                            attribution=decision.attribution))
 
     kind = decision.kind
@@ -229,6 +249,9 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         if resolution != "retry":
             raise DecisionError("Choose one of: retry")
         decision.reusable = False
+    if judged and (attribution or {}).get("verdict") == "send_back":
+        decision.resolution, decision.reusable = "send_back", False
+        resolution = "send_back"
     payload = record(decision.workspace_id, "decision_resolved", f"{author}: {resolution} — {decision.title}",
                      outcome_id=decision.outcome_id, task_id=decision.task_id, actor=user.id, level="success",
                      data={"decision_id": decision.id, "resolution": resolution, "comment": comment[:2000],
