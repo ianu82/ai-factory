@@ -311,6 +311,72 @@ async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(pro
     assert len(sends) == 5 and len(waits) == 3  # a cancelled session sends once and never waits
 
 
+async def test_a_resend_is_given_only_the_time_its_retries_have_left(provider, clocked, monkeypatch):
+    now, guard = clocked
+    retry_clock(monkeypatch, now, guard)
+    allowed = []
+
+    def upstream(req):
+        allowed.append((now[0], req.extensions["timeout"]["read"], req.extensions["timeout"]["connect"]))
+        return httpx.Response(503, json={})
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError):
+        await ModelClient(provider)._post("/responses", {}, deadline=now[0] + 10)
+    # The first send has the client's whole timeout; each resend only what is left of the session's 10 s, so one
+    # sent 3 s before the end cannot run for five minutes past it.
+    assert allowed == [(0, 300, 20), (1, 9, 9), (3, 7, 7), (7, 3, 3)]
+    del allowed[:]
+    now[0] = 1000.0
+    with pytest.raises(inference.InferenceError):
+        await ModelClient(provider)._post("/responses", {})
+    # Without a session the end is the retry budget, counted from the request's first failure.
+    assert allowed[0] == (1000, 300, 20) and allowed[1] == (1001, 299, 20) and allowed[-1] == (1243, 57, 20)
+    del allowed[:]
+    with pytest.raises(inference.InferenceError):
+        await ModelClient(provider, max_retries=2)._post("/responses", {})
+    # A client with a fixed number of resends has no such end: every send keeps the whole timeout.
+    assert [read for _, read, _ in allowed] == [300, 300, 300]
+
+
+async def test_a_resend_cut_short_fails_with_the_answer_that_was_being_retried(provider, clocked, monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends, notes = [], []
+
+    def upstream(req):
+        sends.append(now[0])
+        if len(sends) == 1:
+            return httpx.Response(503, json={"error": {"message": "Service temporarily unavailable"}})
+        now[0] += req.extensions["timeout"]["read"]  # no answer: the request runs out the time it was given
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider)._post("/responses", {}, deadline=now[0] + 10, notice=notes.append)
+    # The resend at 1 s had the 9 s that were left and used them all: the session's time is up, nothing more is
+    # sent, and the failure is the provider's 503, not a provider that could not be reached.
+    assert sends == [0, 1] and waits == [1] and now[0] == 10
+    assert failed.value.status == 503 and "unreachable" not in str(failed.value)
+    assert notes == ["Model provider unavailable (503); gave up after 10 s"]
+
+
+async def test_a_request_that_times_out_with_its_whole_timeout_is_an_unreachable_provider(provider, clocked,
+                                                                                         monkeypatch):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(req.extensions["timeout"]["read"])
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    fake_http(monkeypatch, upstream)
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider, max_retries=1)._post("/responses", {})
+    assert sends == [300, 300] and waits == [1] and "unreachable: ReadTimeout" in str(failed.value)
+
+
 async def test_cancelling_the_session_ends_a_retry_wait(provider, clocked, monkeypatch):
     _, guard = clocked
     sends, waiting, stopped = [], asyncio.Event(), asyncio.Event()
