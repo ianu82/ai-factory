@@ -20,7 +20,7 @@ from .. import merge_manager
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
-from ..models import Decision, Event, Outcome, Plan, Run, Signal, Task, User, Workspace
+from ..models import Decision, DecisionReview, Event, Outcome, Plan, Run, Signal, Task, User, Workspace
 from ..sandbox import disk_report, host_capacity, process_report, purge_quarantine, quarantine_orphaned_jobs
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
@@ -108,6 +108,7 @@ class Orchestrator:
         self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
         self._relay_task: asyncio.Task | None = None
         self._vm_sweep_task: asyncio.Task | None = None
+        self._reviews: dict[str, asyncio.Task] = {}
         self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
         self._lead_check = float("-inf")
         self._directors: dict[str, asyncio.Task] = {}  # workspace id -> its Director's run
@@ -148,6 +149,9 @@ class Orchestrator:
         for job in list(self._ci_polls.values()):
             job.cancel()
         released = asyncio.create_task(self._release(jobs), name="release-leases")  # beside the rest of the shutdown
+        for job in list(self._reviews.values()):
+            job.cancel()
+        await asyncio.gather(*list(self._reviews.values()), return_exceptions=True)
         for job in list(self._leads.values()) + list(self._directors.values()):
             job.cancel()
         await asyncio.gather(*list(self._leads.values()), *list(self._directors.values()), return_exceptions=True)
@@ -203,6 +207,9 @@ class Orchestrator:
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
         with session_scope() as s:
+            from .decision_reviews import recover
+
+            recover(s)
             s.query(Task).filter(Task.status == "waiting_ci").update(
                 {Task.lease_owner: "", Task.lease_expires_at: None})
         self._reclaim(start=True)
@@ -350,6 +357,7 @@ class Orchestrator:
             try:
                 self._maybe_reclaim()
                 await asyncio.to_thread(self._promote)
+                self._schedule_reviews()
                 self._schedule()
                 await self._maybe_sync_signals()
                 await asyncio.to_thread(self._maybe_supervise)
@@ -744,7 +752,7 @@ class Orchestrator:
             outcomes = s.query(Outcome).filter(Outcome.source != "review", Outcome.status.in_(["running", "attention"])).all()
             asked: dict[str, list[Decision]] = {}
             if outcomes:
-                for d in s.query(Decision).filter(Decision.status == "open",
+                for d in s.query(Decision).filter(Decision.status.in_(("open", "judging")),
                                                   Decision.outcome_id.in_([o.id for o in outcomes])):
                     asked.setdefault(d.outcome_id, []).append(d)
             unasked: set[str] = set()
@@ -772,7 +780,7 @@ class Orchestrator:
             s.query(Workspace).filter(Workspace.id == outcome.workspace_id).update(
                 {Workspace.outcome_seq: Workspace.outcome_seq}, synchronize_session=False)
         s.query(Workspace).filter(Workspace.id == outcome.workspace_id).with_for_update().one()
-        return (s.query(Decision).filter(Decision.status == "open", Decision.outcome_id == outcome.id)
+        return (s.query(Decision).filter(Decision.status.in_(("open", "judging")), Decision.outcome_id == outcome.id)
                 .populate_existing().all())
 
     def _ask(self, s, outcome: Outcome, tasks: list[Task], decisions: list[Decision], unasked: set[str],
@@ -887,6 +895,68 @@ class Orchestrator:
         if outcome.status != wanted:
             outcome.status = wanted
             notify(outcome.workspace_id, "outcome", outcome.id)
+
+    def _schedule_reviews(self) -> None:
+        """Bounded, tracked workers; pending intent survives shutdown and duplicate ticks."""
+        from .decision_reviews import apply, claim
+        from ..decision_judge_runner import run_judge
+
+        if self._stopping:
+            return
+        free = max(0, min(4, get_settings().global_concurrency) - len(self._reviews))
+        with session_scope() as s:
+            ids = [r.id for r in s.query(DecisionReview).join(Workspace,
+                DecisionReview.workspace_id == Workspace.id).filter(
+                DecisionReview.state == "pending", Workspace.paused.is_(False),
+                DecisionReview.id.notin_(list(self._reviews)))
+                .order_by(DecisionReview.created_at, DecisionReview.id).limit(free)]
+        for review_id in ids:
+            token = claim(review_id)
+            if token is None:
+                continue
+
+            async def work(rid=review_id, token=token):
+                try:
+                    run, report, _ = await run_judge(token[0], token[1])
+                    # The runner accounts for interrupted calls but returns a hold.
+                    # Shutdown/cancellation must not turn that hold into human attention.
+                    if not self._stopping and not asyncio.current_task().cancelling():
+                        apply(rid, token, run, report)
+                finally:
+                    with session_scope() as s:
+                        r = s.get(DecisionReview, rid)
+                        if r and r.state == "running" and r.started_at == token[4]:
+                            r.state, r.started_at = "pending", None
+
+            job = asyncio.create_task(work(), name=f"decision-review-{review_id}")
+            self._reviews[review_id] = job
+
+            def done(finished, rid=review_id, token=token):
+                # Also release a claim cancelled before its coroutine's first step.
+                with session_scope() as s:
+                    r = s.get(DecisionReview, rid)
+                    if r and r.state == "running" and r.started_at == token[4]:
+                        r.state, r.started_at = "pending", None
+                self._reviews.pop(rid, None)
+                if not finished.cancelled() and finished.exception():
+                    log.error("Decision review failed: %r", finished.exception())
+                self.wake()
+
+            job.add_done_callback(done)
+
+    def _cancel_reviews(self, *, outcome_id=None, task_id=None) -> None:
+        # Look up by association, NOT status: work_services already superseded
+        # the decision in its committed cancellation transaction.
+        with session_scope() as s:
+            query = s.query(DecisionReview).join(Decision, DecisionReview.decision_id == Decision.id)
+            query = query.filter(Decision.task_id == task_id) if task_id else query.filter(Decision.outcome_id == outcome_id)
+            ids = [r.id for r in query]
+            for r in query:
+                if r.state in ("pending", "running"):
+                    r.state, r.finished_at = "superseded", utcnow()
+        for rid in ids:
+            if rid in self._reviews:
+                self._reviews[rid].cancel()
 
     def _schedule(self) -> None:
         self._schedule_ci()
@@ -1166,6 +1236,7 @@ class Orchestrator:
 
     # control -------------------------------------------------------------------
     def cancel_outcome(self, outcome_id: str) -> None:
+        self._cancel_reviews(outcome_id=outcome_id)
         if outcome_id in self._planning:
             job, cancel = self._planning[outcome_id]
             cancel.set()
@@ -1176,6 +1247,7 @@ class Orchestrator:
             self.cancel_task(task_id)
 
     def cancel_task(self, task_id: str) -> None:
+        self._cancel_reviews(task_id=task_id)
         poll = self._ci_polls.get(task_id)
         if poll:
             poll.cancel()

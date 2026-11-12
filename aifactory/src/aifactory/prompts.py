@@ -159,7 +159,7 @@ def _planning_context(outcome: Any, repos: list[Any], decisions: list[Any], guid
         protected = [*(cfg.get("protected_paths") or []), *DEFAULT_PROTECTED]
         lines.append(f"  Protected paths (no change may touch them): {', '.join(protected)}")
     if decisions:
-        lines += ["", "## Prior human decisions that apply (follow them)"]
+        lines += ["", "## Prior recorded decisions that apply (follow them)"]
         for d in decisions:
             lines.append(f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}")
     if guidance:
@@ -330,7 +330,7 @@ def build_prompt(task: Any, outcome: Any, repo: Any, feedback: list[str], decisi
                   "so only propose requests that work without signing in to external services. If nothing is "
                   "observable over HTTP (pure refactor, tests only), send an empty list and say why in your summary."]
     if decisions:
-        lines += ["", "## Prior human decisions that apply"]
+        lines += ["", "## Prior recorded decisions that apply"]
         lines += [f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}" for d in decisions]
     if guidance:
         lines += ["", "## Guidance from the team (follow it)", *[f"- {g}" for g in guidance[-12:]]]
@@ -421,10 +421,10 @@ def verify_prompt(task: Any, repo: Any, base_sha: str, builder_report: dict[str,
         lines += ["", "## Team notes about this repository and its test environment", context[:4000]]
     # People's decisions refine the criteria: the builder follows them, so the verifier must judge by them too.
     if decisions:
-        lines += ["", "## Prior human decisions that apply"]
+        lines += ["", "## Prior recorded decisions that apply"]
         lines += [f"- {d.title}: {d.resolution}{' — ' + d.comment if d.comment else ''}" for d in decisions]
     if guidance:
-        lines += ["", "## What people decided or asked for on this work",
+        lines += ["", "## Guidance recorded on this work",
                   "These answers and requests refine the specification and acceptance criteria. Where one clarifies "
                   "or relaxes a criterion, judge the criterion as clarified; check that requested fixes were made.",
                   *[f"- {g}" for g in guidance[-12:]]]

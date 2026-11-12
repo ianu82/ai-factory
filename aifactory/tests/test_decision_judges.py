@@ -179,6 +179,7 @@ def test_valid_report_planner_cannot_approve_and_fingerprint(data):
         fingerprint = question_fingerprint(q)
         ctx = build_context(s, q)
         assert validate_report(s, q, report(data[-2]), ctx)["verdict"] == "decide"
+        s.get(Decision, data[-2]).scope = "workspace"
         q.task_id, q.metadata_json = None, metadata("planner")
         q.options = [{"value": "approve"}, {"value": "answer"}, {"value": "cancel"}]
         assert eligible(q)
@@ -228,7 +229,7 @@ def test_citations_are_earlier_supplied_local_and_uncorrected(data, invalid):
             ctx["records"][0]["comment"] = "Different answer"
         else:
             correction = Decision(workspace_id=data[0], kind="question", title="Correction", status="resolved",
-                                  resolution="answer", comment="Use a database.", resolved_by=data[1],
+                                  resolution="answer", comment="Use a database.", resolved_by=data[1], scope="workspace",
                                   created_at=q.created_at - timedelta(hours=3), resolved_at=q.created_at - timedelta(hours=2))
             s.add(correction)
             s.flush()
@@ -516,14 +517,18 @@ def test_overrule_access_isolation_validation(client, data):
         assert s.query(Decision).filter_by(workspace_id=ws).count() == 2
 
 
-def test_held_library_and_pending_not_actionable(client, data):
+@pytest.mark.parametrize("status", ["open", "judging"])
+def test_held_library_and_pending_not_actionable(client, data, status):
     ws, _, _, oid, _, _, qid = data
     with db.session_scope() as s:
+        s.get(Decision, qid).status = status
         s.add(DecisionReview(workspace_id=ws, decision_id=qid, state="pending"))
     assert qid not in [d["id"] for d in client.get(f"/api/workspaces/{ws}/inbox").json()["decisions"]]
+    assert qid not in [d["id"] for d in client.get(f"/api/workspaces/{ws}/decisions").json()]
     payload = client.get(f"/api/workspaces/{ws}/outcomes/{oid}").json()
     assert not next(d for d in payload["decisions"] if d["id"] == qid)["actionable"]
     with db.session_scope() as s:
+        s.get(Decision, qid).status = "open"
         r = s.get(Decision, qid).review
         r.state, r.effective_verdict, r.proposed_verdict = "completed", "hold", "decide"
         r.mode, r.summary, r.answer, r.finished_at = "suggest", "Needs confirmation", "Proposed answer", db.utcnow()
@@ -666,3 +671,450 @@ def test_unblock_overrule_does_not_replay_retry(client, data):
         assert (task.status, task.stage, task.attempt, task.blocked_reason) == ("running", "verify", 3, "Original reason")
         correction = s.get(Decision, response.json()["correction_decision_id"])
         assert correction.scope == "item" and correction.reusable
+
+
+@pytest.mark.parametrize("role,kind", [("planner", "question"), ("builder", "question"), ("verifier", "unblock")])
+@pytest.mark.parametrize("mode,verdict", [("decide", "decide"), ("decide", "send_back"), ("decide", "hold"),
+    ("suggest", "decide"), ("suggest", "send_back"), ("suggest", "hold"), ("off", "decide")])
+def test_durable_review_end_to_end(data, client, monkeypatch, role, kind, mode, verdict):
+    import asyncio
+    import json
+    from aifactory import decision_judge_runner as runner
+    from aifactory.inference import ProviderConfig
+    from aifactory.models import Run, User
+    from aifactory.pipeline.orchestrator import Orchestrator
+    from aifactory.pipeline.runtime import open_decision, guidance_history, take_guidance
+    from aifactory.metrics import human_message
+    from tests.fakes import ScriptedModel
+
+    ws, _, _, outcome, task, prior, current = data
+    target_task = None if role == "planner" else task
+    with db.session_scope() as s:
+        s.delete(s.get(Decision, current))
+        s.get(Decision, prior).scope = "workspace"
+        s.get(Workspace, ws).settings = {"decision_judges": mode, "models": {"judge": "judge-custom"},
+            "pricing": {"judge-custom": {"input": 1, "output": 2}}}
+        s.get(Outcome, outcome).status = "needs_input" if role == "planner" else "running"
+        s.get(Task, task).status = "needs_input"
+    ScriptedModel.judge_calls = []
+    ScriptedModel.scripts = {"judge": lambda _: {"content": json.dumps({**report(prior), "verdict": verdict,
+        "resolution": "retry" if kind == "unblock" else "answer"})}}
+    monkeypatch.setattr(runner, "ModelClient", ScriptedModel)
+    monkeypatch.setattr(runner, "resolve_provider", lambda _: ProviderConfig("mindshub", "unused", "secret", "Test"))
+    options = [{"value": "retry" if kind == "unblock" else "answer"}, {"value": "cancel"}]
+    if role == "planner":
+        options.append({"value": "approve"})
+    since = db.utcnow()
+    did = open_decision(ws, kind, "Which queue?", "Need a queue", outcome_id=outcome, task_id=target_task,
+                        options=options, metadata=metadata(role))
+    assert open_decision(ws, kind, "Which queue?", "Need a queue", outcome_id=outcome, task_id=target_task,
+                         options=options, metadata=metadata(role)) == did
+    inbox = lambda: client.get(f"/api/workspaces/{ws}/inbox").json()["decisions"]
+    assert [d["id"] for d in inbox()] == ([did] if mode == "off" else [])
+
+    async def drain():
+        orch = Orchestrator()
+        orch._schedule_reviews()
+        orch._schedule_reviews()
+        await asyncio.gather(*orch._reviews.values())
+        await asyncio.sleep(0)  # run done callbacks, no wall-clock wait
+        orch._schedule_reviews()
+        assert not orch._reviews
+    asyncio.run(drain())
+    auto = mode == "decide" and verdict != "hold"
+    assert len(ScriptedModel.judge_calls) == (0 if mode == "off" else 1)
+    assert [d["id"] for d in inbox()] == ([] if auto else [did])
+    with db.session_scope() as s:
+        d = s.get(Decision, did)
+        assert d.status == ("resolved" if auto else "open")
+        assert s.query(Run).filter_by(role="judge").count() == (0 if mode == "off" else 1)
+        if mode != "off":
+            assert d.review.finished_at and serializers.actionable(d) == (not auto)
+            assert d.review.proposed_verdict == verdict
+        if auto:
+            assert s.get(User, d.resolved_by).name == "Decision judge"
+            assert d.resolution == ("send_back" if verdict == "send_back" else options[0]["value"])
+            assert d.reusable == (verdict == "decide")
+            messages = s.query(Message).filter_by(outcome_id=outcome).all()
+            assert len(messages) == 1 and not human_message(messages[0])
+            assert serializers.message(messages[0])["author"] == "Decision judge"
+            assert (s.get(Outcome, outcome).status == "planning" if role == "planner"
+                    else s.get(Task, task).status == "queued")
+    assert guidance_history(outcome, target_task) == (["Use the durable queue."] if auto else [])
+    take = take_guidance(outcome, target_task, since)
+    assert take() == (["Use the durable queue."] if auto else [])
+    assert take() == []
+    if mode == "suggest":
+        # A proposal is inert until a member explicitly chooses the safe action.
+        response = client.post(f"/api/workspaces/{ws}/decisions/{did}/resolve", json={
+            "resolution": options[0]["value"], "comment": "Confirmed by the team."})
+        assert response.status_code == 200, response.text
+        with db.session_scope() as s:
+            d = s.get(Decision, did)
+            assert d.status == "resolved" and d.resolved_by == data[1]
+            messages = s.query(Message).filter_by(outcome_id=outcome).all()
+            assert len(messages) == 1 and human_message(messages[0])
+            assert (s.get(Outcome, outcome).status == "planning" if role == "planner"
+                    else s.get(Task, task).status == "queued")
+        assert take() == ["Confirmed by the team."]
+        assert take() == []
+
+
+def test_review_restart_edit_idempotence_and_stale_result(data):
+    from aifactory.models import Run
+    from aifactory.pipeline.decision_reviews import apply, claim, recover
+    from aifactory.pipeline.runtime import open_decision
+
+    ws, _, _, outcome, task, prior, current = data
+    def opening(body):
+        return open_decision(ws, "question", "Which queue?", body, outcome_id=outcome, task_id=task,
+                             options=[{"value": "answer"}], metadata=metadata())
+    opening("Original")
+    with db.session_scope() as s:
+        rid = s.query(DecisionReview).filter_by(decision_id=current).one().id
+    first = claim(rid)
+    assert claim(rid) is None
+    with db.session_scope() as s:
+        q = s.get(Decision, current)
+        run = Run(workspace_id=ws, outcome_id=outcome, harness="control_plane", role="judge", status="succeeded", config_snapshot={"context": build_context(s, q)})
+        s.add(run)
+        s.flush()
+    with db.session_scope() as s:
+        recover(s)
+    second = claim(rid)
+    apply(rid, first, run, report(prior))
+    with db.session_scope() as s:
+        assert s.get(Decision, current).status == "judging"
+    opening("Edited")
+    apply(rid, second, run, report(prior))
+    with db.session_scope() as s:
+        assert s.query(Message).count() == 0
+        assert s.get(DecisionReview, rid).state == "pending"
+    third = claim(rid)
+    # Even a direct question edit (not open_decision) invalidates the result.
+    with db.session_scope() as s:
+        s.get(Decision, current).body = "Edited again"
+    apply(rid, third, run, report(prior))
+    fourth = claim(rid)
+    with db.session_scope() as s:
+        run.config_snapshot = {"context": build_context(s, s.get(Decision, current))}
+    apply(rid, fourth, run, report(prior))
+    apply(rid, fourth, run, report(prior))
+    with db.session_scope() as s:
+        assert s.get(Decision, current).status == "resolved"
+        assert s.query(Message).count() == 1
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("target", ["outcome", "task"])
+def test_cancellation_stops_review_after_decision_superseded(data, monkeypatch, running, target):
+    import asyncio
+    from aifactory import decision_judge_runner as runner, work_services
+    from aifactory.models import User
+    from aifactory.pipeline.orchestrator import Orchestrator
+    from aifactory.pipeline.runtime import open_decision
+
+    ws, uid, _, outcome, task, _, current = data
+    open_decision(ws, "question", "Queue?", "Body", outcome_id=outcome, task_id=task,
+                  options=[{"value": "answer"}], metadata=metadata())
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    async def blocked(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+    monkeypatch.setattr(runner, "run_judge", blocked)
+    async def exercise():
+        orch = Orchestrator()
+        if running:
+            orch._schedule_reviews()
+            await entered.wait()
+        with db.session_scope() as s:
+            if target == "outcome":
+                work_services.cancel_outcome(s, s.get(User, uid), ws, outcome)
+            else:
+                work_services.cancel_task(s, s.get(User, uid), ws, task)
+        # Real follow-up runs only after the cancellation transaction commits.
+        if target == "outcome":
+            orch.cancel_outcome(outcome)
+        else:
+            orch.cancel_task(task)
+        jobs = list(orch._reviews.values())
+        await asyncio.gather(*jobs, return_exceptions=True)
+        orch._schedule_reviews()
+        assert cancelled.is_set() == running
+        assert entered.is_set() == running
+    asyncio.run(exercise())
+    with db.session_scope() as s:
+        assert s.get(Decision, current).status == "superseded"
+        assert s.query(Message).count() == 0
+        assert s.get(Task, task).status == "cancelled"
+        assert (s.get(Outcome, outcome).status == "cancelled") == (target == "outcome")
+        r = s.query(DecisionReview).filter_by(decision_id=current).one()
+        assert r.state == "superseded" and r.finished_at
+
+
+@pytest.mark.parametrize("scope", ["item", "repository"])
+def test_reject_citations_outside_recorded_scope(data, scope):
+    ws, _, _, outcome, task, prior, current = data
+    with db.session_scope() as s:
+        source = s.get(Decision, prior)
+        source.scope = scope
+        source.task_id = source.outcome_id = None
+        q = s.get(Decision, current)
+        with pytest.raises(ValueError, match="scope"):
+            validate_report(s, q, report(prior), build_context(s, q))
+
+
+@pytest.mark.parametrize("kind,flags,options", [
+    ("approve_plan", {}, ["approve"]), ("approve_merge", {}, ["approve"]),
+    ("budget", {"budget": True}, ["retry"]),
+    ("unblock", {"takeover": True}, ["retry", "take_over"]),
+    ("question", {"protected_paths": True}, ["answer"]),
+    ("question", {"paths": ["deploy/prod.yml"]}, ["answer"]),
+])
+def test_runtime_governance_bypasses_judge_and_remains_human_resolvable(data, client, monkeypatch, kind, flags, options):
+    import asyncio
+    from aifactory import decision_judge_runner as runner
+    from aifactory.pipeline.runtime import open_decision
+    from aifactory.pipeline.orchestrator import Orchestrator
+
+    ws, _, _, outcome, task, _, current = data
+    def forbidden(*args):
+        pytest.fail("governance reached judge")
+    monkeypatch.setattr(runner, "run_judge", forbidden)
+    did = open_decision(ws, kind, "Human required", "Governance", outcome_id=outcome, task_id=task,
+                        options=[{"value": v} for v in options], metadata=metadata(**flags))
+    async def tick():
+        orch = Orchestrator()
+        orch._schedule_reviews()
+        assert not orch._reviews
+    asyncio.run(tick())
+    with db.session_scope() as s:
+        d = s.get(Decision, did)
+        assert serializers.actionable(d) and d.review is None
+    # Governance still uses the decision's explicit human choices; dismiss is
+    # intentionally invalid when it is not offered (it would strand the work).
+    resolution = options[0]
+    response = client.post(f"/api/workspaces/{ws}/decisions/{did}/resolve",
+                           json={"resolution": resolution, "comment": "Human guidance"})
+    assert response.status_code == 200, response.text
+    with db.session_scope() as s:
+        d = s.get(Decision, did)
+        assert d.status == "resolved" and d.resolution == resolution
+        assert d.resolved_by == data[1] and d.review is None
+
+
+def test_shutdown_before_worker_starts_releases_claim(data):
+    import asyncio
+    from aifactory.pipeline.orchestrator import Orchestrator
+    from aifactory.pipeline.runtime import open_decision
+
+    ws, _, _, outcome, task, _, current = data
+    open_decision(ws, "question", "Queue?", "Body", outcome_id=outcome, task_id=task,
+                  options=[{"value": "answer"}], metadata=metadata())
+    async def exercise():
+        orch = Orchestrator()
+        orch._schedule_reviews()
+        await orch.stop()
+    asyncio.run(exercise())
+    with db.session_scope() as s:
+        r = s.query(DecisionReview).filter_by(decision_id=current).one()
+        assert r.state == "pending"
+        assert s.get(Decision, current).status == "judging"
+
+
+def test_suggest_requires_a_person_even_when_lead_is_enabled(data, client):
+    from aifactory.pipeline.lead import Tools
+
+    ws, _, _, outcome, task, _, current = data
+    with db.session_scope() as s:
+        s.get(Task, task).status = "needs_input"
+        s.add(DecisionReview(workspace_id=ws, decision_id=current, mode="suggest", state="finished",
+            finished_at=db.utcnow(), proposed_verdict="decide", effective_verdict="hold",
+            answer="Proposed answer", summary="Confirm the proposal"))
+    lead = Tools(ws, outcome, "lead-run")
+    result = lead._resolve_decision(current, "answer", "Proposed answer")
+    assert "requires human confirmation" in result
+    with db.session_scope() as s:
+        assert s.get(Decision, current).status == "open"
+        assert s.get(Task, task).status == "needs_input"
+        assert s.query(Message).count() == 0
+    response = client.post(f"/api/workspaces/{ws}/decisions/{current}/resolve",
+                           json={"resolution": "answer", "comment": "Confirmed answer"})
+    assert response.status_code == 200, response.text
+    with db.session_scope() as s:
+        assert s.get(Task, task).status == "queued"
+        assert s.query(Message).one().author_kind == "user"
+
+
+@pytest.mark.parametrize("scope", ["item", "repository"])
+def test_citation_from_another_task_or_repository_is_held_at_apply(data, scope):
+    from aifactory.models import Run
+    from aifactory.pipeline.decision_reviews import apply, claim
+    from aifactory.pipeline.runtime import open_decision
+
+    ws, _, _, outcome, task, prior, current = data
+    with db.session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="team/other")
+        s.add(repo)
+        s.flush()
+        other = Task(workspace_id=ws, outcome_id=outcome, repo_id=repo.id,
+                     plan_id=s.get(Task, task).plan_id, key="T2", title="Other")
+        s.add(other)
+        s.flush()
+        source = s.get(Decision, prior)
+        source.scope, source.task_id = scope, other.id
+    open_decision(ws, "question", "Which queue?", "Need an answer", outcome_id=outcome, task_id=task,
+                  options=[{"value": "answer"}], metadata=metadata())
+    with db.session_scope() as s:
+        rid = s.query(DecisionReview).filter_by(decision_id=current).one().id
+        run = Run(workspace_id=ws, outcome_id=outcome, role="judge", harness="control_plane", status="succeeded",
+                  config_snapshot={"context": build_context(s, s.get(Decision, current))})
+        s.add(run)
+        s.flush()
+    token = claim(rid)
+    apply(rid, token, run, report(prior))
+    apply(rid, token, run, report(prior))
+    with db.session_scope() as s:
+        question = s.get(Decision, current)
+        assert question.status == "open" and serializers.actionable(question)
+        assert question.review.effective_verdict == "hold"
+        assert "scope" in question.review.summary
+        assert question.review.finished_at
+        assert s.query(Message).count() == 0
+
+
+def test_cancelled_outcome_is_never_claimed_even_without_followup(data):
+    from aifactory.models import User
+    from aifactory.pipeline.decision_reviews import claim
+    from aifactory.pipeline.runtime import open_decision
+    from aifactory.work_services import cancel_outcome
+
+    ws, uid, _, outcome, task, _, current = data
+    open_decision(ws, "question", "Queue?", "Body", outcome_id=outcome, task_id=task,
+                  options=[{"value": "answer"}], metadata=metadata())
+    with db.session_scope() as s:
+        rid = s.query(DecisionReview).filter_by(decision_id=current).one().id
+        cancel_outcome(s, s.get(User, uid), ws, outcome)
+    assert claim(rid) is None
+    with db.session_scope() as s:
+        assert s.get(Decision, current).status == "superseded"
+        assert s.get(DecisionReview, rid).state == "superseded"
+        assert s.get(DecisionReview, rid).finished_at
+        assert s.query(Message).count() == 0
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_review_workers_are_bounded_and_shutdown_preserves_pending(data, monkeypatch, started):
+    import asyncio
+    from types import SimpleNamespace
+    from aifactory import decision_judge_runner as runner
+    from aifactory.pipeline import orchestrator as scheduling
+    from aifactory.pipeline.runtime import open_decision
+
+    ws, _, _, outcome, _, _, _ = data
+    # Separate outcomes represent independent durable work, not duplicate questions.
+    with db.session_scope() as s:
+        repo_ids = s.get(Outcome, outcome).repo_ids
+        outcomes = [Outcome(workspace_id=ws, number=100 + i, title=f"Review {i}",
+                            repo_ids=repo_ids, status="needs_input") for i in range(5)]
+        s.add_all(outcomes)
+        s.flush()
+        ids = [o.id for o in outcomes]
+    for oid in ids:
+        open_decision(ws, "question", "Queue?", "Body", outcome_id=oid,
+                      options=[{"value": "answer"}], metadata=metadata("planner"))
+    monkeypatch.setattr(scheduling, "get_settings", lambda: SimpleNamespace(global_concurrency=2))
+    entered = []
+
+    async def blocked(*args):
+        entered.append(args)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "run_judge", blocked)
+
+    async def exercise():
+        orch = scheduling.Orchestrator()
+        orch._schedule_reviews()
+        orch._schedule_reviews()
+        assert len(orch._reviews) == 2
+        with db.session_scope() as s:
+            assert s.query(DecisionReview).filter_by(state="running").count() == 2
+            assert s.query(DecisionReview).filter_by(state="pending").count() == 3
+        if started:
+            await asyncio.sleep(0)
+        await orch.stop()
+        assert len(entered) == (2 if started else 0)
+        assert not orch._reviews
+        orch._schedule_reviews()
+        assert not orch._reviews
+
+    asyncio.run(exercise())
+    with db.session_scope() as s:
+        assert s.query(DecisionReview).filter_by(state="pending").count() == 5
+        assert s.query(DecisionReview).filter_by(state="running").count() == 0
+        assert s.query(Decision).filter(Decision.outcome_id.in_(ids), Decision.status == "judging").count() == 5
+        assert s.query(Message).count() == 0
+
+
+def test_judging_and_review_commit_before_publication(data, monkeypatch):
+    from aifactory import events
+    from aifactory.pipeline import runtime
+    from aifactory.pipeline import decision_reviews
+
+    ws, _, _, outcome, task, _, current = data
+    original = runtime.publish_decision
+    observed, published = [], []
+    monkeypatch.setattr(events.bus, "publish", published.append)
+
+    def inspect_committed(*args, **kwargs):
+        # The publisher uses a fresh transaction, like an HTTP reader/SSE consumer.
+        with db.session_scope() as s:
+            q = s.get(Decision, current)
+            r = s.query(DecisionReview).filter_by(decision_id=current).one()
+            observed.append((q.status, r.state, r.question_fingerprint))
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "publish_decision", inspect_committed)
+    runtime.open_decision(ws, "question", "Queue?", "Body", outcome_id=outcome, task_id=task,
+                          options=[{"value": "answer"}], metadata=metadata())
+    assert len(observed) == 1 and observed[0][:2] == ("judging", "pending")
+    assert observed[0][2]
+    assert published == []  # No transient human-attention event before the review.
+
+    # Failure to persist the review must roll back the question revision as well.
+    def fail(*args):
+        raise RuntimeError("Cannot persist review")
+
+    monkeypatch.setattr(decision_reviews, "prepare", fail)
+    with pytest.raises(RuntimeError, match="Cannot persist review"):
+        runtime.open_decision(ws, "question", "New title", "New body", outcome_id=outcome, task_id=task,
+                              options=[{"value": "answer"}], metadata=metadata())
+    with db.session_scope() as s:
+        assert s.get(Decision, current).body == "Body"
+        assert s.get(Decision, current).review.state == "pending"
+    assert len(observed) == 1 and published == []
+
+
+def test_pending_review_prevents_scheduler_missing_decision_fallback(data):
+    from aifactory.pipeline.orchestrator import Orchestrator, UNASKED_AFTER
+    from aifactory.pipeline.runtime import open_decision
+    import time
+
+    ws, _, _, outcome, task, _, current = data
+    with db.session_scope() as s:
+        s.get(Outcome, outcome).status = "running"
+        s.get(Task, task).status = "needs_input"
+    open_decision(ws, "question", "Queue?", "Body", outcome_id=outcome, task_id=task,
+                  options=[{"value": "answer"}], metadata=metadata())
+    orch = Orchestrator()
+    orch._unasked[task] = time.monotonic() - UNASKED_AFTER - 1
+    orch._promote()
+    with db.session_scope() as s:
+        waiting = s.query(Decision).filter(Decision.outcome_id == outcome,
+                                         Decision.status.in_(("open", "judging"))).all()
+        assert [d.id for d in waiting] == [current]
+        assert waiting[0].status == "judging"

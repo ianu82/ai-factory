@@ -200,6 +200,8 @@ def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, An
 
 
 def message(m: Message, author: str = "") -> dict[str, Any]:
+    if (m.attribution or {}).get("source") == "decision_judge":
+        author = "Decision judge"
     if (m.attribution or {}).get("source") == "mind":
         author += " via Mind"
     return {"author_id": m.author_id, "attribution": m.attribution or {}, "id": m.id, "outcome_id": m.outcome_id, "task_id": m.task_id, "author_kind": m.author_kind,

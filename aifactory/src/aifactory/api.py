@@ -1397,7 +1397,7 @@ def overrule_decision(workspace_id: str, decision_id: str, body: Overrule,
 def decision_library(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id)
     rows = db.query(Decision).filter(Decision.workspace_id == workspace_id,
-        (Decision.status != "open") | Decision.review.has(
+        Decision.status.notin_(("open", "judging")) | Decision.review.has(
             (DecisionReview.workspace_id == workspace_id) & (DecisionReview.finished_at.is_not(None)) &
             (DecisionReview.effective_verdict == "hold") &
             DecisionReview.state.notin_(("pending", "running")))).order_by(

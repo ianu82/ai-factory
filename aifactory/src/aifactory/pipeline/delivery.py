@@ -43,7 +43,8 @@ from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
 from .runtime import (SessionSpec, budget_extension, carried_cause, guidance_history, open_decision,
-                      outcome_committed, outcome_cost, precedents, publish_decision, run_agent, workspace_settings)
+                      outcome_committed, outcome_cost, precedents, publish_decision, question_metadata,
+                      run_agent, workspace_settings)
 
 from .lifecycle import transition
 
@@ -463,6 +464,9 @@ class TaskRunner:
             s.add(decision)
             s.flush()
             decision_id = decision.id
+            from .decision_reviews import prepare
+
+            prepare(s, decision)
         publish_decision(self.ws, decision_id, kind, title, outcome_id=self.task.outcome_id, task_id=self.task_id)
         notify(self.ws, "task", self.task_id, outcome_id=self.task.outcome_id)
         raise Stop()
@@ -901,7 +905,13 @@ class TaskRunner:
                     reason = result.report.get("blocked_reason") or result.report.get("summary", "")
                     self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
                     self.update(attempt=attempt - 1)  # a question is not a failed attempt
+                    try:
+                        question_patch = await extract_patch(self.builder, self.task.base_sha)
+                        safety = question_metadata("builder", paths=question_patch.files)
+                    except SandboxError:
+                        safety = None  # Unknown candidate paths require human review.
                     self.block("question", f"{self.task.key} needs a decision", reason, status="needs_input",
+                               metadata=safety,
                                options=[{"value": "answer", "label": "Answer and continue"},
                                         {"value": "abandon", "label": "Abandon task"}])
 
@@ -1520,7 +1530,7 @@ class TaskRunner:
             self._infrastructure(attempt, "verify", error, "transient")
         self.block("unblock", f"{self.task.key}: independent verification could not run",
                    "Two verifier sessions failed to produce a verdict. The candidate remains unverified and was not "
-                   "published.")
+                   "published.", metadata=question_metadata("verifier", paths=patch.files))
         return None
 
     async def _verifier_sandbox(self, token: str, patch: Patch, attempt: int, tries: int, qa_cfg: dict[str, Any]):
