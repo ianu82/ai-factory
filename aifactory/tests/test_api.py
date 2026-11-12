@@ -796,6 +796,20 @@ def test_task_lifetime_limits_are_validated(client, signed_in):
         assert (stored["limits"]["task_attempts_total"], stored["budgets"]["task_usd"]) == (100, 1000)
 
 
+def test_setting_one_limit_or_budget_leaves_the_others_as_they_were(client, signed_in):
+    wid = signed_in["workspaces"][0]["id"]
+    path = f"/api/workspaces/{wid}"
+    custom = {"limits": {"ci_minutes": 90, "builder_turns": 77}, "budgets": {"outcome_usd": 123.0, "run_usd": 3.5}}
+    assert client.patch(path, json={"settings": custom}).status_code == 200
+    r = client.patch(path, json={"settings": {"limits": {"task_attempts_total": 5}, "budgets": {"task_usd": 7.5}}})
+    assert r.status_code == 200, r.text
+    saved = r.json()["settings"]
+    assert (saved["limits"]["task_attempts_total"], saved["budgets"]["task_usd"]) == (5, 7.5)
+    # A patch of one key is not a replacement of its section: the workspace's own values stay.
+    assert (saved["limits"]["ci_minutes"], saved["limits"]["builder_turns"]) == (90, 77)
+    assert (saved["budgets"]["outcome_usd"], saved["budgets"]["run_usd"]) == (123.0, 3.5)
+
+
 def test_disconnect_repository_deletes_review_history_and_keeps_costs(client, signed_in):
     # Uses foreign-key-enforcing SQLite by default, or Postgres through
     # AIFACTORY_TEST_DATABASE_URL, exactly like the rest of the API suite.

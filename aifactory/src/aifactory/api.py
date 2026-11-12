@@ -339,6 +339,10 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
                 except ValueError as exc:
                     raise HTTPException(422, str(exc)) from None
             patch = {**patch, "alerts": {**before["alerts"], **alerts}}
+        for section in ("limits", "budgets"):
+            # Patched key by key too: setting one limit or budget must not put the others back to their defaults.
+            if isinstance(patch.get(section), dict) and isinstance(before.get(section), dict):
+                patch = {**patch, section: {**before[section], **patch[section]}}
         updated = {**before, **patch}
         if "review" in patch:
             try:

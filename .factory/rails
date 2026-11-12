@@ -16,5 +16,6 @@ aifactory/src/aifactory/decisions.py
 aifactory/src/aifactory/pipeline/delivery.py
 aifactory/src/aifactory/merge_manager.py
 aifactory/src/aifactory/pipeline/holds.py
+aifactory/src/aifactory/pipeline/lead.py
 aifactory/src/aifactory/pipeline/director.py
 aifactory/src/aifactory/pipeline/runtime.py
