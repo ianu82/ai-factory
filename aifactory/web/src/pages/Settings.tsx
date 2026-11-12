@@ -88,6 +88,22 @@ function Policies() {
   const [alertSaving, setAlertSaving] = useState(false);
   useEffect(() => setAlertAfter(String(s.alerts?.after_minutes ?? 120)), [ws.id, s.alerts?.after_minutes]);
   const validAlertAfter = /^\d+$/.test(alertAfter) && Number(alertAfter) >= 15 && Number(alertAfter) <= 1440;
+  const [stoppedAfter, setStoppedAfter] = useState(String(s.alerts?.stopped_minutes ?? 20));
+  useEffect(() => setStoppedAfter(String(s.alerts?.stopped_minutes ?? 20)), [ws.id, s.alerts?.stopped_minutes]);
+  const validStopped = /^\d+$/.test(stoppedAfter) && Number(stoppedAfter) >= 5 && Number(stoppedAfter) <= 240;
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [webhookSaving, setWebhookSaving] = useState(false);
+  const webhook = s.alerts?.webhook;
+  const alertValues = {
+    after_minutes: s.alerts?.after_minutes ?? 120, stopped_minutes: s.alerts?.stopped_minutes ?? 20,
+    slack: false, email: false,
+  };
+  const saveWebhook = async (url: string) => {
+    if (!admin || webhookSaving) return;
+    setWebhookSaving(true);
+    try { await save({ alerts: { ...alertValues, webhook_url: url } }); setWebhookUrl(""); }
+    finally { setWebhookSaving(false); }
+  };
   const qc = useQueryClient();
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const selected = policy.data?.after ?? s.autonomy;
@@ -146,14 +162,55 @@ function Policies() {
         <p>Every few minutes the Factory looks for stuck work: a decision waiting too long, a task waiting on a person with nothing to answer, an outcome where nothing moves, and the same failure across tasks. The outcome's Lead looks first; what stays stuck shows at the top of the Inbox.</p>
         <form onSubmit={async (e) => {
           e.preventDefault();
-          if (!admin || alertSaving || !validAlertAfter) return;
+          if (!admin || alertSaving || !validAlertAfter || !validStopped) return;
           setAlertSaving(true);
-          try { await save({ alerts: { after_minutes: Number(alertAfter), slack: false, email: false } }); }
+          try {
+            await save({ alerts: { after_minutes: Number(alertAfter), stopped_minutes: Number(stoppedAfter),
+                                   slack: false, email: false } });
+          }
           finally { setAlertSaving(false); }
         }}>
           <label className="field"><span>Alert when a decision has waited (minutes)</span><input className="input num" type="number" min={15} max={1440} step={1} value={alertAfter} readOnly={!admin} disabled={alertSaving} aria-describedby="alert-after-help" onChange={(e) => setAlertAfter(e.target.value)} /><span className="hint" id="alert-after-help">15–1440 · default 120</span></label>
-          {admin && <button className="btn primary" disabled={alertSaving || !validAlertAfter}>{alertSaving ? "Saving…" : "Save alert time"}</button>}
+          <label className="field">
+            <span>Alert when nothing has run while work waits (minutes)</span>
+            <input className="input num" type="number" min={5} max={240} step={1} value={stoppedAfter}
+              readOnly={!admin} disabled={alertSaving} aria-describedby="alert-stopped-help"
+              onChange={(e) => setStoppedAfter(e.target.value)} />
+            <span className="hint" id="alert-stopped-help">5–240 · default 20</span>
+          </label>
+          {admin && (
+            <button className="btn primary" disabled={alertSaving || !validAlertAfter || !validStopped}>
+              {alertSaving ? "Saving…" : "Save alert times"}
+            </button>
+          )}
         </form>
+        <div className="s-line">
+          <div className="l"><b>Webhook</b>
+            <span>Sent only when nothing is running: a provider hold, or work waiting with no agent at work.</span>
+          </div>
+          {webhook?.set ? (
+            <span style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span className="muted">Set · {webhook.host} · ••••</span>
+              {admin && (
+                <button className="btn sm" disabled={webhookSaving} onClick={() => saveWebhook("")}>
+                  {webhookSaving ? "…" : "Clear"}
+                </button>
+              )}
+            </span>
+          ) : admin ? (
+            <form style={{ display: "flex", gap: 8 }} onSubmit={(e) => {
+              e.preventDefault();
+              if (webhookUrl.trim().startsWith("https://")) saveWebhook(webhookUrl.trim());
+            }}>
+              <input className="input" type="password" autoComplete="off" aria-label="Webhook URL (HTTPS)"
+                placeholder="https://hooks.slack.com/services/…" value={webhookUrl} disabled={webhookSaving}
+                onChange={(e) => setWebhookUrl(e.target.value)} />
+              <button className="btn primary" disabled={webhookSaving || !webhookUrl.trim().startsWith("https://")}>
+                {webhookSaving ? "Saving…" : "Save"}
+              </button>
+            </form>
+          ) : <span className="muted">Not set</span>}
+        </div>
         <div className="s-line"><div className="l"><b>In the app</b><span>Alerts show at the top of the Inbox.</span></div>
           <Seg value="on" options={[["on", "On"]]} onChange={() => undefined} disabled /></div>
         <div className="s-line"><div className="l"><b>Slack</b><span>Not available yet.</span></div>

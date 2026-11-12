@@ -10,36 +10,42 @@ Every WATCH_EVERY the orchestrator calls run(), which looks in each workspace th
 - quiet: an outcome with work marked active but no activity for QUIET, while the workspace runs nothing at all
   and isn't on a provider hold;
 - repeated: the same failure on REPEAT_TASKS tasks or REPEAT_OUTCOMES outcomes within REPEAT_WINDOW; and, shown
-  the same way, REPEAT_TASKS tasks that asked for VM isolation within REPEAT_WINDOW and had no VM.
+  the same way, REPEAT_TASKS tasks that asked for VM isolation within REPEAT_WINDOW and had no VM;
+- stopped: the whole workspace stopped. No agent is at work (the Lead's runs aside) and none has been for
+  alerts.stopped_minutes, while work waits: an open provider hold, queued tasks, or decisions a person can answer.
 
 Each condition is one Alert row while it lasts, keyed by what it is about: raised once and cleared when the
 condition goes away, so a condition that lasts all day is one alert, not one per pass. Stuck work (unasked,
 stalled, quiet) first wakes the outcome's Lead, which reads the record and tells people why in a note; it is
 shown as an alert only once it has lasted GRACE, which also keeps a passing state from alerting anyone. Overdue
-decisions and repeated failures are shown at once: the Lead had its turn when the decision opened, and a failure
-across outcomes is no single Lead's.
+decisions, repeated failures and a stopped workspace are shown at once: the Lead had its turn when the decision
+opened, and a failure across outcomes, or a workspace where nothing runs, is no single Lead's.
 
 Open alerts show at the top of the Inbox, where people can dismiss them; a dismissed alert stays dismissed while
 its condition lasts. Slack and email are delivery options a workspace will be able to turn on. Neither exists
-yet, so both are off and alerts reach people only in the app.
+yet, so both are off. One thing leaves the product: when a workspace sets a webhook (alert_webhook.py), a provider
+hold opening and "Nothing is running" are sent to it, once when each begins and once when it ends (_deliver).
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from ..db import session_scope, utcnow
 from ..events import notify, record
 from ..models import Alert, Decision, Event, Outcome, Run, Task, Workspace
 from ..serializers import actionable
-from .holds import held_workspaces
+from .holds import PROVIDER_HOLD, held_workspaces, hold_details
 from .orchestrator import ACTIVE_TASK, HUMAN_TASK
 from .planning import ACTIVE_OUTCOME
 from .runtime import DEFAULT_SETTINGS, merged_settings
+
+log = logging.getLogger(__name__)
 
 WATCH_EVERY = timedelta(minutes=5)
 GRACE = timedelta(minutes=30)  # how long stuck work lasts, with its Lead woken, before people are alerted
@@ -67,7 +73,9 @@ def alert_settings(settings: dict[str, Any]) -> dict[str, Any]:
     default = DEFAULT_SETTINGS["alerts"]
     raw = settings.get("alerts") if isinstance(settings.get("alerts"), dict) else {}
     after = raw.get("after_minutes")
+    stopped = raw.get("stopped_minutes")
     return {"after_minutes": after if type(after) is int and 15 <= after <= 1440 else default["after_minutes"],
+            "stopped_minutes": stopped if type(stopped) is int and 5 <= stopped <= 240 else default["stopped_minutes"],
             "slack": False, "email": False}  # not available yet
 
 
@@ -86,6 +94,10 @@ def run(now: datetime | None = None) -> dict[str, int]:
             shown = _apply(s, workspace_id, found, settings_for(settings)["enabled"], now, counts)
         if shown:  # after the commit, so the Inbox refetches what was written
             notify(workspace_id, "alert", workspace_id)
+        try:
+            _deliver(workspace_id, now)
+        except Exception:  # the webhook must never stop the watch
+            log.exception("alert delivery failed for %s", workspace_id[:6])
     return counts
 
 
@@ -162,6 +174,10 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
                 f"The same failure on {f'{n} tasks across {where}' if n else where} in the last day", reason,
                 seen["first"], data={"tasks": sorted(seen["tasks"])[:20],
                                                                    "outcomes": sorted(seen["outcomes"])[:20]})
+    stopped = _stopped(s, workspace_id, decisions, outcomes, tasks, now)
+    if stopped and now - stopped["since"] >= timedelta(minutes=alert_settings(settings)["stopped_minutes"]):
+        add(f"stopped:{workspace_id}", "stopped", "Nothing is running", " ".join(stopped["reasons"]), stopped["since"],
+            data={"reasons": stopped["reasons"]})
     refused = _no_vm(s, workspace_id, now)
     if len(refused["tasks"]) >= REPEAT_TASKS:
         n = len(refused["tasks"])
@@ -170,6 +186,37 @@ def find(s, workspace_id: str, settings: dict[str, Any], now: datetime) -> dict[
             "no VM. It ran in a sandbox in the Factory container, or waited where the repository says to wait. "
             f"The latest reason: {refused['why']}", refused["first"], data={"tasks": sorted(refused["tasks"])[:20]})
     return found
+
+
+def _stopped(s, workspace_id: str, decisions: list[Decision], outcomes: dict[str, Outcome], tasks: list[Task],
+             now: datetime) -> dict[str, Any] | None:
+    """Work waiting while no agent is at work (the Lead's runs aside): why, and since when nothing has run while it
+    waited (the later of the last run's end and when the waiting began). None while an agent works or nothing waits."""
+    if s.query(Run.id).filter(Run.workspace_id == workspace_id, Run.status == "running",
+                              Run.role != "lead").first() is not None:
+        return None
+    waiting: list[tuple[datetime, str]] = []
+    hold = next((d for d in decisions if d.kind == PROVIDER_HOLD), None)
+    if hold is not None:
+        waiting.append((hold.created_at, f"A provider hold is open since {_when(hold.created_at)}: "
+                                          f"{hold_details(hold)['label']}."))
+    queued = [t for t in tasks if t.status == "queued"]
+    if queued:
+        n = len(queued)
+        waiting.append((min(t.updated_at or t.created_at for t in queued),
+                        f"{n} task{'s are' if n != 1 else ' is'} queued."))
+    asked = [d for d in decisions if d.kind != PROVIDER_HOLD and actionable(d)
+             and (not d.outcome_id or d.outcome_id in outcomes)]
+    if asked:
+        n, oldest = len(asked), min(d.created_at for d in asked)
+        waiting.append((oldest, f"{n} decisions are waiting for a person (the oldest for {_for(now - oldest)})."
+                        if n != 1 else f"1 decision is waiting for a person (for {_for(now - oldest)})."))
+    if not waiting:
+        return None
+    last = s.query(func.max(func.coalesce(Run.finished_at, Run.started_at))).filter(
+        Run.workspace_id == workspace_id, Run.role != "lead").scalar()
+    began = min(at for at, _ in waiting)
+    return {"since": max(last, began) if last is not None else began, "reasons": [text for _, text in waiting]}
 
 
 def _no_vm(s, workspace_id: str, now: datetime) -> dict[str, Any]:
@@ -251,7 +298,9 @@ def _apply(s, workspace_id: str, found: dict[str, dict[str, Any]], lead_on: bool
                        task_id=spec["task_id"], data={"alert_id": alert.id, "kind": spec["kind"]}, session=s)
                 counts["woken"] += 1
         else:
-            alert.title, alert.body, alert.data = spec["title"], spec["body"], spec["data"]
+            sent = (alert.data or {}).get("webhook")  # what _deliver sent stays with the alert
+            alert.title, alert.body = spec["title"], spec["body"]
+            alert.data = {**(spec["data"] or {}), "webhook": sent} if sent else spec["data"]
         if alert.status == "watching" and now - alert.created_at >= GRACE:
             alert.status = "open"
         if alert.status == "open" and alert.opened_at is None:
@@ -266,6 +315,86 @@ def _apply(s, workspace_id: str, found: dict[str, dict[str, Any]], lead_on: bool
             alert.status, alert.cleared_at = "cleared", now
             counts["cleared"] += 1
     return changed
+
+
+def _deliver(workspace_id: str, now: datetime) -> None:
+    """Send a provider hold opening and "Nothing is running" to the workspace's webhook, once when each begins and
+    once when it ends. What was sent is marked before sending, on the alert (data) and on the hold (metadata_json),
+    so a restart never sends it twice; a delivery that fails is not tried again."""
+    from ..alert_webhook import send, url_for
+    from ..config import get_settings
+
+    recent = now - timedelta(days=1)
+    with session_scope() as s:
+        url = url_for(s, workspace_id)
+        if not url:
+            return
+        name = s.get(Workspace, workspace_id).name
+        base = get_settings().public_url
+        link = f" Inbox: {base}/w/{workspace_id}/inbox" if base.startswith("https") else ""
+        out: list[tuple[str, str, str]] = []  # (what, its id, the text)
+        for a in s.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.kind == "stopped",
+                                       or_(Alert.status.in_(LIVE), Alert.cleared_at > recent)):
+            sent = dict((a.data or {}).get("webhook") or {})
+            if a.status in ("open", "dismissed") and "raised" not in sent:
+                text, sent["raised"] = f"Nothing is running in {name} since {_when(a.since)}. {a.body}", now.isoformat()
+            elif a.status == "cleared" and "raised" in sent and "cleared" not in sent:
+                text, sent["cleared"] = f"Work has resumed in {name}: an agent is at work again, or nothing waits.", \
+                    now.isoformat()
+            else:
+                continue
+            a.data = {**(a.data or {}), "webhook": sent}
+            out.append(("alert", a.id, text + link))
+        for d in s.query(Decision).filter(Decision.workspace_id == workspace_id, Decision.kind == PROVIDER_HOLD,
+                                          or_(Decision.status == "open", Decision.resolved_at > recent)):
+            meta = dict(d.metadata_json or {})
+            sent = dict(meta.get("webhook") or {})
+            if d.status == "open" and "raised" not in sent:
+                hold = hold_details(d)
+                text = (f"Work is on hold in {name} since {_when(d.created_at)}: {hold['label']}. Nothing new starts "
+                        f"until the hold is lifted. {hold['advice']}")
+                sent["raised"] = now.isoformat()
+            elif d.status != "open" and "raised" in sent and "cleared" not in sent:
+                text, sent["cleared"] = f"Work has resumed in {name}: the provider hold is lifted.", now.isoformat()
+            else:
+                continue
+            d.metadata_json = {**meta, "webhook": sent}
+            out.append(("decision", d.id, text + link))
+    for what, row_id, text in out:
+        error = send(url, text)
+        if error:
+            _undelivered(workspace_id, what, row_id, error)
+
+
+def _undelivered(workspace_id: str, what: str, row_id: str, error: str) -> None:
+    """A delivery that failed: logged, and recorded as one event per alert or hold."""
+    log.warning("alert webhook of %s: %s", workspace_id[:6], error)
+    with session_scope() as s:
+        row = s.get(Alert if what == "alert" else Decision, row_id)
+        field = "data" if what == "alert" else "metadata_json"
+        current = dict(getattr(row, field) or {})
+        sent = dict(current.get("webhook") or {})
+        first = "failed" not in sent
+        sent["failed"] = error
+        setattr(row, field, {**current, "webhook": sent})
+        if first:
+            record(workspace_id, "alert_delivery_failed", f"An alert could not be sent to the webhook: {error}",
+                   level="warn", data={f"{what}_id": row_id, "reason": error}, session=s)
+
+
+def _when(at: datetime) -> str:
+    return f"{at:%d %b %H:%M} UTC"
+
+
+def _for(delta: timedelta) -> str:
+    """A wait in words: minutes under an hour, hours under two days, else days."""
+    minutes = max(int(delta.total_seconds() // 60), 0)
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    if minutes < 48 * 60:
+        hours = minutes // 60
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    return f"{minutes // 1440} days"
 
 
 def _span(delta: timedelta) -> str:

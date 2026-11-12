@@ -76,6 +76,8 @@ def _who(event: Event, ctx: Context) -> dict[str, Any]:
         return LEAD
     if data.get("source") == "director":  # so does the Director
         return DIRECTOR
+    if data.get("source") == "factory":  # the Factory lifting a provider hold itself (pipeline/holds.py)
+        return FACTORY
     if event.actor == "operator" or (event.actor or "") in ctx.operators:
         return OPERATOR
     name = ctx.names.get(event.actor or "")

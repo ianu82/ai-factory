@@ -22,6 +22,11 @@ export function HoldBanner() {
   const hold = inbox.data?.decisions.find((d) => d.kind === "provider_hold");
   if (!hold) return null;
   const why = hold.hold;
+  // The Factory's own test of the provider: it resumes work itself once every model answers (pipeline/holds.py).
+  const tests = why?.tests_every_minutes
+    ? ` The Factory tests the provider every ${why.tests_every_minutes} min and resumes work once it answers`
+      + (why.last_tested_at ? ` (last tested ${ago(why.last_tested_at)})` : "") + "."
+    : "";
   const resume = async () => {
     setBusy(true);
     try {
@@ -40,6 +45,7 @@ export function HoldBanner() {
       <span>
         <b>Work is on hold</b> ({ago(hold.created_at)}): {why ? why.label : "the model provider refused a request"}
         {why?.source ? ` (${why.source})` : ""}. Nothing new starts until work is resumed. {why?.advice}
+        {tests}
       </span>
       <span style={{ flex: 1 }} />
       <button className="btn sm" onClick={() => navigate(`/w/${ws.id}/inbox/${hold.id}`)}>Details</button>

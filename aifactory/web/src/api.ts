@@ -120,8 +120,14 @@ export interface Settings {
   reasoning_effort?: string;
   linear?: LinearConfig;
   mind?: { daily_budget_usd: number };
-  /** Slack and email aren't available yet and are always off; alerts show in the Inbox. */
-  alerts?: { after_minutes: number; slack: boolean; email: boolean };
+  /** Slack and email aren't available yet and are always off; alerts show in the Inbox. The webhook is write-only:
+   * set it with webhook_url ("" clears it); settings show only whether it is set and its host. */
+  alerts?: {
+    after_minutes: number; slack: boolean; email: boolean;
+    stopped_minutes?: number;
+    webhook?: { set: boolean; host: string };
+    webhook_url?: string;
+  };
   /** The stand-in for people while they're away (pipeline/director.py). Off by default. */
   director?: DirectorSettings;
 }
@@ -143,6 +149,9 @@ export interface HoldDetails {
   advice: string;
   source: string | null;
   error: string;
+  /** While the hold is open: how often the Factory tests the provider (0: never), and when it last did. */
+  tests_every_minutes?: number;
+  last_tested_at?: string | null;
 }
 
 export interface ModelCheckResult {
@@ -327,7 +336,7 @@ export interface Run {
 /** Stuck work or a repeated failure the watch found (pipeline/watch.py), shown at the top of the Inbox. */
 export interface Alert {
   id: string;
-  kind: "overdue" | "unasked" | "stalled" | "quiet" | "repeated";
+  kind: "overdue" | "unasked" | "stalled" | "quiet" | "repeated" | "stopped";
   title: string;
   body: string;
   since: string;
