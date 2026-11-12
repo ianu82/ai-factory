@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -61,6 +61,48 @@ def age(tid, seconds=200, *, expired=False):
         t.evidence = {**t.evidence, "ci_wait": wait}
 
 
+def failed_job(conclusion="cancelled", run=9):
+    """CI shows the head's one check failed with this conclusion, as a job of an Actions run (None: of no run)."""
+    FakeGitHub.check_state, FakeGitHub.check_conclusion, FakeGitHub.check_run_id = "failure", conclusion, run
+
+
+def rerun_settled(tid):
+    """The rerun was asked for more than a minute ago: a failure seen now is the rerun's own."""
+    with session_scope() as s:
+        t = s.get(Task, tid)
+        wait = t.evidence["ci_wait"]
+        rerun = {**wait["rerun"], "at": (utcnow() - timedelta(seconds=61)).isoformat()}
+        t.evidence = {**t.evidence, "ci_wait": {**wait, "rerun": rerun}}
+
+
+def branch_candidate(ids):
+    """A parked candidate whose head is not the commit it is built on (the plain candidate's is)."""
+    tid = candidate(ids)
+    with session_scope() as s:
+        s.get(Task, tid).head_sha = "c" * 40
+    asyncio.run(park(tid))
+    return tid
+
+
+def require_ci(ids, setting):
+    with session_scope() as s:
+        r = s.get(Repository, ids["repo"])
+        r.config = {**r.config, "require_ci": setting}
+
+
+def sent_to_builder(tid, monkeypatch):
+    """Run the task's repair round with the builder stubbed out: the feedback the builder would be given."""
+    seen = []
+
+    async def deliver(self, continue_from_branch=False):
+        seen.append(list(self.feedback))
+        assert continue_from_branch
+    monkeypatch.setattr(TaskRunner, "deliver", deliver)
+    asyncio.run(runner(tid).run())
+    assert len(seen) == 1
+    return seen[0]
+
+
 def test_pending_restart_success_preserves_candidate_deadline_and_no_agents(factory):
     tid = candidate(factory)
     FakeGitHub.check_state = "pending"
@@ -100,7 +142,7 @@ def test_grace_required_and_failure(factory, state, required, expected):
     asyncio.run(park(tid))
     assert snapshot(tid)[0] == "waiting_ci"
     asyncio.run(runner(tid).poll_ci())
-    age(tid)
+    age(tid, 700 if required else 200)  # required CI without checks is a question only after ten minutes
     with session_scope() as s:
         r = s.get(Repository, factory["repo"])
         r.config = {**r.config, "require_ci": required}
@@ -116,6 +158,76 @@ def test_grace_required_and_failure(factory, state, required, expected):
     assert ev["ci_wait"]["head"] == ev["ci"]["head"]
 
 
+@pytest.mark.parametrize("setting,workflows,case", [
+    (True, False, "requires CI before merging"), ("auto", True, "a path filter?"), (None, True, "a path filter?"),
+    (None, None, "could not be read"),  # the workflows cannot be listed: CI is taken as required
+])
+def test_no_checks_where_ci_is_required_waits_ten_minutes_then_asks_a_person_and_says_which_case(
+        factory, setting, workflows, case):
+    if setting is not None:
+        require_ci(factory, setting)
+    FakeGitHub.workflows = bool(workflows)
+    if workflows is None:
+        FakeGitHub.failures = {"has_workflows": 5}
+    tid = candidate(factory)
+    FakeGitHub.check_state = "none"
+    asyncio.run(park(tid))
+    age(tid, 200)  # past the grace: no question yet
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("waiting_ci", "ci") and open_decisions(tid) == [] and FakeGitHub.merged == []
+    assert ev["ci_wait"].get("workflows") == (True if workflows else None)
+    FakeGitHub.workflows = False  # the answer is remembered for this head, not asked for on every look
+    age(tid, 700)
+    assert poll(tid)[0] == "blocked" and FakeGitHub.merged == []
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.task_id == tid).one()
+        assert decision.title.endswith("no CI checks reported")
+        assert case in decision.body and "11 minutes" in decision.body
+
+
+def test_no_checks_where_workflows_make_ci_required_refreshes_onto_a_main_that_moved_instead_of_asking(factory):
+    FakeGitHub.workflows = True
+    tid = candidate(factory)
+    FakeGitHub.check_state = "none"
+    asyncio.run(park(tid))
+    main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+    age(tid, 200)
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage, ev["ci_wait"]["stale_main"]) == ("queued", "ci_refresh", main)
+    assert open_decisions(tid) == [] and FakeGitHub.merged == []
+
+
+@pytest.mark.parametrize("setting,workflows", [(None, False), ("auto", False), (False, True)])
+def test_no_checks_where_ci_is_not_required_merges_after_the_grace(factory, setting, workflows):
+    if setting is not None:
+        require_ci(factory, setting)
+    FakeGitHub.workflows = workflows
+    tid = candidate(factory)
+    FakeGitHub.check_state = "none"
+    asyncio.run(park(tid))
+    age(tid, 200)
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("queued", "merge") and open_decisions(tid) == []
+    assert ev["ci_wait"].get("workflows") == (None if setting is False else False)
+
+
+def test_a_head_whose_checks_were_left_to_its_ci_never_merges_without_checks_even_where_ci_is_off(factory):
+    require_ci(factory, False)
+    tid = candidate(factory)
+    with session_scope() as s:
+        t = s.get(Task, tid)
+        t.evidence = {"revalidation": {"phase": "complete", "head": t.head_sha, "local_checks": "skipped"}}
+    FakeGitHub.check_state = "none"
+    asyncio.run(park(tid))
+    age(tid, 200)
+    assert poll(tid)[:2] == ("waiting_ci", "ci") and open_decisions(tid) == [] and FakeGitHub.merged == []
+    age(tid, 700)
+    assert poll(tid)[0] == "blocked" and FakeGitHub.merged == []
+    with session_scope() as s:
+        body = s.query(Decision).filter(Decision.task_id == tid).one().body
+        assert "left to CI after the rebase" in body and "turn off" not in body
+
+
 def test_failure_reconstructs_logs(factory, monkeypatch):
     tid = candidate(factory)
     FakeGitHub.check_state = "failure"
@@ -128,6 +240,173 @@ def test_failure_reconstructs_logs(factory, monkeypatch):
     monkeypatch.setattr(TaskRunner, "deliver", deliver)
     asyncio.run(runner(tid).run())
     assert any("Error: test failed in CI" in text for text in seen)
+
+
+def test_a_cancelled_job_is_rerun_once_and_the_builder_is_not_sent(factory):
+    tid = candidate(factory)
+    failed_job()
+    asyncio.run(park(tid))
+    parked = snapshot(tid)[2]["ci_wait"]
+    status, stage, ev, lease = poll(tid)
+    rerun = ev["ci_wait"]["rerun"]
+    assert (status, stage, lease) == ("waiting_ci", "ci", "") and FakeGitHub.reruns == [9]
+    assert (rerun["head"], rerun["runs"], rerun["checks"], rerun["ok"]) == (parked["head"], [9], ["ci"], True)
+    assert ev["ci"]["state"] == "pending" and "failure_facts" not in ev
+    # The rerun has a CI budget of its own.
+    assert datetime.fromisoformat(ev["ci_wait"]["deadline"]) > datetime.fromisoformat(parked["deadline"])
+    assert events(tid, "ci_rerun") == ["CI failed on PR #1; rerunning the failed jobs once (ci)"]
+    status, stage, ev, _ = poll(tid)  # GitHub still lists the failed job until the rerun starts
+    assert (status, stage) == ("waiting_ci", "ci") and FakeGitHub.reruns == [9]
+    assert len(events(tid, "ci_rerun")) == 1 and events(tid, "ci_failed") == [] and "failure_facts" not in ev
+    assert open_decisions(tid) == [] and ScriptedModel.calls == []
+
+
+def test_a_restart_between_recording_the_rerun_and_asking_for_it_asks_for_nothing_twice(factory, monkeypatch):
+    crash, real = [True], FakeGitHub.rerun_failed_jobs
+
+    async def rerun_failed_jobs(self, full_name, run_id):
+        if crash[0]:
+            raise asyncio.CancelledError()
+        await real(self, full_name, run_id)
+    monkeypatch.setattr(FakeGitHub, "rerun_failed_jobs", rerun_failed_jobs)
+    tid = candidate(factory)
+    failed_job()
+    asyncio.run(park(tid))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner(tid).poll_ci())
+    rerun = snapshot(tid)[2]["ci_wait"]["rerun"]
+    assert rerun["runs"] == [9] and "ok" not in rerun and "failed" not in rerun
+    crash[0] = False
+    assert poll(tid)[:2] == ("waiting_ci", "ci")  # the rerun may have been asked for: wait for it
+    rerun_settled(tid)
+    assert poll(tid)[:2] == ("queued", "ci_repair")  # it was not: the failure stands
+    assert FakeGitHub.reruns == [] and events(tid, "ci_rerun") == []
+
+
+@pytest.mark.parametrize("reviews", [False, True])
+def test_green_after_a_rerun_goes_on_as_before_and_the_flaky_checks_are_recorded(factory, reviews):
+    if reviews:
+        review_on(factory)
+    tid = candidate(factory)
+    failed_job()
+    asyncio.run(park(tid))
+    assert poll(tid)[:2] == ("waiting_ci", "ci")
+    FakeGitHub.check_state, FakeGitHub.check_conclusion = "success", None
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == (("waiting_ci", "review") if reviews else ("queued", "merge"))
+    assert events(tid, "ci_flaky") == ["CI passed on PR #1 once its failed jobs were rerun (ci)"]
+    assert ev["ci_wait"]["rerun"]["flaky"] is True and "failure_facts" not in ev
+    assert FakeGitHub.reruns == [9] and events(tid, "ci_failed") == [] and ScriptedModel.calls == []
+
+
+def test_a_job_that_fails_again_after_its_rerun_goes_to_the_builder_once_and_the_feedback_says_so(
+        factory, monkeypatch):
+    tid = candidate(factory)
+    failed_job()
+    asyncio.run(park(tid))
+    assert poll(tid)[:2] == ("waiting_ci", "ci")
+    rerun_settled(tid)
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("queued", "ci_repair") and FakeGitHub.reruns == [9]
+    assert len(ev["failure_facts"]) == 1 and events(tid, "ci_failed") == []
+    feedback = sent_to_builder(tid, monkeypatch)
+    assert "- These checks failed twice on this commit." in feedback
+    assert any("Error: test failed in CI" in text for text in feedback)
+    assert len(events(tid, "ci_failed")) == 1 and FakeGitHub.reruns == [9]
+
+
+def test_a_rerun_github_refuses_sends_the_failure_to_the_builder_in_the_same_look(factory, monkeypatch):
+    async def refused(self, full_name, run_id):
+        raise GitHubError("GitHub App POST request failed (403). Manage GitHub access.", 403)
+    monkeypatch.setattr(FakeGitHub, "rerun_failed_jobs", refused)
+    tid = candidate(factory)
+    failed_job()
+    asyncio.run(park(tid))
+    status, stage, ev, _ = poll(tid)
+    rerun = ev["ci_wait"]["rerun"]
+    assert (status, stage) == ("queued", "ci_repair") and "403" in rerun["failed"] and "ok" not in rerun
+    assert len(ev["failure_facts"]) == 1
+    assert events(tid, "ci_rerun") == [] and events(tid, "ci_unavailable") == [] and open_decisions(tid) == []
+    feedback = sent_to_builder(tid, monkeypatch)
+    assert any("Error: test failed in CI" in text for text in feedback)
+    assert not any("failed twice" in text for text in feedback)
+
+
+@pytest.mark.parametrize("conclusion,run", [("action_required", 9), ("failure", None)])
+def test_a_failure_that_waits_for_an_approval_or_belongs_to_no_actions_run_is_not_rerun(factory, conclusion, run):
+    tid = candidate(factory)
+    failed_job(conclusion, run)
+    asyncio.run(park(tid))
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("queued", "ci_repair")
+    assert FakeGitHub.reruns == [] and "rerun" not in ev["ci_wait"] and events(tid, "ci_rerun") == []
+
+
+@pytest.mark.parametrize("moved", [True, False])
+def test_a_failure_the_base_commit_has_too_waits_for_main_to_move_and_the_builder_is_not_sent(factory, moved):
+    FakeGitHub.base_failing = ["ci", "lint"]
+    tid = branch_candidate(factory)
+    FakeGitHub.check_state = "failure"
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("waiting_ci", "ci") and ev["ci_wait"]["broken_on_base"]["checks"] == ["ci"]
+    noted = events(tid, "ci_broken_on_base")
+    assert len(noted) == 1 and "(ci)" in noted[0]
+    looked, again = datetime.fromisoformat(ev["ci"]["at"]), datetime.fromisoformat(ev["ci_wait"]["next_poll_at"])
+    assert again - looked == timedelta(seconds=delivery.CI_BASE_POLL_SECONDS)
+    FakeGitHub.failures = {"failing_checks": 1}  # would fail if asked: the base commit is read once
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("waiting_ci", "ci") and FakeGitHub.failures["failing_checks"] == 1
+    assert len(events(tid, "ci_broken_on_base")) == 1 and len(ev["failure_facts"]) == 1
+    assert events(tid, "ci_failed") == [] and open_decisions(tid) == [] and ScriptedModel.calls == []
+    if moved:
+        main = _land_on_main(factory, "other.txt", "landed meanwhile\n")
+        status, stage, ev, _ = poll(tid)
+        assert (status, stage, ev["ci_wait"]["stale_main"]) == ("queued", "ci_refresh", main)
+        assert open_decisions(tid) == []
+        return
+    age(tid, expired=True)
+    assert poll(tid)[0] == "blocked"
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.task_id == tid).one()
+        assert "CI did not finish" in decision.title and "base branch too (ci)" in decision.body
+        assert decision.options[0] == {"value": "retry", "label": "Keep waiting"}
+
+
+@pytest.mark.parametrize("on_base,unreadable", [(["lint"], False), ([], False), (["ci"], True)])
+def test_a_failure_the_base_commit_does_not_have_or_cannot_be_asked_about_is_the_candidates_own(
+        factory, on_base, unreadable):
+    FakeGitHub.base_failing = on_base
+    tid = branch_candidate(factory)
+    FakeGitHub.check_state = "failure"
+    if unreadable:
+        FakeGitHub.failures = {"failing_checks": 1}
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("queued", "ci_repair")
+    assert "broken_on_base" not in ev["ci_wait"] and events(tid, "ci_broken_on_base") == []
+
+
+def test_a_repair_of_a_broken_base_branch_is_sent_to_the_builder_for_the_failure_the_base_has_too(factory):
+    FakeGitHub.base_failing = ["ci"]
+    tid = branch_candidate(factory)
+    with session_scope() as s:
+        s.get(Outcome, s.get(Task, tid).outcome_id).source = "ci_failure"
+    FakeGitHub.check_state = "failure"
+    status, stage, ev, _ = poll(tid)
+    assert (status, stage) == ("queued", "ci_repair") and "broken_on_base" not in ev["ci_wait"]
+
+
+def test_a_failed_job_is_rerun_before_the_base_commit_is_asked_about(factory):
+    FakeGitHub.base_failing = ["ci"]
+    tid = branch_candidate(factory)
+    failed_job()
+    FakeGitHub.failures = {"failing_checks": 1}  # would fail if asked
+    assert poll(tid)[:2] == ("waiting_ci", "ci")
+    assert FakeGitHub.reruns == [9] and FakeGitHub.failures["failing_checks"] == 1
+    FakeGitHub.failures = {}
+    rerun_settled(tid)
+    status, stage, ev, _ = poll(tid)  # failed again: on the base commit too, so nobody is sent
+    assert (status, stage) == ("waiting_ci", "ci") and ev["ci_wait"]["broken_on_base"]["checks"] == ["ci"]
+    assert FakeGitHub.reruns == [9] and events(tid, "ci_failed") == [] and len(events(tid, "ci_broken_on_base")) == 1
 
 
 def test_timeout_keep_waiting_is_only_explicit_reset(factory):
@@ -946,6 +1225,17 @@ def test_a_revert_never_waits_for_a_review(factory):
     assert "@codex review" not in [body for _, body in FakeGitHub.comments]
 
 
+def test_a_reverts_failed_job_is_not_rerun_and_still_asks_a_person(factory):
+    tid = prepare_revert(factory)
+    failed_job()
+    status, _, ev, _ = poll(tid)
+    assert status == "smoke_failed" and FakeGitHub.reruns == [] and "rerun" not in ev["ci_wait"]
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.task_id == tid, Decision.status == "open").one()
+        assert decision.title.endswith("the revert failed CI")
+        assert decision.options == [{"value": "acknowledge", "label": "Acknowledge"}]
+
+
 @pytest.mark.parametrize("stop", ["cancelled", "pause"])
 @pytest.mark.parametrize("where", ["lock", "pull"])
 def test_resumed_revert_revalidates_after_lock_and_pull(factory, monkeypatch, stop, where):
@@ -1211,7 +1501,8 @@ def test_atomic_decision_announced_only_after_commit(factory, monkeypatch, sourc
 @pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.parametrize("continuation", ["delivery", "revert"])
 @pytest.mark.parametrize("slow_call", ["checks", "branch_sha"])
-def test_slow_poll_opens_durable_decision(factory, monkeypatch, expired, continuation, slow_call):
+def test_slow_poll_is_retried_and_the_deadline_opens_durable_decision(factory, monkeypatch, expired, continuation,
+                                                                      slow_call):
     from aifactory.decisions import resolve
 
     tid = candidate(factory)
@@ -1246,30 +1537,30 @@ def test_slow_poll_opens_durable_decision(factory, monkeypatch, expired, continu
         await asyncio.sleep(0)
         assert ended.is_set() and not orch._ci_polls
         assert not orch._tasks
-        # Not eligible again: repeated slow calls cannot silently park forever.
+        # Not eligible again yet: blocked at the deadline, or the next look waits out its backoff.
         orch._schedule_ci()
         assert not orch._ci_polls
     asyncio.run(go())
     status, stage, ev, lease = snapshot(tid)
-    assert (status, stage, lease) == ("blocked", "ci", "")
+    assert (status, stage, lease) == ("blocked" if expired else "waiting_ci", "ci", "")
     assert ev["ci_wait"]["head"] == original["head"]
     assert ev["ci_wait"]["continuation"] == continuation
     assert ev["ci_wait"]["first_wait_at"] == original["first_wait_at"]
+    if not expired:  # one slow look is not a question for a person: it is recorded and tried again
+        assert open_decisions(tid) == [] and len(events(tid, "ci_unavailable")) == 1
+        assert ev["ci_wait"]["errors"] == 1 and "timed out" in ev["ci_wait"]["error"]
+        assert ev["ci_wait"]["next_poll_at"] > original["next_poll_at"]
+        assert ev["ci_wait"]["deadline"] == original["deadline"]
+        return
     with session_scope() as s:
         decision = s.query(Decision).filter(Decision.task_id == tid).one()
-        if expired:
-            assert decision.options[0] == {"value": "retry", "label": "Keep waiting"}
-            assert ev["ci_wait"]["timed_out"] is True
-            resolve(s, decision, s.get(User, factory["user"]), "retry")
-        else:
-            assert "could not check CI" in decision.title
-            assert "timed out" in decision.body
-            assert ev["ci_wait"]["deadline"] == original["deadline"]
-    if expired:
-        reset = snapshot(tid)[2]["ci_wait"]["deadline"]
-        assert reset > ev["ci_wait"]["deadline"]
-        asyncio.run(start())
-        assert snapshot(tid)[2]["ci_wait"]["deadline"] == reset
+        assert decision.options[0] == {"value": "retry", "label": "Keep waiting"}
+        assert ev["ci_wait"]["timed_out"] is True
+        resolve(s, decision, s.get(User, factory["user"]), "retry")
+    reset = snapshot(tid)[2]["ci_wait"]["deadline"]
+    assert reset > ev["ci_wait"]["deadline"]
+    asyncio.run(start())
+    assert snapshot(tid)[2]["ci_wait"]["deadline"] == reset
 
 
 @pytest.mark.parametrize("expired", [False, True])
@@ -1311,18 +1602,64 @@ def test_failed_observation_after_restart_honors_deadline(factory, monkeypatch, 
         assert not orch._ci_polls
     asyncio.run(go())
     status, stage, ev, lease = snapshot(tid)
-    assert (status, stage, lease) == ("blocked", "ci", "")
+    assert (status, stage, lease) == ("blocked" if expired else "waiting_ci", "ci", "")
     for key in ("head", "pr", "continuation", "first_wait_at", "deadline"):
         assert ev["ci_wait"][key] == original[key]
-    with session_scope() as s:
-        decision = s.query(Decision).filter(Decision.task_id == tid).one()
-        if expired:
+    if expired:
+        with session_scope() as s:
+            decision = s.query(Decision).filter(Decision.task_id == tid).one()
             assert decision.options == [{"value": "retry", "label": "Keep waiting"},
                                         {"value": "abandon", "label": "Abandon"}]
             assert ev["ci_wait"]["timed_out"] is True
-        else:
-            assert "could not check CI" in decision.title
-            assert ("No GitHub access" if error_source == "credential" else "GitHub is unavailable") in decision.body
+        return
+    # One failed look is noise: the task keeps waiting, says so once, and looks again.
+    message = "No GitHub access" if error_source == "credential" else "GitHub is unavailable"
+    assert open_decisions(tid) == [] and len(events(tid, "ci_unavailable")) == 1
+    assert ev["ci_wait"]["errors"] == 1 and message in ev["ci_wait"]["error"]
+    status, _, ev, _ = poll(tid)
+    assert (status, ev["ci_wait"]["errors"], len(events(tid, "ci_unavailable"))) == ("waiting_ci", 2, 1)
+    assert ev["ci_wait"]["error_since"] <= ev["ci_wait"]["next_poll_at"]
+    # Ten minutes of failed looks are a question for a person, with how long and the last error.
+    with session_scope() as s:
+        t = s.get(Task, tid)
+        streak = {"error_since": (utcnow() - timedelta(minutes=11)).isoformat()}
+        t.evidence = {**t.evidence, "ci_wait": {**t.evidence["ci_wait"], **streak}}
+    status, _, ev, _ = poll(tid)
+    assert status == "blocked" and not {"errors", "error", "error_since"} & set(ev["ci_wait"])
+    with session_scope() as s:
+        decision = s.query(Decision).filter(Decision.task_id == tid).one()
+        assert "could not check CI" in decision.title
+        assert "3 looks" in decision.body and "11 minutes" in decision.body and message in decision.body
+        assert [o["value"] for o in decision.options] == ["retry", "abandon"]
+
+
+def test_failed_looks_at_ci_back_off_are_reported_once_and_a_look_that_works_ends_the_streak(factory, monkeypatch):
+    tid = candidate(factory)
+    FakeGitHub.check_state = "pending"
+    asyncio.run(park(tid))
+    clock, down, real = [utcnow()], [True], FakeGitHub.checks
+
+    async def checks(self, full_name, sha):
+        if down[0]:
+            raise GitHubError("GitHub App GET request failed (403). Manage GitHub access.", 403)
+        return await real(self, full_name, sha)
+    monkeypatch.setattr(FakeGitHub, "checks", checks)
+    monkeypatch.setattr(delivery, "utcnow", lambda: clock[0])
+    waits = []
+    for look in range(4):
+        status, _, ev, _ = poll(tid)
+        waits.append((datetime.fromisoformat(ev["ci_wait"]["next_poll_at"]) - clock[0]).total_seconds())
+        clock[0] += timedelta(seconds=5)
+    assert waits == [30, 60, 120, 120]
+    assert (status, ev["ci_wait"]["errors"]) == ("waiting_ci", 4) and "403" in ev["ci_wait"]["error"]
+    assert open_decisions(tid) == []
+    assert events(tid, "ci_unavailable") == ["Could not check CI on PR #1; looking again"]
+    down[0] = False
+    status, _, ev, _ = poll(tid)
+    assert status == "waiting_ci" and not {"errors", "error", "error_since"} & set(ev["ci_wait"])
+    down[0] = True
+    assert poll(tid)[2]["ci_wait"]["errors"] == 1 and len(events(tid, "ci_unavailable")) == 2
+    assert open_decisions(tid) == [] and ScriptedModel.calls == []
 
 
 @pytest.mark.parametrize("stop", ["cancelled", "handed_over", "abandoned", "pause"])

@@ -206,9 +206,34 @@ class FakeGitHub:
                 return {}
         raise AssertionError(f"unexpected request {method} {path}")
 
+    # CI: one check, ``ci``, in ``check_state``. ``check_conclusion`` is its conclusion when that is not the state
+    # ("cancelled"), ``check_run_id`` the Actions run it belongs to (its failed jobs can then be rerun; ``reruns``
+    # lists the runs asked for), ``base_failing`` the checks failing on a commit asked about by name alone, and
+    # ``workflows`` whether the repository has an active workflow.
+    check_conclusion: str | None = None
+    check_run_id: int | None = None
+    reruns: list[int] = []
+    base_failing: list[str] = []
+    workflows = False
+
     async def checks(self, full_name, sha):
-        return CheckSummary(self.check_state, [{"name": "ci", "status": "completed", "conclusion": self.check_state,
-                                                 "url": "", "id": 1, "summary": "", "kind": "check_run"}])
+        check = {"name": "ci", "status": "completed", "conclusion": self.check_conclusion or self.check_state,
+                 "url": "", "id": 1, "summary": "", "kind": "check_run"}
+        if self.check_run_id:
+            check["run_id"] = self.check_run_id
+        return CheckSummary(self.check_state, [check])
+
+    async def failing_checks(self, full_name, sha):
+        self._fail("failing_checks")
+        return list(FakeGitHub.base_failing)
+
+    async def rerun_failed_jobs(self, full_name, run_id):
+        self._fail("rerun_failed_jobs")
+        FakeGitHub.reruns.append(run_id)
+
+    async def has_workflows(self, full_name):
+        self._fail("has_workflows")
+        return FakeGitHub.workflows
 
     async def job_log_tail(self, full_name, check, limit=6000):
         return "Error: test failed in CI"
