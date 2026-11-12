@@ -4,9 +4,10 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from aifactory import db
-from aifactory.models import Alert, Decision, Event, Outcome, Plan, Repository, Run, Task
+from aifactory.models import Alert, Decision, DecisionReview, Event, Outcome, Plan, Repository, Run, Task
 from aifactory.pipeline import lead, watch
 
 
@@ -71,10 +72,25 @@ def test_a_decision_waiting_past_the_alert_time_alerts_until_it_is_answered(worl
     assert watch.run()["cleared"] == 1 and alerts(client, world) == []
 
 
+def test_a_decision_waits_on_people_from_when_its_judge_review_finished(world, client):
+    question = decision(world, age=timedelta(hours=3))
+    with db.session_scope() as s:  # a judge held it for nearly all that time, then handed it to people
+        s.add(DecisionReview(workspace_id=world["ws"], decision_id=question, state="held",
+                             finished_at=now() - timedelta(minutes=10)))
+    watch.run()
+    assert alerts(client, world) == []
+    with db.session_scope() as s:
+        s.query(DecisionReview).filter_by(decision_id=question).one().finished_at = now() - timedelta(hours=2, minutes=1)
+    watch.run()
+    assert [a["decision_id"] for a in alerts(client, world)] == [question]
+
+
 def test_a_task_waiting_with_nothing_to_answer_wakes_the_lead_then_alerts(world, client):
     task(world, status="blocked", blocked_reason="Could not push the branch")
     with db.session_scope() as s:
         s.get(Outcome, world["outcome"]).status = "attention"
+    assert watch.run()["raised"] == 0  # the scheduler asks about it within minutes: nothing to wake the Lead for yet
+    task(world, updated_at=now() - watch.UNASKED_AFTER)
     assert watch.run() == {"raised": 1, "shown": 0, "cleared": 0, "woken": 1}
     assert live(world) == {"unasked": "watching"} and alerts(client, world) == []  # the Lead looks first
     [due] = [d for d in lead.due() if d["outcome_id"] == world["outcome"]]
@@ -89,7 +105,7 @@ def test_a_task_waiting_with_nothing_to_answer_wakes_the_lead_then_alerts(world,
 
 def test_without_a_lead_stuck_work_still_waits_before_it_alerts(world, client):
     client.patch(f"/api/workspaces/{world['ws']}", json={"settings": {"lead": {"enabled": False}}})
-    task(world, status="needs_input")
+    task(world, status="needs_input", updated_at=now() - watch.UNASKED_AFTER)
     assert watch.run() == {"raised": 1, "shown": 0, "cleared": 0, "woken": 0}
     with db.session_scope() as s:
         assert s.query(Event).filter_by(kind="lead_watch").count() == 0
@@ -124,6 +140,9 @@ def test_an_active_outcome_with_no_activity_is_quiet_only_when_nothing_runs(worl
         run.status, run.finished_at = "succeeded", now() - timedelta(minutes=90)
     watch.run()
     assert live(world) == {"quiet": "watching"}
+    with db.session_scope() as s:  # the Lead the watch woke is looking into it
+        s.add(Run(workspace_id=world["ws"], outcome_id=world["outcome"], role="lead", harness="control_plane",
+                  status="running", started_at=now()))
     watch.run()  # the watch's own records, and the Lead it woke, are not the work moving
     assert live(world) == {"quiet": "watching"}
     with db.session_scope() as s:  # the provider refused the workspace: nothing starts until a person resumes
@@ -132,6 +151,25 @@ def test_an_active_outcome_with_no_activity_is_quiet_only_when_nothing_runs(worl
         s.add(hold)
     watch.run()
     assert live(world) == {}  # the hold is what to answer, not each outcome it stopped
+
+
+def test_a_persons_guidance_is_activity_and_the_leads_is_not(world):
+    def guidance(**about):
+        with db.session_scope() as s:
+            s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="guidance",
+                        message="Use the durable queue.", **about))
+
+    with db.session_scope() as s:
+        s.add(Event(workspace_id=world["ws"], outcome_id=world["outcome"], kind="stage", message="Building",
+                    created_at=now() - timedelta(hours=2)))
+    watch.run()
+    assert live(world) == {"quiet": "watching"}
+    guidance(run_id="lead-run", actor="lead")  # the Lead it woke steering the agents
+    watch.run()
+    assert live(world) == {"quiet": "watching"}
+    guidance(actor="a-member", data={"intervention": True})  # a person stepping in
+    watch.run()
+    assert live(world) == {}
 
 
 def test_the_same_failure_across_outcomes_is_one_alert(world, client):
@@ -147,10 +185,33 @@ def test_the_same_failure_across_outcomes_is_one_alert(world, client):
                       status="failed", error=error, started_at=started, finished_at=finished))
             s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", status="resolved",
                            title="T1 did not pass after 3 attempts", options=[]))  # the task's own failure
+            s.add(Run(workspace_id=world["ws"], outcome_id=outcome_id, role="lead", harness="control_plane",
+                      status="failed", error="Interrupted by a restart"))  # a deploy, not a failure
+        for outcome_id, crash in ((world["outcome"], "KeyError: 'repo'"), (other.id, "TimeoutError: VM 12 boot")):
+            s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", status="resolved",
+                           title="A task stopped unexpectedly", body=crash, options=[]))  # different crashes
+            # The scheduler asking about work nothing asked about isn't a failure, however many outcomes have it.
+            s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", options=[],
+                           title="T2 is blocked, and nothing was asking what to do", metadata_json={"unasked": "blocked"}))
     assert watch.run()["shown"] == 1
     [shown] = alerts(client, world)
     assert shown["kind"] == "repeated" and shown["body"] == "VM refused: slot # busy (id …)"
     assert shown["title"] == "The same failure on 2 outcomes in the last day"
+
+
+def test_one_outage_in_different_phases_is_one_repeated_failure(world, client):
+    with db.session_scope() as s:
+        other = Outcome(workspace_id=world["ws"], number=8, title="Other", status="running")
+        s.add(other)
+        s.flush()
+        for outcome_id, phase in ((world["outcome"], "Implementation"), (other.id, "Independent verification")):
+            s.add(Decision(workspace_id=world["ws"], outcome_id=outcome_id, kind="unblock", status="resolved",
+                           title="T1: infrastructure problem", options=[],
+                           body=f"{phase} failed 3 times in a row for reasons outside the change. Last error:\n\n"
+                                "Sandbox 4f3a2b1c9d did not start"))
+    assert watch.run()["shown"] == 1
+    [shown] = alerts(client, world)
+    assert shown["body"] == "infrastructure problem: Sandbox … did not start"
 
 
 def test_a_dismissed_alert_stays_dismissed_while_its_condition_lasts(world, client):
@@ -187,3 +248,40 @@ def test_a_failure_reason_drops_what_differs_between_occurrences():
     assert watch.reason_of("T3: could not push the branch") == "could not push the branch"
     assert watch.reason_of("\n  Sandbox 4f3a2b1c9d timed out after 600s\nmore") == "Sandbox … timed out after #s"
     assert watch.reason_of("") == ""
+
+
+def test_the_inbox_shows_every_open_alert(world, client):
+    for _ in range(55):
+        decision(world, age=timedelta(hours=3))
+    assert watch.run()["shown"] == 55
+    assert len(alerts(client, world)) == 55
+
+
+def test_one_live_alert_per_condition_even_from_two_schedulers(world):
+    def alert(status):
+        with db.session_scope() as s:
+            s.add(Alert(workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet", status=status))
+
+    alert("open")
+    with pytest.raises(IntegrityError):  # the second scheduler's insert is refused
+        alert("watching")
+    with db.session_scope() as s:
+        s.query(Alert).filter_by(key="quiet:x").one().status = "cleared"
+    alert("open")  # once it has cleared, the same condition can be raised again
+
+
+def test_an_alerts_table_from_before_the_index_keeps_the_first_alert_raised(world):
+    from sqlalchemy import text
+
+    with db.engine().begin() as conn:  # as it was before one live alert per condition was enforced
+        conn.execute(text("DROP INDEX ux_alerts_live_key"))
+    with db.session_scope() as s:  # a dismissed alert, then a duplicate a second scheduler raised later
+        s.add_all([Alert(id="f" * 32, workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet",
+                         status="dismissed", created_at=now() - timedelta(hours=1)),
+                   Alert(id="0" * 32, workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet",
+                         status="open", created_at=now())])
+    db._migrate_alert_live_key(db.engine())
+    assert live(world) == {"quiet": "dismissed"}  # what a person dismissed stays dismissed
+    with pytest.raises(IntegrityError):  # and the index is back
+        with db.session_scope() as s:
+            s.add(Alert(workspace_id=world["ws"], key="quiet:x", kind="quiet", title="Quiet", status="open"))
