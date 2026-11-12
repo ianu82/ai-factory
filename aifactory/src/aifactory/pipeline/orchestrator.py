@@ -48,8 +48,11 @@ AFTER_SMOKE = [{"value": "revert", "label": "Revert the merge"}, {"value": "fix"
 # A revert that did not go through: accepting cannot complete the task (the merge is still in), so the answers are
 # to try the revert again or to end the task.
 REVERT_AGAIN = [{"value": "revert", "label": "Try the revert again"}, {"value": "abandon", "label": "Abandon task"}]
-STRANDED_OPTIONS = [{"value": "continue", "label": "Start the waiting tasks"},
-                    {"value": "drop", "label": "Drop the waiting tasks"}]
+STRANDED_OPTIONS = [{"value": "continue", "label": "Start the waiting tasks",
+                     "effect": "Starts the waiting tasks without the work they waited for, with your note as "
+                               "guidance."},
+                    {"value": "drop", "label": "Drop the waiting tasks",
+                     "effect": "Ends the waiting tasks undelivered; the outcome ends with what was delivered."}]
 # A running task is leased to the instance that runs it. The instance extends the lease every HEARTBEAT_SECONDS;
 # a lease that ran out belongs to nobody and any instance may requeue the task.
 LEASE_SECONDS = 90

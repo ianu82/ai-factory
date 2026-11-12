@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ExternalLink } from "lucide-react";
 import { api, type Decision } from "../api";
 import { useWs } from "../App";
+import { mergeFactRows, withoutFacts } from "../decisionFacts";
 import { ago, DECISION_KIND } from "../format";
 import { Prose, useToast } from "../ui";
 
@@ -18,6 +19,7 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
   const textNeeded = d.options.some((o) => NEEDS_TEXT.has(o.value));
   const [noting, setNoting] = useState(d.kind === "question");
   const canAct = ws.role !== "viewer" && d.status === "open" && d.actionable !== false;
+  const effects = d.options.some((o) => !!o.effect);
   const card = useRef<HTMLElement>(null);
   useEffect(() => {
     if (focused) {
@@ -59,7 +61,7 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
           <button className="linkish" onClick={onOpen}>#{d.outcome_number} {d.outcome_title}{d.task_key ? ` · ${d.task_key}` : ""}</button>
         </div>
       )}
-      {d.body && <Prose text={d.body} />}
+      {d.body && <Prose text={withoutFacts(d.body, d.merge)} />}
       {d.pr_url && <a className="linkish" href={d.pr_url} target="_blank" rel="noreferrer" style={{ marginTop: 6 }}>Review pull request #{d.pr_number ?? d.pr_url.split("/").pop()} on GitHub <ExternalLink /></a>}
       {d.lead_note && <div className="lead-note" style={{ marginTop: 8 }}>
         <b>Lead{d.outcome_number != null ? ` of #${d.outcome_number}` : ""} · {ago(d.lead_note.created_at)}</b>
@@ -78,19 +80,34 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
       </div>}
       {d.correction && <p>Corrected by {d.correction.resolved_by_name} · {ago(d.correction.resolved_at)}: {d.correction.answer}<br />Reason: {d.correction.attribution.reason}</p>}
       {d.supersedes && <p>Correction of decision {d.supersedes}</p>}
+      {d.merge && (
+        <div className="merge-facts">
+          <dl>
+            {mergeFactRows(d.merge).map((row) => (
+              <Fragment key={row.label}><dt>{row.label}</dt><dd>{row.text}</dd></Fragment>
+            ))}
+          </dl>
+          {d.merge.asked?.text && <p>{d.merge.asked.text}</p>}
+        </div>
+      )}
       {canAct && (
         <>
           {noting && (
             <textarea className="textarea" autoFocus={d.kind !== "question"} placeholder={textNeeded ? "Your answer or instructions — sent to the Factory and recorded" : "Note for the record"}
               value={comment} onChange={(e) => setComment(e.target.value)} aria-label="Comment" />
           )}
-          <div className="opts">
-            {d.options.map((o, i) => (
-              <button key={o.value} className={`btn sm ${i === 0 ? "primary" : ""}`} disabled={!!busy}
-                onClick={() => (NEEDS_TEXT.has(o.value) && !noting ? setNoting(true) : resolve(o.value))}>
-                {busy === o.value ? "…" : o.label}
-              </button>
-            ))}
+          <div className={`opts ${effects ? "with-effects" : ""}`}>
+            {d.options.map((o, i) => {
+              const button = (
+                <button key={o.value} className={`btn sm ${i === 0 ? "primary" : ""}`} disabled={!!busy}
+                  onClick={() => (NEEDS_TEXT.has(o.value) && !noting ? setNoting(true) : resolve(o.value))}>
+                  {busy === o.value ? "…" : o.label}
+                </button>
+              );
+              // What choosing it does, under the button (older decisions have no effects and show as before).
+              if (!o.effect) return button;
+              return <span key={o.value} className="opt">{button}<span className="hint">{o.effect}</span></span>;
+            })}
             {!noting && <button className="btn sm ghost" onClick={() => setNoting(true)}>Add note</button>}
             <span style={{ flex: 1 }} />
             {noting && (

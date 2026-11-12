@@ -34,6 +34,7 @@ PLAN_REVIEW_ROUNDS = 2  # revisions the reviewer may ask for before a person dec
 ACTIVE_OUTCOME = ("planning", "running", "attention", "blocked", "needs_input", "awaiting_approval")
 OTHER_OUTCOMES = 20
 OTHER_TASKS = 8
+CANCEL_EFFECT = {"effect": "Cancels the outcome and stops all of its work."}  # shown under a decision's option
 # The outcome's own events that say where its planning stands with infrastructure retries (_infra_retries).
 _RETRY_STATE = ("infra_retry", "plan_proposed", "provider_hold", "decision_requested")
 
@@ -170,8 +171,10 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         open_decision(workspace_id, "budget", f"Outcome #{snapshot.number} reached its budget",
                       f"{over}, so planning stopped before starting another session. Raise the outcome budget in "
                       "Settings and continue, continue anyway for one more planning run, or cancel the outcome.",
-                      outcome_id=outcome_id, options=[{"value": "retry", "label": "Continue anyway"},
-                                                      {"value": "cancel", "label": "Cancel outcome"}])
+                      outcome_id=outcome_id,
+                      options=[{"value": "retry", "label": "Continue anyway",
+                                "effect": "Allows one more planning run past the budget."},
+                               {"value": "cancel", "label": "Cancel outcome", **CANCEL_EFFECT}])
         return
     harness_name = snapshot.harness or settings["harness"].get("planner") or "native"
     # Automatic approval means the plan reviewer approves; with "approve first" a person reviews instead.
@@ -287,11 +290,13 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         body = "\n\n".join(f"**{q['question']}**\n{q.get('why', '')}" +
                            (("\nOptions: " + ", ".join(q["options"])) if q.get("options") else "") for q in questions)
         set_outcome(outcome_id, status="needs_input")
-        options = [{"value": "answer", "label": "Answer and re-plan"}]
+        options = [{"value": "answer", "label": "Answer and re-plan",
+                    "effect": "Sends your answer to the planner, which plans the outcome again."}]
         if report.get("tasks"):
             body += "\n\nThe planner also proposed a plan with its own assumptions:\n" + report.get("summary", "")
-            options.insert(0, {"value": "approve", "label": "Approve plan as proposed"})
-        options.append({"value": "cancel", "label": "Cancel"})
+            options.insert(0, {"value": "approve", "label": "Approve plan as proposed",
+                               "effect": "Approves the plan with the planner's assumptions; building starts."})
+        options.append({"value": "cancel", "label": "Cancel", **CANCEL_EFFECT})
         open_decision(workspace_id, "question", f"Planner needs a decision for #{snapshot.number}", body,
                       outcome_id=outcome_id, options=options)
         return
@@ -313,8 +318,10 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
     set_outcome(outcome_id, status="awaiting_approval")
     open_decision(workspace_id, "approve_plan", f"Approve plan for #{snapshot.number}: {snapshot.title}", body,
                   outcome_id=outcome_id,
-                  options=[{"value": "approve", "label": "Approve"}, {"value": "replan", "label": "Revise"},
-                           {"value": "cancel", "label": "Cancel"}])
+                  options=[{"value": "approve", "label": "Approve", "effect": "Approves the plan; building starts."},
+                           {"value": "replan", "label": "Revise",
+                            "effect": "Sends your comment to the planner, which proposes a new plan."},
+                           {"value": "cancel", "label": "Cancel", **CANCEL_EFFECT}])
 
 
 async def _review(outcome: Outcome, repos: list[Repository], decisions: list[Any], work: list[str],

@@ -70,6 +70,16 @@ NOT_ATTEMPTS = ("infra", "checks_preexisting")
 RAILS_FILE = ".factory/rails"
 LIFETIME_RECOMMENDATION = ("Recommended: this task has gone round the loop too often to be worth another round as it "
                            "is. Abandon it and plan the work again as smaller tasks, or take it over.")
+# What a decision's options do when chosen (decisions.resolve), shown under each option.
+RETRY_STEP = "Runs the task again from the step that stopped, with your note as guidance."
+RETRY_FRESH = "Starts the task again with a fresh set of attempts, with your note as guidance."
+ANSWER = {"value": "answer", "label": "Answer and continue",
+          "effect": "Sends your answer to the builder; the task goes on from where it asked."}
+ABANDON = {"value": "abandon", "label": "Abandon task",
+           "effect": "Ends the task undelivered and closes its pull request, if it has one."}
+TAKE_OVER = {"value": "take_over", "label": "I'll take it from here",
+             "effect": "Stops the Factory on this task; its latest change waits for you on its branch or pull "
+                       "request."}
 # How far an attempt got: a record ends a run of infrastructure retries only when it shows that the phase which
 # failed (or a later one) has since completed.
 _PHASE_ORDER = {"prepare": 0, "build": 1, "checks": 2, "verify": 3}
@@ -458,8 +468,9 @@ class TaskRunner:
             # can create a retry decision after a concurrent stop.
             decision = Decision(workspace_id=self.ws, kind=kind, title=title, body=body,
                                 outcome_id=self.task.outcome_id, task_id=self.task_id, metadata_json=metadata,
-                                options=options or [{"value": "retry", "label": "Retry"},
-                                                    {"value": "abandon", "label": "Abandon task"}])
+                                options=options or [{"value": "retry", "label": "Retry",
+                                                     "effect": RETRY_FRESH if status == "failed" else RETRY_STEP},
+                                                    ABANDON])
             s.add(decision)
             s.flush()
             decision_id = decision.id
@@ -477,10 +488,7 @@ class TaskRunner:
         authorization. Other steward questions let a person give guidance and
         requeue delivery through its existing rebuild/verification gates.
         """
-        self.block("question", title, body, status=status,
-                   options=options or [{"value": "answer", "label": "Answer and continue"},
-                                       {"value": "abandon", "label": "Abandon task"}],
-                   metadata=metadata)
+        self.block("question", title, body, status=status, options=options or [ANSWER, ABANDON], metadata=metadata)
 
     def _steward_identity(self) -> dict[str, Any] | None:
         """T5/T6 contract: persist evidence.steward with episode_id, action (fix/revert),
@@ -783,9 +791,10 @@ class TaskRunner:
                 self.block("unblock", f"{self.task.key} did not pass after {tried}",
                            f"The task could not be completed within the attempt limit. Latest feedback:\n\n{summary}",
                            status="failed",
-                           options=[{"value": "retry", "label": "Try again (fresh attempts)"},
-                                    {"value": "take_over", "label": "I'll take it from here"},
-                                    {"value": "abandon", "label": "Abandon task"}])
+                           options=[{"value": "retry", "label": "Try again (fresh attempts)",
+                                     "effect": f"Starts up to {max_attempts} fresh attempts, with your note as "
+                                               "guidance; each runs a builder and a verifier session."},
+                                    TAKE_OVER, ABANDON])
             self.update(attempt=attempt)
             budget = self.settings["budgets"].get("outcome_usd")
             # Spending whose cost is known is a lower bound, so reaching the budget with it alone is conclusive.
@@ -808,8 +817,10 @@ class TaskRunner:
                            + (f" (the ${budget:.0f} budget, extended when it last continued)" if extended else "")
                            + f". Raise the budget in Settings, or continue with ${more} more than is spent now.",
                            status="needs_input",
-                           options=[{"value": "retry", "label": f"Continue with ${more} more"},
-                                    {"value": "abandon", "label": "Stop"}])
+                           options=[{"value": "retry", "label": f"Continue with ${more} more",
+                                     "effect": f"Allows the outcome up to ${more} more than it has spent now; the "
+                                               "task goes on."},
+                                    {"value": "abandon", "label": "Stop", "effect": "Ends this task undelivered."}])
             if saved:
                 self._guard_steward_candidate()
                 identity = self._steward_identity()
@@ -902,8 +913,7 @@ class TaskRunner:
                     self.evidence("attempts", {"n": attempt, "result": "builder_blocked", "reason": reason[:1000]})
                     self.update(attempt=attempt - 1)  # a question is not a failed attempt
                     self.block("question", f"{self.task.key} needs a decision", reason, status="needs_input",
-                               options=[{"value": "answer", "label": "Answer and continue"},
-                                        {"value": "abandon", "label": "Abandon task"}])
+                               options=[ANSWER, ABANDON])
 
             # candidate gate
             self.stage("checks", "Checking the candidate change")
@@ -1623,12 +1633,13 @@ class TaskRunner:
             self.update(attempt=resume_at)
             if cause == "provider":
                 self.block("unblock", f"{self.task.key}: access problem", error,
-                           options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon"}])
+                           options=[{"value": "retry", "label": "Retry", "effect": RETRY_STEP},
+                                    {**ABANDON, "label": "Abandon"}])
             self.block("unblock", f"{self.task.key}: infrastructure problem",
                        f"{_PHASES[phase]} failed {retries + 1} times in a row for reasons outside the change (the "
                        "model provider or the sandbox was unavailable). None of these counted as an attempt, and "
                        f"retrying keeps the task's attempt budget. Last error:\n\n{error[:1500]}",
-                       options=[{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}])
+                       options=[{"value": "retry", "label": "Retry", "effect": RETRY_STEP}, ABANDON])
         delay = INFRA_BACKOFF_SECONDS[min(retries, len(INFRA_BACKOFF_SECONDS) - 1)]
         self._set_evidence({"attempts": record, "infra_retries": retries + 1, "infra_phase": unresolved,
                             "infra_retry_at": (utcnow() + timedelta(seconds=delay)).isoformat()})
@@ -1853,16 +1864,10 @@ class TaskRunner:
             return
         ev = self.task.evidence or {}
         allowance = ev.get("lifetime_allowance") if isinstance(ev.get("lifetime_allowance"), dict) else {}
-        charged = [a for a in ev.get("attempts", []) if isinstance(a, dict) and a.get("result")
-                   and a["result"] not in NOT_ATTEMPTS and a["result"] != "builder_blocked"]
+        charged = _charged(ev)
         attempts_limit = int(max(cap_attempts, _positive(allowance.get("attempts")))) if cap_attempts else 0
         usd_limit = max(cap_usd, _positive(allowance.get("usd"))) if cap_usd else 0.0
-        used, spent = len(charged), 0.0
-        if cap_usd:
-            with session_scope() as s:
-                spent = float(s.query(func.coalesce(func.sum(Run.cost_usd), 0)).filter(
-                    Run.task_id == self.task_id, Run.role.in_(("builder", "verifier")),
-                    Run.cost_known.is_(True)).scalar() or 0)
+        used, spent = len(charged), self._spent() if cap_usd else 0.0
         reached = [w for w, hit in (("attempt", attempts_limit and used >= attempts_limit),
                                     ("dollar", usd_limit and spent >= usd_limit)) if hit]
         if not reached:
@@ -1884,13 +1889,23 @@ class TaskRunner:
                  "usd": round(max(usd_limit, spent) + cap_usd, 2) if usd_limit else None}
         self.event("task_limit_reached", f"{self.task.key} reached its lifetime limit: {used} attempts, "
                    f"${spent:.2f}", level="warn", **numbers)
+        more = " and ".join(filter(None,[f"up to {allow['attempts']} attempts in all" if allow["attempts"] else "",
+                                       f"${allow['usd'] - spent:.2f} more on its builder and verifier sessions"
+                                       if allow["usd"] else ""]))
         self.block("unblock", f"{self.task.key}: reached its lifetime limit", "\n\n".join(lines), status="failed",
                    options=[{"value": "retry",
-                             "label": f"Allow {max_attempts} more attempt" + ("" if max_attempts == 1 else "s")},
-                            {"value": "take_over", "label": "I'll take it from here"},
-                            {"value": "abandon", "label": "Abandon task"}],
+                             "label": f"Allow {max_attempts} more attempt" + ("" if max_attempts == 1 else "s"),
+                             "effect": f"Lets the task go on with a fresh set of attempts: {more}."},
+                            TAKE_OVER, ABANDON],
                    metadata={"people_only": "A task at its lifetime limit goes on only when a person says so",
                              "lifetime_limit": {**numbers, "allow": allow}})
+
+    def _spent(self) -> float:
+        """What the task's builder and verifier runs of known cost have cost."""
+        with session_scope() as s:
+            return float(s.query(func.coalesce(func.sum(Run.cost_usd), 0)).filter(
+                Run.task_id == self.task_id, Run.role.in_(("builder", "verifier")),
+                Run.cost_known.is_(True)).scalar() or 0)
 
     def _fresh_budget_after_base_moved(self, why: str) -> None:
         """A verified change that other work overtook is not the builder's failure: rebuilding it gets a fresh
@@ -1899,9 +1914,11 @@ class TaskRunner:
         if rebuilds > 2:
             self.block("unblock", f"{self.task.key} keeps conflicting with newer commits",
                        f"The verified change {why} on {self.repo.default_branch} again, after {rebuilds - 1} rebuilds.",
-                       status="failed", options=[{"value": "retry", "label": "Rebuild again"},
-                                                 {"value": "take_over", "label": "I'll take it from here"},
-                                                 {"value": "abandon", "label": "Abandon task"}])
+                       status="failed", options=[{"value": "retry", "label": "Rebuild again",
+                                                  "effect": "Builds the change again on the latest "
+                                                            f"{self.repo.default_branch} with a fresh set of "
+                                                            "attempts."},
+                                                 TAKE_OVER, ABANDON])
         values = {"rebase_rebuilds": rebuilds, "attempt_base": self.task.attempt}
         revalidation = (self.task.evidence or {}).get("revalidation") or {}
         if revalidation.get("phase") == "rejected":
@@ -2358,8 +2375,10 @@ class TaskRunner:
                           f"({', '.join(broken[:5])}), so the builder was not sent. The base branch did not move "
                           f"within {minutes} minutes.")
             self.block("unblock", f"{self.task.key}: CI did not finish", detail,
-                       options=[{"value": "retry", "label": "Keep waiting"},
-                                {"value": "abandon", "label": "Abandon"}])
+                       options=[{"value": "retry", "label": "Keep waiting",
+                                 "effect": f"Waits up to {minutes} more minute{'' if minutes == 1 else 's'} for CI "
+                                           f"on PR #{wait['pr']}."},
+                                {**ABANDON, "label": "Abandon"}])
 
     async def _ci_required(self, gh: GitHub, wait: dict[str, Any] | None = None) -> tuple[bool, str]:
         """Whether a head must show CI checks before it merges, and why: "setting" (`require_ci` true or false),
@@ -2846,26 +2865,53 @@ class TaskRunner:
 
     # merge ---------------------------------------------------------------------
     def _merge_needs_approval(self, settings: dict[str, Any] | None = None) -> bool:
-        from ..onboarding_policy import active
-
         settings = workspace_settings(self.ws) if settings is None else settings
-        task = getattr(self, "task", None)
-        if active(settings) or _review_asks(task, settings, self.cfg) or _rails_touched(task):
-            return True
-        merge_policy = (self.cfg.get("merge") or {}).get("mode") or settings["autonomy"].get("merge", "auto")
-        release_cfg = self.cfg.get("release") or {}
-        releases_on_merge = release_cfg.get("mode") == "on_merge"
-        if releases_on_merge and settings["autonomy"].get("release") == "approval":
-            return True
-        return merge_policy != "auto"
+        return bool(_merge_asks(getattr(self, "task", None), settings, self.cfg)[0])
 
     def _require_merge_approval(self) -> None:
         if self._merge_needs_approval() and not self._approved("approve_merge"):
             self._open_merge_approval()
 
+    def _merge_facts(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """What a person needs to decide a merge, from the task's own records (``metadata_json["merge"]`` of the
+        approval): the change, what checked it, what it cost and why a person is asked."""
+        ev, head = self.task.evidence or {}, self.task.head_sha or ""
+        facts: dict[str, Any] = {"pr": self.task.pr_number, "head": head}
+        with session_scope() as s:
+            diff = (s.query(Artifact).filter(Artifact.task_id == self.task_id, Artifact.kind == "diff")
+                    .order_by(Artifact.created_at.desc()).first())
+            data = dict(diff.data or {}) if diff is not None else {}
+        if data:
+            paths = [str(p) for p in data.get("files") or []]
+            facts["change"] = {"files": len(paths), "additions": int(data.get("additions") or 0),
+                               "deletions": int(data.get("deletions") or 0), "paths": paths[:8]}
+        verified = next((a for a in reversed(_objects(ev.get("attempts"))) if a.get("result") == "verified"), None)
+        if verified is not None:
+            verdict = verified.get("verdict") if isinstance(verified.get("verdict"), dict) else {}
+            facts["verifier"] = {"verdict": str(verdict.get("verdict") or ""),
+                                 "summary": _one_line(str(verdict.get("summary") or "").partition("\n")[0], 200)}
+            checks = _objects(verified.get("checks"))
+            facts["checks"] = {"passed": sum(bool(c.get("ok")) for c in checks), "total": len(checks),
+                               "preexisting": sum(bool(c.get("preexisting")) for c in checks if not c.get("ok"))}
+        ci = ev.get("ci") if isinstance(ev.get("ci"), dict) else {}
+        if ci.get("head") == head and ci.get("state"):
+            facts["ci"] = {"state": ci["state"], "checks": len(_objects(ci.get("checks")))}
+        review = ev.get("review") if isinstance(ev.get("review"), dict) else {}
+        result = review.get("result") if isinstance(review.get("result"), dict) else {}
+        if result.get("head") == head and self._review_policy()["address"] != "off":
+            found = _objects(result.get("open"))
+            facts["review"] = {"state": result.get("state"), "reviewers": list(result.get("reviewers") or []),
+                               "round": int(review.get("rounds") or 0),
+                               "open": len(found) + int(result.get("more") or 0),
+                               "blocking": sum(bool(f.get("blocking")) for f in found)}
+        facts["cost"] = {"usd": round(self._spent(), 2), "attempts": len(_charged(ev))}
+        because, text = _merge_asks(self.task, settings, self.cfg)
+        facts["asked"] = {"because": because, "text": text}
+        return facts
+
     def _open_merge_approval(self) -> None:
         self.update(stage="merge")
-        rails, why, metadata = _rails_touched(self.task), "", None
+        rails, why, metadata = _rails_touched(self.task), "", {}
         if rails:
             paths = rails.get("paths") or []
             why = (f"This change touches the Factory's rails ({', '.join(paths[:5])}{', …' if len(paths) > 5 else ''}"
@@ -2873,11 +2919,19 @@ class TaskRunner:
                    f"The Factory could not read this change's rails ({rails.get('unreadable')}), so a person approves "
                    "its merge.\n\n")
             metadata = {"people_only": "A change to the Factory's rails merges only when a person approves it"}
+        facts = self._merge_facts(workspace_settings(self.ws))
+        facts["text"] = "\n".join(_merge_lines(facts))
+        pr = self.task.pr_number
         self.block("approve_merge", f"Approve merge: {self.task.title}",
-                   f"{why}PR #{self.task.pr_number} passed independent verification and CI at "
-                   f"{self.task.head_sha[:10]}. {self.task.pr_url}{self._review_summary()}",
-                   status="awaiting_approval", metadata=metadata,
-                   options=[{"value": "approve", "label": "Merge"}, {"value": "reject", "label": "Request changes"}])
+                   f"{why}PR #{pr} passed independent verification and CI at "
+                   f"{self.task.head_sha[:10]}. {self.task.pr_url}\n{facts['text']}{self._review_summary()}",
+                   status="awaiting_approval", metadata={**metadata, "merge": facts},
+                   options=[{"value": "approve", "label": "Merge",
+                             "effect": f"Merges PR #{pr} into {self.repo.default_branch}; the release follows the "
+                                       "repository's release rule."},
+                            {"value": "reject", "label": "Request changes",
+                             "effect": "Sends your comment to the builder for another attempt; the pull request "
+                                       "stays open."}])
 
     async def _check_rails(self, token: str) -> None:
         """Record in ``evidence["rails"]`` which files the published candidate changes that match the repository's
@@ -3078,8 +3132,9 @@ class TaskRunner:
                             # e.g. branch protection requires a human review: that is a real decision.
                             self.block("unblock", f"{self.task.key}: GitHub refused the merge", str(exc),
                                        status="needs_input",
-                                       options=[{"value": "retry", "label": "Retry merge"},
-                                                {"value": "abandon", "label": "Abandon"}])
+                                       options=[{"value": "retry", "label": "Retry merge",
+                                                 "effect": f"Tries to merge PR #{self.task.pr_number} again."},
+                                                {**ABANDON, "label": "Abandon"}])
         if refresh_onto:
             await self._refresh_onto_main(token, gh, refresh_onto)
             return
@@ -3485,6 +3540,91 @@ def _review_asks(task: Any, settings: dict[str, Any], cfg: dict[str, Any]) -> bo
         return review_policy(settings, cfg)["address"] != "off"
     except ValueError:
         return True
+
+
+# Why a person is asked to merge (_merge_asks), most specific first.
+MERGE_ASKS = {
+    "rails": "Asked because this change touches the Factory's rails, and only a person approves those merges.",
+    "review_rounds": "Asked because blocking review findings are still open and the review rounds are used up.",
+    "review_timeout": "Asked because no review arrived in time, and the review policy says to ask a person then.",
+    "review_unread": "Asked because the reviews of this change could not be read from GitHub.",
+    "review_open": "Asked because blocking review findings are still open and no new review arrived.",
+    "learning": "Asked because the workspace is in learning mode, where every merge waits for a person.",
+    "repository": "Asked because merges in this repository wait for a person (Settings → Repositories).",
+    "release": "Asked because this repository releases when it merges, and releases in this workspace wait for a "
+               "person (Settings → Autonomy).",
+    "workspace": "Asked because merges in this workspace wait for a person (Settings → Autonomy).",
+}
+
+
+def _merge_asks(task: Any, settings: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, str]:
+    """Why the merge of the task's head waits for a person, as (a MERGE_ASKS key, its sentence); ("", "") when it
+    does not. No database access: the merge calls this while it holds the workspace lock."""
+    from ..onboarding_policy import active
+
+    because = ""
+    if _rails_touched(task):
+        because = "rails"
+    elif _review_asks(task, settings, cfg):
+        result = task.evidence["review"]["result"]
+        because = ("review_rounds" if result.get("ask") == "limit" else "review_open" if result.get("ask") == "open"
+                   else "review_unread" if result.get("unseen") or result.get("reason") == "unreadable"
+                   else "review_timeout")
+    elif active(settings):
+        because = "learning"
+    else:
+        mode = (cfg.get("merge") or {}).get("mode")
+        if (cfg.get("release") or {}).get("mode") == "on_merge" and settings["autonomy"].get("release") == "approval":
+            because = "repository" if mode and mode != "auto" else "release"
+        elif (mode or settings["autonomy"].get("merge", "auto")) != "auto":
+            because = "repository" if mode else "workspace"
+    return because, MERGE_ASKS.get(because, "")
+
+
+def _merge_lines(facts: dict[str, Any]) -> list[str]:
+    """A merge approval's facts (TaskRunner._merge_facts) as short lines of plain text, in the order a person reads
+    them: the change, what checked it, what it cost, why they are asked."""
+    lines = []
+    change = facts.get("change")
+    if change:
+        paths = change["paths"] + ([f"and {change['files'] - len(change['paths'])} more"]
+                                   if change["files"] > len(change["paths"]) else [])
+        lines.append(f"Change: {change['files']} file{'' if change['files'] == 1 else 's'}, +{change['additions']} "
+                     f"-{change['deletions']}" + (f": {', '.join(paths)}" if paths else ""))
+    verifier = facts.get("verifier")
+    if verifier:
+        lines.append(f"Verifier: {verifier['verdict'] or 'no verdict'}"
+                     + (f" — {verifier['summary']}" if verifier["summary"] else ""))
+    checks = facts.get("checks")
+    if checks:
+        pre = checks["preexisting"]
+        lines.append(f"Repository checks: {checks['passed']} of {checks['total']} passed"
+                     + (f"; {pre} failing check{' also fails' if pre == 1 else 's also fail'} on the base commit"
+                        if pre else ""))
+    ci = facts.get("ci")
+    if ci:
+        lines.append(f"CI: {ci['state']} ({ci['checks']} check{'' if ci['checks'] == 1 else 's'})")
+    review = facts.get("review")
+    if review:
+        who = (f"reviewed by {', '.join(review['reviewers'])}" if review["state"] == "reviewed"
+               else "no review of this head")
+        lines.append(f"Review: {who}; {review['open']} finding{'' if review['open'] == 1 else 's'} open"
+                     + (f" ({review['blocking']} blocking)" if review["blocking"] else "")
+                     + f"; {review['round']} review round{'' if review['round'] == 1 else 's'} so far")
+    cost = facts.get("cost")
+    if cost:
+        lines.append(f"Cost so far: ${cost['usd']:.2f} on builder and verifier sessions, {cost['attempts']} "
+                     f"charged attempt{'' if cost['attempts'] == 1 else 's'}")
+    if (facts.get("asked") or {}).get("text"):
+        lines.append(facts["asked"]["text"])
+    return lines
+
+
+def _charged(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    """The task's attempt records that count against its lifetime limit, in every budget: not infrastructure
+    failures, failures that predate the change or a builder's questions."""
+    return [a for a in evidence.get("attempts", []) if isinstance(a, dict) and a.get("result")
+            and a["result"] not in NOT_ATTEMPTS and a["result"] != "builder_blocked"]
 
 
 def _github_time(value: Any) -> datetime | None:

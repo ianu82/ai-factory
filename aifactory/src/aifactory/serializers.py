@@ -191,6 +191,9 @@ def decision(d: Decision, context: dict[str, Any] | None = None) -> dict[str, An
 
             ws = db.get(Workspace, d.workspace_id)
             context["hold"].update(probe_status(d.workspace_id, merged_settings(ws.settings if ws else {})))
+    merge = (d.metadata_json or {}).get("merge") if isinstance(d.metadata_json, dict) else None
+    if d.kind == "approve_merge" and isinstance(merge, dict):
+        context["merge"] = merge  # the change, what checked it, what it cost and why a person is asked
     return {"attribution": attribution, "actionable": actionable(d), "correction": correction,
             "supersedes": attribution.get("supersedes"), "id": d.id, "kind": d.kind, "title": d.title, "body": d.body, "options": d.options, "status": d.status,
             "resolution": d.resolution, "comment": d.comment, "resolved_by": d.resolved_by,

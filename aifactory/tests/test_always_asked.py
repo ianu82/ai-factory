@@ -84,6 +84,9 @@ def test_tasks_behind_an_ended_task_get_one_decision_for_the_outcome(factory, en
     [decision] = asked(oid)
     assert decision["kind"] == "unblock" and decision["task_id"] is None
     assert decision["options"] == ["continue", "drop"]
+    with session_scope() as s:  # each option says what it does
+        assert s.get(Decision, decision["id"]).options == scheduler.STRANDED_OPTIONS
+    assert all(o["effect"] for o in scheduler.STRANDED_OPTIONS)
     assert decision["metadata"] == {"stranded": {"waiting": ["T2", "T3"], "ended": ["T1"]}}
     assert decision["title"] == "T2, T3 cannot start: T1 ended without being delivered"
     assert "- T2 (Part T2) waits for T1." in decision["body"] and "- T3 (Part T3) waits for T2." in decision["body"]
