@@ -723,7 +723,7 @@ async def connect_repo(workspace_id: str, body: RepoConnect, user: User = Depend
         definitions.lock_workspace(db, workspace_id)
         definitions.lock_repositories(db, workspace_id)
         db.add(repo)
-        definitions.validate_repository_change(db, workspace_id)
+        definitions.validate_repository_change(db, workspace_id, author=user.id)
         db.commit()
     except definitions.DefinitionError as exc:
         db.rollback()
@@ -748,7 +748,7 @@ def update_repo(workspace_id: str, repo_id: str, body: RepoUpdate, user: User = 
         raise HTTPException(404, "Repository not found")
     try:
         repo.config = _clean_repo_config(repo.config or {}, body.config)
-        definitions.validate_repository_change(db, workspace_id)
+        definitions.validate_repository_change(db, workspace_id, author=user.id)
         db.commit()
     except definitions.DefinitionError as exc:
         db.rollback()
@@ -839,6 +839,7 @@ def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(curren
         db.delete(preview_account)
     workstream_events = workstreams.remove_repository_defaults(db, workspace_id, repo_id, user)
     db.delete(repo)
+    definitions.validate_repository_change(db, workspace_id, author=user.id)
     db.commit()
     workstreams.publish_changes(workstream_events)
     return {"ok": True}

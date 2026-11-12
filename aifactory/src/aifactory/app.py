@@ -18,6 +18,7 @@ from .api import router as api_router
 from .auth import router as auth_router
 from .config import get_settings
 from .db import init_engine
+from .definitions_api import router as definitions_router
 from .gateway import router as gateway_router
 from .merge_manager import router as merge_queue_router
 from .coordination import router as coordination_router
@@ -76,6 +77,7 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
         return response
 
     app.include_router(api_router)
+    app.include_router(definitions_router)
     app.include_router(auth_router)
     app.include_router(gateway_router)
     app.include_router(onboarding_router)
