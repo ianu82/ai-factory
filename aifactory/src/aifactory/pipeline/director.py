@@ -103,14 +103,29 @@ def choices(db, decision: Decision, cfg: dict[str, Any]) -> tuple[list[str], str
     allowed = [value for value in offered if value not in NEVER]
     why = "Taking work over is left to people" if len(allowed) < len(offered) else ""
     if decision.kind == "budget" and "retry" in allowed and decision.outcome_id:
-        # Continuing grants the outcome one more extension (budgets.continue_usd): it must fit under the ceiling.
+        # What continuing may cost must fit under the ceiling.
         committed, _ = outcome_committed(decision.outcome_id)
-        after = committed + budget_extension(workspace_settings(decision.workspace_id))
+        after = committed + continuation_usd(decision, workspace_settings(decision.workspace_id))
         if after > cfg["max_outcome_usd"]:
             allowed.remove("retry")
             why = (f"Continuing would take the outcome to ${after:.2f} (${committed:.2f} committed), past the "
                    f"Director's ceiling of ${cfg['max_outcome_usd']:.2f}: only a person lets it spend more")
     return allowed, why
+
+
+def continuation_usd(decision: Decision, settings: dict[str, Any]) -> float:
+    """The most that continuing a budget decision lets the outcome spend. A task's continuation is one extension
+    (budgets.continue_usd, decisions.resolve). Planning's is one more planning run (planning._continued_past_budget):
+    up to PLAN_REVIEW_ROUNDS + 1 rounds of a planner and a plan reviewer session, each capped by budgets.run_usd.
+    Without a run cap, planning's continuation has no bound."""
+    if decision.task_id:
+        return budget_extension(settings)
+    from .planning import PLAN_REVIEW_ROUNDS
+
+    run = (settings.get("budgets") or {}).get("run_usd")
+    if type(run) not in (int, float) or not math.isfinite(run) or run <= 0:
+        return math.inf
+    return 2 * (PLAN_REVIEW_ROUNDS + 1) * float(run)
 
 
 def within_ceiling(db, decision: Decision) -> bool:
@@ -253,12 +268,15 @@ def claim(item: dict[str, Any]) -> tuple[str, float] | None:
     workspace_id = item["workspace_id"]
     now = utcnow()
     with session_scope() as s:
-        lock_workspace(s, workspace_id)
+        ws = lock_workspace(s, workspace_id)
+        # What due() saw may have changed before the lock: paused, a provider hold opened, or the Director turned off.
+        cfg = settings_for(merged_settings(ws.settings))
+        if ws.paused or cfg["mode"] != "on" or workspace_id in held_workspaces(s):
+            return None
         history = _history(s, workspace_id, now)
         if history and (now - history[0]["started_at"] < COOLDOWN
                         or any(run["finished"] is None and now - run["started_at"] < CLAIMED for run in history)):
             return None
-        cfg = settings_for(merged_settings(s.get(Workspace, workspace_id).settings))
         usd = min(float(item.get("usd") or 0.0), cfg["daily_usd"] - _spent(history))
         if usd < UNPRICED_MIN:
             return None

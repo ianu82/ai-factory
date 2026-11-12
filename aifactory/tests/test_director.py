@@ -174,6 +174,21 @@ def test_two_scheduler_instances_never_both_start_a_run(world):
     assert world["ws"] not in woken()
 
 
+@pytest.mark.parametrize("change", ["paused", "off", "hold"])
+def test_a_claim_rechecks_what_may_have_changed_since_due(world, change):
+    item = woken()[world["ws"]]
+    if change == "hold":
+        open_provider_hold(world["ws"], "402 Payment Required", "a test")
+    else:
+        with db.session_scope() as s:
+            w = s.get(Workspace, world["ws"])
+            if change == "paused":
+                w.paused = True
+            else:
+                w.settings = {**w.settings, "director": {**ON, "mode": "off"}}
+    assert director.claim(item) is None
+
+
 def test_it_lets_an_outcome_continue_past_its_budget_only_up_to_the_ceiling(world):
 
     with db.session_scope() as s:
@@ -193,6 +208,24 @@ def test_it_lets_an_outcome_continue_past_its_budget_only_up_to_the_ceiling(worl
         allowed, why = director.choices(s, budget, cfg)
         assert allowed == ["abandon"] and "to $125.00" in why and "ceiling of $120.00" in why
         assert director.choices(s, budget, {**cfg, "max_outcome_usd": 200.0})[0] == ["retry", "abandon"]
+
+
+def test_continuing_planning_must_fit_a_whole_planning_run_under_the_ceiling(world):
+    with db.session_scope() as s:  # planning stopped at the budget: a decision on the outcome, with no task
+        budget = Decision(workspace_id=world["ws"], outcome_id=world["outcome"], kind="budget",
+                          title="Outcome #7 reached its budget", options=[{"value": "retry", "label": "Continue anyway"},
+                                                                          {"value": "cancel", "label": "Cancel"}])
+        s.add(budget)
+        s.flush()
+        budget_id = budget.id
+    cfg = director.settings_for({"director": ON})
+    spend(world, 90.0)
+    with db.session_scope() as s:  # 3 rounds of a planner and a reviewer session at $5 each: $30 fits under $120
+        assert director.choices(s, s.get(Decision, budget_id), cfg)[0] == ["retry", "cancel"]
+    spend(world, 5.0)
+    with db.session_scope() as s:
+        allowed, why = director.choices(s, s.get(Decision, budget_id), cfg)
+        assert allowed == ["cancel"] and "to $125.00" in why
 
 
 def test_a_continuation_the_director_granted_holds_only_under_its_ceiling(world):
