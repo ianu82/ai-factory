@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal, session_scope, utcnow
@@ -56,6 +57,9 @@ _BODY = re.compile(r"^The model provider refused a request \((?P<source>.*?)\):\
                    r"\n\n(?:Cause: |Nothing new)", re.DOTALL)
 FACTORY_EMAIL = "factory@factory.local"
 TEST_AFTER = timedelta(minutes=2)  # a hold is first tested this long after it opened
+# Unless it opened this soon after the Factory lifted the last one: that test passed and the work was refused all the
+# same (a quota that lets a small request through), so this hold waits as long before its first test.
+RETEST_AFTER = timedelta(minutes=30)
 TEST_TIMEOUT = 30.0
 TEST_TOKENS = 16
 # When each workspace's hold was last tested, in memory: after a restart it is simply tested again.
@@ -153,10 +157,14 @@ def due_probes(tested: dict[str, datetime], running: frozenset[str] = frozenset(
                 .join(Workspace, Workspace.id == Decision.workspace_id)
                 .filter(Decision.kind == PROVIDER_HOLD, Decision.status == "open", Workspace.paused.isnot(True))
                 .order_by(Decision.created_at).all())
+        lifted = dict(s.query(Event.workspace_id, func.max(Event.created_at)).filter(
+            Event.kind == "provider_hold_lifted", Event.workspace_id.in_({row[1] for row in rows}))
+            .group_by(Event.workspace_id).all()) if rows else {}
     for decision_id, workspace_id, opened, settings in rows:
         every = every_minutes(merged_settings(settings))
-        last = tested.get(workspace_id)
-        if (not every or workspace_id in running or workspace_id in due or now - opened < TEST_AFTER
+        last, lift = tested.get(workspace_id), lifted.get(workspace_id)
+        first = RETEST_AFTER if lift is not None and timedelta(0) <= opened - lift < RETEST_AFTER else TEST_AFTER
+        if (not every or workspace_id in running or workspace_id in due or now - opened < first
                 or (last is not None and now - last < timedelta(minutes=every))):
             continue
         due[workspace_id] = {"workspace_id": workspace_id, "decision_id": decision_id}

@@ -475,7 +475,8 @@ export type ConversationItem =
   | ({ kind: "lead"; id: string; at: string; text: string; task_key: string | null; update: boolean; decision_id: string | null } & StepGroup)
   | { kind: "lead_guidance"; id: string; at: string; text: string; task_key: string | null; delivered: boolean }
   | { kind: "person"; id: string; at: string; text: string; task_key: string | null; author: string; operator: boolean; delivered: boolean }
-  | { kind: "factory"; id: string; at: string; text: string; task_key: string | null }
+  | ({ kind: "factory"; id: string; at: string; text: string; task_key: string | null; digest?: boolean }
+    & Partial<StepGroup>)
   | { kind: "decision"; at: string; decision: Decision }
   | ({ kind: "working"; at: string } & StepGroup);
 

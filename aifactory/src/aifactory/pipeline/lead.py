@@ -329,7 +329,10 @@ def due(running: frozenset[str] = frozenset(), now: datetime | None = None) -> l
             if (o.status not in FINISHED and limit is not None and outcome_committed(o.id)[0] >= limit
                     and not continued_past_budget(s, o.id)):
                 # A spent outcome waits for a person to raise its budget or let it continue: its Lead couldn't run,
-                # and trying every 15 minutes would only fill the activity with failed runs.
+                # and trying every 15 minutes would only fill the activity with failed runs. Its progress is told
+                # all the same: a digest needs no budget.
+                if progress and (digested is None or now - digested >= DIGEST_EVERY):
+                    digests.append((o.workspace_id, o.id, progress))
                 continue
             until = posts[-1].created_at.isoformat() if posts else seen.get("posts_until")
             woken.append({"workspace_id": o.workspace_id, "outcome_id": o.id, "reasons": reasons,
