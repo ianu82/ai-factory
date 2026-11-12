@@ -23,6 +23,7 @@ from typing import Any, Callable
 from ..config import get_settings
 from ..db import session_scope, utcnow
 from ..events import notify, record
+from ..failures import RUN_CAPS, failure_cause, text_cause
 from ..guided import README_TEMPLATE, outcome_guidance
 from .. import merge_manager
 from ..github import CheckSummary, GitHub, GitHubError, resolve_credential as resolve_token
@@ -31,6 +32,7 @@ from ..gitops import (AUTHOR, DEFAULT_PROTECTED, BranchMoved, GitError, Patch, _
                       tree_changes, tree_id)
 from ..gitops import patch_id
 from ..models import Artifact, Decision, Event, Outcome, Repository, Run, Signal, Task, new_id
+from ..harness.schemas import _criterion_key
 from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, verify_prompt
 from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, findings_unseen, headline,
                       new_review_evidence, normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
@@ -38,8 +40,8 @@ from ..sandbox import COMMAND_TIMEOUT, LocalSandbox, SandboxError
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
-from .runtime import (SessionSpec, budget_extension, guidance_history, open_decision, outcome_committed,
-                      outcome_cost, precedents, publish_decision, run_agent, workspace_settings)
+from .runtime import (SessionSpec, budget_extension, carried_cause, guidance_history, open_decision,
+                      outcome_committed, outcome_cost, precedents, publish_decision, run_agent, workspace_settings)
 
 from .lifecycle import transition
 
@@ -49,25 +51,6 @@ CI_POLL_TIMEOUT_SECONDS = 90
 REVIEW_POLL_SECONDS = 60
 REVIEW_REPLY_TRIES = 3  # polls that may fail to post a round's answers on their threads before the Factory gives up
 
-# Billing, quota and access problems: a person has to act (top up credits, fix a key), so the task blocks and no
-# attempt is charged. Each harness words them differently: the native client ("MindsHub: no credit remaining"), Codex
-# through the Factory gateway ("wallet_empty", "Provider returned 402: …") and Anton through the OpenAI SDK
-# ("Error code: 402 - …", "insufficient_quota").
-PROVIDER_PROBLEMS = ("refused the credential", "no credit", "No model provider", "limit reached", "wallet",
-                     "No GitHub access", "Bad credentials", "credits are used up", "wallet_empty", "insufficient_quota",
-                     "quota exceeded", "billing")
-# HTTP 402 as a status code, never as digits inside a number such as a token count ("1,402,000").
-_PAYMENT_REQUIRED = re.compile(r"(?:\b(?:returned|error code|status(?: code)?|http)\W{0,3}|\()402\b|\b402 payment",
-                               re.IGNORECASE)
-# An attempt's own caps (turns, time, tokens, cost) are not infrastructure: they stay charged.
-RUN_CAPS = ("budget of", "budget_exhausted", "time budget", "Stopped after")
-# The provider or the sandbox was unavailable after the client's own retries: the same attempt is redone later.
-TRANSIENT_PROBLEMS = ("Model request failed", "unreachable", "timed out", "timeout", "connection error",
-                      "connection reset", "connection refused", "stream disconnected", "server disconnected",
-                      "bad gateway", "service unavailable", "gateway timeout", "overloaded", "upstream_error",
-                      "VM bridge", "No sandbox identities", "Sandbox setup failed")
-_SERVER_ERROR = re.compile(r"\b(?:returned|error(?: code)?|status(?: code)?|http)\W{0,3}(?:5\d\d|429)\b",
-                           re.IGNORECASE)
 INFRA_RETRIES = 3  # consecutive automatic retries of an infrastructure failure before a person decides
 INFRA_BACKOFF_SECONDS = (120, 600)  # before the first retry, then before each later one
 _PHASES = {"prepare": "Preparing the sandbox", "build": "The builder session",
@@ -207,18 +190,15 @@ BUILD_STAGES = ("prepare", "build", "checks", "verify", "publish")
 _BASE_CHECKS: dict[tuple[str, ...], dict[str, Any]] = {}
 
 
-def infrastructure_problem(error: str) -> str:
+def infrastructure_problem(error: str, cause: str | None = None) -> str:
     """Why a session or sandbox failed when it was not the attempt's doing: "provider" (billing, quota or access; a
     person acts), "transient" (the provider or the sandbox was unavailable; the attempt is redone later), or "" (the
-    attempt's own failure, including its turn, time, token and cost caps)."""
-    text = (error or "").lower()
-    if any(p.lower() in text for p in PROVIDER_PROBLEMS) or _PAYMENT_REQUIRED.search(text):
-        return "provider"
-    if any(c.lower() in text for c in RUN_CAPS):
-        return ""
-    if any(p.lower() in text for p in TRANSIENT_PROBLEMS) or _SERVER_ERROR.search(text):
-        return "transient"
-    return ""
+    attempt's own failure, including its turn, time, token and cost caps).
+
+    ``cause`` is what the failure itself said, where it happened (runtime.carried_cause), and it decides, whatever
+    the wording. Without one the error's wording is read (failures.text_cause): the Codex CLI, sandbox and GitHub
+    errors, and runs recorded before causes were carried."""
+    return text_cause(error) if cause is None else cause
 
 
 class Stop(Exception):
@@ -829,7 +809,7 @@ class TaskRunner:
                 await self._prepare_steward_revert(identity)
             else:
                 findings, unlisted = self._round_findings()
-                run, result, error = await run_agent(SessionSpec(
+                run, result, error = await self._session(attempt, "build", SessionSpec(
                     workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="builder",
                     effective_settings=self.settings, repositories={self.repo.full_name: self.cfg},
                     harness=self.task.harness, system=BUILDER, sandbox=self.builder, attempt=attempt, writable=True,
@@ -837,9 +817,9 @@ class TaskRunner:
                     prompt=build_prompt(self.task, self.outcome, self.repo, self._builder_feedback(),
                                         precedents(self.ws, self.repo.id),
                                         guidance_history(self.task.outcome_id, self.task_id), sections,
-                                        review_findings(findings, unlisted))), self.cancelled)
+                                        review_findings(findings, unlisted))))
                 if result is None:
-                    cause = infrastructure_problem(error)
+                    cause = infrastructure_problem(error, carried_cause(run))
                     if cause:
                         self._infrastructure(attempt, "build", error, cause)
                     # A session stopped by its own cap (time, turns, tokens, cost) may have left the work done, so its
@@ -1291,6 +1271,7 @@ class TaskRunner:
             sandbox = None
             app: AppRun | None = None
             result = None
+            carried = None  # what the session's failure said it was; a sandbox that failed says nothing
             try:
                 try:
                     sandbox = await self._verifier_sandbox(token, patch, attempt, tries, qa_cfg)
@@ -1303,7 +1284,7 @@ class TaskRunner:
                         app = await self._start_app(sandbox, qa_cfg)
                         brief = verifier_brief(app)
                     sections = await self._sections(verifier=True)
-                    run, result, error = await run_agent(SessionSpec(
+                    run, result, error = await self._session(attempt, "verify", SessionSpec(
                         workspace_id=self.ws, outcome_id=self.task.outcome_id, task_id=self.task_id, role="verifier",
                         harness=self.task.verifier_harness, system=verifier_system(self.task.base_sha), sandbox=sandbox,
                         attempt=attempt, writable=False, effective_settings=self.settings,
@@ -1314,7 +1295,8 @@ class TaskRunner:
                                              guidance_history(self.task.outcome_id, self.task_id),
                                              outcome=self.outcome, sections=sections, previous=previous)
                         + ("\nExplicit verification criterion: " + STEWARD_TEST_CRITERION if self._steward_identity() else "")
-                        + brief), self.cancelled)
+                        + brief))
+                    carried = carried_cause(run)
                     if app is not None:
                         await self._store_app_evidence(app, attempt, run.id)
             finally:
@@ -1323,7 +1305,7 @@ class TaskRunner:
                 if sandbox is not None:
                     await sandbox.close()
             if result is None:
-                if infrastructure_problem(error) == "provider":
+                if infrastructure_problem(error, carried) == "provider":
                     self._infrastructure(attempt, "verify", error, "provider")
                 self.event("verification_unavailable", f"Verifier session failed: {error[:300]}", level="warn")
                 continue
@@ -1366,7 +1348,7 @@ class TaskRunner:
                                        "checks": _brief(self.checks), "app_run": self.app_summary, **seen, **flipped})
             self.event("verification_failed", str(report.get("summary") or "")[:400], level="warn", **flipped)
             return None
-        if infrastructure_problem(error) == "transient":
+        if infrastructure_problem(error, carried) == "transient":
             self._infrastructure(attempt, "verify", error, "transient")
         self.block("unblock", f"{self.task.key}: independent verification could not run",
                    "Two verifier sessions failed to produce a verdict. The candidate remains unverified and was not "
@@ -1419,6 +1401,16 @@ class TaskRunner:
         epoch = int(ev.get("budget_epoch", 0))
         return [a for a in ev.get("attempts", []) if isinstance(a, dict) and int(a.get("epoch", 0)) == epoch
                 and a.get("result") not in NOT_ATTEMPTS]
+
+    async def _session(self, attempt: int, phase: str, spec: SessionSpec):
+        """One builder or verifier session (run_agent). A provider that refuses before the session starts (no valid
+        credential: there is no run yet) holds the workspace as a refusal inside the session does."""
+        try:
+            return await run_agent(spec, self.cancelled)
+        except Exception as exc:
+            if failure_cause(exc) != "provider":
+                raise
+            self._infrastructure(attempt, phase, str(exc), "provider")
 
     def _infrastructure(self, attempt: int, phase: str, error: str, cause: str) -> None:
         """The model provider or the sandbox failed, not the attempt, so it is not charged. Billing, quota and access
@@ -3089,10 +3081,11 @@ def _diff_changes(before: bytes, after: bytes) -> tuple[list[str], list[str]]:
 
 
 def _flipped(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
-    """Criteria the previous verdict passed and this one does not, matched by their text (trimmed, case-folded): a
-    reworded criterion does not match."""
+    """Criteria the previous verdict passed and this one does not, matched the way a report's criteria are matched to
+    the task's (schemas._criterion_key: case, spacing, a list number and quoting aside): a reworded criterion does not
+    match."""
     def key(c: dict[str, Any]) -> str:
-        return str(c.get("criterion") or "").strip().casefold()
+        return _criterion_key(c.get("criterion"))
 
     passed = {key(c) for c in _objects(before.get("criteria")) if c.get("status") == "pass"} - {""}
     return [str(c.get("criterion")) for c in _objects(after.get("criteria"))

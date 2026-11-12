@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 
+from ..failures import text_cause
 from ..sandbox import SCRATCH, read_text, write_text
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
 from .schemas import validate_report
@@ -66,8 +67,9 @@ class CodexHarness:
             f'base_url = "{session.gateway_url}"',
             'env_key = "FACTORY_GATEWAY_TOKEN"',
             'wire_api = "responses"',
-            "request_max_retries = 2",
-            "stream_max_retries = 2",
+            # The CLI's own retries of a request or a stream the gateway could not serve.
+            "request_max_retries = 5",
+            "stream_max_retries = 5",
             "",
         ])
         await write_text(sandbox, f"{scratch}/config.toml", config)
@@ -129,7 +131,9 @@ class CodexHarness:
         if report is None:
             failure = next((e for e in reversed(events) if e.get("type") in ("turn.failed", "error")), None)
             detail = json.dumps(failure)[:600] if failure else result.output[-800:]
-            raise HarnessFailed(f"Codex did not return a report (exit {result.exit_code}): {detail}")
+            # The CLI reports a failure only as text, so this is the one place its wording is read for a cause.
+            message = f"Codex did not return a report (exit {result.exit_code}): {detail}"
+            raise HarnessFailed(message, cause=text_cause(message))
         report, error = validate_report(session.role, report, session.expected_criteria, session.expected_findings)
         if report is None:
             raise HarnessFailed(f"Codex report was invalid: {error}")

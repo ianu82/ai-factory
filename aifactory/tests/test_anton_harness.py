@@ -14,9 +14,10 @@ anton = pytest.importorskip("anton.core.session")
 
 from fastapi import FastAPI, Request  # noqa: E402
 
+from aifactory import inference  # noqa: E402
 from aifactory.inference_limits import provider_guard  # noqa: E402
 from aifactory.harness.anton import AntonHarness  # noqa: E402
-from aifactory.harness.base import HarnessSession  # noqa: E402
+from aifactory.harness.base import HarnessFailed, HarnessSession  # noqa: E402
 from aifactory.harness.schemas import BUILDER_REPORT  # noqa: E402
 from aifactory.inference import ModelClient, ProviderConfig, UsageLedger  # noqa: E402
 from aifactory.sandbox import LocalSandbox  # noqa: E402
@@ -28,7 +29,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100, cached_tokens=0):
+def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100, cached_tokens=0, errors=None):
+    """``errors``: HTTP statuses the provider answers with first, one per request, before it serves any."""
     import uvicorn
 
     app = FastAPI()
@@ -43,6 +45,9 @@ def _fake_server(port: int, requests: list, web_enabled=False, input_tokens=100,
     @app.post("/v1/responses")
     async def responses(request: Request):
         body = await request.json()
+        if errors:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": {"message": "the fake provider refused"}}, status_code=errors.pop(0))
         requests.append(body)
         outputs = [i for i in body.get("input", []) if isinstance(i, dict) and i.get("type") == "function_call_output"]
         n = len(requests)
@@ -128,6 +133,61 @@ def test_anton_harness_runs_factory_tools_and_returns_validated_report(tmp_path,
     # The actual ChatSession dispatch must use the replacement and pass vision
     # content to the provider, not just advertise an otherwise unreachable tool.
     assert any("data:image/png;base64," in json.dumps(body) for body in requests[2:])
+
+
+def test_anton_retries_a_short_outage_inside_the_session(tmp_path, monkeypatch):
+    # The real SDK and real HTTP 503s: the request is sent again in place, and the session goes on to its report.
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    monkeypatch.setattr(inference, "RETRY_WAIT_CAP_SECONDS", 0.01)
+    port = _free_port()
+    requests: list = []
+    errors = [503, 503]
+    server = _fake_server(port, requests, errors=errors)
+    progress = []
+    try:
+        sb = _sandbox(tmp_path)
+        provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
+        session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
+                                 sandbox=sb, model="fake-model", client=ModelClient(provider),
+                                 ledger=UsageLedger(run_id="r", workspace_settings={}), report_schema=BUILDER_REPORT,
+                                 writable=True, max_turns=10, on_progress=lambda *event: progress.append(event))
+        result = asyncio.run(AntonHarness().run(session))
+    finally:
+        server.should_exit = True
+    assert result.report == {"status": "done", "summary": "Wrote hello.txt"}
+    assert errors == [] and (sb.work / "hello.txt").read_text() == "hi from anton\n"
+    warnings = [event[1] for event in progress if event[0] == "warn"]
+    assert len(warnings) == 1, warnings  # one line for the request that was retried, not one per try
+    assert warnings[0].startswith("Model provider unavailable (503); retried for ")
+    assert warnings[0].endswith(" s, then succeeded")
+    guard = provider_guard(provider)
+    assert guard.active == 0
+    assert len(guard._sends) == len(requests) + 2  # each refused send took a permit of its own, and gave it back
+
+
+def test_a_provider_refusal_ends_an_anton_session_with_its_cause(tmp_path, monkeypatch):
+    # HTTP 402 through the real SDK: never retried here, and the failure itself says the provider refused.
+    monkeypatch.setattr(UsageLedger, "persist", lambda self: None)
+    monkeypatch.setattr(inference, "RETRY_WAIT_CAP_SECONDS", 0.01)
+    port = _free_port()
+    requests: list = []
+    server = _fake_server(port, requests, errors=[402] * 100)
+    progress = []
+    try:
+        provider = ProviderConfig("openai", f"http://127.0.0.1:{port}/v1", "sk-test", "Fake")
+        session = HarnessSession(run_id="r", role="builder", system="You are a builder.", prompt="Create hello.txt",
+                                 sandbox=_sandbox(tmp_path), model="fake-model", client=ModelClient(provider),
+                                 ledger=UsageLedger(run_id="r", workspace_settings={}), report_schema=BUILDER_REPORT,
+                                 writable=True, max_turns=2, deadline=time.monotonic() + 60,
+                                 on_progress=lambda *event: progress.append(event))
+        with pytest.raises(HarnessFailed) as failed:
+            asyncio.run(AntonHarness().run(session))
+    finally:
+        server.should_exit = True
+    assert failed.value.cause == "provider", str(failed.value)
+    assert requests == []  # no request was served
+    assert not [event for event in progress if event[0] == "warn"]  # the retry loop never waited on a refusal
+    assert provider_guard(provider).active == 0
 
 
 @pytest.mark.parametrize("seconds_left", [300, 60])
