@@ -352,6 +352,285 @@ def test_bootstrap_cancels_by_number_only_when_idle_and_declares_priority(monkey
         assert declared == {"Mind v1": 0, "Other": 2}
 
 
+@pytest.fixture
+def priority_bootstrap(monkeypatch):
+    """Run the real bootstrap in its startup event loop, without repository connections."""
+    base = {"organization": "Acme", "workspace": "Delivery"}
+
+    def boot(items=None, **overrides):
+        config = {**base, **overrides}
+        if items is not None:
+            config["priority"] = items
+        monkeypatch.setenv("AIFACTORY_BOOTSTRAP", json.dumps(config))
+
+        async def run():
+            return apply_bootstrap()
+
+        return asyncio.run(run())
+
+    return boot, boot()
+
+
+@pytest.mark.parametrize("source", ["user", "signal", "operator", "improvement", "review"])
+def test_bootstrap_priority_records_operator_attribution_without_changing_work(priority_bootstrap, monkeypatch, source):
+    from aifactory import events
+    from aifactory.models import Decision, Event, Plan, Task
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws_id, full_name="acme/app", config={})
+        outcome = Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2,
+                          source=source, status="running")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id, status="approved", content={})
+        s.add(plan)
+        s.flush()
+        s.add_all([Task(workspace_id=ws_id, outcome_id=outcome.id, plan_id=plan.id, key=key,
+                        title=key, repo_id=repo.id, status=status, attempt=1, stage="verify")
+                   for key, status in (("T1", "running"), ("T2", "queued"))])
+        decision = Decision(workspace_id=ws_id, outcome_id=outcome.id, kind="question", title="Question", body="")
+        s.add(decision)
+        s.flush()
+        outcome_id, plan_id, decision_id = outcome.id, plan.id, decision.id
+    notified = []
+
+    def notify(workspace_id, entity, entity_id):
+        # A separate reader must see both the new priority and nonce before notification.
+        with session_scope() as s:
+            assert s.get(Outcome, entity_id).priority == 0
+            assert s.query(Event).filter(Event.outcome_id == entity_id,
+                                         Event.kind == "outcome_priority_changed").count() == 1
+        notified.append((workspace_id, entity, entity_id))
+
+    monkeypatch.setattr(events, "notify", notify)
+    boot([{"outcome": 19, "priority": 0, "nonce": "raise-review"}], delegated_by="ian@example.com")
+    assert notified == [(ws_id, "outcome", outcome_id)]
+    with session_scope() as s:
+        outcome = s.get(Outcome, outcome_id)
+        assert (outcome.priority, outcome.status, outcome.source) == (0, "running", source)
+        event = s.query(Event).filter(Event.kind == "outcome_priority_changed").one()
+        assert (event.workspace_id, event.outcome_id, event.actor) == (ws_id, outcome_id, "operator")
+        assert {k: event.data[k] for k in ("from", "to", "nonce", "delegated_by")} == {
+            "from": 2, "to": 0, "nonce": "raise-review", "delegated_by": "ian@example.com"}
+        assert event.message == "Operator changed priority of #19 from 2 to 0 (delegated by ian@example.com)"
+        assert {(t.key, t.status, t.attempt, t.stage) for t in s.query(Task)} == {
+            ("T1", "running", 1, "verify"), ("T2", "queued", 1, "verify")}
+        assert s.get(Plan, plan_id).status == "approved"
+        assert s.get(Decision, decision_id).status == "open"
+
+
+def test_bootstrap_priority_nonce_is_outcome_scoped_and_preserves_later_edits(priority_bootstrap):
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add_all([Outcome(workspace_id=ws_id, number=n, title=str(n), priority=2) for n in (19, 20)])
+    action = {"outcome": 19, "priority": 0, "nonce": "p1"}
+    boot([action])
+    with session_scope() as s:
+        s.query(Outcome).filter(Outcome.workspace_id == ws_id, Outcome.number == 19).one().priority = 3
+    boot([action])
+    with session_scope() as s:
+        assert s.query(Outcome).filter(Outcome.number == 19).one().priority == 3
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 1
+    boot([{**action, "nonce": "p2", "priority": 1}, {**action, "outcome": 20}])
+    with session_scope() as s:
+        assert {o.number: o.priority for o in s.query(Outcome)} == {19: 1, 20: 0}
+        events = s.query(Event).filter(Event.kind == "outcome_priority_changed").order_by(Event.id).all()
+        assert [(e.data["from"], e.data["to"], e.data["nonce"]) for e in events] == [
+            (2, 0, "p1"), (3, 1, "p2"), (2, 0, "p1")]
+        assert events[0].message == "Operator changed priority of #19 from 2 to 0"
+        assert "delegated_by" not in events[0].data
+
+
+def test_bootstrap_priority_is_visible_in_outcome_and_audit_api(priority_bootstrap, client):
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        outcome = Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2)
+        s.add(outcome)
+        s.flush()
+        outcome_id = outcome.id
+    boot([{"outcome": 19, "priority": 0, "nonce": "api-visible"}], admins=["ian@example.com"],
+         delegated_by="ian@example.com")
+    response = client.post("/auth/dev", json={"email": "ian@example.com", "organization": "Acme"})
+    assert response.status_code == 200
+    response = client.get(f"/api/workspaces/{ws_id}/outcomes/{outcome_id}")
+    assert response.status_code == 200
+    assert response.json()["outcome"]["priority"] == 0
+    response = client.get(f"/api/workspaces/{ws_id}/events")
+    assert response.status_code == 200
+    event = next(e for e in response.json() if e["kind"] == "outcome_priority_changed")
+    assert event["actor"] == "operator" and event["outcome_id"] == outcome_id
+    assert event["data"]["nonce"] == "api-visible"
+    assert event["data"]["delegated_by"] == "ian@example.com"
+
+
+def test_bootstrap_priority_equal_value_consumes_nonce(priority_bootstrap):
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=19, title="Already urgent", priority=0))
+    action = {"outcome": 19, "priority": 0, "nonce": "acknowledge"}
+    boot([action])
+    with session_scope() as s:
+        event = s.query(Event).filter(Event.kind == "outcome_priority_changed").one()
+        assert event.data["from"] == event.data["to"] == 0
+        s.query(Outcome).filter(Outcome.number == 19).one().priority = 3
+    boot([action])
+    with session_scope() as s:
+        assert s.query(Outcome).filter(Outcome.number == 19).one().priority == 3
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 1
+
+
+@pytest.mark.parametrize("value", [-1, 4, 0.0, 1.5, "0", True, False, None, [], {}])
+def test_bootstrap_priority_rejects_invalid_priorities_without_consuming_nonce(priority_bootstrap, value, caplog):
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2))
+    action = {"outcome": 19, "nonce": "fixable"}
+    boot([{**action, "priority": value}])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 2
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 0
+    assert "invalid outcome number, priority or nonce" in caplog.text
+    boot([{**action, "priority": 0}])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 0
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 1
+
+
+def test_bootstrap_priority_skips_malformed_and_missing_entries_and_is_workspace_scoped(priority_bootstrap, caplog):
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        org_id = s.get(Workspace, ws_id).org_id
+        foreign = Workspace(org_id=org_id, name="Other", slug="other", settings={})
+        s.add(foreign)
+        s.flush()
+        other_id = foreign.id
+        s.add_all([Outcome(workspace_id=ws_id, number=19, title="Managed", priority=2),
+                   Outcome(workspace_id=other_id, number=19, title="Namesake", priority=2),
+                   Outcome(workspace_id=other_id, number=99, title="Foreign only", priority=2)])
+    action = {"outcome": 19, "priority": 0, "nonce": "p1"}
+    malformed = [None, False, 1, "bad", [], {},
+                 {"outcome": 19, "nonce": "missing-priority"},
+                 {"outcome": 19, "priority": 0}]
+    malformed += [{**action, "nonce": nonce} for nonce in (None, "", "  ", 123, True, [], {})]
+    malformed += [{**action, "outcome": n} for n in (None, "19", 19.0, True, -1, 0, 2**63, [], {})]
+    malformed += [{**action, "outcome": 99}, {**action, "workspace": other_id}]
+    boot(malformed + [action], delegated_by="ian@example.com")
+    with session_scope() as s:
+        assert {(o.workspace_id, o.number): o.priority for o in s.query(Outcome)} == {
+            (ws_id, 19): 0, (other_id, 19): 2, (other_id, 99): 2}
+        event = s.query(Event).filter(Event.kind == "outcome_priority_changed").one()
+        assert event.workspace_id == ws_id and event.data["nonce"] == "p1"
+        # The nonexistent target did not consume the nonce, even though #99 exists elsewhere.
+        s.add(Outcome(workspace_id=ws_id, number=99, title="Now exists", priority=2))
+    assert "no such outcome" in caplog.text and "outside the managed workspace" in caplog.text
+    boot([{**action, "outcome": 99}])
+    with session_scope() as s:
+        assert s.query(Outcome).filter(Outcome.workspace_id == ws_id, Outcome.number == 99).one().priority == 0
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 2
+
+
+@pytest.mark.parametrize("items", ["bad", "", 0, False, 123, True, {"outcome": 19, "priority": 0, "nonce": "p1"}])
+def test_bootstrap_priority_requires_a_list(priority_bootstrap, items, caplog):
+    boot, _ = priority_bootstrap
+    boot(items)
+    assert "priority must be a list" in caplog.text
+
+
+@pytest.mark.parametrize("nonce", ["sk-" + "a" * 32, "github_pat_" + "b" * 32])
+def test_bootstrap_priority_nonce_digest_survives_event_redaction(priority_bootstrap, nonce, caplog):
+    import hashlib
+
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2))
+    action = {"outcome": 19, "priority": 0, "nonce": nonce}
+    boot([action])
+    with session_scope() as s:
+        event = s.query(Event).filter(Event.kind == "outcome_priority_changed").one()
+        assert nonce not in json.dumps(event.data)
+        assert event.data["nonce_sha256"] == hashlib.sha256(nonce.encode()).hexdigest()
+        s.query(Outcome).one().priority = 3
+    boot([action])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 3
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 1
+    assert nonce not in caplog.text
+
+
+@pytest.mark.parametrize("scope", ["matching", "actor", "workspace", "kind", "outcome"])
+def test_bootstrap_priority_recognizes_only_matching_legacy_nonce_events(priority_bootstrap, scope):
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        outcome = Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=3)
+        s.add(outcome)
+        s.flush()
+        s.add(Event(workspace_id=ws_id if scope != "workspace" else "other-workspace",
+                    outcome_id=outcome.id if scope != "outcome" else "other-outcome",
+                    kind="outcome_priority_changed" if scope != "kind" else "operator_retry",
+                    actor="operator" if scope != "actor" else "person", data={"nonce": "legacy"}))
+    boot([{"outcome": 19, "priority": 0, "nonce": "legacy"}])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == (3 if scope == "matching" else 0)
+        assert s.query(Event).count() == (1 if scope == "matching" else 2)
+
+
+def test_bootstrap_priority_nonce_digest_takes_precedence_over_redacted_audit_value(priority_bootstrap):
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2))
+    boot([{"outcome": 19, "priority": 0, "nonce": "sk-" + "a" * 32}])
+    # A distinct nonce can literally equal a prior event's redaction placeholder.
+    boot([{"outcome": 19, "priority": 1, "nonce": "[redacted]"}])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 1
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 2
+
+
+def test_bootstrap_priority_rolls_back_mutation_if_audit_fails(priority_bootstrap, monkeypatch):
+    from aifactory import events
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2))
+    action = {"outcome": 19, "priority": 0, "nonce": "atomic"}
+    original_record = events.record
+    notifications = []
+
+    def fail_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise RuntimeError("audit failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(events, "record", fail_record)
+        patch.setattr(events, "notify", lambda *args: notifications.append(args))
+        with pytest.raises(RuntimeError, match="audit failed"):
+            boot([action])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 2
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 0
+    assert notifications == []
+    boot([action])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 0
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 1
+
+
 def test_bootstrap_guidance_reaches_tasks_once_and_is_attributed_to_the_operator(monkeypatch):
     from aifactory.models import Event, Message, Plan, Task, User
     from aifactory.pipeline.runtime import guidance_history
@@ -769,3 +1048,77 @@ def test_delegated_resolve_applies_only_to_the_head_it_was_judged_on(monkeypatch
         assert s.get(Task, ids["T1"]).status == "awaiting_approval"
         assert s.query(Decision).filter(Decision.task_id == ids["T1"]).one().status == "open"
         assert s.get(Task, ids["T2"]).status == "queued"
+
+
+def test_bootstrap_priority_publishes_audit_only_after_commit(priority_bootstrap, monkeypatch):
+    from aifactory import events
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        outcome = Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2)
+        s.add(outcome)
+        s.flush()
+        outcome_id = outcome.id
+    published = []
+
+    def publish(payload):
+        # Another session must see the committed mutation and audit even at the first
+        # publication, not merely when the outcome notification follows it.
+        with session_scope() as s:
+            assert s.get(Outcome, outcome_id).priority == 0
+            event = s.query(Event).filter(Event.kind == "outcome_priority_changed").one()
+            if payload["type"] == "event":
+                assert payload == {"type": "event", **events.event_dict(event)}
+        published.append(payload)
+
+    monkeypatch.setattr(events.bus, "publish", publish)
+    action = {"outcome": 19, "priority": 0, "nonce": "publish-after-commit"}
+    boot([action])
+    assert [p["type"] for p in published] == ["event", "changed"]
+    assert published[1] == {"type": "changed", "workspace_id": ws_id,
+                            "entity": "outcome", "id": outcome_id}
+    boot([action])
+    assert len(published) == 2
+
+
+def test_bootstrap_priority_commit_failure_does_not_publish_or_consume_nonce(priority_bootstrap, monkeypatch):
+    from sqlalchemy.orm import Session
+
+    from aifactory import events
+    from aifactory.models import Event
+
+    boot, ws_id = priority_bootstrap
+    with session_scope() as s:
+        s.add(Outcome(workspace_id=ws_id, number=19, title="Review rounds", priority=2))
+    action = {"outcome": 19, "priority": 0, "nonce": "commit-failure"}
+    original_commit = Session.commit
+    published = []
+    failed_commits = []
+
+    def fail_priority_commit(session):
+        # Allow apply_bootstrap's workspace transaction to commit, but fail the
+        # priority transaction after record() has flushed its audit entry.
+        event = session.query(Event).filter(Event.kind == "outcome_priority_changed").first()
+        if event is not None:
+            assert event.data["nonce"] == action["nonce"]
+            assert session.query(Outcome).one().priority == 0
+            failed_commits.append(event.id)
+            raise RuntimeError("priority commit failed")
+        return original_commit(session)
+
+    monkeypatch.setattr(events.bus, "publish", published.append)
+    with monkeypatch.context() as patch:
+        patch.setattr(Session, "commit", fail_priority_commit)
+        with pytest.raises(RuntimeError, match="priority commit failed"):
+            boot([action])
+    assert len(failed_commits) == 1
+    assert published == []  # Neither a phantom audit event nor an outcome notification.
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 2
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 0
+    boot([action])
+    with session_scope() as s:
+        assert s.query(Outcome).one().priority == 0
+        assert s.query(Event).filter(Event.kind == "outcome_priority_changed").count() == 1
+    assert [p["type"] for p in published] == ["event", "changed"]
