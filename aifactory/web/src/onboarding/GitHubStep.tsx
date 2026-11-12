@@ -1,9 +1,17 @@
+import { GitHubConnection } from "../components/Setup";
 import { useState } from "react";
 import { type OnboardingStepProps } from "./api";
 import { ConnectionField, useConnection } from "./connections";
 import { GitHubPermissions } from "./GitHubPermissions";
 
-export function GitHubStep({ workspace, progress, readOnly, onComplete, onNavigate }: OnboardingStepProps) {
+export function GitHubStep(props: OnboardingStepProps) {
+  const { workspace, readOnly, onNavigate } = props;
+  return <GitHubConnection workspaceId={workspace.id} admin={!readOnly} destination="setup" onContinue={() => void onNavigate("repositories")}>
+    <GitHubTokenStep {...props} />
+  </GitHubConnection>;
+}
+
+function GitHubTokenStep({ workspace, progress, readOnly, onComplete, onNavigate }: OnboardingStepProps) {
   const c = useConnection(workspace.id, "github_token", readOnly);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");

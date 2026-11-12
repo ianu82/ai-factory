@@ -21,11 +21,12 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from .config import get_settings
 from .db import session_scope
-from .models import Workspace
+from .models import GitHubInstallation, Workspace
 
 INSTALLATION_SETTING = "github_app_installation_id"
 APP_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "write",
-                   "checks": "read", "actions": "read", "deployments": "read", "metadata": "read"}
+                   "checks": "read", "actions": "read", "deployments": "read",
+                   "metadata": "read", "statuses": "read"}
 EXPIRY_SKEW = 60
 _cache: dict[tuple[str, str], tuple[str, float]] = {}
 _lock = threading.Lock()
@@ -40,6 +41,9 @@ def installation_id(workspace_id: str) -> str | None:
         if INSTALLATION_SETTING not in settings:
             return None
         value = settings[INSTALLATION_SETTING]
+        evidence = db.get(GitHubInstallation, str(value))
+        if evidence is not None and (evidence.status != "active" or missing_permissions(evidence.permissions)):
+            raise GitHubError("GitHub App access is unavailable or missing permissions. Manage GitHub access.")
     # A present but malformed binding must never select the PAT fallback.
     if isinstance(value, bool) or not str(value).isascii() or not str(value).isdigit() or int(value) <= 0:
         raise GitHubError("Invalid GitHub App installation binding. Manage GitHub access.")
@@ -129,3 +133,8 @@ class InstallationCredential:
     def invalidate(self) -> None:
         with _lock:
             _cache.pop((self.installation, _identity()), None)
+
+
+def missing_permissions(granted: dict) -> dict[str, str]:
+    return {name: level for name, level in APP_PERMISSIONS.items()
+            if granted.get(name) not in (("read", "write") if level == "read" else ("write",))}

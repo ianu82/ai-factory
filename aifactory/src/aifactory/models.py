@@ -983,3 +983,30 @@ class TraceState(Base):
     reserved_usd: Mapped[float] = mapped_column(Float, default=0)
     spent_usd: Mapped[float] = mapped_column(Float, default=0)
     __table_args__ = (CheckConstraint("reserved_usd >= 0 AND spent_usd >= 0", name="ck_trace_spend"),)
+
+
+class GitHubConnectionState(Base):
+    """Hashed, single-use browser authorization intent; never contains OAuth tokens."""
+
+    __tablename__ = "github_connection_states"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    session_hash: Mapped[str] = mapped_column(String(64))
+    stage: Mapped[str] = mapped_column(String(20))
+    installation_id: Mapped[str] = mapped_column(String(40), default="")
+    destination: Mapped[str] = mapped_column(String(20))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class GitHubInstallation(Base):
+    """Non-secret installation evidence, shared by all explicitly bound workspaces."""
+
+    __tablename__ = "github_installations"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    permissions: Mapped[dict] = mapped_column(JSON, default=dict)
+    account: Mapped[str] = mapped_column(String(200), default="")
+    webhook_received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Nullable for additive upgrades; rotated on every evidence write, not wall-clock based.
+    version: Mapped[str | None] = mapped_column(String(32), nullable=True, default=new_id)

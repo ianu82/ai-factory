@@ -21,9 +21,14 @@ SYNC_CLIENT = httpx.Client
 ASYNC_CLIENT = httpx.AsyncClient
 
 
+@pytest.fixture(scope="session")
+def signing_key():
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
 @pytest.fixture
-def app(monkeypatch, signed_in):
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def app(monkeypatch, signed_in, signing_key):
+    key = signing_key
     pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                             serialization.NoEncryption()).decode()
     for name, value in {"ID": "123", "PRIVATE_KEY": pem, "CLIENT_ID": "client-id",
@@ -61,7 +66,7 @@ def fake(monkeypatch, key, clock):
             assert 0 < claims["exp"] - claims["iat"] <= 600
             assert claims["exp"] > clock[0]
             assert json.loads(request.content) == {"permissions": github_app.APP_PERMISSIONS}
-            assert "statuses" not in request.content.decode()
+            assert json.loads(request.content)["permissions"]["statuses"] == "read"
             if fail["mint"]:
                 return httpx.Response(403, json={"message": encoded + " client-secret-sensitive"})
             token = f"installation-sensitive-{len(minted)}"
@@ -69,7 +74,7 @@ def fake(monkeypatch, key, clock):
             return httpx.Response(201, json={"token": token, "expires_at": datetime.fromtimestamp(
                 clock[0] + 120, timezone.utc).isoformat()})
         assert request.headers["authorization"] == "Bearer " + minted[-1]
-        assert path != "/user" and not path.endswith("/status") and "/statuses/" not in path
+        assert path != "/user" and "/statuses/" not in path
         if fail["api"]:
             return httpx.Response(401, json={"message": minted[-1]})
         if path == "/installation/repositories":
@@ -77,6 +82,8 @@ def fake(monkeypatch, key, clock):
             size = int(request.url.params["per_page"])
             return httpx.Response(200, json={"repositories": [
                 {"full_name": "acme/demo" if i == 0 else f"acme/r{i}"} for i in range(size if page == 1 else 1)], "total_count": size + 1})
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"statuses": [{"context": "external-ci", "state": "success"}]})
         if path.endswith("/check-runs"):
             return httpx.Response(200, json={"check_runs": []})
         if path.endswith("/actions/runs"):
@@ -92,7 +99,7 @@ def fake(monkeypatch, key, clock):
     return seen, minted, fail
 
 
-async def test_sign_mint_pagination_refresh_and_no_status(app, monkeypatch):
+async def test_sign_mint_pagination_refresh_and_commit_status(app, monkeypatch):
     ws, key = app
     clock = [1800000000]
     seen, minted, _ = fake(monkeypatch, key, clock)
@@ -106,7 +113,7 @@ async def test_sign_mint_pagination_refresh_and_no_status(app, monkeypatch):
     clock[0] += 61  # within the expiry safety window; same long-lived client
     assert (await gh.repo("acme/demo"))["permissions"]["push"]
     assert len(minted) == 2
-    assert (await gh.checks("acme/demo", "sha")).state == "none"
+    assert (await gh.checks("acme/demo", "sha")).state == "success"
     before = len(seen)
     await gh.set_status("acme/demo", "sha", "success", "Verified")
     assert len(seen) == before
@@ -346,3 +353,321 @@ async def test_real_git_publish_keeps_credentials_out_of_config(app, monkeypatch
             assert "x-access-token" not in text
     finally:
         await sandbox.close()
+
+
+@pytest.fixture
+def connection_github(app, monkeypatch):
+    """All network calls use a deterministic transport; no retries, sleeps or RSA generation."""
+    ws, key = app
+    with session_scope() as db:
+        db.get(Workspace, ws).settings = {}
+    selected = {"id": 42, "app_id": 123, "account": {"login": "acme"},
+                "permissions": dict(github_app.APP_PERMISSIONS), "suspended_at": None}
+    control = {"authorized": True, "selected": selected}
+    seen, minted, _ = fake(monkeypatch, key, [1800000000])
+    # Preserve installation transport while routing the connection protocol separately.
+    transport_client = httpx.AsyncClient
+
+    def handle(request):
+        path = request.url.path
+        if path == "/app":
+            assert request.headers["authorization"].startswith("Bearer eyJ")
+            return httpx.Response(200, json={"slug": "factory-test"})
+        if path == "/login/oauth/access_token":
+            assert json.loads(request.content)["client_secret"] == "client-secret-sensitive"
+            return httpx.Response(200, json={"access_token": "transient-user-sensitive"})
+        if path == "/user/installations":
+            assert request.headers["authorization"] == "Bearer transient-user-sensitive"
+            return httpx.Response(200, json={"installations": [selected] if control["authorized"] else []})
+        if path.startswith("/app/installations/"):
+            return httpx.Response(200, json=selected)
+        raise AssertionError(path)
+
+    def clients(**kw):
+        # github_json uses follow_redirects=False; transport uses timeout only.
+        if "follow_redirects" in kw:
+            return ASYNC_CLIENT(**kw, transport=httpx.MockTransport(handle))
+        return transport_client(**kw)
+
+    monkeypatch.setattr(httpx, "AsyncClient", clients)
+    return ws, control
+
+
+def _start(client, ws, destination="setup"):
+    from urllib.parse import parse_qs, urlparse
+
+    root = f"/api/workspaces/{ws}/github/connection"
+    response = client.post(root + "/start?destination=" + destination)
+    assert response.status_code == 200, response.text
+    url = response.json()["url"]
+    assert url.startswith("https://github.com/apps/factory-test/installations/new?")
+    return root, parse_qs(urlparse(url).query)["state"][0]
+
+
+def _return(client, root, state, installation="42"):
+    from urllib.parse import parse_qs, urlparse
+
+    response = client.get(root + "/return", params={"state": state, "installation_id": installation}, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    return parse_qs(urlparse(response.headers["location"]).query)["state"][0]
+
+
+def test_install_oauth_roundtrip_repos_and_no_credentials(connection_github, client, signed_in):
+    from sqlalchemy import select
+    from aifactory.models import Base, GitHubConnectionState
+
+    ws, _ = connection_github
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state)
+    response = client.get(root + "/oauth", params={"state": oauth, "code": "test-code"}, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == f"/w/{ws}/onboarding"
+    metadata = client.get(root).json()
+    assert metadata["ready"] and metadata["account"] == "acme"
+    assert metadata["granted_permissions"] == github_app.APP_PERMISSIONS
+    assert metadata["missing_permissions"] == {}
+    assert metadata["manage_url"] == "https://github.com/settings/installations/42"
+    repos = client.get(f"/api/workspaces/{ws}/github/repos")
+    assert repos.status_code == 200, repos.text
+    assert repos.json()["items"][0]["full_name"] == "acme/demo"
+    assert "github" in client.get(f"/api/workspaces/{ws}/onboarding").json()["completed_steps"]
+    with session_scope() as db:
+        assert db.query(GitHubConnectionState).count() == 0
+        rows = repr([list(db.execute(select(table))) for table in Base.metadata.sorted_tables])
+    assert all(s not in rows + response.text + json.dumps(metadata) for s in
+               ["transient-user-sensitive", "client-secret-sensitive", "webhook-sensitive", "installation-sensitive"])
+    assert client.get(root + "/oauth", params={"state": oauth, "code": "test-code"}).status_code == 400
+    assert client.get(root + "/return", params={"state": state, "installation_id": "42"}).status_code == 400
+
+
+@pytest.mark.parametrize("failure", ["absent", "forged", "suspended", "wrong-app", "missing-permission"])
+def test_installation_must_be_authorized_and_available(connection_github, client, failure):
+    ws, control = connection_github
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state, "43" if failure == "forged" else "42")
+    if failure == "absent":
+        control["authorized"] = False
+    if failure == "suspended":
+        control["selected"]["suspended_at"] = "2026-01-01T00:00:00Z"
+    if failure == "wrong-app":
+        control["selected"]["app_id"] = 999
+    if failure == "missing-permission":
+        control["selected"]["permissions"]["contents"] = "read"
+    response = client.get(root + "/oauth", params={"state": oauth, "code": "test"})
+    assert response.status_code == 403, response.text
+    with session_scope() as db:
+        assert github_app.INSTALLATION_SETTING not in db.get(Workspace, ws).settings
+
+
+@pytest.mark.parametrize("stage", ["return", "oauth"])
+def test_expired_forged_and_wrong_session_state(connection_github, client, stage):
+    from datetime import timedelta
+    from aifactory.db import utcnow
+    from aifactory.models import GitHubConnectionState
+    from aifactory.security import token_hash
+
+    ws, _ = connection_github
+    root, state = _start(client, ws)
+    if stage == "oauth":
+        state = _return(client, root, state)
+    params = {"state": state, "installation_id": "42", "code": "test"}
+    assert client.get(root + "/" + stage, params={**params, "state": state + "x"}).status_code == 400
+    # Same user, newly signed-in browser session cannot reuse the intent.
+    from fastapi.testclient import TestClient
+    other = TestClient(client.app)
+    other.post("/auth/dev", json={"email": "ian@example.com", "name": "Ian", "organization": "MindsDB"})
+    assert other.get(root + "/" + stage, params=params).status_code == 400
+    with session_scope() as db:
+        db.get(GitHubConnectionState, token_hash(state)).expires_at = utcnow() - timedelta(seconds=1)
+    assert client.get(root + "/" + stage, params=params).status_code == 400
+
+
+def _webhook(client, payload, event="installation", valid=True):
+    import hashlib
+    import hmac
+    body = json.dumps(payload).encode()
+    sig = hmac.new(b"webhook-sensitive", body, hashlib.sha256).hexdigest()
+    return client.post("/api/github/webhook", content=body, headers={
+        "x-github-event": event, "x-hub-signature-256": "sha256=" + (sig if valid else "0" * 64)})
+
+
+def test_signed_ping_and_installation_lifecycle(connection_github, client):
+    from aifactory.models import GitHubInstallation
+
+    ws, _ = connection_github
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state)
+    assert client.get(root + "/oauth", params={"state": oauth, "code": "test"}, follow_redirects=False).status_code == 303
+    assert _webhook(client, {"zen": "hello"}, "ping").status_code == 200
+    assert _webhook(client, {}, "ping", valid=False).status_code == 401
+    payload = {"action": "suspend", "installation": {"id": 42}}
+    assert _webhook(client, payload, valid=False).status_code == 401
+    assert client.get(root).json()["ready"]
+    assert _webhook(client, {"action": "suspend", "installation": {"id": 999}}).status_code == 200
+    assert client.get(root).json()["ready"]
+    assert _webhook(client, payload).status_code == 200
+    assert not client.get(root).json()["ready"]
+    with pytest.raises(GitHubError, match="unavailable"):
+        resolve_token(ws)
+    assert "github" not in client.get(f"/api/workspaces/{ws}/onboarding").json()["completed_steps"]
+    with session_scope() as db:
+        assert db.get(GitHubInstallation, "42").webhook_received_at is not None
+    assert _webhook(client, {"action": "unsuspend", "installation": {"id": 42}}).status_code == 200
+    assert client.get(root).json()["ready"]
+    github_app._cache[("42", "test")] = ("old", 9999999999)
+    assert _webhook(client, {"action": "removed", "installation": {"id": 42}}, "installation_repositories").status_code == 200
+    assert ("42", "test") not in github_app._cache
+    assert _webhook(client, {"action": "deleted", "installation": {"id": 42}}).status_code == 200
+    assert not client.get(root).json()["ready"]
+    assert _webhook(client, {"action": "unsuspend", "installation": {"id": 42}}).status_code == 200
+    assert not client.get(root).json()["ready"]
+
+
+def test_unconfigured_disconnect_restores_token_fallback(app, monkeypatch, client):
+    from aifactory.models import Secret
+    from aifactory.security import encrypt
+
+    ws, _ = app
+    root = f"/api/workspaces/{ws}/github/connection"
+    monkeypatch.delenv("AIFACTORY_GITHUB_APP_CLIENT_ID")
+    config.reset_settings_cache()
+    with session_scope() as db:
+        db.add(Secret(workspace_id=ws, kind="github_token", ciphertext=encrypt("saved-pat")))
+    assert client.get(root).json()["configured"] is False
+    assert client.post(root + "/start").status_code == 503
+    with pytest.raises(GitHubError, match="not configured"):
+        resolve_token(ws)
+    assert client.delete(root).status_code == 200
+    assert resolve_token(ws) == "saved-pat"
+    assert client.get("/api/meta").json()["auth"]["github_app"] is False
+
+
+def test_unsafe_destination_is_rejected(connection_github, client):
+    ws, _ = connection_github
+    assert client.post(f"/api/workspaces/{ws}/github/connection/start?destination=https://evil.test").status_code == 422
+
+
+def test_global_callbacks_preserve_destination_and_only_bind_initiator(connection_github, client):
+    from urllib.parse import parse_qs, urlparse
+
+    ws, _ = connection_github
+    with session_scope() as db:
+        other = Workspace(name="Unconnected", slug="unconnected", org_id=db.get(Workspace, ws).org_id, settings={})
+        db.add(other)
+        db.flush()
+        other_id = other.id
+    root, state = _start(client, ws, "settings")
+    response = client.get("/api/github/return", params={"state": state, "installation_id": "42"}, follow_redirects=False)
+    assert response.status_code == 303
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [config.get_settings().public_url + "/api/github/oauth"]
+    response = client.get("/api/github/oauth", params={"state": query["state"][0], "code": "test"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/w/{ws}/settings/credentials"
+    with session_scope() as db:
+        assert db.get(Workspace, other_id).settings == {}
+        assert db.get(Workspace, ws).settings[github_app.INSTALLATION_SETTING] == "42"
+    assert client.get("/api/github/return", params={"state": state, "installation_id": "42"}).status_code == 400
+
+
+def test_webhook_missing_permission_invalidates_readiness(connection_github, client):
+    ws, _ = connection_github
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state)
+    assert client.get(root + "/oauth", params={"state": oauth, "code": "test"}, follow_redirects=False).status_code == 303
+    assert _webhook(client, {"action": "new_permissions_accepted", "installation": {
+        "id": 42, "permissions": {"contents": "read"}}}).status_code == 200
+    info = client.get(root).json()
+    assert not info["ready"]
+    assert info["missing_permissions"]["contents"] == "write"
+    with pytest.raises(GitHubError, match="missing permissions"):
+        resolve_token(ws)
+
+
+@pytest.mark.parametrize("disconnect_first", [False, True])
+def test_reconnect_refreshes_missed_unsuspend_evidence(connection_github, client, disconnect_first):
+    from aifactory.models import GitHubInstallation
+
+    ws, _ = connection_github
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state)
+    assert client.get(root + "/oauth", params={"state": oauth, "code": "test"}, follow_redirects=False).status_code == 303
+    assert _webhook(client, {"action": "suspend", "installation": {"id": 42}}).status_code == 200
+    assert not client.get(root).json()["ready"]
+    with pytest.raises(GitHubError, match="unavailable"):
+        resolve_token(ws)
+    if disconnect_first:
+        assert client.delete(root).status_code == 200
+    # GitHub is now live/unsuspended, but its unsuspend webhook never arrived.
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state)
+    response = client.get(root + "/oauth", params={"state": oauth, "code": "test"}, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    assert client.get(root).json()["ready"]
+    with session_scope() as db:
+        evidence = db.get(GitHubInstallation, "42")
+        assert evidence.status == "active"
+        assert evidence.permissions == github_app.APP_PERMISSIONS
+        assert evidence.webhook_received_at is not None
+    assert client.get(f"/api/workspaces/{ws}/github/repos").status_code == 200
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("event,action", [
+    ("installation", "suspend"),
+    ("installation", "deleted"),
+    ("installation_repositories", "removed"),
+])
+def test_webhook_during_live_lookup_wins_over_reconnect(connection_github, client, monkeypatch, existing, event, action):
+    """Deliver a real signed webhook after the live response, before the callback's CAS.
+
+    No sleeps or threads: the hook deterministically exercises both an updated
+    evidence row and the first-connection insert race on SQLite and Postgres.
+    """
+    import hashlib
+    import hmac
+    from aifactory import github_connection
+    from aifactory.models import GitHubInstallation
+
+    ws, _ = connection_github
+    if existing:
+        root, state = _start(client, ws)
+        oauth = _return(client, root, state)
+        assert client.get(root + "/oauth", params={"state": oauth, "code": "test"}, follow_redirects=False).status_code == 303
+        assert _webhook(client, {"action": "suspend", "installation": {"id": 42}}).status_code == 200
+        # Include legacy, additively migrated evidence whose version is still NULL.
+        with session_scope() as db:
+            db.get(GitHubInstallation, "42").version = None
+    root, state = _start(client, ws)
+    oauth = _return(client, root, state)
+    live_json = github_connection.github_json
+    delivered = []
+
+    async def deliver_after_lookup(method, url, **kwargs):
+        response = await live_json(method, url, **kwargs)
+        if url.endswith("/app/installations/42"):
+            payload = {"action": action, "installation": {"id": 42}}
+            if event == "installation_repositories":
+                payload["installation"]["permissions"] = {"contents": "read"}
+            body = json.dumps(payload).encode()
+            signature = hmac.new(b"webhook-sensitive", body, hashlib.sha256).hexdigest()
+            async with ASYNC_CLIENT(transport=httpx.ASGITransport(app=client.app), base_url="http://testserver") as sender:
+                receipt = await sender.post("/api/github/webhook", content=body, headers={
+                    "x-github-event": event, "x-hub-signature-256": "sha256=" + signature})
+            assert receipt.status_code == 200, receipt.text
+            with session_scope() as db:
+                evidence = db.get(GitHubInstallation, "42")
+                delivered.append((evidence.status, evidence.version, evidence.permissions, evidence.webhook_received_at))
+        return response
+
+    monkeypatch.setattr(github_connection, "github_json", deliver_after_lookup)
+    response = client.get(root + "/oauth", params={"state": oauth, "code": "test"}, follow_redirects=False)
+    assert response.status_code == 409, response.text
+    assert len(delivered) == 1
+    with session_scope() as db:
+        evidence = db.get(GitHubInstallation, "42")
+        assert (evidence.status, evidence.version, evidence.permissions, evidence.webhook_received_at) == delivered[0]
+        binding = db.get(Workspace, ws).settings.get(github_app.INSTALLATION_SETTING)
+        assert binding == ("42" if existing else None)
+    assert not client.get(root).json()["ready"]
+    assert "github" not in client.get(f"/api/workspaces/{ws}/onboarding").json()["completed_steps"]

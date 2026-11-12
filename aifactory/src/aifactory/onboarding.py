@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, Vali
 from sqlalchemy.orm import Session
 
 from .auth import current_user, require_member
+from .config import get_settings
 from .db import get_db
 from .models import Outcome, Repository, Secret, User, Workspace
 
@@ -86,6 +87,15 @@ def snapshot(db: Session, ws: Workspace) -> OnboardingState:
     github_fallback = fallback["github_token"]
     github_usable = bool(github and github.status != "invalid") or github_fallback
     repo_connected = db.query(Repository.id).filter(Repository.workspace_id == ws.id).first() is not None
+    from .github_app import INSTALLATION_SETTING, missing_permissions
+    from .models import GitHubInstallation
+
+    binding = (ws.settings or {}).get(INSTALLATION_SETTING)
+    evidence = db.get(GitHubInstallation, str(binding)) if binding else None
+    app_ready = bool(get_settings().github_app_available and evidence and evidence.status == "active"
+                     and not missing_permissions(evidence.permissions))
+    if binding:
+        github_usable = app_ready
     usable = {"models": model_usable, "github": github_usable, "repositories": repo_connected}
     # Catalog evidence comes from credential validation (including seeded keys),
     # never from an identity-only sign-in or this local snapshot.
@@ -103,6 +113,8 @@ def snapshot(db: Session, ws: Workspace) -> OnboardingState:
         and github_meta.get("diagnostic_code") in ("github_verified", "github_permissions_unverified")
         and all(permissions.get(name) in ("present", "unverified") for name in REQUIRED_PERMISSIONS)
     )
+    if binding:
+        github_validated = app_ready
     validated = {
         "models": bool(model and model.status == "valid" and (model.metadata_json or {}).get("models")),
         "github": github_validated,
