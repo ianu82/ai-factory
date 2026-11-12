@@ -290,6 +290,34 @@ async def test_a_provider_refusal_is_never_retried(provider, clocked, monkeypatc
     assert (failed.value.status, failed.value.cause) == (status, "provider") and said in str(failed.value)
 
 
+@pytest.mark.parametrize("status, message", [
+    (503, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+    (529, "Overloaded"),
+    (429, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+])
+async def test_an_overload_the_provider_gave_up_on_is_retried_like_any_outage_not_refused(provider, clocked,
+                                                                                          monkeypatch, status, message):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(now[0])
+        if len(sends) != 2:  # "do not send this again": the provider retried on its side and gave up for now
+            return httpx.Response(status, headers={"x-should-retry": "false"}, json={"error": {"message": message}})
+        return httpx.Response(200, json={"ok": True})
+
+    fake_http(monkeypatch, upstream)
+    assert await ModelClient(provider)._post("/responses", {}) == {"ok": True}
+    assert sends == [0, 1] and waits == [1] and guard.active == 0
+    # Where it does not pass in time, the failure is the provider being unavailable: work that is redone later,
+    # never a refusal that holds the workspace until a person resumes it.
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider, max_retries=0)._post("/responses", {})
+    assert (failed.value.status, failed.value.cause) == (status, "transient")
+    assert "limit reached" not in str(failed.value)
+
+
 async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):
     now, guard = clocked
     waits = retry_clock(monkeypatch, now, guard)
