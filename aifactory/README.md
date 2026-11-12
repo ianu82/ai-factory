@@ -38,6 +38,16 @@ logs) into the next attempt instead of starting over blind. Completion is honest
 `completed` only when merged and smoke-tested; `smoke_failed`, `failed`, `blocked`,
 `needs_input` and `awaiting_approval` are explicit and reach the Inbox.
 
+Each outcome has a **Lead**, an agent that owns it end to end: it answers agents' questions, retries
+or acknowledges blocked tasks, requests changes, and leaves people a recommendation on what it may
+not decide. A workspace can also turn on the **Director** (Settings → Policies; off by default), which
+stands in for the people who run the workspace while they are away. Once a decision's judge and Lead
+have had their turn, the Director decides what would otherwise wait on a person: plan, merge and
+release approvals, budgets (up to a ceiling), blocked work, Supervisor findings, alerts and signal
+triage. It decides through the same choices a person has, so every gate still applies. It never
+takes work over, lifts a provider hold or changes settings, and it stays within its own spend per
+run and per day (`pipeline/director.py`).
+
 ## Product surfaces
 
 - **Inbox** — decisions that need a person (plan approval, questions, merge/release approval,

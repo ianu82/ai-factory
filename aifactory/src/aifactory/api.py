@@ -42,7 +42,7 @@ from .review import review_policy, validate_review
 from .repo_detect import detect
 from .sandbox import isolation_available
 from .security import decrypt, encrypt, mask, redact
-from .signals import outcome_from_text, sync_github, upsert_signal
+from .signals import sync_github, triage, upsert_signal
 from .steward_policy import steward_policy, validate_steward
 
 router = APIRouter(prefix="/api")
@@ -188,6 +188,27 @@ def _lead_settings(value: Any) -> dict[str, Any]:
     return {"enabled": enabled, "run_usd": float(usd), "turns": turns}
 
 
+def _director_settings(value: Any) -> dict[str, Any]:
+    """The Director: off or on, its spend per run and per day, the most an outcome may have committed for it to let
+    the outcome continue past its budget, and how long a decision waits before it takes it (pipeline/director.py)."""
+    default = DEFAULT_SETTINGS["director"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict) or set(value) - set(default):
+        raise HTTPException(422, "director accepts only mode, run_usd, daily_usd, max_outcome_usd and after_minutes")
+    out = {**default, **value}
+    if out["mode"] not in ("off", "on"):
+        raise HTTPException(422, "director.mode must be off or on")
+    for key, top in (("run_usd", 20), ("daily_usd", 500), ("max_outcome_usd", 2000)):
+        number = out[key]
+        if type(number) not in (int, float) or not math.isfinite(number) or not 0 <= number <= top:
+            raise HTTPException(422, f"director.{key} must be a number from 0 to {top}")
+        out[key] = float(number)
+    if type(out["after_minutes"]) is not int or not 0 <= out["after_minutes"] <= 1440:
+        raise HTTPException(422, "director.after_minutes must be a whole number from 0 to 1440")
+    return out
+
+
 def _alert_settings(value: Any) -> dict[str, Any]:
     """Alerts: how long a decision may wait before it alerts, and the outside channels. Slack and email aren't
     available yet, so they can only be off: alerts show in the app's Inbox."""
@@ -221,7 +242,8 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     mind = _mind_settings(raw.get("mind"))
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
     alerts = _alert_settings(raw.get("alerts"))
-    merged = merged_settings({**raw, "lead": lead, "alerts": alerts})
+    director = _director_settings(raw.get("director"))
+    merged = merged_settings({**raw, "lead": lead, "alerts": alerts, "director": director})
     if "decision_judges" in raw and raw["decision_judges"] not in ("off", "suggest", "decide"):
         raise HTTPException(422, "decision_judges must be off, suggest or decide")
     merged["supervisor"] = supervisor
@@ -229,6 +251,7 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
     merged["mind"] = mind
     merged["lead"] = lead
     merged["alerts"] = alerts
+    merged["director"] = director
     merged["max_attempts"] = max(1, min(int(merged.get("max_attempts", 3)), 8))
     merged["auto_retry_rounds"] = max(0, min(int(merged.get("auto_retry_rounds", 1)), 3))
     for role in ("builder", "verifier", "planner"):
@@ -1150,9 +1173,11 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
                                                          "decision_resolved", "task_completed", "outcome_created"]))
                   .order_by(Event.id.desc()).limit(50).all())
     change_outcomes = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({e.outcome_id for e in recent if e.outcome_id}))}
+    from .pipeline.director import director_notes
     from .pipeline.lead import notes_for
 
     lead_notes = notes_for(db, decisions)
+    director_said = director_notes(db, decisions)
     alerts = db.query(Alert).filter(Alert.workspace_id == workspace_id, Alert.status == "open") \
         .order_by(Alert.opened_at.desc()).limit(50).all()
     about = {o.id: o for o in db.query(Outcome).filter(Outcome.id.in_({a.outcome_id for a in alerts if a.outcome_id}))}
@@ -1171,6 +1196,7 @@ def inbox(workspace_id: str, user: User = Depends(current_user), db: Session = D
             "pr_number": tasks[d.task_id].pr_number if d.task_id in tasks else None,
             "priority": outcomes[d.outcome_id].priority if d.outcome_id in outcomes else 2,
             "lead_note": lead_notes.get(d.id),
+            "director_note": director_said.get(d.id),
         }) for d in decisions],
         "since": S.ts(since),
         "changes": [event_dict(e) | ({"outcome_number": change_outcomes[e.outcome_id].number,
@@ -1619,8 +1645,7 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
             return S.signal(sig)
         raise HTTPException(409, "Linear signals are managed by configured Linear intake")
     if body.action == "ignore":
-        sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
-        sig.status = "ignored"
+        triage(db, sig, user, "ignore")
         db.commit()
         return S.signal(sig)
     if body.action != "accept":
@@ -1634,24 +1659,11 @@ def act_on_signal(workspace_id: str, signal_id: str, body: SignalAction, user: U
         db.commit()
         notify(workspace_id, "signal", sig.id)
         return S.signal(sig)
-    sig.data = {key: value for key, value in (sig.data or {}).items() if key != "acceptance_reason"}
-    if sig.outcome_id:
-        db.commit()
-        return S.signal(sig)  # accepting again must not create duplicate work
-    from .connectors.core import signal_priority
-
-    worker = (sig.data or {}).get("worker") if sig.source == "github_issue" else None
-    if worker not in ("native", "codex", "anton"):
-        worker = None
-    repo_ids = [sig.repo_id] if sig.repo_id else [r.id for r in db.query(Repository).filter(
-        Repository.workspace_id == workspace_id).limit(1)]
-    outcome = outcome_from_text(db, workspace_id, user, body.title or sig.title,
-                                (body.brief or sig.body or "") + (f"\n\nSource: {sig.url}" if sig.url else ""),
-                                repo_ids, source="signal", signal_id=sig.id, harness=worker,
-                                priority=signal_priority(sig))
-    sig.status, sig.outcome_id = "accepted", outcome.id
+    created = sig.outcome_id is None
+    triage(db, sig, user, "accept", title=body.title, brief=body.brief)
     db.commit()
-    orchestrator.wake()
+    if created:
+        orchestrator.wake()
     return S.signal(sig)
 
 

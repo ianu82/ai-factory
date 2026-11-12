@@ -82,6 +82,8 @@ class Orchestrator:
         self._vm_sweep_task: asyncio.Task | None = None
         self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
         self._lead_check = float("-inf")
+        self._directors: dict[str, asyncio.Task] = {}  # workspace id -> its Director's run
+        self._director_check = float("-inf")
         self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
         self._unasked: dict[str, float] = {}  # task id -> when it was first seen waiting on a person with no decision
 
@@ -116,9 +118,9 @@ class Orchestrator:
         for job in list(self._ci_polls.values()):
             job.cancel()
         released = asyncio.create_task(self._release(jobs), name="release-leases")  # beside the rest of the shutdown
-        for job in list(self._leads.values()):
+        for job in list(self._leads.values()) + list(self._directors.values()):
             job.cancel()
-        await asyncio.gather(*list(self._leads.values()), return_exceptions=True)
+        await asyncio.gather(*list(self._leads.values()), *list(self._directors.values()), return_exceptions=True)
         if self._loop_task:
             self._loop_task.cancel()
         await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
@@ -163,7 +165,7 @@ class Orchestrator:
                                                         Task.status == "running")]
         return {"planning": list(self._planning), "running": running, "waiting_ci": waiting,
                 "global_limit": get_settings().global_concurrency, "check_slots": check_slot_usage(),
-                "leads": list(self._leads), "instance": self.instance}
+                "leads": list(self._leads), "directors": list(self._directors), "instance": self.instance}
 
     def _recover(self) -> None:
         """Work that was mid-flight when the server stopped resumes from its durable stage."""
@@ -325,6 +327,7 @@ class Orchestrator:
                 await self._maybe_sweep_vms()
                 await self._maybe_watch()
                 await self._maybe_run_leads()
+                await self._maybe_run_directors()
             except Exception:  # never let the scheduler die
                 log.exception("orchestrator tick failed")
             try:
@@ -586,6 +589,32 @@ class Orchestrator:
                 self._leads.pop(outcome_id, None)
                 if not finished.cancelled() and finished.exception() is not None:
                     log.error("Lead of %s failed: %r", outcome_id, finished.exception())
+                self.wake()
+
+            job.add_done_callback(done)
+
+    async def _maybe_run_directors(self) -> None:
+        """Start the Director of each workspace that turned it on and has something new waiting on a person
+        (pipeline/director.py), at most every 15 seconds and within the server's Director limit. It runs beside the
+        scheduler, never inside its tick."""
+        import time
+
+        from .director import concurrency, due, run_director
+
+        free = concurrency() - len(self._directors)
+        now = time.monotonic()
+        if self._stopping or free <= 0 or now - self._director_check < 15:
+            return
+        self._director_check = now
+        for item in (await asyncio.to_thread(due, frozenset(self._directors)))[:free]:
+            workspace_id = item["workspace_id"]
+            job = asyncio.create_task(run_director(item), name=f"director-{workspace_id[:8]}")
+            self._directors[workspace_id] = job
+
+            def done(finished: asyncio.Task, workspace_id: str = workspace_id) -> None:
+                self._directors.pop(workspace_id, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    log.error("Director of %s failed: %r", workspace_id, finished.exception())
                 self.wake()
 
             job.add_done_callback(done)

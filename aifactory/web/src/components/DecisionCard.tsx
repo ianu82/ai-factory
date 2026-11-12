@@ -64,6 +64,10 @@ export function DecisionCard({ d, showContext = false, onOpen, focused = false }
         <b>Lead{d.outcome_number != null ? ` of #${d.outcome_number}` : ""} · {ago(d.lead_note.created_at)}</b>
         <Prose text={d.lead_note.text} />
       </div>}
+      {d.director_note && <div className="lead-note" style={{ marginTop: 8 }}>
+        <b>Director · {ago(d.director_note.created_at)}</b>
+        <Prose text={d.director_note.text} />
+      </div>}
       {d.judge && <div className="muted" style={{ marginTop: 8 }}>
         <b>Decision judge · {d.judge.effective_verdict || d.judge.state}</b>
         <p>{d.judge.summary}</p>
