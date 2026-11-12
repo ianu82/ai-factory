@@ -3318,7 +3318,56 @@ def test_failing_tests_are_compared_with_the_base_commit():
     assert not delivery._same_failure(other(), {**other(), "failures": [network]})  # only the base printed test names
     assert not delivery._same_failure(other(), {"ok": True})
     assert not delivery._same_failure(other(timed_out=True), other(timed_out=False))
+    # Out of time on the base as well: too slow for the limit whatever the change does, when both runs had got
+    # about as far. What each had printed by then differs, so the text is not compared, only how much there was; a
+    # failing test only the candidate printed still counts.
+    def slow(progress=900, **more):
+        return other(124, timed_out=True, progress=progress, **more)
+
+    assert delivery._same_failure(slow(), slow(600, signature="def"))
+    assert delivery._same_failure(slow(0), slow(0))  # both hang before printing anything
+    assert not delivery._same_failure(slow(0), slow())  # it stopped at once: it may hang because of the change
+    assert not delivery._same_failure(slow(400), slow())  # it stopped printing well before the base did
+    assert not delivery._same_failure(slow(5000), slow())  # it printed far more: it may be looping
+    assert not delivery._same_failure(other(124, timed_out=True), slow())  # progress not recorded proves nothing
+    assert not delivery._same_failure(slow(), other(124, timed_out=True))
+    assert not delivery._same_failure(slow(failures=[network]), slow())
+    assert delivery._progress("\x1b[32mrun 1\x1b[0m\n") == 5 and delivery._progress("") == 0
+    assert delivery._progress("kept" * 7_000, 5_000_000) == 5_000_000  # cut output: the count of all that was printed
     assert not delivery._same_failure(other(), None)
+    # A check that failed on two runs is excused only when both runs match the base: what the first run alone failed
+    # is still the candidate's, however the second run ended.
+    twice = {"ok": False, "failures": [network], "first": {"failures": [network, "FAILED tests/test_new.py::test_new"]}}
+    assert not delivery._same_failure(twice, base)
+    assert delivery._same_failure({**twice, "first": {"failures": [network]}}, base)
+    assert not delivery._same_failure({**slow(), "first": other()}, slow())  # failed, then out of time as the base is
+    # Two failed runs failed the same way only with the same exit code and the same failing tests or, where the
+    # output names none, the same output.
+    assert delivery._same_run(other(), other()) and delivery._same_run({"failures": [network]}, {"failures": [network]})
+    assert not delivery._same_run(other(), other(signature="def"))
+    assert not delivery._same_run(other(), other(exit_code=2))
+    assert not delivery._same_run(other(), other(timed_out=True))
+    assert not delivery._same_run({"failures": [network]}, {"failures": None})
+
+
+def test_a_timed_out_check_s_progress_counts_all_it_printed_when_the_output_kept_was_cut():
+    from types import SimpleNamespace
+
+    from aifactory.sandbox import ExecResult
+
+    def row(total_bytes, truncated=True):
+        async def run(command, timeout):  # what a sandbox returns for a command stopped at the limit
+            return ExecResult(command=command, exit_code=124, output="y\n" * 15_000, duration=3.0, timed_out=True,
+                              truncated=truncated, total_bytes=total_bytes)
+
+        return asyncio.run(delivery.TaskRunner._run_command(None, SimpleNamespace(exec=run), "sh loop.sh", 3))[0]
+
+    # The same 30,000 characters were kept of each run; what tells them apart is how much each printed in all.
+    base, loop = row(40_000), row(4_000_000)
+    assert (base["progress"], loop["progress"]) == (40_000, 4_000_000)
+    assert not delivery._same_failure(loop, base)  # a hundred times the output: the change may make it loop
+    assert delivery._same_failure(row(50_000), base)
+    assert row(30_000, truncated=False)["progress"] == 29_999  # nothing was cut: what was printed, stripped
 
 
 def test_a_failure_signature_ignores_what_differs_between_two_runs_of_the_same_failure():
@@ -3384,6 +3433,8 @@ def test_check_failures_that_also_fail_on_the_base_commit_are_not_charged(factor
         assert task.attempt == 2
         assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
             "sh test.sh": None, "sh env_check.sh": True}
+        assert [[c.get("cause") for c in a["checks"]] for a in records] == [[None, "real"], [None, "preexisting"],
+                                                                            [None, "preexisting"]]
         base_runs = s.query(Event).filter(Event.task_id == task.id, Event.kind == "base_check_result").count()
     assert base_runs == 1  # the second attempt reused the base commit's result
     # The builder learns which failure is its own; the verifier is told which ones predate the change.
@@ -3429,6 +3480,335 @@ def test_a_failure_without_test_names_is_preexisting_only_when_the_base_prints_t
         assert {c["command"]: c.get("preexisting") for c in records[-1]["checks"]} == {
             "sh test.sh": None, "sh lint.sh": True}
     assert "it fails on the base commit too, but not with the same output" in prompts[1]
+
+
+# Counts its runs in its sandbox. With flaky.txt in the checkout only its first run fails, with broken.txt every run
+# fails the same way, with stuck.txt a run that gets that far hangs before it prints anything, and with slow.txt a
+# run that gets that far says which run it is and does not finish in time.
+COUNTED_CHECK = ('echo run >> "$TMPDIR/runs"\n'
+                 'n=$(grep -c run "$TMPDIR/runs")\n'
+                 'if [ -f flaky.txt ] && [ "$n" = 1 ]; then echo "run $n: connection reset by peer"; exit 1; fi\n'
+                 'if [ -f broken.txt ]; then echo "broken.txt must not exist"; exit 3; fi\n'
+                 'if [ -f stuck.txt ]; then sleep 30; fi\n'
+                 'echo "run $n"\n'
+                 'if [ -f slow.txt ]; then sleep 30; fi\n')
+
+# What pytest prints for a suite with one test that fails wherever it runs, the base commit included. With new.txt in
+# the checkout, the first run in a sandbox fails a second test as well; later runs there do not.
+RETRIED_CHECK = ('echo run >> "$TMPDIR/runs"\n'
+                 'echo "FAILED tests/test_env.py::test_network - OSError: network is unreachable"\n'
+                 "n=1\n"
+                 'if [ -f new.txt ] && [ "$(grep -c run "$TMPDIR/runs")" = 1 ]; then\n'
+                 '  echo "FAILED tests/test_new.py::test_new - assert 1 == 2"; n=2\n'
+                 "fi\n"
+                 'echo "$n failed in 0.01s"\n'
+                 "exit 1\n")
+
+# A check that fixes what it finds and fails for having found it, as a formatter or a lock-file check does: with
+# fixme.txt in the checkout it rewrites the file and fails, and it passes once the file says "fixed".
+REWRITING_CHECK = ('echo run >> "$TMPDIR/runs"\n'
+                   'n=$(grep -c run "$TMPDIR/runs")\n'
+                   'if [ -f fixme.txt ] && [ "$(cat fixme.txt)" != fixed ]; then\n'
+                   '  echo fixed > fixme.txt; echo "run $n: rewrote fixme.txt"; exit 1\n'
+                   "fi\n"
+                   'echo "run $n"\n')
+
+
+def _counted_check(factory, leave, prompts, briefs, script=COUNTED_CHECK):
+    """Add ``script`` to the repository's checks. The builder's first attempt leaves the file ``leave`` in the
+    checkout beside its change, and its second removes it."""
+    _land_on_main(factory, "counted.sh", script)
+    with session_scope() as s:
+        repo = s.get(Repository, factory["repo"])
+        repo.config = {**repo.config, "checks": ["sh test.sh", "sh counted.sh"]}
+
+    def builder(messages):
+        if step(messages) == 0:
+            prompts.append(messages[1]["content"])
+            if len(prompts) == 1:
+                return {"content": "", "tool_calls": [
+                    call("write_file", {"path": "greet.sh", "content": "echo 'Hello, Factory!'\n"}),
+                    call("write_file", {"path": leave, "content": "x\n"}, 1)]}
+            return {"content": "", "tool_calls": [call("run", {"command": f"rm -f {leave}"})]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Updated the greeting.",
+                                                              "tests": []})]}
+
+    def verifier(messages):
+        if step(messages) == 0:
+            briefs.append(messages[1]["content"])
+        return passing_verifier(messages)
+
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+
+
+def _counted(record):
+    return next(c for c in record["checks"] if c["command"] == "sh counted.sh")
+
+
+def _three_second_checks(monkeypatch):
+    """Give a check three seconds, on the candidate and on the base commit, instead of twenty-five minutes."""
+    run_commands = delivery.TaskRunner._run_commands
+
+    async def shortened(self, sandbox, commands, kind, timeout=1500):
+        return await run_commands(self, sandbox, commands, kind, 3 if kind in ("check", "base_check") else timeout)
+
+    monkeypatch.setattr(delivery.TaskRunner, "_run_commands", shortened)
+
+
+def test_a_check_that_passes_when_run_again_is_flaky_and_does_not_use_an_attempt(factory):
+    prompts, briefs = [], []
+    _counted_check(factory, "flaky.txt", prompts, briefs)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "verified")]
+        assert task.attempt == 1
+        check = _counted(records[0])
+        assert check["ok"] and check["cause"] == "flaky"
+        assert check["first_failure"].strip() == "run 1: connection reset by peer"
+        events = [(e.kind, e.level) for e in s.query(Event).filter(Event.task_id == task.id).order_by(Event.id)
+                  if e.data.get("command") == "sh counted.sh"]
+        body = FakeGitHub.pulls[task.pr_number]["body"]
+    # One warning that it took a second run, and one result, a pass: nothing that counts failed checks sees a failure,
+    # and the base commit is not consulted.
+    assert events == [("check_flaky", "warn"), ("check_result", "success")]
+    assert not {"base_checks", "base_check_result", "checks_preexisting"} & set(_event_kinds(outcome_id))
+    assert len(briefs) == 1 and "`sh counted.sh` → passed on a second run" in briefs[0]
+    assert "`sh counted.sh`" in body and "failed on its first run, passed on a second" in body
+
+
+def test_a_check_that_fails_twice_is_real_and_uses_the_attempt(factory):
+    prompts, briefs = [], []
+    _counted_check(factory, "broken.txt", prompts, briefs)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "verified")]
+        assert task.attempt == 2
+        check = _counted(records[0])
+        assert not check["ok"] and check["cause"] == "real"
+        assert check["tail"].strip() == "broken.txt must not exist" and check["first"] == {"exit_code": 3, "same": True}
+        assert "cause" not in _counted(records[1]) and "first" not in _counted(records[1])
+    assert "check_flaky" not in _event_kinds(outcome_id)
+    assert "Check `sh counted.sh` failed (exit 3) on two runs in a row (it passes on the base commit)" in prompts[1]
+    # The builder is told how long a check may take, and that its own commands may take as long.
+    limit = delivery.COMMAND_TIMEOUT
+    assert f"Each may take up to {limit // 60} minutes ({limit} seconds)" in prompts[0]
+    assert len(briefs) == 1 and "`sh counted.sh` → passed" in briefs[0] and "second run" not in briefs[0]
+
+
+def test_a_failed_check_that_changed_the_checkout_is_not_run_again(factory):
+    from aifactory.models import Artifact
+
+    prompts, briefs = [], []
+    _counted_check(factory, "fixme.txt", prompts, briefs, script=REWRITING_CHECK)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # A second run would have passed, but on the file the first run rewrote, not on the candidate: a fresh
+        # checkout of the candidate still fails. So the failure stands and the attempt is used.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "verified")]
+        check = _counted(records[0])
+        assert (check["ok"], check["cause"], check["not_rerun"], check["changed_files"]) == (
+            False, "real", "changed", ["fixme.txt"])
+        assert check["tail"].strip() == "run 1: rewrote fixme.txt" and "first" not in check
+        assert "not_rerun" not in _counted(records[1]) and "cause" not in _counted(records[1])
+        kept = [a.name for a in s.query(Artifact).filter(Artifact.task_id == task.id, Artifact.kind == "check")]
+        messages = [e.message for e in s.query(Event).filter(
+            Event.task_id == task.id, Event.kind == "check_result", Event.level == "warn").order_by(Event.id)]
+    assert "check_flaky" not in _event_kinds(outcome_id)
+    assert kept.count("sh counted.sh") == 2 and "first run (failed): sh counted.sh" not in kept
+    how = "failed (exit 1) and changed files in the checkout (fixme.txt), so it was not run again"
+    assert messages == [f"✗ sh counted.sh — {how}"]
+    assert f"Check `sh counted.sh` {how} (it passes on the base commit):\n```\nrun 1: rewrote fixme.txt" in prompts[1]
+
+
+def test_a_check_that_was_not_run_again_says_why():
+    changed = {"command": "ruff format --check", "ok": False, "exit_code": 1, "duration": 0.4, "cause": "real",
+               "tail": "1 file reformatted", "not_rerun": "changed", "changed_files": ["a.py", "b/c.py", "…"]}
+    unknown = {**changed, "not_rerun": "unknown", "changed_files": []}
+    assert delivery._how_failed(changed) == ("failed (exit 1) and changed files in the checkout (a.py, b/c.py, …), so "
+                                             "it was not run again")
+    assert delivery._how_failed(unknown) == ("failed (exit 1) and was not run again, because the state of the "
+                                             "checkout could not be read")
+    assert delivery._whose_output(changed) == ""
+    # The attempt record keeps why, so the row reads the same after a restart.
+    assert delivery._brief([changed, unknown]) == [
+        {"command": "ruff format --check", "ok": False, "exit_code": 1, "duration": 0.4, "cause": "real",
+         "not_rerun": "changed", "changed_files": ["a.py", "b/c.py", "…"], "tail": "1 file reformatted"},
+        {"command": "ruff format --check", "ok": False, "exit_code": 1, "duration": 0.4, "cause": "real",
+         "not_rerun": "unknown", "tail": "1 file reformatted"}]
+
+
+def test_a_failure_on_the_first_run_only_is_not_excused_by_the_base_commit(factory):
+    from aifactory.models import Artifact
+
+    prompts, briefs = [], []
+    _counted_check(factory, "new.txt", prompts, briefs, script=RETRIED_CHECK)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # First attempt: the second run fails only what the base commit fails, but the first failed a test of the
+        # change's own. Second attempt: both runs fail only what the base commit fails.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        check, again = _counted(records[0]), _counted(records[1])
+        assert (check["cause"], check.get("preexisting"), check["first"]) == ("real", None,
+                                                                              {"exit_code": 1, "same": False})
+        assert "FAILED tests/test_new.py::test_new" in check["tail"]  # the first run's output
+        assert (again["cause"], again.get("preexisting"), again["first"]) == ("preexisting", True,
+                                                                              {"exit_code": 1, "same": True})
+        kept = [a.name for a in s.query(Artifact).filter(Artifact.task_id == task.id, Artifact.kind == "check")]
+    # The first run's whole output is kept beside the second's when the two differ, and only then.
+    assert kept.count("first run (failed): sh counted.sh") == 1 and kept.count("sh counted.sh") == 2
+    assert ("Check `sh counted.sh` failed (exit 1) on its first run, then failed differently (exit 1) when run again "
+            "(failing here but not on the base commit: FAILED tests/test_new.py::test_new). Output of the first run:"
+            ) in prompts[1]
+    assert "FAILED tests/test_new.py::test_new - assert 1 == 2" in prompts[1]
+    assert len(briefs) == 1 and "`sh counted.sh` → FAILED (pre-existing, see below)" in briefs[0]
+    assert "- `sh counted.sh`: FAILED tests/test_env.py::test_network" in briefs[0]
+
+
+def test_a_check_that_times_out_is_not_run_again_and_reads_as_a_timeout(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "slow.txt", prompts, briefs)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "verified")]
+        check = _counted(records[0])
+        assert (check["cause"], check["timed_out"], check["limit"], check["exit_code"]) == ("timeout", True, 3, 124)
+        assert check["tail"].strip() == "run 1"  # a second run would have printed "run 2"
+        messages = [e.message for e in s.query(Event).filter(Event.task_id == task.id, Event.kind == "check_result",
+                                                             Event.level == "warn")]
+    assert len(messages) == 1 and "sh counted.sh — timed out after" in messages[0]
+    assert "Check `sh counted.sh` timed out after " in prompts[1]
+    assert "s (the limit is 3s) (it passes on the base commit)" in prompts[1]
+    assert "exit 124" not in prompts[1]
+
+
+def test_a_check_that_times_out_on_the_base_commit_too_is_preexisting(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "slow.txt", prompts, briefs)
+    _land_on_main(factory, "slow.txt", "x\n")  # the check was too slow for the limit before the change
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_preexisting"), (1, "verified")]
+        assert task.attempt == 1
+        check = _counted(records[-1])
+        assert (check["cause"], check["timed_out"], check.get("preexisting")) == ("preexisting", True, True)
+        body = FakeGitHub.pulls[task.pr_number]["body"]
+    assert len(prompts) == 1 and len(briefs) == 1
+    assert "`sh counted.sh` → FAILED (timed out after " in briefs[0]
+    assert "; the limit is 3s) (pre-existing, see below)" in briefs[0]
+    assert "- `sh counted.sh`: times out on the base commit too" in briefs[0]
+    assert "(the limit is 3s); it times out on the base commit too, so not caused by this change" in body
+
+
+def test_a_timeout_that_got_less_far_than_the_base_commit_s_is_not_preexisting(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "stuck.txt", prompts, briefs)
+    _land_on_main(factory, "slow.txt", "x\n")  # on the base commit the check prints its run, then runs out of time
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # First attempt: the check hangs before it prints anything, which the base commit's run does not explain.
+        # Second attempt: it gets as far as the base commit's run before the limit.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        check, again = _counted(records[0]), _counted(records[1])
+        assert (check["cause"], check["timed_out"], check.get("preexisting"), check["tail"].strip()) == (
+            "timeout", True, None, "")
+        assert (again["cause"], again["timed_out"], again.get("preexisting")) == ("preexisting", True, True)
+    assert "Check `sh counted.sh` timed out after " in prompts[1]
+    assert ("(it times out on the base commit too, but the two runs had not got equally far when they were stopped, "
+            "so this timeout counts as a failure of your change)") in prompts[1]
+    assert len(briefs) == 1 and "- `sh counted.sh`: times out on the base commit too" in briefs[0]
+
+
+def test_a_check_that_fails_and_then_times_out_as_the_base_commit_does_is_not_preexisting(factory, monkeypatch):
+    _three_second_checks(monkeypatch)
+    prompts, briefs = [], []
+    _counted_check(factory, "flaky.txt", prompts, briefs)
+    _land_on_main(factory, "slow.txt", "x\n")  # on the base commit the check only ever runs out of time
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention"), timeout=120)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        records = task.evidence["attempts"]
+        # First attempt: the check fails, then runs out of time when run again, as it does on the base commit. That
+        # does not excuse the first run's failure. Second attempt: it only runs out of time.
+        assert [(a["n"], a["result"]) for a in records] == [(1, "checks_failed"), (2, "checks_preexisting"),
+                                                             (2, "verified")]
+        check, again = _counted(records[0]), _counted(records[1])
+        assert (check["cause"], check["timed_out"], check["exit_code"], check.get("preexisting")) == (
+            "real", True, 124, None)
+        assert check["first"] == {"exit_code": 1, "same": False}
+        assert check["tail"].strip() == "run 1: connection reset by peer"  # the first run's output, not the timeout's
+        assert (again["cause"], again["timed_out"], again.get("first")) == ("preexisting", True, None)
+        messages = [e.message for e in s.query(Event).filter(
+            Event.task_id == task.id, Event.kind == "check_result", Event.level == "warn").order_by(Event.id)]
+    assert "sh counted.sh — failed (exit 1) on its first run, then timed out after " in messages[0]
+    assert "Check `sh counted.sh` failed (exit 1) on its first run, then timed out after " in prompts[1]
+    assert ("s (the limit is 3s) when run again (the base commit fails as the second run did, not as the first, so "
+            "the first run's failure counts as a failure of your change). Output of the first run:\n"
+            "```\nrun 1: connection reset by peer") in prompts[1]
+
+
+def test_a_check_that_failed_twice_says_how_each_run_ended():
+    from types import SimpleNamespace
+
+    from aifactory.prompts import verify_prompt
+
+    again = {"command": "pytest", "ok": False, "exit_code": 2, "duration": 0.4, "tail": "the first run's output",
+             "first": {"exit_code": 1, "same": False}}
+    same = {**again, "first": {"exit_code": 2, "same": True}}
+    assert delivery._how_failed(same) == "failed (exit 2) on two runs in a row"
+    assert delivery._how_failed(again) == ("failed (exit 1) on its first run, then failed differently (exit 2) when "
+                                           "run again")
+    assert delivery._whose_output(again) == ". Output of the first run"
+    assert delivery._whose_output(same) == delivery._whose_output({"exit_code": 2}) == ""
+    # Failed, then out of time: neither "exit 124" nor a plain timeout, wherever the check is described. This is how
+    # the row reads after a restart too, when only the attempt record is left of it.
+    slow = delivery._brief([{**again, "exit_code": 124, "duration": 3.2, "timed_out": True, "limit": 3,
+                             "cause": "preexisting", "preexisting": True, "failures": None, "signature": "abc"}])
+    assert slow == [{"command": "pytest", "ok": False, "exit_code": 124, "duration": 3.2, "cause": "preexisting",
+                     "timed_out": True, "limit": 3, "tail": "the first run's output", "preexisting": True,
+                     "first": {"exit_code": 1, "same": False}}]
+    how = "failed (exit 1) on its first run, then timed out after 3s (the limit is 3s) when run again"
+    assert delivery._how_failed(slow[0]) == how
+    assert delivery._check_note(slow[0]) == (f" — {how}; it times out on the base commit too, so not caused by this "
+                                             "change")
+    brief = verify_prompt(SimpleNamespace(key="T1", title="t", spec="s", acceptance=["a"]),
+                          SimpleNamespace(full_name="acme/demo", config={}), "base", {"summary": "done"}, slow)
+    assert ("- `pytest` → FAILED (timed out after 3s on a second run; the limit is 3s; the first run failed, exit 1) "
+            "(pre-existing, see below)") in brief
 
 
 def _slow_builder(messages):
