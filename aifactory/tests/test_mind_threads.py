@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 from aifactory.auth import current_user
 from aifactory.db import SessionLocal, init_engine
 from aifactory.mind import api, store
-from aifactory.models import (Event, Membership, Message, MindCharge, MindMessage, MindThread,
-                             Organization, Secret, User, Workspace)
+from aifactory.models import (Event, Membership, Message, MindAction, MindCharge, MindMessage, MindThread,
+                             Organization, Outcome, Secret, User, Workspace)
 from aifactory.security import encrypt
 
 
@@ -68,6 +68,7 @@ def create(world, ws=None):
     client, _, _, ids = world
     response = client.post("/api/mind/threads", json={"billing_workspace_id": ws or ids[2]})
     assert response.status_code == 200, response.text
+    assert response.json()["workspace_ids"] == [ws or ids[2]]
     return response.json()["id"]
 
 
@@ -117,7 +118,8 @@ def test_validation_and_unavailable(world):
     thread = create(world)
     assert send(world, thread, text="").status_code == 422
     assert send(world, thread, text="x" * 8001).status_code == 422
-    assert send(world, thread, context={"workspace_id": ids[3], "kind": "workspace", "label": "B"}).status_code == 404
+    assert events(send(world, thread, context={"workspace_id": ids[3], "kind": "workspace", "label": "B"}))[-1]["data"] == {"status": "complete"}
+    assert world[1].history[-1]["context"] is None
     assert client.get("/api/mind/status", params={"workspace_id": ids[2]}).json()["status"] == "ready"
 
 
@@ -545,28 +547,47 @@ async def test_same_session_midnight_cumulative_usage_is_allocated_per_call(worl
         await ledger.before_call()
 
 
-def test_reads_in_a_newly_joined_workspace_widen_the_thread_scope(world):
+@pytest.mark.parametrize("name", ["overview", "propose_create_outcome"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_calls_in_another_workspace_are_refused_without_widening_scope(world, monkeypatch, name, legacy):
     client, runtime, _, ids = world
     thread = create(world)  # Alice's memberships at creation: workspace A only
+    scope = [ids[2], ids[3]] if legacy else [ids[2]]
     with SessionLocal() as db:
         db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        db.get(MindThread, thread).workspace_ids = scope
         db.commit()
+
+    async def unexpected_call(*_):
+        pytest.fail("Out-of-workspace call reached the dispatcher")
+
+    monkeypatch.setattr(api.Tools, "call", unexpected_call)
 
     async def run_turn(context, history, emit, tools, ledger):
         await ledger.before_call()
-        await tools.call("overview", {"workspace_id": ids[3]})
-        await emit({"type": "token", "data": {"text": "Workspace B is quiet."}})
+        result = await tools.call(name, {"workspace_id": ids[3], "title": "Private B", "text": "Do not leak"})
+        assert result == {"refused": True, "status": 403, "reason":
+                          "Mind can only read and act in this conversation's workspace; "
+                          f"use workspace_id {ids[2]}."}
+        assert ids[3] not in json.dumps(result) and "Private B" not in json.dumps(result)
         await ledger.after_call(runtime.total)
 
     runtime.run_turn = run_turn
-    assert events(send(world, thread))[-1]["data"] == {"status": "complete"}
+    es = events(send(world, thread))
+    assert es[-1]["data"] == {"status": "complete"}
+    assert next(e["data"] for e in es if e["type"] == "tool_finished")["summary"] == "Factory refused the call"
+    assert not any(e["type"] == "action_card" for e in es)
+    view = client.get(f"/api/mind/threads/{thread}").json()
+    assert view["messages"][1]["citations"] == []
+    assert "Private B" not in json.dumps(view["messages"])
     with SessionLocal() as db:
-        assert ids[3] in db.get(MindThread, thread).workspace_ids
+        assert db.get(MindThread, thread).workspace_ids == scope
+        assert db.query(MindAction).filter_by(thread_id=thread).count() == 0
         db.query(Membership).filter_by(user_id=ids[0], workspace_id=ids[3]).delete()
         db.commit()
-    # What Mind read in B stays with B: losing B hides the whole thread.
-    assert client.get(f"/api/mind/threads/{thread}").status_code == 404
-    assert thread not in [t["id"] for t in client.get("/api/mind/threads").json()]
+    # Legacy visibility is unchanged; new threads never acquired B's revocation scope.
+    assert client.get(f"/api/mind/threads/{thread}").status_code == (404 if legacy else 200)
+    assert (thread in [t["id"] for t in client.get("/api/mind/threads").json()]) is not legacy
 
 
 @pytest.mark.parametrize("closed", [True, False])
@@ -602,19 +623,24 @@ def test_a_credential_split_between_a_key_and_its_value_is_redacted():
                                                     {"type": "token", "data": {"text": "[redacted]"}}]
 
 
-def test_context_from_a_newly_joined_workspace_widens_the_thread_scope(world):
-    client, _, _, ids = world
+@pytest.mark.parametrize("legacy", [False, True])
+def test_context_from_another_workspace_is_dropped_without_widening_scope(world, legacy):
+    client, runtime, _, ids = world
     thread = create(world)
+    scope = [ids[2], ids[3]] if legacy else [ids[2]]
     with SessionLocal() as db:
         db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        db.get(MindThread, thread).workspace_ids = scope
         db.commit()
-    context = {"workspace_id": ids[3], "kind": "inbox", "id": ids[3], "label": "Inbox"}
+    context = {"workspace_id": ids[3], "kind": "inbox", "id": ids[3], "label": "Other workspace inbox"}
     assert events(send(world, thread, context=context))[-1]["data"] == {"status": "complete"}
+    assert runtime.history[-1]["context"] is None
+    view = client.get(f"/api/mind/threads/{thread}").json()
+    assert view["messages"][0]["context"] is None
+    assert "Other workspace inbox" not in json.dumps(view["messages"])
     with SessionLocal() as db:
-        assert ids[3] in db.get(MindThread, thread).workspace_ids
-        db.query(Membership).filter_by(user_id=ids[0], workspace_id=ids[3]).delete()
-        db.commit()
-    assert client.get(f"/api/mind/threads/{thread}").status_code == 404
+        assert db.query(MindMessage).filter_by(thread_id=thread, role="user").one().context is None
+        assert db.get(MindThread, thread).workspace_ids == scope
 
 
 def test_a_streamed_credential_that_needs_a_later_delimiter_is_held(world):
@@ -639,3 +665,117 @@ def test_unfinished_credentials_in_structured_events_are_redacted(world, kind):
     response = send(world, thread)
     assert "MIIBVQ" not in response.text
     assert "MIIBVQ" not in client.get(f"/api/mind/threads/{thread}").text
+
+
+def test_creation_and_thread_list_are_scoped_to_billing_workspace(world):
+    client, _, actor, ids = world
+    with SessionLocal() as db:
+        db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        db.commit()
+    first, second = create(world), create(world, ids[3])
+    assert client.get(f"/api/mind/threads/{first}").json()["thread"]["workspace_ids"] == [ids[2]]
+    assert client.get(f"/api/mind/threads/{second}").json()["thread"]["workspace_ids"] == [ids[3]]
+    # A legacy thread retains both its original scope and its original visibility rules.
+    with SessionLocal() as db:
+        legacy = MindThread(owner_id=ids[0], billing_workspace_id=ids[2], workspace_ids=[ids[2], ids[3]])
+        db.add(legacy); db.commit()
+        legacy_id = legacy.id
+    assert {t["id"] for t in client.get("/api/mind/threads").json()} == {first, second, legacy_id}
+    assert {t["id"] for t in client.get("/api/mind/threads", params={"workspace_id": ids[2]}).json()} == {first, legacy_id}
+    assert [t["id"] for t in client.get("/api/mind/threads", params={"workspace_id": ids[3]}).json()] == [second]
+    actor[0] = ids[1]  # Bob belongs only to A and cannot list Alice's threads.
+    assert client.get("/api/mind/threads", params={"workspace_id": ids[2]}).json() == []
+    assert client.get("/api/mind/threads", params={"workspace_id": ids[3]}).status_code == 404
+    actor[0] = ids[0]
+    with SessionLocal() as db:
+        db.query(Membership).filter_by(user_id=ids[0], workspace_id=ids[3]).delete()
+        db.commit()
+    assert [t["id"] for t in client.get("/api/mind/threads", params={"workspace_id": ids[2]}).json()] == [first]
+    assert [t["id"] for t in client.get("/api/mind/threads").json()] == [first]
+
+
+@pytest.mark.parametrize("arguments", [{}, None, [], "not a dict"])
+async def test_tool_calls_without_a_workspace_are_refused_before_dispatch(world, monkeypatch, arguments):
+    thread = create(world)
+    ids, emitted = world[3], []
+
+    async def unexpected_call(*_):
+        pytest.fail("Invalid arguments reached the dispatcher")
+
+    async def emit(event):
+        emitted.append(event)
+
+    monkeypatch.setattr(api.Tools, "call", unexpected_call)
+    tools = api.PrivateTools(api.Context(None, ids[0], thread), emit)
+    result = await tools.call("overview", arguments)
+    assert result["refused"] is True and result["status"] == 403
+    assert f"use workspace_id {ids[2]}" in result["reason"]
+    assert emitted == [{"type": "tool_finished", "data": {"call_id": "1", "name": "overview",
+                        "summary": "Factory refused the call", "citations": []}}]
+    with SessionLocal() as db:
+        assert db.get(MindThread, thread).workspace_ids == [ids[2]]
+        assert db.query(MindAction).filter_by(thread_id=thread).count() == 0
+
+
+async def test_cross_workspace_citations_refuse_the_entire_result_and_rollback(world, monkeypatch):
+    thread = create(world)
+    client, _, _, ids = world
+    with SessionLocal() as db:
+        db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        db.commit()
+    emitted = []
+
+    async def emit(event):
+        emitted.append(event)
+
+    async def leaking_call(tools, name, arguments):
+        # Simulate a faulty tool: none of its result or pending persistence may survive.
+        tools.context.db.add(MindAction(owner_id=ids[0], thread_id=thread, workspace_id=ids[2],
+                                       kind="create_outcome", fields={"title": "Private B"}))
+        tools.context.db.flush()
+        return {"items": [{"title": "Private B"}], "citations": [
+            {"workspace_id": ids[2], "label": "A"}, {"workspace_id": ids[3], "label": "Private B"}]}
+
+    monkeypatch.setattr(api.Tools, "call", leaking_call)
+    tools = api.PrivateTools(api.Context(None, ids[0], thread), emit)
+    result = await tools.call("overview", {"workspace_id": ids[2]})
+    assert result["refused"] is True and result["status"] == 403 and ids[2] in result["reason"]
+    assert "Private B" not in json.dumps([result, emitted])
+    assert emitted[0]["data"]["summary"] == "Factory refused the call"
+    assert emitted[0]["data"]["citations"] == []
+    with SessionLocal() as db:
+        assert db.get(MindThread, thread).workspace_ids == [ids[2]]
+        assert db.query(MindAction).filter_by(thread_id=thread).count() == 0
+    assert client.get(f"/api/mind/threads/{thread}").json()["messages"] == []
+
+
+@pytest.mark.parametrize("kind", ["create_outcome", "build_plan"])
+@pytest.mark.parametrize("action_in_billing,outcome_in_billing", [(False, False), (False, True), (True, False), (True, True)])
+def test_legacy_handoff_requires_both_action_and_outcome_in_billing_workspace(
+        world, kind, action_in_billing, outcome_in_billing):
+    client, _, _, ids = world
+    thread_id = create(world)
+    with SessionLocal() as db:
+        db.add(Membership(user_id=ids[0], workspace_id=ids[3]))
+        thread = db.get(MindThread, thread_id)
+        thread.workspace_ids = [ids[2], ids[3]]
+        outcome = Outcome(workspace_id=ids[2] if outcome_in_billing else ids[3], number=1,
+                          title="Handoff outcome")
+        db.add(outcome); db.flush()
+        action = MindAction(owner_id=ids[0], thread_id=thread_id, kind=kind, status="succeeded",
+                            workspace_id=ids[2] if action_in_billing else ids[3],
+                            result={"outcome_id": outcome.id})
+        db.add(action); db.commit()
+        expected = {"id": outcome.id, "number": 1, "title": outcome.title, "status": outcome.status,
+                    "workspace_id": ids[2], "action_id": action.id} if action_in_billing and outcome_in_billing else None
+
+    response = client.get(f"/api/mind/threads/{thread_id}")
+    assert response.status_code == 200
+    assert response.json()["thread"]["outcome"] == expected
+    # Both the full transcript and workspace-filtered conversation list use the same safe projection.
+    response = client.get("/api/mind/threads", params={"workspace_id": ids[2]})
+    assert response.status_code == 200
+    assert response.json()[0]["outcome"] == expected
+    assert response.json()[0]["workspace_ids"] == [ids[2], ids[3]]
+    with SessionLocal() as db:
+        assert db.get(MindThread, thread_id).workspace_ids == [ids[2], ids[3]]

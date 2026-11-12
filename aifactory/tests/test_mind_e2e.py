@@ -2,6 +2,7 @@
 durable accounting, against a local fake MindsHub. Nothing here calls a paid service."""
 import asyncio
 import json
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,8 +14,8 @@ from aifactory.mind import provider as mp
 from aifactory.mind import runtime as mr
 from aifactory.mind.contracts import TurnContext
 from aifactory.mind.store import AccountingError
-from aifactory.models import (Decision, Event, Membership, MindAction, MindCharge, MindThread, Organization, Outcome,
-                             Plan, Repository, Secret, Task, User, Workspace)
+from aifactory.models import (Decision, Event, Membership, MindAction, MindActionResult, MindCharge, MindThread,
+                             MindMessage, Organization, Outcome, Plan, Repository, Secret, Task, User, Workspace)
 from aifactory.security import encrypt
 from tests.test_mind_provider import KEY, MODEL, fake_provider
 
@@ -82,7 +83,7 @@ def test_real_engine_answers_through_the_app(app_as, people, monkeypatch):
     with fake_provider() as (credential, requests, headers):
         monkeypatch.setattr(mp, "saved_credential", lambda workspace_id: credential)
         thread = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()
-        assert sorted(thread["workspace_ids"]) == sorted([people["first"], people["second"]])
+        assert thread["workspace_ids"] == [people["first"]]
         status = client.get("/api/mind/status", params={"workspace_id": people["first"]}).json()
         assert status == {"status": "ready", "model_id": MODEL, "reason": None, "accounting": "settled"}
         probes = len(requests)
@@ -99,7 +100,9 @@ def test_real_engine_answers_through_the_app(app_as, people, monkeypatch):
     turn = requests[probes:]
     assert len(turn) == 2
     prompt = json.dumps(turn[0])
-    assert "Workspaces this person can ask about" in prompt and people["second"] in prompt
+    assert "This conversation belongs to the Factory workspace" in prompt
+    assert "Platform" in prompt and people["first"] in prompt
+    assert "Mobile" not in prompt and people["second"] not in prompt
     assert "The person is looking at" in prompt and KEY not in prompt
     sessions = {h.get("langfuse-session-id") for h in headers if h.get("langfuse-session-id")}
     view = client.get(f"/api/mind/threads/{thread['id']}").json()
@@ -271,7 +274,8 @@ def test_a_viewer_is_refused_and_its_thread_keeps_its_scope(app_as, people):
     assert events[-1]["data"] == {"status": "complete"}
     viewer, stranger = runtime.results
     assert viewer["refused"] and viewer["status"] == 403
-    assert stranger["refused"] and stranger["status"] == 404
+    assert stranger["refused"] and stranger["status"] == 403
+    assert people["first"] in stranger["reason"]
     with SessionLocal() as db:
         assert db.query(MindAction).count() == 0 and db.get(Task, people["task"]).status == "blocked"
         assert people["second"] not in db.get(MindThread, thread).workspace_ids
@@ -367,16 +371,17 @@ def test_card_edits_and_confirmations_use_the_workspace_secret_scrub(app_as, peo
         assert response.status_code == 422 and opaque not in response.text
 
 
-def test_the_runtime_adapter_builds_one_turn(people):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_the_runtime_adapter_builds_one_turn(people, legacy):
     provider = FakeProvider()
     engine = FakeEngine(provider)
     runtime = mr.EngineRuntime(engine)
     with SessionLocal() as db:
         thread = MindThread(owner_id=people["alice"], billing_workspace_id=people["first"],
-                            workspace_ids=[people["first"], people["second"]])
+                            workspace_ids=[people["first"], people["second"]] if legacy else [people["first"]])
         db.add(thread); db.commit()
         thread_id = thread.id
-    # The thread began before Alice joined the second workspace; the prompt still offers it.
+    # Even legacy threads with a wider stored scope may only use their billing workspace.
     context = TurnContext(people["alice"], thread_id, people["first"], (people["first"],))
     history = [{"role": "user", "text": "first"}, {"role": "assistant", "text": ""},  # an interrupted reply
                {"role": "tool", "text": "x"}, {"role": "assistant", "text": "answer"},
@@ -390,12 +395,15 @@ def test_the_runtime_adapter_builds_one_turn(people):
     ledger = FakeLedger()
     asyncio.run(runtime.run_turn(context, history, emit, tools=None, ledger=ledger))
     call = engine.calls[0]
-    assert call["history"] == [{"role": "user", "content": "first"}, {"role": "assistant", "content": "answer"}]
+    assert call["history"] == ([] if legacy else [
+        {"role": "user", "content": "first"}, {"role": "assistant", "content": "answer"}])
     assert call["session_id"] == provider.sessions[0] == "mind-turn"  # one MindsHub session for the turn
     assert call["prompt"].endswith("next") and "Outcome 7" in call["prompt"] and "evil" not in call["prompt"]
-    assert "Mobile" in call["prompt"] and "Platform" in call["prompt"]
-    with SessionLocal() as db:  # a workspace offered to the model is in the thread's revocation scope
-        assert people["second"] in db.get(MindThread, thread_id).workspace_ids
+    assert "Platform" in call["prompt"] and people["first"] in call["prompt"]
+    assert "Mobile" not in call["prompt"] and people["second"] not in call["prompt"]
+    with SessionLocal() as db:
+        assert db.get(MindThread, thread_id).workspace_ids == (
+            [people["first"], people["second"]] if legacy else [people["first"]])
     assert [e["type"] for e in seen] == ["tool_start", "text_delta"]  # finished tools come from the dispatcher
     assert ledger.reconciled == 1
 
@@ -465,7 +473,7 @@ def test_mind_budget_setting_defaults_and_accepts_zero(client, signed_in):
 def test_workspace_names_reach_the_model_only_scrubbed(people):
     opaque = "opaque-name-secret-0042"
     with SessionLocal() as db:
-        db.get(Workspace, people["second"]).name = f"Mobile {opaque}"
+        db.get(Workspace, people["first"]).name = f"Platform {opaque}"
         db.add(Secret(workspace_id=people["first"], kind="github_token", ciphertext=encrypt(opaque)))
         thread = MindThread(owner_id=people["alice"], billing_workspace_id=people["first"],
                             workspace_ids=[people["first"]])
@@ -479,7 +487,8 @@ def test_workspace_names_reach_the_model_only_scrubbed(people):
     asyncio.run(mr.EngineRuntime(engine).run_turn(context, [{"role": "user", "text": "hi"}], emit, tools=None,
                                                   ledger=FakeLedger()))
     prompt = engine.calls[0]["prompt"]
-    assert opaque not in prompt and "Mobile [redacted]" in prompt
+    assert opaque not in prompt and "Platform [redacted]" in prompt
+    assert "Mobile" not in prompt and people["second"] not in prompt
 
 
 @pytest.mark.parametrize("module", ["aifactory.mind.actions", "aifactory.mind.api", "aifactory.mind.runtime"])
@@ -555,3 +564,111 @@ def test_a_finished_turn_is_saved_before_its_done_frame(app_as, people):
                 saved = client.get(f"/api/mind/threads/{thread}").json()["messages"][1]
                 assert saved["status"] == "complete" and saved["text"] == "Saved before done."
                 break
+
+
+@pytest.mark.parametrize("invalid", ["missing_thread", "revoked_membership", "wrong_billing_workspace"])
+def test_runtime_refuses_invalid_thread_scope_before_provider_access(people, invalid):
+    from fastapi import HTTPException
+
+    with SessionLocal() as db:
+        thread = MindThread(owner_id=people["alice"], billing_workspace_id=people["first"],
+                            workspace_ids=[people["first"]])
+        db.add(thread); db.commit()
+        thread_id = thread.id
+        if invalid == "revoked_membership":
+            # Even a malformed legacy scope omitting the billing workspace must fail closed.
+            thread.workspace_ids = []
+            db.query(Membership).filter_by(user_id=people["alice"], workspace_id=people["first"]).delete()
+            db.commit()
+    context = TurnContext(people["alice"], "missing" if invalid == "missing_thread" else thread_id,
+                          people["second"] if invalid == "wrong_billing_workspace" else people["first"], ())
+    provider = FakeProvider()
+    engine = FakeEngine(provider)
+
+    async def emit(_):
+        pytest.fail("A refused turn emitted an event")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(mr.EngineRuntime(engine).run_turn(context, [{"role": "user", "text": "hello"}], emit,
+                                                    tools=None, ledger=FakeLedger()))
+    assert exc.value.status_code == 404 and exc.value.detail == "Thread not found"
+    assert provider.sessions == [] and engine.calls == []
+
+
+def test_legacy_action_results_only_continue_in_the_billing_workspace(people):
+    opaque = "opaque-result-secret-0063"
+    start = datetime(2026, 11, 1)
+    with SessionLocal() as db:
+        thread = MindThread(owner_id=people["alice"], billing_workspace_id=people["first"],
+                            workspace_ids=[people["first"], people["second"]])
+        db.add(thread); db.flush()
+        thread_id = thread.id
+        db.add(Secret(workspace_id=people["first"], kind="github_token", ciphertext=encrypt(opaque)))
+        # More than a page of newer B results must neither reach the provider nor crowd out A's results.
+        for index in range(23):
+            workspace_id = people["first"] if index < 2 else people["second"]
+            action = MindAction(owner_id=people["alice"], thread_id=thread_id, workspace_id=workspace_id,
+                                kind="send_guidance", status="succeeded")
+            db.add(action); db.flush()
+            content = ({"message": f"Billing result {index}: {opaque}"} if index < 2 else
+                       {"workspace_id": people["second"], "message": "Mobile private result"})
+            db.add(MindActionResult(owner_id=people["alice"], thread_id=thread_id, action_id=action.id,
+                                    content=content, created_at=start + timedelta(seconds=index)))
+        db.commit()
+
+    engine = FakeEngine(FakeProvider())
+
+    async def emit(_):
+        pass
+
+    context = TurnContext(people["alice"], thread_id, people["first"], (people["first"], people["second"]))
+    asyncio.run(mr.EngineRuntime(engine).run_turn(context, [{"role": "user", "text": "What's next?"}], emit,
+                                                tools=None, ledger=FakeLedger()))
+    prompt = engine.calls[0]["prompt"]
+    assert "Confirmed action results" in prompt
+    assert prompt.index("Billing result 0") < prompt.index("Billing result 1")
+    assert "[redacted]" in prompt and opaque not in prompt
+    assert "Mobile" not in prompt and people["second"] not in prompt
+    with SessionLocal() as db:
+        assert db.get(MindThread, thread_id).workspace_ids == [people["first"], people["second"]]
+        assert db.query(MindActionResult).filter_by(thread_id=thread_id).count() == 23  # no migration
+
+
+def test_legacy_cross_workspace_transcript_never_reaches_later_model_turns(app_as, people):
+    client, app, _ = app_as
+    engine = FakeEngine(FakeProvider())
+    app.state.mind_runtime = mr.EngineRuntime(engine)
+    thread_id = client.post("/api/mind/threads", json={"billing_workspace_id": people["first"]}).json()["id"]
+    with SessionLocal() as db:
+        db.get(MindThread, thread_id).workspace_ids = [people["first"], people["second"]]
+        # Plain messages can carry B's data too: context/citation filtering alone cannot establish provenance.
+        old = [
+            MindMessage(thread_id=thread_id, role="user", text=f"Check Mobile {people['second']}",
+                        context={"workspace_id": people["second"], "kind": "workspace"},
+                        turn_id="legacy-1", position=1),
+            MindMessage(thread_id=thread_id, role="assistant", text="Mobile private outcome: Hidden launch",
+                        turn_id="legacy-1", position=2),
+            MindMessage(thread_id=thread_id, role="user", text="Tell me about Hidden launch",
+                        turn_id="legacy-2", position=3),
+            MindMessage(thread_id=thread_id, role="assistant", text="Private launch details",
+                        turn_id="legacy-2", position=4),
+        ]
+        db.add_all(old); db.commit()
+        saved = [(m.id, m.text, m.context) for m in old]
+
+    for index in range(2):
+        events = send(client, thread_id, "What is next here?", key=f"scoped-{index}", context={
+            "workspace_id": people["first"], "kind": "workspace", "label": "Platform overview"})
+        assert events[-1]["data"] == {"status": "complete"}
+        call = engine.calls[index]
+        assert call["history"] == []
+        prompt = call["prompt"]
+        assert "Platform overview" in prompt and prompt.endswith("What is next here?")
+        assert "Mobile" not in prompt and people["second"] not in prompt
+        assert "Hidden launch" not in prompt and "Private launch details" not in prompt
+
+    with SessionLocal() as db:
+        assert db.get(MindThread, thread_id).workspace_ids == [people["first"], people["second"]]
+        for message_id, text, context in saved:
+            message = db.get(MindMessage, message_id)
+            assert (message.text, message.context) == (text, context)  # no transcript migration
