@@ -37,6 +37,9 @@ _SERVER_ERROR = re.compile(r"\b(?:returned|error(?: code)?|status(?: code)?|http
 # "limit reached" also matches an ordinary rate limit ("Rate limit reached for …").
 _EXHAUSTED = ("insufficient_quota", "quota exceeded", "exceeded your current quota", "credits are used up",
               "no credit", "wallet", "billing")
+# Wording of an answer whose trouble passes by itself. A provider that adds "do not send this again" to such an
+# answer (it already retried on its side) has given up for the moment, not set a limit.
+_MOMENTARY = ("overloaded", "momentarily", "temporarily")
 CAUSES = ("provider", "transient", "")
 
 
@@ -60,6 +63,12 @@ def quota_exhausted(text: str) -> bool:
     return any(p in text for p in _EXHAUSTED)
 
 
+def momentary(text: str) -> bool:
+    """Whether a provider's answer says its trouble passes by itself (an overload, a brief outage)."""
+    text = (text or "").lower()
+    return any(p in text for p in _MOMENTARY)
+
+
 def _status(exc: BaseException | None) -> int | None:
     for name in ("status", "status_code"):
         value = getattr(exc, name, None)
@@ -75,7 +84,7 @@ def failure_status(exc: BaseException) -> int | None:
 
 
 def _never_retry(exc: BaseException) -> bool:
-    """The provider marked its answer as not worth retrying (``x-should-retry: false``): a limit a person lifts."""
+    """The provider marked its answer as not to be sent again (``x-should-retry: false``)."""
     headers: Any = getattr(getattr(exc, "response", None), "headers", None)
     try:
         return str(headers.get("x-should-retry", "")).lower() == "false"
@@ -92,14 +101,22 @@ def failure_cause(exc: BaseException) -> str:
     provider SDK's exceptions are read by shape (``status_code``, class name), so no SDK is imported here."""
     cause = getattr(exc, "cause", None)
     if isinstance(cause, str) and cause in CAUSES:
-        return cause
+        # A refusal whose own words say it passes by itself is not one a person has to lift: on 12 November a session
+        # ended with "The model provider is momentarily overloaded", carried as a refusal, and held the workspace.
+        return "transient" if cause == "provider" and momentary(str(exc)) else cause
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and not isinstance(status, bool):
         if status in (401, 402, 403):
             return "provider"
+        if status == 429 and quota_exhausted(str(exc)):
+            return "provider"
+        # "Do not send this again" on a limit is a limit a person lifts. On a server error, or on an answer that says
+        # its trouble is momentary (whatever its status), the provider only gave up for now: tried again, by nobody.
+        if _never_retry(exc) and momentary(str(exc)):
+            return "transient"
         if status not in (408, 409, 429) and status < 500:
             return ""
-        if (status == 429 and quota_exhausted(str(exc))) or _never_retry(exc):
+        if _never_retry(exc) and status < 500:
             return "provider"
         return "transient"
     if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):

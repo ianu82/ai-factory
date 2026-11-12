@@ -18,7 +18,7 @@ from typing import Any, Callable
 import httpx
 
 from .config import get_settings
-from .failures import quota_exhausted
+from .failures import momentary, quota_exhausted
 from .inference_limits import admission
 from .db import session_scope
 from .models import Run, Secret, Workspace
@@ -487,12 +487,16 @@ class ModelClient:
                 detail = _error_detail(response)
                 if response.status_code == 402:
                     raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
-                if response.headers.get("x-should-retry", "").lower() == "false":
+                # "Do not send this again" on a limit is a limit a person lifts. On a server error, or an answer that
+                # says its trouble is momentary, the provider only gave up for now: retried below like any outage.
+                never = response.headers.get("x-should-retry", "").lower() == "false"
+                passing = never and (response.status_code >= 500 or momentary(detail))
+                if never and not passing:
                     raise InferenceError(f"{self.provider.label} limit reached ({response.status_code}): {detail}",
                                          status=response.status_code, cause="provider")
                 if response.status_code in (401, 403):
                     raise InferenceError(f"{self.provider.label} refused the credential ({response.status_code}): {detail}", status=response.status_code)
-                if response.status_code in (400, 404, 422):
+                if response.status_code in (400, 404, 422) and not passing:
                     rejected = InferenceError(
                         f"{self.provider.label} rejected the request ({response.status_code}): {detail}",
                         status=response.status_code)

@@ -290,6 +290,64 @@ async def test_a_provider_refusal_is_never_retried(provider, clocked, monkeypatc
     assert (failed.value.status, failed.value.cause) == (status, "provider") and said in str(failed.value)
 
 
+@pytest.mark.parametrize("status, message", [
+    (503, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+    (529, "Overloaded"),
+    (429, "The model provider is momentarily overloaded. It did not recover after 3 attempts."),
+    (422, "The model is temporarily unavailable, try again shortly."),  # not a rejected request either
+])
+async def test_an_overload_the_provider_gave_up_on_is_retried_like_any_outage_not_refused(provider, clocked,
+                                                                                          monkeypatch, status, message):
+    now, guard = clocked
+    waits = retry_clock(monkeypatch, now, guard)
+    sends = []
+
+    def upstream(req):
+        sends.append(now[0])
+        if len(sends) != 2:  # "do not send this again": the provider retried on its side and gave up for now
+            return httpx.Response(status, headers={"x-should-retry": "false"}, json={"error": {"message": message}})
+        return httpx.Response(200, json={"ok": True})
+
+    fake_http(monkeypatch, upstream)
+    assert await ModelClient(provider)._post("/responses", {}) == {"ok": True}
+    assert sends == [0, 1] and waits == [1] and guard.active == 0
+    # Where it does not pass in time, the failure is the provider being unavailable: work that is redone later,
+    # never a refusal that holds the workspace until a person resumes it.
+    with pytest.raises(inference.InferenceError) as failed:
+        await ModelClient(provider, max_retries=0)._post("/responses", {})
+    assert (failed.value.status, failed.value.cause) == (status, "transient")
+    assert "limit reached" not in str(failed.value)
+
+
+def test_do_not_send_this_again_is_a_refusal_only_on_a_limit():
+    from aifactory.failures import failure_cause
+
+    never = {"x-should-retry": "false"}
+    assert failure_cause(sdk_error("RateLimitError", 429, "Too many requests", never)) == "provider"
+    # About an overload the provider retried itself, it means "not now": no limit a person lifts.
+    assert failure_cause(sdk_error("InternalServerError", 503, "Error code: 503 - upstream failed",
+                                   never)) == "transient"
+    assert failure_cause(sdk_error("RateLimitError", 429, "The model provider is momentarily overloaded. It did not "
+                                   "recover after 3 attempts.", never)) == "transient"
+    assert failure_cause(sdk_error("UnprocessableEntityError", 422, "The model is temporarily unavailable, try "
+                                   "again shortly.", never)) == "transient"
+    # A spent quota and a monthly limit stay refusals, even where their wording says to try again.
+    assert failure_cause(sdk_error("RateLimitError", 429, "Quota exceeded, try again next month",
+                                   never)) == "provider"
+    assert failure_cause(sdk_error("RateLimitError", 429, "Monthly limit reached; try again next month",
+                                   never)) == "provider"
+
+
+def test_a_session_that_ended_on_an_overload_is_not_a_refusal_whatever_cause_it_carried():
+    from aifactory.failures import failure_cause
+    from aifactory.harness.base import HarnessFailed
+
+    # What production recorded on 12 November: the session's failure carried "provider", and held the workspace.
+    overload = "The model provider is momentarily overloaded. It did not recover after 3 attempts."
+    assert failure_cause(HarnessFailed(overload, cause="provider")) == "transient"
+    assert failure_cause(HarnessFailed("MindsHub: no credit remaining", cause="provider")) == "provider"
+
+
 async def test_retries_stop_at_the_session_deadline_and_when_it_is_cancelled(provider, clocked, monkeypatch):
     now, guard = clocked
     waits = retry_clock(monkeypatch, now, guard)
