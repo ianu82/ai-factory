@@ -247,31 +247,28 @@ def path_overlap(candidate: list[str], main: list[str]) -> dict:
             "matching_pairs": [[left[d], right[d]] for d in sample_dirs]}
 
 
-async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
-    """Everything the job changed relative to the base commit (committed or not)."""
-    out_file = f"{SCRATCH}/candidate.patch"
+def _diff_commands(base_sha: str, stem: str) -> str:
+    """Shell commands writing what the index holds beyond ``base_sha`` to three scratch files named ``stem``: the
+    diff, its numstat and its paths."""
     # Keep publication rename-free so excluded scratch paths cannot leak as
     # rename sources. Policy size statistics still recognize ordinary renames.
-    stats_file = f"{SCRATCH}/candidate.numstat"
-    names_file = f"{SCRATCH}/candidate.paths"
     # File data goes through backend-neutral reads (exec output is clipped).
     paths = "-- . ':(top,exclude).factory' ':(top,exclude).factory/**'"
-    script = (
-        f"set -e; mkdir -p {SCRATCH}; git add -A >/dev/null; "
-        f"git -c core.quotepath=off diff --cached --binary --no-renames --no-color {base_sha} {paths} > {out_file}; "
-        f"git diff --cached --numstat -z --find-renames {base_sha} {paths} > {stats_file}; "
-        f"git diff --cached --name-only -z --no-renames {base_sha} {paths} > {names_file}"
-    )
-    result = await sandbox.exec(script, timeout=180)
-    if not result.ok:
-        raise SandboxError(f"Could not read the candidate changes: {result.output[-800:]}")
+    out, diff = f"{SCRATCH}/{stem}", "git -c core.quotepath=off diff --cached --binary --no-renames --no-color"
+    return (f"{diff} {base_sha} {paths} > {out}.patch; "
+            f"git diff --cached --numstat -z --find-renames {base_sha} {paths} > {out}.numstat; "
+            f"git diff --cached --name-only -z --no-renames {base_sha} {paths} > {out}.paths")
+
+
+async def _read_patch(sandbox: LocalSandbox, stem: str) -> Patch:
+    """The patch that ``_diff_commands`` wrote to the scratch files named ``stem``."""
     from .sandbox import read_bytes
 
-    diff = await read_bytes(sandbox, out_file)
+    diff = await read_bytes(sandbox, f"{SCRATCH}/{stem}.patch")
     files = [name.decode("utf-8", "surrogateescape")
-             for name in (await read_bytes(sandbox, names_file)).split(b"\0") if name]
+             for name in (await read_bytes(sandbox, f"{SCRATCH}/{stem}.paths")).split(b"\0") if name]
     adds, dels = 0, 0
-    stats = iter((await read_bytes(sandbox, stats_file)).split(b"\0"))
+    stats = iter((await read_bytes(sandbox, f"{SCRATCH}/{stem}.numstat")).split(b"\0"))
     for record in stats:
         if not record:
             continue
@@ -282,6 +279,39 @@ async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
         adds += int(added) if added.isdigit() else 0
         dels += int(deleted) if deleted.isdigit() else 0
     return Patch(diff=diff, files=files, additions=adds, deletions=dels)
+
+
+async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
+    """Everything the job changed relative to the base commit (committed or not)."""
+    script = f"set -e; mkdir -p {SCRATCH}; git add -A >/dev/null; {_diff_commands(base_sha, 'candidate')}"
+    result = await sandbox.exec(script, timeout=180)
+    if not result.ok:
+        raise SandboxError(f"Could not read the candidate changes: {result.output[-800:]}")
+    return await _read_patch(sandbox, "candidate")
+
+
+async def snapshot_patch(sandbox: LocalSandbox, base_sha: str, timeout: float = 60) -> Patch:
+    """What ``extract_patch`` would read at this moment, while the job is still working: the files are added to a
+    copy of the index, so the job's own index and working tree are left as they are, and the result is written to
+    scratch files of its own, never the candidate's."""
+    # The copy lives in the git directory, not the scratch directory: that is in the working tree, where the copy's
+    # lock file would come and go as an untracked file under the job's own git commands. No pathspec for `git add`:
+    # where the checkout ignores the scratch directory, one that names it fails (see tree_id). The copy keeps the
+    # index's time (cp -p): git compares a file's content when it changed in the second its index was written, and
+    # a newer index would take such a file as unchanged.
+    # Every snapshot has names of its own. One that was cancelled is killed in a local sandbox but runs on in a VM,
+    # beside the next one: it then writes only its own files. What earlier snapshots left is removed first, and a
+    # snapshot whose index was removed under it fails (an index that is gone reads as "every file deleted").
+    stem = f"wip-{os.urandom(4).hex()}"
+    script = (f'set -e; mkdir -p {SCRATCH}; dir="$(git rev-parse --absolute-git-dir)"; index="$dir/factory-{stem}"; '
+              f'rm -f "$dir"/factory-wip-* {SCRATCH}/wip-*; '
+              'cp -p "$(git rev-parse --git-path index)" "$index" 2>/dev/null || true; '
+              f'export GIT_INDEX_FILE="$index"; git add -A >/dev/null; {_diff_commands(base_sha, stem)}; '
+              'test -s "$index"; rm -f "$index"')
+    result = await sandbox.exec(script, timeout=timeout)
+    if not result.ok:
+        raise SandboxError(f"Could not read the changes in progress: {result.output[-800:]}")
+    return await _read_patch(sandbox, stem)
 
 
 _TREE_ID = re.compile(r"[0-9a-f]{40,64}")

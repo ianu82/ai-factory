@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -4469,6 +4470,427 @@ def test_after_a_restart_the_builder_starts_from_what_its_failed_attempt_changed
         assert len(warnings) == 1 and warnings[0][0] == "warn" and why_not in warnings[0][1], warnings
         assert "changes_restored" not in kinds
     assert "Hello, Factory!" in git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+
+
+def _interrupted_builder(reached, write=None):
+    """A builder that changes a file (it fixes the greeting, unless told what to ``write``) and is then still at
+    work when the server stops."""
+    def builder(messages):
+        n = step(messages)
+        if n == 0:
+            return {"content": "", "tool_calls": [call("write_file", write)]} if write else _fix_greeting()
+        reached.append(n)
+        return {"content": "", "tool_calls": [call("run", {"command": "sleep 30"}, n)]}
+    return builder
+
+
+def _saved_work(outcome_id):
+    """What is kept of the work in progress of the outcome's task: its record, and its artifacts of that kind as
+    (id, content)."""
+    from aifactory.models import Artifact
+
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one_or_none()
+        if task is None:
+            return None, []
+        return (task.evidence or {}).get("wip"), [(a.id, a.content) for a in s.query(Artifact).filter(
+            Artifact.task_id == task.id, Artifact.kind == "wip")]
+
+
+INTERRUPTED = "Your previous session on this attempt was interrupted"
+
+
+@pytest.mark.parametrize("save, change, why_not", [
+    ("at the stop", None, None),
+    ("periodic", None, None),
+    ("at the stop", "main moved elsewhere", None),  # the saved diff still applies to the new base
+    ("at the stop", "main changed the same line", "they no longer apply to main at "),
+    ("at the stop", "stored in part", "no whole copy of them was saved"),
+])
+def test_after_a_restart_the_builder_continues_from_the_work_in_progress_saved_for_its_session(
+        factory, monkeypatch, save, change, why_not):
+    from aifactory.models import Artifact
+
+    if save == "periodic":
+        monkeypatch.setattr(delivery, "CHECKPOINT_SECONDS", 0)  # the interval has always passed: nothing waits for it
+    reached, seen, before_stop = [], [], {}
+    builder, prompts = _in_turn(_interrupted_builder(reached), _greeting_reader(seen))
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id = new_outcome(factory)
+
+    def at_work():
+        before_stop.update(_saved_work(outcome_id)[0] or {})
+        return bool(reached) and (save == "at the stop" or bool(before_stop.get("artifact_id")))
+
+    assert drive(at_work, timeout=90)  # the server restarts while the builder is at work
+    # Saved while the session ran, or only as the server stopped it.
+    assert bool(before_stop.get("artifact_id")) is (save == "periodic")
+    assert _task_state(outcome_id)[:2] == ("queued", "build") and _attempt_records(outcome_id) == []
+    saved, stored = _saved_work(outcome_id)
+    assert saved and len(stored) == 1, (saved, stored)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.attempt == 1
+        assert s.query(Artifact).filter(Artifact.task_id == task.id, Artifact.kind == "diff").count() == 0
+        # One record and one artifact that holds the diff it describes, byte for byte.
+        assert saved == {"attempt": 1, "epoch": 0, "artifact_id": stored[0][0], "base_sha": task.base_sha,
+                         "patch_sha256": hashlib.sha256(stored[0][1].encode()).hexdigest(),
+                         "saved_at": saved["saved_at"], "files": 1, "additions": 1, "deletions": 1}
+    assert "\n-echo 'Hello'\n+echo 'Hello, Factory!'\n" in stored[0][1]
+    if change == "stored in part":
+        with session_scope() as s:
+            kept = s.get(Artifact, saved["artifact_id"])
+            kept.content = kept.content[:40]
+    elif change == "main moved elsewhere":
+        _land_on_main(factory, "NOTES.md", "landed meanwhile\n")
+    elif change:
+        _land_on_main(factory, "greet.sh", "echo 'Hi'\n")
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        # The interrupted session is no attempt of its own: still attempt 1, which ends with one record.
+        assert task.attempt == 1
+        assert [(a["n"], a["result"]) for a in task.evidence["attempts"]] == [(1, "verified")]
+        assert s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count() == 2
+        assert "wip" not in task.evidence
+        restored = [e.data for e in s.query(Event).filter(Event.task_id == task.id, Event.kind == "wip_restored")]
+    assert _saved_work(outcome_id) == (None, [])  # nothing is kept once the attempt has its candidate
+    kinds = _event_kinds(outcome_id)
+    assert kinds.count("attempt_resumed") == 1 and len(prompts) == 2
+    assert "Nothing from an earlier attempt is in it." in prompts[0] and INTERRUPTED not in prompts[0]
+    at = saved["saved_at"][:16].replace("T", " ") + " UTC"
+    if why_not is None:
+        # The new checkout holds what the interrupted session had changed, and the builder is told so.
+        assert "Hello, Factory!" in seen[0], seen
+        assert (f"{INTERRUPTED} (the service restarted, or its infrastructure failed). The changes in its checkout "
+                f"were last saved at {at} (1 file(s), +1 -1 against the base commit) and have been restored into "
+                "this one, staged but not committed.") in prompts[1]
+        assert "continue from it rather than starting again." in prompts[1]
+        assert "Nothing from an earlier attempt is in it." not in prompts[1]
+        assert _events(outcome_id, "wip_restored") == [
+            ("info", f"Attempt 1 was interrupted: restored the work in progress saved at {at} (1 file(s), +1 -1) "
+                     "into the new checkout, so the builder continues from it")]
+        assert [(d["saved_at"], d["files"], d["additions"], d["deletions"]) for d in restored] == [
+            (saved["saved_at"], 1, 1, 1)]
+        assert "wip_not_restored" not in kinds
+    else:
+        # The save cannot be used: the builder starts from a clean checkout and is told its work is gone, and why.
+        assert "Hello, Factory!" not in seen[0], seen
+        assert (f"Nothing from an earlier attempt is in it. {INTERRUPTED}, and what it had changed could not be "
+                f"restored ({why_not}") in prompts[1]
+        assert "that work is lost, and so is the earlier conversation." in prompts[1]
+        warnings = _events(outcome_id, "wip_not_restored")
+        assert len(warnings) == 1 and warnings[0][0] == "warn" and why_not in warnings[0][1], warnings
+        assert "wip_restored" not in kinds and restored == []
+    assert "Hello, Factory!" in git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
+
+
+@pytest.mark.parametrize("kept", [True, False])
+def test_work_in_progress_saved_for_an_attempt_comes_before_what_the_attempt_before_it_changed(factory, kept):
+    from aifactory.models import Artifact
+
+    notes = {"path": "NOTES.md", "content": "robust now\n"}
+    reached, seen = [], []
+
+    def looks_and_finishes(messages):
+        n = step(messages)
+        if n == 0:
+            return {"content": "", "tool_calls": [call("run", {"command": "cat greet.sh NOTES.md"})]}
+        if n == 1:
+            seen.append(messages[-1]["content"])
+            return {"content": "", "tool_calls": [call("write_file", notes)]}
+        return {"content": "", "tool_calls": [call("finish", {"status": "done", "summary": "Kept both.", "tests": []})]}
+
+    builder, prompts = _in_turn(good_builder, _interrupted_builder(reached, notes), looks_and_finishes)
+    verifier, _ = _in_turn(_always_failing_verifier, passing_verifier)
+    ScriptedModel.scripts.update(builder=builder, verifier=verifier)
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: bool(reached), timeout=90)  # the server restarts during the second attempt
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [(1, "verification_failed")]
+    # Saved as the server stopped: the second attempt's tree, which holds what the first one changed as well.
+    saved, stored = _saved_work(outcome_id)
+    assert saved and len(stored) == 1, (saved, stored)
+    assert (saved["attempt"], saved["files"], saved["additions"], saved["deletions"]) == (2, 2, 2, 1)
+    assert "+echo 'Hello, Factory!'\n" in stored[0][1] and "+robust now\n" in stored[0][1]
+    if not kept:
+        with session_scope() as s:
+            row = s.get(Artifact, saved["artifact_id"])
+            row.content = row.content[:40]
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    assert _task_state(outcome_id)[0] == "completed" and len(prompts) == 3
+    assert [(a["n"], a["result"]) for a in _attempt_records(outcome_id)] == [
+        (1, "verification_failed"), (2, "verified")]
+    assert _saved_work(outcome_id) == (None, [])
+    # The feedback is still about attempt 1, whose change is in the new checkout either way.
+    assert "- Independent review FAILED. Greeting still wrong." in prompts[2]
+    assert "Hello, Factory!" in seen[0], seen
+    kinds = _event_kinds(outcome_id)
+    if kept:
+        # The save of the interrupted attempt 2 is what is restored: attempt 1's change and its own work on top.
+        assert "robust now" in seen[0], seen
+        assert kinds.count("wip_restored") == 1 and "wip_not_restored" not in kinds
+        assert "changes_restored" not in kinds and "changes_not_restored" not in kinds
+        assert f"{INTERRUPTED} (the service restarted, or its infrastructure failed)." in prompts[2]
+        assert "(2 file(s), +2 -1 against the base commit) and have been restored into this one" in prompts[2]
+        assert "The whole change of attempt 1 was restored" not in prompts[2]
+    else:
+        # Without it the checkout starts from attempt 1's stored diff, as before, and says what was lost.
+        assert "robust now" not in seen[0], seen
+        assert kinds.count("wip_not_restored") == 1 and "wip_restored" not in kinds
+        assert kinds.count("changes_restored") == 1
+        assert ("The whole change of attempt 1 was restored into it from a saved copy, staged but not committed: run "
+                f"`git status` and `git diff HEAD` to see it. {INTERRUPTED}, and what it had changed could not be "
+                "restored (no whole copy of them was saved): that work is lost") in prompts[2]
+    assert "robust now" in git("show", "main:NOTES.md", cwd=factory["remotes"] / "acme/demo.git")
+
+
+def test_an_infrastructure_failure_during_the_build_keeps_the_saved_work_in_progress_for_the_retry(factory,
+                                                                                                   monkeypatch):
+    from aifactory.inference import InferenceError
+
+    monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))
+    monkeypatch.setattr(delivery, "CHECKPOINT_SECONDS", 0)  # the interval has always passed: nothing waits for it
+    seen = []
+
+    def loses_its_provider(messages):  # once its change is saved, or after a minute of turns without a save
+        n = step(messages)
+        if n == 0:
+            return _fix_greeting()
+        if (_saved_work(outcome_id)[0] or {}).get("additions") or n > 60:
+            raise InferenceError("MindsHub error 503: upstream unavailable", retryable=True, status=503)
+        return {"content": "", "tool_calls": [call("run", {"command": "sleep 0.2"}, n)]}
+
+    builder, prompts = _in_turn(loses_its_provider, _greeting_reader(seen))
+    ScriptedModel.scripts["builder"] = builder
+    outcome_id = new_outcome(factory)
+    assert drive(lambda: outcome_status(outcome_id) in ("completed", "attention", "blocked"), timeout=90)
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
+        assert task.status == "completed", task.blocked_reason
+        assert task.attempt == 1
+        assert s.query(Run).filter(Run.task_id == task.id, Run.role == "builder").count() == 2
+    # The failed session is not an attempt, and its record does not drop the save: the same attempt is run again in
+    # a new sandbox (the old one is closed with the run), which starts from the save.
+    records = _attempt_records(outcome_id)
+    assert [(a["n"], a["result"]) for a in records] == [(1, "infra"), (1, "verified")]
+    assert (records[0]["phase"], records[0]["cause"]) == ("build", "transient")
+    assert len(prompts) == 2 and "Hello, Factory!" in seen[0], seen
+    assert f"{INTERRUPTED} (the service restarted, or its infrastructure failed)." in prompts[1]
+    assert "(1 file(s), +1 -1 against the base commit) and have been restored into this one" in prompts[1]
+    kinds = _event_kinds(outcome_id)
+    assert kinds.count("wip_restored") == 1 and "wip_not_restored" not in kinds and "attempt_resumed" not in kinds
+    assert _saved_work(outcome_id) == (None, [])
+
+
+def _building(factory):
+    """A runner whose task is in the build of attempt 1, as it is while its builder's session runs."""
+    outcome_id, task_id, _ = _waiting_task_with_pr(factory)
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        task.status, task.stage, task.attempt = "running", "build", 1
+    return outcome_id, _runner(task_id)
+
+
+def _change(greeting, files=("greet.sh",)):
+    diff = ("diff --git a/greet.sh b/greet.sh\n--- a/greet.sh\n+++ b/greet.sh\n@@ -1 +1 @@\n-echo 'Hello'\n"
+            f"+echo '{greeting}'\n").encode()
+    return gitops.Patch(diff=diff, files=list(files), additions=1, deletions=1)
+
+
+def _snapshots(monkeypatch, *results):
+    """Each snapshot of the builder's tree gives the next of ``results`` (the last one from then on; an exception
+    is raised). Returns the list that grows by one with every snapshot taken."""
+    taken = []
+
+    async def snapshot(sandbox, base_sha, timeout=60):
+        taken.append(base_sha)
+        result = results[min(len(taken), len(results)) - 1]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(delivery, "snapshot_patch", snapshot)
+    return taken
+
+
+def test_a_save_replaces_the_one_before_it_and_only_a_changed_tree_is_saved(factory, monkeypatch):
+    outcome_id, runner = _building(factory)
+    first, second = _change("Hello, Fac"), _change("Hello, Factory!")
+    nothing = gitops.Patch(diff=b"", files=[], additions=0, deletions=0)
+    taken = _snapshots(monkeypatch, first, first, nothing, delivery.SandboxError("git failed"), TimeoutError(), second)
+    events = len(_event_kinds(outcome_id))
+    asyncio.run(runner._save_progress())
+    saved, stored = _saved_work(outcome_id)
+    assert stored == [(saved["artifact_id"], first.diff.decode())]
+    assert saved == {"attempt": 1, "epoch": 0, "artifact_id": stored[0][0], "base_sha": runner.task.base_sha,
+                     "patch_sha256": hashlib.sha256(first.diff).hexdigest(), "saved_at": saved["saved_at"],
+                     "files": 1, "additions": 1, "deletions": 1}
+    # The same tree again, a tree with nothing in it, and a snapshot that fails or times out: nothing is written
+    # and nothing is raised, so the attempt goes on with the save it has.
+    for _ in range(4):
+        asyncio.run(runner._save_progress())
+        assert _saved_work(outcome_id) == (saved, stored)
+    # A changed tree: the one artifact now holds it, and the record describes it.
+    asyncio.run(runner._save_progress())
+    later, kept = _saved_work(outcome_id)
+    assert kept == [(saved["artifact_id"], second.diff.decode())]
+    assert later == {**saved, "patch_sha256": hashlib.sha256(second.diff).hexdigest(), "saved_at": later["saved_at"]}
+    assert len(taken) == 6 and taken[0] == runner.task.base_sha
+    assert len(_event_kinds(outcome_id)) == events  # a save is not an event: the activity feed stays readable
+
+    async def hangs(sandbox, base_sha, timeout=60):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(delivery, "snapshot_patch", hangs)
+    asyncio.run(runner._save_progress(timeout=0.01))  # given up at its time limit, without an error
+    assert _saved_work(outcome_id) == (later, kept)
+
+
+def test_work_in_progress_that_cannot_be_kept_is_not_saved_and_the_reason_is_recorded_once(factory, monkeypatch):
+    outcome_id, runner = _building(factory)
+    good = _change("Hello, Factory!")
+    secret = _change("Hello, Fac", files=["greet.sh", ".env"])  # a protected path: never in a stored diff
+    binary = gitops.Patch(diff=b"diff --git a/logo b/logo\n\xff\xfe\n", files=["logo"], additions=0, deletions=0)
+    huge = gitops.Patch(diff=b"+" * 400_001, files=["big.txt"], additions=1, deletions=0)
+    _snapshots(monkeypatch, good, secret, secret, good, binary, huge)
+    # The tree as the candidate this runner last judged left it: the session has changed nothing yet.
+    runner.patch = good
+    asyncio.run(runner._save_progress())
+    assert _saved_work(outcome_id) == (None, [])
+    runner.patch = None
+    skipped = {"attempt": 1, "epoch": 0, "skipped": "the changes include protected paths: .env"}
+    for _ in range(2):
+        asyncio.run(runner._save_progress())
+        assert _saved_work(outcome_id) == (skipped, [])
+    asyncio.run(runner._save_progress())
+    saved, stored = _saved_work(outcome_id)
+    assert "skipped" not in saved and stored == [(saved["artifact_id"], good.diff.decode())]
+    # A later tree that cannot be stored (it would not reload byte for byte) leaves the last save in place.
+    for _ in range(2):
+        asyncio.run(runner._save_progress())
+        assert _saved_work(outcome_id) == ({**saved, "skipped": "the diff is not all UTF-8 text"}, stored)
+
+
+def test_saves_run_while_the_session_does_and_none_starts_after_it(factory, monkeypatch):
+    outcome_id, runner = _building(factory)
+    first, second = _change("Hello, Fac"), _change("Hello, Factory!")
+    taken = _snapshots(monkeypatch, first, delivery.SandboxError("git failed"), second)
+    monkeypatch.setattr(delivery, "CHECKPOINT_SECONDS", 0)  # the interval has always passed: nothing waits for it
+
+    async def session(fix_round, until):
+        async with runner._checkpoints(fix_round):
+            for _ in range(500):  # the builder at work: every turn lets the saves run
+                if until():
+                    break
+                await asyncio.sleep(0)
+        during = len(taken)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return during, len(taken)
+
+    during, after = asyncio.run(session("", lambda: len(taken) >= 4))
+    # A snapshot that failed neither ended the session nor the saves after it, and none started once it returned.
+    assert during >= 4 and after == during
+    saved, stored = _saved_work(outcome_id)
+    assert stored == [(saved["artifact_id"], second.diff.decode())]  # one artifact, holding the latest save
+    assert saved["patch_sha256"] == hashlib.sha256(second.diff).hexdigest()
+    # A fix round works on the pull request's branch, where nothing is restored: nothing is saved in it.
+    assert asyncio.run(session("revise", lambda: False)) == (during, during)
+
+
+@pytest.mark.parametrize("fix_round, by_a_person, saves", [("", False, True), ("", True, False),
+                                                           ("revise", False, False)])
+def test_the_work_in_progress_is_saved_once_more_when_the_service_stops_the_session(factory, monkeypatch, fix_round,
+                                                                                    by_a_person, saves):
+    outcome_id, runner = _building(factory)
+    change = _change("Hello, Factory!")
+    taken = _snapshots(monkeypatch, change)
+
+    async def stop():
+        async def session():
+            async with runner._checkpoints(fix_round):
+                await asyncio.Event().wait()
+
+        job = asyncio.create_task(session())
+        await asyncio.sleep(0)
+        if by_a_person:  # a person's cancel ends the task: there is nothing to continue
+            runner.cancelled.set()
+        job.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await job
+
+    asyncio.run(stop())
+    saved, stored = _saved_work(outcome_id)
+    assert len(taken) == (1 if saves else 0)
+    assert stored == ([(saved["artifact_id"], change.diff.decode())] if saves else []) and bool(saved) is saves
+
+
+@pytest.mark.parametrize("write, cleared", [
+    ({"attempts": {"n": 1, "result": "builder_failed", "error": "ended without a report"}}, True),
+    ({"attempts": {"n": 1, "result": "policy", "detail": "- over the line limit", "files": 1}}, True),
+    ({"attempts": {"n": 1, "result": "checks_failed", "checks": []}}, True),
+    ({"attempts": {"n": 1, "result": "verification_failed", "verdict": {}}}, True),
+    ({"candidate": {"n": 1, "epoch": 0, "checks": None}}, True),  # built: a stop now resumes the candidate
+    # Not the end of the attempt: its number is handed back, and the run that redoes it restores the save.
+    ({"attempts": {"n": 1, "result": "infra", "cause": "transient", "phase": "build", "error": "503"}}, False),
+    ({"candidate": None}, False),
+])
+def test_saved_work_in_progress_is_dropped_when_its_attempt_ends_or_its_candidate_is_built(factory, monkeypatch,
+                                                                                           write, cleared):
+    outcome_id, runner = _building(factory)
+    _snapshots(monkeypatch, _change("Hello, Factory!"))
+    asyncio.run(runner._save_progress())
+    saved, stored = _saved_work(outcome_id)
+    assert saved and len(stored) == 1
+    runner._set_evidence(write)  # the write that records the attempt's end, or its candidate
+    assert _saved_work(outcome_id) == ((None, []) if cleared else (saved, stored))
+    assert _runner(runner.task_id)._saved_progress() == (None if cleared else saved)
+
+
+def test_saved_work_in_progress_is_restored_only_into_the_attempt_and_budget_it_was_saved_for(factory):
+    _, task_id, _ = _waiting_task_with_pr(factory)
+
+    def restores(attempt=2, skipped=None, **evidence):
+        """Whether the save (of attempt 2, in budget 1) is this run's to restore, and what its builder is told."""
+        kept = {"skipped": skipped} if skipped else {"artifact_id": "0" * 12, "patch_sha256": "0" * 64}
+        with session_scope() as s:
+            task = s.get(Task, task_id)
+            task.attempt = attempt
+            task.evidence = {"budget_epoch": 1, **evidence, "wip": {"attempt": 2, "epoch": 1, **kept}}
+        runner = _runner(task_id)
+        return runner._saved_progress() is not None, asyncio.run(runner._earlier_changes())
+
+    # The attempt it was saved for, interrupted or handed back by an infrastructure failure. (Its stored diff is
+    # gone here, so the builder is told its work is lost; the restore itself is followed end to end above.)
+    assert restores() == (True, {"wip": {"restored": False, "why": "no whole copy of them was saved"}})
+    assert restores(attempt=3) == (False, {})  # a later attempt never starts from an earlier attempt's work
+    assert restores(attempt=1) == (False, {})
+    assert restores(budget_epoch=2) == (False, {})  # fresh attempts after a person's decision: numbers start again
+    # A save that could not be stored says why, and that is what the builder is told.
+    assert restores(skipped="the diff is larger than 400,000 characters") == (True, {"wip": {
+        "restored": False, "why": "they were not saved: the diff is larger than 400,000 characters"}})
+
+
+def test_saved_work_in_progress_is_never_taken_for_a_candidate_diff(factory, monkeypatch):
+    from aifactory import coordination
+    from aifactory.models import Artifact
+
+    outcome_id, runner = _building(factory)
+    change = _change("Hello, Factory!")
+    _snapshots(monkeypatch, change)
+    asyncio.run(runner._save_progress())
+    _, stored = _saved_work(outcome_id)
+    assert len(stored) == 1
+    with session_scope() as s:  # the files a task changes are its latest candidate's, and it has none yet
+        assert coordination._files(s, [s.get(Task, runner.task_id)]) == {runner.task_id: set()}
+    # The diff under review is a candidate's, stored as one: never the save, though it holds the same change.
+    reviewed = runner._reviewed_diff(change, 1)
+    assert reviewed != stored[0][0] and runner._reviewed_diff(change, 1) == reviewed
+    with session_scope() as s:
+        kinds = sorted(a.kind for a in s.query(Artifact).filter(Artifact.task_id == runner.task_id))
+        assert kinds == ["diff", "wip"]
+        assert coordination._files(s, [s.get(Task, runner.task_id)]) == {runner.task_id: {"greet.sh"}}
 
 
 @pytest.mark.parametrize("result, failing, ends", [
