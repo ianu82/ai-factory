@@ -454,8 +454,13 @@ def test_what_it_left_to_people_it_decides_itself_once_no_one_has_answered_in_ti
     assert page["decide_now_not_yet_handled"] == 1 and page["limits"]["decide_after_hours"] == 4
     assert not any(row.get("decide_now") for row in page["items"][1:])
 
-    seen = director.seen_after(due, tools)  # it had its turn: noted again, it now waits for a person
-    assert seen["final"] == {stuck: due["marks"][stuck]}
+    seen = director.seen_after(due, tools)  # shown, but the run ended before it decided or noted it: it comes back
+    assert (seen["final"], seen["skips"]) == ({}, {stuck: 1})
+    past_run(world, seen=seen, ago=timedelta(minutes=6))
+    assert woken(later + timedelta(minutes=5))[world["ws"]]["overdue"] == [stuck]
+    tools.handled.add(stuck)  # it had its turn: noted again, it now waits for a person
+    seen = director.seen_after(due, tools)
+    assert (seen["final"], seen["skips"]) == ({stuck: due["marks"][stuck]}, {})
     past_run(world, seen=seen, ago=timedelta(minutes=5))
     assert world["ws"] not in woken(later + timedelta(minutes=5))
     with db.session_scope() as s:  # unless the question changes: then it is new again

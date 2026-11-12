@@ -784,8 +784,9 @@ def seen_after(item: dict[str, Any], tools: Tools) -> dict[str, Any]:
     """What the next run counts as seen: what was seen before and is still waiting, unchanged, plus what this run
     decided or noted. A new item an inbox page showed but the run passed over comes back next run, and counts as seen
     after SKIPS such runs, so an item the model keeps ignoring can't wake it forever. One the run never got to see
-    (on a later page) stays new, with no skip counted. ``final`` keeps the items that have had their turn to be
-    decided now (_overdue), each with its mark then: an item that is still waiting, unchanged, doesn't get another."""
+    (on a later page) stays new, with no skip counted. An item to decide now (_overdue) is counted the same way:
+    once the run has decided or noted it, or passed over it SKIPS times, it has had its turn, and ``final`` keeps it
+    with its mark then, so it doesn't get another while it waits unchanged."""
     before = item.get("seen") or {}
     known, skips = dict(before.get("marks") or {}), dict(before.get("skips") or {})
     marks: dict[str, str] = item["marks"]
@@ -805,8 +806,20 @@ def seen_after(item: dict[str, Any], tools: Tools) -> dict[str, Any]:
                 left[key] = count
     final = {key: mark for key, mark in (before.get("final") or {}).items() if marks.get(key) == mark} \
         if isinstance(before.get("final"), dict) else {}
-    final.update({key: marks[key] for key in item.get("overdue") or []
-                  if key in marks and (key in tools.shown or key in tools.handled)})
+    for key in item.get("overdue") or []:
+        if key not in marks:
+            continue
+        if key in tools.handled:
+            final[key] = marks[key]
+        elif key not in tools.shown:
+            if key in skips:
+                left[key] = int(skips[key])
+        else:  # shown, but the run ended before it decided or noted it (its turns or caps ran out): it comes back
+            count = int(skips.get(key, 0)) + 1
+            if count >= SKIPS:
+                final[key] = marks[key]
+            else:
+                left[key] = count
     return {"marks": out, "skips": left, "final": final}
 
 
