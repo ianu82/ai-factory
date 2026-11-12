@@ -24,7 +24,7 @@ from ..sandbox import disk_report, host_capacity, process_report, purge_quaranti
 from .check_slots import check_slot_count, check_slot_usage
 from .delivery import Stop, TaskRunner
 from .holds import held_workspaces
-from .lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, transition
+from .lifecycle import ACCEPTING, ENDED, ENDED_AS, accepted_after_merge, complete_accepted, stranded, transition
 from .planning import plan_outcome
 from .runtime import merged_settings, open_decision, publish_decision, workspace_settings
 from .scheduling import Candidate, RequesterTurns
@@ -35,6 +35,17 @@ ACTIVE_TASK = {"queued", "running", "waiting_ci"}
 DONE_TASK = {"completed"}
 TERMINAL_TASK = {"completed", "abandoned", "cancelled", "reverted", "handed_over"}
 HUMAN_TASK = {"needs_input", "awaiting_approval", "blocked", "failed", "smoke_failed"}
+# A task that waits on a person with no open decision for this long gets one (the scheduler's own sweep). The wait
+# covers the places that set the status and open the decision in two transactions.
+UNASKED_AFTER = 120
+WAITS_AS = {"needs_input": "is waiting for an answer", "awaiting_approval": "is waiting for an approval",
+            "blocked": "is blocked", "failed": "failed",
+            "smoke_failed": "was merged, and its checks after the merge failed"}
+RETRY_OR_ABANDON = [{"value": "retry", "label": "Retry"}, {"value": "abandon", "label": "Abandon task"}]
+AFTER_SMOKE = [{"value": "revert", "label": "Revert the merge"}, {"value": "fix", "label": "Create a fix outcome"},
+               {"value": "acknowledge", "label": "Acknowledge"}]
+STRANDED_OPTIONS = [{"value": "continue", "label": "Start the waiting tasks"},
+                    {"value": "drop", "label": "Drop the waiting tasks"}]
 # A running task is leased to the instance that runs it. The instance extends the lease every HEARTBEAT_SECONDS;
 # a lease that ran out belongs to nobody and any instance may requeue the task.
 LEASE_SECONDS = 90
@@ -69,6 +80,7 @@ class Orchestrator:
         self._leads: dict[str, asyncio.Task] = {}  # outcome id -> its Lead's run
         self._lead_check = float("-inf")
         self._last_watch = time.monotonic()  # the first pass waits a full interval: a restart settles first
+        self._unasked: dict[str, float] = {}  # task id -> when it was first seen waiting on a person with no decision
 
     # lifecycle -----------------------------------------------------------------
     def start(self) -> None:
@@ -633,9 +645,17 @@ class Orchestrator:
                 log.warning("readiness %s check failed: %s", workspace_id[:6], type(exc).__name__)
 
     def _promote(self) -> None:
-        """Advance pending tasks whose dependencies completed, and roll up outcome status."""
+        """Advance pending tasks whose dependencies completed, roll up outcome status, and see that whatever waits
+        on a person has a decision to answer."""
+        opened: list[tuple[str, str, str, str, str | None]] = []
         with session_scope() as s:
             outcomes = s.query(Outcome).filter(Outcome.source != "review", Outcome.status.in_(["running", "attention"])).all()
+            asked: dict[str, list[Decision]] = {}
+            if outcomes:
+                for d in s.query(Decision).filter(Decision.status == "open",
+                                                  Decision.outcome_id.in_([o.id for o in outcomes])):
+                    asked.setdefault(d.outcome_id, []).append(d)
+            unasked: set[str] = set()
             for outcome in outcomes:
                 tasks = s.query(Task).filter(Task.outcome_id == outcome.id).all()
                 by_key = {t.key: t for t in tasks}
@@ -646,6 +666,74 @@ class Orchestrator:
                             task.status = "queued"
                             notify(outcome.workspace_id, "task", task.id, outcome_id=outcome.id)
                 self._rollup(outcome, tasks, s)
+                opened += self._ask(s, outcome, tasks, asked.get(outcome.id, []), unasked)
+            for task_id in [k for k in self._unasked if k not in unasked]:
+                del self._unasked[task_id]
+        for workspace_id, decision_id, title, outcome_id, task_id in opened:  # announced once they are committed
+            publish_decision(workspace_id, decision_id, "unblock", title, outcome_id=outcome_id, task_id=task_id)
+
+    def _ask(self, s, outcome: Outcome, tasks: list[Task], decisions: list[Decision],
+             unasked: set[str]) -> list[tuple[str, str, str, str, str | None]]:
+        """Nothing waits on a person without a decision to answer. Two cases no other code asks about: tasks that
+        can never start because what they depend on ended undelivered (one decision for the outcome), and a task
+        left waiting on a person with no open decision. Returns the decisions opened, for announcing."""
+        ws, opened = outcome.workspace_id, []
+        whole = [d for d in decisions if not d.task_id]
+        current = next((d for d in whole if d.kind == "unblock" and "stranded" in (d.metadata_json or {})), None)
+        waiting, ended = stranded(tasks)
+        if waiting:
+            keys = {"waiting": [t.key for t in waiting], "ended": [t.key for t in ended]}
+            names = ", ".join(keys["waiting"])
+            title = (f"{names} cannot start: {', '.join(keys['ended'])} ended without being delivered")[:300]
+            body = "\n".join([
+                "These tasks wait for work that will not arrive by itself:", "",
+                *[f"- {t.key} ({t.title}) waits for {', '.join(t.depends_on or [])}." for t in waiting], "",
+                *[f"- {t.key} ({t.title}) {ENDED_AS[t.status]}." for t in ended], "",
+                "Start the waiting tasks when what they needed is in the repository some other way (a pull request "
+                "finished by hand, for example) or they can do without it; anything you write here is passed to "
+                "the builders. Drop them otherwise: the outcome then ends with what was delivered.",
+            ])
+            if current is None:
+                decision = Decision(workspace_id=ws, kind="unblock", title=title, body=body, outcome_id=outcome.id,
+                                    options=STRANDED_OPTIONS, metadata_json={"stranded": keys})
+                s.add(decision)
+                s.flush()
+                record(ws, "tasks_stranded", f"{names} cannot start: {', '.join(keys['ended'])} ended without "
+                       "being delivered. A decision asks whether to start or drop them", outcome_id=outcome.id,
+                       level="warn", data=keys, session=s)
+                opened.append((ws, decision.id, title, outcome.id, None))
+            elif current.metadata_json.get("stranded") != keys:
+                current.title, current.body = title, body
+                current.metadata_json = {**current.metadata_json, "stranded": keys}
+                notify(ws, "decision", current.id)
+        elif current is not None:
+            current.status, current.comment = "superseded", "Nothing waits behind an ended task any more."
+            notify(ws, "decision", current.id)
+        # An open question about the whole outcome (a budget, for example) covers its tasks. A supervisor's finding
+        # and the decision above do not: answering them moves no waiting task.
+        if any(d is not current and d.kind != "supervisor" for d in whole):
+            return opened
+        with_decision = {d.task_id for d in decisions if d.task_id}
+        now = time.monotonic()
+        for task in tasks:
+            if task.status not in HUMAN_TASK or task.id in with_decision:
+                continue
+            unasked.add(task.id)
+            if now - self._unasked.setdefault(task.id, now) < UNASKED_AFTER:
+                continue
+            title = f"{task.key} {WAITS_AS[task.status]}, and nothing was asking what to do"[:300]
+            body = (f"{task.key} ({task.title}) {WAITS_AS[task.status]}, with no open decision: nobody was being "
+                    f"asked what to do next.\n\nRecorded reason: {task.blocked_reason or 'none'}")
+            decision = Decision(workspace_id=ws, kind="unblock", title=title, body=body, outcome_id=outcome.id,
+                                task_id=task.id, metadata_json={"unasked": task.status},
+                                options=AFTER_SMOKE if task.status == "smoke_failed" else RETRY_OR_ABANDON)
+            s.add(decision)
+            s.flush()
+            record(ws, "decision_missing", f"{task.key} {WAITS_AS[task.status]} with no open decision; one was "
+                   "opened", outcome_id=outcome.id, task_id=task.id, level="warn", data={"status": task.status},
+                   session=s)
+            opened.append((ws, decision.id, title, outcome.id, task.id))
+        return opened
 
     def _rollup(self, outcome: Outcome, tasks: list[Task], session=None) -> None:
         if not tasks:
@@ -671,9 +759,8 @@ class Orchestrator:
                                + (f"; {handed} handed over to people." if handed else "."))
             notify(outcome.workspace_id, "outcome", outcome.id)
             return
-        # A pending task is stalled when something it depends on is waiting on a person or was dropped.
-        by_key = {t.key: t for t in tasks}
-        stalled: set[str] = {t.key for t in tasks if t.status in HUMAN_TASK | {"abandoned", "cancelled"}}
+        # A pending task is stalled when something it depends on is waiting on a person or ended undelivered.
+        stalled: set[str] = {t.key for t in tasks if t.status in HUMAN_TASK | set(ENDED)}
         changed = True
         while changed:
             changed = False
@@ -841,12 +928,22 @@ class Orchestrator:
                     log.exception("could not record the task crash")
             finally:
                 self._tasks.pop(task_id, None)
+                asked: tuple[str, str] | None = None
                 with session_scope() as s:
                     task = s.get(Task, task_id)
                     if task and task.status == "running" and not self._stopping:
-                        # Never silently loop: a runner that stops without a recorded state needs a look.
-                        transition(s, task, owner=self.instance, status="blocked", lease_owner="",
-                                   blocked_reason="The task stopped without recording an outcome.")
+                        # Never silently loop: a runner that stops without a recorded state needs a look, and the
+                        # decision that asks for it is written with the status.
+                        if transition(s, task, owner=self.instance, status="blocked", lease_owner="",
+                                      blocked_reason="The task stopped without recording an outcome."):
+                            decision = Decision(
+                                workspace_id=ws, kind="unblock", outcome_id=outcome_id, task_id=task_id,
+                                title=f"{task.key} stopped without recording an outcome", options=RETRY_OR_ABANDON,
+                                body=f"The run of {task.key} ended at stage '{task.stage or 'start'}' without saying "
+                                     "how it ended. Retry continues from that stage.")
+                            s.add(decision)
+                            s.flush()
+                            asked = decision.id, decision.title
                     if task and task.status == "running":
                         # A workspace pause stops continuation at the next gate;
                         # retain the stage for resumption when it is unpaused.
@@ -859,6 +956,8 @@ class Orchestrator:
                         # Leases are execution-only, including pause/stop/error exits.
                         s.query(Task).filter(Task.id == task_id, Task.lease_owner == self.instance).update(
                             {Task.lease_owner: "", Task.lease_expires_at: None}, synchronize_session=False)
+                if asked:
+                    publish_decision(ws, asked[0], "unblock", asked[1], outcome_id=outcome_id, task_id=task_id)
                 notify(ws, "task", task_id, outcome_id=outcome_id)
                 self.wake()
 

@@ -11,7 +11,7 @@ from .db import utcnow
 from .events import record
 from .models import Decision, Message, Outcome, Plan, Task, User
 from .pipeline.orchestrator import ACTIVE_TASK, HUMAN_TASK, orchestrator
-from .pipeline.lifecycle import ACCEPTING, accepted_after_merge, complete_accepted
+from .pipeline.lifecycle import ACCEPTING, accepted_after_merge, complete_accepted, stranded
 from .pipeline.planning import approve_plan
 from .review import requested_round
 
@@ -44,7 +44,9 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
         raise DecisionError("A Mind resolution leaves its events and follow-up work to its confirmation")
     if decision.status != "open":
         raise DecisionError("This decision is already resolved")
-    valid = {o.get("value") for o in decision.options or []} | {"dismiss"}
+    # A decision that offers choices is answered with one of them: dismissing it would leave the work it is about
+    # waiting with nothing asking. "dismiss" closes a decision that offers none, or one that lists it.
+    valid = {o.get("value") for o in decision.options or []} or {"dismiss"}
     if resolution not in valid:
         raise DecisionError(f"Choose one of: {', '.join(sorted(v for v in valid if v))}")
     decision.status = "resolved" if resolution != "dismiss" else "dismissed"
@@ -205,6 +207,22 @@ def resolve(db: Session, decision: Decision, user: User, resolution: str, commen
             elif resolution == "cancel":
                 outcome.status = "cancelled"
                 stop(outcome.id)
+            elif resolution in ("continue", "drop"):
+                # Tasks that could never start because what they depend on ended undelivered (the scheduler asks,
+                # once per outcome). Worked out again here: the tasks may have moved since the question was put.
+                waiting, ended = stranded(db.query(Task).filter(Task.outcome_id == outcome.id).all())
+                gone = {t.key for t in ended}
+                for waiter in waiting:
+                    if resolution == "drop":
+                        waiter.status = "abandoned"
+                        continue
+                    waived = [k for k in waiter.depends_on or [] if k in gone]
+                    if waived:  # the scheduler starts a task once everything it still depends on is delivered
+                        waiter.depends_on = [k for k in waiter.depends_on if k not in gone]
+                        before = waiter.evidence or {}
+                        waiter.evidence = {**before, "waived_deps": [*before.get("waived_deps", []), *waived]}
+                if resolution == "continue":
+                    guidance(comment)
     elif kind == "provider_hold":
         # Closing the decision is what lifts the hold: the workspace's parked tasks are queued and its outcomes still
         # planning, so the scheduler starts them again. A hold is only ever resumed, and is never a precedent.

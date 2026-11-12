@@ -151,6 +151,11 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         snapshot = Outcome(**{c.name: getattr(outcome, c.name) for c in Outcome.__table__.columns})
     if not repos:
         set_outcome(outcome_id, status="blocked", blocked_reason="No repositories are selected for this outcome.")
+        open_decision(workspace_id, "unblock", f"#{snapshot.number} has no repositories selected",
+                      "Planning cannot start: no repositories are selected for this outcome. Select at least one "
+                      "on the outcome, then retry planning.", outcome_id=outcome_id,
+                      options=[{"value": "retry", "label": "Retry planning"},
+                               {"value": "cancel", "label": "Cancel outcome"}])
         return
     settings = workspace_settings(workspace_id)
     # Replans (a person's revision or answer, a judge's answer, a retry) keep the outcome's earlier spending, so the
@@ -270,6 +275,12 @@ async def plan_outcome(outcome_id: str, cancelled: asyncio.Event) -> None:
         note = f"The planner could not revise this plan after the review: {error[:1000]}"
     elif problems:
         set_outcome(outcome_id, status="blocked", blocked_reason=f"Plan references unknown repositories: {problems}")
+        open_decision(workspace_id, "unblock", f"The plan for #{snapshot.number} names repositories it may not use",
+                      f"The plan references repositories that are not selected for this outcome: {problems}\n\n"
+                      "Select them on the outcome, or say in a note which repositories to use, then retry planning.",
+                      outcome_id=outcome_id,
+                      options=[{"value": "retry", "label": "Retry planning"},
+                               {"value": "cancel", "label": "Cancel outcome"}])
         return
     questions = report.get("questions") or []
     if questions and not note:

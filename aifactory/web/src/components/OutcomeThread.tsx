@@ -15,6 +15,7 @@ const RESOLUTION: Record<string, string> = {
   answer: "Answered", approve: "Approved", reject: "Changes requested", replan: "Sent back to the planner",
   retry: "Retried", acknowledge: "Acknowledged", abandon: "Abandoned", take_over: "Taken over", cancel: "Cancelled",
   dismiss: "Dismissed", fix: "Fix opened", revert: "Reverted",
+  continue: "Waiting tasks started", drop: "Waiting tasks dropped",
 };
 
 /** An outcome as a conversation: the Lead narrates, decisions sit in the thread, people message the Lead, and a side
