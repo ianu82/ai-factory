@@ -691,9 +691,15 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
     for key in ("release", "qa", "recovery", "build"):
         if key in patch and isinstance(patch[key], dict):
             cfg[key] = patch[key]
-    for key in ("require_ci", "max_changed_lines"):
-        if key in patch:
-            cfg[key] = patch[key]
+    if "require_ci" in patch:
+        value = patch["require_ci"]
+        if type(value) is not bool and value != "auto":
+            raise HTTPException(422, "require_ci must be true, false or auto")
+        cfg.pop("require_ci", None)  # no setting is "auto": required when the repository has workflows
+        if value != "auto":
+            cfg["require_ci"] = value
+    if "max_changed_lines" in patch:
+        cfg["max_changed_lines"] = patch["max_changed_lines"]
     return cfg
 
 

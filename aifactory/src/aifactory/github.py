@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -100,6 +101,17 @@ async def fresh_git_auth_env(token: str | InstallationCredential) -> dict[str, s
     if isinstance(token, InstallationCredential):
         return await asyncio.to_thread(git_auth_env, token)
     return git_auth_env(token)
+
+
+_ACTIONS_RUN = re.compile(r"/actions/runs/(\d+)")
+
+
+def _run_id(*urls: str | None) -> dict[str, int]:
+    """`run_id` for a check that an Actions workflow run produced (`…/actions/runs/<run>/job/<job>`), else nothing."""
+    for url in urls:
+        if match := _ACTIONS_RUN.search(url or ""):
+            return {"run_id": int(match.group(1))}
+    return {}
 
 
 @dataclass
@@ -535,11 +547,12 @@ class GitHub:
             jobs = await self.request("GET", f"/repos/{full_name}/actions/runs/{run['id']}/jobs", params={"per_page": 100})
             for job in jobs.get("jobs", []):
                 checks.append({"name": job["name"], "status": job["status"], "conclusion": job.get("conclusion") or "",
-                               "url": job.get("html_url") or "", "id": job["id"], "summary": "", "kind": "check_run"})
+                               "url": job.get("html_url") or "", "id": job["id"], "summary": "", "kind": "check_run",
+                               "run_id": run["id"]})
             if not jobs.get("jobs"):
                 checks.append({"name": run.get("name", "workflow"), "status": run["status"],
                                "conclusion": run.get("conclusion") or "", "url": run.get("html_url") or "",
-                               "id": run["id"], "summary": "", "kind": "workflow"})
+                               "id": run["id"], "summary": "", "kind": "workflow", "run_id": run["id"]})
         return checks
 
     async def checks(self, full_name: str, sha: str) -> CheckSummary:
@@ -568,6 +581,7 @@ class GitHub:
                 "id": run["id"],
                 "summary": ((run.get("output") or {}).get("summary") or "")[:2000],
                 "kind": "check_run",
+                **_run_id(run.get("details_url"), run.get("html_url")),
             })
         for status in statuses.get("statuses", []):
             if status["context"].startswith("ai-factory/"):
@@ -590,6 +604,18 @@ class GitHub:
         else:
             state = "success"
         return CheckSummary(state, checks)
+
+    async def failing_checks(self, full_name: str, sha: str) -> list[str]:
+        """Names of the checks failing on a commit (empty while they are green, pending or absent)."""
+        return [c["name"] for c in (await self.checks(full_name, sha)).failing]
+
+    async def rerun_failed_jobs(self, full_name: str, run_id: int) -> None:
+        """Needs Actions write; a token without it gets 403, which the caller treats as "cannot rerun"."""
+        await self.request("POST", f"/repos/{full_name}/actions/runs/{run_id}/rerun-failed-jobs", retries=0)
+
+    async def has_workflows(self, full_name: str) -> bool:
+        found = await self.request("GET", f"/repos/{full_name}/actions/workflows", params={"per_page": 100})
+        return any(w.get("state") == "active" for w in found.get("workflows", []))
 
     async def set_status(self, full_name: str, sha: str, state: str, description: str, target_url: str = "") -> None:
         if self.installation_bound:

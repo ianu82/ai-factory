@@ -226,7 +226,9 @@ async def changed_paths(full_name: str, token: str | InstallationCredential, bas
 
 
 def path_overlap(candidate: list[str], main: list[str]) -> dict:
-    """Linear-size set operations, never a Cartesian product (even within one package)."""
+    """Linear-size set operations, never a Cartesian product (even within one package).
+
+    Two changes overlap when they share a file; a shared directory is recorded as information only."""
     candidates, intervening = set(candidate), set(main)
     shared = candidates & intervening
     candidate_dirs = {name.rpartition("/")[0] for name in candidates}
@@ -240,7 +242,7 @@ def path_overlap(candidate: list[str], main: list[str]) -> dict:
             directory = name.rpartition("/")[0]
             if directory in sample_dirs:
                 representatives.setdefault(directory, name)
-    return {"overlap": bool(shared or directories), "shared_files_count": len(shared),
+    return {"overlap": bool(shared), "shared_files_count": len(shared),
             "shared_directories_count": len(directories), "shared_files": sorted(shared)[:20],
             "matching_pairs": [[left[d], right[d]] for d in sample_dirs]}
 

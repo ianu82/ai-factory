@@ -176,7 +176,7 @@ export interface Repo {
     start_detection?: { available: boolean; reason: string };
     merge?: { mode?: string; method?: string; revalidate?: boolean; reverify?: "overlap" | "always" | "never" };
     release?: { mode?: string; health_url?: string; expect_text?: string };
-    require_ci?: boolean;
+    require_ci?: boolean | "auto";
     require_trusted_issue_author?: boolean;
     steward?: { mode?: "off" | "propose" | "fix"; fix_minutes?: number };
     review?: { mode?: "off" | "all" | "labelled"; allow_untrusted_local?: boolean; [key: string]: unknown };
