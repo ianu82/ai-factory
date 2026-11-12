@@ -88,10 +88,10 @@ def test_push_protection_two_sweeps(world, text, run_error):
 ])
 def test_main_red(world, branch, status, recovered, expected):
     with session_scope() as db:
-        signal(db, world, "ci_failure", status=status, data={"branch": branch} if branch else {})
+        signal(db, world, "ci_failure", status=status, data={"branch": branch, "workflow": "CI"} if branch else {})
         if recovered:
             db.add(Event(workspace_id=world[0], kind="ci_status", created_at=NOW,
-                         data={"repo_id": world[1], "branch": "trunk", "state": "success"}))
+                         data={"repo_id": world[1], "branch": "trunk", "workflow": "CI", "state": "success"}))
     assert bool(findings(world, "main_red")) is expected
 
 

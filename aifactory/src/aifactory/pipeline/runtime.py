@@ -150,10 +150,19 @@ def budget_extension(settings: dict[str, Any]) -> float:
     return max(0.01, round(positive(budgets.get("continue_usd")) or positive(budgets.get("outcome_usd")) / 4, 2))
 
 
+def _guidance_filter():
+    from sqlalchemy import and_, or_
+
+    # Only explicitly marked internal guidance, never arbitrary Factory chat/agent output.
+    return or_(Message.author_kind == "user", and_(Message.author_kind == "factory",
+        Message.attribution["source"].as_string() == "supervisor",
+        Message.attribution["guidance"].as_boolean().is_(True)))
+
+
 def guidance_history(outcome_id: str, task_id: str | None = None) -> list[str]:
     """All team guidance so far for an outcome (and this task), for inclusion in new prompts."""
     with session_scope() as s:
-        rows = (s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user")
+        rows = (s.query(Message).filter(Message.outcome_id == outcome_id, _guidance_filter())
                 .order_by(Message.created_at).all())
         return [m.body for m in rows if m.task_id in (None, task_id)]
 
@@ -165,7 +174,7 @@ def take_guidance(outcome_id: str, task_id: str | None = None, since=None):
 
     def take() -> list[str]:
         with session_scope() as s:
-            rows = [m for m in s.query(Message).filter(Message.outcome_id == outcome_id, Message.author_kind == "user",
+            rows = [m for m in s.query(Message).filter(Message.outcome_id == outcome_id, _guidance_filter(),
                                                         Message.created_at >= started).order_by(Message.created_at)
                     if m.task_id in (None, task_id) and m.id not in seen]
             for m in rows:
@@ -459,7 +468,7 @@ def open_decision(workspace_id: str, kind: str, title: str, body: str, *, outcom
                     {Workspace.outcome_seq: Workspace.outcome_seq}, synchronize_session=False)
             s.query(Workspace).filter(Workspace.id == workspace_id).with_for_update().one()
             candidates = s.query(Decision).filter(Decision.workspace_id == workspace_id,
-                Decision.kind == kind, Decision.status.in_(["open", "dismissed"]))
+                Decision.kind == kind, Decision.status.in_(["open", "resolved", "dismissed"]))
             existing = next((d for d in candidates
                              if (d.metadata_json or {}).get("fingerprint") == dedup_key), None)
             if existing:

@@ -235,8 +235,9 @@ def autonomy(outcomes: dict, tasks: dict, events, messages, decisions, system_us
         for e in outcome_events[o.id]:
             if not within(e.created_at, o):
                 continue
-            # Reconciliation also observes external merges as factory events.
-            if e.kind == "merged_outside":
+            # External merges and Supervisor fixes are assistance; observing or
+            # acknowledging a Supervisor notification is not.
+            if e.kind == "merged_outside" or (e.actor == "supervisor" and e.kind == "supervisor_action"):
                 assisted = True
                 continue
             if not human(e.actor):
