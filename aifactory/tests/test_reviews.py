@@ -9,7 +9,8 @@ import pytest
 from aifactory.db import session_scope
 from aifactory.github import GitHub, GitHubError
 from aifactory.models import Repository
-from aifactory.pipeline.runtime import merged_settings
+from aifactory.pipeline.runtime import (SETTINGS_REVISION, merged_settings, refresh_copied_defaults,
+                                        refreshed_defaults)
 from aifactory.review import (DEFAULT_REVIEW, FACTORY_REPLY_MARKER, SEVERITIES, blocking, codex_review_state,
                               findings_unseen, headline, new_review_evidence, normalize_feedback, open_findings,
                               reply_text, requested_round, review_policy, reviewed_by, severity, validate_review)
@@ -63,6 +64,47 @@ def test_defaults_inheritance_and_evidence_contract():
     assert evidence == {"rounds": 0, "answered": {}}
     evidence["answered"]["x"] = {}
     assert new_review_evidence()["answered"] == {}
+
+
+def test_a_copied_former_default_moves_to_the_current_default_and_a_choice_stays():
+    stale = {"review": {**DEFAULT_REVIEW, "wait_seconds": 120, "max_rounds": 2, "block_on": "all"}, "concurrency": 5}
+    fresh = refreshed_defaults(stale)
+    assert fresh == {"review": {**DEFAULT_REVIEW, "block_on": "all"}, "concurrency": 5,
+                     "_defaults": SETTINGS_REVISION}
+    assert (DEFAULT_REVIEW["wait_seconds"], DEFAULT_REVIEW["max_rounds"]) == (600, 3)
+    assert stale["review"]["wait_seconds"] == 120 and refreshed_defaults(fresh) is None
+    # set by a person after the refresh: it stays, even when it is what the default once was
+    assert refreshed_defaults({**fresh, "review": {**fresh["review"], "wait_seconds": 120}}) is None
+    kept = {"review": {"wait_seconds": 45, "max_rounds": 5}}
+    assert refreshed_defaults(kept) == {**kept, "_defaults": SETTINGS_REVISION}
+    assert refreshed_defaults(None) == {"_defaults": SETTINGS_REVISION}
+    assert refreshed_defaults({"review": "broken", "_defaults": "x"}) == {"review": "broken",
+                                                                          "_defaults": SETTINGS_REVISION}
+
+
+def test_a_workspaces_copies_of_former_review_defaults_are_refreshed_at_startup_once(client, signed_in):
+    from aifactory.models import Workspace
+
+    ws_id = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        ws = s.get(Workspace, ws_id)
+        ws.settings = {**ws.settings, "review": {**DEFAULT_REVIEW, "wait_seconds": 120, "max_rounds": 2,
+                                                  "block_on": "all"}}
+    assert refresh_copied_defaults() >= 1
+    with session_scope() as s:
+        settings = s.get(Workspace, ws_id).settings
+        assert settings["review"] == {**DEFAULT_REVIEW, "block_on": "all"}
+        assert settings["_defaults"] == SETTINGS_REVISION
+        assert review_policy(merged_settings(settings))["wait_seconds"] == 600
+    assert refresh_copied_defaults() == 0
+    # A person's later choice of the former value stays, and the API cannot move the revision back.
+    response = client.patch(f"/api/workspaces/{ws_id}", json={"settings": {"review": {"wait_seconds": 120},
+                                                                           "_defaults": 0}})
+    assert response.status_code == 200, response.text
+    assert refresh_copied_defaults() == 0
+    with session_scope() as s:
+        settings = s.get(Workspace, ws_id).settings
+        assert settings["review"]["wait_seconds"] == 120 and settings["_defaults"] == SETTINGS_REVISION
 
 
 def test_commented_inline_is_actionable_but_prose_and_resolved_are_not():
