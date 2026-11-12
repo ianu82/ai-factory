@@ -73,6 +73,51 @@ def merged_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     return effective(out)
 
 
+# A workspace is created with a copy of DEFAULT_SETTINGS and every save writes the merged settings back, so a default
+# that changes here never reaches a workspace that already exists. List each changed default: (revision, section,
+# key, the value it had). A stored value that still equals the former default is that copy, not a choice, and moves
+# to the current default once; "_defaults" in the settings (a key the API never sets) is the revision a workspace
+# is at. A workspace made after a change runs through this at the next start with nothing to move.
+SETTINGS_REVISION = 1
+FORMER_DEFAULTS = ((1, "review", "wait_seconds", 120), (1, "review", "max_rounds", 2))
+
+
+def new_settings() -> dict[str, Any]:
+    """A new workspace's own copy of the defaults, marked current: a restart has nothing to refresh in it."""
+    return {**json.loads(json.dumps(DEFAULT_SETTINGS)), "_defaults": SETTINGS_REVISION}
+
+
+def refreshed_defaults(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The settings with copies of former defaults moved to the current ones; None when they are up to date."""
+    raw = raw or {}
+    at = raw.get("_defaults") if type(raw.get("_defaults")) is int else 0
+    if at >= SETTINGS_REVISION:
+        return None
+    out = json.loads(json.dumps(raw))
+    for revision, section, key, former in FORMER_DEFAULTS:
+        stored = out.get(section)
+        if (revision > at and isinstance(stored, dict) and type(stored.get(key)) is type(former)
+                and stored[key] == former):
+            stored[key] = DEFAULT_SETTINGS[section][key]
+    out["_defaults"] = SETTINGS_REVISION
+    return out
+
+
+def refresh_copied_defaults() -> int:
+    """At startup: bring every workspace's copy of the defaults up to date. Returns how many were written."""
+    from ..onboarding_policy import lock_workspace
+
+    with session_scope() as s:
+        stale = [workspace_id for workspace_id, settings in s.query(Workspace.id, Workspace.settings)
+                 .order_by(Workspace.created_at, Workspace.id) if refreshed_defaults(settings) is not None]
+        for workspace_id in stale:
+            workspace = lock_workspace(s, workspace_id)  # a settings save may be running; read again under the lock
+            fresh = refreshed_defaults(workspace.settings)
+            if fresh is not None:
+                workspace.settings = fresh
+        return len(stale)
+
+
 def workspace_settings(workspace_id: str) -> dict[str, Any]:
     with session_scope() as s:
         ws = s.get(Workspace, workspace_id)
