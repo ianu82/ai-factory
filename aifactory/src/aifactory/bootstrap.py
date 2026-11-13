@@ -21,6 +21,7 @@ import os
 from . import definitions
 from .db import session_scope
 from .models import Organization, Repository, Workspace
+from .network_policy import validate_network
 from .pipeline.runtime import merged_settings, new_settings
 from .steward_policy import validate_steward
 
@@ -59,8 +60,10 @@ def _changed(applied: dict[str, str], key: str, value) -> bool:
 
 
 def _repo_overrides(name: str, overrides: dict) -> dict:
-    """Skip invalid operator policy without discarding unrelated configuration."""
+    """Canonicalize operator policies; invalid network isolation fails closed."""
     overrides = dict(overrides)
+    if "network" in overrides:
+        overrides["network"] = validate_network(overrides["network"])
     if "steward" in overrides:
         try:
             overrides["steward"] = validate_steward(overrides["steward"])
