@@ -104,6 +104,74 @@ export interface CredentialsResponse {
   server_fallbacks: Record<string, boolean>;
 }
 
+export interface ReviewFinding {
+  id: string;
+  kind: string;
+  comment_id: string | null;
+  review_id: string | null;
+  thread_id: string | null;
+  reply_to_id: string | null;
+  author: string;
+  author_type: string;
+  body: string;
+  url: string;
+  created_at: string | null;
+  updated_at: string | null;
+  review_state: string | null;
+  resolved: boolean | null;
+  path: string | null;
+  line: number | null;
+  original_line: number | null;
+  diff_hunk: string | null;
+  severity?: "P0" | "P1" | "P2" | "P3" | "unrated";
+}
+
+export interface ReviewEvidence {
+  rounds: number;
+  // Current delivery evidence; the optional ledger fields below support older tasks.
+  answered?: Record<string, { action: "fixed" | "disputed" | "deferred"; note: string; updated_at?: string }>;
+  head?: string;
+  started_at?: string;
+  deadline?: string;
+  next_poll_at?: string;
+  requested?: { head: string; state: "first" | "intent" | "posted"; at?: string };
+  result?: { head?: string; state?: "reviewed" | "unavailable"; ask?: "limit" | "open" | "unreviewed"; [key: string]: unknown };
+  round?: { n: number; head: string; findings: string[]; replies?: Record<string, unknown>; tries?: number } | null;
+  unanswered?: string[];
+  pending?: ReviewFinding[];
+  wait_deadlines?: Record<string, string>;
+  active_round?: number | null;
+  active_head?: string | null;
+  findings?: Record<string, {
+    finding: ReviewFinding;
+    head: string;
+    round: number;
+    status: "pending" | "addressed" | "disputed";
+    commit: string | null;
+    reply_id: string | null;
+    replied_at: string | null;
+    resolved_at: string | null;
+  }>;
+}
+
+export const DEFAULT_REVIEW: ReviewPolicy = {
+  address: "unresolved", reviewers: "all", ignore: [], wait_seconds: 600, max_rounds: 3,
+  trust: "collaborators", block_on: "p1", on_timeout: "proceed", request: "@codex review",
+};
+
+/** Derive display state from persisted evidence, never from build attempts. */
+export function reviewState(review?: Partial<ReviewEvidence>, head = ""): string | null {
+  if (!review) return null;
+  if (Object.values(review.answered || {}).some((answer) => answer.action === "disputed")) return "Review disputed";
+  if (review.round) return "Addressing review comments";
+  if (review.head === head && review.deadline && Date.parse(review.deadline) > Date.now() && review.result?.head !== head) return "Waiting for reviews";
+  if (Object.values(review.findings || {}).some((f) => f.status === "disputed")) return "Review disputed";
+  if (review.active_round != null) return "Addressing review comments";
+  if (review.pending?.length) return "Waiting to address review comments";
+  if (review.wait_deadlines?.[head] && Date.parse(review.wait_deadlines[head]) > Date.now()) return "Waiting for reviews";
+  return null;
+}
+
 export interface Settings {
   learning?: { status: "learning" | "applied"; preset: Settings["autonomy"] };
   provider: "mindshub" | "openai";
@@ -200,7 +268,7 @@ export interface Me {
 }
 
 export interface Meta {
-  capabilities?: { reverify?: boolean };
+  capabilities?: { reverify?: boolean; review_gating?: boolean };
   auth: { oidc: boolean; api_key: boolean; dev: boolean };
   harnesses: { name: string; label: string; available: boolean; detail: string }[];
   sandbox: { isolation: string };
@@ -227,7 +295,7 @@ export interface Repo {
     require_ci?: boolean | "auto";
     require_trusted_issue_author?: boolean;
     steward?: { mode?: "off" | "propose" | "fix"; fix_minutes?: number };
-    review?: { mode?: "off" | "all" | "labelled"; allow_untrusted_local?: boolean; [key: string]: unknown };
+    review?: Partial<ReviewPolicy> & { mode?: "off" | "all" | "labelled"; allow_untrusted_local?: boolean; [key: string]: unknown };
   };
 }
 
@@ -304,6 +372,7 @@ export interface Task {
   summary: string;
   blocked_reason: string;
   evidence: {
+    review?: ReviewEvidence;
     attempts?: Attempt[];
     ci?: { state: string; checks?: { name: string; conclusion: string; url: string }[] };
     merge?: { sha: string; pr: number; at: string };
@@ -610,14 +679,15 @@ export interface PullRow {
   updated_at: string;
   merged_at: string | null;
   base: string;
-  group: "ready" | "attention" | "checks" | "draft" | "merged";
+  group: "ready" | "attention" | "checks" | "draft" | "handed_over" | "merged";
   reason: string;
   detail: { additions?: number; deletions?: number; changed_files?: number; mergeable_state?: string };
   ci?: { state: string; total?: number; failing?: string[]; pending?: string[] };
-  factory: { outcome_id: string; outcome_number: number | null; task_key: string; status: string; decision_id: string | null } | null;
+  factory: { task_id?: string; head_sha?: string; review?: Partial<ReviewEvidence>; outcome_id: string; outcome_number: number | null; task_key: string; status: string; decision_id: string | null } | null;
 }
 
 export interface PullsResponse {
+  next_cursor?: string | null;
   items: PullRow[];
   counts: Partial<Record<PullRow["group"], number>>;
   errors: string[];

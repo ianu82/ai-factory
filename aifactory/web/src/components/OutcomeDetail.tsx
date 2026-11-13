@@ -29,6 +29,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
   const [guided, setGuided] = useState(true);
   const [showAll, setShowAll] = useState(false);
   const { hash } = useLocation();
+  const targetTaskId = hash.startsWith("#task-") ? hash.slice("#task-".length) : undefined;
   const targetDecisionId = hash.startsWith("#decision-") ? hash.slice("#decision-".length) : focusDecisionId;
   if (q.isLoading) return <Skeleton rows={8} />;
   if (q.error || !q.data) return <div className="empty"><h3>Could not load this outcome</h3><p>{(q.error as Error)?.message}</p></div>;
@@ -136,7 +137,7 @@ export function OutcomeDetail({ outcomeId, onClose, focusDecisionId }: { outcome
               : outcome.blocked_reason || "The planner is reading the repositories and drafting tasks…"}
           </div>
         ) : (
-          tasks.map((t) => <TaskCard key={t.id} task={t} runs={runs.filter((r) => r.task_id === t.id)} defaultOpen={tasks.length === 1} />)
+          tasks.map((t) => <TaskCard key={t.id} task={t} focused={t.id === targetTaskId} runs={runs.filter((r) => r.task_id === t.id)} defaultOpen={tasks.length === 1} />)
         )}
       </section>
 

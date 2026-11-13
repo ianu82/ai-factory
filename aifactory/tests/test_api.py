@@ -852,3 +852,472 @@ def test_review_intake_controls_are_deferred_until_intake_exists():
     assert "Review pull requests" not in settings
     assert "allow_untrusted_local" not in settings
     assert "review_mode" not in settings
+
+
+def test_recorded_factory_pulls_are_local_serialized_and_tenant_scoped(client, signed_in, monkeypatch):
+    from fastapi.testclient import TestClient
+    from aifactory.github import GitHub
+    from aifactory.models import Outcome, Plan, Repository, Task
+    from aifactory.review import new_review_evidence
+    from aifactory.security import encrypt
+    from aifactory import serializers
+
+    def no_github(*args, **kwargs):
+        pytest.fail("Recorded PR page must not contact GitHub")
+
+    monkeypatch.setattr(GitHub, "request", no_github)
+    ws = signed_in["workspaces"][0]["id"]
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    assert client.get(root).json()["items"] == []
+    with session_scope() as s:
+        s.add(Secret(workspace_id=ws, kind="github_token", ciphertext=encrypt("ghp_never_expose_credentials")))
+        repo = Repository(workspace_id=ws, full_name="owner/app", config={"private_setting": "not-public"})
+        s.add(repo)
+        s.flush()
+        outcome = Outcome(workspace_id=ws, number=42, title="Review work", repo_ids=[repo.id])
+        s.add(outcome)
+        s.flush()
+        plan = Plan(outcome_id=outcome.id, content={})
+        s.add(plan)
+        s.flush()
+        review = new_review_evidence()
+        review.update(rounds=2, pending=[{"id": f"comment:{n}", "author": "reviewer"} for n in range(3)])
+        task = Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id,
+                    key="T5", title="Review task", attempt=1, status="needs_input", stage="revise",
+                    pr_number=7, pr_url="https://github.com/owner/app/pull/7", head_sha="current-head",
+                    evidence={"review": review})
+        legacy = Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id,
+                      key="T1", title="Old task", pr_number=8, evidence={})
+        merged = Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id,
+                      key="T2", title="Merged", pr_number=9, merge_sha="abc", status="completed")
+        s.add_all([task, legacy, merged])
+        s.flush()
+        task_id, outcome_id = task.id, outcome.id
+        assert serializers.task(task)["evidence"]["review"] == review
+    r = client.get(root)
+    assert r.status_code == 200
+    rows = {row["number"]: row for row in r.json()["items"]}
+    row = rows[7]
+    assert row["reason"] == "Review comments to address (3)"
+    assert row["group"] == "attention"
+    assert row["url"] == "https://github.com/owner/app/pull/7"
+    assert row["factory"]["task_id"] == task_id
+    assert row["factory"]["outcome_id"] == outcome_id
+    assert row["factory"]["outcome_number"] == 42
+    assert row["factory"]["review"]["rounds"] == 2
+    assert row["factory"]["head_sha"] == "current-head"
+    assert rows[8]["factory"]["review"] == {}
+    assert "not-public" not in r.text and "ciphertext" not in r.text and "ghp_never_expose_credentials" not in r.text
+    assert [row["number"] for row in client.get(root + "?state=merged").json()["items"]] == [9]
+    assert len(client.get(root + "?state=all").json()["items"]) == 3
+    assert client.get(root + "?state=invalid").status_code == 400
+    assert client.post(root).status_code == 405
+
+    other = TestClient(client.app)
+    assert other.get(root).status_code == 401
+    other.post("/auth/dev", json={"email": "outsider@other.test", "organization": "Other"})
+    other_ws = other.get("/api/me").json()["workspaces"][0]["id"]
+    assert other.get(root).status_code in (403, 404)
+    assert other.get(f"/api/workspaces/{other_ws}/pulls/recorded").json()["items"] == []
+
+
+def test_review_controls_preserve_overrides_and_require_admin(client, signed_in):
+    from aifactory.models import Membership, Repository
+    from aifactory.review import review_policy
+
+    ws = signed_in["workspaces"][0]["id"]
+    root = f"/api/workspaces/{ws}"
+    policy = {"address": "changes_requested", "reviewers": "bots", "ignore": ["noise[bot]"],
+              "wait_seconds": 0, "max_rounds": 4}
+    assert client.patch(root, json={"settings": {"review": policy}}).json()["settings"]["review"] == {**review_policy(), **policy}
+    with session_scope() as s:
+        config = {"qa": {"start": "npm start", "port": 4000}, "recovery": {"mode": "manual"},
+                  "merge": {"mode": "approval", "reverify": "always"}, "checks": ["pytest"],
+                  "steward": {"mode": "off", "fix_minutes": 30}}
+        repo = Repository(workspace_id=ws, full_name="owner/repo", config=config)
+        s.add(repo)
+        s.flush()
+        repo_id = repo.id
+    url = root + f"/repositories/{repo_id}"
+    r = client.patch(url, json={"config": {"review": policy}})
+    assert r.status_code == 200
+    assert r.json()["config"] == {**config, "review": {"mode": "off", "allow_untrusted_local": False, **policy}}
+    # Explicit zero/empty values stay overrides; inheritance removals are explicit.
+    patch = {"reviewers": "all", "ignore": [], "wait_seconds": 0}
+    r = client.patch(url, json={"config": {"review": patch, "review_inherit": ["address", "max_rounds"]}})
+    assert r.status_code == 200
+    overrides = {"mode": "off", "allow_untrusted_local": False, "reviewers": "all", "ignore": [], "wait_seconds": 0}
+    assert r.json()["config"] == {**config, "review": overrides}
+    assert review_policy({"review": policy}, r.json()["config"]) == {**review_policy(), **policy, **{k: v for k, v in overrides.items() if k in review_policy()}}
+    assert client.patch(url, json={"config": {"review": {"max_rounds": 1}}}).json()["config"]["review"] == {**overrides, "max_rounds": 1}
+    for invalid in ({"unknown": None}, {"wait_seconds": -1}, {"max_rounds": 1.5}):
+        assert client.patch(url, json={"config": {"review": invalid}}).status_code == 422
+    for inherit in ("address", ["unknown"], [None]):
+        assert client.patch(url, json={"config": {"review_inherit": inherit}}).status_code == 422
+    assert client.patch(url, json={"config": {"review": {"address": "off"}, "review_inherit": ["address"]}}).status_code == 422
+    # Clearing every override preserves the rest of the repository configuration.
+    cleared = client.patch(url, json={"config": {"review_inherit": list(policy)}})
+    assert cleared.json()["config"] == {**config, "review": {"mode": "off", "allow_untrusted_local": False}}
+    for role in ("member", "viewer"):
+        with session_scope() as s:
+            s.query(Membership).filter_by(workspace_id=ws).one().role = role
+        assert client.patch(root, json={"settings": {"review": policy}}).status_code == 403
+        assert client.patch(url, json={"config": {"review": policy}}).status_code == 403
+        assert client.get(root + "/pulls/recorded").status_code == 200
+
+
+@pytest.mark.parametrize("status,closed", [("abandoned", True), ("cancelled", True), ("handed_over", True),
+                                               ("abandoned", False), ("cancelled", False)])
+def test_recorded_pulls_exclude_closed_terminal_records_even_under_all(client, signed_in, status, closed):
+    from aifactory.models import Outcome, Plan, Repository, Task
+
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        s.add(repo)
+        s.flush()
+        outcome = Outcome(workspace_id=ws, number=1, title="Closed PR")
+        s.add(outcome)
+        s.flush()
+        plan = Plan(outcome_id=outcome.id, content={})
+        s.add(plan)
+        s.flush()
+        s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id, key="T1",
+                   title="Closed", status=status, pr_number=1, evidence={"pr_closed": closed}))
+    for state in ("open", "ready", "merged", "all"):
+        response = client.get(f"/api/workspaces/{ws}/pulls/recorded?state={state}")
+        assert response.status_code == 200
+        assert response.json()["items"] == []
+
+
+@pytest.mark.parametrize("deadline,head,waiting", [
+    ("2999-01-01T00:00:00Z", "current-head", True),
+    ("2999-01-01T00:00:00+00:00", "current-head", True),
+    ("2000-01-01T00:00:00Z", "current-head", False),
+    ("2999-01-01T00:00:00Z", "old-head", False),
+    ("invalid", "current-head", False),
+])
+def test_recorded_pulls_return_current_head_and_persisted_wait_deadline(client, signed_in, deadline, head, waiting):
+    from aifactory.models import Outcome, Plan, Repository, Task
+    from aifactory.review import new_review_evidence
+
+    ws = signed_in["workspaces"][0]["id"]
+    review = new_review_evidence()
+    review["wait_deadlines"] = {head: deadline}
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        s.add(repo)
+        s.flush()
+        outcome = Outcome(workspace_id=ws, number=1, title="Waiting PR")
+        s.add(outcome)
+        s.flush()
+        plan = Plan(outcome_id=outcome.id, content={})
+        s.add(plan)
+        s.flush()
+        s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id, key="T1",
+                   title="Waiting", status="awaiting_approval", pr_number=1, head_sha="current-head",
+                   evidence={"review": review, "ci": {"state": "success"}}))
+    row = client.get(f"/api/workspaces/{ws}/pulls/recorded").json()["items"][0]
+    assert row["factory"]["head_sha"] == "current-head"
+    assert row["factory"]["review"] == review
+
+    assert row["group"] == ("checks" if waiting else "ready")
+    if waiting:
+        assert row["reason"] == "Waiting for reviews"
+    for state in ("open", "all"):
+        result = client.get(f"/api/workspaces/{ws}/pulls/recorded?state={state}").json()
+        assert result["items"][0]["group"] == row["group"]
+        assert result["counts"]["ready"] == (0 if waiting else 1)
+    ready = client.get(f"/api/workspaces/{ws}/pulls/recorded?state=ready").json()
+    assert len(ready["items"]) == (0 if waiting else 1)
+
+
+@pytest.mark.parametrize("draft", [True, False, None])
+@pytest.mark.parametrize("ci", ["success", "pending", "failure", "unknown"])
+def test_recorded_handed_over_pr_uses_github_draft_flag_in_its_own_group(client, signed_in, ci, draft):
+    from aifactory.models import Outcome, Plan, Repository, Task
+    from aifactory.pulls import classify
+
+    ws = signed_in["workspaces"][0]["id"]
+    evidence = {"ci": {"state": ci}, "review": {"pending": [{"id": "comment:1"}]}}
+    if draft is not None:
+        evidence["pr_draft"] = draft
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        outcome = Outcome(workspace_id=ws, number=1, title="Handed over")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id)
+        s.add(plan)
+        s.flush()
+        s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id, key="T1",
+                   title="Finish by hand", status="handed_over", stage="ci", pr_number=1, evidence=evidence))
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    for state in ("open", "all"):
+        response = client.get(root, params={"state": state}).json()
+        row, = response["items"]
+        # Only GitHub's recorded flag makes it a draft; unknown legacy records are not drafts.
+        assert row["draft"] is (draft is True)
+        assert row["group"] == "handed_over"
+        assert row["reason"] == ("Draft" if draft is True else "Handed over")
+        assert response["counts"]["handed_over"] == 1
+        assert response["counts"]["ready"] == response["counts"]["checks"] == 0
+        assert classify(row) == ("handed_over", row["reason"])
+    assert client.get(root, params={"state": "ready"}).json()["items"] == []
+
+
+def test_recorded_pull_counts_are_workspace_wide_beyond_the_first_page(client, signed_in):
+    from aifactory.models import Outcome, Plan, Repository, Task, Workspace
+    from aifactory.review import new_review_evidence
+
+    ws = signed_in["workspaces"][0]["id"]
+    review = new_review_evidence()
+    review["pending"] = [{"id": "comment:1", "author": "reviewer"}]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        outcome = Outcome(workspace_id=ws, number=1, title="Many PRs")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id)
+        s.add(plan)
+        s.flush()
+        for n in range(1, 8):  # 3 ready, 2 needing attention, 1 merged, 1 handed over
+            kind = ["ready", "ready", "ready", "attention", "attention", "merged", "handed_over"][n - 1]
+            s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id, key=f"T{n}",
+                       title=f"PR {n}", pr_number=n,
+                       status={"ready": "awaiting_approval", "attention": "needs_input", "merged": "completed",
+                               "handed_over": "handed_over"}[kind],
+                       merge_sha="abc" if kind == "merged" else "",
+                       evidence={"ci": {"state": "success"}, **({"review": review} if kind == "attention" else {})}))
+        # Another workspace's PRs never count.
+        mine = s.get(Workspace, ws)
+        elsewhere = Workspace(org_id=mine.org_id, name="Elsewhere", slug="elsewhere")
+        s.add(elsewhere)
+        s.flush()
+        other = Outcome(workspace_id=elsewhere.id, number=1, title="Elsewhere")
+        s.add(other)
+        s.flush()
+        s.add(Task(workspace_id=elsewhere.id, outcome_id=other.id, plan_id=plan.id, repo_id=repo.id,
+                   key="X", title="Other", pr_number=99, status="awaiting_approval", evidence={"ci": {"state": "success"}}))
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    page = client.get(root, params={"limit": 1}).json()
+    assert len(page["items"]) == 1 and page["next_cursor"]
+    assert page["counts"] == {"ready": 3, "attention": 2, "checks": 0, "draft": 0, "handed_over": 1, "merged": 0}
+    everything = client.get(root, params={"state": "all", "limit": 1}).json()["counts"]
+    assert everything["merged"] == 1 and everything["ready"] == 3
+    ready = client.get(root, params={"state": "ready", "limit": 1}).json()["counts"]
+    assert ready["ready"] == 3 and ready["attention"] == 0
+
+
+@pytest.mark.parametrize("github", ["merged", "closed", "ready", "draft"])
+def test_reconciliation_keeps_handed_over_pull_requests_synchronized(client, signed_in, monkeypatch, github):
+    import asyncio
+    from aifactory import reconcile
+    from aifactory.models import Event, Outcome, Plan, Repository, Task
+
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        outcome = Outcome(workspace_id=ws, number=3, title="Handed over")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id)
+        s.add(plan)
+        s.flush()
+        task = Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id, key="T1",
+                    title="Finish by hand", status="handed_over", pr_number=5, evidence={"pr_draft": True})
+        s.add(task)
+        s.flush()
+        task_id = task.id
+    pr = {"number": 5, "state": "open", "merged": False, "draft": github == "draft"}
+    if github == "merged":
+        pr.update(state="closed", merged=True, merge_commit_sha="m3rg3", merged_at="2026-11-10T12:00:00Z",
+                  merged_by={"login": "person"})
+    elif github == "closed":
+        pr.update(state="closed")
+    calls = []
+
+    class FakeGitHub:
+        def __init__(self, token):
+            pass
+
+        async def pull(self, full_name, number):
+            calls.append((full_name, number))
+            return pr
+
+    monkeypatch.setattr(reconcile, "GitHub", FakeGitHub)
+    monkeypatch.setattr(reconcile, "resolve_token", lambda ws: "token")
+    assert asyncio.run(reconcile.reconcile_pull_requests()) == (0 if github == "draft" else 1)
+    assert calls == [("owner/app", 5)]
+    with session_scope() as s:
+        task = s.get(Task, task_id)
+        assert task.status == "handed_over" and task.merge_sha == ""  # bookkeeping, never resumed
+        evidence = dict(task.evidence)
+        kinds = [e.kind for e in s.query(Event).filter(Event.task_id == task_id)]
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    if github == "merged":
+        assert evidence["merge"]["sha"] == "m3rg3" and evidence["merge"]["outside"] is True
+        assert kinds == ["merged_outside"]
+        for state in ("merged", "all"):
+            row, = client.get(root, params={"state": state}).json()["items"]
+            assert row["group"] == "merged" and row["merged_at"] == "2026-11-10T12:00:00Z"
+        assert client.get(root).json()["items"] == []
+    elif github == "closed":
+        assert evidence["pr_closed"] is True and kinds == ["pr_closed_outside"]
+        for state in ("open", "ready", "merged", "all"):
+            assert client.get(root, params={"state": state}).json()["items"] == []
+    else:
+        row, = client.get(root).json()["items"]
+        assert evidence["pr_draft"] is (github == "draft")
+        assert row["reason"] == ("Draft" if github == "draft" else "Handed over")
+    # Settled records are not polled again; open ones are refreshed.
+    calls.clear()
+    asyncio.run(reconcile.reconcile_pull_requests())
+    assert calls == ([] if github in ("merged", "closed") else [("owner/app", 5)])
+
+
+def test_recorded_pulls_page_in_sql_before_serializing_review_history(client, signed_in, monkeypatch):
+    from datetime import timedelta
+    from sqlalchemy import event
+    from aifactory.db import utcnow
+    from aifactory.models import Outcome, Plan, Repository, Task
+    from aifactory import serializers
+
+    ws = signed_in["workspaces"][0]["id"]
+    now = utcnow()
+    with session_scope() as s:
+        engine = s.get_bind()
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        outcome = Outcome(workspace_id=ws, number=1, title="PR history")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id)
+        s.add(plan)
+        s.flush()
+        # Identical timestamps exercise the unique id tie-breaker. Newer closed/merged
+        # records must be filtered before the page limit, not consume the open page.
+        for number in range(1, 66):
+            merged = number > 60
+            s.add(Task(id=f"{number:032d}", workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id,
+                       repo_id=repo.id, key=f"T{number}", title=f"PR {number}", pr_number=number,
+                       status="completed" if merged else "awaiting_approval", merge_sha="abc" if merged else "",
+                       evidence={"ci": {"state": "success"}, "review": {"rounds": number, "findings": {}}},
+                       updated_at=now + timedelta(minutes=1) if merged else now))
+        s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id,
+                   key="closed", title="Closed", pr_number=66, status="abandoned",
+                   updated_at=now + timedelta(minutes=2)))
+    serialized = []
+    original = serializers.task
+
+    def task_summary(task, *args, **kwargs):
+        serialized.append(task.pr_number)
+        return original(task, *args, **kwargs)
+
+    monkeypatch.setattr(serializers, "task", task_summary)
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "FROM tasks JOIN outcomes" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    try:
+        response = client.get(root)
+        assert response.status_code == 200
+        page = response.json()
+        assert [r["number"] for r in page["items"]] == list(range(60, 10, -1))
+        assert serialized == list(range(60, 10, -1))  # No ledger serialization for hidden rows.
+        assert page["next_cursor"]
+        counted, paged = queries[0], queries[1]
+        assert "GROUP BY" in counted[0] and "count(tasks.id)" in counted[0]  # Totals aggregate in SQL.
+        assert "LIMIT" not in counted[0]
+        assert page["counts"]["ready"] == 60  # Workspace-wide, not just the 50 rows on this page.
+        assert "ORDER BY tasks.updated_at DESC, tasks.id DESC" in paged[0]
+        # SQLite binds positionally; psycopg binds by name. Inspect SQLAlchemy's
+        # compiled parameters rather than assuming one driver's DBAPI shape.
+        assert "LIMIT" in paged[0]
+        parameters = paged[1]
+        if isinstance(parameters, dict):
+            assert parameters["param_1"] == 51
+        else:
+            assert parameters[-2] == 51
+        older = client.get(root, params={"cursor": page["next_cursor"]}).json()
+        assert [r["number"] for r in older["items"]] == list(range(10, 0, -1))
+        assert older["next_cursor"] is None
+        ready = client.get(root, params={"state": "ready", "limit": 2}).json()
+        assert [r["number"] for r in ready["items"]] == [60, 59]
+        merged = client.get(root, params={"state": "merged", "limit": 2}).json()
+        assert [r["number"] for r in merged["items"]] == [65, 64]
+        all_prs = client.get(root, params={"state": "all", "limit": 100}).json()
+        assert len(all_prs["items"]) == 65 and all_prs["next_cursor"] is None
+        for cursor in ("garbage", "W10=", "bnVsbA=="):
+            assert client.get(root, params={"cursor": cursor}).status_code == 400
+        for limit in (0, 101):
+            assert client.get(root, params={"limit": limit}).status_code == 422
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+
+@pytest.mark.parametrize("review,group,reason", [
+    ({"head": "head", "deadline": "2999-01-01T00:00:00Z"}, "checks", "Waiting for reviews"),
+    ({"head": "head", "deadline": "invalid"}, "ready", ""),
+    ({"round": {"n": 1, "head": "head", "findings": []}}, "checks", "Addressing review comments"),
+    ({"result": {"head": "head", "ask": "limit"}}, "attention", "Review holds merge"),
+    ({"result": {"head": "old", "ask": "limit"}}, "ready", ""),
+])
+def test_recorded_pulls_read_current_delivery_review_contract(client, signed_in, review, group, reason):
+    from aifactory.models import Outcome, Plan, Repository, Task
+
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        outcome = Outcome(workspace_id=ws, number=1, title="Reviewed PR")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id)
+        s.add(plan)
+        s.flush()
+        s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id, key="T1",
+                   title="Reviewed", status="awaiting_approval", pr_number=1, head_sha="head",
+                   evidence={"review": review, "ci": {"state": "success"}}))
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    response = client.get(root).json()
+    row, = response["items"]
+    assert row["group"] == group
+    assert reason in row["reason"]
+    assert response["counts"][group] == 1
+    assert len(client.get(root, params={"state": "ready"}).json()["items"]) == (1 if group == "ready" else 0)
+
+
+@pytest.mark.parametrize("status", ["awaiting_approval", "completed"])
+@pytest.mark.parametrize("draft", [True, False])
+def test_recorded_drafts_are_not_selected_or_counted_as_ready(client, signed_in, status, draft):
+    from aifactory.models import Outcome, Plan, Repository, Task
+
+    ws = signed_in["workspaces"][0]["id"]
+    with session_scope() as s:
+        repo = Repository(workspace_id=ws, full_name="owner/app")
+        outcome = Outcome(workspace_id=ws, number=1, title="Recorded draft")
+        s.add_all([repo, outcome])
+        s.flush()
+        plan = Plan(outcome_id=outcome.id)
+        s.add(plan)
+        s.flush()
+        s.add(Task(workspace_id=ws, outcome_id=outcome.id, plan_id=plan.id, repo_id=repo.id,
+                   key="T1", title="Green PR", status=status, pr_number=1,
+                   evidence={"pr_draft": draft, "ci": {"state": "success"}}))
+    root = f"/api/workspaces/{ws}/pulls/recorded"
+    expected = "draft" if draft else "ready"
+    for state in ("open", "all"):
+        response = client.get(root, params={"state": state})
+        assert response.status_code == 200
+        data = response.json()
+        row, = data["items"]
+        assert row["draft"] is draft
+        assert row["group"] == expected
+        assert data["counts"][expected] == 1
+        assert data["counts"]["ready"] == (0 if draft else 1)
+    ready = client.get(root, params={"state": "ready"}).json()
+    assert len(ready["items"]) == (0 if draft else 1)
+    assert ready["counts"]["ready"] == (0 if draft else 1)

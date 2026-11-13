@@ -177,7 +177,7 @@ function Sidebar() {
   });
   const pulls = usePulls("open");
   const needsYou = (inbox.data?.decisions.length || 0) + (inbox.data?.alerts?.length || 0);
-  const pullsNeedingYou = (pulls.data?.counts.ready || 0) + (pulls.data?.counts.attention || 0);
+  const pullsNeedingYou = (pulls.data?.pages[0]?.counts.ready || 0) + (pulls.data?.pages[0]?.counts.attention || 0);
   const [switching, setSwitching] = useState(false);
   const base = `/w/${ws.id}`;
   const signOut = async () => {

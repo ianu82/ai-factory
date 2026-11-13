@@ -97,6 +97,8 @@ async def publish_candidate(task_id: str, info: dict[str, Any]) -> dict[str, Any
         task = s.get(Task, task_id)
         task.branch, task.head_sha = branch, head
         task.pr_number, task.pr_url = pr.get("number"), pr.get("html_url", "")
+        # GitHub's own flag: an existing open PR may have been reused rather than created as a draft.
+        task.evidence = {**(task.evidence or {}), "pr_draft": bool(pr.get("draft"))}
     record(ws, "handover_published", f"Pushed the candidate to {branch} and opened draft PR #{pr.get('number')}",
            outcome_id=info["outcome_id"], task_id=task_id, data={"pr_url": pr.get("html_url", "")})
     notify(ws, "task", task_id, outcome_id=info["outcome_id"])

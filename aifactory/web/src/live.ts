@@ -134,10 +134,10 @@ export function useLive(workspaceId: string | undefined): LiveState {
           if (["outcome_completed", "settings_changed", "learning_preset_applied"].includes(data.kind)) touch("learning-policy");
           if (data.kind.startsWith("run_")) touch("runs");
           if (["outcome_completed", "merged", "plan_proposed", "plan_approved", "outcome_created", "task_completed", "stage"].includes(data.kind)) touch("outcomes");
-          if (["published", "merged", "merged_outside", "ci_status", "task_completed"].includes(data.kind)) touch("pulls");
+          if (data.kind.startsWith("review_") || ["published", "merged", "merged_outside", "ci_status", "task_completed", "stage", "decision_resolved"].includes(data.kind)) touch("pulls");
         } else if (data.type === "changed") {
-          touch("outcome", "outcomes");
           if (data.entity === "workspace") { touch("learning-policy"); qc.invalidateQueries({ queryKey: ["me"] }); }
+          touch("outcome", "outcomes", "pulls");
           if (data.entity === "decision") touch("inbox", "decisions");
           if (data.entity === "alert") touch("inbox");
           if (data.entity === "run") touch("runs");
