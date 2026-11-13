@@ -23,7 +23,7 @@ export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs
   const label = task.status === "running" ? STAGE_TEXT[task.stage] || "Running"
     : reviewWait ? "Waiting for review" : undefined;
   return (
-    <div className="task">
+    <div className="task" data-testid={`task-${task.id}`}>
       <div className="task-head" onClick={() => setOpen(!open)} role="button" tabIndex={0} aria-expanded={open}
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setOpen(!open))}>
         <span className="key">{task.key}</span>
