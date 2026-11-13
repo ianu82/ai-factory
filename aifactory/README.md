@@ -130,6 +130,7 @@ AIFACTORY_ALLOW_DEV_SIGN_IN=1 .venv/bin/python -m aifactory.cli serve --port 800
 Tests: `.venv/bin/python -m pytest` (includes end-to-end pipeline tests against a local git
 remote with a scripted model). Set `AIFACTORY_TEST_DATABASE_URL=postgresql://…` to run the
 suite against a throwaway Postgres (CI does both). UI fixture for rendering checks: `scripts/seed_local_fixture.py`.
+Unsharded runs use xdist workers by default; opt out with `-n 0` or `AIFACTORY_TEST_SERIAL=1`.
 
 ## Releases
 

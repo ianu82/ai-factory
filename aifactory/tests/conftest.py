@@ -13,6 +13,38 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
+def default_workers(
+    *, shard: str, xdist_worker: str | None, numprocesses: int | str | None,
+    dist: str, usepdb: bool, has_xdist: bool, serial_env: str, cpu_count: int | None,
+) -> int:
+    """Parallelise unsharded runs unless the user or environment chose otherwise."""
+    if (
+        not has_xdist or xdist_worker is not None or numprocesses is not None
+        or dist != "no" or usepdb or shard or serial_env == "1"
+    ):
+        return 0
+    # Most suite time is spent waiting on fixtures and subprocesses, not CPU work.
+    return min(8, max(4, cpu_count or 1))
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    workers = default_workers(
+        shard=os.environ.get("AIFACTORY_TEST_SHARD", ""),
+        xdist_worker=os.environ.get("PYTEST_XDIST_WORKER"),
+        numprocesses=getattr(config.option, "numprocesses", None),
+        dist=getattr(config.option, "dist", "no"),
+        usepdb=config.option.usepdb,
+        has_xdist=config.pluginmanager.hasplugin("xdist"),
+        serial_env=os.environ.get("AIFACTORY_TEST_SERIAL", ""),
+        cpu_count=os.cpu_count(),
+    )
+    if workers:
+        config.option.numprocesses = workers
+        config.option.dist = "load"
+        config.option.tx = ["popen"] * workers
+
+
 def shard_of(nodeid: str, total: int) -> int:
     """Which of `total` shards (1-based) runs this test: a stable hash of its file and function.
 
@@ -25,8 +57,9 @@ def shard_of(nodeid: str, total: int) -> int:
 def pytest_collection_modifyitems(config, items):
     """CI runs the suite on several runners at once: AIFACTORY_TEST_SHARD=2/3 keeps the second third of the tests.
 
-    Unset (a developer's machine, the Factory's own check commands) every test runs, as before. Every test sets
-    up its own data directory and database (`isolated_env`), so which tests share a process does not matter.
+    Unset (a developer's machine, the Factory's own check commands), every test runs using xdist workers by
+    default; opt out with -n 0 or AIFACTORY_TEST_SERIAL=1. Every test sets up its own data directory and
+    database (`isolated_env`), so which tests share a process does not matter.
     """
     spec = os.environ.get("AIFACTORY_TEST_SHARD", "").strip()
     if not spec:
