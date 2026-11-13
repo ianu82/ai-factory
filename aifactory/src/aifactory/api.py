@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from . import definitions
 from . import attachments as A
-from . import insights, linear_config, onboarding_policy, preview_config, workstreams
+from . import insights, linear_config, onboarding_policy, preview_config, previews, workstreams
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
@@ -954,12 +954,13 @@ def delete_preview_account(workspace_id: str, repo_id: str, user: User = Depends
 @router.delete("/workspaces/{workspace_id}/repositories/{repo_id}")
 def disconnect_repo(workspace_id: str, repo_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    # Use the same serialization point as account PUT/DELETE before reading
-    # repository state, so a late account write cannot leave an orphan secret.
+    # Serialize with preview get-or-create and account PUT/DELETE before reading
+    # references or repository state, so neither can race with disconnect.
     definitions.lock_workspace(db, workspace_id)
     repo = _preview_repository(db, user, workspace_id, repo_id, "admin")
     if db.query(Task).filter(Task.repo_id == repo_id, Task.status.in_(["queued", "running", "waiting_ci"])).first():
         raise HTTPException(409, "Work is running on this repository")
+    previews.guard_repository_disconnect(db, workspace_id, repo_id)
     try:
         definitions.guard_disconnect(db, workspace_id, repo_id)
     except definitions.DefinitionError as exc:
