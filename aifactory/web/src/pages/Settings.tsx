@@ -3,11 +3,13 @@ import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-quer
 import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import {
-  api, type Credential, type DirectorSettings, type ModelCheckResult, type Repo, type ReviewPolicy, type Settings,
+  api, DEFAULT_REVIEW, type Credential, type DirectorSettings, type ModelCheckResult, type Repo, type ReviewPolicy, type Settings,
   type Workspace,
 } from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
+import { ReviewControls } from "../components/ReviewControls";
+import { saveReviewPolicy } from "../reviewPolicy";
 import { validMindBudget } from "../mind";
 import { type LearningPolicy, policyPatch } from "../learningPolicy";
 import { ago } from "../format";
@@ -116,7 +118,7 @@ const reviewForm = (r: Partial<ReviewPolicy> | undefined): ReviewForm => {
 };
 
 function ReviewPolicySection() {
-  const { ws } = useWs();
+  const { ws, meta } = useWs();
   const save = useSaveSettings();
   const admin = ws.role === "owner" || ws.role === "admin";
   const saved = useMemo(() => reviewForm(ws.settings.review), [ws.settings.review]);
@@ -140,7 +142,9 @@ function ReviewPolicySection() {
     if (JSON.stringify(logins(form.ignore)) !== JSON.stringify(logins(saved.ignore))) out.ignore = logins(form.ignore);
     return out;
   };
+  const supported = meta.capabilities?.review_gating === true;
   const off = !admin || saving;
+  if (!supported) return <section className="s-block" id="rules-review"><p className="hint">Review-driven revisions are coming.</p></section>;
   return (
     <section className="s-block" id="rules-review">
       <h2>Review</h2>
@@ -150,7 +154,7 @@ function ReviewPolicySection() {
       <form onSubmit={async (e) => {
         e.preventDefault();
         const changes = patch();
-        if (!admin || saving || !valid || !Object.keys(changes).length) return;
+        if (!supported || !admin || saving || !valid || !Object.keys(changes).length) return;
         setSaving(true);
         try { await save({ review: changes }); }
         finally { setSaving(false); }
@@ -857,6 +861,11 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
               appear.</span></label>
           <label className="check"><input type="checkbox" checked={form.require_trusted_issue_author} disabled={!admin} onChange={(e) => setForm({ ...form, require_trusted_issue_author: e.target.checked })} /> Require trusted issue authors for automatic work</label>
           <p className="hint">Enabled by default: factory:auto issues start only when their author currently has write or admin access. Other issues, or permissions that cannot be verified, need a person to accept them in Signals. Turning this off allows the automatic label alone to start work in this repository. Held proposals still need acceptance.</p>
+          <h3>Pull request review overrides</h3>
+          <ReviewControls key={JSON.stringify([c.review, ws.settings.review])} supported={meta.capabilities?.review_gating === true} value={c.review || {}} defaults={ws.settings.review || DEFAULT_REVIEW} admin={admin} onSave={async (review) => {
+            await saveReviewPolicy(meta, admin, ws.id, review, repo.id);
+            await qc.invalidateQueries({ queryKey: ["repos", ws.id] });
+          }} />
           {admin && <div style={{ display: "flex", gap: 8 }}><button className="btn primary" onClick={save}>Save</button><span style={{ flex: 1 }} /><button className="btn ghost danger" onClick={remove}>Disconnect</button></div>}
         </div>
       )}

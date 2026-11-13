@@ -127,6 +127,9 @@ async def _ci(gh: GitHub, repo: str, sha: str, refresh: bool = False) -> dict[st
 def classify(row: dict[str, Any]) -> tuple[str, str]:
     """(group, reason) for an open pull request."""
     factory, ci, detail = row.get("factory") or {}, row.get("ci") or {}, row.get("detail") or {}
+    if factory.get("status") == "handed_over":
+        # Its own group either way; only GitHub's draft flag makes it a draft.
+        return "handed_over", "Draft" if row.get("draft") else "Handed over"
     if row.get("draft"):
         return "draft", "Draft"
     if factory.get("status") in HUMAN_TASK:

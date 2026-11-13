@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import math
 import re
@@ -14,7 +15,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import case, update
+from sqlalchemy import and_, case, func, not_, or_, update
 from sqlalchemy.orm import Session
 
 from . import definitions
@@ -746,10 +747,16 @@ def _clean_repo_config(current: dict[str, Any], patch: dict[str, Any]) -> dict[s
             cfg["steward"] = {**policy, **update}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
-    if "review" in patch:
+    if "review" in patch or "review_inherit" in patch:
         try:
-            cfg["review"] = {"mode": "off", "allow_untrusted_local": False,
-                             **(current.get("review") or {}), **validate_review(patch["review"], repository=True)}
+            values = validate_review(patch.get("review", {}), repository=True)
+            inherit = patch.get("review_inherit", [])
+            if not isinstance(inherit, list) or any(not isinstance(k, str) or k not in review_policy() for k in inherit):
+                raise ValueError("review_inherit must list review policy fields")
+            if set(inherit) & values.keys():
+                raise ValueError("Cannot override and inherit the same review field")
+            policy = {"mode": "off", "allow_untrusted_local": False, **(current.get("review") or {}), **values}
+            cfg["review"] = {k: v for k, v in policy.items() if k not in inherit}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
     for key in ("setup", "checks", "smoke", "protected_paths"):
@@ -1052,6 +1059,144 @@ class OutcomeCreate(BaseModel):
 class OutcomeUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     priority: int = Field(strict=True, ge=0, le=3)
+
+
+@router.get("/workspaces/{workspace_id}/pulls/recorded")
+def recorded_pulls(workspace_id: str, state: str = "open", limit: int = Query(50, ge=1, le=100),
+                   cursor: str | None = None, user: User = Depends(current_user),
+                   db: Session = Depends(get_db)):
+    """Read-only Factory PR summaries. Never query GitHub from a page load."""
+    _ws(db, user, workspace_id)
+    if state not in ("open", "ready", "merged", "all"):
+        raise HTTPException(400, "state must be open, ready, merged or all")
+    from .pulls import classify
+
+    repos = {r.id: r.full_name for r in db.query(Repository).filter(Repository.workspace_id == workspace_id)}
+    # Filter and page in SQL before loading task evidence. JSON strings use the T1 UTC ISO contract.
+    evidence = Task.evidence
+    merged = or_(Task.merge_sha != "", func.coalesce(evidence["merge"].as_string(), "") != "")
+    closed = or_(Task.status.in_(("abandoned", "cancelled")),
+                 func.coalesce(evidence["pr_closed"].as_boolean(), False))
+    review = evidence["review"]
+    if db.bind.dialect.name == "sqlite":
+        # SQLite dynamic JSON keys require a path, unlike Postgres' ->> operator.
+        deadline = func.json_extract(evidence, '$.review.wait_deadlines.' + func.json_quote(Task.head_sha))
+        waiting = func.julianday(deadline) > func.julianday(datetime.now(timezone.utc).isoformat())
+    else:
+        # T1 stores UTC ISO timestamps, whose lexical order is chronological.
+        deadline = func.coalesce(review["wait_deadlines"][Task.head_sha].as_string(), "")
+        waiting = and_(deadline > datetime.now(timezone.utc).isoformat(), deadline < "9999-12-31")
+    current_deadline = review["deadline"].as_string()
+    current_future = (func.julianday(current_deadline) > func.julianday(datetime.now(timezone.utc).isoformat())
+                      if db.bind.dialect.name == "sqlite" else
+                      and_(current_deadline > datetime.now(timezone.utc).isoformat(), current_deadline < "9999-12-31"))
+    current_waiting = and_(review["head"].as_string() == Task.head_sha, current_future,
+                           func.coalesce(review["result"]["head"].as_string(), "") != Task.head_sha)
+    waiting = or_(waiting, current_waiting)
+    held = and_(review["result"]["head"].as_string() == Task.head_sha,
+                func.coalesce(review["result"]["ask"].as_string(), "") != "")
+    pending = review["pending"][0].as_string().isnot(None)
+    active = or_(review["active_round"].as_integer().isnot(None),
+                 review["round"]["n"].as_integer().isnot(None))
+    ci = func.coalesce(evidence["ci"]["state"].as_string(), "unknown")
+    group = case(
+        (merged, "merged"),
+        (Task.status == "handed_over", "handed_over"),
+        (or_(pending, held), "attention"),
+        (or_(active, waiting), "checks"),
+        (evidence["pr_draft"].as_boolean().is_(True), "draft"),
+        (Task.status.in_(("needs_input", "failed", "blocked", "smoke_failed")), "attention"),
+        (and_(Task.status.in_(("queued", "running", "waiting_ci")),
+              Task.stage.notin_(("ci", "merge", "publish", "smoke", "release"))), "checks"),
+        (ci == "failure", "attention"),
+        (ci == "pending", "checks"),
+        (Task.status == "awaiting_approval", "ready"),
+        (and_(Task.status.in_(("queued", "running", "waiting_ci")),
+              Task.stage.in_(("ci", "merge", "publish"))), "checks"),
+        (ci == "success", "ready"),
+        else_="checks",
+    )
+    scope = (Task.workspace_id == workspace_id, Outcome.workspace_id == workspace_id,
+             Task.pr_number.isnot(None), or_(merged, not_(closed)))
+    # Workspace-wide counts for the selected filter, aggregated in SQL rather than from the page.
+    counted = db.query(group, func.count(Task.id)).join(Outcome, Task.outcome_id == Outcome.id).filter(*scope)
+    if state == "merged":
+        counted = counted.filter(merged)
+    elif state in ("open", "ready"):
+        counted = counted.filter(not_(merged))
+    totals = dict(counted.group_by(group).all())
+    query = db.query(Task, Outcome.number).join(Outcome, Task.outcome_id == Outcome.id).filter(*scope)
+    if state == "merged":
+        query = query.filter(merged)
+    elif state in ("open", "ready"):
+        query = query.filter(not_(merged))
+    if state == "ready":
+        query = query.filter(group == "ready")
+    if cursor:
+        try:
+            stamp, task_id = json.loads(base64.urlsafe_b64decode(cursor))
+            before = datetime.fromisoformat(stamp)
+            if before.tzinfo is not None or not isinstance(task_id, str):
+                raise ValueError
+        except (binascii.Error, ValueError, TypeError, KeyError):
+            raise HTTPException(400, "Invalid pull request cursor") from None
+        query = query.filter(or_(Task.updated_at < before, and_(Task.updated_at == before, Task.id < task_id)))
+    rows = query.order_by(Task.updated_at.desc(), Task.id.desc()).limit(limit + 1).all()
+    next_cursor = None
+    if len(rows) > limit:
+        last = rows[limit - 1][0]
+        next_cursor = base64.urlsafe_b64encode(json.dumps([last.updated_at.isoformat(), last.id]).encode()).decode()
+    items = []
+    for task, outcome_number in rows[:limit]:
+        t = S.task(task, repo_name=repos.get(task.repo_id, ""))
+        evidence = t["evidence"]
+        review = evidence.get("review") or {}
+        merged = bool(t["merge_sha"] or evidence.get("merge"))
+        row = {"repo": t["repo"], "number": t["pr_number"], "title": t["title"], "url": t["pr_url"] or f"https://github.com/{t['repo']}/pull/{t['pr_number']}",
+               "author": {"login": "", "avatar": ""}, "draft": evidence.get("pr_draft") is True, "created_at": t["created_at"],
+               "updated_at": t["updated_at"], "merged_at": (evidence.get("merge") or {}).get("at") if merged else None,
+               "base": "", "detail": {}, "ci": evidence.get("ci") or {"state": "unknown"},
+               "factory": {"outcome_id": t["outcome_id"], "outcome_number": outcome_number,
+                           "task_id": t["id"], "task_key": t["key"], "status": t["status"], "stage": t["stage"],
+                           "blocked_reason": t["blocked_reason"], "decision_id": None,
+                           "head_sha": t["head_sha"], "review": review}}
+        pending = len(review.get("pending") or [])
+        result = review.get("result") or {}
+        held = result.get("head") == t["head_sha"] and bool(result.get("ask"))
+        deadline = (review.get("wait_deadlines") or {}).get(t["head_sha"])
+        if review.get("head") == t["head_sha"] and result.get("head") != t["head_sha"]:
+            deadline = review.get("deadline") or deadline
+        waiting = False
+        if deadline:
+            try:
+                until = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=timezone.utc)
+                waiting = until > datetime.now(timezone.utc)
+            except (ValueError, TypeError, AttributeError):
+                pass  # Invalid legacy evidence is not an active wait.
+        if merged:
+            row["group"], row["reason"] = "merged", "Merged"
+        elif t["status"] == "handed_over":
+            row["group"], row["reason"] = classify(row)
+        elif held:
+            row["group"], row["reason"] = "attention", "Review holds merge: a person must decide"
+        elif pending:
+            row["group"], row["reason"] = "attention", f"Review comments to address ({pending})"
+        elif review.get("active_round") is not None or review.get("round"):
+            row["group"], row["reason"] = "checks", "Addressing review comments"
+        elif waiting:
+            row["group"], row["reason"] = "checks", "Waiting for reviews"
+        else:
+            row["group"], row["reason"] = classify(row)
+            if row["group"] == "ready" and row["ci"]["state"] != "success" and t["status"] != "awaiting_approval":
+                row["group"], row["reason"] = "checks", "Waiting for recorded checks"
+        items.append(row)
+    counts = {name: int(totals.get(name, 0)) for name in ("ready", "attention", "checks", "draft", "handed_over", "merged")}
+    if state == "ready":
+        counts = {name: (value if name == "ready" else 0) for name, value in counts.items()}
+    return {"items": items, "counts": counts, "next_cursor": next_cursor, "errors": [], "repositories": sorted(repos.values()),
+            "fetched_at": utcnow().timestamp(), "notes": ["Recorded Factory pull requests; no live GitHub requests."]}
 
 
 def _outcome_rows(db: Session, workspace_id: str, outcome_ids: list[str]) -> tuple[dict, dict, dict]:

@@ -19,8 +19,12 @@ def test_seeded_workspace(signed_in_page, scenario, navigate, no_overflow, check
     no_overflow(page)
     checkpoint("outcomes")
     navigate(page, "Pull requests")
-    expect(page.get_by_text("Factory awaiting approval", exact=True)).to_be_visible()
-    expect(page.get_by_text("Failing CI", exact=True)).to_be_visible()
+    # This view uses recorded Factory tasks, not the live GitHub-only fixture PRs.
+    expect(page.get_by_text("Implement the seeded change", exact=True)).to_be_visible()
+    expect(page.get_by_text("Checks passed; merge needs approval in AI Factory", exact=True)).to_be_visible()
+    expect(page.get_by_text("Failing CI", exact=True)).to_have_count(0)
+    expect(page.get_by_role("link", name="#4 T1")).to_have_attribute(
+        "href", f"/w/{scenario['workspace_id']}/outcomes/{scenario['outcomes']['running']}#task-{scenario['tasks']['running']}")
     no_overflow(page)
     checkpoint("pulls")
 

@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, ExternalLink, GitPullRequest } from "lucide-react";
-import { api, type Artifact, type Run, type Task } from "../api";
+import { api, reviewState, type Artifact, type Run, type Task } from "../api";
 import { useWs } from "../App";
 import { duration, HARNESS_LABEL, money, tokens } from "../format";
 import { DiffView, GateTrack, Mark, Prose, Status, useToast } from "../ui";
@@ -16,14 +16,21 @@ const STAGE_TEXT: Record<string, string> = {
   release: "Watching the release", revert: "Reverting the merge", done: "Done",
 };
 
-export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs: Run[]; defaultOpen?: boolean }) {
+export function TaskCard({ task, runs, defaultOpen = false, focused = false }: { task: Task; runs: Run[]; defaultOpen?: boolean; focused?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
+  const card = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (focused) {
+      card.current?.scrollIntoView({ block: "center" });
+      card.current?.focus({ preventScroll: true });
+    }
+  }, [focused]);
   // Parked at stage "review": CI passed and the pull request's reviewers are next.
   const reviewWait = task.status === "waiting_ci" && task.stage === "review";
   const label = task.status === "running" ? STAGE_TEXT[task.stage] || "Running"
     : reviewWait ? "Waiting for review" : undefined;
   return (
-    <div className="task">
+    <div ref={card} className="task" id={`task-${task.id}`} tabIndex={-1} aria-label={`${task.key}: ${task.title}`}>
       <div className="task-head" onClick={() => setOpen(!open)} role="button" tabIndex={0} aria-expanded={open}
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setOpen(!open))}>
         <span className="key">{task.key}</span>
@@ -43,6 +50,8 @@ export function TaskCard({ task, runs, defaultOpen = false }: { task: Task; runs
           <Status status={task.status} kind="task" label={label} />
           {task.status === "waiting_ci" && <span className="muted">Not holding a task slot</span>}
           <span className="muted">{task.repo}</span>
+          {task.evidence.review && <span className="muted">review rounds {task.evidence.review.rounds ?? 0}</span>}
+          {reviewState(task.evidence.review, task.head_sha) && <span className="muted">{reviewState(task.evidence.review, task.head_sha)}</span>}
           {task.attempt > 0 && <span className="muted">attempt {task.attempt}</span>}
           <span className="muted num">{money(task.cost_usd, task.cost_known)}</span>
           {task.depends_on.length > 0 && task.status === "pending" && <span className="muted">after {task.depends_on.join(", ")}</span>}

@@ -31,6 +31,11 @@ async def reconcile_pull_requests() -> int:
                 Task.status.in_(("cancelled", "handed_over", "abandoned")))):
             candidate = (task.evidence or {}).get("revert_candidate")
             is_revert = bool(candidate and not (task.evidence or {}).get("revert"))
+            if _handed_over_open(task, task.pr_number):
+                repo = s.get(Repository, task.repo_id)
+                if repo:
+                    rows.append((task.id, task.workspace_id, repo.full_name, task.pr_number, False))
+                continue
             if not is_revert and (not _still_waiting(task, task.pr_number)
                                   or not task.pr_number or (task.evidence or {}).get("pr_closed")):
                 continue
@@ -46,6 +51,10 @@ async def reconcile_pull_requests() -> int:
             pr = await gh.pull(full_name, number)
         except GitHubError as exc:
             log.debug("reconcile skipped %s#%s: %s", full_name, number, exc)
+            continue
+        handed = None if is_revert else _handover_pull(task_id, pr)
+        if handed is not None:
+            changed += handed
             continue
         if pr.get("merged"):
             changed += _handle_reverted(task_id, pr) if is_revert else _handle_merged(task_id, pr)
@@ -66,6 +75,52 @@ def _supersede(s, task_id: str, why: str) -> None:
 def _still_waiting(task: Task | None, number: int) -> bool:
     """People may have resolved the decision while GitHub was being asked: only act on an unchanged wait."""
     return bool(task and task.status in WAITING and task.pr_number == number and not task.merge_sha)
+
+
+def _handed_over_open(task: Task | None, number: int | None) -> bool:
+    """A handed-over PR a person may still merge, close or mark ready on GitHub."""
+    ev = (task.evidence or {}) if task else {}
+    return bool(task and task.status == "handed_over" and number and task.pr_number == number
+                and not task.merge_sha and not ev.get("merge") and not ev.get("pr_closed"))
+
+
+def _handover_pull(task_id: str, pr: dict) -> bool | None:
+    """Record what happened to a handed-over PR without resuming the Factory's work.
+
+    Returns None when the task is not (or no longer) an open handed-over PR, so the
+    normal waiting-task handling applies. Merge evidence carries the merge SHA; the
+    task column stays empty because the Factory did not deliver this change.
+    """
+    with session_scope() as s:
+        task = s.query(Task).filter(Task.id == task_id).with_for_update().one_or_none()
+        if not _handed_over_open(task, pr.get("number")):
+            return None
+        ev = dict(task.evidence or {})
+        number = task.pr_number
+        if pr.get("merged"):
+            who = (pr.get("merged_by") or {}).get("login") or "someone"
+            ev["merge"] = {"sha": pr.get("merge_commit_sha") or "", "pr": number, "by": who,
+                           "at": pr.get("merged_at") or utcnow().isoformat(), "outside": True, "handed_over": True}
+            ev["pr_draft"] = False
+            kind, message, level = "merged_outside", f"Handed-over PR #{number} was merged on GitHub by {who}", "info"
+        elif pr.get("state") == "closed":
+            ev["pr_closed"] = True
+            kind, message, level = "pr_closed_outside", f"Handed-over PR #{number} was closed on GitHub without merging", "warn"
+        else:
+            draft = bool(pr.get("draft"))
+            if ev.get("pr_draft") is draft:
+                return False
+            ev["pr_draft"] = draft
+            task.evidence = ev
+            ws, outcome_id = task.workspace_id, task.outcome_id
+            kind = None
+        if kind:
+            task.evidence = ev
+            record(task.workspace_id, kind, message, outcome_id=task.outcome_id, task_id=task.id,
+                   level=level, session=s)
+            ws, outcome_id = task.workspace_id, task.outcome_id
+    notify(ws, "task", task_id, outcome_id=outcome_id)
+    return True
 
 
 def _handle_merged(task_id: str, pr: dict) -> bool:

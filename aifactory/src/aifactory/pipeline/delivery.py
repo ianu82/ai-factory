@@ -2132,6 +2132,7 @@ class TaskRunner:
                                     "pr": pr["number"], "patch_id": change_id})
         self._carry_approval()
         self.update(head_sha=head, pr_number=pr["number"], pr_url=pr["html_url"], stage="ci")
+        self.evidence("pr_draft", bool(pr.get("draft")))
         self.event("published", f"Opened PR #{pr['number']}", level="success", url=pr["html_url"], head=head)
 
     async def _patch_id(self, token: str, base: str, head: str) -> str:
