@@ -19,8 +19,9 @@ from ..failures import failure_cause, failure_status
 from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessFailed, HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
+from ..harness.anton_policy import DEFAULT_ANTON_OPTIONS, tool_config
 from ..inference import InferenceError, ModelClient, UsageLedger, resolve_provider, workspace_models
-from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
+from ..models import Decision, DecisionReview, Message, Outcome, Repository, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
 from ..review import DEFAULT_REVIEW
 from .attachments import prepare_attachments
@@ -45,6 +46,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "holds": {"test_minutes": 5},
     "models": {"default": "gpt-terra"},
     "harness": {"builder": "native", "verifier": "native", "planner": "native"},
+    "anton": DEFAULT_ANTON_OPTIONS,
     "concurrency": 3,
     "planning_concurrency": 2,
     "max_attempts": 3,
@@ -73,6 +75,8 @@ def merged_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, default in DEFAULT_SETTINGS.items():
         value = (raw or {}).get(key)
+        if key == "anton" and not isinstance(value, dict):
+            value = {}
         if isinstance(default, dict):
             out[key] = {**default, **(value or {})}
         else:
@@ -263,6 +267,27 @@ class SessionSpec:
                 object.__setattr__(self, key, freeze(value))
 
 
+def anton_repository_ids(spec: SessionSpec) -> tuple[str, ...]:
+    """Resolve scope through durable task/outcome records, never a prompt or repo config snapshot."""
+    with session_scope() as s:
+        outcome = s.get(Outcome, spec.outcome_id)
+        if (s.get(Workspace, spec.workspace_id) is None or outcome is None
+                or outcome.workspace_id != spec.workspace_id):
+            raise HarnessFailed("Anton repository scope not found")
+        if spec.task_id is not None:
+            task = s.get(Task, spec.task_id)
+            if task is None or task.workspace_id != spec.workspace_id or task.outcome_id != outcome.id:
+                raise HarnessFailed("Anton repository scope not found")
+            ids = [task.repo_id]
+        else:
+            ids = outcome.repo_ids or []
+        for rid in ids:
+            repo = s.get(Repository, rid)
+            if repo is None or repo.workspace_id != spec.workspace_id:
+                raise HarnessFailed("Anton repository scope not found")
+        return tuple(dict.fromkeys(ids))
+
+
 def carried_cause(run: Any) -> str | None:
     """Why a failed run failed, as run_agent recorded it from the exception: "provider", "transient" or "" (see
     failures.failure_cause). None when the failure did not say (a sandbox error, a run recorded before causes were
@@ -292,7 +317,9 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     with session_scope() as s:
         run = Run(workspace_id=spec.workspace_id, outcome_id=spec.outcome_id, task_id=spec.task_id, role=spec.role,
                   harness=spec.harness, provider=provider.provider, model=model, attempt=spec.attempt,
-                  config_version=version, config_snapshot=snapshot)
+                  config_version=version, config_snapshot=snapshot,
+                  tool_config=(tool_config(spec.writable, settings["anton"], getattr(spec.sandbox, "kind", "local"))
+                               if spec.harness == "anton" else None))
         s.add(run)
         s.flush()
         run_id = run.id
@@ -327,6 +354,14 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             record(spec.workspace_id, f"agent_{kind}", message, outcome_id=spec.outcome_id, task_id=spec.task_id,
                    run_id=run_id, level="warn" if kind == "warn" else "info", data={"role": spec.role, **data})
 
+        def on_tool_config(config: dict[str, Any]) -> None:
+            with session_scope() as s:
+                row = s.get(Run, run_id)
+                if row is None or row.workspace_id != spec.workspace_id:
+                    raise HarnessFailed("Run tool configuration scope not found")
+                row.tool_config = config
+
+        repository_ids = anton_repository_ids(spec) if spec.harness == "anton" else ()
         session = HarnessSession(
             run_id=run_id, role=spec.role, system=spec.system, prompt=spec.prompt, sandbox=spec.sandbox, model=model,
             client=client, ledger=ledger, report_schema=SCHEMAS[spec.role], writable=spec.writable, max_turns=turns,
@@ -337,6 +372,11 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             gateway_url=f"{get_settings().public_url if getattr(spec.sandbox, 'kind', 'local') == 'vm' else get_settings().internal_url}/gateway/v1",
             gateway_token=gateway_token,
             reasoning_effort=settings.get("reasoning_effort"),
+            workspace_id=spec.workspace_id, repository_ids=repository_ids,
+            anton_options=dict(settings["anton"]) if spec.harness == "anton" else {},
+            tool_policy={"web": (settings["anton"].get("own_tools") is True
+                                 and settings["anton"].get("web_enabled") is True)} if spec.harness == "anton" else {},
+            on_tool_config=on_tool_config,
         )
         context, session.image_inputs = await prepare_attachments(spec.sandbox, spec.workspace_id, spec.outcome_id)
         session.prompt += context

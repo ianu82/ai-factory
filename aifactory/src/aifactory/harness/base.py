@@ -56,6 +56,11 @@ class HarnessSession:
     image_inputs: list[dict[str, str]] = field(default_factory=list)
     # Host-supplied, workspace-scoped opt-ins. Tools fail closed when absent.
     tool_policy: dict[str, Any] = field(default_factory=dict)
+    # Trusted host context. Never infer memory scope from prompts, paths or tool arguments.
+    workspace_id: str = ""
+    repository_ids: tuple[str, ...] = ()
+    anton_options: dict[str, Any] = field(default_factory=dict)
+    on_tool_config: Callable[[dict[str, Any]], None] = lambda config: None
     # The task's acceptance criteria: a verifier's report needs a result of its own for each (see validate_report).
     expected_criteria: list[str] | None = None
     # Ids of the review findings a builder was given: its report answers each (see validate_report).

@@ -415,6 +415,7 @@ class Run(Base):
     )
     config_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     config_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    tool_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     role: Mapped[str] = mapped_column(String(20))  # planner|builder|verifier
     harness: Mapped[str] = mapped_column(String(20))
     provider: Mapped[str] = mapped_column(String(20), default="")
