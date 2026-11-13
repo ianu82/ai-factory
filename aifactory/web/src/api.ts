@@ -1,3 +1,5 @@
+import type { RepositoryReleaseConfig } from "./releaseTypes";
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -238,6 +240,7 @@ export interface Repo {
   default_branch: string;
   description: string;
   config: {
+    [key: string]: unknown;
     setup?: string[];
     checks?: string[];
     smoke?: string[];
@@ -247,7 +250,7 @@ export interface Repo {
     qa?: { start?: string; [key: string]: unknown };
     start_detection?: { available: boolean; reason: string };
     merge?: { mode?: string; method?: string; revalidate?: boolean; reverify?: "overlap" | "always" | "never" };
-    release?: { mode?: string; health_url?: string; expect_text?: string };
+    release?: RepositoryReleaseConfig | null;
     require_ci?: boolean | "auto";
     require_trusted_issue_author?: boolean;
     steward?: { mode?: "off" | "propose" | "fix"; fix_minutes?: number };

@@ -15,6 +15,8 @@ import { ago } from "../format";
 import { GitHubPermissions } from "../onboarding/GitHubPermissions";
 import { onboardingQueryKey } from "../onboarding/api";
 import { Avatar, Dot, Skeleton, useToast } from "../ui";
+import { ReleaseConfig } from "../components/ReleaseConfig";
+import { generalRepositoryPatch } from "../releaseTypes";
 import { LinearSettings } from "../components/LinearSettings";
 import { REVIEW_DEFAULTS, ruleText, rulesInForce } from "../rules";
 
@@ -841,24 +843,23 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
     require_trusted_issue_author: c.require_trusted_issue_author !== false,
     setup: lines(c.setup), checks: lines(c.checks), smoke: lines(c.smoke), protected_paths: lines(c.protected_paths),
     context: c.context || "", merge_mode: c.merge?.mode || "", method: c.merge?.method || "squash", reverify: c.merge?.reverify ?? "overlap",
-    health_url: c.release?.health_url || "", release_mode: c.release?.mode || "",
     require_ci: c.require_ci === true ? "true" : c.require_ci === false ? "false" : "auto",
   });
   const save = async () => {
+    if (!admin) return;
     const minutes = Number(form.steward_minutes);
     if (!Number.isSafeInteger(minutes) || minutes <= 0) {
       toast("Steward fallback minutes must be a positive integer", true);
       return;
     }
     try {
-      await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "PATCH", json: { config: {
+      await api(`/api/workspaces/${ws.id}/repositories/${repo.id}`, { method: "PATCH", json: { config: generalRepositoryPatch({
         setup: unlines(form.setup), checks: unlines(form.checks), smoke: unlines(form.smoke), protected_paths: unlines(form.protected_paths),
         steward: { mode: form.steward_mode, fix_minutes: minutes },
         context: form.context, require_ci: form.require_ci === "auto" ? "auto" : form.require_ci === "true",
         require_trusted_issue_author: form.require_trusted_issue_author,
         merge: { ...c.merge, mode: form.merge_mode || undefined, method: form.method, ...(supportsReverify ? { reverify: form.reverify } : {}) },
-        release: { ...c.release, mode: form.release_mode || undefined, health_url: form.health_url || undefined },
-      } } });
+      }) } });
       toast("Repository saved");
       await Promise.all([
         qc.invalidateQueries({ queryKey: ["repos", ws.id] }),
@@ -915,12 +916,8 @@ function RepoCard({ repo, admin }: { repo: Repo; admin: boolean }) {
                 review every rebased candidate. Never: skip independent re-review. Review includes runtime QA when
                 configured. Required CI still reruns; the repository’s checks rerun in the Factory too, unless no
                 file is shared and CI is required (CI is then the gate).</span></label>}
-            <label className="field"><span>Releases</span>
-              <select className="select" value={form.release_mode} disabled={!admin} onChange={(e) => setForm({ ...form, release_mode: e.target.value })}>
-                <option value="">Not managed by the Factory</option><option value="on_merge">Deploys when main changes</option>
-              </select></label>
-            <label className="field"><span>Health check after release</span><input className="input mono" placeholder="https://app.example.com/health" value={form.health_url} disabled={!admin} onChange={(e) => setForm({ ...form, health_url: e.target.value })} /></label>
           </div>
+          <ReleaseConfig repo={repo} workspaceId={ws.id} admin={admin} />
           {repo.steward_policy_invalid && <p className="hint" role="alert">Stored steward policy is invalid. Showing Propose with a 60-minute fallback. An admin can save a valid policy to replace it.</p>}
           <div className="s-grid">
             <label className="field"><span>Keep main green</span>

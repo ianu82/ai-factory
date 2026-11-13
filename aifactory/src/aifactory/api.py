@@ -587,7 +587,7 @@ async def test_credential(workspace_id: str, kind: str,
 @router.delete("/workspaces/{workspace_id}/credentials/{kind}")
 def delete_credential(workspace_id: str, kind: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _ws(db, user, workspace_id, "admin")
-    if kind.startswith("preview_"):
+    if kind.startswith(("preview_", "relhook:")):
         raise HTTPException(404, "Unknown credential")
     sec = db.query(Secret).filter(Secret.workspace_id == workspace_id, Secret.kind == kind).one_or_none()
     if sec:
@@ -840,6 +840,20 @@ def _validated_release(value, db: Session, workspace_id: str, repo_id: str):
 class ReleaseWebhookSecretBody(BaseModel):
     # Explicitly omit Pydantic's value-bearing validation errors for this credential.
     value: Any = None
+
+
+@router.get("/workspaces/{workspace_id}/repositories/{repo_id}/release/webhook-secret/status")
+def release_webhook_secret_status(workspace_id: str, repo_id: str, user: User = Depends(current_user),
+                                  db: Session = Depends(get_db)):
+    from .release_config import webhook_secret_kind
+
+    _ws(db, user, workspace_id)
+    repo = db.get(Repository, repo_id)
+    if repo is None or repo.workspace_id != workspace_id:
+        raise HTTPException(404, "Repository not found")
+    # Only existence is public: do not load, decrypt or return credential material.
+    configured = db.query(Secret.id).filter_by(workspace_id=workspace_id, kind=webhook_secret_kind(repo_id)).first()
+    return {"configured": configured is not None}
 
 
 @router.put("/workspaces/{workspace_id}/repositories/{repo_id}/release/webhook-secret")

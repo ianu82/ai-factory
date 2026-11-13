@@ -381,3 +381,74 @@ def test_minimum_webhook_secret_is_trimmed_and_accepts_train_configuration(clien
     response = client.patch(path, json={"config": {"release": {**train(), "staging": webhook()}}})
     assert response.status_code == 200, response.text
     assert "abcdefgh" not in response.text
+
+
+def test_secret_status_is_existence_only_and_generic_deletion_is_blocked(client, repo, monkeypatch):
+    ws, rid, path = repo
+    status_path = path + "/release/webhook-secret/status"
+    assert client.get(status_path).json() == {"configured": False}
+    assert client.put(path + "/release/webhook-secret", json={"value": "private-credential"}).status_code == 200
+    config = {**train(), "staging": webhook()}
+    assert client.patch(path, json={"config": {"release": config}}).status_code == 200
+
+    def no_decrypt(*_args):
+        raise AssertionError("Configured-state checks must never decrypt secrets")
+
+    monkeypatch.setattr("aifactory.api.decrypt", no_decrypt)
+    response = client.get(status_path)
+    assert response.status_code == 200 and response.json() == {"configured": True}
+    # The generic credential route cannot invalidate an active train (or remove an
+    # unused release credential behind the release configuration UI's back).
+    response = client.delete(f"/api/workspaces/{ws}/credentials/{webhook_secret_kind(rid)}")
+    assert response.status_code == 404
+    with db.session_scope() as s:
+        assert s.query(Secret).filter_by(workspace_id=ws, kind=webhook_secret_kind(rid)).count() == 1
+        assert s.get(Repository, rid).config["release"]["staging"]["secret_ref"]
+    assert client.patch(path, json={"config": {"context": "changed"}}).status_code == 200
+    assert client.get(status_path).json() == {"configured": True}
+
+
+@pytest.mark.parametrize("role", ["member", "viewer"])
+def test_release_status_readable_but_config_and_secret_are_admin_only(client, repo, signed_in, role):
+    ws, rid, path = repo
+    assert client.put(path + "/release/webhook-secret", json={"value": "private-credential"}).status_code == 200
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=ws, user_id=signed_in["user"]["id"]).one().role = role
+    response = client.get(path + "/release/webhook-secret/status")
+    assert response.status_code == 200 and response.json() == {"configured": True}
+    assert client.get(f"/api/workspaces/{ws}/repositories").status_code == 200
+    assert client.put(path + "/release/webhook-secret", json={"value": "another-private-credential"}).status_code == 403
+    assert client.patch(path, json={"config": {"release": train()}}).status_code == 403
+
+
+def test_release_secret_status_is_workspace_scoped(client, repo):
+    ws, rid, path = repo
+    with db.session_scope() as s:
+        workspace = s.get(Workspace, ws)
+        other = Workspace(org_id=workspace.org_id, name="Other", slug="release-status-other")
+        s.add(other)
+        s.flush()
+        other_repo = Repository(workspace_id=other.id, full_name="acme/other-release")
+        s.add(other_repo)
+        s.flush()
+        other_rid = other_repo.id
+    assert client.get(f"/api/workspaces/{ws}/repositories/{other_rid}/release/webhook-secret/status").status_code == 404
+    assert client.get(f"/api/workspaces/{ws}/repositories/missing/release/webhook-secret/status").status_code == 404
+
+
+@pytest.mark.parametrize("release", [train(), {"mode": "on_merge", "health_url": "https://legacy.test/?probe=1",
+                                          "expect_text": "healthy", "custom": {"keep": True}}])
+def test_general_repo_settings_do_not_erase_release_or_unrelated_config(client, repo, release):
+    ws, rid, path = repo
+    saved = {"release": release, "qa": {"start": "npm run dev", "pages": ["/"]},
+             "build": {"max_tokens": 123}, "unknown": {"nested": [1, 2]}, "context": "old"}
+    with db.session_scope() as s:
+        s.get(Repository, rid).config = saved
+    response = client.patch(path, json={"config": {"context": "new", "checks": ["npm test"],
+                                                  "merge": {"method": "squash"}}})
+    assert response.status_code == 200, response.text
+    with db.session_scope() as s:
+        stored = s.get(Repository, rid).config
+        for key in ("release", "qa", "build", "unknown"):
+            assert stored[key] == saved[key]
+        assert stored["context"] == "new" and stored["checks"] == ["npm test"]
