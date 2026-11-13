@@ -167,6 +167,22 @@ def source(workspace_id: str, body: SelectSource, user: User = Depends(current_u
     return _active(db, workspace_id)
 
 
+@router.post("/sync")
+async def sync(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_member(db, user, workspace_id, "admin")
+    # The service owns short transactions; release the request's read transaction
+    # before any network I/O and reload the response after publication.
+    db.rollback()
+    from .definitions.repository import sync_definitions
+
+    try:
+        await sync_definitions(workspace_id)
+    except DefinitionError as exc:
+        _error(db, exc)
+    db.expire_all()
+    return _active(db, workspace_id)
+
+
 @router.get("/knowledge")
 def search(workspace_id: str, q: str = Query("", max_length=1000), limit: int = Query(20, ge=1, le=50),
            user: User = Depends(current_user), db: Session = Depends(get_db)):

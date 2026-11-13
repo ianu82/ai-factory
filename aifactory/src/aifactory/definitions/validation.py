@@ -41,8 +41,13 @@ def safe_path(path: str) -> None:
         raise DefinitionError(f"Unsafe relative path: {path!r}")
 
 
-def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Only name/description scalar strings, no YAML collections, tags or aliases."""
+def parse_frontmatter(text: str, *, allow_repository: bool = False,
+                      require_metadata: bool = True) -> tuple[dict[str, str], str]:
+    """Restricted scalar strings, no YAML collections, tags or aliases.
+
+    Repository ingestion alone may opt into a repository: owner/name scope.
+    Plain Markdown pages/instructions may omit name/description metadata.
+    """
     utf8_size(text)
     lines = text.splitlines(keepends=True)
     if not lines or lines[0].rstrip("\r\n") != "---":
@@ -52,19 +57,19 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
         line = line.rstrip("\r\n")
         if line == "---":
             for key in ("name", "description"):
-                if not fields.get(key, "").strip():
+                if (require_metadata or key in fields) and not fields.get(key, "").strip():
                     raise DefinitionError(f"Frontmatter requires nonempty {key}")
-            if not _NAME.fullmatch(fields["name"]):
+            if "name" in fields and not _NAME.fullmatch(fields["name"]):
                 raise DefinitionError("Skill name must be a safe 1-100 character name")
             body = "".join(lines[index + 1:])
-            if utf8_size(body) > SKILL_BODY_LIMIT:
+            if require_metadata and utf8_size(body) > SKILL_BODY_LIMIT:
                 raise DefinitionError(f"Skill body exceeds {SKILL_BODY_LIMIT} UTF-8 bytes")
             return fields, body
         match = re.fullmatch(r"([a-z_]+):[ \t]*(.*)", line)
         if not match:
             raise DefinitionError(f"Malformed frontmatter line {index + 1}: expected key: value")
         key, value = match.groups()
-        if key not in {"name", "description"}:
+        if key not in ({"name", "description", "repository"} if allow_repository else {"name", "description"}):
             raise DefinitionError(f"Unsupported frontmatter field: {key}")
         if key in fields:
             raise DefinitionError(f"Duplicate frontmatter field: {key}")

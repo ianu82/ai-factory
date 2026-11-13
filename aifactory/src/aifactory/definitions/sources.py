@@ -13,8 +13,8 @@ from pydantic import Field
 from sqlalchemy.orm import Session
 
 from ..models import DefinitionRevision, DefinitionState, Repository
-from .schema import Model
-from .store import RevisionConflict, get_snapshot, lock_repositories, lock_workspace
+from .schema import Bundle, Model
+from .store import RevisionConflict, get_snapshot, lock_repositories, lock_workspace, save_bundle
 from .validation import DefinitionError, safe_path, validate_bundle
 
 
@@ -69,6 +69,21 @@ def select_source(db: Session, workspace_id: str, source: SourceConfig, *,
         state = DefinitionState(workspace_id=workspace_id, revision=0)
         db.add(state)
     state.desired_source = desired
+    if desired["kind"] == "managed" and (state.active_source or {}).get("kind") == "repository":
+        # Source-intent checkpoints while awaiting first sync are also managed
+        # snapshots. Ignore repository snapshots; history is never overwritten.
+        previous = db.query(DefinitionRevision).filter_by(workspace_id=workspace_id).order_by(
+            DefinitionRevision.revision.desc())
+        managed = next((row for row in previous if (row.source or {}).get("kind", "managed") == "managed"
+                        and not any(e.get("source", {}).get("kind") == "repository"
+                                    for kind in ("skills", "instructions", "knowledge")
+                                    for e in row.bundle.get(kind, []))), None)
+        bundle = Bundle.model_validate(managed.bundle) if managed else Bundle()
+        # Live repository notes remain config-owned, not restored from history.
+        bundle.knowledge = [p for p in bundle.knowledge if p.source.kind != "repository_context"]
+        save_bundle(db, workspace_id, bundle, expected_revision=snapshot.revision,
+                    author=author, active_source={"kind": "managed"})
+        return
     state.revision = snapshot.revision + 1
     # Preserve active data and provenance until a replacement validates. Do not
     # overwrite sync diagnostics: source selection is not a successful sync.

@@ -106,6 +106,7 @@ class Orchestrator:
         self._stopping = False
         self._last_signal_sync = float("-inf")
         self._linear_task: asyncio.Task | None = None
+        self._definitions_task: asyncio.Task | None = None
         from ..operator_relay import Relay
 
         self._relay = Relay(wake=self.wake)  # operator commands from the bootstrap's control issue, live
@@ -139,6 +140,7 @@ class Orchestrator:
 
             self._linear_task = asyncio.create_task(LinearSync(wake=self.wake).run(), name="linear-sync")
             self._relay_task = asyncio.create_task(self._relay.run(), name="operator-relay")
+            self._definitions_task = asyncio.create_task(self._poll_definitions(), name="definition-sync")
 
     async def stop(self) -> None:
         """Shutdown (e.g. a redeploy) interrupts work without cancelling it: tasks resume on restart."""
@@ -160,6 +162,9 @@ class Orchestrator:
         if self._loop_task:
             self._loop_task.cancel()
         await asyncio.gather(*list(self._ci_polls.values()), return_exceptions=True)
+        if self._definitions_task:
+            self._definitions_task.cancel()
+            await asyncio.gather(self._definitions_task, return_exceptions=True)
         if self._linear_task:
             self._linear_task.cancel()
             await asyncio.gather(self._linear_task, return_exceptions=True)
@@ -572,6 +577,20 @@ class Orchestrator:
                     log.exception("supervisor sweep failed for %s", workspace_id)
         except Exception:
             log.exception("supervisor pass failed")
+
+    async def _poll_definitions(self) -> None:
+        """A separate clock/task: slow intake or paused work cannot gate knowledge."""
+        from ..definitions.repository import poll_definitions
+
+        interval = int(os.environ.get("AIFACTORY_DEFINITION_INTERVAL_SECONDS", "180"))
+        if interval <= 0:
+            return
+        while not self._stopping:
+            try:
+                await poll_definitions()
+            except Exception:
+                log.exception("definition poll failed")
+            await asyncio.sleep(interval)
 
     async def _maybe_sync_signals(self) -> None:
         """Poll GitHub for issues and CI failures every few minutes (intake + feedback)."""
