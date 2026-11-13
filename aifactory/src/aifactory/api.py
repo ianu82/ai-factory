@@ -7,6 +7,7 @@ import base64
 import json
 import math
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from . import definitions
 from . import attachments as A
-from . import insights, linear_config, onboarding_policy, preview_config, workstreams
+from . import insights, linear_config, onboarding_policy, preview_config, supervisor, workstreams
 from . import serializers as S
 from .auth import ROLE_RANK, auth_methods, current_user, require_member
 from .credential_diagnostics import MESSAGES, safe_metadata, test_models
@@ -1319,6 +1320,59 @@ def artifact(workspace_id: str, artifact_id: str, user: User = Depends(current_u
             if outcome is None or outcome.workspace_id != workspace_id:
                 raise HTTPException(404, "Artifact not found")
     return S.artifact(a, content=True)
+
+
+# --- supervisor ---------------------------------------------------------------------
+def _supervisor_status(db: Session, ws: Workspace, limit: int, offset: int) -> dict[str, Any]:
+    """Latest detector counts and a bounded page of open Inbox findings (not historical incidents)."""
+    try:
+        policy = supervisor.supervisor_policy(ws.settings)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    state = ws.settings.get("supervisor_state", {}) if isinstance(ws.settings, dict) else {}
+    if not isinstance(ws.settings, dict):
+        # The engine journals legacy workspaces rather than rewriting their settings.
+        event = (db.query(Event).filter_by(workspace_id=ws.id, kind="supervisor_sweep")
+                 .order_by(Event.created_at.desc(), Event.id.desc()).first())
+        state = (event.data or {}).get("state", {}) if event else {}
+    state = state if isinstance(state, dict) else {}
+    summaries = [f for f in state.get("findings", []) if isinstance(f, dict)]
+    by_fingerprint = {f.get("fingerprint"): f for f in summaries}
+    rows = (db.query(Decision).filter_by(workspace_id=ws.id, kind="supervisor", status="open")
+            .order_by(Decision.created_at, Decision.id).offset(offset).limit(limit + 1).all())
+    findings = []
+    for row in rows[:limit]:
+        metadata = row.metadata_json or {}
+        summary = by_fingerprint.get(metadata.get("fingerprint"), {})
+        findings.append(S.decision(row, {"finding_kind": metadata.get("finding_kind", "unknown"),
+            "subject": metadata.get("subject"), "confidence": summary.get("confidence")}))
+    return {"policy": policy, "last_sweep_at": state.get("last_sweep_at"),
+            "counts": dict(Counter(f["finding_kind"] for f in summaries if isinstance(f.get("finding_kind"), str))),
+            "findings": findings, "next_offset": offset + limit if len(rows) > limit else None}
+
+
+@router.get("/workspaces/{workspace_id}/supervisor")
+def supervisor_status(workspace_id: str, limit: int = Query(50, ge=1, le=200),
+                      offset: int = Query(0, ge=0, le=1_000_000),
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id)
+    return _supervisor_status(db, ws, limit, offset)
+
+
+@router.post("/workspaces/{workspace_id}/supervisor/run")
+def run_supervisor(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ws, _ = _ws(db, user, workspace_id, "admin")
+    try:
+        supervisor.supervisor_policy(ws.settings)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    # sweep owns its transactions. Release the request's read transaction before it writes,
+    # then reload the workspace so the response includes its committed state on both DBs.
+    db.rollback()
+    supervisor.sweep(workspace_id, utcnow())
+    db.expire_all()
+    ws, _ = _ws(db, user, workspace_id, "admin")
+    return _supervisor_status(db, ws, 50, 0)
 
 
 # --- attention & decisions -----------------------------------------------------------

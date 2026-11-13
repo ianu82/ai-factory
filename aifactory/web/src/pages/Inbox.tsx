@@ -27,6 +27,7 @@ const GROUPS: { key: string; label: string; kinds: string[] }[] = [
   { key: "plan", label: "Plans to approve", kinds: ["approve_plan"] },
   { key: "question", label: "Questions", kinds: ["question"] },
   { key: "stuck", label: "Stuck", kinds: ["unblock", "budget"] },
+  { key: "supervisor", label: "Supervisor", kinds: ["supervisor"] },
 ];
 
 /** One line that says why this needs a person: the useful part of the body, without boilerplate. */

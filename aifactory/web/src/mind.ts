@@ -300,6 +300,7 @@ const STEP_LABELS: Record<string, [string, string]> = {
   outcome_detail: ["Reading an outcome", "Read an outcome"],
   task_detail: ["Reading a task", "Read a task"],
   open_decisions: ["Checking open decisions", "Checked open decisions"],
+  supervisor_findings: ["Reading Supervisor findings", "Read Supervisor findings"],
   runs: ["Reading recent runs", "Read recent runs"],
   recent_events: ["Reading recent activity", "Read recent activity"],
   pull_requests: ["Checking pull requests", "Checked pull requests"],

@@ -123,6 +123,7 @@ export interface Settings {
   reasoning_effort?: string;
   linear?: LinearConfig;
   mind?: { daily_budget_usd: number };
+  supervisor?: SupervisorPolicy;
   /** Slack and email aren't available yet and are always off; alerts show in the Inbox. The webhook is write-only:
    * set it with webhook_url ("" clears it); the workspace's alert_webhook says whether it is set and its host. */
   alerts?: { after_minutes: number; slack: boolean; email: boolean; stopped_minutes?: number; webhook_url?: string };
@@ -168,6 +169,29 @@ export interface HoldDetails {
   /** While the hold is open: how often the Factory tests the provider (0: never), and when it last did. */
   tests_every_minutes?: number;
   last_tested_at?: string | null;
+}
+
+export interface SupervisorPolicy {
+  mode: "off" | "observe" | "fix";
+  interval_minutes: number;
+  stuck_minutes: number;
+  unaccepted_issue_hours: number;
+}
+
+/** Open Inbox decision enriched with the latest sweep's classification, when available. */
+export interface SupervisorFinding extends Decision {
+  finding_kind: string;
+  subject: string | null;
+  confidence: "observed" | "inferred" | null;
+}
+
+export interface SupervisorStatus {
+  policy: SupervisorPolicy;
+  last_sweep_at: string | null;
+  /** Counts from the latest sweep, not the number of outstanding Inbox decisions. */
+  counts: Record<string, number>;
+  findings: SupervisorFinding[];
+  next_offset: number | null;
 }
 
 export interface ModelCheckResult {

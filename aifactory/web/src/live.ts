@@ -130,7 +130,8 @@ export function useLive(workspaceId: string | undefined): LiveState {
       onData: (data) => {
         if (data.type === "event") {
           touch("outcome", "events");
-          if (["decision_requested", "decision_resolved"].includes(data.kind)) touch("inbox", "outcomes");
+          if (["decision_requested", "decision_resolved"].includes(data.kind)) touch("inbox", "outcomes", "supervisor");
+          if (["supervisor_sweep", "settings_changed"].includes(data.kind)) touch("supervisor");
           if (["outcome_completed", "settings_changed", "learning_preset_applied"].includes(data.kind)) touch("learning-policy");
           if (data.kind.startsWith("run_")) touch("runs");
           if (["outcome_completed", "merged", "plan_proposed", "plan_approved", "outcome_created", "task_completed", "stage"].includes(data.kind)) touch("outcomes");
@@ -138,7 +139,7 @@ export function useLive(workspaceId: string | undefined): LiveState {
         } else if (data.type === "changed") {
           touch("outcome", "outcomes");
           if (data.entity === "workspace") { touch("learning-policy"); qc.invalidateQueries({ queryKey: ["me"] }); }
-          if (data.entity === "decision") touch("inbox", "decisions");
+          if (data.entity === "decision") touch("inbox", "decisions", "supervisor");
           if (data.entity === "alert") touch("inbox");
           if (data.entity === "run") touch("runs");
           if (data.entity === "signal") touch("signals");

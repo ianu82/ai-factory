@@ -76,4 +76,5 @@ export const DECISION_KIND: Record<string, string> = {
   budget: "Budget",
   ruling: "Team rule",
   provider_hold: "Provider hold",
+  supervisor: "Supervisor",
 };
