@@ -321,15 +321,68 @@ export interface Task {
   dependents?: { id: string; key: string; title: string }[];
 }
 
+export type ConfigurationVersion = string | null;
+
+export interface ScorerDefinition {
+  id: string;
+  version: string;
+  instructions: string;
+  roles: string[];
+  classifications: Record<string, number>;
+  pass_threshold: number;
+  sample_rate: number;
+  model: string | null;
+}
+
 export interface ScorerResult {
-  id: string; scorer_id: string; definition_version: string; status: string;
+  id: string; scorer_id: string; definition_version: string; status: "queued" | "running" | "succeeded" | "error";
   classification: string | null; score: number | null; passed: boolean | null;
   reasoning: string; error: string;
   cost_usd: number; cost_known: boolean;
+  definition: Omit<ScorerDefinition, "version">;
+}
+
+export type MetricDefinition = { [key: string]: string | Record<string, [number, number | null]> };
+
+export interface RatioMetric {
+  definition: MetricDefinition;
+  value: number | null;
+  numerator: number;
+  denominator: number;
+  unknown_count: number;
+  excluded_count: number;
+}
+
+export type ChangeSize = "small" | "medium" | "large";
+
+export interface MedianTaskCostMetric {
+  definition: MetricDefinition;
+  value: Record<ChangeSize, { value: number | null; sample_count: number }>;
+  sample_count: number;
+  unknown_count: number;
+  unknown_size_count: number;
+  unknown_cost_count: number;
+  excluded_count: number;
+}
+
+export interface WorkspaceStats {
+  metrics: {
+    autonomy: RatioMetric;
+    first_attempt_pass_rate: RatioMetric;
+    verifier_false_accept_rate: RatioMetric;
+    median_delivered_task_cost: MedianTaskCostMetric;
+  };
+  tasks: { total: number; completed: number; merged: number; first_attempt: number; smoke_failed: number };
+  cost: { usd: number; known: boolean; per_completed_task: number };
+  tokens: number;
+  human: { decisions: number; open: number; interventions: number };
+  harnesses: Record<string, { runs: number; succeeded: number }>;
 }
 
 export interface Run {
-  scores?: Omit<ScorerResult, "reasoning" | "error">[];
+  scores?: Omit<ScorerResult, "reasoning" | "error" | "definition">[];
+  config_version: ConfigurationVersion;
+  result?: { source?: string; [key: string]: unknown };
   score_summary?: { count: number; cost_usd: number; cost_known: boolean };
   id: string;
   task_id: string | null;

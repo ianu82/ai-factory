@@ -46,7 +46,10 @@ def reservation(judge, automatic=False):
 
 def test_builtin_on_demand_storage_and_accounting(client, judge):
     root = f"/api/workspaces/{judge['ws']}"
-    assert client.get(root + '/scorers').json()[0]['id'] == 'planner-quality'
+    definition_response = client.get(root + '/scorers')
+    assert definition_response.status_code == 200
+    definition = definition_response.json()[0]
+    assert definition == scorers.BUILTIN.model_dump() | {'version': scorers.BUILTIN.version}
     response = client.post(root + f"/runs/{judge['run']}/scores", json={'scorer_id': 'planner-quality'})
     assert response.status_code == 200
     score = response.json()
@@ -58,8 +61,14 @@ def test_builtin_on_demand_storage_and_accounting(client, judge):
         attempt = s.query(ScorerAttempt).one()
         assert attempt.model == 'gpt-6.1-terra'  # DEFAULT_SETTINGS contains gpt-terra, even with an own OpenAI key
         assert s.get(Run, judge['run']).result == {'tasks': [{'spec': 'Change greeting'}]}
-    assert client.get(root + f"/runs/{judge['run']}/scores").json()[0]['id'] == score['id']
-    assert client.get(root + '/runs').json()[0]['scores'][0]['id'] == score['id']
+    stored = client.get(root + f"/runs/{judge['run']}/scores").json()[0]
+    assert stored == score
+    assert stored['definition'] == scorers.BUILTIN.model_dump()
+    assert stored['definition_version'] == definition['version']
+    summary = client.get(root + '/runs').json()[0]['scores'][0]
+    assert summary['id'] == score['id']
+    assert (summary['classification'], summary['score'], summary['passed']) == ('good', 1, True)
+    assert 'reasoning' not in summary and 'definition' not in summary
     assert outcome_cost(judge['outcome']) == (1.0014, True)
     stats = client.get(root + '/stats').json()
     assert stats['tokens'] == 1200
@@ -633,3 +642,39 @@ def test_empty_workspace_score_usage_is_known_zero(client, judge):
     assert response.status_code == 200
     assert response.json()['cost'] == {'usd': 0, 'known': True, 'per_completed_task': 0}
     assert response.json()['tokens'] == 0
+
+
+def test_runs_ui_score_permissions_applicability_and_errors(client, judge):
+    from aifactory.models import Membership
+
+    root = f"/api/workspaces/{judge['ws']}"
+    path = root + f"/runs/{judge['run']}/scores"
+    # Successful HTTP transport can carry an error verdict; the details remain readable.
+    ScriptedModel.scripts['scorer'] = lambda _: {'content': json.dumps({'classification': 'not-configured'})}
+    response = client.post(path, json={'scorer_id': 'planner-quality'})
+    assert response.status_code == 200
+    score = response.json()
+    assert score['status'] == 'error' and score['error']
+    assert score['classification'] is None and score['score'] is None and score['passed'] is None
+    assert client.get(path).json()[0] == score
+    assert client.get(root + '/runs').json()[0]['status'] == 'succeeded'
+
+    with session_scope() as s:
+        membership = s.query(Membership).filter_by(workspace_id=judge['ws']).one()
+        membership.role = 'viewer'
+    assert client.get(root + '/scorers').status_code == 200
+    assert client.get(path).json()[0]['error'] == score['error']
+    assert client.post(path, json={'scorer_id': 'planner-quality'}).status_code == 403
+    with session_scope() as s:
+        assert s.query(ScorerResult).count() == 1
+        s.query(Membership).filter_by(workspace_id=judge['ws']).one().role = 'member'
+        s.get(Run, judge['run']).role = 'builder'
+    response = client.post(path, json={'scorer_id': 'planner-quality'})
+    assert response.status_code == 422
+    assert 'applicable role' in response.json()['detail']
+    with session_scope() as s:
+        run = s.get(Run, judge['run'])
+        run.role, run.status = 'planner', 'running'
+    assert client.post(path, json={'scorer_id': 'planner-quality'}).status_code == 422
+    with session_scope() as s:
+        assert s.query(ScorerResult).count() == 1
