@@ -12,12 +12,13 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import OperationalError, TimeoutError as PoolTimeoutError
 
 from . import __version__
 from .api import router as api_router
 from .auth import router as auth_router
 from .config import get_settings
-from .db import init_engine
+from .db import init_engine, is_database_contention
 from .definitions_api import router as definitions_router
 from .gateway import router as gateway_router
 from .merge_manager import router as merge_queue_router
@@ -60,6 +61,16 @@ def create_app(*, start_orchestrator: bool | None = None) -> FastAPI:
             await orchestrator.stop()
 
     app = FastAPI(title="AI Factory", version=__version__, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
+
+    @app.exception_handler(PoolTimeoutError)
+    @app.exception_handler(OperationalError)
+    async def database_error(_request: Request, exc: Exception):
+        # Dependencies/context managers have unwound (rollback/close) before the
+        # exception handler runs. Never include SQL, parameters or driver text.
+        if not is_database_contention(exc):
+            raise exc
+        return JSONResponse({"detail": "Database temporarily unavailable; please retry"},
+                            status_code=503, headers={"Retry-After": "1"})
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):

@@ -155,7 +155,11 @@ See [docs/RELEASING.md](docs/RELEASING.md).
 | `AIFACTORY_ALLOWED_EMAILS` | Comma list of emails or `@domain` allowed to sign in |
 | `AIFACTORY_BOOTSTRAP` | JSON: organization, workspace, invited admins, repositories (+config), settings, declared outcomes |
 | `AIFACTORY_BOOTSTRAP_GITHUB_TOKEN` / `..._OPENAI_API_KEY` / `..._MINDSHUB_API_KEY` | Server fallback credentials until a workspace stores its own |
-| `AIFACTORY_GLOBAL_CONCURRENCY` | Server-wide cap on concurrent tasks |
+| `AIFACTORY_GLOBAL_CONCURRENCY` | Server-wide cap on concurrent tasks (default 8; 1–50) |
+| `AIFACTORY_GLOBAL_PLANNING_CONCURRENCY` | Server-wide cap on concurrent planners (default 4; 1–50) |
+| `AIFACTORY_DB_POOL_SIZE` | Base connections per server process; default execution + planning concurrency + 16; override must be an integer 1–128 |
+| `AIFACTORY_DB_MAX_OVERFLOW` | Additional connections per process (default 0); override must be an integer 0–32 |
+| `AIFACTORY_SQLITE_BUSY_TIMEOUT_MS` | Bounded SQLite writer lock wait in milliseconds (default 2000); integer 0–5000, also applied to the sqlite3 connection timeout |
 | `AIFACTORY_MINDSHUB_REQUESTS_PER_MINUTE` / `AIFACTORY_OPENAI_REQUESTS_PER_MINUTE` | Positive per-credential rolling-minute model request limits (default 50 each; minimum 1) |
 | `MINDSHUB_OIDC_CLIENT_ID` | Enables "Continue with MindsHub" |
 
@@ -163,3 +167,51 @@ Model admission is shared across native, Anton and gateway calls in the Factory 
 including retries and credentials reused by multiple workspaces. Each provider/base URL and
 full credential digest shares a 16-request concurrency cap; gateway streams hold capacity
 until cleanup. Waiting emits run activity with elapsed time, never credential material.
+
+
+### Database contention and capacity
+
+File-backed SQLite explicitly uses a bounded QueuePool with **zero checkout wait**
+(`pool_timeout=0`). SQLite writers have a short, bounded lock wait: the sqlite3
+connection timeout and `PRAGMA busy_timeout` on every connection both default to
+**2000 ms**, configurable with `AIFACTORY_SQLITE_BUSY_TIMEOUT_MS` (integer 0–5000).
+This absorbs ordinary overlapping short writes without the former 60-second wait;
+set it to zero to reject any overlap immediately. Existing WAL mode is retained.
+Synchronous helpers called from async code fail immediately on pool exhaustion,
+but can still block that caller up to the configured SQLite lock wait. This is not
+an async-session rewrite or a guarantee that arbitrary SQL/computation cannot
+block. Scorer recovery selection is offloaded to a worker thread so its lock wait
+does not block the event loop. In-memory SQLite retains SQLAlchemy's compatible
+per-thread pool behavior.
+Postgres uses the same bounded, zero-checkout-wait pool, retaining pre-ping and
+30-minute recycling; SQLite's lock settings do not apply to Postgres.
+
+Default capacity is configured global execution + global planning + **16 slots**:
+4 CI polls, 4 scorer jobs, 4 review/background operations (including recovery), and
+4 HTTP requests. For 17 execution tasks and 4 planners, that is **37 connections**
+(28 at the default 8 + 4). Workspace limits do not add to the global execution cap.
+The budget uses startup environment settings, not live workspace changes; raise it
+explicitly if increasing workload beyond those settings. Pools open connections
+lazily. Overrides are validated at startup, never unlimited; reducing capacity
+below the budget intentionally admits less work. Each server process has its own
+pool: account for replicas/processes and other clients against the Postgres
+server's connection limit (maximum override capacity is 128 + 32 per process).
+
+`aifactory.db.pool_snapshot()` is a connection-free telemetry interface and does
+not initialize an engine. It returns `capacity` (base + permitted overflow),
+`in_use`, nonnegative `overflow`, `waiters`, `saturated`, and `checkout_failures`.
+Waiters count actual outstanding acquisition calls, including connection setup
+and pre-ping, with cleanup on success or failure; they are normally zero with
+fail-fast admission, not inferred from checkout/checkin events. Failures count all
+unsuccessful acquisitions, including exhaustion and connection/setup failures,
+since pool creation. Engine replacement/disposal starts fresh counters. Unknown
+capacity/in-use for uninitialized or non-QueuePool engines are `null`; overflow,
+waiters and failures are zero and saturation false. Health integration and the
+production-sized CI latency test are separate changes.
+
+API pool exhaustion or SQLite BUSY/LOCKED returns a sanitized **503** with
+`Retry-After: 1`, after transaction rollback/session cleanup. Other database
+operational errors retain normal error handling. No handler or external
+GitHub/model effect is automatically retried. Scorer recovery offloads only its
+selection transaction to a thread, dispatches on the event loop after commit,
+and leaves queued work durable if contention prevents selection or claiming.

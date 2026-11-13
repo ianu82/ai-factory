@@ -31,6 +31,20 @@ def concurrency_limit(value: object, default: int) -> int:
         return default
 
 
+def _bounded_int(name: str, default: int | None, minimum: int, maximum: int) -> int | None:
+    """Reject unsafe pool overrides rather than silently accepting unbounded capacity."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        result = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}") from None
+    if not minimum <= result <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return result
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -60,6 +74,16 @@ class Settings:
     internal_url: str
     allowed_emails: tuple[str, ...] = field(default_factory=tuple)
     allowed_org_ids: tuple[str, ...] = field(default_factory=tuple)
+
+    # None derives the pool from configured execution/planning plus 16 background/HTTP slots.
+    db_pool_size: int | None = None
+    db_max_overflow: int = 0
+    sqlite_busy_timeout_ms: int = 2000
+
+    @property
+    def database_pool_size(self) -> int:
+        return self.db_pool_size if self.db_pool_size is not None else (
+            self.global_concurrency + self.global_planning_concurrency + 16)
 
     # Positive provider-wide rolling-minute allowances (shared across workspaces).
     mindshub_requests_per_minute: int = 50
@@ -111,6 +135,9 @@ def get_settings() -> Settings:
         sandbox_user=os.environ.get("AIFACTORY_SANDBOX_USER", ""),
         global_concurrency=concurrency_limit(os.environ.get("AIFACTORY_GLOBAL_CONCURRENCY"), 8),
         global_planning_concurrency=concurrency_limit(os.environ.get("AIFACTORY_GLOBAL_PLANNING_CONCURRENCY"), 4),
+        db_pool_size=_bounded_int("AIFACTORY_DB_POOL_SIZE", None, 1, 128),
+        db_max_overflow=_bounded_int("AIFACTORY_DB_MAX_OVERFLOW", 0, 0, 32) or 0,
+        sqlite_busy_timeout_ms=_bounded_int("AIFACTORY_SQLITE_BUSY_TIMEOUT_MS", 2000, 0, 5000) or 0,
         orchestrator_enabled=_bool("AIFACTORY_ORCHESTRATOR", True),
         internal_url=os.environ.get("AIFACTORY_INTERNAL_URL", f"http://127.0.0.1:{port}").rstrip("/"),
         mindshub_requests_per_minute=max(1, _int("AIFACTORY_MINDSHUB_REQUESTS_PER_MINUTE", 50)),

@@ -278,7 +278,8 @@ def dispatch(ids: list[str]) -> None:
             job.add_done_callback(done)
 
 
-def recover() -> None:
+def select_recovery() -> list[str]:
+    """Select durable queued work in a short transaction; never dispatch from a thread."""
     with session_scope() as s:
         stale = utcnow() - timedelta(seconds=JUDGE_TIMEOUT + 10)
         stale_ids = [r.id for r in s.query(ScorerResult).filter(
@@ -289,13 +290,18 @@ def recover() -> None:
                                           ScorerAttempt.finished_at.is_(None)).update({"finished_at": utcnow()})
             s.query(ScorerResult).filter(ScorerResult.id.in_(stale_ids)).update({"status": "queued"})
         ids = [r.id for r in s.query(ScorerResult).filter_by(status="queued").order_by(ScorerResult.created_at).limit(20)]
-    dispatch(ids)
+    return ids
+
+
+def recover() -> None:
+    """Synchronous entry point for callers already on the dispatch event loop."""
+    dispatch(select_recovery())
 
 
 async def worker() -> None:
     while True:
         try:
-            recover()
+            dispatch(await asyncio.to_thread(select_recovery))
         except Exception:
             log.exception("scorer queue recovery failed")
         await asyncio.sleep(3)
