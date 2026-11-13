@@ -1068,4 +1068,9 @@ def _scrub_release_evidence(_mapper, connection, target) -> None:
     for field in fields:
         value = getattr(target, field)
         if value is not None:
-            setattr(target, field, release_redacted(value, secrets))
+            # Cut evidence is explicitly bounded at discovery (10k changes, 1MiB
+            # version files). Do not silently truncate a paginated release or its
+            # resumable Git-data intent at the generic UI/log preview limits.
+            limits = {"max_items": 10000, "max_text": 16 * 1024 * 1024} if field in (
+                "included_items", "notes", "external_handle") else {}
+            setattr(target, field, release_redacted(value, secrets, **limits))

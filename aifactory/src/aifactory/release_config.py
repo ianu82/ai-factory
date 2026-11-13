@@ -318,7 +318,8 @@ def _redact_evidence_url(match: re.Match) -> str:
     return match.group()
 
 
-def release_redacted(value: Any, secrets: tuple[str, ...] = (), *, depth: int = 0) -> Any:
+def release_redacted(value: Any, secrets: tuple[str, ...] = (), *, depth: int = 0,
+                     max_items: int = 100, max_text: int = 16000) -> Any:
     """Bounded snapshot/log scrubber, shared by all durable release egress fields."""
     if depth > 12:
         return "[truncated]"
@@ -329,10 +330,12 @@ def release_redacted(value: Any, secrets: tuple[str, ...] = (), *, depth: int = 
         # URLs in evidence may be external handles with signed query strings.
         # This scrubber is intentionally NOT used for editable legacy config.
         text = re.sub(r"https?://[^\s<>\"]+", _redact_evidence_url, text)
-        return text[:16000]
+        return text[:max_text]
     if isinstance(value, dict):
         return {redact(str(key), secrets)[:200]: (bool(item) if _secret_key(str(key)) else
-                release_redacted(item, secrets, depth=depth + 1)) for key, item in list(value.items())[:100]}
+                release_redacted(item, secrets, depth=depth + 1, max_items=max_items, max_text=max_text))
+                for key, item in list(value.items())[:max_items]}
     if isinstance(value, list):
-        return [release_redacted(item, secrets, depth=depth + 1) for item in value[:100]]
+        return [release_redacted(item, secrets, depth=depth + 1, max_items=max_items, max_text=max_text)
+                for item in value[:max_items]]
     return value
