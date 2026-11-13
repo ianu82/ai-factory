@@ -20,6 +20,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -346,6 +347,17 @@ class Task(Base):
     outcome: Mapped[Outcome] = relationship(back_populates="tasks")
 
     __table_args__ = (UniqueConstraint("outcome_id", "key"),)
+
+
+class DeliveryCheckpoint(Base):
+    """Private delivery recovery data, never an API/display artifact or a published branch."""
+
+    __tablename__ = "delivery_checkpoints"
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    id: Mapped[str] = mapped_column(String(32), default=new_id)
+    patch: Mapped[bytes] = mapped_column(LargeBinary)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
 class BenchmarkSuite(Base):

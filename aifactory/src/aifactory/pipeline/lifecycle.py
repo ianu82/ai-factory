@@ -55,7 +55,8 @@ def dependents(tasks: list[Task], key: str) -> list[Task]:
     return stranded(tasks, {key})[0]
 
 
-def transition(session, task: Task, *, owner: str | None = None, exclusive: bool = False, **fields) -> bool:
+def transition(session, task: Task, *, owner: str | None = None, exclusive: bool = False,
+               expected: dict | None = None, guards: tuple = (), **fields) -> bool:
     """`owner` is the instance making the change: the row must still be leased to it, or to nobody (the scheduler
     tidies up after a shutdown released its leases). A runner whose task another instance took changes nothing.
 
@@ -70,7 +71,8 @@ def transition(session, task: Task, *, owner: str | None = None, exclusive: bool
             Task.status.notin_(STOPPED),
             exists().where(Workspace.id == Task.workspace_id, Workspace.paused.is_(False)),
             exists().where(Outcome.id == Task.outcome_id, Outcome.status != "cancelled"),
-            *held,
+            *held, *guards,
+            *(getattr(Task, key) == value for key, value in (expected or {}).items()),
         ).values(**fields).execution_options(synchronize_session=False)
     )
     return result.rowcount == 1

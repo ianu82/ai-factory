@@ -1527,7 +1527,7 @@ def test_the_builder_gets_the_whole_review_and_its_open_points_outlive_a_failed_
     assert "Nothing from an earlier attempt is in it." in prompts[0]
     assert "What attempt 1 changed is still in it, uncommitted" in prompts[1]
     assert "What attempt 2 changed is still in it, uncommitted" in prompts[2]
-    assert "The whole change of attempt 2 was restored into it from a saved copy" in prompts[3]
+    assert "The whole change of attempt 3 was restored into it from a saved copy" in prompts[3]
     assert _event_kinds(outcome_id).count("changes_restored") == 1
 
 
@@ -1854,7 +1854,7 @@ def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         assert task.status == "queued", task.status
-        assert task.attempt == 1
+        assert task.attempt == 0  # the private checkpoint atomically refunds the interrupted reservation
 
     # After the restart the interrupted attempt is redone, not counted against the limit.
     ScriptedModel.scripts["builder"] = good_builder
@@ -1862,7 +1862,7 @@ def test_shutdown_interrupts_tasks_without_cancelling_them(factory):
     with session_scope() as s:
         task = s.query(Task).filter(Task.outcome_id == outcome_id).one()
         assert task.attempt == 1 and [a["n"] for a in task.evidence["attempts"]] == [1]
-        assert s.query(Event).filter(Event.task_id == task.id, Event.kind == "attempt_resumed").count() == 1
+        assert s.query(Event).filter(Event.task_id == task.id, Event.kind == "changes_restored").count() == 1
 
 
 def test_a_restart_closes_the_agent_sessions_it_interrupted(factory, monkeypatch):
@@ -4629,7 +4629,8 @@ def test_a_revision_interrupted_by_a_restart_continues_on_the_pull_request_branc
     # The builder is told that is what it has.
     assert (f"## State of your working tree\nThe pull request's branch `{branch}`, on top of the default branch "
             "`main` at `") in prompts[0]
-    assert "everything already pushed to the pull request is in it as commits" in prompts[0]
+    assert "the pull request's earlier change is in it as uncommitted changes" in prompts[0]
+    assert "was restored into it from a saved copy" in prompts[0]
     _approve_and_finish(factory, outcome_id)
 
 
@@ -4827,6 +4828,11 @@ def test_a_restart_during_verification_verifies_the_candidate_with_the_check_res
 def test_a_saved_candidate_that_cannot_be_restored_is_built_again(factory, monkeypatch, problem, why):
     from aifactory.models import Artifact
 
+    # Legacy artifact-only recovery remains supported for pre-checkpoint tasks.
+    async def no_checkpoint(runner):
+        return False
+    monkeypatch.setattr(delivery.checkpoints, "park", no_checkpoint)
+
     def keep_part_of_the_diff(runner):  # as for a diff over the stored size: the copy is not the whole candidate
         with session_scope() as s:
             diff = s.query(Artifact).filter(Artifact.task_id == runner.task_id, Artifact.kind == "diff").one()
@@ -4881,13 +4887,8 @@ def test_a_saved_candidate_is_used_only_by_the_attempt_budget_base_and_round_tha
     assert not resumes(fix_round="revise")  # built before the pull request's revision began
 
 
-@pytest.mark.parametrize("change, why_not", [
-    (None, None),
-    ("main moved elsewhere", None),  # the saved diff still applies to the new base
-    ("main changed the same line", "they no longer apply to main at "),
-    ("stored in part", "no whole copy of them was saved"),
-])
-def test_after_a_restart_the_builder_starts_from_what_its_failed_attempt_changed(factory, change, why_not):
+@pytest.mark.parametrize("change", [None, "main moved elsewhere", "stored in part"])
+def test_after_a_restart_the_builder_starts_from_what_its_failed_attempt_changed(factory, change):
     from aifactory.models import Artifact
 
     seen = []
@@ -4917,20 +4918,13 @@ def test_after_a_restart_the_builder_starts_from_what_its_failed_attempt_changed
     assert "Nothing from an earlier attempt is in it." in prompts[0]
     assert "A checkout of the default branch `main` at `" in prompts[1]
     assert "What attempt 1 changed is still in it, uncommitted (staged or not)" in prompts[1]
-    # After the restart the feedback is still about attempt 1, and the new checkout holds its change when the saved
-    # copy can be put back. When it cannot, the builder is told that the change is gone.
+    # The interrupted attempt is restored on its exact base. Moving main and truncating
+    # display artifacts cannot change the work that its next builder session receives.
     assert "- Independent review FAILED. Greeting still wrong." in prompts[2]
+    assert "Hello, Factory!" in seen[0], seen
+    assert "The whole change of attempt 2 was restored into it from a saved copy" in prompts[2]
     kinds = _event_kinds(outcome_id)
-    if why_not is None:
-        assert "Hello, Factory!" in seen[0], seen
-        assert "The whole change of attempt 1 was restored into it from a saved copy" in prompts[2]
-        assert kinds.count("changes_restored") == 1 and "changes_not_restored" not in kinds
-    else:
-        assert "Hello, Factory!" not in seen[0], seen
-        assert "What attempt 1 changed could not be restored and is not in it" in prompts[2]
-        warnings = _events(outcome_id, "changes_not_restored")
-        assert len(warnings) == 1 and warnings[0][0] == "warn" and why_not in warnings[0][1], warnings
-        assert "changes_restored" not in kinds
+    assert kinds.count("changes_restored") == 1 and "changes_not_restored" not in kinds
     assert "Hello, Factory!" in git("show", "main:greet.sh", cwd=factory["remotes"] / "acme/demo.git")
 
 
@@ -4962,6 +4956,14 @@ def _saved_work(outcome_id):
 INTERRUPTED = "Your previous session on this attempt was interrupted"
 
 
+@pytest.fixture
+def legacy_artifact_recovery(monkeypatch):
+    """Pre-checkpoint tasks still recover from display artifacts, including incomplete copies."""
+    async def no_checkpoint(runner):
+        return False
+    monkeypatch.setattr(delivery.checkpoints, "park", no_checkpoint)
+
+
 @pytest.mark.parametrize("save, change, why_not", [
     ("at the stop", None, None),
     ("periodic", None, None),
@@ -4970,7 +4972,7 @@ INTERRUPTED = "Your previous session on this attempt was interrupted"
     ("at the stop", "stored in part", "no whole copy of them was saved"),
 ])
 def test_after_a_restart_the_builder_continues_from_the_work_in_progress_saved_for_its_session(
-        factory, monkeypatch, save, change, why_not):
+        factory, monkeypatch, legacy_artifact_recovery, save, change, why_not):
     from aifactory.models import Artifact
 
     if save == "periodic":
@@ -5049,7 +5051,8 @@ def test_after_a_restart_the_builder_continues_from_the_work_in_progress_saved_f
 
 
 @pytest.mark.parametrize("kept", [True, False])
-def test_work_in_progress_saved_for_an_attempt_comes_before_what_the_attempt_before_it_changed(factory, kept):
+def test_work_in_progress_saved_for_an_attempt_comes_before_what_the_attempt_before_it_changed(
+        factory, legacy_artifact_recovery, kept):
     from aifactory.models import Artifact
 
     notes = {"path": "NOTES.md", "content": "robust now\n"}
@@ -5107,8 +5110,8 @@ def test_work_in_progress_saved_for_an_attempt_comes_before_what_the_attempt_bef
     assert "robust now" in git("show", "main:NOTES.md", cwd=factory["remotes"] / "acme/demo.git")
 
 
-def test_an_infrastructure_failure_during_the_build_keeps_the_saved_work_in_progress_for_the_retry(factory,
-                                                                                                   monkeypatch):
+def test_an_infrastructure_failure_during_the_build_keeps_the_saved_work_in_progress_for_the_retry(
+        factory, monkeypatch, legacy_artifact_recovery):
     from aifactory.inference import InferenceError
 
     monkeypatch.setattr(delivery, "INFRA_BACKOFF_SECONDS", (0,))

@@ -260,15 +260,20 @@ def _diff_commands(base_sha: str, stem: str) -> str:
             f"git diff --cached --name-only -z --no-renames {base_sha} {paths} > {out}.paths")
 
 
-async def _read_patch(sandbox: LocalSandbox, stem: str) -> Patch:
+async def _read_patch(sandbox: LocalSandbox, stem: str, *, limit: int | None = None) -> Patch:
     """The patch that ``_diff_commands`` wrote to the scratch files named ``stem``."""
     from .sandbox import read_bytes
 
-    diff = await read_bytes(sandbox, f"{SCRATCH}/{stem}.patch")
-    files = [name.decode("utf-8", "surrogateescape")
-             for name in (await read_bytes(sandbox, f"{SCRATCH}/{stem}.paths")).split(b"\0") if name]
+    diff = await read_bytes(sandbox, f"{SCRATCH}/{stem}.patch", limit=limit + 1 if limit is not None else None)
+    if limit is not None and len(diff) > limit:
+        raise SandboxError("Candidate patch exceeds the checkpoint byte limit")
+    names = await read_bytes(sandbox, f"{SCRATCH}/{stem}.paths", limit=limit + 1 if limit is not None else None)
+    stats_raw = await read_bytes(sandbox, f"{SCRATCH}/{stem}.numstat", limit=limit + 1 if limit is not None else None)
+    if limit is not None and (len(names) > limit or len(stats_raw) > limit):
+        raise SandboxError("Candidate metadata exceeds the checkpoint byte limit")
+    files = [name.decode("utf-8", "surrogateescape") for name in names.split(b"\0") if name]
     adds, dels = 0, 0
-    stats = iter((await read_bytes(sandbox, f"{SCRATCH}/{stem}.numstat")).split(b"\0"))
+    stats = iter(stats_raw.split(b"\0"))
     for record in stats:
         if not record:
             continue
@@ -281,13 +286,13 @@ async def _read_patch(sandbox: LocalSandbox, stem: str) -> Patch:
     return Patch(diff=diff, files=files, additions=adds, deletions=dels)
 
 
-async def extract_patch(sandbox: LocalSandbox, base_sha: str) -> Patch:
+async def extract_patch(sandbox: LocalSandbox, base_sha: str, *, limit: int | None = None) -> Patch:
     """Everything the job changed relative to the base commit (committed or not)."""
     script = f"set -e; mkdir -p {SCRATCH}; git add -A >/dev/null; {_diff_commands(base_sha, 'candidate')}"
     result = await sandbox.exec(script, timeout=180)
     if not result.ok:
         raise SandboxError(f"Could not read the candidate changes: {result.output[-800:]}")
-    return await _read_patch(sandbox, "candidate")
+    return await _read_patch(sandbox, "candidate", limit=limit)
 
 
 async def snapshot_patch(sandbox: LocalSandbox, base_sha: str, timeout: float = 60) -> Patch:
