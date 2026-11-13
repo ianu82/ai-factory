@@ -723,6 +723,7 @@ class Orchestrator:
     async def _provider_readiness(self) -> None:
         """Log whether each workspace's model provider answers and serves the configured models."""
         from ..inference import InferenceError, ModelClient, resolve_provider, workspace_models
+        from ..provider_errors import ProviderStop
 
         with session_scope() as s:
             workspace_ids = [w.id for w in s.query(Workspace).all()]
@@ -736,7 +737,7 @@ class Orchestrator:
                 missing = sorted(m for m in wanted if m and m not in names)
                 log.info("readiness %s provider=%s models=%d configured=%s missing=%s", workspace_id[:6],
                          provider.provider, len(names), sorted(wanted), missing or "none")
-            except InferenceError as exc:
+            except (InferenceError, ProviderStop) as exc:
                 log.warning("readiness %s provider unavailable: %s", workspace_id[:6], exc)
             except Exception as exc:  # readiness must never break scheduling
                 log.warning("readiness %s check failed: %s", workspace_id[:6], type(exc).__name__)

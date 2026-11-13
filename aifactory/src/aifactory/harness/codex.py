@@ -13,6 +13,7 @@ import shlex
 import shutil
 
 from ..failures import text_cause
+from ..gateway import raise_if_provider_stopped
 from ..sandbox import SCRATCH, read_text, write_text
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
 from .schemas import validate_report
@@ -114,12 +115,15 @@ class CodexHarness:
                         session.on_progress("thought", text, {})
 
         timeout = max(60.0, session.remaining() - 30)
-        result = await sandbox.exec(
-            command,
-            timeout=timeout,
-            env={"FACTORY_GATEWAY_TOKEN": session.gateway_token, "CODEX_HOME": str(codex_home)},
-            on_output=on_output,
-        )
+        try:
+            result = await sandbox.exec(
+                command,
+                timeout=timeout,
+                env={"FACTORY_GATEWAY_TOKEN": session.gateway_token, "CODEX_HOME": str(codex_home)},
+                on_output=on_output,
+            )
+        finally:
+            raise_if_provider_stopped(session.run_id)
         turns = sum(1 for e in events if e.get("type") == "turn.completed") or session.ledger.calls
         if result.timed_out:
             raise HarnessFailed("Codex exceeded its time budget")

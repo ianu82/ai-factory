@@ -38,6 +38,7 @@ from .models import (Alert, Artifact, Decision, DecisionReview, Event, Membershi
                      Secret, Signal, Task, User, Workspace, new_id)
 from .pipeline.orchestrator import orchestrator
 from .pipeline.runtime import DEFAULT_SETTINGS, merged_settings, new_settings
+from .provider_errors import ProviderStop
 from .review import review_policy, validate_review
 from .repo_detect import detect
 from .sandbox import isolation_available
@@ -604,6 +605,8 @@ async def models(workspace_id: str, user: User = Depends(current_user), db: Sess
         provider = resolve_provider(workspace_id)
         names = await ModelClient(provider).list_models()
         return {"provider": provider.provider, "label": provider.label, "models": names}
+    except ProviderStop:
+        return {"provider": None, "models": [], "error": "Model catalog request failed"}
     except InferenceError as exc:
         return {"provider": None, "models": [], "error": str(exc)}
 
@@ -1591,6 +1594,7 @@ async def score_run(workspace_id: str, run_id: str, body: ScoreRequest,
                     user: User = Depends(current_user), db: Session = Depends(get_db)):
     from .models import ScorerResult
     from .scorers import definitions, execute, reserve, result_dict
+    from .provider_errors import ProviderStop
     ws, run = _score_run(db, user, workspace_id, run_id, "member")
     try:
         configured = definitions(ws.settings or {})
@@ -1605,7 +1609,12 @@ async def score_run(workspace_id: str, run_id: str, body: ScoreRequest,
         raise HTTPException(422, str(exc)) from None
     result_id = row.id
     db.commit()
-    await execute(result_id)
+    try:
+        await execute(result_id)
+    except ProviderStop as exc:
+        # Detection already persisted the workspace hold; don't turn it into an
+        # unhandled 500 at this HTTP host boundary.
+        raise HTTPException(409, detail=exc.diagnostics()) from None
     db.expire_all()
     return result_dict(db.get(ScorerResult, result_id))
 

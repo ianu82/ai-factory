@@ -23,6 +23,7 @@ from .inference_limits import admission
 from .db import session_scope
 from .models import Run, Secret, Workspace
 from .security import decrypt
+from .provider_errors import ProviderStop, StopHandler, detect_provider_stop, safe_error_detail, workspace_stop_handler
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,9 @@ class ProviderConfig:
     # Set when a server bootstrap credential for a different provider is used, so roles
     # get a model that provider actually serves (recorded on every run).
     model_override: str | None = None
+
+    # Host-only detection hook; never forwarded to providers or sandboxes.
+    on_provider_stop: StopHandler | None = field(default=None, repr=False, compare=False)
 
     def headers(self, session_id: str | None = None) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -159,7 +163,7 @@ def resolve_provider(workspace_id: str, *, required_provider: str | None = None)
             cause="provider")
     base = settings.mindshub_api_base if provider == "mindshub" else settings.openai_api_base
     return ProviderConfig(provider=provider, base_url=base, api_key=key, label=PROVIDERS[provider]["label"],
-                          model_override=override)
+                          model_override=override, on_provider_stop=workspace_stop_handler(workspace_id))
 
 
 def price_for(model: str, workspace_settings: dict[str, Any] | None = None) -> tuple[float, float] | None:
@@ -459,7 +463,7 @@ class ModelClient:
         retries = Retries(deadline=deadline, cancelled=cancelled, notice=notice, limit=self.max_retries)
         try:
             data = await self._send(path, body, retries)
-        except InferenceError:
+        except (InferenceError, ProviderStop):
             retries.report(False)
             raise
         retries.report(True)
@@ -484,9 +488,10 @@ class ModelClient:
                             timeout=httpx.Timeout(timeout, connect=min(20.0, timeout)))
                 if response.status_code == 200:
                     return response.json()
-                detail = _error_detail(response)
-                if response.status_code == 402:
-                    raise InferenceError(f"{self.provider.label}: no credit remaining ({detail})", status=402)
+                stop = detect_provider_stop(self.provider, response.status_code, response.content, self.session_id)
+                if stop is not None:
+                    raise stop
+                detail = safe_error_detail(response.content, self.provider.api_key)
                 # "Do not send this again" on a limit is a limit a person lifts. On a server error, a rate limit, or an
                 # answer that says its trouble is momentary, the provider only gave up for now: retried below like any
                 # outage (a gateway marks it so once its own retries are spent).
@@ -565,6 +570,9 @@ class ModelClient:
         except httpx.HTTPError:
             raise InferenceError("Model catalog is unreachable", retryable=True) from None
         if response.status_code != 200:
+            stop = detect_provider_stop(self.provider, response.status_code, response.content, self.session_id)
+            if stop is not None:
+                raise stop
             raise InferenceError("Model catalog request failed", status=response.status_code,
                                  retryable=response.status_code == 429 or response.status_code >= 500)
         try:

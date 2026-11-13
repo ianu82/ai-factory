@@ -20,6 +20,7 @@ from aifactory.harness.anton import AntonHarness  # noqa: E402
 from aifactory.harness.base import HarnessFailed, HarnessSession  # noqa: E402
 from aifactory.harness.schemas import BUILDER_REPORT  # noqa: E402
 from aifactory.inference import ModelClient, ProviderConfig, UsageLedger  # noqa: E402
+from aifactory.provider_errors import ProviderStop  # noqa: E402
 from aifactory.sandbox import LocalSandbox  # noqa: E402
 
 
@@ -184,7 +185,7 @@ def test_a_provider_refusal_ends_an_anton_session_with_its_cause(tmp_path, monke
                                  ledger=UsageLedger(run_id="r", workspace_settings={}), report_schema=BUILDER_REPORT,
                                  writable=True, max_turns=2, deadline=time.monotonic() + 60,
                                  on_progress=lambda *event: progress.append(event))
-        with pytest.raises(HarnessFailed) as failed:
+        with pytest.raises(ProviderStop) as failed:
             asyncio.run(AntonHarness().run(session))
     finally:
         server.should_exit = True

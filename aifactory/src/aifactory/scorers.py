@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from .db import session_scope, utcnow
+from .provider_errors import ProviderStop
 from .inference import InferenceError, ModelClient, UsageLedger, resolve_provider, workspace_models
 from .models import Outcome, Run, ScorerAttempt, ScorerResult, Task, Workspace
 
@@ -244,7 +245,9 @@ async def execute(result_id: str) -> None:
     except Exception as exc:
         # Provider exceptions can contain credentials or reflected context; never persist their text.
         error = f"Judge failed ({type(exc).__name__})"
-        rejected = isinstance(exc, InferenceError) and exc.status in (400, 401, 402, 403, 404, 422, 429)
+        rejected = isinstance(exc, (InferenceError, ProviderStop)) and exc.status in (400, 401, 402, 403, 404, 422, 429)
+        if isinstance(exc, ProviderStop):
+            raise
     finally:
         with session_scope() as s:
             a = s.get(ScorerAttempt, attempt_id)

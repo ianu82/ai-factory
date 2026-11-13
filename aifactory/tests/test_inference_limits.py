@@ -288,7 +288,7 @@ async def test_a_client_with_a_retry_limit_fails_fast(provider, clocked, monkeyp
 
 
 @pytest.mark.parametrize("status, headers, message, said", [
-    (402, {}, "Payment required", "no credit remaining"),
+    (402, {}, "Payment required", "billing/quota stop"),
     (401, {}, "Invalid API key", "refused the credential"),
     (403, {}, "Key disabled", "refused the credential"),
     (429, {}, "You exceeded your current quota, please check your plan and billing details.", "error 429"),
@@ -304,7 +304,9 @@ async def test_a_provider_refusal_is_never_retried(provider, clocked, monkeypatc
         return httpx.Response(status, headers=headers, json={"error": {"message": message}})
 
     fake_http(monkeypatch, upstream)
-    with pytest.raises(inference.InferenceError) as failed:
+    from aifactory.provider_errors import ProviderStop
+
+    with pytest.raises(ProviderStop if status == 402 else inference.InferenceError) as failed:
         await ModelClient(provider)._post("/responses", {})
     assert len(sends) == 1 and waits == [] and guard.active == 0
     assert (failed.value.status, failed.value.cause) == (status, "provider") and said in str(failed.value)
@@ -540,9 +542,12 @@ async def test_anton_retries_a_short_outage_outside_the_permit_and_never_a_refus
     assert await _create_admitted_response(provider, None, sdk_hook, sdk, {}, session_retries) == {"id": "resp_1"}
     assert sends == [1, 1, 1] and waits == [1, 5] and guard.active == 0
     assert notes == ["Model provider unavailable (429); retried for 6 s, then succeeded"]
-    with pytest.raises(type(refusal)) as failed:
+    from aifactory.harness.anton import _ProviderStopped
+
+    with pytest.raises(_ProviderStopped) as failed:
         await _create_admitted_response(provider, None, sdk_hook, sdk, {}, session_retries)
-    assert failed.value is refusal and len(sends) == 4 and waits == [1, 5] and len(notes) == 1
+    assert failed.value.stop.status == 402 and failed.value.stop.cause == "provider"
+    assert len(sends) == 4 and waits == [1, 5] and len(notes) == 1
 
 
 @pytest.mark.parametrize("failure", ["send", "read", "close", "cancel"])

@@ -19,6 +19,7 @@ from ..failures import failure_cause, failure_status
 from ..gateway import GatewayGrant, issue, revoke
 from ..harness import HarnessFailed, HarnessResult, HarnessSession, get_harness
 from ..harness.schemas import SCHEMAS
+from ..provider_errors import ProviderStop
 from ..inference import InferenceError, ModelClient, UsageLedger, resolve_provider, workspace_models
 from ..models import Decision, DecisionReview, Message, Outcome, Run, ScorerResult, Task, Workspace
 from ..sandbox import LocalSandbox
@@ -306,6 +307,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
     error = ""
     status = "succeeded"
     failure: dict[str, Any] | None = None
+    provider_stopped = False
     try:
         if spec.harness == "codex":
             gateway_token = issue(GatewayGrant(run_id=run_id, workspace_id=spec.workspace_id, model=model,
@@ -359,10 +361,14 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
         # (the sandbox, a stray error) carries nothing unless its type is telling, and is read from its wording.
         if cause or isinstance(exc, (HarnessFailed, InferenceError)):
             failure = {"cause": cause, "status": failure_status(exc)}
+        if isinstance(exc, ProviderStop):
+            provider_stopped = True
+            raise
     finally:
         if gateway_token:
             revoke(run_id)
-        measured = await client.session_cost(run_id) if provider.provider == "mindshub" else None
+        rejected_stop = provider_stopped and ledger.calls == 0
+        measured = await client.session_cost(run_id) if provider.provider == "mindshub" and not rejected_stop else None
         with session_scope() as s:
             row = s.get(Run, run_id)
             row.status = status
@@ -373,7 +379,7 @@ async def run_agent(spec: SessionSpec, cancelled: asyncio.Event) -> tuple[Run, H
             if measured is not None:
                 row.cost_usd, row.cost_known = round(measured, 6), True
             else:
-                row.cost_usd, row.cost_known = round(ledger.cost_usd, 6), ledger.cost_known and ledger.calls > 0
+                row.cost_usd, row.cost_known = round(ledger.cost_usd, 6), ledger.cost_known and (ledger.calls > 0 or rejected_stop)
             if result:
                 row.result = result.report
             if failure is not None:

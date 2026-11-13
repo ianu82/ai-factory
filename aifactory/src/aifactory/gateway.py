@@ -22,6 +22,7 @@ from .db import session_scope, utcnow
 from .inference import BudgetExceeded, ProviderConfig, UsageLedger, extract_usage
 from .inference_limits import acquire
 from .models import RunToken
+from .provider_errors import ProviderStop, detect_provider_stop, read_error_body, safe_error_detail
 from .security import new_token, token_hash
 
 router = APIRouter()
@@ -37,6 +38,7 @@ class GatewayGrant:
     model: str
     provider: ProviderConfig
     ledger: UsageLedger
+    provider_stop: ProviderStop | None = None
 
 
 _grants: dict[str, GatewayGrant] = {}
@@ -49,6 +51,13 @@ def issue(grant: GatewayGrant, ttl_seconds: int = 4 * 3600) -> str:
                        expires_at=utcnow() + timedelta(seconds=ttl_seconds)))
     _grants[grant.run_id] = grant
     return token
+
+
+def raise_if_provider_stopped(run_id: str) -> None:
+    """Recover the original stop at a sandbox harness's trusted host boundary."""
+    grant = _grants.get(run_id)
+    if grant is not None and grant.provider_stop is not None:
+        raise grant.provider_stop
 
 
 def revoke(run_id: str) -> None:
@@ -84,11 +93,19 @@ async def proxy(path: str, request: Request):
     path = path.strip("/")
     if path not in ALLOWED_PATHS:
         return _error(400, "unsupported_endpoint", f"/{path} is not available to Factory runs")
+    if grant.provider_stop is not None:
+        return _error(400, "provider_billing_stop", str(grant.provider_stop))
     url = f"{grant.provider.base_url}/{path}"
     headers = grant.provider.headers(grant.run_id)
     if request.method == "GET":
         async with httpx.AsyncClient(timeout=30.0) as client:
             upstream = await client.get(url, headers=headers)
+        if upstream.status_code >= 400:
+            stop = detect_provider_stop(grant.provider, upstream.status_code, upstream.content, grant.run_id)
+            if stop is not None:
+                grant.provider_stop = stop
+                return _error(400, "provider_billing_stop", str(stop))
+            return _error(400, "upstream_error", safe_error_detail(upstream.content, grant.provider.api_key))
         return JSONResponse(upstream.json() if upstream.headers.get("content-type", "").startswith("application/json")
                             else {"data": []}, status_code=upstream.status_code if upstream.status_code < 400 else 400)
 
@@ -139,12 +156,18 @@ async def proxy(path: str, request: Request):
             upstream_request = client.build_request("POST", url, headers=headers, content=payload)
             permit = await acquire(grant.provider, grant.run_id)
             upstream = await client.send(upstream_request, stream=True)
+            if upstream.status_code >= 400:
+                error_body = await read_error_body(upstream)
+                stop = detect_provider_stop(grant.provider, upstream.status_code, error_body, grant.run_id)
+                if stop is not None:
+                    grant.provider_stop = stop
+                    return _error(400, "provider_billing_stop", str(stop))
             retry = (upstream.status_code == 429
                      and upstream.headers.get("x-should-retry", "").lower() != "false" and attempt < 2)
             if retry:
                 retry_after = upstream.headers.get("retry-after", "5")
             elif upstream.status_code >= 400:
-                detail = (await upstream.aread()).decode(errors="replace")[:800]
+                detail = safe_error_detail(error_body, grant.provider.api_key, limit=800)
                 status = upstream.status_code
                 code = {401: "credential_refused", 402: "wallet_empty", 403: "permission_denied", 404: "model_not_found",
                         429: "rate_limited"}.get(status, "upstream_error")

@@ -16,6 +16,7 @@ from .decision_judges import allowed_resolutions, build_context, validate_report
 from .events import notify, record
 from .inference import BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider, workspace_models
 from .models import Decision, Outcome, Run
+from .provider_errors import ProviderStop
 from .pipeline.runtime import outcome_committed, workspace_settings
 
 SYSTEM = """You are a decision judge in the Factory control plane, not an execution agent.
@@ -88,7 +89,8 @@ async def run_judge(workspace_id: str, decision_id: str) -> tuple[Run, dict[str,
     """Return (finished run, validated report or safe hold, audit reason).
 
     Requires a workspace question with an outcome, as agent questions have. No
-    model/provider exception escapes as an unresolved internal review. Cancellation
+    model/provider exception escapes as an unresolved internal review, except a
+    structured account stop propagated after accounting for host recovery. Cancellation
     also returns a hold so callers can expose the question rather than hide it.
     """
     settings = workspace_settings(workspace_id)
@@ -110,6 +112,7 @@ async def run_judge(workspace_id: str, decision_id: str) -> tuple[Run, dict[str,
     ledger = UsageLedger(run_id=run_id, workspace_settings=settings)
     client = None
     request_started = False
+    provider_stopped = False
     response_received = False
     provider = None
     error = ""
@@ -197,17 +200,20 @@ async def run_judge(workspace_id: str, decision_id: str) -> tuple[Run, dict[str,
             error = str(exc) if not isinstance(exc, json.JSONDecodeError) else "Malformed judge JSON"
         elif isinstance(exc, TimeoutError):
             error = "Judge deadline exceeded"
-        elif isinstance(exc, InferenceError):
+        elif isinstance(exc, (InferenceError, ProviderStop)):
             error = f"Judge provider unavailable or request rejected (status {exc.status or 'unknown'})"
         else:
             error = f"Judge review failed ({type(exc).__name__})"
         result = safe_hold(error)
+        if isinstance(exc, ProviderStop):
+            provider_stopped = True
+            raise
     finally:
         measured = None
         # A request can be billable even when no response reaches UsageLedger.add.
         # Recover measured spend after interrupted requests too; an empty ledger
-        # is only evidence of zero spend when inference was never attempted.
-        if request_started and provider.provider == "mindshub":
+        # is only evidence of zero spend before dispatch or after an explicit billing rejection.
+        if request_started and provider.provider == "mindshub" and not provider_stopped:
             try:
                 async with asyncio.timeout(20):
                     measured = await client.session_cost(run_id)
@@ -225,7 +231,7 @@ async def run_judge(workspace_id: str, decision_id: str) -> tuple[Run, dict[str,
             row.input_tokens, row.output_tokens = ledger.input_tokens, ledger.output_tokens
             row.cost_usd = round(measured if measured is not None else ledger.cost_usd, 6)
             row.cost_known = measured is not None or (
-                ledger.cost_known and (not request_started or (response_received and ledger.calls > 0)))
+                ledger.cost_known and (not request_started or provider_stopped or (response_received and ledger.calls > 0)))
             row.result = result
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})
