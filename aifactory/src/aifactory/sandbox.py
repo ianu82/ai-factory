@@ -438,10 +438,13 @@ async def write_bytes(sandbox, relative: str, content: bytes) -> None:
 async def read_bytes(sandbox, relative: str, limit: int | None = None, from_end: bool = False) -> bytes:
     if _is_vm(sandbox):
         return await sandbox.read_bytes_async(relative, limit, from_end)
-    data = sandbox.resolve(relative).read_bytes()
-    if limit:
-        return data[-limit:] if from_end else data[:limit]
-    return data
+    with sandbox.resolve(relative).open("rb") as handle:
+        if limit is not None:
+            if from_end:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - limit))
+            return handle.read(limit)
+        return handle.read()
 
 
 async def read_image_bytes(sandbox, relative: str, limit: int) -> bytes:

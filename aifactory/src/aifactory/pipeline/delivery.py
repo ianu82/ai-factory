@@ -39,6 +39,7 @@ from ..prompts import BUILDER, build_prompt, review_findings, verifier_system, v
 from ..review import (ACTIONS, FACTORY_REPLY_MARKER, MAX_FINDINGS, SEVERITIES, findings_unseen, headline,
                       new_review_evidence, normalize_feedback, open_findings, reply_text, review_policy, reviewed_by)
 from ..sandbox import COMMAND_TIMEOUT, LocalSandbox, SandboxError
+from . import checkpoints
 from .check_slots import check_slot
 from .context import plan_context, repo_instructions
 from .qa import AppRun, change_checks, verifier_brief
@@ -394,15 +395,24 @@ class TaskRunner:
         "wip" record describes: the task's one artifact of that kind holds it from this write on."""
         with session_scope() as s:
             task = s.get(Task, self.task_id)
+            if ((task.evidence or {}).get("delivery_checkpoint")
+                    and values.get("attempts", {}).get("result") not in (*NOT_ATTEMPTS, None)):
+                checkpoints._fence(self, s)  # finishing and deleting recovery bytes obey the same lifecycle fence
             # Deep copy: mutating the stored JSON in place would hide the change from the ORM.
             ev = json.loads(json.dumps(task.evidence or {}))
             stored = (ev.get("wip") or {}).get("artifact_id")
+            if (ev.get("delivery_checkpoint") and "candidate" in values and values["candidate"] is None):
+                checkpoints._fence(self, s)
+                ev.pop("delivery_checkpoint", None)
+                checkpoints.discard(s, self.task_id)
             for key, value in values.items():
                 if key == "attempts":  # tagged with the budget it belongs to (attempt numbers restart per budget)
                     ev.setdefault("attempts", []).append({**value, "epoch": int(ev.get("budget_epoch", 0))})
                     if value.get("result") not in NOT_ATTEMPTS:
                         ev.pop("candidate", None)  # the attempt ended: its saved candidate is never resumed
                         ev.pop("wip", None)  # and no later attempt starts from its work in progress
+                        ev.pop("delivery_checkpoint", None)
+                        checkpoints.discard(s, self.task_id)
                     if recovered_from_infra(str(value.get("result")), ev.get("infra_phase")):
                         ev.pop("infra_retries", None)  # the phase that failed has since completed
                         ev.pop("infra_phase", None)
@@ -744,8 +754,13 @@ class TaskRunner:
             pass
         finally:
             if self.builder:
-                await self.builder.close()
-                self.builder = None
+                try:
+                    await checkpoints.park(self)
+                except Stop:
+                    pass  # cancellation, manual pause or a newer lifecycle won
+                finally:
+                    await self.builder.close()
+                    self.builder = None
 
     # build / verify loop ---------------------------------------------------------
     async def deliver(self, continue_from_branch: bool = False) -> None:
@@ -768,8 +783,18 @@ class TaskRunner:
         unpublished = bool(self._unpublished_candidate())
         # Built before the task stopped (a restart, or an infrastructure failure at its checks or verification):
         # the attempt goes on from there below, and the builder does not run again.
-        saved = self._saved_candidate()
-        if saved:
+        if (self.task.evidence or {}).get("delivery_checkpoint") and (self.task.evidence or {}).get("candidate"):
+            self._guard_steward_candidate()
+            identity = self._steward_identity()
+            if identity is not None and identity["action"] == "revert":
+                main_sha = await GitHub(token).branch_sha(self.repo.full_name, self.repo.default_branch)
+                if main_sha != self.task.base_sha:
+                    await self._refresh_onto_main(token, GitHub(token), main_sha)
+        recovery = await checkpoints.resume(self, token)
+        saved = None if recovery else self._saved_candidate()
+        if recovery:
+            pass  # resume reclaimed the existing reservation, not a new attempt
+        elif saved:
             if saved["n"] == self.task.attempt:
                 self.update(attempt=self.task.attempt - 1)
         elif self.task.attempt and (self.task.attempt not in finished or unpublished):
@@ -778,8 +803,8 @@ class TaskRunner:
             self.event("attempt_resumed", f"Attempt {self.task.attempt} was interrupted; running it again")
             self.update(attempt=self.task.attempt - 1)
         while True:
-            attempt = self.task.attempt + 1
-            if not saved and not (identity is not None and identity["action"] == "revert"):
+            attempt = recovery["reserved_attempt"] if recovery else self.task.attempt + 1
+            if not recovery and not saved and not (identity is not None and identity["action"] == "revert"):
                 self._check_lifetime(max_attempts)  # before a builder session, never inside an attempt
             if attempt - int((self.task.evidence or {}).get("attempt_base", 0)) > max_attempts and self._auto_retry():
                 attempt = self.task.attempt + 1
@@ -821,6 +846,22 @@ class TaskRunner:
                                      "effect": f"Allows the outcome up to ${more} more than it has spent now; the "
                                                "task goes on."},
                                     {"value": "abandon", "label": "Stop", "effect": "Ends this task undelivered."}])
+            if recovery:
+                restored, recovery = recovery, None
+                if restored["stage"] != "build":
+                    candidate = restored.get("candidate") or {}
+                    diff_id = candidate.get("diff_artifact_id") or self._reviewed_diff(self.patch, attempt)
+                    self.stage("checks")
+                    if self._steward_identity() is not None:
+                        self.patch = await extract_patch(self.builder, self.task.base_sha)
+                        self._guard_steward_candidate()
+                        problem = await self._policy_problem(self.patch)
+                        if problem:
+                            self._steward_question("Resumed steward candidate violates policy", problem)
+                        await self._steward_test_gate(self.patch)
+                    if await self._check_and_verify(token, attempt, self.patch, diff_id, restored.get("checks")):
+                        break
+                    continue
             if saved:
                 self._guard_steward_candidate()
                 identity = self._steward_identity()
@@ -856,6 +897,7 @@ class TaskRunner:
                     self._infrastructure(attempt, "prepare", error, infrastructure_problem(
                         error, "transient" if isinstance(exc, NoVM) else None))
             self._describe_tree(attempt)
+            self.checks = []
             self.stage("build", f"Attempt {attempt}: building with {self.task.harness}")
             sections = await self._sections()
             if identity != self._steward_identity():
@@ -880,6 +922,7 @@ class TaskRunner:
                 if result is None:
                     cause = infrastructure_problem(error, carried_cause(run))
                     if cause:
+                        await checkpoints.park(self)
                         self._infrastructure(attempt, "build", error, cause)
                     # A session stopped by its own cap (time, turns, tokens, cost) may have left the work done, so its
                     # tree is checked as it stands: unless it is empty or the candidate this runner already judged.
@@ -1058,6 +1101,7 @@ class TaskRunner:
                     preexisting = await self._failing_on_base(token, failed)
                 except (SandboxError, GitError, OSError) as exc:  # the base's sandbox, not the attempt
                     error = f"Sandbox setup failed: {exc}"
+                    await checkpoints.park(self)
                     self._infrastructure(attempt, "checks", error, infrastructure_problem(error))
                 if preexisting:
                     self.evidence("attempts", {"n": attempt, "result": "checks_preexisting",
@@ -1484,6 +1528,7 @@ class TaskRunner:
                     await sandbox.close()
             if result is None:
                 if infrastructure_problem(error, carried) == "provider":
+                    await checkpoints.park(self)
                     self._infrastructure(attempt, "verify", error, "provider")
                 self.event("verification_unavailable", f"Verifier session failed: {error[:300]}", level="warn")
                 continue
@@ -1527,6 +1572,7 @@ class TaskRunner:
             self.event("verification_failed", str(report.get("summary") or "")[:400], level="warn", **flipped)
             return None
         if infrastructure_problem(error, carried) == "transient":
+            await checkpoints.park(self)
             self._infrastructure(attempt, "verify", error, "transient")
         self.block("unblock", f"{self.task.key}: independent verification could not run",
                    "Two verifier sessions failed to produce a verdict. The candidate remains unverified and was not "
@@ -1595,6 +1641,7 @@ class TaskRunner:
         except Exception as exc:
             if failure_cause(exc) != "provider":
                 raise
+            await checkpoints.park(self)
             self._infrastructure(attempt, phase, str(exc), "provider")
 
     def _infrastructure(self, attempt: int, phase: str, error: str, cause: str) -> None:
