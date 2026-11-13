@@ -13,6 +13,7 @@ import { RecoveryGuide } from "../components/RecoveryGuide";
 import { type GroupResult, groupDecisions, groupReport, sharedTitle, sortDecisions, waiting } from "../inboxGroups";
 
 import { type LearningPolicy, policyLabel } from "../learningPolicy";
+import { withoutAlerts } from "../inboxAlerts";
 
 type InboxData = { decisions: Decision[]; alerts?: Alert[]; since: string | null; changes: (FactoryEvent & { outcome_number?: number; outcome_title?: string })[] };
 
@@ -48,6 +49,7 @@ export function InboxPage() {
   const { decisionId } = useParams();
   const [guide, setGuide] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [dismissing, setDismissing] = useState<Set<string>>(() => new Set());
   const q = useQuery({ queryKey: ["inbox", ws.id], queryFn: () => api<InboxData>(`/api/workspaces/${ws.id}/inbox`) });
   const policy = useQuery({ queryKey: ["learning-policy", ws.id], queryFn: () => api<LearningPolicy>(`/api/workspaces/${ws.id}/onboarding/policy`) });
   const applyPreset = async () => {
@@ -83,21 +85,31 @@ export function InboxPage() {
   const close = () => navigate(`/w/${ws.id}/inbox`);
   const openOutcome = (e: FactoryEvent) => e.outcome_id && navigate(`/w/${ws.id}/outcomes/${e.outcome_id}`);
   const canAct = ws.role !== "viewer";
-  const alerts = q.data?.alerts || [];
+  const alerts = withoutAlerts(q.data, dismissing)?.alerts || [];
   const openAlert = (a: Alert) => {
     if (a.decision_id && decisions.some((d) => d.id === a.decision_id)) navigate(`/w/${ws.id}/inbox/${a.decision_id}`);
     else if (a.outcome_id) navigate(`/w/${ws.id}/outcomes/${a.outcome_id}`);
     else navigate(`/w/${ws.id}/runs`);
   };
   const dismiss = async (a: Alert) => {
-    setBusy(`alert:${a.id}`);
+    setDismissing((ids) => new Set(ids).add(a.id));
+    const key = ["inbox", ws.id];
+    let previous: InboxData | undefined;
+    let optimistic: InboxData | undefined;
     try {
+      await qc.cancelQueries({ queryKey: key });
+      previous = qc.getQueryData<InboxData>(key);
+      optimistic = qc.setQueryData<InboxData>(key, (data) => withoutAlerts(data, new Set([a.id])));
       await api(`/api/workspaces/${ws.id}/alerts/${a.id}/dismiss`, { method: "POST" });
-      qc.invalidateQueries({ queryKey: ["inbox", ws.id] });
+      // A refetch during the POST may have restored this alert in the shared sidebar cache.
+      qc.setQueryData<InboxData>(key, (data) => withoutAlerts(data, new Set([a.id])));
+      await qc.invalidateQueries({ queryKey: key });
     } catch (err) {
+      setDismissing((ids) => { const next = new Set(ids); next.delete(a.id); return next; });
+      // Do not overwrite a newer refetch or another action with our old snapshot.
+      if (qc.getQueryData<InboxData>(key) === optimistic) qc.setQueryData(key, previous);
+      void qc.invalidateQueries({ queryKey: key });
       toast((err as Error).message, true);
-    } finally {
-      setBusy(null);
     }
   };
 
@@ -273,9 +285,9 @@ export function InboxPage() {
                         </div>
                         <div className="meta">
                           {canAct && (
-                            <button className="btn sm ib-act" disabled={busy !== null}
+                            <button className="btn sm ib-act" disabled={dismissing.has(a.id)}
                               onClick={(e) => { e.stopPropagation(); dismiss(a); }}>
-                              {busy === `alert:${a.id}` ? "…" : "Dismiss"}
+                              {dismissing.has(a.id) ? "…" : "Dismiss"}
                             </button>
                           )}
                           <span className="num" style={{ minWidth: 52 }}>{ago(a.since)}</span>

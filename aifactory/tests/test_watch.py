@@ -230,6 +230,62 @@ def test_a_dismissed_alert_stays_dismissed_while_its_condition_lasts(world, clie
     assert [a["id"] != shown["id"] for a in raised(world)] == [True]
 
 
+def test_dismissing_an_alert_removes_it_from_the_inbox_at_once(world, client):
+    working(world)
+    late = decision(world, age=timedelta(hours=3))
+    assert watch.run()["shown"] == 1
+    [shown] = raised(world)
+    # An open decision folds its overdue alert into its row. Resolve it without a watch pass
+    # so the still-open alert is listed, and prove dismissal removes an actually visible item.
+    with db.session_scope() as s:
+        s.get(Decision, late).status = "resolved"
+    assert [a["id"] for a in alerts(client, world)] == [shown["id"]]
+    url = f"/api/workspaces/{world['ws']}/alerts/{shown['id']}/dismiss"
+    first = client.post(url)
+    assert first.status_code == 200 and first.json() == {"status": "dismissed"}
+    assert alerts(client, world) == []  # no watch pass needed to remove it
+    second = client.post(url)
+    assert second.status_code == 200 and second.json() == {"status": "dismissed"}
+    with db.session_scope() as s:
+        assert s.query(Event).filter_by(workspace_id=world["ws"], kind="alert_dismissed").count() == 1
+
+
+def test_dismissing_an_unknown_alert_returns_404(world, client):
+    response = client.post(f"/api/workspaces/{world['ws']}/alerts/unknown/dismiss")
+    assert response.status_code == 404
+
+
+def test_dismissing_another_workspaces_alert_returns_404(world, client):
+    working(world)
+    decision(world, age=timedelta(hours=3))
+    watch.run()
+    [shown] = raised(world)
+    with db.session_scope() as s:
+        other = Workspace(org_id=s.get(Workspace, world["ws"]).org_id, name="Other", slug="other")
+        s.add(other)
+        s.flush()
+        s.get(Alert, shown["id"]).workspace_id = other.id
+    response = client.post(f"/api/workspaces/{world['ws']}/alerts/{shown['id']}/dismiss")
+    assert response.status_code == 404
+    with db.session_scope() as s:
+        assert s.get(Alert, shown["id"]).status == "open"
+        assert s.query(Event).filter_by(kind="alert_dismissed").count() == 0
+
+
+def test_a_viewer_cannot_dismiss_an_alert(world, client):
+    from aifactory.models import Membership
+
+    working(world)
+    decision(world, age=timedelta(hours=3))
+    watch.run()
+    [shown] = raised(world)
+    with db.session_scope() as s:
+        s.query(Membership).filter_by(workspace_id=world["ws"]).one().role = "viewer"
+    response = client.post(f"/api/workspaces/{world['ws']}/alerts/{shown['id']}/dismiss")
+    assert response.status_code == 403
+    assert [a["id"] for a in raised(world)] == [shown["id"]]
+
+
 def test_alerts_show_in_the_app_and_slack_and_email_stay_off(world, client):
     url = f"/api/workspaces/{world['ws']}"
     for bad in ({"slack": True}, {"email": True}, {"after_minutes": 10}, {"after_minutes": 60.5}, {"sms": False},
