@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
@@ -40,7 +41,7 @@ def world():
                                 body=SECRET, options=[{"value": "answer"}])
             unblock = Decision(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, kind="unblock", title="Retry?",
                                options=[{"value": "retry"}])
-            db.add_all([question, unblock])
+            db.add_all([question, unblock, Decision(workspace_id=ws.id, kind="supervisor", title="Finding", body=SECRET)])
             # This is the runtime's real storage format, not synthetic transcript artifacts.
             for j in range(8):
                 db.add(Event(workspace_id=ws.id, outcome_id=o.id, task_id=t.id, run_id=run.id,
@@ -111,6 +112,70 @@ def test_forged_nested_ids(world, name):
     with pytest.raises(HTTPException):
         read_call("runs", {"workspace_id": work[0][0].id, "outcome_id": work[0][1].id,
                            "task_id": work[1][2].id}, Context(db, users[0].id))
+
+
+@pytest.mark.parametrize("kind", ["stuck_task", "push_protection", "unrelayed_review"])
+def test_supervisor_findings_resolve_task_only_links_without_leaking_other_workspaces(world, kind):
+    db, users, work = world
+    ws, outcome, task, *_ = work[0]
+    finding = Decision(workspace_id=ws.id, task_id=task.id, kind="supervisor", title="Task finding",
+                       metadata_json={"finding_kind": kind})
+    invalid = [
+        Decision(workspace_id=ws.id, task_id=work[1][2].id, kind="supervisor", title="Other workspace"),
+        Decision(workspace_id=ws.id, task_id="missing-task", kind="supervisor", title="Missing task"),
+        Decision(workspace_id=ws.id, outcome_id=work[1][1].id, task_id=task.id,
+                 kind="supervisor", title="Mismatched outcome"),
+    ]
+    db.add_all([finding, *invalid])
+    db.commit()
+
+    result = read_call("supervisor_findings", {"workspace_id": ws.id}, Context(db, users[0].id))
+    item = next(d for d in result["items"] if d["id"] == finding.id)
+    assert item["task_id"] == task.id and item["outcome_id"] == outcome.id
+    cite = next(c for c in result["citations"] if c["id"] == finding.id)
+    assert cite["href"] == f"/w/{ws.id}/outcomes/{outcome.id}?task={task.id}"
+    assert not {d.id for d in invalid} & {d["id"] for d in result["items"]}
+    assert not {d.id for d in invalid} & {c["id"] for c in result["citations"]}
+    assert work[1][2].id not in json.dumps(result)
+    # Reading resolves links without rewriting the durable decision.
+    db.refresh(finding)
+    assert finding.outcome_id is None
+
+
+@pytest.mark.parametrize("valid_count", [0, 1, 2, 3, 5])
+@pytest.mark.parametrize("same_timestamp", [False, True])
+def test_supervisor_findings_fill_page_past_invalid_links(world, valid_count, same_timestamp):
+    db, users, work = world
+    ws, outcome, task, *_ = work[0]
+    db.query(Decision).filter_by(workspace_id=ws.id, kind="supervisor").update({"status": "resolved"})
+    now = datetime(2026, 11, 12)
+    rows, valid = [], []
+
+    def add(**links):
+        row = Decision(id=f"finding-{len(rows):03d}", workspace_id=ws.id, kind="supervisor",
+                       title="Finding", created_at=now if same_timestamp else now + timedelta(seconds=len(rows)),
+                       **links)
+        rows.append(row)
+        return row
+
+    # More than one batch of stale/foreign links precedes and follows the valid findings.
+    for _ in range(4):
+        add(task_id="missing-task")
+        add(task_id=work[1][2].id)
+    for _ in range(valid_count):
+        valid.append(add(task_id=task.id))  # task-only findings still get the correct outcome citation
+        add(outcome_id=work[1][1].id, task_id=task.id)
+    for _ in range(4):
+        add(outcome_id="missing-outcome")
+    db.add_all(rows)
+    db.commit()
+
+    result = read_call("supervisor_findings", {"workspace_id": ws.id, "limit": 2}, Context(db, users[0].id))
+    assert [d["id"] for d in result["items"]] == [d.id for d in valid[:2]]
+    assert [c["id"] for c in result["citations"]] == [d.id for d in valid[:2]]
+    assert all(c["href"] == f"/w/{ws.id}/outcomes/{outcome.id}?task={task.id}" for c in result["citations"])
+    assert result["truncated"] is (valid_count > 2)
+    assert work[1][2].id not in json.dumps(result)
 
 
 def test_read_validation(world):

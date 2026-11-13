@@ -4,10 +4,11 @@ import { NavLink, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import {
   api, type Credential, type DirectorSettings, type ModelCheckResult, type Repo, type ReviewPolicy, type Settings,
-  type Workspace,
+  type SupervisorPolicy, type SupervisorStatus, type Workspace,
 } from "../api";
 import { useWs } from "../App";
 import { connectReviewedRepository, previewRepository, repositoryDiscoveryUrl, type RepositoryPreview } from "../repositoryConnect";
+import { supervisorConfidenceLabel, supervisorFindingLabel } from "../supervisor";
 import { validMindBudget } from "../mind";
 import { type LearningPolicy, policyPatch } from "../learningPolicy";
 import { ago } from "../format";
@@ -19,6 +20,7 @@ import { REVIEW_DEFAULTS, ruleText, rulesInForce } from "../rules";
 
 const SECTIONS = [
   ["policies", "Autonomy & limits"],
+  ["supervisor", "Supervisor"],
   ["models", "Models & workers"],
   ["credentials", "Credentials"],
   ["linear", "Linear"],
@@ -40,6 +42,7 @@ export function SettingsPage() {
           </nav>
           <div>
             {section === "policies" && <Policies />}
+            {section === "supervisor" && <Supervisor key={ws.id} />}
             {section === "models" && <Models key={ws.id} />}
             {section === "credentials" && <Credentials />}
             {section === "linear" && <LinearSettings key={ws.id} />}
@@ -68,6 +71,87 @@ function useSaveSettings() {
       toast((err as Error).message, true);
     }
   };
+}
+
+function Supervisor() {
+  const { ws } = useWs();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const admin = ws.role === "owner" || ws.role === "admin";
+  const [busy, setBusy] = useState<"save" | "run" | null>(null);
+  const [form, setForm] = useState({ mode: "observe" as SupervisorPolicy["mode"], interval_minutes: "", stuck_minutes: "", unaccepted_issue_hours: "" });
+  const [offset, setOffset] = useState(0);
+  const q = useQuery({ queryKey: ["supervisor", ws.id, offset], queryFn: () => api<SupervisorStatus>(`/api/workspaces/${ws.id}/supervisor?offset=${offset}`) });
+  const p = q.data?.policy;
+  useEffect(() => {
+    if (p) setForm({ mode: p.mode, interval_minutes: String(p.interval_minutes), stuck_minutes: String(p.stuck_minutes), unaccepted_issue_hours: String(p.unaccepted_issue_hours) });
+  }, [p?.mode, p?.interval_minutes, p?.stuck_minutes, p?.unaccepted_issue_hours]);
+  const refresh = () => Promise.all([
+    qc.invalidateQueries({ queryKey: ["supervisor", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["inbox", ws.id] }),
+    qc.invalidateQueries({ queryKey: ["me"] }),
+  ]);
+  const save = async () => {
+    setBusy("save");
+    try {
+      await api(`/api/workspaces/${ws.id}`, { method: "PATCH", json: { settings: { supervisor: {
+        mode: form.mode, interval_minutes: Number(form.interval_minutes), stuck_minutes: Number(form.stuck_minutes), unaccepted_issue_hours: Number(form.unaccepted_issue_hours),
+      } } } });
+      await refresh();
+      toast("Saved");
+    } catch (err) { toast((err as Error).message, true); }
+    finally { setBusy(null); }
+  };
+  const run = async () => {
+    setBusy("run");
+    try {
+      await api<SupervisorStatus>(`/api/workspaces/${ws.id}/supervisor/run`, { method: "POST" });
+      setOffset(0);
+      await refresh();
+      toast(ws.paused ? "Workspace is paused; sweep skipped" : "Supervisor sweep finished");
+    } catch (err) { toast((err as Error).message, true); }
+    finally { setBusy(null); }
+  };
+  return (
+    <section className="s-block" aria-label="Supervisor">
+      <h2>Supervisor</h2>
+      <p>Checks Factory state for stuck work and unattended findings. Observe surfaces findings. Fix currently surfaces findings just like Observe; safe auto-fixes will come in a later change. Approval policies still apply.</p>
+      {q.isPending && <Skeleton rows={3} />}
+      {q.isError && <p role="alert">Could not load Supervisor: {q.error.message} <button className="btn sm" onClick={() => q.refetch()}>Retry</button></p>}
+      {q.data && <>
+        <form onSubmit={(e) => { e.preventDefault(); if (admin && !busy) save(); }}>
+          <div className="s-grid">
+            <label className="field"><span>Mode</span>
+              <select className="select" aria-label="Mode" value={form.mode} disabled={!admin || !!busy} onChange={(e) => setForm({ ...form, mode: e.target.value as SupervisorPolicy["mode"] })}>
+                <option value="off">Off</option><option value="observe">Observe</option><option value="fix">Fix</option>
+              </select></label>
+            <label className="field"><span>Sweep interval (minutes)</span><input className="input" type="number" min={5} step={1} required value={form.interval_minutes} disabled={!admin || !!busy} onChange={(e) => setForm({ ...form, interval_minutes: e.target.value })} /></label>
+            <label className="field"><span>Stuck task threshold (minutes)</span><input className="input" type="number" min={1} step={1} required value={form.stuck_minutes} disabled={!admin || !!busy} onChange={(e) => setForm({ ...form, stuck_minutes: e.target.value })} /></label>
+            <label className="field"><span>Unaccepted issue threshold (hours)</span><input className="input" type="number" min={1} step={1} required value={form.unaccepted_issue_hours} disabled={!admin || !!busy} onChange={(e) => setForm({ ...form, unaccepted_issue_hours: e.target.value })} /></label>
+          </div>
+          {admin && <button className="btn primary" disabled={!!busy}>{busy === "save" ? "Saving…" : "Save Supervisor"}</button>}
+        </form>
+        <div className="s-line">
+          <div className="l"><b>Last sweep: {q.data.last_sweep_at ? ago(q.data.last_sweep_at) : "Never"}</b>
+            <span>{q.data.last_sweep_at || "No sweep recorded yet."}</span>
+            <span>Run now uses the saved policy. Off runs no checks; paused workspaces skip the sweep.</span>
+          </div>
+          {admin && <button type="button" className="btn" disabled={!!busy} onClick={run}>{busy === "run" ? "Running…" : "Run now"}</button>}
+        </div>
+        <h3>Latest sweep counts</h3>
+        {Object.keys(q.data.counts).length ? <ul>{Object.entries(q.data.counts).map(([kind, count]) => <li key={kind}>{supervisorFindingLabel(kind)}: {count}</li>)}</ul> : <p className="muted">No findings recorded in the latest sweep.</p>}
+        <h3>Open Supervisor decisions</h3>
+        <p>Open Inbox items can remain after a condition clears. Acknowledge or dismiss them in Inbox.</p>
+        {q.data.findings.length ? <ul className="rows">{q.data.findings.map((f) => <li key={f.id} className="s-line">
+          <div className="l"><NavLink to={`/w/${ws.id}/inbox/${f.id}`}>{f.title}</NavLink><span>{supervisorFindingLabel(f.finding_kind)} · {supervisorConfidenceLabel(f.confidence)}</span></div>
+        </li>)}</ul> : <p className="muted">No open findings on this page.</p>}
+        <div style={{ display: "flex", gap: 8 }}>
+          {offset > 0 && <button className="btn sm" onClick={() => setOffset(Math.max(0, offset - 50))}>Previous findings</button>}
+          {q.data.next_offset !== null && <button className="btn sm" onClick={() => setOffset(q.data!.next_offset!)}>Next findings</button>}
+        </div>
+      </>}
+    </section>
+  );
 }
 
 function Seg<T extends string>({ value, options, onChange, disabled }: { value: T; options: [T, string][]; onChange: (v: T) => void; disabled?: boolean }) {

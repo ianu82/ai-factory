@@ -320,6 +320,45 @@ def open_decisions(args, context):
                 lambda d: citation(d.workspace_id, "decision", d.id, d.title, d.outcome_id, d.task_id))
 
 
+@register("supervisor_findings", "Open Supervisor findings: what the deterministic checks are seeing, "
+          "with acknowledge/dismiss options and links to the Inbox.")
+def supervisor_findings(args, context):
+    query = scoped(context, args, Decision).filter_by(status="open", kind="supervisor")
+    items, citations = [], []
+    remaining = query
+    while True:
+        # Bound each read, but fill the page from valid findings rather than stale stored links.
+        rows = remaining.order_by(Decision.created_at, Decision.id).limit(args["limit"] + 1).all()
+        if not rows:
+            return {"items": items, "citations": citations, "truncated": False}
+        for d in rows:
+            outcome_id = d.outcome_id
+            if d.task_id and not outcome_id:
+                # Supervisor task findings predate storing both links. Resolve only within this workspace,
+                # without changing the durable decision or weakening the shared link validator.
+                task = scoped(context, args, Task).filter_by(id=d.task_id).one_or_none()
+                if task is None:
+                    continue
+                outcome_id = task.outcome_id
+            try:
+                if outcome_id:
+                    target(context.db, current(context), args["workspace_id"], outcome_id, d.task_id)
+                elif d.task_id:
+                    continue
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                # A stale or cross-workspace link must not hide the rest of the Supervisor feed.
+                continue
+            if len(items) == args["limit"]:
+                return {"items": items, "citations": citations, "truncated": True}
+            items.append(S.decision(d, {"outcome_id": outcome_id}))
+            citations.append(citation(d.workspace_id, "decision", d.id, d.title, outcome_id, d.task_id))
+        last = rows[-1]
+        remaining = query.filter((Decision.created_at > last.created_at) |
+                                 ((Decision.created_at == last.created_at) & (Decision.id > last.id)))
+
+
 @register("runs", "Runs with bounded redacted excerpts from the runtime agent event journal and known/unknown costs.",
           {"outcome_id": OUTCOME_REF, "task_id": TASK_REF, "run_id": {"type": "string"}})
 def runs(args, context):
