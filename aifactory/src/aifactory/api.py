@@ -262,6 +262,15 @@ def _clean_settings(raw: dict[str, Any]) -> dict[str, Any]:
         supervisor = supervisor_policy(raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+    anton = raw.get("anton", {})
+    if not isinstance(anton, dict):
+        raise HTTPException(422, "anton must be an object")
+    for key in ("own_tools", "web_enabled"):
+        if key in anton and type(anton[key]) is not bool:
+            raise HTTPException(422, f"anton.{key} must be a boolean")
+    root = anton.get("skills_root")
+    if root is not None and (not isinstance(root, str) or not root.strip() or len(root) > 4096 or "\x00" in root):
+        raise HTTPException(422, "anton.skills_root must be a non-empty path or null")
     mind = _mind_settings(raw.get("mind"))
     lead = _lead_settings(raw.get("lead"))  # before merging: a lead that isn't an object is refused, not a 500
     alerts = _alert_settings(raw.get("alerts"))
@@ -339,7 +348,7 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Depe
                 except ValueError as exc:
                     raise HTTPException(422, str(exc)) from None
             patch = {**patch, "alerts": {**before["alerts"], **alerts}}
-        for section in ("limits", "budgets"):
+        for section in ("limits", "budgets", "anton"):
             # Patched key by key too: setting one limit or budget must not put the others back to their defaults.
             if isinstance(patch.get(section), dict) and isinstance(before.get(section), dict):
                 patch = {**patch, section: {**before[section], **patch[section]}}

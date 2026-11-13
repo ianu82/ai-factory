@@ -3,7 +3,8 @@
 Anton's ChatSession runs in the control plane; its provider is pointed at the workspace's
 model provider with per-run accounting. Factory tools and a protected image reader
 access the job sandbox. Web tools are explicit policy opt-ins and execute only in
-the sandbox; SDK/native web, code-execution runtime, memory and skills stay disabled.
+the sandbox. Factory-owned memory is workspace/repository scoped. SDK/native web,
+code-execution runtime and skills stay disabled.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from uuid import uuid4
 from ..failures import failure_cause, failure_status
 from ..inference import BudgetExceeded, Retries, _seconds
 from ..inference_limits import admission
+from .anton_policy import tool_config
 from .anton_tools import replace_session_tools
 from .anton_web import sandbox_web_tools
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
@@ -103,6 +105,66 @@ def _with_note(output: Any, note: str) -> Any:
     return output
 
 
+# Each stage has its own bound; a stuck SDK finalizer cannot keep a job alive.
+_CLEANUP_SECONDS = 5.0
+
+
+async def _bounded(awaitable, seconds: float | None = None) -> bool:
+    seconds = _CLEANUP_SECONDS if seconds is None else seconds
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait((task,), timeout=seconds)
+    if not done:
+        task.cancel()
+        done, _ = await asyncio.wait((task,), timeout=1.0)
+    if done:
+        # Retrieve errors (including CancelledError), without masking the run's original exit.
+        return not isinstance((await asyncio.gather(task, return_exceptions=True))[0], BaseException)
+    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    return False
+
+
+async def _cleanup(chat, client, memory, cancellation=None) -> None:
+    if cancellation is not None:
+        cancellation.cancel()
+        await _bounded(asyncio.gather(cancellation, return_exceptions=True), 1.0)
+    if chat is not None:
+        try:
+            if memory is not None:
+                await _bounded(memory.settle(chat))
+        finally:
+            # The SDK tracks explicit memorize writes separately from close().
+            # On a settling timeout stop them before releasing their stores/client.
+            writes = tuple(chat._memory_writes)
+            for task in writes:
+                if not task.done():
+                    task.cancel()
+            if writes:
+                await _bounded(asyncio.gather(*writes, return_exceptions=True), 1.0)
+            closed = await _bounded(chat.close())
+            if closed:
+                return  # ChatSession owns and closes the LLM client.
+    await _bounded(client.aclose())
+
+
+async def _cleanup_shielded(chat, client, memory, cancellation=None) -> None:
+    cleanup = asyncio.create_task(_cleanup(chat, client, memory, cancellation))
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # Repeated task cancellation must not interrupt write settling/transport close.
+            cancelled = True
+    await cleanup
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _watch_cancel(cancelled, task) -> None:
+    await cancelled.wait()
+    task.cancel()
+
+
 class AntonHarness:
     name = "anton"
     label = "Anton"
@@ -115,6 +177,10 @@ class AntonHarness:
         return True, "MindsDB Anton agent with Factory tools"
 
     async def run(self, session: HarnessSession) -> HarnessResult:
+        options = session.anton_options
+        own_tools = options.get("own_tools", True) is True
+        sandbox_kind = getattr(session.sandbox, "kind", "local")
+        session.on_tool_config(tool_config(session.writable, options, sandbox_kind))
         ok, why = self.availability()
         if not ok:
             raise HarnessUnavailable(why)
@@ -141,7 +207,7 @@ class AntonHarness:
         class Provider(OpenAIProvider):
             async def _create_response(provider, body):  # noqa: N805 - SDK hook signature
                 if session.cancelled.is_set():
-                    raise _Stop()
+                    raise asyncio.CancelledError
                 if state["calls"] >= session.max_turns + 3 or session.remaining() <= 0:
                     failed("Anton exhausted its turn or time budget")
                     raise _Stop()
@@ -212,17 +278,20 @@ class AntonHarness:
         tools = [ToolDef(t["function"]["name"], t["function"]["description"], t["function"]["parameters"],
                          finish_handler if t["function"]["name"] == "finish" else make_handler(t["function"]["name"]))
                  for t in specs]
-        tools = replace_session_tools(tools, session.sandbox) + sandbox_web_tools(session)
-        tools = [t if t.name == "finish" else budgeted(t) for t in tools]
 
         class SandboxChatSession(ChatSession):
+            def __init__(chat, config):
+                super().__init__(config)
+                # Even a configured future root must not inject skills into prompts.
+                # No workspace is supplied, so repository context loading is also off.
+                chat._skill_store = None
+
             def _build_core_tools(chat):
-                super()._build_core_tools()
-                # The pinned SDK registers built-ins before config.tools and
-                # deduplicates by name. Override only this session's registry,
-                # including on lazy rebuilds; never patch SDK ToolDefs globally.
-                chat.tool_registry.unregister_tool("read_image")
-                chat.tool_registry.register_tool(next(t for t in tools if t.name == "read_image"))
+                # The SDK deduplicates ToolDefs by name: appending a replacement to
+                # config.tools does not override a built-in. Own this session's core
+                # registry instead, including lazy rebuilds. Never mutate SDK globals.
+                for tool in tools:
+                    chat.tool_registry.register_tool(tool)
 
         provider = Provider(api_key=provider_cfg.api_key, base_url=provider_cfg.base_url,
                             flavor=OpenAIProvider.FLAVOR_OPENAI, reasoning_effort=session.reasoning_effort)
@@ -237,60 +306,92 @@ class AntonHarness:
                            coding_model=session.model, router_provider=provider, router_model=session.model,
                            max_tokens=16000)
         started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix="factory-anton-") as temporary:
-            # Anton's per-turn token ceiling (max_turn_tokens, 1.25M with cache reads at full weight) protects an
-            # interactive user's allowance: it pauses to ask them whether to go on. A Factory run has nobody to
-            # ask, so it only cost a hand-back call and interrupted the agent mid-task until we said "Continue".
-            # The run's ledger already bounds its tokens, cost, calls and time.
-            settings = CoreSettings.model_construct(max_tool_rounds=session.max_turns, max_continuations=2,
-                                                    verify_min_tool_rounds=session.max_turns + 1, verifier_jev="off",
-                                                    max_turn_tokens=0)
-            settings = settings.model_copy(update={
-                "analytics_enabled": False, "skills_root": Path(temporary) / "skills", "skills_extra_roots": [],
-                "skills_artifact_roots": [], "skill_drafts_root": None})
-            chat = SandboxChatSession(ChatSessionConfig(
-                llm_client=client, settings=settings, runtime_factory=no_runtime, session_id=uuid4().hex,
-                harness="anton", tools=tools, tool_allowlist=frozenset(t.name for t in tools),
-                background_memory=False, web_search_enabled=False, web_fetch_enabled=False,
-                connector_usage_notes={}, system_prompt_context=SystemPromptContext(suffix=session.system),
-                output_dir=temporary))
-            try:
-                async with asyncio.timeout(max(30.0, session.remaining())):
-                    prompt = session.prompt
-                    for _ in range(4):  # allow continuation if Anton stops without finishing
-                        try:
-                            events = chat.turn_stream(prompt, enable_interaction=True)
-                            try:
-                                async for event in events:
-                                    text = getattr(event, "text", None) or (event.get("text") if isinstance(event, dict) else None)
-                                    if text and len(text) > 40:
-                                        session.on_progress("thought", str(text)[:600], {})
-                            finally:
-                                await events.aclose()
-                        except _ReportReady:
-                            break
-                        if state["report"] is not None:
-                            break
-                        prompt = "Continue. When the work is complete, call the finish tool with your report."
-            except _ReportReady:
-                pass
-            except _Stop:
-                pass
-            except TimeoutError:
-                failed("Anton exceeded its time budget")
-            except Exception as exc:
-                # The model provider failed the session: say so by type, with the SDK's wording. The SDK's own verdict
-                # on how its retries ended (an overload, a billing stop) comes first, then the last refused request's.
-                cause = failure_cause(exc) or state["cause"]
-                if cause:
-                    raise HarnessFailed(str(exc) or type(exc).__name__, cause=cause) from exc
-                raise
-            finally:
+        memory = chat = None
+        fallback_reason = None
+        cancellation = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="factory-anton-") as temporary:
+                # Anton's per-turn token ceiling (max_turn_tokens, 1.25M with cache reads at full weight) protects an
+                # interactive user's allowance: it pauses to ask them whether to go on. A Factory run has nobody to
+                # ask, so it only cost a hand-back call and interrupted the agent mid-task until we said "Continue".
+                # The run's ledger already bounds its tokens, cost, calls and time.
+                settings = CoreSettings.model_construct(max_tool_rounds=session.max_turns, max_continuations=2,
+                                                        verify_min_tool_rounds=session.max_turns + 1, verifier_jev="off",
+                                                        max_turn_tokens=0)
+                settings = settings.model_copy(update={
+                    "analytics_enabled": False, "skills_root": (Path(options["skills_root"]) if options.get("skills_root")
+                                                               else Path(temporary) / "skills"), "skills_extra_roots": [],
+                    "skills_artifact_roots": [], "skill_drafts_root": None})
                 try:
-                    await chat.close()
-                except BaseException:
+                    if own_tools:
+                        from ..memory import MemoryScopeError
+                        from .anton_memory import build_factory_memory
+                        from anton.core.tools.tool_defs import MEMORIZE_TOOL, RECALL_TOOL
+
+                        tools = replace_session_tools(tools, session.sandbox)
+                        if options.get("web_enabled") is True:
+                            tools += sandbox_web_tools(session)
+                        try:
+                            memory = build_factory_memory(
+                                workspace_id=session.workspace_id, run_id=session.run_id,
+                                allowed_repo_ids=session.repository_ids, llm_client=client)
+                        except MemoryScopeError:
+                            # A bad tenant/repository binding is not an availability fallback.
+                            raise
+                        except Exception:
+                            fallback_reason = "memory_startup_failed"
+                            session.on_progress("warn", "Anton memory unavailable; continuing without memory tools", {})
+                        if memory is not None:
+                            tools += [replace(MEMORIZE_TOOL), replace(RECALL_TOOL)]
+                    tools = [t if t.name == "finish" else budgeted(t) for t in tools]
+                    chat = SandboxChatSession(ChatSessionConfig(
+                        llm_client=client, settings=settings, runtime_factory=no_runtime, session_id=uuid4().hex,
+                        harness="anton", tools=[], tool_allowlist=frozenset(t.name for t in tools),
+                        cortex=memory.cortex if memory else None, episodic=memory.episodic if memory else None,
+                        background_memory=False, web_search_enabled=False, web_fetch_enabled=False,
+                        connector_usage_notes={}, system_prompt_context=SystemPromptContext(suffix=session.system),
+                        output_dir=temporary))
+                    chat._build_tools()
+                    session.on_tool_config(tool_config(
+                        session.writable, options, sandbox_kind,
+                        effective=[t.name for t in chat.tool_registry.get_tool_defs()],
+                        fallback_reason=fallback_reason))
+                    cancellation = asyncio.create_task(_watch_cancel(session.cancelled, asyncio.current_task()))
+                    if session.cancelled.is_set():
+                        raise asyncio.CancelledError
+                    async with asyncio.timeout(max(0.0, session.remaining())):
+                        prompt = session.prompt
+                        for _ in range(4):  # allow continuation if Anton stops without finishing
+                            try:
+                                events = chat.turn_stream(prompt, enable_interaction=True)
+                                try:
+                                    async for event in events:
+                                        text = getattr(event, "text", None) or (event.get("text") if isinstance(event, dict) else None)
+                                        if text and len(text) > 40:
+                                            session.on_progress("thought", str(text)[:600], {})
+                                finally:
+                                    await events.aclose()
+                            except _ReportReady:
+                                break
+                            if state["report"] is not None:
+                                break
+                            prompt = "Continue. When the work is complete, call the finish tool with your report."
+                except _ReportReady:
                     pass
-                await client.aclose()
+                except _Stop:
+                    pass
+                except TimeoutError:
+                    failed("Anton exceeded its time budget")
+                except Exception as exc:
+                    # The model provider failed the session: say so by type, with the SDK's wording. The SDK's own verdict
+                    # on how its retries ended (an overload, a billing stop) comes first, then the last refused request's.
+                    cause = failure_cause(exc) or state["cause"]
+                    if cause:
+                        raise HarnessFailed(str(exc) or type(exc).__name__, cause=cause) from exc
+                    raise
+        finally:
+            # Shield the whole finalization, including draining the cancellation watcher.
+            await _cleanup_shielded(chat, client, memory, cancellation)
         if state["report"] is None:
             raise HarnessFailed(state["error"] or "Anton ended without a valid report", cause=state["cause"])
         session.on_progress("harness", f"Anton finished in {time.monotonic() - started:.0f}s", {})

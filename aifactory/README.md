@@ -77,6 +77,34 @@ it is retried. While a hold is open, every page shows a banner with its cause, w
   harness per role, masked credentials with save/test, repositories (setup/checks/smoke,
   protected paths, merge and release policy), members.
 
+### Anton capability settings
+
+Workspace settings accept an `anton` object (partial updates preserve its other keys):
+
+- `own_tools`: `true` by default. Adds the protected sandbox `read_image` tool and
+  Factory-backed `memorize`/`recall`. Setting it to `false` exposes only the shared
+  Factory tools and `finish`, with no Anton memory or web tools.
+- `web_enabled`: `false` by default. With `own_tools=true`, enables sandbox-executed
+  web search/fetch; provider-native and controller-side SDK web stay disabled.
+- `skills_root`: a non-empty path or `null` (default: an empty per-session temporary
+  root). Reserved for future skills support: skill tools and prompt injection stay
+  disabled even when a root is configured. Controller home-directory skills are never used.
+
+Memory's global scope means the workspace, not the controller. Task sessions use
+that task's repository; planners read the outcome's selected repositories. A planner
+with multiple repositories must use global scope for writes rather than choosing an
+arbitrary project destination. Invalid workspace/repository bindings fail closed.
+Memory startup availability failures produce one warning and continue without memory
+tools. Pending explicit memory writes are settled before bounded session/transport
+cleanup on both successful and aborted runs. Scratchpad execution remains disabled.
+
+Run API responses include nullable `tool_config`: `requested_tools`, `effective_tools`,
+`profile` (`factory-only`, `enhanced`, `web-enabled`, or `degraded`), `sandbox_kind`, and
+`fallback_reason`. Effective tools come from the session's built registry before its
+first model request. Metadata is persisted independently of `result`, so failed or
+cancelled sessions retain it; legacy and non-Anton runs have `null` metadata. This
+records capabilities only, never credentials or memory content.
+
 ## Identity, tenancy and credentials
 
 - Sign-in uses MindsHub Auth: either MindsHub OIDC (`MINDSHUB_OIDC_CLIENT_ID`, needs the
