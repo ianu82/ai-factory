@@ -30,6 +30,7 @@ from sqlalchemy import func, or_
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
 from ..events import notify, record
+from ..provider_errors import ProviderStop
 from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider,
                          workspace_models)
 from ..models import Decision, Event, Message, Outcome, Plan, Repository, Run, Task, User, Workspace
@@ -734,7 +735,7 @@ def _reserve(outcome_id: str, run_id: str, cap: float, outcome_limit: float | No
 
 async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen: dict[str, Any],
                    decisions: list[str] | None = None) -> Run:
-    """One Lead run on an outcome. Never raises: every failure ends the run as failed, with the reason recorded."""
+    """Record one Lead run; provider account stops propagate to the host after accounting."""
     settings = workspace_settings(workspace_id)
     cfg = settings_for(settings)
     model = workspace_models(settings).lead
@@ -753,6 +754,7 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
     tools.closing = bool(seen.get("closing"))
     client = provider = None
     started = False
+    provider_stopped = False
     status, error, summary = "failed", "", ""
     budget: _Budget | None = None
     try:
@@ -793,8 +795,11 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         error = str(exc)
     except TimeoutError:
         error = "The Lead ran out of time"
-    except InferenceError as exc:
+    except (InferenceError, ProviderStop) as exc:
         error = f"Model unavailable or request rejected (status {exc.status or 'unknown'})"
+        if isinstance(exc, ProviderStop):
+            provider_stopped = True
+            raise
     except Exception as exc:  # never let one outcome's Lead break the scheduler
         log.exception("lead run %s failed", run_id)
         error = f"Lead run failed ({type(exc).__name__})"
@@ -802,7 +807,8 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
         measured = None
         attempts = budget.attempts if budget else 0
         reading = budget.reading if budget else []
-        if started and provider is not None and provider.provider == "mindshub" and attempts:
+        if (started and provider is not None and provider.provider == "mindshub" and attempts
+                and not (provider_stopped and ledger.calls == 0)):
             try:
                 async with asyncio.timeout(20):
                     measured = await client.session_cost(run_id)
@@ -817,8 +823,9 @@ async def run_lead(workspace_id: str, outcome_id: str, reasons: list[str], seen:
             row.input_tokens, row.output_tokens = ledger.input_tokens, ledger.output_tokens
             # A final reading that fails leaves the last one taken during the run: a lower bound, so not "known".
             row.cost_usd = round(measured if measured is not None else max([ledger.cost_usd, *reading]), 6)
-            # A request that failed before its usage was recorded may still be billed: unknown unless measured.
-            row.cost_known = measured is not None or (ledger.cost_known and not reading and attempts == ledger.calls)
+            # A billing rejection adds no spend; other unrecorded requests remain unknown unless measured.
+            row.cost_known = measured is not None or (
+                ledger.cost_known and not reading and attempts == ledger.calls + int(provider_stopped))
             row.result = {"summary": summary, "actions": tools.actions}
             s.flush()
             snapshot = Run(**{c.name: getattr(row, c.name) for c in Run.__table__.columns})

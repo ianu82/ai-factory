@@ -36,6 +36,7 @@ from sqlalchemy import or_
 from ..db import SessionLocal, session_scope, utcnow
 from ..decision_judges import question_fingerprint
 from ..events import notify, record
+from ..provider_errors import ProviderStop
 from ..inference import (BudgetExceeded, InferenceError, ModelClient, UsageLedger, price_for, resolve_provider,
                          workspace_models)
 from ..models import Alert, Decision, Event, Message, Outcome, Run, Signal, Task, User, Workspace, new_id
@@ -927,7 +928,7 @@ Rules:
 
 
 async def run_director(item: dict[str, Any]) -> dict[str, Any]:
-    """One Director run on a workspace. Never raises: every failure ends the run as failed, with the reason recorded."""
+    """Record one Director run; provider account stops propagate to the host after accounting."""
     workspace_id = item["workspace_id"]
     claimed = await asyncio.to_thread(claim, item)
     if claimed is None:
@@ -939,6 +940,7 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
     tools = Tools(workspace_id, run_id, cfg, set(item["new"]), set(item.get("overdue") or []))
     client = provider = None
     started = False
+    provider_stopped = False
     status, error, summary, model = "failed", "", "", ""
     budget: _Budget | None = None
     try:
@@ -976,8 +978,11 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
         error = str(exc)
     except TimeoutError:
         error = "The Director ran out of time"
-    except InferenceError as exc:
+    except (InferenceError, ProviderStop) as exc:
         error = f"Model unavailable or request rejected (status {exc.status or 'unknown'})"
+        if isinstance(exc, ProviderStop):
+            provider_stopped = True
+            raise
     except Exception as exc:  # never let the Director break the scheduler
         log.exception("director run %s failed", run_id)
         error = f"Director run failed ({type(exc).__name__})"
@@ -987,7 +992,8 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
         measured = None
         attempts = budget.attempts if budget else 0
         reading = budget.reading if budget else []
-        if started and provider is not None and provider.provider == "mindshub" and attempts:
+        if (started and provider is not None and provider.provider == "mindshub" and attempts
+                and not (provider_stopped and ledger.calls == 0)):
             try:
                 async with asyncio.timeout(20):
                     measured = await client.session_cost(run_id)
@@ -996,7 +1002,8 @@ async def run_director(item: dict[str, Any]) -> dict[str, Any]:
             except (Exception, asyncio.CancelledError):
                 measured = None
         cost = round(measured if measured is not None else max([ledger.cost_usd, *reading]), 6)
-        known = measured is not None or (ledger.cost_known and not reading and attempts == ledger.calls)
+        known = measured is not None or (
+            ledger.cost_known and not reading and attempts == ledger.calls + int(provider_stopped))
         result = {"run_id": run_id, "role": "director", "status": status, "reason": error, "summary": summary,
                   "actions": tools.actions, "model": model, "cost_usd": cost, "cost_known": known,
                   "tokens": ledger.input_tokens + ledger.output_tokens, "turns": ledger.calls}

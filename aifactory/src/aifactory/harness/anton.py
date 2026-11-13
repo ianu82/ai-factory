@@ -19,6 +19,7 @@ from uuid import uuid4
 from ..failures import failure_cause, failure_status
 from ..inference import BudgetExceeded, Retries, _seconds
 from ..inference_limits import admission
+from ..provider_errors import ProviderStop, detect_provider_stop
 from .anton_tools import replace_session_tools
 from .anton_web import sandbox_web_tools
 from .base import HarnessFailed, HarnessResult, HarnessSession, HarnessUnavailable
@@ -29,6 +30,14 @@ from .tools import ToolBox, finish_tool, tool_specs
 
 class _ReportReady(BaseException):
     pass
+
+
+class _ProviderStopped(BaseException):
+    """Escape SDK repair/continuation handlers; unwrap only at the host boundary."""
+
+    def __init__(self, stop: ProviderStop):
+        self.stop = stop
+        super().__init__(str(stop))
 
 
 class _Stop(BaseException):
@@ -71,7 +80,18 @@ class _AdmittedResponses:
                 async with admission(self.config, self.run_id):
                     response = await self.responses.create(**body)
             except Exception as exc:
-                headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+                # SDK status errors expose body/status without importing the SDK.
+                response = getattr(exc, "response", None)
+                status = getattr(exc, "status_code", None)
+                if status is None and response is not None:
+                    status = getattr(response, "status_code", None)
+                error_body = getattr(exc, "body", None)
+                if error_body is None and response is not None:
+                    error_body = getattr(response, "content", None)
+                stop = detect_provider_stop(self.config, status, error_body, self.run_id)
+                if stop is not None:
+                    raise _ProviderStopped(stop) from None
+                headers = getattr(response, "headers", None) or {}
                 if failure_cause(exc) != "transient" or not await retries.wait(
                         str(failure_status(exc) or type(exc).__name__), _seconds(headers.get("retry-after"))):
                     retries.report(False)
@@ -274,6 +294,8 @@ class AntonHarness:
                         prompt = "Continue. When the work is complete, call the finish tool with your report."
             except _ReportReady:
                 pass
+            except _ProviderStopped as exc:
+                raise exc.stop from None
             except _Stop:
                 pass
             except TimeoutError:

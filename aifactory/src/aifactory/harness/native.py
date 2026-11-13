@@ -12,6 +12,7 @@ from typing import Any
 
 from ..failures import failure_cause
 from ..inference import BudgetExceeded, InferenceError
+from ..provider_errors import ProviderStop
 from .base import HarnessFailed, HarnessResult, HarnessSession
 from .schemas import validate_report
 from .tools import ToolBox, clip, finish_tool, tool_specs
@@ -74,6 +75,8 @@ class NativeHarness:
                     cancelled=session.cancelled,
                     notice=lambda text: session.on_progress("warn", text, {}),
                 )
+            except ProviderStop:
+                raise
             except BudgetExceeded as exc:
                 raise HarnessFailed(str(exc)) from exc
             except InferenceError as exc:

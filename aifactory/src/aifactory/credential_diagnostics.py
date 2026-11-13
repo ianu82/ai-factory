@@ -6,6 +6,7 @@ from typing import Any
 
 from .config import get_settings
 from .inference import InferenceError, ModelClient, ProviderConfig
+from .provider_errors import ProviderStop
 from .security import redact
 
 # Messages are local constants, never upstream exception text.
@@ -77,6 +78,8 @@ async def test_models(kind: str, value: str, identity: dict[str, Any] | None = N
     try:
         # Catalog only: no paid generation, retries or unbounded polling.
         models = await ModelClient(ProviderConfig(provider, base, value, provider), timeout=10, max_retries=0).list_models()
+    except ProviderStop:
+        return result("inference_denied", "invalid", **metadata)
     except InferenceError as exc:
         if exc.status in (401, 402, 403):
             return result("inference_denied", "invalid", **metadata)
