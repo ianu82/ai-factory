@@ -31,18 +31,35 @@ class StreamControl:
         self.streams = {}
         self.connections = {}
         self.changed = asyncio.Event()
+        self.established = set()
+        self.rejecting = set()
+        self.rejections = {}
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
         ws = path.split("/")[3] if path.startswith("/api/workspaces/") and path.endswith("/stream") else None
         task = asyncio.current_task()
+        if ws and ws in self.rejecting:
+            self.rejections[ws] = self.rejections.get(ws, 0) + 1
+            self.changed.set()
+            await send({"type": "http.response.start", "status": 503, "headers": []})
+            await send({"type": "http.response.body", "body": b"Test stream temporarily unavailable"})
+            return
         if ws:
             self.streams[task] = ws
             self.connections[ws] = self.connections.get(ws, 0) + 1
             self.changed.set()
+        async def stream_send(message):
+            # The first SSE body means /stream subscribed and sent its retry frame.
+            if ws and message["type"] == "http.response.body" and message.get("body"):
+                self.established.add(task)
+                self.changed.set()
+            await send(message)
+
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, stream_send)
         finally:
+            self.established.discard(task)
             self.streams.pop(task, None)
             self.changed.set()
 
@@ -64,7 +81,7 @@ async def serve(sock, pipe, build, env):
     ModelClient.list_models = list_models
     httpx.AsyncClient.send = deny_network
     from aifactory.db import session_scope
-    from aifactory.models import Outcome, Workspace
+    from aifactory.models import Outcome, Signal, Workspace
     from tests.browser.seed import create_scenario
     from tests.test_pulls import FakeGitHub
 
@@ -96,18 +113,46 @@ async def serve(sock, pipe, build, env):
             if not isinstance(minimum, int) or not 1 <= minimum <= 20:
                 raise ValueError("connections must be 1..20")
             async with asyncio.timeout(10):
-                while not (ws in wrapped.streams.values() and wrapped.connections.get(ws, 0) >= minimum):
+                while not (any(w == ws and t in wrapped.established for t, w in wrapped.streams.items())
+                           and wrapped.connections.get(ws, 0) >= minimum):
                     wrapped.changed.clear()
                     await wrapped.changed.wait()
             return {"connections": wrapped.connections[ws]}
         if operation == "stream_state":
             return {"active": sum(w == ws for w in wrapped.streams.values()),
-                    "connections": wrapped.connections.get(ws, 0)}
+                    "connections": wrapped.connections.get(ws, 0), "rejected": wrapped.rejections.get(ws, 0)}
+        if operation == "restore_stream":
+            wrapped.rejecting.discard(ws)
+            return {"restored": True}
         if operation == "interrupt_stream":
+            if body.get("reject_reconnects", False):
+                wrapped.rejecting.add(ws)
             tasks = [t for t, w in wrapped.streams.items() if w == ws]
             for task in tasks:
                 task.cancel()
             return {"interrupted": len(tasks)}
+        if operation == "create_signal":
+            title = body.get("title")
+            if not isinstance(title, str) or not 3 <= len(title) <= 100:
+                raise ValueError("Signal title must contain 3..100 characters")
+            # Intentionally no record/notify here: tests can prove an event causes
+            # refresh, or that reconnect resync recovers a completely missed change.
+            with session_scope() as s:
+                signal = Signal(workspace_id=ws, source="feedback", title=title,
+                                fingerprint="browser-live-" + title, body="Server-side browser mutation")
+                s.add(signal)
+                s.flush()
+                signal_id = signal.id
+            return {"signal_id": signal_id}
+        if operation == "notify_signal":
+            signal_id = body.get("signal_id")
+            with session_scope() as s:
+                signal = s.get(Signal, signal_id)
+                if signal is None or signal.workspace_id != ws:
+                    raise ValueError("Unknown browser signal")
+            payload = events.record(ws, "feedback_received", "Browser feedback received")
+            events.notify(ws, "signal", signal_id)
+            return {"event_id": payload["id"]}
         if operation == "emit":
             # A bounded, real persisted mutation + normal server event, not an API mock.
             title = body.get("title", "Live browser outcome")

@@ -130,7 +130,10 @@ class Diagnostics:
             digest = hashlib.sha256(self.node.nodeid.encode()).hexdigest()[:10]
             path = self.directory / f"{safe}-{digest}-{self.viewport}-{label}-{index}-{uuid.uuid4().hex[:8]}.png"
             try:
-                page.screenshot(path=str(path), full_page=True, timeout=5000)
+                # The one-time credential is also present in the curl example. Mask
+                # the whole intake section in every diagnostic, including failures.
+                secret_sections = page.locator("section").filter(has=page.get_by_role("heading", name="Product feedback", exact=True))
+                page.screenshot(path=str(path), full_page=True, timeout=5000, mask=[secret_sections])
                 self.captures.append((page.url, path))
             except Exception as exc:
                 self.errors.append(f"Screenshot failed for {page.url}: {exc}")
