@@ -177,6 +177,20 @@ def vm_available() -> tuple[bool, str]:
     return True, "Railway sandbox VMs"
 
 
+async def preview_vm_available() -> tuple[bool, str]:
+    """Preview policy is stricter than verifier availability; never fall back locally."""
+    available, reason = vm_available()
+    if not available:
+        return False, reason
+    try:
+        caps = await VMBridge.get().call("previewCapabilities", {}, timeout=30)
+    except (SandboxError, TimeoutError):
+        return False, "Preview unavailable: provider isolation could not be established"
+    # railway 3.16.0 has no deny-egress operation, regardless of VM availability.
+    reason = caps.get("reason") if isinstance(caps, dict) else None
+    return False, reason or "Preview unavailable: runtime deny-egress is unsupported"
+
+
 class VMBridge:
     _instance: "VMBridge | None" = None
 
