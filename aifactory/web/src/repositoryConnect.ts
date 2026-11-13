@@ -54,9 +54,12 @@ export function repositoryStack(repo: RepositoryPreview): string[] {
 
 export function reviewedConfig(config: Repo["config"], commands: ReviewedCommands) {
   const lines = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean);
-  const release = { ...config.release };
-  if (commands.deploys) release.mode = "on_merge";
-  else delete release.mode;
+  // The onboarding command review does not own scheduled release configuration.
+  const release: NonNullable<Repo["config"]["release"]> = { ...config.release };
+  if (config.release?.mode !== "train") {
+    if (commands.deploys) release.mode = "on_merge";
+    else delete release.mode;
+  }
   return {
     ...config,
     setup: lines(commands.setup), checks: lines(commands.checks),
