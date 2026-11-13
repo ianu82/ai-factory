@@ -124,5 +124,45 @@ Checkpoints and staged captures are retained only on failure, removed on success
 Use `--basetemp=/your/artifact/path` to choose a durable location. Server logs
 are under `browser-server*/server.log`, build logs under `browser-web*/build.log`.
 The smoke tests exercise rendering, fake Pulls, independent identities/decisions,
-materializable plans/counters and actual stream reconnection; full product flows
-remain T2/T3 work.
+materializable plans/counters and actual stream reconnection.
+
+## Inbox, capture, and Outcomes workflows (T2)
+
+`test_workflows.py` covers flows 1–4 as four independently seeded tests, each
+parametrized at **1440x900** and **375x812**. Every test signs in through the real
+Dev sign-in form and checks the Inbox landing state. Coverage includes:
+
+- The compact Inbox's Merge approvals, Plans to approve, Questions, and Stuck
+  groups; inline plan approval removes only that decision without opening a pane.
+- Answering a question in Decision detail with Comment and Remember for future
+  work; the Decisions page visibly records the answer, note, and Retire precedent
+  affordance.
+- The actual lowercase `c` shortcut focused outside a text input; capture of a
+  title, description, repository, and acceptance criteria; the new Outcomes row
+  and its reopened Full activity detail show the supplied content. On current
+  main, clicking an Outcomes row first opens its conversation, not the detail.
+- Positive and negative seeded row membership in Active, Needs you, Delivered,
+  and All; task collapse/expansion, criterion evidence, and fetched QA report
+  content (not merely the artifact button).
+
+**Outcomes title/number search is desktop-only.** The product's `hide-sm` search
+is not exposed at 375px; the mobile case asserts it is hidden and does not add or
+force access to a mobile search control. Both sizes exercise every other flow.
+Every visited page, dialog, detail, and expanded/collapsed evidence state calls
+`no_overflow` and records a diagnostic checkpoint. The only added UI hook is
+`task-<id>` on TaskCard, to scope its criterion, artifact, and expansion controls
+without relying on DOM ancestry or confusing outcome-level acceptance lists.
+
+Validation on this change: five consecutive runs of `pytest -q tests/browser`
+passed (28 tests each, 66–73 seconds including build/server startup). For the
+negative control, the inline Inbox `quick(d, inline.value)` call was temporarily
+removed and the mobile inline approval test failed with **Browser approve_plan
+is still visible in Inbox after its inline Approve action**. T1's diagnostics
+retained a valid, nonempty 56,147-byte call-failure PNG plus prior checkpoints.
+The deliberate break was restored before the five passing runs. To reproduce,
+temporarily no-op only that inline handler in `Inbox.tsx`, run
+`pytest -q 'tests/browser/test_workflows.py::test_inbox_inline_plan_approval[375x812]'`
+with a dedicated `--basetemp`, inspect the reported `PNG:` path, and restore the
+handler before running the passing suite. No browser response interception,
+forced clicks, fixed sleeps, or SSE-incompatible network-idle waits are used by
+these workflow tests.
