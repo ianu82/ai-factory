@@ -162,6 +162,9 @@ def test_cost_size_boundaries_final_artifact_and_even_medians(client, signed_in)
     assert m["value"] == {"small": {"value": 3, "sample_count": 2}, "medium": {"value": 7, "sample_count": 2},
                           "large": {"value": 10, "sample_count": 1}}
     assert (m["sample_count"], m["unknown_count"], m["unknown_size_count"], m["unknown_cost_count"]) == (5, 1, 1, 1)
+    response = client.get(f"/api/workspaces/{ws}/stats")
+    assert response.status_code == 200
+    assert response.json()["metrics"]["median_delivered_task_cost"] == m
 
 
 def test_failure_evidence_survives_overwrites(client, signed_in):
@@ -189,12 +192,15 @@ def test_stats_empty_nulls_legacy_compatibility_and_tenancy(client, signed_in):
     assert {"outcomes", "tasks", "cost", "tokens", "human", "harnesses"} <= data.keys()
     assert len(data["metrics"]) == 4
     for name, m in data["metrics"].items():
-        assert isinstance(m["definition"], dict)
+        assert isinstance(m["definition"], dict) and m["definition"]["population"]
+        assert all(isinstance(value, (str, dict)) for value in m["definition"].values())
         assert m["unknown_count"] == m["excluded_count"] == 0
         if name != "median_delivered_task_cost":
-            assert m["value"] is None and m["denominator"] == 0
+            assert m["value"] is None and m["denominator"] == m["numerator"] == 0
         else:
-            assert all(v["value"] is None for v in m["value"].values())
+            assert m["value"] == {size: {"value": None, "sample_count": 0} for size in ("small", "medium", "large")}
+            assert m["sample_count"] == m["unknown_size_count"] == m["unknown_cost_count"] == 0
+            assert m["definition"]["boundaries"] == {"small": [0, 100], "medium": [101, 400], "large": [401, None]}
     other = TestClient(client.app)
     assert other.get(f"/api/workspaces/{ws}/stats").status_code == 401
     other.post("/auth/dev", json={"email": "other@test.com", "organization": "Other"})
