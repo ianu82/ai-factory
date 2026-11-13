@@ -80,7 +80,17 @@ def test_failure_diagnostics_cover_all_pages_and_unique_checkpoints(tmp_path):
         def is_closed(self):
             return False
 
-        def screenshot(self, *, path, full_page, timeout):
+        def locator(self, selector):
+            return self
+
+        def filter(self, **kwargs):
+            return self
+
+        def get_by_role(self, *args, **kwargs):
+            return self
+
+        def screenshot(self, *, path, full_page, timeout, mask):
+            assert mask == [self]
             assert full_page and timeout == 5000
             Path(path).write_bytes(b"captured")
 

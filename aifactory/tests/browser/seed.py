@@ -10,7 +10,7 @@ from aifactory.auth import DevSignIn, dev_sign_in
 from aifactory.db import session_scope, utcnow
 from aifactory.models import Artifact, Decision, Membership, Organization, Outcome, Plan, Repository, Run, Secret, Signal, Workspace
 from aifactory.models import Task
-from aifactory.security import encrypt
+from aifactory.security import encrypt, mask
 from aifactory.github import REQUIRED_PERMISSIONS
 
 STATUSES = ("planning", "awaiting_approval", "needs_input", "running", "attention", "blocked", "completed",
@@ -44,6 +44,11 @@ async def create_scenario() -> dict:
                          hint="browser dummy", status="valid", metadata_json={"models": ["gpt-test"], "login": "browser",
                          "repository": "acme/app", "test_status": "valid", "diagnostic_code": "github_verified",
                          "permissions": [{"permission": p, "state": "present"} for p in REQUIRED_PERMISSIONS]}))
+        # Feedback intake stores only a one-way hash, just like the real rotate handler.
+        dummy_feedback_key = "aff_browser-only-configured-feedback"
+        s.add(Secret(workspace_id=ws.id, kind="feedback_key",
+                     ciphertext=hashlib.sha256(dummy_feedback_key.encode()).hexdigest(),
+                     hint=mask(dummy_feedback_key), status="valid"))
         outcomes, plans, tasks = {}, {}, {}
         for number, status in enumerate(STATUSES, 1):
             outcome = Outcome(workspace_id=ws.id, number=number, title=f"Scenario {status}", status=status,
@@ -105,7 +110,7 @@ async def create_scenario() -> dict:
                           title="Make empty states clearer", body="Explain what to do next.")
         improvement = Signal(workspace_id=ws.id, repo_id=repo.id, source="improvement", fingerprint="browser-team-note",
                              title="Teach builders to test empty states", body="Edit this team note before applying.",
-                             status="proposed", data={"rule": "review_themes", "action": {"type": "team_note",
+                             status="new", data={"rule": "review_themes", "action": {"type": "team_note",
                              "repo_id": repo.id, "note": "Test empty states before shipping.", "label": "Add to team notes"},
                              "evidence": [{"label": "Verified task", "detail": "Missing empty-state coverage",
                                            "outcome_id": outcomes["completed"], "task_id": tasks["completed"]}]})
