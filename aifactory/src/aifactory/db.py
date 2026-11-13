@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from threading import Lock
 from typing import Iterator
 
 from sqlalchemy import create_engine, event
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import OperationalError, TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from .config import get_settings
 
@@ -43,15 +47,81 @@ _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
 
-def _configure_sqlite(engine: Engine) -> None:
+class _ObservedQueuePool(QueuePool):
+    """Count outstanding acquisitions, not just successful checkout/checkin events.
+
+    Instrument the pool boundary so direct engine users, lazy ORM checkouts, failed
+    creators and pre-ping failures all have the same finally-based accounting.
+    Counters belong to the pool, so replacement/disposal cannot contaminate a new one.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._metrics_lock = Lock()
+        self._acquiring = 0
+        self._checkout_failures = 0
+
+    def connect(self):
+        with self._metrics_lock:
+            self._acquiring += 1
+        try:
+            return super().connect()
+        except BaseException:
+            with self._metrics_lock:
+                self._checkout_failures += 1
+            raise
+        finally:
+            with self._metrics_lock:
+                self._acquiring -= 1
+
+
+def pool_snapshot() -> dict[str, int | bool | None]:
+    """Connection-free telemetry; reading it must never initialize an engine.
+
+    waiters are outstanding connect() calls (including connection setup/pre-ping),
+    not an estimate derived from checkouts. With fail-fast checkout they are normally
+    zero. Non-QueuePool capacity/in_use are unknown rather than invented counts.
+    """
+    pool = _engine.pool if _engine is not None else None
+    snapshot: dict[str, int | bool | None] = {
+        "capacity": None, "in_use": None, "overflow": 0, "waiters": 0,
+        "saturated": False, "checkout_failures": 0,
+    }
+    if isinstance(pool, QueuePool):
+        capacity = pool.size() + pool._max_overflow
+        in_use = pool.checkedout()
+        snapshot.update(capacity=capacity, in_use=in_use, overflow=max(0, pool.overflow()),
+                        saturated=in_use >= capacity)
+    if isinstance(pool, _ObservedQueuePool):
+        with pool._metrics_lock:
+            snapshot.update(waiters=pool._acquiring, checkout_failures=pool._checkout_failures)
+    return snapshot
+
+
+def is_database_contention(exc: Exception) -> bool:
+    """Only pool exhaustion and SQLite BUSY/LOCKED are retryable, never arbitrary SQL errors."""
+    if isinstance(exc, PoolTimeoutError):
+        return True
+    if not isinstance(exc, OperationalError) or not isinstance(exc.orig, sqlite3.OperationalError):
+        return False
+    code = getattr(exc.orig, "sqlite_errorcode", None)
+    if code is not None:
+        # Extended SQLite result codes retain the base result in the low byte.
+        return code & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    return str(exc.orig).lower() in ("database is locked", "database table is locked", "database is busy")
+
+
+def _configure_sqlite(engine: Engine, busy_timeout_ms: int) -> None:
     @event.listens_for(engine, "connect")
     def _pragmas(dbapi_connection, _record):  # pragma: no cover - driver hook
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=60000")
-        cursor.close()
+        try:
+            cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
 def normalize_url(url: str) -> str:
@@ -66,24 +136,30 @@ def init_engine(url: str | None = None) -> Engine:
     global _engine, _session_factory
     settings = get_settings()
     url = normalize_url(url or settings.database_url)
-    if url.startswith("sqlite:///"):
-        path = url.removeprefix("sqlite:///")
-        if path and path != ":memory:":
+    parsed = make_url(url)
+    sqlite = parsed.get_backend_name() == "sqlite"
+    memory = sqlite and (parsed.database in (None, "", ":memory:") or parsed.query.get("mode") == "memory")
+    if sqlite and not memory:
+        path = parsed.database
+        if path:
             from pathlib import Path
 
             Path(path).parent.mkdir(parents=True, exist_ok=True)
     kwargs: dict = {"future": True}
-    if url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
+    if not memory:
+        kwargs.update(poolclass=_ObservedQueuePool, pool_size=settings.database_pool_size,
+                      max_overflow=settings.db_max_overflow, pool_timeout=0)
+    if sqlite:
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": settings.sqlite_busy_timeout_ms / 1000}
     else:
-        kwargs.update(pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=1800)
+        kwargs.update(pool_pre_ping=True, pool_recycle=1800)
     if _engine is not None:
         # Re-initialisation (every test, each create_app) must not leave the old pool's connections open: on
         # PostgreSQL they count against max_connections until garbage collection ("too many clients").
         _engine.dispose()
     _engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
-        _configure_sqlite(_engine)
+        _configure_sqlite(_engine, settings.sqlite_busy_timeout_ms)
     _session_factory = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
     from . import models  # noqa: F401  (register tables)
 
@@ -254,7 +330,7 @@ def session_scope() -> Iterator[Session]:
     try:
         yield session
         session.commit()
-    except Exception:
+    except BaseException:
         session.rollback()
         raise
     finally:
@@ -266,5 +342,8 @@ def get_db() -> Iterator[Session]:
     session = SessionLocal()
     try:
         yield session
+    except BaseException:
+        session.rollback()
+        raise
     finally:
         session.close()

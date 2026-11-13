@@ -633,3 +633,102 @@ def test_empty_workspace_score_usage_is_known_zero(client, judge):
     assert response.status_code == 200
     assert response.json()['cost'] == {'usd': 0, 'known': True, 'per_completed_task': 0}
     assert response.json()['tokens'] == 0
+
+
+@pytest.fixture
+def manual_scorer_worker(monkeypatch):
+    """Keep the TestClient's separate loop from competing with the loop under test."""
+    original = scorers.worker
+
+    async def parked():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(scorers, 'worker', parked)
+    return original
+
+
+@pytest.mark.parametrize('contention', ['pool', 'writer'])
+async def test_worker_preserves_queued_result_after_contention(manual_scorer_worker, judge, monkeypatch, contention):
+    """Recovery retries only selection: no model call until the queued claim can commit."""
+    import threading
+    from contextlib import ExitStack
+
+    from aifactory import db
+    from sqlalchemy import text
+
+    engine = db.engine()
+    if contention == 'writer' and engine.dialect.name != 'sqlite':
+        pytest.skip('SQLite writer-lock regression; pool exhaustion is tested on both databases')
+    rid = reservation(judge)
+    if contention == 'writer':
+        stale_id = reservation(judge)
+        with session_scope() as s:
+            stale = s.get(ScorerResult, stale_id)
+            stale.status, stale.started_at = 'running', utcnow() - timedelta(seconds=200)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    failed = asyncio.Event()
+    resume = asyncio.Event()
+    finished = asyncio.Event()
+    original_select, original_execute = scorers.select_recovery, scorers.execute
+    selections = 0
+
+    def select():
+        nonlocal selections
+        assert threading.get_ident() != loop_thread
+        selections += 1
+        return original_select()
+
+    async def execute(result_id):
+        assert asyncio.get_running_loop() is loop
+        try:
+            await original_execute(result_id)
+        finally:
+            finished.set()
+
+    async def pause(_):
+        failed.set()
+        await resume.wait()
+        # After the resumed selection, park until test cleanup rather than spin.
+        resume.clear()
+
+    monkeypatch.setattr(scorers, 'select_recovery', select)
+    monkeypatch.setattr(scorers, 'execute', execute)
+    # Only replace the worker's sleep, not asyncio.sleep process-wide.
+    class WorkerAsyncio:
+        sleep = staticmethod(pause)
+
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(scorers, 'asyncio', WorkerAsyncio())
+    with ExitStack() as stack:
+        if contention == 'pool':
+            for _ in range(db.pool_snapshot()['capacity']):
+                stack.enter_context(engine.connect())
+        else:
+            connection = stack.enter_context(engine.connect())
+            # Include a stale running result so recovery must write before dispatching queued work.
+            connection.execute(text("UPDATE scorer_results SET status='running' WHERE id=:id"), {'id': rid})
+        worker = asyncio.create_task(manual_scorer_worker())
+        try:
+            await asyncio.wait_for(failed.wait(), 5)
+            assert not ScriptedModel.calls
+            assert not scorers._jobs
+            stack.close()  # roll back the independent writer / return all pooled connections
+            with session_scope() as s:
+                assert s.get(ScorerResult, rid).status == 'queued'
+            resume.set()
+            await asyncio.wait_for(finished.wait(), 5)
+            await asyncio.gather(*list(scorers._jobs.values()))
+            with session_scope() as s:
+                assert s.get(ScorerResult, rid).status == 'succeeded'
+                assert s.query(ScorerAttempt).filter_by(result_id=rid).count() == 1
+            assert ScriptedModel.calls.count('scorer') == (2 if contention == 'writer' else 1)
+            assert selections >= 2
+        finally:
+            stack.close()
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            await scorers.stop()
+    assert not scorers._jobs
